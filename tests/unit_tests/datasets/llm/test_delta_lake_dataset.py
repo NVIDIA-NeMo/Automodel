@@ -27,7 +27,9 @@ import pytest
 def _deltalake_available():
     """Helper to check if deltalake is available."""
     try:
-        import deltalake  # noqa: F401
+        import importlib
+
+        importlib.import_module("deltalake")
 
         return True
     except ImportError:
@@ -283,6 +285,7 @@ class TestLoadDatasetWithDelta:
                     storage_options=None,
                     streaming=True,
                     version=None,
+                    sql_query=None,
                 )
 
     def test_passes_delta_options(self):
@@ -306,7 +309,152 @@ class TestLoadDatasetWithDelta:
                     storage_options=storage_opts,
                     streaming=True,
                     version=5,
+                    sql_query=None,
                 )
+
+    def test_passes_delta_sql_query(self):
+        """Test that delta SQL query is passed through."""
+        from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import _load_dataset
+
+        with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset.is_delta_lake_path", return_value=True):
+            with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset.load_delta_lake_dataset") as mock_load:
+                mock_load.return_value = MagicMock()
+
+                query = "SELECT 'q' AS question, 'a' AS answer"
+                _load_dataset("delta:///path/to/table", streaming=True, delta_sql_query=query)
+
+                mock_load.assert_called_once_with(
+                    path="delta:///path/to/table",
+                    storage_options=None,
+                    streaming=True,
+                    version=None,
+                    sql_query=query,
+                )
+
+
+class TestDeltaLakeSqlQueryExecution:
+    """Tests for executing SQL queries via the Databricks SQL backend."""
+
+    def test_databricks_sql_uses_sql_query(self):
+        """When sql_query is provided, it should be executed as-is (no table_path SELECT wrapper)."""
+        from nemo_automodel.components.datasets.llm import delta_lake_dataset as mod
+
+        executed: dict[str, str] = {}
+
+        class FakeCursor:
+            def __init__(self):
+                self.description = [("a",), ("b",)]
+                self._done = False
+
+            def execute(self, query):
+                executed["query"] = query
+
+            def fetchmany(self, batch_size):
+                if self._done:
+                    return []
+                self._done = True
+                return [(1, 2)]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeConn:
+            def cursor(self):
+                return FakeCursor()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeSql:
+            def connect(self, **kwargs):
+                return FakeConn()
+
+        fake_databricks = types.ModuleType("databricks")
+        fake_databricks.sql = FakeSql()
+
+        query = "SELECT 1 AS a, 2 AS b"
+        storage_opts = {"DATABRICKS_HOST": "https://workspace", "DATABRICKS_TOKEN": "dapi...", "DATABRICKS_HTTP_PATH": "/sql"}
+
+        with patch.dict(sys.modules, {"databricks": fake_databricks}):
+            with patch.object(mod, "_check_databricks_sql_available", return_value=True):
+                with patch.object(mod, "_get_spark_session", return_value=None):
+                    it = mod.DeltaLakeIterator(
+                        table_path="catalog.schema.table",
+                        storage_options=storage_opts,
+                        batch_size=8,
+                        sql_query=query,
+                    )
+                    rows = list(it)
+
+        assert executed["query"] == query
+        assert rows == [{"a": 1, "b": 2}]
+
+    def test_databricks_sql_wraps_query_when_columns_requested(self):
+        """If columns are set alongside sql_query, we project via SELECT ... FROM (<query>)."""
+        from nemo_automodel.components.datasets.llm import delta_lake_dataset as mod
+
+        executed: dict[str, str] = {}
+
+        class FakeCursor:
+            def __init__(self):
+                self.description = [("a",)]
+                self._done = False
+
+            def execute(self, query):
+                executed["query"] = query
+
+            def fetchmany(self, batch_size):
+                if self._done:
+                    return []
+                self._done = True
+                return [(1,)]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeConn:
+            def cursor(self):
+                return FakeCursor()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeSql:
+            def connect(self, **kwargs):
+                return FakeConn()
+
+        fake_databricks = types.ModuleType("databricks")
+        fake_databricks.sql = FakeSql()
+
+        base_query = "SELECT 1 AS a, 2 AS b"
+        storage_opts = {"DATABRICKS_HOST": "https://workspace", "DATABRICKS_TOKEN": "dapi...", "DATABRICKS_HTTP_PATH": "/sql"}
+
+        with patch.dict(sys.modules, {"databricks": fake_databricks}):
+            with patch.object(mod, "_check_databricks_sql_available", return_value=True):
+                with patch.object(mod, "_get_spark_session", return_value=None):
+                    it = mod.DeltaLakeIterator(
+                        table_path="catalog.schema.table",
+                        columns=["a"],
+                        storage_options=storage_opts,
+                        batch_size=8,
+                        sql_query=base_query,
+                    )
+                    rows = list(it)
+
+        assert executed["query"] == f"SELECT a FROM ({base_query}) AS _q"
+        assert rows == [{"a": 1}]
 
 
 class TestDeletionVectorsFallback:

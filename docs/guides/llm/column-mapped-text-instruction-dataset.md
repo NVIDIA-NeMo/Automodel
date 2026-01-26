@@ -14,7 +14,7 @@ It supports three data sources out-of-the-box and optionally streams them so the
 
 1. **Local JSON/JSONL files** - pass a single file path or a list of paths on disk. The newline-delimited JSON works great.
 2. **Hugging Face Hub** - point to any dataset repo (`org/dataset`) that contains the required columns.
-3. **Delta Lake tables** - load from Databricks, cloud storage (S3, Azure, GCS), or local Delta tables with streaming support.
+3. **Delta Lake tables** - load from Databricks, cloud storage (S3, Azure, GCS), or local Delta tables with streaming support. You can also provide a SQL query (`delta_sql_query`) to compute/alias columns on the fly.
 
 ---
 ## Quickstart
@@ -275,6 +275,57 @@ for sample in ds:
     break
 ```
 
+**Streaming from a Delta SQL query (computed/aliased columns):**
+If you want to generate columns dynamically (joins, filters, computed prompt strings, etc.), pass a SQL query that returns the fields referenced by your `column_mapping`.
+
+```python
+from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset import (
+    ColumnMappedTextInstructionIterableDataset,
+)
+
+ds = ColumnMappedTextInstructionIterableDataset(
+    # Still provide a Delta-looking identifier so the loader picks the Delta backend.
+    path_or_dataset_id="delta://catalog.schema.training_data",
+    column_mapping={"question": "question", "answer": "answer"},
+    tokenizer=tokenizer,
+    delta_storage_options={
+        "DATABRICKS_HOST": "https://your-workspace.databricks.com",
+        "DATABRICKS_TOKEN": "dapi...",
+        "DATABRICKS_HTTP_PATH": "/sql/1.0/warehouses/...",  # or set via env var
+    },
+    delta_sql_query="""
+      SELECT
+        concat(system_prompt, '\n', user_message) AS question,
+        assistant_message AS answer
+      FROM catalog.schema.training_data
+      WHERE split = 'train'
+    """,
+)
+```
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset.ColumnMappedTextInstructionIterableDataset
+  path_or_dataset_id: delta://catalog.schema.training_data
+  column_mapping:
+    question: question
+    answer: answer
+  delta_sql_query: |
+    SELECT
+      concat(system_prompt, '\n', user_message) AS question,
+      assistant_message AS answer
+    FROM catalog.schema.training_data
+    WHERE split = 'train'
+  delta_storage_options:
+    DATABRICKS_HOST: ${oc.env:DATABRICKS_HOST}
+    DATABRICKS_TOKEN: ${oc.env:DATABRICKS_TOKEN}
+    DATABRICKS_HTTP_PATH: ${oc.env:DATABRICKS_HTTP_PATH}
+```
+
+::::{note}
+**SQL engine requirement:** `delta_sql_query` is executed via Spark (Databricks runtime / pyspark) when available, otherwise via `databricks-sql-connector`. It is not supported in a deltalake-only environment.
+::::
+
 :::{note}
 **Authentication:** The Delta Lake loader automatically picks up credentials from environment variables
 (`DATABRICKS_TOKEN`, `AWS_ACCESS_KEY_ID`, `AZURE_STORAGE_ACCOUNT_KEY`, etc.) if not explicitly
@@ -290,6 +341,7 @@ provided in `delta_storage_options`.
 | `start_of_turn_token`   | `None`  | String token marking the assistant's response. Required when `answer_only_loss_mask=True` for tokenizers with chat template. |
 | `delta_storage_options` | `None`  | Dict of storage options for Delta Lake cloud authentication (e.g., `{"DATABRICKS_TOKEN": "dapi..."}`). |
 | `delta_version`         | `None`  | Specific version of the Delta table to read. If `None`, reads the latest version. |
+| `delta_sql_query`       | `None`  | SQL query to generate the dataset rows for Delta sources (Spark / Databricks SQL only). Your query must return columns referenced by `column_mapping`. |
 
 ---
 ## Tokenization Paths

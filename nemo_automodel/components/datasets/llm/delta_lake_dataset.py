@@ -101,7 +101,9 @@ def _check_deltalake_available() -> bool:
     global _DELTALAKE_AVAILABLE
     if _DELTALAKE_AVAILABLE is None:
         try:
-            import deltalake  # noqa: F401
+            import importlib
+
+            importlib.import_module("deltalake")
 
             _DELTALAKE_AVAILABLE = True
         except ImportError:
@@ -114,8 +116,10 @@ def _check_pyspark_available() -> bool:
     global _PYSPARK_AVAILABLE
     if _PYSPARK_AVAILABLE is None:
         try:
-            import pyspark  # noqa: F401
-            from pyspark.sql import SparkSession  # noqa: F401
+            import importlib
+
+            importlib.import_module("pyspark")
+            importlib.import_module("pyspark.sql")
 
             _PYSPARK_AVAILABLE = True
         except Exception:  # noqa: BLE001
@@ -160,7 +164,9 @@ def _get_spark_session() -> Optional[Any]:
     if not _check_pyspark_available():
         return None
     try:
-        from pyspark.sql import SparkSession
+        import importlib
+
+        SparkSession = importlib.import_module("pyspark.sql").SparkSession
 
         return SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
     except Exception as e:  # noqa: BLE001
@@ -350,6 +356,7 @@ class DeltaLakeIterator:
         storage_options: Optional[Dict[str, str]] = None,
         batch_size: int = 1024,
         version: Optional[int] = None,
+        sql_query: Optional[str] = None,
     ):
         if not _check_delta_reader_available():
             raise ImportError(
@@ -363,6 +370,15 @@ class DeltaLakeIterator:
         self.storage_options = storage_options or {}
         self.batch_size = batch_size
         self.version = version
+        self.sql_query = sql_query
+
+        # SQL query execution requires an engine (Spark or Databricks SQL). The `deltalake`
+        # reader does not support arbitrary SQL query execution on its own.
+        if self.sql_query is not None and not (_check_pyspark_available() or _check_databricks_sql_available()):
+            raise ImportError(
+                "Delta Lake `sql_query` requires either Spark (pyspark / Databricks runtime) "
+                "or `databricks-sql-connector`. A deltalake-only install cannot execute SQL queries."
+            )
 
         # Add environment-based storage options
         self._add_env_storage_options()
@@ -411,47 +427,53 @@ class DeltaLakeIterator:
             )
 
         try:
-            effective_path = self.table_path
-
-            # Unity Catalog managed tables have internal storage locations under __unitystorage.
-            # Databricks blocks direct reads of these locations (LOCATION_OVERLAP); resolve to a UC table name if possible.
-            if not _is_unity_catalog_path(effective_path):
-                ids = _parse_unity_storage_ids(effective_path)
-                if ids is not None:
-                    resolved = _resolve_uc_table_from_unity_storage_path(spark, effective_path)
-                    if resolved is not None:
-                        logger.info(
-                            "Resolved Unity Catalog managed storage path to table: %s (from %s)",
-                            resolved,
-                            effective_path,
-                        )
-                        effective_path = resolved
-                        self.table_path = resolved
-                    else:
-                        raise RuntimeError(
-                            "This looks like a Unity Catalog managed-table storage location (contains '__unitystorage'). "
-                            "Databricks blocks direct path access to UC managed storage. "
-                            "Pass the Unity Catalog table name in `catalog.schema.table` format (or "
-                            "`delta://catalog.schema.table`) instead of the underlying cloud path.\n"
-                            f"Provided: {effective_path}\n"
-                            f"Detected table_id: {ids.get('table_id')}"
-                        )
-
-            if _is_unity_catalog_path(effective_path):
-                if self.version is not None:
-                    col_select = ", ".join([f"`{c}`" for c in self.columns]) if self.columns else "*"
-                    df = spark.sql(f"SELECT {col_select} FROM {effective_path} VERSION AS OF {int(self.version)}")
-                else:
-                    df = spark.table(effective_path)
-                    if self.columns:
-                        df = df.select(*self.columns)
-            else:
-                reader = spark.read.format("delta")
-                if self.version is not None:
-                    reader = reader.option("versionAsOf", str(int(self.version)))
-                df = reader.load(effective_path)
+            if self.sql_query is not None:
+                query = str(self.sql_query).strip().rstrip(";").strip()
+                df = spark.sql(query)
                 if self.columns:
                     df = df.select(*self.columns)
+            else:
+                effective_path = self.table_path
+
+                # Unity Catalog managed tables have internal storage locations under __unitystorage.
+                # Databricks blocks direct reads of these locations (LOCATION_OVERLAP); resolve to a UC table name if possible.
+                if not _is_unity_catalog_path(effective_path):
+                    ids = _parse_unity_storage_ids(effective_path)
+                    if ids is not None:
+                        resolved = _resolve_uc_table_from_unity_storage_path(spark, effective_path)
+                        if resolved is not None:
+                            logger.info(
+                                "Resolved Unity Catalog managed storage path to table: %s (from %s)",
+                                resolved,
+                                effective_path,
+                            )
+                            effective_path = resolved
+                            self.table_path = resolved
+                        else:
+                            raise RuntimeError(
+                                "This looks like a Unity Catalog managed-table storage location (contains '__unitystorage'). "
+                                "Databricks blocks direct path access to UC managed storage. "
+                                "Pass the Unity Catalog table name in `catalog.schema.table` format (or "
+                                "`delta://catalog.schema.table`) instead of the underlying cloud path.\n"
+                                f"Provided: {effective_path}\n"
+                                f"Detected table_id: {ids.get('table_id')}"
+                            )
+
+                if _is_unity_catalog_path(effective_path):
+                    if self.version is not None:
+                        col_select = ", ".join([f"`{c}`" for c in self.columns]) if self.columns else "*"
+                        df = spark.sql(f"SELECT {col_select} FROM {effective_path} VERSION AS OF {int(self.version)}")
+                    else:
+                        df = spark.table(effective_path)
+                        if self.columns:
+                            df = df.select(*self.columns)
+                else:
+                    reader = spark.read.format("delta")
+                    if self.version is not None:
+                        reader = reader.option("versionAsOf", str(int(self.version)))
+                    df = reader.load(effective_path)
+                    if self.columns:
+                        df = df.select(*self.columns)
         except Exception as e:  # noqa: BLE001
             # Common Databricks failure when users pass the managed storage path for a UC table.
             if _is_location_overlap_error(e) and not _is_unity_catalog_path(self.table_path):
@@ -469,7 +491,14 @@ class DeltaLakeIterator:
 
     def _iter_with_deltalake(self) -> Iterator[Dict[str, Any]]:
         """Iterate using deltalake library."""
-        from deltalake import DeltaTable
+        if self.sql_query is not None:
+            raise RuntimeError(
+                "Delta Lake `sql_query` is not supported with the `deltalake` backend. "
+                "Run with Spark (Databricks / pyspark) or install `databricks-sql-connector`."
+            )
+        import importlib
+
+        DeltaTable = importlib.import_module("deltalake").DeltaTable
 
         try:
             # Open the Delta table and get PyArrow dataset for efficient streaming
@@ -534,8 +563,16 @@ class DeltaLakeIterator:
         # Build column selection
         col_select = ", ".join(self.columns) if self.columns else "*"
 
-        # Build query - table_path is catalog.schema.table format
-        query = f"SELECT {col_select} FROM {self.table_path}"
+        if self.sql_query is not None:
+            base_query = str(self.sql_query).strip().rstrip(";").strip()
+            # Optional projection on top of the provided query.
+            if self.columns:
+                query = f"SELECT {col_select} FROM ({base_query}) AS _q"
+            else:
+                query = base_query
+        else:
+            # Build query - table_path is catalog.schema.table format
+            query = f"SELECT {col_select} FROM {self.table_path}"
 
         logger.info(f"Connecting to Databricks SQL: {server_hostname}")
 
@@ -564,6 +601,21 @@ class DeltaLakeIterator:
         Yields:
             Dict containing column name to value mappings for each row.
         """
+        # Custom SQL query: prefer Spark when available, fall back to Databricks SQL connector.
+        if self.sql_query is not None:
+            if _get_spark_session() is not None:
+                logger.info("Executing Delta SQL query via Spark.")
+                yield from self._iter_with_spark()
+                return
+            if _check_databricks_sql_available():
+                logger.info("Executing Delta SQL query via Databricks SQL connector.")
+                yield from self._iter_with_databricks_sql()
+                return
+            raise ImportError(
+                "Delta Lake `sql_query` requires either Spark (Databricks runtime / pyspark) "
+                "or `databricks-sql-connector`."
+            )
+
         # Check if this is a Unity Catalog table (catalog.schema.table format)
         if _is_unity_catalog_path(self.table_path):
             # Prefer Spark when available (Databricks notebooks/jobs) to avoid extra dependencies.
@@ -619,12 +671,14 @@ class DeltaLakeDataset:
         storage_options: Optional[Dict[str, str]] = None,
         streaming: bool = False,
         version: Optional[int] = None,
+        sql_query: Optional[str] = None,
     ):
         self.table_path = _normalize_delta_path(table_path)
         self.columns = columns
         self.storage_options = storage_options or {}
         self.streaming = streaming
         self.version = version
+        self.sql_query = sql_query
         self._data: Optional[list] = None
         self._length: Optional[int] = None
 
@@ -642,6 +696,7 @@ class DeltaLakeDataset:
             columns=columns,
             storage_options=storage_options,
             version=version,
+            sql_query=sql_query,
         )
 
         if not streaming:
@@ -702,6 +757,7 @@ def load_delta_lake_dataset(
     storage_options: Optional[Dict[str, str]] = None,
     streaming: bool = False,
     version: Optional[int] = None,
+    sql_query: Optional[str] = None,
 ) -> Union[DeltaLakeDataset, "HFDeltaLakeDataset"]:
     """Load a Delta Lake table as a HuggingFace-compatible dataset.
 
@@ -747,6 +803,7 @@ def load_delta_lake_dataset(
             storage_options=storage_options,
             streaming=streaming,
             version=version,
+            sql_query=sql_query,
         )
     except ImportError:
         return DeltaLakeDataset(
@@ -755,6 +812,7 @@ def load_delta_lake_dataset(
             storage_options=storage_options,
             streaming=streaming,
             version=version,
+            sql_query=sql_query,
         )
 
 
@@ -780,12 +838,14 @@ class HFDeltaLakeDataset:
         storage_options: Optional[Dict[str, str]] = None,
         streaming: bool = False,
         version: Optional[int] = None,
+        sql_query: Optional[str] = None,
     ):
         self.table_path = _normalize_delta_path(table_path)
         self.columns = columns
         self.storage_options = storage_options or {}
         self.streaming = streaming
         self.version = version
+        self.sql_query = sql_query
         self._dataset: Optional[Any] = None
         self._epoch: int = 0
         self._shard_info: Optional[tuple] = None  # (num_shards, shard_index)
@@ -797,6 +857,7 @@ class HFDeltaLakeDataset:
             columns=columns,
             storage_options=storage_options,
             version=version,
+            sql_query=sql_query,
         )
 
         if not streaming:
@@ -811,6 +872,7 @@ class HFDeltaLakeDataset:
             columns=self.columns,
             storage_options=self._base_iterator.storage_options,
             version=self.version,
+            sql_query=self.sql_query,
         )
         self._dataset = Dataset.from_list(list(iterator))
 
@@ -838,6 +900,7 @@ class HFDeltaLakeDataset:
                 columns=self.columns,
                 storage_options=self._base_iterator.storage_options,
                 version=self.version,
+                sql_query=self.sql_query,
             )
 
             row_idx = 0

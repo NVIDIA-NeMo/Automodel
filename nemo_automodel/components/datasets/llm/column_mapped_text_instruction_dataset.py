@@ -93,6 +93,7 @@ def _load_dataset(
     name: Optional[str] = None,
     delta_storage_options: Optional[Dict[str, str]] = None,
     delta_version: Optional[int] = None,
+    delta_sql_query: Optional[str] = None,
 ):
     """Load a dataset from HuggingFace Hub, local JSON/JSONL files, or Delta Lake tables.
 
@@ -115,6 +116,10 @@ def _load_dataset(
         delta_storage_options: Optional dict of storage options for Delta Lake
             cloud authentication (e.g., ``{"DATABRICKS_TOKEN": "dapi..."}``)
         delta_version: Optional specific version of the Delta table to read.
+        delta_sql_query: Optional SQL query to execute against the Delta Lake source.
+            This is supported when running with a SparkSession (Databricks / pyspark)
+            or when using the Databricks SQL Connector. The query must return the
+            columns expected by `column_mapping`.
 
     Returns:
         datasets.Dataset: The loaded dataset.
@@ -146,6 +151,7 @@ def _load_dataset(
                 storage_options=delta_storage_options,
                 streaming=streaming,
                 version=delta_version,
+                sql_query=delta_sql_query,
             )
 
     if isinstance(path_or_dataset_id, str) and _str_is_hf_repo_id(path_or_dataset_id):
@@ -209,6 +215,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
         use_hf_chat_template: bool = False,
         delta_storage_options: Optional[Dict[str, str]] = None,
         delta_version: Optional[int] = None,
+        delta_sql_query: Optional[str] = None,
     ) -> None:
         """
         Initialize the dataset.
@@ -228,6 +235,9 @@ class ColumnMappedTextInstructionDataset(Dataset):
             delta_storage_options: Optional dict of storage options for Delta Lake cloud authentication
                 (e.g., {"DATABRICKS_TOKEN": "dapi...", "DATABRICKS_HOST": "https://..."})
             delta_version: Optional specific version of the Delta table to read.
+            delta_sql_query: Optional SQL query to execute against the Delta Lake source.
+                Supported when running with Spark (Databricks / pyspark) or Databricks SQL Connector.
+                The query must return the columns expected by `column_mapping`.
         """
 
         if use_hf_chat_template and _has_chat_template(tokenizer):
@@ -252,6 +262,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
             name=name,
             delta_storage_options=delta_storage_options,
             delta_version=delta_version,
+            delta_sql_query=delta_sql_query,
         )
 
         if limit_dataset_samples is not None:

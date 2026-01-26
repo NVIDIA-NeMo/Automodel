@@ -57,6 +57,7 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
         use_hf_chat_template: bool = False,
         delta_storage_options: Optional[Dict[str, str]] = None,
         delta_version: Optional[int] = None,
+        delta_sql_query: Optional[str] = None,
     ) -> None:
         if tokenizer is None:
             raise ValueError("Tokenizer is required")
@@ -100,6 +101,7 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
             name=name,
             delta_storage_options=delta_storage_options,
             delta_version=delta_version,
+            delta_sql_query=delta_sql_query,
         )
         if limit_dataset_samples is not None:
             try:
@@ -108,6 +110,13 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
                 logger.warning("limit_dataset_samples ignored; 'take' not supported on this dataset: %s", e)
 
         self.dataset = ds
+        # Expose the underlying dataset's shard count (HF streaming uses `n_shards`).
+        # This enables sharding strategies that depend on shard metadata.
+        try:
+            self.num_shards = int(getattr(ds, "num_shards", getattr(ds, "n_shards", self.num_shards)))
+        except Exception:
+            # Keep the default if the underlying dataset doesn't expose shard count.
+            pass
 
     def __iter__(self) -> Iterator[Dict[str, List[int]]]:
         while True:
