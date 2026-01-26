@@ -865,13 +865,15 @@ class GroupedExpertsTE(nn.Module):
         else:
             # Handle edge case: no tokens routed to local experts
             # Perform dummy computation for gradient flow
-            dummy_input = x[0:1] * 0
-            dummy_splits = [1] + [0] * (self.num_local_experts - 1)
+            def to_local(tensor):
+                if isinstance(tensor, DTensor):
+                    return tensor.to_local()
+                else:
+                    return tensor
 
-            dummy_out1 = self.gate_up_linear(dummy_input, dummy_splits)
-            dummy_probs = permuted_probs[:1] if len(permuted_probs) > 0 else torch.ones(1, 1, device=x.device)
-            dummy_act = self.expert_activation(dummy_out1, dummy_probs)
-            output2 = self.down_linear(dummy_act, dummy_splits)
+            output1 = torch.matmul(x[0] * 0, to_local(self.gate_up_linear.weight0).T)
+            output1_ = self.expert_activation(output1, permuted_probs)
+            output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).T)
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
