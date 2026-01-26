@@ -1,6 +1,6 @@
 # YAML Configuration and Environment Variable Interpolation
 
-NeMo AutoModel recipes are configured with YAML. Under the hood, YAML is parsed into a `ConfigNode` which:
+NeMo Automodel recipes are configured with YAML. Under the hood, YAML is parsed into a `ConfigNode` which:
 
 - Translates common scalar strings into typed Python values (e.g., `"10"` → `10`).
 - Resolves `_target_` (and `*_fn`) into Python callables/classes.
