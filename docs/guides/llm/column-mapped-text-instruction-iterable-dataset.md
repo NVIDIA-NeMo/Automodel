@@ -137,7 +137,7 @@ ds = ColumnMappedTextInstructionIterableDataset(
 )
 ```
 
-### YAML Configuration (Delta Lake / Databricks)
+### YAML Configuration (Delta Lake/Databricks)
 
 ```yaml
 dataset:
