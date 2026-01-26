@@ -9,7 +9,7 @@ NeMo AutoModel recipes are configured with YAML. Under the hood, YAML is parsed 
 
 ---
 
-## Loading model/dataset configs
+## Load Model and Dataset Configs
 
 Most recipes load the YAML via `nemo_automodel.components.config.loader.load_yaml_config()`, which returns a `ConfigNode`.
 
