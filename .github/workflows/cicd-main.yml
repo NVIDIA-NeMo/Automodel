@@ -131,7 +131,7 @@ jobs:
 
   cicd-container-build:
     needs: [pre-flight, cicd-wait-in-queue]
-    runs-on: self-hoste-nemo
+    runs-on: self-hosted-nemo
     if: |
       (
         success()
