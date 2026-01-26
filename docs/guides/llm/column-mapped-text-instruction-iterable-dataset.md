@@ -125,7 +125,7 @@ ds = ColumnMappedTextInstructionIterableDataset(
     },
 )
 
-# Azure (ADLS Gen2 / ABFS)
+# Azure (ADLS Gen2/ABFS)
 ds = ColumnMappedTextInstructionIterableDataset(
     path_or_dataset_id="abfss://container@account.dfs.core.windows.net/delta_table",
     column_mapping={"question": "input", "answer": "output"},
