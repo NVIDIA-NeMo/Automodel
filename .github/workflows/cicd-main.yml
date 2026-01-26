@@ -142,7 +142,9 @@ jobs:
       && !cancelled()
     uses: ./.github/workflows/_build_container.yml
     with:
+      environment_name: "nemo-ci"
       repo_name: "Automodel"
+      runner_prefix: ${{ needs.pre-flight.outputs.runner_prefix }}
 
   cicd-unit-tests:
     strategy:

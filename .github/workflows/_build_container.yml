@@ -19,11 +19,20 @@ on:
       repo_name:
         description: "The name of the repo to build container"
         required: true
-        default: ""
+        type: string
+      runner_prefix:
+        description: "Prefix for the runner label"
+        required: true
+        type: string
+      environment_name:
+        description: "GitHub environment to use for this build"
+        required: true
         type: string
 
 jobs:
   docker-build:
+    runs-on: ${{ inputs.runner_prefix }}-gpu-x2
+    environment: ${{ inputs.environment_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
