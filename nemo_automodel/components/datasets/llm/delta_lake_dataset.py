@@ -35,7 +35,11 @@ Usage:
     Local Delta tables:
 
     ```python
-    ds = ColumnMappedTextInstructionDataset(
+    from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset import (
+        ColumnMappedTextInstructionIterableDataset,
+    )
+
+    ds = ColumnMappedTextInstructionIterableDataset(
         path_or_dataset_id="delta:///path/to/delta_table",
         column_mapping={"question": "input", "answer": "output"},
         tokenizer=tokenizer,
@@ -45,7 +49,7 @@ Usage:
     Cloud storage (S3, Azure, GCS):
 
     ```python
-    ds = ColumnMappedTextInstructionDataset(
+    ds = ColumnMappedTextInstructionIterableDataset(
         path_or_dataset_id="s3://bucket/path/to/delta_table",
         column_mapping={"question": "input", "answer": "output"},
         tokenizer=tokenizer,
@@ -59,8 +63,8 @@ Usage:
     Databricks Unity Catalog (streaming):
 
     ```python
-    ds = ColumnMappedTextInstructionDataset(
-        path_or_dataset_id="catalog.schema.table",  # Unity Catalog format
+    ds = ColumnMappedTextInstructionIterableDataset(
+        path_or_dataset_id="delta://catalog.schema.table",  # Unity Catalog format
         column_mapping={"question": "input", "answer": "output"},
         tokenizer=tokenizer,
         delta_storage_options={

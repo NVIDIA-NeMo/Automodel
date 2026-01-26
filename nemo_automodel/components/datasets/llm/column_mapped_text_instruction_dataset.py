@@ -146,6 +146,11 @@ def _load_dataset(
         )
 
         if is_delta_lake_path(path_or_dataset_id):
+            if not streaming:
+                raise ValueError(
+                    "Delta Lake / Databricks sources are only supported in streaming mode. "
+                    "Use ColumnMappedTextInstructionIterableDataset to avoid accidental dataset materialization."
+                )
             return load_delta_lake_dataset(
                 path=path_or_dataset_id,
                 storage_options=delta_storage_options,
@@ -194,9 +199,12 @@ class ColumnMappedTextInstructionDataset(Dataset):
     (either from HF or from local JSON/JSONL files) and remaps the columns so
     that downstream components can rely on a consistent field interface.
 
-    Optionally, if *answer_only_loss_mask* is requested, the dataset will also
-    compute a *loss_mask* indicating which tokens should contribute to the
-    loss (typically only those belonging to the assistant answer).
+    This is a map-style dataset (`torch.utils.data.Dataset`) intended for
+    local JSON/JSONL files and Hugging Face Hub datasets.
+
+    Delta Lake / Databricks sources are intentionally **not supported** here.
+    Use `ColumnMappedTextInstructionIterableDataset` for streaming-only Delta
+    sources to avoid accidental dataset materialization.
     """
 
     def __init__(
@@ -255,6 +263,12 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 logger.warning("Setting tokenizer pad_token to ' '. tokenizer does not have `eos_token`.")
                 self.tokenizer.pad_token = " "
 
+        if delta_storage_options is not None or delta_version is not None or delta_sql_query is not None:
+            raise ValueError(
+                "Delta Lake / Databricks options are not supported by ColumnMappedTextInstructionDataset. "
+                "Use ColumnMappedTextInstructionIterableDataset."
+            )
+
         self.dataset = _load_dataset(
             path_or_dataset_id,
             split=split,
@@ -304,9 +318,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
 
         Returns:
             The length of the dataset.
-
-        Raises:
-            RuntimeError: If streaming is enabled.
         """
         return len(self.dataset)
 
@@ -319,9 +330,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
 
         Returns:
             A dictionary with the mapped columns.
-
-        Raises:
-            RuntimeError: If streaming is enabled.
         """
         row = self.dataset[idx]
         mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
