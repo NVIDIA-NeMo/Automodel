@@ -122,9 +122,9 @@ slurm:
     WANDB_API_KEY: ${WANDB_API_KEY}
 ```
 
-Notes:
-
+:::{note}
 - `job_dir` is used by the CLI on the submit host to create the local log directory and write the sbatch script/config. If you set `job_dir` to a placeholder like `${SLURM_JOB_DIR}`, the CLI will treat it literally.
 - Some values are rendered into `#SBATCH` directives (which are **not** shell-expanded). Prefer env placeholders for runtime `export ...` lines (`hf_token`, `env_vars`, etc.), not for SBATCH fields.
 - The `slurm:` section is passed through to a **bash script**. Use bash-compatible syntax (`$VAR` / `${VAR}`) there. Python-only forms like `${oc.env:VAR}` (and dotted names like `${foo.bar}`) are not valid bash parameter expansions and can fail at runtime.
+:::
 
