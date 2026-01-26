@@ -23,91 +23,92 @@ on:
         type: string
 
 jobs:
-  steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+  docker-build:
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Setup python
-      uses: actions/setup-python@v5
-      with:
-        python-version: 3.12
+      - name: Setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.12
 
-    - name: Get PR info
-      id: get-pr-info
-      if: startsWith(github.ref, 'refs/heads/pull-request/')
-      uses: nv-gha-runners/get-pr-info@main
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
 
-    - name: Install Azure CLI
-      shell: bash
-      run: |
-        echo "::group::Install Azure CLI"
-        # Create systemd override for proper dependencies
-        curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-        echo "::endgroup::"
+      - name: Install Azure CLI
+        shell: bash
+        run: |
+          echo "::group::Install Azure CLI"
+          # Create systemd override for proper dependencies
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          echo "::endgroup::"
 
-    - name: Azure Login
-      uses: azure/login@v2
-      with:
-        client-id: ${{ secrets.AZURE_CLIENT_ID }}
-        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-    - name: Azure ACR Login
-      shell: bash
-      run: |
-        az acr login --name nemoci
+      - name: Azure ACR Login
+        shell: bash
+        run: |
+          az acr login --name nemoci
 
-    - name: Install GH CLI
-      shell: bash
-      run: |
-        apt-get update
-        apt-get install -y gh
+      - name: Install GH CLI
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y gh
 
-    - name: Get last merged PR
-      id: cache_from
-      env:
-        GH_TOKEN: ${{ github.token }}
-        REPO_NAME: ${{ inputs.repo_name }}
-      run: |
-        LAST_PRS=$(gh api graphql -f query='
-          query {
-            repository(owner: "NVIDIA-NeMo", name: "$REPO_NAME") {
-              pullRequests(states: MERGED, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
-                nodes {
-                  number
+      - name: Get last merged PR
+        id: cache_from
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_NAME: ${{ inputs.repo_name }}
+        run: |
+          LAST_PRS=$(gh api graphql -f query='
+            query {
+              repository(owner: "NVIDIA-NeMo", name: "$REPO_NAME") {
+                pullRequests(states: MERGED, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
+                  nodes {
+                    number
+                  }
                 }
               }
-            }
-          }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
-            echo "type=registry,ref=${{ env.container-registry }}/$REPO_NAME:$number-buildcache,mode=max"
-          done)
+            }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
+              echo "type=registry,ref=${{ env.container-registry }}/$REPO_NAME:$number-buildcache,mode=max"
+            done)
 
-        echo "LAST_PRS<<EOF" | tee -a $GITHUB_OUTPUT
-        echo "$LAST_PRS" | tee -a $GITHUB_OUTPUT
-        echo "EOF" | tee -a $GITHUB_OUTPUT
+          echo "LAST_PRS<<EOF" | tee -a $GITHUB_OUTPUT
+          echo "$LAST_PRS" | tee -a $GITHUB_OUTPUT
+          echo "EOF" | tee -a $GITHUB_OUTPUT
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-    - name: Build and push
-      uses: docker/build-push-action@v5
-      env:
-        REPO_NAME: ${{ inputs.repo_name }}
-      with:
-        file: ./docker/Dockerfile.ci
-        push: true
-        context: .
-        build-args: |
-          BASE_IMAGE=pytorch
-        cache-from: |
-          type=registry,ref=${{ env.container-registry }}/$REPO_NAME:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
-          type=registry,ref=${{ env.container-registry }}/$REPO_NAME:main-buildcache,mode=max
-          ${{ steps.cache_from.outputs.LAST_PRS }}
-        cache-to: |
-          type=registry,ref=${{ env.container-registry }}/$REPO_NAME:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
-        no-cache: false
-        tags: |
-          ${{ env.container-registry }}/$REPO_NAME:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
-          ${{ env.container-registry }}/$REPO_NAME:${{ github.sha }}
-        secrets: |
-          GH_TOKEN=${{ secrets.PAT }}
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        env:
+          REPO_NAME: ${{ inputs.repo_name }}
+        with:
+          file: ./docker/Dockerfile.ci
+          push: true
+          context: .
+          build-args: |
+            BASE_IMAGE=pytorch
+          cache-from: |
+            type=registry,ref=${{ env.container-registry }}/$REPO_NAME:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+            type=registry,ref=${{ env.container-registry }}/$REPO_NAME:main-buildcache,mode=max
+            ${{ steps.cache_from.outputs.LAST_PRS }}
+          cache-to: |
+            type=registry,ref=${{ env.container-registry }}/$REPO_NAME:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+          no-cache: false
+          tags: |
+            ${{ env.container-registry }}/$REPO_NAME:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
+            ${{ env.container-registry }}/$REPO_NAME:${{ github.sha }}
+          secrets: |
+            GH_TOKEN=${{ secrets.PAT }}
