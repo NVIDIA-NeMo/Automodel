@@ -260,6 +260,13 @@ class BaseRecipe:
                     )
 
         self.checkpointer.save_model(model, path, peft_config=self.peft_config, tokenizer=tokenizer)
+
+        # Sync before checkpointing for Dion
+        optimizers = optimizer if isinstance(optimizer, list) else [optimizer]
+        for opt in optimizers:
+            if hasattr(opt, "synchronize_for_checkpoint"):
+                opt.synchronize_for_checkpoint()
+
         self.checkpointer.save_optimizer(optimizer, model, path, scheduler)
         save_config(config.raw_config, path)
         if is_dist_initialized:

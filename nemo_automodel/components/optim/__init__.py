@@ -13,7 +13,10 @@
 # limitations under the License.
 
 from .scheduler import OptimizerParamScheduler
+from .utils import build_dion_optimizer, is_dion_optimizer
 
 __all__ = [
     "OptimizerParamScheduler",
+    "build_dion_optimizer",
+    "is_dion_optimizer",
 ]

@@ -136,7 +136,10 @@ linting = [
     "import-linter~=2.4",
 ]
 test = ["coverage", "pytest", "peft"]
-dev = ["cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab"]
+dev = [
+    "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab",
+    "dion @ git+https://github.com/microsoft/dion.git; platform_machine == 'x86_64' and platform_system != 'Darwin'",
+]
 
 [tool.uv]
 default-groups = ["build", "docs", "test"]

@@ -12,15 +12,64 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, Iterator, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
 from torch.distributed.fsdp import (
     fully_shard,
 )
+from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle
+from torch.distributed.tensor.placement_types import Shard
 
 UniformSubtreeItem = Union[Tuple[nn.Module, torch.dtype], Tuple[str, nn.Module, torch.dtype]]
+
+
+def _build_fsdp_shard_placement_fn_from_tp_plan(
+    model: nn.Module,
+    tp_plan: Dict[str, ParallelStyle],
+) -> Any:
+    """
+    Build an FSDP2 shard_placement_fn that avoids Dion-incompatible _StridedShard placements when TP is enabled.
+
+    The function returns Shard(1) for 2D parameters whose module patterns are TP-colwise sharded (TP shards dim=0),
+    and Shard(0) for all other >=1D parameters.
+    """
+    force_dim1_suffixes: List[str] = []
+    for module_pat, style in tp_plan.items():
+        if not isinstance(style, ColwiseParallel):
+            continue
+        if module_pat.endswith("lm_head"):
+            force_dim1_suffixes.append("lm_head.weight")
+            continue
+        if "*" in module_pat:
+            suffix = module_pat.split("*")[-1]
+            if not suffix:
+                continue
+            force_dim1_suffixes.append(f"{suffix}.weight")
+        else:
+            force_dim1_suffixes.append(f"{module_pat}.weight")
+
+    force_dim1_suffixes.extend(["model.embed_tokens.weight", "embed_tokens.weight"])
+
+    seen = set()
+    force_dim1_suffixes = tuple[str, ...]([s for s in force_dim1_suffixes if not (s in seen or seen.add(s))])
+
+    id_to_name: Optional[Dict[int, str]] = None
+
+    def shard_placement_fn(p: nn.Parameter) -> Optional[Shard]:
+        nonlocal id_to_name
+        if getattr(p, "ndim", 0) == 2:
+            if id_to_name is None or id(p) not in id_to_name:
+                id_to_name = {id(pp): n for n, pp in model.named_parameters()}
+            name = id_to_name.get(id(p), "")
+            if name.endswith(force_dim1_suffixes):
+                return Shard(1)
+        if getattr(p, "ndim", 0) >= 1:
+            return Shard(0)
+        return None
+
+    return shard_placement_fn
 
 
 def iter_maximal_uniform_dtype_subtrees(
@@ -101,22 +150,34 @@ def _get_module_from_path(layer, path):
     return layer
 
 
-def _fully_shard(module, mesh, mp_policy, offload_policy):
+def _fully_shard(module, mesh, mp_policy, offload_policy, shard_placement_fn=None):
     if isinstance(module, nn.ModuleList):
         for layer in module:
-            _fully_shard(layer, mesh, mp_policy, offload_policy)
+            _fully_shard(layer, mesh, mp_policy, offload_policy, shard_placement_fn=shard_placement_fn)
     else:
-        fully_shard(module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+        fully_shard(
+            module,
+            mesh=mesh,
+            shard_placement_fn=shard_placement_fn,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+        )
 
 
-def fully_shard_by_dtype(module, mesh, mp_policy, offload_policy):
+def fully_shard_by_dtype(module, mesh, mp_policy, offload_policy, shard_placement_fn=None):
     # calling _group_params_by_dtype is not optimal here, because we may
     # end up with two traversals over the module, but this code is not in the hot path.
     grouped_params = _group_params_by_dtype(module)
     if len(grouped_params) == 0:
         return
     elif len(grouped_params) == 1:
-        fully_shard(module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+        fully_shard(
+            module,
+            mesh=mesh,
+            shard_placement_fn=shard_placement_fn,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+        )
     else:
         least_items_dtype = min(grouped_params.items(), key=lambda x: len(x[1]))[0]
         for path, mod, dtype in iter_maximal_uniform_dtype_subtrees(
@@ -130,6 +191,13 @@ def fully_shard_by_dtype(module, mesh, mp_policy, offload_policy):
                     mesh=mesh,
                     mp_policy=mp_policy,
                     offload_policy=offload_policy,
+                    shard_placement_fn=shard_placement_fn,
                 )
         if len(grouped_params) == 2:
-            fully_shard(module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+            fully_shard(
+                module,
+                mesh=mesh,
+                shard_placement_fn=shard_placement_fn,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+            )

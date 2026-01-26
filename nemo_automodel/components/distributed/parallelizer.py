@@ -97,6 +97,7 @@ class ParallelizationStrategy(ABC):
         sequence_parallel: bool = False,
         activation_checkpointing: bool = False,
         tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        shard_placement_fn: Optional[Any] = None,
         use_hf_tp_plan: bool = False,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
@@ -118,6 +119,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         sequence_parallel: bool = False,
         activation_checkpointing: bool = False,
         tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        shard_placement_fn: Optional[Any] = None,
         use_hf_tp_plan: bool = False,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
@@ -189,7 +191,13 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             )
 
         # Find transformer layers and apply parallelisms
-        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
+        apply_fsdp2_sharding_recursively(
+            model,
+            dp_mesh,
+            mp_policy,
+            offload_policy,
+            shard_placement_fn=shard_placement_fn,
+        )
 
         # Apply FSDP to the root model
         # Do not reshard after forward for root model because its parameters
@@ -197,6 +205,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         model = fully_shard(
             model,
             mesh=dp_mesh,
+            shard_placement_fn=shard_placement_fn,
             mp_policy=mp_policy,
             reshard_after_forward=False,
             offload_policy=offload_policy,
@@ -217,6 +226,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         sequence_parallel: bool = False,
         activation_checkpointing: bool = False,
         tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        shard_placement_fn: Optional[Any] = None,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
@@ -256,7 +266,11 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
 
         for layer in layers:
             parallelizer_utils.fully_shard_by_dtype(
-                layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy
+                layer,
+                mesh=dp_mesh,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+                shard_placement_fn=shard_placement_fn,
             )
 
         # do not reshard after forward for root model
@@ -264,6 +278,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         return fully_shard(
             model,
             mesh=dp_mesh,
+            shard_placement_fn=shard_placement_fn,
             mp_policy=mp_policy,
             offload_policy=offload_policy,
             reshard_after_forward=False,
@@ -410,6 +425,7 @@ def apply_fsdp2_sharding_recursively(
     mesh: DeviceMesh,
     mp_policy: Optional[MixedPrecisionPolicy],
     offload_policy: Optional[OffloadPolicy] = None,
+    shard_placement_fn: Optional[Any] = None,
 ) -> None:
     """
     Recursively apply FSDP2 sharding to modules, with optimizations for ModuleList.
@@ -439,7 +455,13 @@ def apply_fsdp2_sharding_recursively(
             # If child is also a ModuleList (nested structure), recurse instead of wrapping
             # since ModuleList doesn't have a forward() method required by fully_shard
             if isinstance(child_module, nn.ModuleList):
-                apply_fsdp2_sharding_recursively(child_module, mesh, mp_policy, offload_policy)
+                apply_fsdp2_sharding_recursively(
+                    child_module,
+                    mesh,
+                    mp_policy,
+                    offload_policy,
+                    shard_placement_fn=shard_placement_fn,
+                )
             else:
                 # As an optimization, do not reshard after forward for the last
                 # transformer block since FSDP would prefetch it immediately
@@ -447,6 +469,7 @@ def apply_fsdp2_sharding_recursively(
                 fully_shard(
                     child_module,
                     mesh=mesh,
+                    shard_placement_fn=shard_placement_fn,
                     mp_policy=mp_policy,
                     reshard_after_forward=reshard_after_forward,
                     offload_policy=offload_policy,
@@ -454,7 +477,13 @@ def apply_fsdp2_sharding_recursively(
                 module[layer_id] = child_module
     else:
         for name, sub_module in module.named_children():
-            apply_fsdp2_sharding_recursively(sub_module, mesh, mp_policy, offload_policy)
+            apply_fsdp2_sharding_recursively(
+                sub_module,
+                mesh,
+                mp_policy,
+                offload_policy,
+                shard_placement_fn=shard_placement_fn,
+            )
 
 
 def get_hf_tp_shard_plan(model):
@@ -925,6 +954,7 @@ def fsdp2_strategy_parallelize(
     sequence_parallel: bool = False,
     activation_checkpointing: bool = False,
     tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+    is_dion: bool = False,
     dp_replicate_mesh_name: str = "dp_replicate",
     dp_shard_cp_mesh_name: str = "dp_shard_cp",
     tp_mesh_name: str = "tp",
@@ -969,7 +999,10 @@ def fsdp2_strategy_parallelize(
     # Get the appropriate parallelization strategy for this model
     strategy = get_parallelization_strategy(model)
 
-    # Delegate to the strategy
+    shard_placement_fn = None
+    if is_dion and isinstance(tp_shard_plan, dict) and device_mesh[tp_mesh_name].size() > 1:
+        shard_placement_fn = parallelizer_utils._build_fsdp_shard_placement_fn_from_tp_plan(model, tp_shard_plan)
+
     return strategy.parallelize(
         model=model,
         device_mesh=device_mesh,
@@ -978,6 +1011,7 @@ def fsdp2_strategy_parallelize(
         sequence_parallel=sequence_parallel,
         activation_checkpointing=activation_checkpointing,
         tp_shard_plan=tp_shard_plan,
+        shard_placement_fn=shard_placement_fn,
         dp_replicate_mesh_name=dp_replicate_mesh_name,
         dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
         tp_mesh_name=tp_mesh_name,

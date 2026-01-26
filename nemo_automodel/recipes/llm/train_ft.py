@@ -47,6 +47,7 @@ from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPret
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.ddp import DDPManager
+from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 from nemo_automodel.components.distributed.init_utils import (
     get_rank_safe,
     get_world_size_safe,
@@ -62,6 +63,7 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
@@ -348,22 +350,43 @@ def build_model_and_optimizer(
         # TP does not support foreach
         cfg_opt.foreach = False
 
-    if hasattr(model, "parts"):
+    if is_dion_optimizer(cfg_opt):
+        distributed_mesh = getattr(model_wrapper, "device_mesh", None)
         optimizer = []
-        for part in model.parts:
-            trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
-            assert len(trainable_params) > 0, "trainable_params cannot be empty"
-            optimizer.append(cfg_opt.instantiate(params=trainable_params))
+        if hasattr(model, "parts"):
+            for part in model.parts:
+                optimizer.append(
+                    build_dion_optimizer(
+                        cfg_opt=cfg_opt,
+                        model=part,
+                        distributed_mesh=distributed_mesh,
+                    )
+                )
+        else:
+            optimizer = [
+                build_dion_optimizer(
+                    cfg_opt=cfg_opt,
+                    model=model,
+                    distributed_mesh=distributed_mesh,
+                )
+            ]
     else:
-        trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
-        assert len(trainable_params) > 0, "trainable_params cannot be empty"
-        optimizer = [cfg_opt.instantiate(params=trainable_params)]
+        if hasattr(model, "parts"):
+            optimizer = []
+            for part in model.parts:
+                trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
+                assert len(trainable_params) > 0, "trainable_params cannot be empty"
+                optimizer.append(cfg_opt.instantiate(params=trainable_params))
+        else:
+            trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
+            assert len(trainable_params) > 0, "trainable_params cannot be empty"
+            optimizer = [cfg_opt.instantiate(params=trainable_params)]
 
-    # Print trainable parameters after model has been moved to device
-    if autopipeline is None:
-        trainable_params, total_params = print_trainable_parameters(model)
-        param_info["trainable_params"] = trainable_params
-        param_info["total_params"] = total_params
+        # Print trainable parameters after model has been moved to device
+        if autopipeline is None:
+            trainable_params, total_params = print_trainable_parameters(model)
+            param_info["trainable_params"] = trainable_params
+            param_info["total_params"] = total_params
 
     return model, state_dict_keys, optimizer, loss_fn, param_info
 
@@ -919,7 +942,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.moe_mesh = None
         self.model_wrapper = None
         if "distributed" in self.cfg:
+            # Instantiate distributed manager first (don't introspect `_target_`).
+            # Then, if it's FSDP2, enable Dion-compatible shard placement based on optimizer config.
             self.model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
+
+            opt_cfg = getattr(self.cfg, "optimizer", None)
+            if isinstance(opt_cfg, list):
+                use_dion_shard_placement = any(is_dion_optimizer(o) for o in opt_cfg)
+            else:
+                use_dion_shard_placement = is_dion_optimizer(opt_cfg) if opt_cfg is not None else False
+
+            if isinstance(self.model_wrapper, FSDP2Manager):
+                self.model_wrapper.use_dion_shard_placement = use_dion_shard_placement
             self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
             self.moe_mesh = getattr(self.model_wrapper, "moe_mesh", None)
 

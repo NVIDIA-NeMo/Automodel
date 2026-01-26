@@ -1169,6 +1169,16 @@ wheels = [
 ]
 
 [[package]]
+name = "dion"
+version = "0.1.0"
+source = { git = "https://github.com/microsoft/dion.git#b17a7699f1398b9cba69d760a52c79bc0ee0e420" }
+dependencies = [
+    { name = "numpy", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
+    { name = "torch", marker = "sys_platform == 'never'" },
+    { name = "triton", marker = "sys_platform == 'never'" },
+]
+
+[[package]]
 name = "distlib"
 version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2904,6 +2914,7 @@ build = [
 ]
 dev = [
     { name = "cut-cross-entropy" },
+    { name = "dion", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
 ]
 docs = [
     { name = "myst-parser" },
@@ -2970,7 +2981,10 @@ build = [
     { name = "torch", marker = "sys_platform != 'darwin'", specifier = "<=2.10.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = "<=2.10.0", index = "https://pypi.org/simple" },
 ]
-dev = [{ name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86ab" }]
+dev = [
+    { name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86ab" },
+    { name = "dion", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", git = "https://github.com/microsoft/dion.git" },
+]
 docs = [
     { name = "myst-parser" },
     { name = "nvidia-sphinx-theme" },
