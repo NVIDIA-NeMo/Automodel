@@ -108,7 +108,7 @@ The dataset schema is `{task_name, id, definition, inputs, targets}`.
 
 The following are examples from the training split:
 
-```json
+```jsonl
 {
   "task_name": "task001_quoref_question_generation",
   "id": "task001-abc123",
