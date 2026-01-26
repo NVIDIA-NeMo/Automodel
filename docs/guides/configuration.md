@@ -47,7 +47,7 @@ There is also support for resolving callables from:
 - **Dotted paths**: `pkg.module.symbol`
 - **Local file paths**: `/abs/path/to/file.py:symbol`
 
-### Safety / policy
+### Safety and Policy
 
 By default, resolving targets is restricted:
 
