@@ -19,7 +19,7 @@ Within a `ConfigNode`:
 - Lists are recursively wrapped.
 - Scalars are translated with `translate_value()` when they are YAML strings.
 
-### Typed scalar translation (`translate_value`)
+### Typed Scalar Translation (`translate_value`)
 
 Only **strings** are translated. Examples:
 
