@@ -61,7 +61,7 @@ By default, resolving targets is restricted:
 
 NeMo Automodel supports env var interpolation inside YAML **string values**.
 
-### Supported forms
+### Supported Forms
 
 - **Braced**:
   - `${VAR}`
