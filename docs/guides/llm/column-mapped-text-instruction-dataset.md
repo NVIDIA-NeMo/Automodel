@@ -46,7 +46,7 @@ print(next(iter(ds)))
 #   'loss_mask': [1, 1, 1, 1, ..., 1, 1, 1, 1]
 # }
 
-# if you disable streaming (i.e., pass `streaming=False`), then you can inspect samples with
+# If you disable streaming (i.e., pass `streaming=False`), then you can inspect samples with
 # print(ds[0])
 # or inspect the length of the dataset
 # print(len(ds))
