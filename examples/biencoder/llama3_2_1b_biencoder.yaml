@@ -98,6 +98,24 @@ dataloader:
 #   shuffle: false
 #   num_workers: 0
 
+# LoRA/PEFT configuration
+# Uncomment and configure for LoRA/PEFT
+# peft:
+#   _target_: nemo_automodel.components._peft.lora.PeftConfig
+#   target_modules:
+#     - q_proj
+#     - k_proj
+#     - v_proj
+#     - o_proj
+#     - gate_proj
+#     - up_proj
+#     - down_proj
+#   exclude_modules: []
+#   match_all_linear: True
+#   dim: 16
+#   alpha: 32
+#   use_triton: true
+
 optimizer:
   _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
   lr: 5.0e-6
