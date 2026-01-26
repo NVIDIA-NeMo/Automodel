@@ -4,7 +4,7 @@ NeMo Automodel supports **biencoder/embedding model fine-tuning** using a retrie
 
 This dataset is used by the biencoder recipes (see `examples/biencoder/`) together with the `RetrievalBiencoderCollator`.
 
-## What the biencoder consumes
+## What the Biencoder Consumes
 
 The dataset factory `nemo_automodel.components.datasets.llm.make_retrieval_dataset` returns a Hugging Face `datasets.Dataset`. At runtime it transforms each raw record into the training-time schema:
 
@@ -13,11 +13,11 @@ The dataset factory `nemo_automodel.components.datasets.llm.make_retrieval_datas
 - `doc_image`: list of images (or empty strings), aligned with `doc_text`
 - `query_instruction` / `passage_instruction`: optional, used when `use_dataset_instruction: true` and the corpus provides instructions via metadata
 
-## Supported input formats
+## Supported Input Formats
 
 NeMo Automodel supports **two** input schemas:
 
-### 1) Corpus-ID-based JSON (Merlin/NeMo-retriever style)
+### Corpus ID-Based JSON (Merlin/NeMo-Retriever Style)
 
 This is the format used by NeMo retriever pipelines where documents live in a separate **corpus** and training examples reference documents by **ID**.
 
@@ -50,11 +50,12 @@ Minimal example:
 { "class": "TextQADataset", "corpus_id": "wiki_corpus" }
 ```
 
-Notes:
+:::{note}
 - `pos_doc` and `neg_doc` can be lists of `{"id": ...}` dicts or raw IDs (they are normalized internally).
-- If you set `use_dataset_instruction: true`, optional fields like `query_instruction` and `passage_instruction` in `merlin_metadata.json` will be surfaced to the collator.
+- If you set `use_dataset_instruction: true`, optional fields like `query_instruction` and `passage_instruction` in `merlin_metadata.json` are surfaced to the collator.
+:::
 
-### 2) Inline-text JSONL (no corpus required)
+### Inline-Text JSONL (No Corpus Required)
 
 This is convenient for custom fine-tuning pipelines where the documents are included **inline**.
 
@@ -65,16 +66,17 @@ This is convenient for custom fine-tuning pipelines where the documents are incl
 {"query":"What is Python?","pos_doc":["A programming language."],"neg_doc":"A snake."}
 ```
 
-Notes:
-- `query` is accepted (and `question` is also accepted as an alias).
+:::{note}
+- `query` is accepted (`question` is also accepted as an alias).
 - `pos_doc` and `neg_doc` can be either:
   - strings (interpreted as document text), or
   - lists of strings, or
   - dicts with at least `text` (optionally `image`, `nr_ocr`) for multimodal use cases.
 - If `corpus_id` is not provided, it defaults to `__inline__`.
 - `use_dataset_instruction: true` has no effect for pure inline records (instructions come from corpus metadata).
+:::
 
-## YAML usage (dataset + collator)
+## YAML Usage (Dataset + Collator)
 
 Use the dataset factory plus the biencoder collator:
 
@@ -98,7 +100,7 @@ dataloader:
     pad_to_multiple_of: 8
 ```
 
-## Gotchas
+## Requirements
 
 - `pos_doc` must be **non-empty**.
 - If training requests negatives (e.g., `train_n_passages > 1`), `neg_doc` must contain **at least one** document (the loader will cycle negatives if you provide fewer than needed).
