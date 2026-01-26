@@ -2228,11 +2228,6 @@ dependencies = [
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/54/69/a87f06d9dba78c041adb81f2228e978aab179477c64f1a210c0fe0d63e8d/mamba_ssm-2.3.0.tar.gz", hash = "sha256:8294e12125f76021e4e190f4137e84a84935920eeda5d0037a6917524456b303", size = 121116, upload-time = "2026-01-12T17:07:22.152Z" }
 
-[package.optional-dependencies]
-causal-conv1d = [
-    { name = "causal-conv1d" },
-]
-
 [[package]]
 name = "markdown-it-py"
 version = "3.0.0"
@@ -2895,7 +2890,6 @@ all = [
     { name = "albumentations" },
     { name = "backoff" },
     { name = "flash-linear-attention" },
-    { name = "mamba-ssm", extra = ["causal-conv1d"] },
     { name = "mistral-common", extra = ["opencv"] },
     { name = "numba" },
     { name = "numpy" },
@@ -2908,12 +2902,13 @@ all = [
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
 ]
 cuda = [
+    { name = "causal-conv1d" },
     { name = "flash-attn", marker = "sys_platform == 'never'" },
+    { name = "mamba-ssm" },
     { name = "transformer-engine", extra = ["pytorch"] },
 ]
 extra = [
     { name = "flash-linear-attention" },
-    { name = "mamba-ssm", extra = ["causal-conv1d"] },
     { name = "perceptron" },
     { name = "sentencepiece" },
 ]
@@ -2963,6 +2958,7 @@ test = [
 requires-dist = [
     { name = "albumentations", marker = "extra == 'vlm'" },
     { name = "backoff", marker = "extra == 'vlm'" },
+    { name = "causal-conv1d", marker = "extra == 'cuda'" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "diffusers" },
     { name = "flash-attn", marker = "extra == 'cuda'", specifier = "<=2.8.3" },
@@ -2970,7 +2966,7 @@ requires-dist = [
     { name = "ftfy" },
     { name = "imageio-ffmpeg" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", specifier = ">=0.5.9" },
-    { name = "mamba-ssm", extras = ["causal-conv1d"], marker = "extra == 'extra'" },
+    { name = "mamba-ssm", marker = "extra == 'cuda'" },
     { name = "megatron-fsdp" },
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'" },
     { name = "mlflow" },
