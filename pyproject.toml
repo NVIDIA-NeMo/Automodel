@@ -92,7 +92,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cuda = ["flash-attn<=2.8.3", "transformer-engine[pytorch]==2.10.0"]
+fa = ["flash-attn<=2.8.3"]
+# Flash-attn version should be selected to satisfy TE requirements
+# https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
+# "flash-attn==2.8.1",
+cuda = ["nemo_automodel[fa]", "transformer-engine[pytorch]==2.10.0"]
+extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
+moe = [
+    "nemo_automode[cuda]",
+    "deep_ep",
+    "nv_grouped_gemm",
+    # This is required to prevent ONNX errors arising from TE
+    "onnxscript>=0.5.6",
+]
 vlm = [
     "pillow",
     "qwen-vl-utils[decord]; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
@@ -105,18 +117,6 @@ vlm = [
     "mistral_common[opencv]",
     "albumentations"
 ]
-fa = ["flash-attn<=2.8.3"]
-moe = [
-    "transformer-engine[pytorch]==2.10.0",
-    # Flash-attn version should be selected to satisfy TE requirements
-    # https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
-    # "flash-attn==2.8.1",
-    "nv_grouped_gemm",
-    "deep_ep",
-    # This is required to prevent ONNX errors arising from TE
-    "onnxscript>=0.5.6",
-]
-extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
 
 all = [
     "nemo_automodel[extra]",
