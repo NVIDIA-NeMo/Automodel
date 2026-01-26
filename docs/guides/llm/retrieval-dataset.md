@@ -1,6 +1,6 @@
 # Biencoder Retrieval Dataset (Embedding Fine-tuning)
 
-NeMo Automodel supports **biencoder / embedding model fine-tuning** using a retrieval-style dataset: each training example is a **query** paired with **one positive** document and **one or more negative** documents.
+NeMo Automodel supports **biencoder/embedding model fine-tuning** using a retrieval-style dataset: each training example is a **query** paired with **one positive** document and **one or more negative** documents.
 
 This dataset is used by the biencoder recipes (see `examples/biencoder/`) together with the `RetrievalBiencoderCollator`.
 
