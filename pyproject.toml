@@ -99,7 +99,7 @@ fa = ["flash-attn<=2.8.3"]
 cuda = ["nemo_automodel[fa]", "transformer-engine[pytorch]==2.10.0"]
 extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
 moe = [
-    "nemo_automode[cuda]",
+    "nemo_automodel[cuda]",
     "deep_ep",
     "nv_grouped_gemm",
     # This is required to prevent ONNX errors arising from TE
