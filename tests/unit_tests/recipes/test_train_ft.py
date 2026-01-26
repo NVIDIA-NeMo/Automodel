@@ -1016,3 +1016,212 @@ def test_run_validation_epoch_pp_main_rank_receives_from_last_stage(monkeypatch)
     # Main rank should have received from src_rank=3
     assert 3 in recv_calls, "Main rank should receive val_loss from last stage (rank 3)"
     assert isinstance(result.metrics["val_loss"], float)
+
+
+# -----------------
+# State dict adapter tests for _maybe_adapt_state_dict_to_hf
+# -----------------
+
+
+class MockStateDictAdapter:
+    """Mock state dict adapter that transforms keys."""
+
+    def to_hf(self, state_dict, exclude_key_regex=None, quantization=False, **kwargs):
+        """Transform state dict keys by adding 'transformed_' prefix."""
+        return {f"transformed_{k}": v for k, v in state_dict.items()}
+
+
+class DummyModelWithAdapter(nn.Module):
+    """Model with a state_dict_adapter for testing."""
+
+    def __init__(self):
+        super().__init__()
+        self.layer = DummyLinear(10, 10)
+        self.state_dict_adapter = MockStateDictAdapter()
+
+    def forward(self, x):
+        return self.layer.weight @ x
+
+
+class DummyModelConfigWithAdapter:
+    """Mock model config that returns a model with state_dict_adapter."""
+
+    def __init__(self):
+        self.pretrained_model_name_or_path = None
+
+    def instantiate(self, **kwargs):
+        return DummyModelWithAdapter()
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+
+def test_build_model_state_dict_keys_uses_adapter(caplog):
+    """Test that state_dict_keys are transformed using _maybe_adapt_state_dict_to_hf when adapter is present."""
+
+    device = torch.device("cpu")
+    cfg_model = DummyModelConfigWithAdapter()
+    cfg_opt = DummyOptConfig()
+    cfg_peft = None
+
+    # Create mock checkpointer with config that has dequantize_base_checkpoint
+    mock_checkpointer_config = MagicMock()
+    mock_checkpointer_config.dequantize_base_checkpoint = False
+    mock_checkpointer = MagicMock()
+    mock_checkpointer.config = mock_checkpointer_config
+    mock_checkpointer.load_base_model = MagicMock()
+
+    def _load_base_model_stub(model, device, *args, **kwargs):
+        if hasattr(model, "to_empty"):
+            model.to_empty(device=device)
+    mock_checkpointer.load_base_model = _load_base_model_stub
+
+    with patch('nemo_automodel.recipes.llm.train_ft.print_trainable_parameters', return_value=(100, 1000)):
+        with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
+            model, state_dict_keys, optimizer, loss_fn, param_info = build_model_and_optimizer(
+                device=device,
+                cfg_model=cfg_model,
+                cfg_opt=cfg_opt,
+                cfg_peft=cfg_peft,
+                model_wrapper=SimpleNamespace(parallelize=lambda m: m),
+                seed=42,
+                checkpointer=mock_checkpointer,
+                autopipeline=None,
+                loss_fn=None,
+            )
+
+    # Verify that state_dict_keys are transformed (should have 'transformed_' prefix)
+    assert len(state_dict_keys) > 0, "state_dict_keys should not be empty"
+    for key in state_dict_keys:
+        assert key.startswith("transformed_"), f"Key '{key}' should be transformed by adapter"
+
+
+def test_build_model_state_dict_keys_without_adapter():
+    """Test that state_dict_keys are not transformed when no adapter is present."""
+
+    device = torch.device("cpu")
+    cfg_model = DummyModelConfig()  # DummyModel has no state_dict_adapter
+    cfg_opt = DummyOptConfig()
+    cfg_peft = None
+
+    # Create mock checkpointer
+    mock_checkpointer_config = MagicMock()
+    mock_checkpointer_config.dequantize_base_checkpoint = False
+    mock_checkpointer = MagicMock()
+    mock_checkpointer.config = mock_checkpointer_config
+    mock_checkpointer.load_base_model = MagicMock()
+
+    def _load_base_model_stub(model, device, *args, **kwargs):
+        if hasattr(model, "to_empty"):
+            model.to_empty(device=device)
+    mock_checkpointer.load_base_model = _load_base_model_stub
+
+    with patch('nemo_automodel.recipes.llm.train_ft.print_trainable_parameters', return_value=(100, 1000)):
+        with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
+            model, state_dict_keys, optimizer, loss_fn, param_info = build_model_and_optimizer(
+                device=device,
+                cfg_model=cfg_model,
+                cfg_opt=cfg_opt,
+                cfg_peft=cfg_peft,
+                model_wrapper=SimpleNamespace(parallelize=lambda m: m),
+                seed=42,
+                checkpointer=mock_checkpointer,
+                autopipeline=None,
+                loss_fn=None,
+            )
+
+    # Verify that state_dict_keys are not transformed (no 'transformed_' prefix)
+    assert len(state_dict_keys) > 0, "state_dict_keys should not be empty"
+    for key in state_dict_keys:
+        assert not key.startswith("transformed_"), f"Key '{key}' should not be transformed without adapter"
+
+
+def test_build_model_infers_dequantize_from_model_config():
+    """Test that dequantize_base_checkpoint is inferred from model.config.quantization_config."""
+
+    device = torch.device("cpu")
+    cfg_opt = DummyOptConfig()
+    cfg_peft = None
+
+    # Create a model config that returns a model with quantization_config
+    class DummyQuantizedModelConfig:
+        def __init__(self):
+            self.pretrained_model_name_or_path = None
+
+        def instantiate(self, **kwargs):
+            model = DummyModel()
+            # Add a config attribute with quantization_config
+            model.config = SimpleNamespace(quantization_config={"bits": 4})
+            return model
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = DummyQuantizedModelConfig()
+
+    # Create mock checkpointer with dequantize_base_checkpoint=None (to trigger inference)
+    mock_checkpointer_config = MagicMock()
+    mock_checkpointer_config.dequantize_base_checkpoint = None
+    mock_checkpointer = MagicMock()
+    mock_checkpointer.config = mock_checkpointer_config
+    mock_checkpointer.load_base_model = MagicMock()
+
+    def _load_base_model_stub(model, device, *args, **kwargs):
+        if hasattr(model, "to_empty"):
+            model.to_empty(device=device)
+    mock_checkpointer.load_base_model = _load_base_model_stub
+
+    with patch('nemo_automodel.recipes.llm.train_ft.print_trainable_parameters', return_value=(100, 1000)):
+        with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
+            model, state_dict_keys, optimizer, loss_fn, param_info = build_model_and_optimizer(
+                device=device,
+                cfg_model=cfg_model,
+                cfg_opt=cfg_opt,
+                cfg_peft=cfg_peft,
+                model_wrapper=SimpleNamespace(parallelize=lambda m: m),
+                seed=42,
+                checkpointer=mock_checkpointer,
+                autopipeline=None,
+                loss_fn=None,
+            )
+
+    # Verify that dequantize_base_checkpoint was inferred as True
+    assert mock_checkpointer_config.dequantize_base_checkpoint is True
+
+
+def test_build_model_dequantize_defaults_to_false_without_quant_config():
+    """Test that dequantize_base_checkpoint defaults to False when model has no quantization_config."""
+
+    device = torch.device("cpu")
+    cfg_model = DummyModelConfig()  # DummyModel has no config.quantization_config
+    cfg_opt = DummyOptConfig()
+    cfg_peft = None
+
+    # Create mock checkpointer with dequantize_base_checkpoint=None (to trigger inference)
+    mock_checkpointer_config = MagicMock()
+    mock_checkpointer_config.dequantize_base_checkpoint = None
+    mock_checkpointer = MagicMock()
+    mock_checkpointer.config = mock_checkpointer_config
+    mock_checkpointer.load_base_model = MagicMock()
+
+    def _load_base_model_stub(model, device, *args, **kwargs):
+        if hasattr(model, "to_empty"):
+            model.to_empty(device=device)
+    mock_checkpointer.load_base_model = _load_base_model_stub
+
+    with patch('nemo_automodel.recipes.llm.train_ft.print_trainable_parameters', return_value=(100, 1000)):
+        with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
+            model, state_dict_keys, optimizer, loss_fn, param_info = build_model_and_optimizer(
+                device=device,
+                cfg_model=cfg_model,
+                cfg_opt=cfg_opt,
+                cfg_peft=cfg_peft,
+                model_wrapper=SimpleNamespace(parallelize=lambda m: m),
+                seed=42,
+                checkpointer=mock_checkpointer,
+                autopipeline=None,
+                loss_fn=None,
+            )
+
+    # Verify that dequantize_base_checkpoint was inferred as False
+    assert mock_checkpointer_config.dequantize_base_checkpoint is False
