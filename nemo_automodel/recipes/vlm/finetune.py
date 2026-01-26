@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 import wandb
 from torch.distributed.device_mesh import DeviceMesh
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
 from transformers.modeling_utils import no_init_weights
@@ -183,8 +183,9 @@ def build_model_and_optimizer(
                     logger.info("Enabling PEFT with Pipeline Parallelism")
                     logger.info("Disabling Triton with Pipeline Parallelism Enabled.")
                     cfg_peft.use_triton = False
-                apply_lora_to_linear_modules(model, cfg_peft, quantization_config=kwargs.get("quantization_config", None))
-
+                apply_lora_to_linear_modules(
+                    model, cfg_peft, quantization_config=kwargs.get("quantization_config", None)
+                )
 
         if cfg_fp8 is not None:
             fp8_config = build_fp8_config(cfg_fp8)
@@ -574,6 +575,7 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
 
     return loss_fn(**loss_fn_kwargs)
 
+
 def parallelize_for_pp(
     model: nn.Module,
     *,
@@ -866,7 +868,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for k, v in batch.items()
         }
 
-
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
 
@@ -891,21 +892,21 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 # image_grid_hws: [num_images, 2] where each row is [H, W] for one image
                 pixel_values = batch.pop("pixel_values", None)
                 image_grid_hws = batch.pop("image_grid_hws", None)
-                
+
                 if self.pp.info.has_first_stage and pixel_values is not None and image_grid_hws is not None:
                     stage0_model = self.model_parts[0]
                     n_microbatches = self.pp._info.schedule._n_microbatches
                     batch_size = input_ids.shape[0]
                     n_images = image_grid_hws.shape[0]
-                    
+
                     # Calculate patch counts per image: H * W for each image
                     patch_counts = image_grid_hws[:, 0] * image_grid_hws[:, 1]
                     cumsum = torch.cumsum(patch_counts, dim=0)
-                    
+
                     # Pre-chunk pixel_values and image_grid_hws aligned with image boundaries
                     pixel_values_chunks = []
                     image_grid_hws_chunks = []
-                    
+
                     # Handle case where n_images != batch_size
                     # This can happen if samples have 0 or multiple images
                     if n_images == batch_size:
@@ -914,16 +915,16 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         for mb_idx in range(n_microbatches):
                             img_start = mb_idx * images_per_mb
                             img_end = min(img_start + images_per_mb, n_images)
-                            
+
                             # Slice image_grid_hws
                             image_grid_hws_chunks.append(image_grid_hws[img_start:img_end])
-                            
+
                             # Calculate patch boundaries
                             patch_start = 0 if img_start == 0 else cumsum[img_start - 1].item()
                             patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
-                            
+
                             # Slice pixel_values at correct image boundaries
-                            pixel_values_chunks.append(pixel_values[int(patch_start):int(patch_end)])
+                            pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
                     else:
                         # Irregular - give all images to first microbatch, empty to rest
                         # This handles cases where n_images != batch_size
@@ -932,8 +933,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         for _ in range(n_microbatches - 1):
                             pixel_values_chunks.append(pixel_values[:0])  # Empty tensor with same structure
                             image_grid_hws_chunks.append(image_grid_hws[:0])
-                        logging.warning(f"VLM chunking: n_images={n_images} != batch_size={batch_size}, giving all images to first microbatch")
-                    
+                        logging.warning(
+                            f"VLM chunking: n_images={n_images} != batch_size={batch_size}, giving all images to first microbatch"
+                        )
+
                     # Store pre-chunked tensors on model for forward to use
                     stage0_model._vlm_pixel_values_chunks = pixel_values_chunks
                     stage0_model._vlm_image_grid_hws_chunks = image_grid_hws_chunks
@@ -1066,7 +1069,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model.install_optimized_model_weights()
         # self.model.zero_grad_buffer()
-            
+
         t = time.perf_counter()
         time_delta = t - self.timestamp
         self.timestamp = t

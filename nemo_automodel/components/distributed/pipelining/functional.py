@@ -32,11 +32,11 @@ from torch.distributed.pipelining.schedules import (
     get_schedule_class,
 )
 
-from nemo_automodel.components.distributed.pipelining.hf_utils import patch_hf_model_for_pp
-from nemo_automodel.components.utils.model_utils import (
+from nemo_automodel.components.distributed.pipelining.hf_utils import (
     MULTIMODAL_SUFFIXES,
     TEXT_MODULE_ATTRS,
     get_text_module,
+    patch_hf_model_for_pp,
 )
 
 logger = logging.getLogger(__name__)
@@ -301,9 +301,12 @@ def split_model_into_stages(
     include_multimodal_encoders = True
     extra_module_fqns = None
 
-    text_model_attr_prefix = text_model_attr_name+"."
-    layers_prefix = f"{base_prefix}{text_model_attr_prefix}model." if text_model_has_model_attr else f"{base_prefix}{text_model_attr_prefix}"
-
+    text_model_attr_prefix = text_model_attr_name + "."
+    layers_prefix = (
+        f"{base_prefix}{text_model_attr_prefix}model."
+        if text_model_has_model_attr
+        else f"{base_prefix}{text_model_attr_prefix}"
+    )
 
     # If layers live under a nested language_model, keep multimodal encoders at the base prefix
     if layers_prefix != base_prefix:
