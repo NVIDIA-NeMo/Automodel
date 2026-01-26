@@ -719,3 +719,5 @@ class TestValidateHfModelForPipelineSupport:
         output = forward_fn(mock_model, inputs_embeds=inputs_embeds)
 
         assert isinstance(output, BaseModelOutputWithPast)
+
+
