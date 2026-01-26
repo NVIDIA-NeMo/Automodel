@@ -23,6 +23,10 @@ from typing import List, Optional, Union
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
+
+from nemo_automodel.shared.torch_patches import apply_torch_patches
+
+apply_torch_patches()
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
