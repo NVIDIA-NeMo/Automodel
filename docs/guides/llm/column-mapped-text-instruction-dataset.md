@@ -139,7 +139,7 @@ remote_ds = ColumnMappedTextInstructionDataset(
     path_or_dataset_id="Muennighoff/natural-instructions",  # Hugging Face repo ID
     column_mapping={
         "context": "definition",  # high-level context
-        "question": "inputs",         # the actual prompt / input
+         "question": "inputs",      # the actual prompt / input
         "answer": "targets",          # expected answer string
     },
     tokenizer=tokenizer,
