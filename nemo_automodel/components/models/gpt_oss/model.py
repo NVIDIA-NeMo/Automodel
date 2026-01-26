@@ -193,26 +193,6 @@ class GptOssModel(nn.Module):
 
 
 class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
-    @classmethod
-    def from_config(
-        cls,
-        config: GptOssConfig,
-        moe_config: MoEConfig | None = None,
-        backend: BackendConfig | None = None,
-        **kwargs,
-    ):
-        return cls(config, moe_config, backend, **kwargs)
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str,
-        *model_args,
-        **kwargs,
-    ):
-        config = GptOssConfig.from_pretrained(pretrained_model_name_or_path)
-        return cls.from_config(config, *model_args, **kwargs)
-
     def __init__(
         self,
         config: GptOssConfig,

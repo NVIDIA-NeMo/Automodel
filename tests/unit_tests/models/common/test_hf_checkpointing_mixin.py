@@ -325,6 +325,70 @@ class TestHFCheckpointingMixinFromPretrained:
             SimpleModelWithMixin.from_pretrained("test-model")
 
 
+class TestHFCheckpointingMixinFromConfig:
+    """Tests for from_config() class method."""
+
+    @patch("nemo_automodel.components.models.common.hf_checkpointing_mixin.Checkpointer")
+    def test_from_config_creates_model_with_config(self, mock_checkpointer_cls):
+        """Test that from_config() creates a model with the given config."""
+        # Setup mock checkpointer
+        mock_checkpointer = MagicMock()
+        mock_checkpointer_cls.return_value = mock_checkpointer
+
+        config = MockConfig()
+        model = SimpleModelWithMixin.from_config(config)
+
+        # Verify model was created with config
+        assert model.config is config
+        assert isinstance(model, SimpleModelWithMixin)
+
+    @patch("nemo_automodel.components.models.common.hf_checkpointing_mixin.Checkpointer")
+    def test_from_config_calls_load_base_model_without_loading(self, mock_checkpointer_cls):
+        """Test that from_config() calls load_base_model with load_base_model=False."""
+        # Setup mock checkpointer
+        mock_checkpointer = MagicMock()
+        mock_checkpointer_cls.return_value = mock_checkpointer
+
+        config = MockConfig()
+        model = SimpleModelWithMixin.from_config(config)
+
+        # Verify load_base_model was called with load_base_model=False
+        mock_checkpointer.load_base_model.assert_called_once()
+        call_kwargs = mock_checkpointer.load_base_model.call_args[1]
+        assert call_kwargs["load_base_model"] is False
+
+    @patch("nemo_automodel.components.models.common.hf_checkpointing_mixin.Checkpointer")
+    def test_from_config_does_not_set_checkpointer_attribute(self, mock_checkpointer_cls):
+        """Test that from_config() does not set _checkpointer on the model."""
+        # Setup mock checkpointer
+        mock_checkpointer = MagicMock()
+        mock_checkpointer_cls.return_value = mock_checkpointer
+
+        config = MockConfig()
+        model = SimpleModelWithMixin.from_config(config)
+
+        # Verify _checkpointer is NOT set (remains None) since it's internal
+        assert model._checkpointer is None
+
+    @patch("nemo_automodel.components.models.common.hf_checkpointing_mixin.Checkpointer")
+    def test_from_config_creates_checkpointer_with_correct_config(self, mock_checkpointer_cls):
+        """Test that from_config() creates Checkpointer with correct CheckpointingConfig."""
+        # Setup mock checkpointer
+        mock_checkpointer = MagicMock()
+        mock_checkpointer_cls.return_value = mock_checkpointer
+
+        config = MockConfig()
+        SimpleModelWithMixin.from_config(config)
+
+        # Verify Checkpointer was created with correct config
+        mock_checkpointer_cls.assert_called_once()
+        call_kwargs = mock_checkpointer_cls.call_args[1]
+        assert "config" in call_kwargs
+        checkpointing_config = call_kwargs["config"]
+        assert checkpointing_config.enabled is True
+        assert checkpointing_config.is_peft is False
+
+
 class TestHFCheckpointingMixinCheckpointerAttribute:
     """Tests for _checkpointer attribute."""
 

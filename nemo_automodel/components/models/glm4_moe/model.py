@@ -194,26 +194,6 @@ class Glm4MoeModel(nn.Module):
 
 
 class Glm4MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
-    @classmethod
-    def from_config(
-        cls,
-        config: Glm4MoeConfig,
-        moe_config: MoEConfig | None = None,
-        backend: BackendConfig | None = None,
-        **kwargs,
-    ):
-        return cls(config, moe_config, backend, **kwargs)
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str,
-        *model_args,
-        **kwargs,
-    ):
-        config = Glm4MoeConfig.from_pretrained(pretrained_model_name_or_path)
-        return cls.from_config(config, *model_args, **kwargs)
-
     def __init__(
         self,
         config: Glm4MoeConfig,

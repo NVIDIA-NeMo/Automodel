@@ -22,7 +22,6 @@ from contextlib import contextmanager
 from typing import List, Optional, Union
 
 import torch
-from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import (
     AutoConfig,
@@ -49,43 +48,31 @@ HAS_FA, _ = safe_import("flash_attn")
 logger = logging.getLogger(__name__)
 
 
-def _wrap_with_checkpointing_mixin(model: nn.Module, checkpointer: Optional[Checkpointer] = None) -> nn.Module:
+def _get_mixin_wrapped_class(model_class: type) -> type:
     """
-    Wrap HF model with HFCheckpointingMixin while preserving class identity.
+    Get a class that combines HFCheckpointingMixin with the original model class.
 
-    This creates a dynamic subclass that adds the mixin's methods while
-    keeping all identity metadata (name, module, qualname) unchanged.
-    Only overrides: state_dict(), load_state_dict(), save_pretrained()
+    If the class already has the mixin, returns it unchanged.
 
     Args:
-        model: The HF model to wrap
-        checkpointer: Optional Checkpointer instance to store on the model.
-            If provided, enables save_pretrained() functionality.
+        model_class: The original model class (e.g., LlamaForCausalLM)
 
     Returns:
-        The same model instance with its class changed to include the mixin
+        A class that inherits from both HFCheckpointingMixin and model_class
     """
-    original_class = model.__class__
+    # Custom models already inherit HFCheckpointingMixin
+    if issubclass(model_class, HFCheckpointingMixin):
+        return model_class
 
-    # Check if already wrapped or already has the mixin
-    if issubclass(original_class, HFCheckpointingMixin):
-        if checkpointer is not None:
-            model._checkpointer = checkpointer
-        return model
-
-    # Create wrapper that looks identical to original
-    WrappedClass = type(
-        original_class.__name__,  # Same name: "LlamaForCausalLM"
-        (HFCheckpointingMixin, original_class),
+    # Create wrapper class that looks identical to original
+    return type(
+        model_class.__name__,
+        (HFCheckpointingMixin, model_class),
         {
-            "__module__": original_class.__module__,  # Same: "transformers.models.llama..."
-            "__qualname__": original_class.__qualname__,  # Same: "LlamaForCausalLM"
+            "__module__": model_class.__module__,
+            "__qualname__": model_class.__qualname__,
         },
     )
-    model.__class__ = WrappedClass
-    if checkpointer is not None:
-        model._checkpointer = checkpointer
-    return model
 
 
 @contextmanager
@@ -360,24 +347,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     """
 
     @classmethod
-    def _from_pretrained_parent_class(cls, *args, **kwargs):
-        name = cls.__name__
-        if name.startswith("NeMo"):
-            cls.__name__ = name[4:]
-        model = super().from_pretrained(*args, **kwargs)
-        cls.__name__ = name
-        return model
-
-    @classmethod
-    def _from_config_parent_class(cls, *args, **kwargs):
-        name = cls.__name__
-        if name.startswith("NeMo"):
-            cls.__name__ = name[4:]
-        model = super().from_config(*args, **kwargs)
-        cls.__name__ = name
-        return model
-
-    @classmethod
     def from_pretrained(
         cls,
         pretrained_model_name_or_path,
@@ -469,21 +438,26 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
+                checkpointer=checkpointer,
                 **kwargs,
             )
 
-        # 1. if force_hf is True, we will use the parent class to load and return the model as is
+        # 1. if force_hf is True, use HF model class wrapped with mixin
         if force_hf:
-            model = cls._from_pretrained_parent_class(
+            # Get HF model class and wrap with mixin
+            hf_model_cls = cls._model_mapping[type(hf_config)]
+            wrapped_cls = _get_mixin_wrapped_class(hf_model_cls)
+            # Use mixin's from_pretrained which handles weight loading
+            model = wrapped_cls.from_pretrained(
                 pretrained_model_name_or_path,
                 *model_args,
+                checkpointer=checkpointer,
                 torch_dtype=torch_dtype,
+                hf_config=hf_config,
                 attn_implementation=attn_implementation,
                 quantization_config=quantization_config,
                 **kwargs,
             )
-            # Wrap HF model with mixin for consistent save_pretrained/state_dict API
-            model = _wrap_with_checkpointing_mixin(model, checkpointer)
             return model
         architectures = get_architectures(hf_config)
         # 2. If we have a custom model implementation available, we prioritize that over HF
@@ -505,15 +479,21 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             )
             return model
 
-        # 3. fallback to parent class
+        # 3. fallback to HF model class wrapped with mixin
+        hf_model_cls = cls._model_mapping[type(hf_config)]
+        wrapped_cls = _get_mixin_wrapped_class(hf_model_cls)
+
         model = None
         try:
             if quantization_config is not None:
                 kwargs["quantization_config"] = quantization_config
-            model = cls._from_pretrained_parent_class(
+            # Use mixin's from_pretrained which handles weight loading
+            model = wrapped_cls.from_pretrained(
                 pretrained_model_name_or_path,
                 *model_args,
+                checkpointer=checkpointer,
                 torch_dtype=torch_dtype,
+                hf_config=hf_config,
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
@@ -546,8 +526,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         _verify_sdpa_support(model, is_hf_model, cp_size)
 
-        # Wrap HF model with mixin for consistent save_pretrained/state_dict API
-        model = _wrap_with_checkpointing_mixin(model, checkpointer)
         return model
 
     @classmethod
@@ -641,37 +619,51 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 trust_remote_code=kwargs.get("trust_remote_code", False),
                 attn_implementation=attn_implementation,
             )
-        # 1. if force_hf is True, we will use the parent class to load and return the model as is
+        # 1. if force_hf is True, use HF model class wrapped with mixin
         if force_hf:
-            model = cls._from_config_parent_class(
+            # Get HF model class and wrap with mixin
+            hf_model_cls = cls._model_mapping[type(config)]
+            wrapped_cls = _get_mixin_wrapped_class(hf_model_cls)
+            # Use mixin's from_config which handles initialization
+            model = wrapped_cls.from_config(
                 config,
                 *model_args,
-                attn_implementation=attn_implementation,
                 torch_dtype=torch_dtype,
+                attn_implementation=attn_implementation,
                 **kwargs,
             )
-            # Wrap HF model with mixin for consistent save_pretrained/state_dict API
-            model = _wrap_with_checkpointing_mixin(model)
             return model
 
         # 2. If we have a custom model implementation available, we prioritize that over HF
         architectures = get_architectures(config)
         if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
-            with local_torch_dtype(torch_dtype, ModelRegistry.model_arch_name_to_cls[architectures[0]].__name__):
-                # Custom models already inherit HFCheckpointingMixin
-                model = ModelRegistry.model_arch_name_to_cls[architectures[0]](config, *model_args, **kwargs)
+            logger.info(f"Using custom model implementation for {architectures[0]}")
+            kwargs.pop("trust_remote_code", None)
+            model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
+
+            # Use the mixin's from_config which handles initialization via Checkpointer
+            model = model_cls.from_config(
+                config,
+                *model_args,
+                torch_dtype=torch_dtype,
+                **kwargs,
+            )
             return model
 
-        # 3. fallback to parent class
+        # 3. fallback to HF model class wrapped with mixin
+        hf_model_cls = cls._model_mapping[type(config)]
+        wrapped_cls = _get_mixin_wrapped_class(hf_model_cls)
+
         model = None
         try:
             if quantization_config is not None:
                 kwargs["quantization_config"] = quantization_config
-            model = cls._from_config_parent_class(
+            # Use mixin's from_config which handles initialization
+            model = wrapped_cls.from_config(
                 config,
                 *model_args,
-                attn_implementation=attn_implementation,
                 torch_dtype=torch_dtype,
+                attn_implementation=attn_implementation,
                 **kwargs,
             )
         except ValueError as e:
@@ -699,9 +691,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             return _retry(use_sdpa_patching=False)
 
         _verify_sdpa_support(model, is_hf_model, cp_size)
-
-        # Wrap HF model with mixin for consistent save_pretrained/state_dict API
-        model = _wrap_with_checkpointing_mixin(model)
         return model
 
 

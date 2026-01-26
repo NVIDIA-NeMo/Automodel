@@ -232,26 +232,6 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
 class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForConditionalGeneration, MoEFSDPSyncMixin):
     """Qwen3-VL conditional generation model using the Qwen3-MoE backend components."""
 
-    @classmethod
-    def from_config(
-        cls,
-        config: Qwen3VLMoeConfig,
-        moe_config: MoEConfig | None = None,
-        backend: BackendConfig | None = None,
-        **kwargs,
-    ):
-        return cls(config, moe_config=moe_config, backend=backend, **kwargs)
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str,
-        *model_args,
-        **kwargs,
-    ):
-        config = Qwen3VLMoeConfig.from_pretrained(pretrained_model_name_or_path)
-        return cls.from_config(config, *model_args, **kwargs)
-
     def __init__(
         self,
         config: Qwen3VLMoeConfig,
