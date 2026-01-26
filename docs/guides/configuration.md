@@ -52,7 +52,7 @@ There is also support for resolving callables from:
 By default, resolving targets is restricted:
 
 - Imports are allowed from common safe prefixes (e.g. `nemo_automodel`, `torch`, `transformers`, …).
-- Accessing private/dunder attributes is blocked by default.
+- Accessing private or dunder attributes is blocked by default.
 - Loading out-of-tree user code can be enabled with `NEMO_ENABLE_USER_MODULES=1` (or by calling `set_enable_user_modules(True)`).
 
 ---
