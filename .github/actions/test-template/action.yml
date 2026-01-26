@@ -139,6 +139,24 @@ runs:
         ls -al $MNT_PATH/TestData
         echo "::endgroup::"
 
+    - name: Checkout repository
+      uses: actions/checkout@v2
+      with:
+        path: NeMo-Automodel
+
+    - name: Build container
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.PAT }}
+      run: |
+        echo "::group::Build test container"
+        docker system prune -af
+        docker build -f docker/Dockerfile \
+          --build-arg BASE_IMAGE=pytorch \
+          --build-arg INSTALL_MAMBA=True \
+          --target automodel_final -t automodel .
+        echo "::endgroup::"
+
     - name: Start container
       shell: bash
       run: |
