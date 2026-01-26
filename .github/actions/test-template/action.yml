@@ -139,6 +139,7 @@ runs:
         docker system prune -af
         docker build -f docker/Dockerfile \
           --build-arg BASE_IMAGE=pytorch \
+          --build-arg INSTALL_MAMBA=True \
           --target automodel_final -t automodel .
         echo "::endgroup::"
 
