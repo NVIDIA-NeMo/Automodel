@@ -173,7 +173,9 @@ def test_build_model_and_optimizer_basic():
 
     # Check returned objects and their properties
     assert isinstance(model, DummyModel)
-    assert isinstance(optim, torch.optim.Optimizer)
+    assert isinstance(optim, list)
+    assert len(optim) == 1
+    assert isinstance(optim[0], torch.optim.Optimizer)
 
     # Model parameters should reside on the requested device
     assert next(model.parameters()).device == device
@@ -183,7 +185,7 @@ def test_build_model_and_optimizer_basic():
 
     # Optimizer should hold only trainable parameters
     trainable_param_count = _count_trainable(model.parameters())
-    optim_param_count = sum(p.numel() for group in optim.param_groups for p in group["params"])
+    optim_param_count = sum(p.numel() for group in optim[0].param_groups for p in group["params"])
     assert trainable_param_count == optim_param_count
 
 
@@ -221,8 +223,10 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     recipe.device_mesh = None
     recipe.moe_mesh = None
     recipe.loss_fn = object()
-    recipe.model = _TensorModel()
-    recipe.optimizer = _DummyOptimizer()
+    model = _TensorModel()
+    recipe.model_parts = [model]  # Now uses model_parts instead of model
+    recipe.pp_enabled = False  # Pipeline parallelism disabled
+    recipe.optimizer = [_DummyOptimizer()]  # Now a list
     recipe.step_scheduler = SimpleNamespace(step=0, epoch=0)
     recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
     recipe.cfg = _Cfg(fp8=None)
@@ -232,6 +236,7 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
 
     recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
     recipe._get_dp_group_size = lambda include_cp=True: 1
+    recipe._get_cp_group_size = lambda: 1
 
     batches = [
         {
@@ -248,7 +253,7 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
 
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-        lambda device_mesh, batch, labels: (lambda: nullcontext(), batch),
+        lambda device_mesh, batch: (lambda: nullcontext(), batch),
     )
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
@@ -264,6 +269,15 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
         grad_clip_mock,
     )
 
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_for_grad_accumulation",
+        lambda model_parts, pp_enabled: None,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_for_final_backward",
+        lambda model_parts, pp_enabled: None,
+    )
+
     metrics = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
 
     assert isinstance(metrics, MetricsSample)
@@ -271,8 +285,8 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     grad_clip_mock.assert_called_once()
     assert calculate_mock.call_args.kwargs["num_label_tokens"] == 1
     assert metrics.metrics["grad_norm"] == 2.5
-    assert recipe.optimizer.step_called
-    assert recipe.optimizer.zero_grad_called
+    assert recipe.optimizer[0].step_called
+    assert recipe.optimizer[0].zero_grad_called
 
 
 # -----------------------------------------------------------------------------
@@ -363,3 +377,187 @@ def test_autoprocessor_with_processor_kwargs(caplog):
         assert processor is None
         mock_from_pretrained.assert_called_once_with("test/model", trust_remote_code=True, some_param="value")
         
+
+# -----------------------------------------------------------------------------
+# build_lr_scheduler with list of optimizers (diff coverage)
+# -----------------------------------------------------------------------------
+
+from nemo_automodel.recipes.vlm.finetune import build_lr_scheduler
+
+
+class TestBuildLrScheduler:
+    """Tests for build_lr_scheduler handling list of optimizers."""
+
+    def test_build_lr_scheduler_with_list_of_optimizers(self):
+        """Test that build_lr_scheduler handles a list of optimizers."""
+        model1 = nn.Linear(10, 10)
+        model2 = nn.Linear(10, 10)
+        opt1 = torch.optim.SGD(model1.parameters(), lr=0.01)
+        opt2 = torch.optim.SGD(model2.parameters(), lr=0.02)
+        optimizer_list = [opt1, opt2]
+
+        # Mock dataloader with __len__
+        mock_dataloader = MagicMock()
+        mock_dataloader.__len__ = MagicMock(return_value=100)
+        step_scheduler = SimpleNamespace(
+            num_epochs=10,
+            dataloader=mock_dataloader,
+            grad_acc_steps=1,
+            max_steps=None,
+        )
+
+        cfg = SimpleNamespace(to_dict=lambda: {})
+
+        schedulers = build_lr_scheduler(cfg, optimizer_list, step_scheduler)
+
+        assert isinstance(schedulers, list)
+        assert len(schedulers) == 2
+        # Each scheduler should have the correct optimizer
+        assert schedulers[0].optimizer is opt1
+        assert schedulers[1].optimizer is opt2
+
+    def test_build_lr_scheduler_with_single_optimizer_wrapped(self):
+        """Test that build_lr_scheduler wraps single optimizer into list."""
+        model = nn.Linear(10, 10)
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+
+        # Mock dataloader with __len__
+        mock_dataloader = MagicMock()
+        mock_dataloader.__len__ = MagicMock(return_value=100)
+        step_scheduler = SimpleNamespace(
+            num_epochs=10,
+            dataloader=mock_dataloader,
+            grad_acc_steps=1,
+            max_steps=None,
+        )
+
+        cfg = SimpleNamespace(to_dict=lambda: {})
+
+        schedulers = build_lr_scheduler(cfg, opt, step_scheduler)
+
+        assert isinstance(schedulers, list)
+        assert len(schedulers) == 1
+        assert schedulers[0].optimizer is opt
+
+    def test_build_lr_scheduler_respects_max_steps(self):
+        """Test that max_steps limits total_steps correctly."""
+        model = nn.Linear(10, 10)
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+
+        # Mock dataloader with __len__
+        mock_dataloader = MagicMock()
+        mock_dataloader.__len__ = MagicMock(return_value=1000)
+        step_scheduler = SimpleNamespace(
+            num_epochs=10,
+            dataloader=mock_dataloader,
+            grad_acc_steps=1,
+            max_steps=500,  # Should limit to 500
+        )
+
+        cfg = SimpleNamespace(to_dict=lambda: {})
+
+        schedulers = build_lr_scheduler(cfg, opt, step_scheduler)
+
+        # lr_decay_steps should be min(10000, 500) = 500
+        assert schedulers[0].lr_decay_steps == 500
+
+
+# -----------------------------------------------------------------------------
+# parallelize_for_pp (new function - diff coverage)
+# -----------------------------------------------------------------------------
+
+from nemo_automodel.recipes.vlm.finetune import parallelize_for_pp
+
+
+class TestParallelizeForPP:
+    """Tests for the new parallelize_for_pp function."""
+
+    def test_parallelize_for_pp_with_model_wrapper(self):
+        """Test that parallelize_for_pp calls model_wrapper.parallelize."""
+        model = nn.Linear(10, 10)
+        mock_wrapper = MagicMock()
+        parallelized_model = nn.Linear(10, 10)
+        mock_wrapper.parallelize.return_value = parallelized_model
+
+        result = parallelize_for_pp(
+            model,
+            world_mesh=MagicMock(),
+            model_wrapper=mock_wrapper,
+        )
+
+        mock_wrapper.parallelize.assert_called_once_with(model)
+        assert result is parallelized_model
+
+    def test_parallelize_for_pp_without_model_wrapper(self):
+        """Test that parallelize_for_pp returns model unchanged when no wrapper."""
+        model = nn.Linear(10, 10)
+
+        result = parallelize_for_pp(
+            model,
+            world_mesh=MagicMock(),
+            model_wrapper=None,
+        )
+
+        assert result is model
+
+    def test_parallelize_for_pp_wrapper_without_parallelize_method(self):
+        """Test behavior when wrapper doesn't have parallelize method."""
+        model = nn.Linear(10, 10)
+        mock_wrapper = MagicMock(spec=[])  # No parallelize method
+
+        result = parallelize_for_pp(
+            model,
+            world_mesh=MagicMock(),
+            model_wrapper=mock_wrapper,
+        )
+
+        assert result is model
+
+
+# -----------------------------------------------------------------------------
+# build_model_and_optimizer returns list (diff coverage)
+# -----------------------------------------------------------------------------
+
+
+def test_build_model_and_optimizer_returns_optimizer_list():
+    """Test that build_model_and_optimizer returns list of optimizers."""
+    cfg_model = DummyModelConfig()
+    cfg_opt = DummyOptConfig(lr=0.01)
+
+    device = torch.device("cpu")
+    ckpt_cfg = CheckpointingConfig(
+        enabled=False,
+        checkpoint_dir="checkpoints/",
+        model_save_format="safetensors",
+        model_cache_dir=".",
+        model_repo_id="dummy/model",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    def _load_base_model_stub(model, device, *args, **kwargs):
+        if hasattr(model, "to_empty"):
+            model.to_empty(device=device)
+
+    with patch.object(checkpointer, 'load_base_model', new=_load_base_model_stub):
+        model, state_dict_keys, optim = build_model_and_optimizer(
+            device=device,
+            cfg_model=cfg_model,
+            cfg_opt=cfg_opt,
+            cfg_freeze=None,
+            cfg_peft=None,
+            model_wrapper=SimpleNamespace(parallelize=lambda m: m),
+            seed=123,
+            checkpointer=checkpointer,
+            tp_size=1,
+            freeze_embeddings=True,
+        )
+
+    # Now returns list of optimizers
+    assert isinstance(optim, list)
+    assert len(optim) == 1
+    assert isinstance(optim[0], torch.optim.Optimizer)
+
+    # state_dict_keys should be a list
+    assert isinstance(state_dict_keys, list)
