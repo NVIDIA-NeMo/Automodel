@@ -71,6 +71,7 @@ hf_token = getpass("HF token: ")
 ```
 ```bash
 !hf auth login --token {hf_token}
+```
 
 ### Single-node
 
