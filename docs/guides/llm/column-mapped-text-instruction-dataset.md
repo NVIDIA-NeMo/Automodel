@@ -318,7 +318,7 @@ strategies depending on the capabilities of the provided tokenizer:
    "<context> <question> " + "<answer>"
    ```
 
-   The helper strips any trailing *eos* from the prompt and leading *bos* from
+   The helper strips any trailing `EOS` from the prompt and leading `BOS` from
    the answer so that the two halves join cleanly.
 
 Regardless of the path, the output dict is always:
