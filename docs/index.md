@@ -53,6 +53,7 @@ model-coverage/vlm.md
 
 guides/dataset-overview.md
 guides/llm/dataset.md
+guides/llm/retrieval-dataset.md
 guides/llm/column-mapped-text-instruction-dataset.md
 guides/vlm/dataset.md
 ```
