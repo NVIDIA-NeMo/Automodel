@@ -76,13 +76,13 @@ class ReservoirSampler:
                 buffer[new_pos] = next(it)
             except StopIteration:
                 yield evicted_item
-                self._buffer[new_pos] = None
+                buffer[new_pos] = None
                 break
             else:
                 yield evicted_item
 
         # handle tail
-        yield from filter(lambda x: x is not None, self._buffer)
+        yield from filter(lambda x: x is not None, buffer)
 
     def __len__(self) -> int:
         """
