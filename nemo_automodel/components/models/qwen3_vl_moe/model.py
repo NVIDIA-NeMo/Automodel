@@ -16,13 +16,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-
-from nemo_automodel.components.models.qwen3_moe.model import Block
-from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
-from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
-from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration as HFQwen3VLMoeForConditionalGeneration,
@@ -35,6 +28,13 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeTextRotaryEmbedding,
     Qwen3VLMoeVisionRotaryEmbedding,
 )
+
+from nemo_automodel.components.models.qwen3_moe.model import Block
+from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
+from nemo_automodel.components.moe.layers import MoEConfig
+from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .state_dict_adapter import Qwen3VLMoeStateDictAdapter
 
