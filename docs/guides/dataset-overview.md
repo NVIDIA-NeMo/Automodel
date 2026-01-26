@@ -13,7 +13,7 @@ NeMo Automodel supports several common patterns for language modeling and instru
 
 - **HellaSwag (completion SFT)**
   - Wrapper: `nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`
-  - Use case: single-turn completion style SFT where a prompt (ctx) is followed by a gold continuation (ending)
+  - Use case: single-turn, completion-style SFT where a prompt (context) is followed by a gold continuation 
   - Key args: `path_or_dataset`, `split`, `num_samples_limit`
   - Example YAML:
 ```yaml
