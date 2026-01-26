@@ -131,6 +131,7 @@ jobs:
 
   cicd-container-build:
     needs: [pre-flight, cicd-wait-in-queue]
+    runs-on: self-hoste-nemo
     if: |
       (
         success()
@@ -138,11 +139,12 @@ jobs:
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
       && !cancelled()
-    uses: ./.github/workflows/_build_container.yml
-    with:
-      environment_name: "nemo-ci"
-      repo_name: "Automodel"
-      runner_prefix: ${{ needs.pre-flight.outputs.runner_prefix }}
+    environment: nemo-ci
+    steps:
+      - name: Build docker container
+        uses: ./.github/workflows/_build_container.yml
+        with:
+          repo_name: "Automodel"
 
   cicd-unit-tests:
     strategy:
