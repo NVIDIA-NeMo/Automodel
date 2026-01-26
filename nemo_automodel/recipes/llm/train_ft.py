@@ -509,12 +509,13 @@ def build_dataloader(
         # If using an IterableDataset, per-rank sharding for unique samples
         if isinstance(ds, IterableDataset):
             try:
-                if ds.num_shards >= dp_world_size:
+                if ds.num_shards >= dp_world_size or getatr(ds, "shard", None) is not None:
                     ds = ds.shard(dp_world_size, dp_rank)
                     logging.info(
                         f"Sharded IterableDataset via dataset.shard: world_size={dp_world_size}, rank={dp_rank}"
                     )
                 else:
+                    # HuggingFace streaming datasets: split by file shards when possible.
                     from datasets.distributed import split_dataset_by_node
 
                     ds.dataset = split_dataset_by_node(ds.dataset, world_size=dp_world_size, rank=dp_rank)
