@@ -31,8 +31,7 @@ except ImportError:
 from nemo_automodel.components.moe.megatron.moe_utils import (
     weighted_bias_swiglu_impl,
 )
-from nemo_automodel.components.moe.megatron.token_dispatcher import MoEConfig as MegatronMoEConfig
-from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher
+from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher, TokenDispatcherConfig
 from nemo_automodel.components.moe.utils import MoEConfig
 
 if TYPE_CHECKING:
@@ -373,7 +372,7 @@ class GroupedExpertsDeepEP(nn.Module):
         self.ep_size = ep_mesh.size()
         self.ep_rank = ep_mesh.get_local_rank()
 
-        config = MegatronMoEConfig(
+        token_dispatcher_config = TokenDispatcherConfig(
             moe_router_topk=self.config.n_activated_experts,
             num_moe_experts=self.config.n_routed_experts,
             moe_permute_fusion=True,
@@ -390,7 +389,7 @@ class GroupedExpertsDeepEP(nn.Module):
         self.token_dispatcher = MoEFlexTokenDispatcher(
             num_local_experts=num_local_experts,
             local_expert_indices=local_expert_indices,
-            config=config,
+            config=token_dispatcher_config,
             ep_group=ep_mesh.get_group(),
         )
 
@@ -785,7 +784,7 @@ class GroupedExpertsTE(nn.Module):
             device="meta",
         )
 
-        megatron_config = MegatronMoEConfig(
+        token_dispatcher_config = TokenDispatcherConfig(
             moe_router_topk=self.config.n_activated_experts,
             num_moe_experts=self.config.n_routed_experts,
             moe_permute_fusion=True,
@@ -798,7 +797,7 @@ class GroupedExpertsTE(nn.Module):
         self.token_dispatcher = MoEFlexTokenDispatcher(
             num_local_experts=self.num_local_experts,
             local_expert_indices=local_expert_indices,
-            config=megatron_config,
+            config=token_dispatcher_config,
             ep_group=ep_mesh.get_group(),
         )
 
