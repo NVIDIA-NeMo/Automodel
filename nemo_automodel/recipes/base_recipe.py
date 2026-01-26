@@ -368,7 +368,7 @@ class BaseRecipe:
         self.checkpointer.load_optimizer(optimizer, model, ckpt_dir, scheduler)
 
     def _log_experiment_details(self):
-        """Log metadata and resolved config on main rank using YAML markers."""
+        """Log metadata and config on main rank using YAML markers."""
         if not getattr(self, "dist_env", None) or not getattr(self.dist_env, "is_main", False):
             return
         details = {
@@ -387,16 +387,24 @@ class BaseRecipe:
                 logging.info(line)
         except Exception:
             logging.info(f"Experiment details: {details}")
-        # Resolved config
+        # Config (avoid leaking secrets to logs)
         try:
             cfg_obj = getattr(self, "cfg", None)
             # Prefer YAML-ready dict that converts callables/classes to dotted paths and preserves typed scalars
             if hasattr(cfg_obj, "to_yaml_dict"):
-                cfg_dict = cfg_obj.to_yaml_dict()
+                cfg_dict = cfg_obj.to_yaml_dict(redact_sensitive=True, use_orig_values=True)
             elif hasattr(cfg_obj, "to_dict"):
                 cfg_dict = cfg_obj.to_dict()
             else:
                 cfg_dict = dict(cfg_obj) if cfg_obj is not None else {}
+
+            # Ensure secrets don't land in logs even for non-ConfigNode inputs.
+            try:
+                from nemo_automodel.components.config.loader import _redact
+
+                cfg_dict = _redact(cfg_dict)
+            except Exception:
+                pass
 
             # Print as clean YAML on stdout for easy copy/paste and readability
             cfg_yaml = yaml.safe_dump(cfg_dict, sort_keys=False, default_flow_style=False).strip()

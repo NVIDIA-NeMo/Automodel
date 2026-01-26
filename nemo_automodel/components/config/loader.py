@@ -164,6 +164,15 @@ def translate_value(v):
 _OC_ENV_PATTERN = re.compile(r"\$\{oc\.env:([^}]+)\}")
 
 
+class _OrigValueStr(str):
+    """String that keeps its original (unresolved) value for safe printing."""
+
+    def __new__(cls, value: str, orig_value: str):
+        obj = super().__new__(cls, value)
+        obj._orig_value = orig_value
+        return obj
+
+
 def resolve_yaml_env_vars(obj: Any) -> Any:
     """Resolve `${oc.env:VAR}` (and `${oc.env:VAR,default}`) references in a YAML-loaded container.
 
@@ -337,6 +346,14 @@ class ConfigNode:
         elif k == "_target_":
             return _resolve_target(v)
         else:
+            # Support `${oc.env:VAR}` (with optional default) in YAML scalars.
+            # Store the resolved value for runtime, but keep the original token for safe printing.
+            if isinstance(v, str) and "${oc.env:" in v:
+                resolved = resolve_yaml_env_vars(v)
+                translated = translate_value(resolved)
+                if isinstance(translated, str):
+                    return _OrigValueStr(translated, v)
+                return translated
             return translate_value(v)
 
     @property
@@ -414,6 +431,9 @@ class ConfigNode:
 
         # Override/add with passed kwargs
         config_kwargs.update(kwargs)
+        # Resolve env interpolations at the last moment, so printing/saving the config
+        # does not leak secrets (e.g., `${oc.env:HF_TOKEN}` remains in YAML output).
+        config_kwargs = resolve_yaml_env_vars(config_kwargs)
 
         try:
             return func(*args, **config_kwargs)
@@ -449,11 +469,13 @@ class ConfigNode:
         if isinstance(v, ConfigNode) and hasattr(v, "_target_"):
             return v.instantiate()
         elif isinstance(v, ConfigNode):
-            return v.to_dict()
+            # Dict-like configs should resolve env vars before being passed to targets.
+            return resolve_yaml_env_vars(v.to_dict())
         elif isinstance(v, list):
             return [self._instantiate_value(i) for i in v]
         else:
-            return translate_value(v)
+            # Resolve leaf env vars (strings) before attempting to cast.
+            return translate_value(resolve_yaml_env_vars(v))
 
     def to_dict(self):
         """
@@ -508,18 +530,30 @@ class ConfigNode:
             return repr(obj)
         return dotted
 
-    def to_yaml_dict(self):
+    def to_yaml_dict(
+        self, *, resolve_env: bool = False, redact_sensitive: bool = False, use_orig_values: bool = False
+    ):
         """
         Convert configuration to a YAML-ready dictionary:
         - Preserves typed scalars (ints, floats, bools)
         - Converts callables/classes/methods (e.g., _target_, *_fn) to dotted path strings
         - Recurses through nested ConfigNodes and lists
+
+        Args:
+            resolve_env: If True, resolve `${oc.env:VAR}` interpolations in the returned dict.
+                This does not mutate the in-memory config.
+            redact_sensitive: If True, redact values for keys that look sensitive (token/secret/etc).
+            use_orig_values: If True, prefer `_orig_value` (when present) for safe printing/logging.
         """
 
         def _convert(key, value):
             # Nested config
             if isinstance(value, ConfigNode):
-                return value.to_yaml_dict()
+                return value.to_yaml_dict(
+                    resolve_env=resolve_env,
+                    redact_sensitive=redact_sensitive,
+                    use_orig_values=use_orig_values,
+                )
             # Lists
             if isinstance(value, list):
                 return [_convert(None, v) for v in value]
@@ -538,13 +572,20 @@ class ConfigNode:
                     return self._to_dotted_path(value)
             except Exception:
                 pass
+            if use_orig_values and hasattr(value, "_orig_value"):
+                return getattr(value, "_orig_value")
             # Primitive – already typed via translate_value/_wrap
             return value
 
         # Walk live attributes to preserve translated scalars
-        return {
+        out = {
             k: _convert(k, v) for k, v in self.__dict__.items() if k not in ("raise_on_missing_attr", "_raw_config")
         }
+        if resolve_env:
+            out = resolve_yaml_env_vars(out)
+        if redact_sensitive:
+            out = _redact(out)
+        return out
 
     def _unwrap(self, v):
         """
@@ -651,6 +692,8 @@ class ConfigNode:
                 + f"\n{'  ' * level}]"
             )
         else:
+            if hasattr(value, "_orig_value"):
+                return repr(getattr(value, "_orig_value"))
             return repr(value)
 
     def __str__(self):
@@ -695,5 +738,4 @@ def load_yaml_config(path):
     """
     with open(path, "r") as f:
         raw = yaml.safe_load(f)
-    raw = resolve_yaml_env_vars(raw)
     return ConfigNode(raw)

@@ -332,6 +332,20 @@ def test_load_yaml_config_oc_env_missing_raises(monkeypatch, tmp_path: Path):
         _ = load_yaml_config(str(yml))
 
 
+def test_confignode_repr_uses_orig_value_for_oc_env(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("SECRET_ENV", "super_secret_value")
+    yml = tmp_path / "cfg.yaml"
+    yml.write_text("x: ${oc.env:SECRET_ENV}\n")
+    cfg = load_yaml_config(str(yml))
+
+    # Runtime value is resolved
+    assert cfg.x == "super_secret_value"
+    # But printing the config should not leak the resolved secret
+    s = str(cfg)
+    assert "${oc.env:SECRET_ENV}" in s
+    assert "super_secret_value" not in s
+
+
 def test_load_module_from_file(tmp_path):
     """Module is imported, its globals are accessible, and it gets a unique name."""
     py_file = tmp_path / "plugin.py"
