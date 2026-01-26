@@ -142,7 +142,7 @@ jobs:
     environment: nemo-ci
     steps:
       - name: main
-        uses: ./.github/workflows/_build_container.yml
+        uses: ./.github/actions/build-container
         with:
           repo_name: "Automodel"
           has-azure-credentials: "true"
