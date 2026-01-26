@@ -203,9 +203,9 @@ dataset:
 **SQL engine requirement:** `delta_sql_query` is executed via Spark (Databricks runtime/pyspark) when available, otherwise via `databricks-sql-connector`. It is not supported in a deltalake-only environment.
 :::
 
-::::{note}
+:::{note}
 **Authentication:** The Delta Lake loader automatically picks up credentials from environment variables (`DATABRICKS_TOKEN`, `AWS_ACCESS_KEY_ID`, `AZURE_STORAGE_ACCOUNT_KEY`, etc.) if not explicitly provided in `delta_storage_options`.
-::::
+:::
 
 ---
 ## Common Arguments
