@@ -99,7 +99,7 @@ fa = ["flash-attn<=2.8.3"]
 # "flash-attn==2.8.1",
 cuda = [
     "nemo_automodel[fa]",
-    "nvidia-cudnn-cu12>=9.18.0.0; sys_platform == 'linux'",
+    # "nvidia-cudnn-cu12>=9.18.0.0; sys_platform == 'linux'",
     "transformer-engine[pytorch]==2.10.0",
 ]
 extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
