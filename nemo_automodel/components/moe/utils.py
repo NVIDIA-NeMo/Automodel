@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.util
+import warnings
 from dataclasses import dataclass
 from typing import Literal
 
@@ -31,7 +32,9 @@ class BackendConfig:
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
-    enable_deepep: bool = HAVE_DEEP_EP
+    experts: Literal["torch", "te", "gmm"] = "torch"
+    dispatcher: Literal["torch", "deepep"] = "torch"
+    enable_deepep: bool | None = None  # Deprecated: use dispatcher="deepep" instead
     fake_balanced_gate: bool = False
     enable_hf_state_dict_adapter: bool = True
     enable_fsdp_optimizations: bool = False
@@ -40,6 +43,60 @@ class BackendConfig:
     def __post_init__(self):
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
+
+        # Handle deprecated enable_deepep parameter
+        if self.enable_deepep is not None:
+            warnings.warn(
+                "enable_deepep is deprecated and will be removed in a future release. "
+                "Use experts='gmm' and dispatcher='deepep' instead of enable_deepep=True, "
+                "or dispatcher='torch' instead of enable_deepep=False.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.enable_deepep:
+                self.experts = "gmm"
+                self.dispatcher = "deepep"
+            else:
+                self.dispatcher = "torch"
+            # Clear the deprecated field after conversion
+            self.enable_deepep = None
+
+        # TE and GMM experts require DeepEP dispatcher
+        if self.experts in ("te", "gmm") and self.dispatcher != "deepep":
+            raise ValueError(
+                f"experts='{self.experts}' requires dispatcher='deepep', but got dispatcher='{self.dispatcher}'"
+            )
+
+
+@dataclass(kw_only=True)
+class MoEConfig:
+    n_routed_experts: int
+    n_shared_experts: int
+    n_activated_experts: int
+    n_expert_groups: int
+    n_limited_groups: int
+    train_gate: bool
+    gate_bias_update_factor: float
+    aux_loss_coeff: float
+    score_func: str
+    route_scale: float
+    dim: int
+    inter_dim: int
+    moe_inter_dim: int
+    norm_topk_prob: bool
+    router_bias: bool = False
+    expert_bias: bool = False
+    expert_activation: Literal["swiglu", "quick_geglu"] = "swiglu"
+    activation_alpha: float = 1.702
+    activation_limit: float = 7.0
+    softmax_before_topk: bool = False
+    dtype: str | torch.dtype = torch.bfloat16
+    shared_expert_gate: bool = False
+    shared_expert_inter_dim: int | None = None
+
+    def __post_init__(self):
+        if isinstance(self.dtype, str):
+            self.dtype = dtype_from_str(self.dtype, default=torch.bfloat16)
 
 
 def initialize_rms_norm_module(
