@@ -91,74 +91,27 @@ def _load_dataset(
     split: Optional[str] = None,
     streaming: bool = False,
     name: Optional[str] = None,
-    delta_storage_options: Optional[Dict[str, str]] = None,
-    delta_version: Optional[int] = None,
-    delta_sql_query: Optional[str] = None,
 ):
-    """Load a dataset from HuggingFace Hub, local JSON/JSONL files, or Delta Lake tables.
+    """Load a dataset either from the Hugging Face Hub or from local JSON/JSONL files.
 
     If *path_or_dataset_id* resembles a HF repo ID (i.e. of the form
     ``org/dataset`` and the path does **not** exist on the local filesystem),
-    we defer to ``datasets.load_dataset`` directly. If the path is a Delta Lake
-    table (prefixed with ``delta://``, ``dbfs:/``, or a directory containing
-    ``_delta_log``), we load using the Delta Lake reader. Otherwise, we assume
-    the argument points to one or more local JSON/JSONL files and let
+    we defer to ``datasets.load_dataset`` directly. Otherwise, we assume the
+    argument points to one or more local JSON/JSONL files and let
     ``datasets.load_dataset`` with the *"json"* script handle the parsing.
 
     Args:
-        path_or_dataset_id: Either a HF dataset identifier (``org/name``),
-            a Delta Lake table path (``delta://path/to/table``), or
+        path_or_dataset_id: Either a HF dataset identifier (``org/name``) or
             a path / list of paths to local ``.json`` / ``.jsonl`` files.
         split: Optional split to load when retrieving a remote dataset. This
-            parameter is ignored for local files and Delta Lake tables.
+            parameter is ignored for local files as the *json* script always
+            returns a single split.
         streaming: Whether to stream the dataset.
         name: Optional name of the dataset configuration/subset to load
-        delta_storage_options: Optional dict of storage options for Delta Lake
-            cloud authentication (e.g., ``{"DATABRICKS_TOKEN": "dapi..."}``)
-        delta_version: Optional specific version of the Delta table to read.
-        delta_sql_query: Optional SQL query to execute against the Delta Lake source.
-            This is supported when running with a SparkSession (Databricks / pyspark)
-            or when using the Databricks SQL Connector. The query must return the
-            columns expected by `column_mapping`.
 
     Returns:
         datasets.Dataset: The loaded dataset.
-
-    Examples:
-        >>> # Load from HuggingFace Hub
-        >>> ds = _load_dataset("org/dataset", split="train")
-
-        >>> # Load from local Delta Lake table
-        >>> ds = _load_dataset("delta:///path/to/delta_table", streaming=True)
-
-        >>> # Load from Databricks with authentication
-        >>> ds = _load_dataset(
-        ...     "delta://catalog.schema.table",
-        ...     delta_storage_options={"DATABRICKS_TOKEN": "dapi..."},
-        ...     streaming=True,
-        ... )
     """
-    # Check for Delta Lake sources first
-    if isinstance(path_or_dataset_id, str):
-        from nemo_automodel.components.datasets.llm.delta_lake_dataset import (
-            is_delta_lake_path,
-            load_delta_lake_dataset,
-        )
-
-        if is_delta_lake_path(path_or_dataset_id):
-            if not streaming:
-                raise ValueError(
-                    "Delta Lake / Databricks sources are only supported in streaming mode. "
-                    "Use ColumnMappedTextInstructionIterableDataset to avoid accidental dataset materialization."
-                )
-            return load_delta_lake_dataset(
-                path=path_or_dataset_id,
-                storage_options=delta_storage_options,
-                streaming=streaming,
-                version=delta_version,
-                sql_query=delta_sql_query,
-            )
-
     if isinstance(path_or_dataset_id, str) and _str_is_hf_repo_id(path_or_dataset_id):
         return load_dataset(
             path_or_dataset_id,
@@ -199,12 +152,9 @@ class ColumnMappedTextInstructionDataset(Dataset):
     (either from HF or from local JSON/JSONL files) and remaps the columns so
     that downstream components can rely on a consistent field interface.
 
-    This is a map-style dataset (`torch.utils.data.Dataset`) intended for
-    local JSON/JSONL files and Hugging Face Hub datasets.
-
-    Delta Lake / Databricks sources are intentionally **not supported** here.
-    Use `ColumnMappedTextInstructionIterableDataset` for streaming-only Delta
-    sources to avoid accidental dataset materialization.
+    Optionally, if *answer_only_loss_mask* is requested, the dataset will also
+    compute a *loss_mask* indicating which tokens should contribute to the
+    loss (typically only those belonging to the assistant answer).
     """
 
     def __init__(
@@ -221,18 +171,12 @@ class ColumnMappedTextInstructionDataset(Dataset):
         truncation: Union[str, bool] = "do_not_truncate",
         limit_dataset_samples: Optional[int] = None,
         use_hf_chat_template: bool = False,
-        delta_storage_options: Optional[Dict[str, str]] = None,
-        delta_version: Optional[int] = None,
-        delta_sql_query: Optional[str] = None,
     ) -> None:
         """
         Initialize the dataset.
 
         Args:
-            path_or_dataset_id: The path or dataset id of the dataset. Can be:
-                - HuggingFace dataset identifier (e.g., "org/dataset")
-                - Path to local JSON/JSONL files
-                - Delta Lake table path (e.g., "delta:///path/to/table", "dbfs:/path", or local dir with _delta_log)
+            path_or_dataset_id: The path or dataset id of the dataset.
             column_mapping: The mapping of the columns.
             tokenizer: The tokenizer to use.
             split: The split of the dataset to load.
@@ -240,12 +184,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
             answer_only_loss_mask: Whether to compute the loss mask only on the answer tokens.
             seq_length: The sequence length to use for padding.
             limit_dataset_samples: The number of samples to load from the dataset.
-            delta_storage_options: Optional dict of storage options for Delta Lake cloud authentication
-                (e.g., {"DATABRICKS_TOKEN": "dapi...", "DATABRICKS_HOST": "https://..."})
-            delta_version: Optional specific version of the Delta table to read.
-            delta_sql_query: Optional SQL query to execute against the Delta Lake source.
-                Supported when running with Spark (Databricks / pyspark) or Databricks SQL Connector.
-                The query must return the columns expected by `column_mapping`.
         """
 
         if use_hf_chat_template and _has_chat_template(tokenizer):
@@ -263,21 +201,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 logger.warning("Setting tokenizer pad_token to ' '. tokenizer does not have `eos_token`.")
                 self.tokenizer.pad_token = " "
 
-        if delta_storage_options is not None or delta_version is not None or delta_sql_query is not None:
-            raise ValueError(
-                "Delta Lake / Databricks options are not supported by ColumnMappedTextInstructionDataset. "
-                "Use ColumnMappedTextInstructionIterableDataset."
-            )
-
-        self.dataset = _load_dataset(
-            path_or_dataset_id,
-            split=split,
-            streaming=False,
-            name=name,
-            delta_storage_options=delta_storage_options,
-            delta_version=delta_version,
-            delta_sql_query=delta_sql_query,
-        )
+        self.dataset = _load_dataset(path_or_dataset_id, split=split, streaming=False, name=name)
 
         if limit_dataset_samples is not None:
             self.dataset = self.dataset.select(range(limit_dataset_samples))
