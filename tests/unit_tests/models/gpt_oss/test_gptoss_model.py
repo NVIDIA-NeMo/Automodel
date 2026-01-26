@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import Mock, patch
+import tempfile
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.gpt_oss.model import Block, GptOssForCausalLM, GptOssModel
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.moe.utils import BackendConfig
@@ -463,3 +465,45 @@ class TestGptOssForCausalLM:
                 # from_config should have been called with the returned config
                 called_cfg = mock_from_config.call_args[0][0]
                 assert called_cfg is gpt_config
+
+
+class TestGptOssHFCheckpointingMixin:
+    """Tests for HFCheckpointingMixin integration."""
+
+    def test_model_inherits_hf_checkpointing_mixin(self):
+        """Test that GptOssForCausalLM inherits from HFCheckpointingMixin."""
+        assert issubclass(GptOssForCausalLM, HFCheckpointingMixin), (
+            "GptOssForCausalLM should inherit from HFCheckpointingMixin"
+        )
+
+    def test_model_has_checkpointer_attribute(self, gpt_config, backend_config):
+        """Test that model has _checkpointer attribute."""
+        model = GptOssForCausalLM(gpt_config, backend=backend_config)
+
+        assert hasattr(model, "_checkpointer"), (
+            "Model should have _checkpointer attribute from HFCheckpointingMixin"
+        )
+
+    def test_save_pretrained_requires_checkpointer(self, gpt_config, backend_config):
+        """Test that save_pretrained raises error without checkpointer."""
+        model = GptOssForCausalLM(gpt_config, backend=backend_config)
+        model._checkpointer = None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="No checkpointer provided"):
+                model.save_pretrained(tmpdir)
+
+    def test_save_pretrained_uses_checkpointer(self, gpt_config, backend_config):
+        """Test that save_pretrained delegates to Checkpointer.save_model."""
+        model = GptOssForCausalLM(gpt_config, backend=backend_config)
+
+        mock_checkpointer = MagicMock()
+        model._checkpointer = mock_checkpointer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model.save_pretrained(tmpdir)
+
+            mock_checkpointer.save_model.assert_called_once()
+            call_kwargs = mock_checkpointer.save_model.call_args[1]
+            assert call_kwargs["model"] is model
+            assert call_kwargs["weights_path"] == tmpdir

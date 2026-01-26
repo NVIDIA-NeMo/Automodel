@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
+import tempfile
+from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from transformers import AutoConfig, AutoModel
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.mistral3 import model as mistral_mod
 from nemo_automodel.components.models.mistral3.model import (
     Ministral3Config,
@@ -97,4 +100,63 @@ class TestMinistral3ForCausalLM:
 
         assert outputs.logits.shape == (batch, seq_len, cfg.vocab_size)
         mock_forward.assert_called_once()
+
+
+class TestMinistral3HFCheckpointingMixin:
+    """Tests for HFCheckpointingMixin integration."""
+
+    def test_model_inherits_hf_checkpointing_mixin(self):
+        """Test that Ministral3ForCausalLM inherits from HFCheckpointingMixin."""
+        # Verify class inheritance
+        assert issubclass(Ministral3ForCausalLM, HFCheckpointingMixin), (
+            "Ministral3ForCausalLM should inherit from HFCheckpointingMixin"
+        )
+
+        # Verify MRO has mixin before PreTrainedModel
+        mro_names = [cls.__name__ for cls in Ministral3ForCausalLM.__mro__]
+        mixin_idx = mro_names.index("HFCheckpointingMixin")
+        pretrained_idx = mro_names.index("PreTrainedModel")
+        assert mixin_idx < pretrained_idx, (
+            "HFCheckpointingMixin should come before PreTrainedModel in MRO"
+        )
+
+    def test_model_has_checkpointer_attribute(self):
+        """Test that model has _checkpointer attribute."""
+        cfg = tiny_config()
+        model = Ministral3ForCausalLM(cfg)
+
+        # Model should have _checkpointer attribute (may be None if not set)
+        assert hasattr(model, "_checkpointer"), (
+            "Model should have _checkpointer attribute from HFCheckpointingMixin"
+        )
+
+    def test_save_pretrained_requires_checkpointer(self):
+        """Test that save_pretrained raises error without checkpointer."""
+        cfg = tiny_config()
+        model = Ministral3ForCausalLM(cfg)
+
+        # Clear checkpointer if set
+        model._checkpointer = None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="No checkpointer provided"):
+                model.save_pretrained(tmpdir)
+
+    def test_save_pretrained_uses_checkpointer(self):
+        """Test that save_pretrained delegates to Checkpointer.save_model."""
+        cfg = tiny_config()
+        model = Ministral3ForCausalLM(cfg)
+
+        # Create mock checkpointer
+        mock_checkpointer = MagicMock()
+        model._checkpointer = mock_checkpointer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model.save_pretrained(tmpdir)
+
+            # Verify Checkpointer.save_model was called
+            mock_checkpointer.save_model.assert_called_once()
+            call_kwargs = mock_checkpointer.save_model.call_args[1]
+            assert call_kwargs["model"] is model
+            assert call_kwargs["weights_path"] == tmpdir
 

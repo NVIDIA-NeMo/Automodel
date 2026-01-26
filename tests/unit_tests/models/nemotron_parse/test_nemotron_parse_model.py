@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import tempfile
 import types
+from unittest.mock import MagicMock
 
+import pytest
 import torch
 from transformers.models.donut.modeling_donut_swin import DonutSwinModelOutput
 
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.nemotron_parse import model as np_model
 
 
@@ -96,4 +100,129 @@ def test_nemotron_parse_forward_with_stub_encoder(monkeypatch):
     assert outputs.logits.shape == (1, labels.shape[1], vocab_size)
     assert outputs.loss is not None
     assert torch.isfinite(outputs.loss)
+
+
+class TestNemotronParseHFCheckpointingMixin:
+    """Tests for HFCheckpointingMixin integration."""
+
+    def test_model_inherits_hf_checkpointing_mixin(self):
+        """Test that NemotronParseForConditionalGeneration inherits from HFCheckpointingMixin."""
+        # Verify class inheritance
+        assert issubclass(np_model.NemotronParseForConditionalGeneration, HFCheckpointingMixin), (
+            "NemotronParseForConditionalGeneration should inherit from HFCheckpointingMixin"
+        )
+
+        # Verify MRO has mixin before PreTrainedModel
+        mro_names = [cls.__name__ for cls in np_model.NemotronParseForConditionalGeneration.__mro__]
+        mixin_idx = mro_names.index("HFCheckpointingMixin")
+        pretrained_idx = mro_names.index("PreTrainedModel")
+        assert mixin_idx < pretrained_idx, (
+            "HFCheckpointingMixin should come before PreTrainedModel in MRO"
+        )
+
+    def test_model_has_checkpointer_attribute(self, monkeypatch):
+        """Test that model has _checkpointer attribute."""
+        # Stub encoder config to avoid heavy RADIO dependencies
+        class DummyEncoderConfig:
+            def __init__(self):
+                self.patch_size = 16
+                self.max_resolution = 64
+
+            def to_dict(self):
+                return {"patch_size": self.patch_size, "max_resolution": self.max_resolution}
+
+        class DummyEncoder(torch.nn.Module):
+            def forward(self, pixel_values, *args, **kwargs):
+                batch = pixel_values.shape[0]
+                summary = torch.zeros(batch, 3840)
+                feature = torch.zeros(batch, 16, 1280)
+                return summary, feature
+
+        monkeypatch.setattr(np_model.AutoConfig, "from_pretrained", lambda *args, **kwargs: DummyEncoderConfig())
+        monkeypatch.setattr(np_model.AutoModel, "from_config", lambda config, trust_remote_code=True: DummyEncoder())
+
+        config = np_model.NemotronParseConfig(
+            encoder={"patch_size": 16, "max_resolution": 64},
+            decoder={"vocab_size": 50, "d_model": 32, "decoder_ffn_dim": 64, "encoder_ffn_dim": 64},
+        )
+        model = np_model.NemotronParseForConditionalGeneration(config)
+
+        # Model should have _checkpointer attribute (may be None if not set)
+        assert hasattr(model, "_checkpointer"), (
+            "Model should have _checkpointer attribute from HFCheckpointingMixin"
+        )
+
+    def test_save_pretrained_requires_checkpointer(self, monkeypatch):
+        """Test that save_pretrained raises error without checkpointer."""
+        # Stub encoder config to avoid heavy RADIO dependencies
+        class DummyEncoderConfig:
+            def __init__(self):
+                self.patch_size = 16
+                self.max_resolution = 64
+
+            def to_dict(self):
+                return {"patch_size": self.patch_size, "max_resolution": self.max_resolution}
+
+        class DummyEncoder(torch.nn.Module):
+            def forward(self, pixel_values, *args, **kwargs):
+                batch = pixel_values.shape[0]
+                summary = torch.zeros(batch, 3840)
+                feature = torch.zeros(batch, 16, 1280)
+                return summary, feature
+
+        monkeypatch.setattr(np_model.AutoConfig, "from_pretrained", lambda *args, **kwargs: DummyEncoderConfig())
+        monkeypatch.setattr(np_model.AutoModel, "from_config", lambda config, trust_remote_code=True: DummyEncoder())
+
+        config = np_model.NemotronParseConfig(
+            encoder={"patch_size": 16, "max_resolution": 64},
+            decoder={"vocab_size": 50, "d_model": 32, "decoder_ffn_dim": 64, "encoder_ffn_dim": 64},
+        )
+        model = np_model.NemotronParseForConditionalGeneration(config)
+
+        # Clear checkpointer if set
+        model._checkpointer = None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="No checkpointer provided"):
+                model.save_pretrained(tmpdir)
+
+    def test_save_pretrained_uses_checkpointer(self, monkeypatch):
+        """Test that save_pretrained delegates to Checkpointer.save_model."""
+        # Stub encoder config to avoid heavy RADIO dependencies
+        class DummyEncoderConfig:
+            def __init__(self):
+                self.patch_size = 16
+                self.max_resolution = 64
+
+            def to_dict(self):
+                return {"patch_size": self.patch_size, "max_resolution": self.max_resolution}
+
+        class DummyEncoder(torch.nn.Module):
+            def forward(self, pixel_values, *args, **kwargs):
+                batch = pixel_values.shape[0]
+                summary = torch.zeros(batch, 3840)
+                feature = torch.zeros(batch, 16, 1280)
+                return summary, feature
+
+        monkeypatch.setattr(np_model.AutoConfig, "from_pretrained", lambda *args, **kwargs: DummyEncoderConfig())
+        monkeypatch.setattr(np_model.AutoModel, "from_config", lambda config, trust_remote_code=True: DummyEncoder())
+
+        config = np_model.NemotronParseConfig(
+            encoder={"patch_size": 16, "max_resolution": 64},
+            decoder={"vocab_size": 50, "d_model": 32, "decoder_ffn_dim": 64, "encoder_ffn_dim": 64},
+        )
+        model = np_model.NemotronParseForConditionalGeneration(config)
+
+        # Create mock checkpointer
+        mock_checkpointer = MagicMock()
+        model._checkpointer = mock_checkpointer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model.save_pretrained(tmpdir)
+
+            # Verify Checkpointer.save_model was called
+            mock_checkpointer.save_model.assert_called_once()
+            call_kwargs = mock_checkpointer.save_model.call_args[1]
+            assert call_kwargs["model"] is model
+            assert call_kwargs["weights_path"] == tmpdir
 

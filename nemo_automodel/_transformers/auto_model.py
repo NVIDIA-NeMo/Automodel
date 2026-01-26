@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from typing import List, Optional, Union
 
 import torch
+from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import (
     AutoConfig,
@@ -33,11 +34,11 @@ from transformers import (
 )
 from transformers.modeling_utils import _get_resolved_checkpoint_files
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
-
 import nemo_automodel.components.distributed.utils as dist_utils
-from nemo_automodel import __version__
 from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
@@ -46,6 +47,45 @@ HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 HAS_FA, _ = safe_import("flash_attn")
 
 logger = logging.getLogger(__name__)
+
+
+def _wrap_with_checkpointing_mixin(model: nn.Module, checkpointer: Optional[Checkpointer] = None) -> nn.Module:
+    """
+    Wrap HF model with HFCheckpointingMixin while preserving class identity.
+
+    This creates a dynamic subclass that adds the mixin's methods while
+    keeping all identity metadata (name, module, qualname) unchanged.
+    Only overrides: state_dict(), load_state_dict(), save_pretrained()
+
+    Args:
+        model: The HF model to wrap
+        checkpointer: Optional Checkpointer instance to store on the model.
+            If provided, enables save_pretrained() functionality.
+
+    Returns:
+        The same model instance with its class changed to include the mixin
+    """
+    original_class = model.__class__
+
+    # Check if already wrapped or already has the mixin
+    if issubclass(original_class, HFCheckpointingMixin):
+        if checkpointer is not None:
+            model._checkpointer = checkpointer
+        return model
+
+    # Create wrapper that looks identical to original
+    WrappedClass = type(
+        original_class.__name__,  # Same name: "LlamaForCausalLM"
+        (HFCheckpointingMixin, original_class),
+        {
+            "__module__": original_class.__module__,  # Same: "transformers.models.llama..."
+            "__qualname__": original_class.__qualname__,  # Same: "LlamaForCausalLM"
+        },
+    )
+    model.__class__ = WrappedClass
+    if checkpointer is not None:
+        model._checkpointer = checkpointer
+    return model
 
 
 @contextmanager
@@ -349,6 +389,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = "flash_attention_2",
         quantization_config=None,
         force_hf: bool = False,
+        checkpointer: Optional[Checkpointer] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -380,6 +421,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 will be applied to the model.
             force_hf (bool, default=False): If `True`, force the use of HF model implementation.
                 If `False`, the model will be loaded using the custom model implementation if available.
+            checkpointer (Checkpointer, optional): Checkpointer instance for loading weights
+                and enabling save_pretrained() functionality. If not provided for custom models,
+                the model will have randomly initialized weights. The checkpointer is stored
+                on the model for later use in save_pretrained().
             **kwargs: Additional keyword arguments forwarded verbatim to
                 `AutoModelForCausalLM.from_pretrained`.
 
@@ -429,7 +474,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         # 1. if force_hf is True, we will use the parent class to load and return the model as is
         if force_hf:
-            return cls._from_pretrained_parent_class(
+            model = cls._from_pretrained_parent_class(
                 pretrained_model_name_or_path,
                 *model_args,
                 torch_dtype=torch_dtype,
@@ -437,6 +482,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 quantization_config=quantization_config,
                 **kwargs,
             )
+            # Wrap HF model with mixin for consistent save_pretrained/state_dict API
+            model = _wrap_with_checkpointing_mixin(model, checkpointer)
+            return model
         architectures = get_architectures(hf_config)
         # 2. If we have a custom model implementation available, we prioritize that over HF
         if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
@@ -444,13 +492,18 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             _download_model_weights(hf_config, pretrained_model_name_or_path)
             logger.info(f"Using custom model implementation for {architectures[0]}")
             kwargs.pop("trust_remote_code", None)
-            # TODO(@akoumpa): restore weights after initialization.
             model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
-            # Override config's torch_dtype with user-requested dtype so model __init__ uses correct dtype
-            if torch_dtype != "auto":
-                hf_config.torch_dtype = torch_dtype
-            with local_torch_dtype(torch_dtype, model_cls.__name__):
-                return model_cls(hf_config, *model_args, **kwargs)
+
+            # Use the mixin's from_pretrained which handles weight loading via Checkpointer
+            model = model_cls.from_pretrained(
+                pretrained_model_name_or_path,
+                *model_args,
+                checkpointer=checkpointer,
+                torch_dtype=torch_dtype,
+                hf_config=hf_config,
+                **kwargs,
+            )
+            return model
 
         # 3. fallback to parent class
         model = None
@@ -493,7 +546,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         _verify_sdpa_support(model, is_hf_model, cp_size)
 
-        model.config.update({"nemo_version": __version__})
+        # Wrap HF model with mixin for consistent save_pretrained/state_dict API
+        model = _wrap_with_checkpointing_mixin(model, checkpointer)
         return model
 
     @classmethod
@@ -535,8 +589,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             attn_implementation (str, optional):
                 Specifies which attention implementation to use (e.g.,
                 ``"flash_attention_2"``, ``"eager"``). Only applied when the
-                base model supports this kwarg. Defaults to
-                ``"flash_attention_2"``.
+                base model supports this kwarg. Defaults to ``"flash_attention_2"``.
             force_hf (bool, default=False): If `True`, force the use of HF model implementation.
                 If `False`, the model will be loaded using the custom model implementation if available.
             **kwargs:
@@ -590,19 +643,24 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             )
         # 1. if force_hf is True, we will use the parent class to load and return the model as is
         if force_hf:
-            return cls._from_config_parent_class(
+            model = cls._from_config_parent_class(
                 config,
                 *model_args,
                 attn_implementation=attn_implementation,
                 torch_dtype=torch_dtype,
                 **kwargs,
             )
+            # Wrap HF model with mixin for consistent save_pretrained/state_dict API
+            model = _wrap_with_checkpointing_mixin(model)
+            return model
 
         # 2. If we have a custom model implementation available, we prioritize that over HF
         architectures = get_architectures(config)
         if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
             with local_torch_dtype(torch_dtype, ModelRegistry.model_arch_name_to_cls[architectures[0]].__name__):
-                return ModelRegistry.model_arch_name_to_cls[architectures[0]](config, *model_args, **kwargs)
+                # Custom models already inherit HFCheckpointingMixin
+                model = ModelRegistry.model_arch_name_to_cls[architectures[0]](config, *model_args, **kwargs)
+            return model
 
         # 3. fallback to parent class
         model = None
@@ -642,7 +700,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         _verify_sdpa_support(model, is_hf_model, cp_size)
 
-        model.config.update({"nemo_version": __version__})
+        # Wrap HF model with mixin for consistent save_pretrained/state_dict API
+        model = _wrap_with_checkpointing_mixin(model)
         return model
 
 

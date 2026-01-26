@@ -27,7 +27,6 @@ from nemo_automodel._transformers.auto_model import (
     _get_next_fallback_attn,
     _patch_attention,
 )
-from nemo_automodel import __version__
 
 
 HAS_LIGER_KERNEL = False
@@ -58,8 +57,7 @@ class TestNeMoAutoModelForCausalLM:
             # Test line 208 - warning when HAS_LIGER_KERNEL is False
             with caplog.at_level(logging.WARNING):
                 model = NeMoAutoModelForCausalLM.from_pretrained("hf-internal-testing/tiny-random-gpt2")
-                assert model.config["nemo_version"] == __version__
-
+    
             assert "Asked to use Liger Kernel, but could not import" in caplog.text
             assert model is mock_model
             assert mock_from_pretrained.call_count == 1
@@ -80,8 +78,7 @@ class TestNeMoAutoModelForCausalLM:
             # Test line 297 - warning when HAS_LIGER_KERNEL is False
             with caplog.at_level(logging.WARNING):
                 model = NeMoAutoModelForCausalLM.from_config(config)
-                assert model.config["nemo_version"] == __version__
-
+    
             assert "Asked to use Liger Kernel, but could not import" in caplog.text
             assert model is mock_model
             assert mock_from_config.call_count == 1
@@ -100,10 +97,12 @@ class TestNeMoAutoModelForCausalLM:
             cfg.architectures = ["CustomArch"]
             mock_cfg_from_pretrained.return_value = cfg
 
-            # Prepare a fake custom model class and return value
+            # Prepare a fake custom model class with from_pretrained method
             custom_model_instance = Mock()
-            custom_cls = Mock(return_value=custom_model_instance)
+            custom_model_instance.config = Mock()
+            custom_cls = Mock()
             custom_cls.__name__ = "MockMockMock"
+            custom_cls.from_pretrained = Mock(return_value=custom_model_instance)
             mock_registry.model_arch_name_to_cls = {"CustomArch": custom_cls}
 
             returned = NeMoAutoModelForCausalLM.from_pretrained("dummy/path")
@@ -112,8 +111,8 @@ class TestNeMoAutoModelForCausalLM:
             assert returned is custom_model_instance
             # HF path should not be invoked
             mock_hf_loader.assert_not_called()
-            # Custom cls should be invoked with config first arg
-            custom_cls.assert_called()
+            # Custom cls.from_pretrained should be invoked
+            custom_cls.from_pretrained.assert_called()
 
     def test_from_config_uses_registry_when_available(self):
         """If config.architectures[0] maps to a custom class in ModelRegistry,
@@ -159,10 +158,12 @@ class TestNeMoAutoModelForCausalLM:
             cfg._commit_hash = "abc123"
             mock_cfg_from_pretrained.return_value = cfg
 
-            # Prepare a fake custom model class and return value
+            # Prepare a fake custom model class with from_pretrained method
             custom_model_instance = Mock()
-            custom_cls = Mock(return_value=custom_model_instance)
+            custom_model_instance.config = Mock()
+            custom_cls = Mock()
             custom_cls.__name__ = "MockMockMock"
+            custom_cls.from_pretrained = Mock(return_value=custom_model_instance)
             mock_registry.model_arch_name_to_cls = {"CustomArch": custom_cls}
 
             returned = NeMoAutoModelForCausalLM.from_pretrained("dummy/repo-id")
@@ -194,10 +195,12 @@ class TestNeMoAutoModelForCausalLM:
             cfg._commit_hash = "commit456"
             mock_cfg_from_pretrained.return_value = cfg
 
-            # Prepare a fake custom model class and return value
+            # Prepare a fake custom model class with from_pretrained method
             custom_model_instance = Mock()
-            custom_cls = Mock(return_value=custom_model_instance)
+            custom_model_instance.config = Mock()
+            custom_cls = Mock()
             custom_cls.__name__ = "MockMockMock"
+            custom_cls.from_pretrained = Mock(return_value=custom_model_instance)
             mock_registry.model_arch_name_to_cls = {"CustomArch": custom_cls}
 
             returned = NeMoAutoModelForCausalLM.from_pretrained("dummy/repo-id")
@@ -217,7 +220,6 @@ class TestNeMoAutoModelForCausalLM:
         config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-gpt2")
 
         model = NeMoAutoModelForCausalLM.from_config(config, attn_implementation="eager")
-        assert model.config.nemo_version == __version__
 
     def test_from_config_with_string_calls_autoconfig(self):
         """Test that from_config calls AutoConfig.from_pretrained when config is a string."""
@@ -249,7 +251,6 @@ class TestNeMoAutoModelForCausalLM:
             )
             # Verify the model was returned
             assert model is mock_model
-            assert model.config["nemo_version"] == __version__
 
     def test_from_pretrained_runtimeerror_triggers_reload(self):
         """When _patch_liger_kernel raises, the loader should retry with
@@ -277,8 +278,7 @@ class TestNeMoAutoModelForCausalLM:
             ) as mock_from_pretrained,
         ):
             returned = NeMoAutoModelForCausalLM.from_pretrained("hf-internal-testing/tiny-random-gpt2")
-            assert returned.config["nemo_version"] == __version__
-
+    
         # _patch_liger_kernel called twice, first with ligand=True, then False
         assert patch_calls == [model1]
         # The underlying HF loader is also called twice
@@ -307,8 +307,7 @@ class TestNeMoAutoModelForCausalLM:
             ) as mock_from_config,
         ):
             returned = NeMoAutoModelForCausalLM.from_config(cfg)
-            assert returned.config["nemo_version"] == __version__
-
+    
         assert patch_calls == [model1]
         assert mock_from_config.call_count == 2
         assert returned is model2
@@ -353,8 +352,7 @@ class TestNeMoAutoModelForCausalLM:
                 "hf-internal-testing/tiny-random-gpt2",
                 attn_implementation="flash_attention_2"
             )
-            assert returned.config["nemo_version"] == __version__
-
+    
         # Verify the warning was logged
         assert "Falling back to sdpa attention." in caplog.text
 
@@ -436,8 +434,7 @@ class TestNeMoAutoModelForCausalLM:
                 "hf-internal-testing/tiny-random-gpt2",
                 attn_implementation="flash_attention_2"
             )
-            assert returned.config["nemo_version"] == __version__
-
+    
         # Verify the method was called twice for retry
         assert mock_from_pretrained.call_count == 2 + int(not HAS_LIGER_KERNEL)
 
@@ -495,8 +492,7 @@ class TestNeMoAutoModelForCausalLM:
                 cfg,
                 attn_implementation="flash_attention_2"
             )
-            assert returned.config["nemo_version"] == __version__
-
+    
         # Verify the warning was logged
         assert "Falling back to eager attention." in caplog.text
 
@@ -644,8 +640,7 @@ class TestNeMoAutoModelForImageTextToText:
             # Test line 356 - warning when HAS_LIGER_KERNEL is False
             with caplog.at_level(logging.WARNING):
                 model = NeMoAutoModelForImageTextToText.from_pretrained("dummy_model")
-                assert model.config["nemo_version"] == __version__
-
+    
             assert "Asked to use Liger Kernel, but could not import" in caplog.text
             assert model is mock_model
             assert mock_from_pretrained.call_count == 1
@@ -699,8 +694,7 @@ class TestNeMoAutoModelForImageTextToText:
             cfg.architectures = ["HFArch"]
             mock_cfg_from_pretrained.return_value = cfg
             returned = NeMoAutoModelForImageTextToText.from_pretrained("dummy_model")
-            assert returned.config["nemo_version"] == __version__
-
+    
 
         # _patch_liger_kernel called twice, first with ligand=True, then False
         assert patch_calls == [model1]
@@ -738,8 +732,7 @@ class TestNeMoAutoModelForImageTextToText:
             cfg.architectures = ["HFArch"]
             mock_cfg_from_pretrained.return_value = cfg
             returned = NeMoAutoModelForImageTextToText.from_pretrained("dummy_model")
-            assert returned.config["nemo_version"] == __version__
-
+    
 
         # _patch_liger_kernel called twice, first with ligand=True, then False
         assert patch_calls == [model1]
@@ -770,8 +763,7 @@ class TestNeMoAutoModelForImageTextToText:
             ) as mock_from_config,
         ):
             returned = NeMoAutoModelForImageTextToText.from_config(cfg)
-            assert returned.config["nemo_version"] == __version__
-
+    
         assert patch_calls == [model1]
         assert mock_from_config.call_count == 2
         assert returned is model2
@@ -798,8 +790,7 @@ class TestNeMoAutoModelForImageTextToText:
             ) as mock_from_config,
         ):
             returned = NeMoAutoModelForImageTextToText.from_config(cfg)
-            assert returned.config["nemo_version"] == __version__
-
+    
         assert patch_calls == [model1]
         assert mock_from_config.call_count == 2
         assert returned is model2

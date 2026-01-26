@@ -15,6 +15,7 @@
 
 import os
 import tempfile
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -22,6 +23,8 @@ import torch
 from transformers import AutoModelForCausalLM, LlamaConfig
 
 from nemo_automodel import NeMoAutoModelForCausalLM
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.llama.model import LlamaForCausalLM
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -92,9 +95,11 @@ class TestLlamaModel:
         # Test forward direction: HF → Custom
         hf_state_dict = llama_model_hf.state_dict()
         custom_state_dict_from_hf = adapter.from_hf(hf_state_dict)
-        llama_model_custom.load_state_dict(custom_state_dict_from_hf, strict=True)
+        # Use nn.Module.load_state_dict directly to bypass mixin (testing adapter, not mixin)
+        torch.nn.Module.load_state_dict(llama_model_custom, custom_state_dict_from_hf, strict=True)
 
-        s = adapter.to_hf(llama_model_custom.state_dict())
+        # Use nn.Module.state_dict directly to get native format (testing adapter, not mixin)
+        s = adapter.to_hf(torch.nn.Module.state_dict(llama_model_custom))
 
         for n1, p1 in hf_state_dict.items():
             p2 = s[n1]
@@ -124,7 +129,8 @@ class TestLlamaModel:
         )
 
         # Test reverse direction: Custom → HF
-        custom_state_dict = llama_model_custom.state_dict()
+        # Use nn.Module.state_dict directly to get native format (testing adapter, not mixin)
+        custom_state_dict = torch.nn.Module.state_dict(llama_model_custom)
         hf_state_dict_from_custom = adapter.to_hf(custom_state_dict)
 
         # Create new HF model and load converted state dict
@@ -183,7 +189,8 @@ class TestLlamaModel:
             attn_implementation="eager",
             torch_dtype=torch.bfloat16,
         )
-        custom_state_dict = llama_model_custom.state_dict()
+        # Use nn.Module.state_dict directly to get native format (testing adapter, not mixin)
+        custom_state_dict = torch.nn.Module.state_dict(llama_model_custom)
 
         # Check that all original HF keys don't exist in custom state dict
         assert "model.layers.0.self_attn.q_proj.weight" not in custom_state_dict
@@ -196,52 +203,66 @@ class TestLlamaModel:
         assert "model.layers.0.self_attn.qkv_proj.weight" in custom_state_dict
         assert "model.layers.0.mlp.gate_up_proj.weight" in custom_state_dict
 
-    def test_export_custom_to_hf_checkpoint(self, tiny_llama_checkpoint):
-        """Test exporting custom model to HF-compatible checkpoint format."""
-        config = LlamaConfig.from_pretrained(tiny_llama_checkpoint)
+    def test_model_inherits_hf_checkpointing_mixin(self, tiny_llama_checkpoint):
+        """Test that LlamaForCausalLM inherits from HFCheckpointingMixin."""
+        # Verify class inheritance
+        assert issubclass(LlamaForCausalLM, HFCheckpointingMixin), (
+            "LlamaForCausalLM should inherit from HFCheckpointingMixin"
+        )
+
+        # Verify MRO has mixin before PreTrainedModel
+        mro_names = [cls.__name__ for cls in LlamaForCausalLM.__mro__]
+        mixin_idx = mro_names.index("HFCheckpointingMixin")
+        pretrained_idx = mro_names.index("PreTrainedModel")
+        assert mixin_idx < pretrained_idx, (
+            "HFCheckpointingMixin should come before PreTrainedModel in MRO"
+        )
+
+    def test_model_has_checkpointer_attribute(self, tiny_llama_checkpoint):
+        """Test that model has _checkpointer attribute."""
+        llama_model_custom = NeMoAutoModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path=tiny_llama_checkpoint,
+            attn_implementation="eager",
+            torch_dtype=torch.bfloat16,
+        )
+
+        # Model should have _checkpointer attribute (may be None if not set)
+        assert hasattr(llama_model_custom, "_checkpointer"), (
+            "Model should have _checkpointer attribute from HFCheckpointingMixin"
+        )
+
+    def test_save_pretrained_requires_checkpointer(self, tiny_llama_checkpoint):
+        """Test that save_pretrained raises error without checkpointer."""
+        llama_model_custom = NeMoAutoModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path=tiny_llama_checkpoint,
+            attn_implementation="eager",
+            torch_dtype=torch.bfloat16,
+        )
+
+        # Clear checkpointer if set
+        llama_model_custom._checkpointer = None
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            export_path = os.path.join(tmpdir, "hf_checkpoint")
+            with pytest.raises(ValueError, match="No checkpointer provided"):
+                llama_model_custom.save_pretrained(tmpdir)
 
-            # Build custom model
-            llama_model_custom = NeMoAutoModelForCausalLM.from_pretrained(
-                pretrained_model_name_or_path=tiny_llama_checkpoint,
-                attn_implementation="eager",
-                torch_dtype=torch.bfloat16,
-            ).to("cuda")
-            llama_model_custom.eval()
+    def test_save_pretrained_uses_checkpointer(self, tiny_llama_checkpoint):
+        """Test that save_pretrained delegates to Checkpointer.save_model."""
+        llama_model_custom = NeMoAutoModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path=tiny_llama_checkpoint,
+            attn_implementation="eager",
+            torch_dtype=torch.bfloat16,
+        )
 
-            # Generate test input
-            input_ids = torch.randint(0, config.vocab_size, (1, 10)).to("cuda")
-            attention_mask = torch.ones((1, 10)).to("cuda")
+        # Create mock checkpointer
+        mock_checkpointer = MagicMock()
+        llama_model_custom._checkpointer = mock_checkpointer
 
-            # Get custom model output
-            with torch.no_grad():
-                output_custom = llama_model_custom(input_ids, attention_mask)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            llama_model_custom.save_pretrained(tmpdir)
 
-            # Save in HF-compatible format using the convenience method
-            llama_model_custom.save_pretrained_hf_format(export_path)
-
-            # Load from saved HF checkpoint
-            llama_model_hf_loaded = (
-                AutoModelForCausalLM.from_pretrained(
-                    export_path,
-                    attn_implementation="eager",
-                    torch_dtype=torch.bfloat16,
-                )
-                .to("cuda")
-                .to(torch.bfloat16)
-            )  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
-            llama_model_hf_loaded.eval()
-
-            # Compare outputs
-            with torch.no_grad():
-                output_hf_loaded = llama_model_hf_loaded(input_ids, attention_mask)
-
-            np.testing.assert_allclose(
-                output_custom.logits.float().cpu().numpy(),
-                output_hf_loaded.logits.float().cpu().numpy(),
-                atol=1e-5,
-                rtol=1e-5,
-                err_msg="HF model loaded from exported checkpoint doesn't match custom model",
-            )
+            # Verify Checkpointer.save_model was called
+            mock_checkpointer.save_model.assert_called_once()
+            call_kwargs = mock_checkpointer.save_model.call_args[1]
+            assert call_kwargs["model"] is llama_model_custom
+            assert call_kwargs["weights_path"] == tmpdir

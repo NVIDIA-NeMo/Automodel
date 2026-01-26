@@ -21,5 +21,11 @@ from nemo_automodel.components.models.common.combined_projection import (
 from nemo_automodel.components.models.common.combined_projection.state_dict_adapter import (
     CombinedProjectionStateDictAdapter,
 )
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
-__all__ = ["CombinedQKVAttentionMixin", "CombinedGateUpMLP", "CombinedProjectionStateDictAdapter"]
+__all__ = [
+    "CombinedQKVAttentionMixin",
+    "CombinedGateUpMLP",
+    "CombinedProjectionStateDictAdapter",
+    "HFCheckpointingMixin",
+]

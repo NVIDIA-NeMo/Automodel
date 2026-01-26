@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.qwen3_moe.model import Block, Qwen3MoeForCausalLM, Qwen3MoeModel
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.moe.utils import BackendConfig
@@ -301,3 +303,45 @@ class TestQwen3MoeModelFromPretrainedAndExport:
 
         assert hasattr(qwen_mod, "ModelClass")
         assert qwen_mod.ModelClass is Qwen3MoeForCausalLM
+
+
+class TestQwen3MoeHFCheckpointingMixin:
+    """Tests for HFCheckpointingMixin integration."""
+
+    def test_model_inherits_hf_checkpointing_mixin(self):
+        """Test that Qwen3MoeForCausalLM inherits from HFCheckpointingMixin."""
+        assert issubclass(Qwen3MoeForCausalLM, HFCheckpointingMixin), (
+            "Qwen3MoeForCausalLM should inherit from HFCheckpointingMixin"
+        )
+
+    def test_model_has_checkpointer_attribute(self, qwen_config, backend_config):
+        """Test that model has _checkpointer attribute."""
+        model = Qwen3MoeForCausalLM(qwen_config, backend=backend_config)
+
+        assert hasattr(model, "_checkpointer"), (
+            "Model should have _checkpointer attribute from HFCheckpointingMixin"
+        )
+
+    def test_save_pretrained_requires_checkpointer(self, qwen_config, backend_config):
+        """Test that save_pretrained raises error without checkpointer."""
+        model = Qwen3MoeForCausalLM(qwen_config, backend=backend_config)
+        model._checkpointer = None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="No checkpointer provided"):
+                model.save_pretrained(tmpdir)
+
+    def test_save_pretrained_uses_checkpointer(self, qwen_config, backend_config):
+        """Test that save_pretrained delegates to Checkpointer.save_model."""
+        model = Qwen3MoeForCausalLM(qwen_config, backend=backend_config)
+
+        mock_checkpointer = MagicMock()
+        model._checkpointer = mock_checkpointer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model.save_pretrained(tmpdir)
+
+            mock_checkpointer.save_model.assert_called_once()
+            call_kwargs = mock_checkpointer.save_model.call_args[1]
+            assert call_kwargs["model"] is model
+            assert call_kwargs["weights_path"] == tmpdir
