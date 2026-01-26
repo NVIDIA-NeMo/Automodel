@@ -93,7 +93,7 @@ def _load_streaming_dataset(
                     "Use ColumnMappedTextInstructionIterableDataset to avoid accidental dataset materialization."
                 )
             return DeltaLakeDataset(
-                path=path_or_dataset_id,
+                table_path=path_or_dataset_id,
                 storage_options=delta_storage_options,
                 version=delta_version,
                 sql_query=delta_sql_query,
