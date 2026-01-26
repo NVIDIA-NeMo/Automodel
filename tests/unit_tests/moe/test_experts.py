@@ -12,10 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
+
+HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
+HAVE_CUDA = torch.cuda.is_available()
+SKIP_TE_TESTS = not (HAVE_TE and HAVE_CUDA)
 
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
@@ -25,7 +30,7 @@ from nemo_automodel.components.moe.experts import (
     get_expert_activation_for_deepep,
     swiglu,
 )
-from nemo_automodel.components.moe.layers import MoEConfig
+from nemo_automodel.components.moe.utils import MoEConfig
 
 
 @pytest.fixture
@@ -613,7 +618,7 @@ class TestGroupedExpertsDeepEP:
         assert result.shape == value.shape
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for TE GroupedLinear")
+@pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")
 class TestGroupedExpertsTE:
     """Test GroupedExpertsTE module using Transformer Engine's GroupedLinear."""
 

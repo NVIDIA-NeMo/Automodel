@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 from unittest.mock import Mock, patch
 
 import pytest
@@ -30,6 +31,10 @@ from nemo_automodel.components.moe.layers import (
     MoE,
 )
 from nemo_automodel.components.moe.utils import BackendConfig, MoEConfig
+
+HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
+HAVE_CUDA = torch.cuda.is_available()
+SKIP_TE_TESTS = not (HAVE_TE and HAVE_CUDA)
 
 
 @pytest.fixture
@@ -701,6 +706,7 @@ class TestMoE:
         assert isinstance(moe.gate, Gate)
         assert isinstance(moe.experts, GroupedExperts)
 
+    @pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")
     def test_moe_init_with_deepep_multi_device(self, moe_config, backend_config):
         """DeepEP dispatcher enabled and world size > 1 should use GroupedExpertsTE."""
         backend_config.experts = "te"
