@@ -91,6 +91,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Union
+from nemo_automodel.components.datasets.reservoir_sampler import ReservoirSampler
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +213,8 @@ def is_delta_lake_path(path: str) -> bool:
     # Check for Databricks file system paths
     if path.startswith("dbfs:/"):
         return True
+
+    # @akoumparouli: we allow on purpose abfss,s3,s3a,gs paths.
 
     # Check for abfss:// (Azure Blob Storage with hierarchical namespace)
     if path.startswith("abfss://"):
@@ -351,6 +354,9 @@ class DeltaLakeIterator:
         storage_options: Optional storage options for cloud storage access.
         batch_size: Number of rows to read at a time (default: 1024).
         version: Optional version of the table to read.
+        sql_query: Optional SQL query to read the table and/or create alias columns.
+        shard_info: Optional sharding configuration ``(num_shards, shard_index)``.
+            When provided, only rows where ``row_idx % num_shards == shard_index`` are yielded.
     """
 
     def __init__(
@@ -361,6 +367,7 @@ class DeltaLakeIterator:
         batch_size: int = 1024,
         version: Optional[int] = None,
         sql_query: Optional[str] = None,
+        shard_info: Optional[tuple[int, int]] = None,
     ):
         if not _check_delta_reader_available():
             raise ImportError(
@@ -375,6 +382,18 @@ class DeltaLakeIterator:
         self.batch_size = batch_size
         self.version = version
         self.sql_query = sql_query
+        self._shard_info: Optional[tuple[int, int]] = None
+
+        if shard_info is not None:
+            num_shards, shard_index = shard_info
+            num_shards = int(num_shards)
+            shard_index = int(shard_index)
+            if num_shards <= 0:
+                raise ValueError(f"num_shards must be > 0, got {num_shards}")
+            if shard_index < 0 or shard_index >= num_shards:
+                raise ValueError(f"shard_index must be in [0, {num_shards}), got {shard_index}")
+            # Normalize the no-op shard case to None to keep checks cheap.
+            self._shard_info = None if num_shards == 1 else (num_shards, shard_index)
 
         # SQL query execution requires an engine (Spark or Databricks SQL). The `deltalake`
         # reader does not support arbitrary SQL query execution on its own.
@@ -386,6 +405,50 @@ class DeltaLakeIterator:
 
         # Add environment-based storage options
         self._add_env_storage_options()
+
+    def _iter_all_rows(self) -> Iterator[Dict[str, Any]]:
+        """Iterate over all rows (no sharding)."""
+        # Custom SQL query: prefer Spark when available, fall back to Databricks SQL connector.
+        if self.sql_query is not None:
+            if _get_spark_session() is not None:
+                logger.info("Executing Delta SQL query via Spark.")
+                yield from self._iter_with_spark()
+                return
+            if _check_databricks_sql_available():
+                logger.info("Executing Delta SQL query via Databricks SQL connector.")
+                yield from self._iter_with_databricks_sql()
+                return
+            raise ImportError(
+                "Delta Lake `sql_query` requires either Spark (Databricks runtime / pyspark) "
+                "or `databricks-sql-connector`."
+            )
+
+        # Check if this is a Unity Catalog table (catalog.schema.table format)
+        if _is_unity_catalog_path(self.table_path):
+            # Prefer Spark when available (Databricks notebooks/jobs) to avoid extra dependencies.
+            if _get_spark_session() is not None:
+                logger.info(f"Detected Unity Catalog table (Spark): {self.table_path}")
+                yield from self._iter_with_spark()
+                return
+            if _check_databricks_sql_available():
+                logger.info(f"Detected Unity Catalog table (Databricks SQL): {self.table_path}")
+                yield from self._iter_with_databricks_sql()
+                return
+            raise ImportError(
+                f"Unity Catalog table '{self.table_path}' requires either Spark (Databricks runtime) "
+                "or databricks-sql-connector."
+            )
+
+        # File-based tables: prefer deltalake when possible, fall back to Spark (for deletion vectors).
+        if _check_deltalake_available():
+            yield from self._iter_with_deltalake()
+            return
+        if _get_spark_session() is not None:
+            yield from self._iter_with_spark()
+            return
+        raise ImportError(
+            "Unable to read this Delta table. Install 'deltalake' or run inside a Spark environment (Databricks)."
+        )
 
     def _add_env_storage_options(self):
         """Add storage options from environment variables if not already set."""
@@ -605,222 +668,30 @@ class DeltaLakeIterator:
         Yields:
             Dict containing column name to value mappings for each row.
         """
-        # Custom SQL query: prefer Spark when available, fall back to Databricks SQL connector.
-        if self.sql_query is not None:
-            if _get_spark_session() is not None:
-                logger.info("Executing Delta SQL query via Spark.")
-                yield from self._iter_with_spark()
-                return
-            if _check_databricks_sql_available():
-                logger.info("Executing Delta SQL query via Databricks SQL connector.")
-                yield from self._iter_with_databricks_sql()
-                return
-            raise ImportError(
-                "Delta Lake `sql_query` requires either Spark (Databricks runtime / pyspark) "
-                "or `databricks-sql-connector`."
-            )
+        base_iter = self._iter_all_rows()
+        if self._shard_info is None:
+            num_shards = 1
+            shard_index = 0
+        else:
+            num_shards, shard_index = self._shard_info
 
-        # Check if this is a Unity Catalog table (catalog.schema.table format)
-        if _is_unity_catalog_path(self.table_path):
-            # Prefer Spark when available (Databricks notebooks/jobs) to avoid extra dependencies.
-            if _get_spark_session() is not None:
-                logger.info(f"Detected Unity Catalog table (Spark): {self.table_path}")
-                yield from self._iter_with_spark()
-                return
-            if _check_databricks_sql_available():
-                logger.info(f"Detected Unity Catalog table (Databricks SQL): {self.table_path}")
-                yield from self._iter_with_databricks_sql()
-                return
-            raise ImportError(
-                f"Unity Catalog table '{self.table_path}' requires either Spark (Databricks runtime) "
-                "or databricks-sql-connector."
-            )
+        for row_idx, row in enumerate(base_iter):
+            if row_idx % num_shards == shard_index:
+                yield row
 
-        # File-based tables: prefer deltalake when possible, fall back to Spark (for deletion vectors).
-        if _check_deltalake_available():
-            yield from self._iter_with_deltalake()
-            return
-        if _get_spark_session() is not None:
-            yield from self._iter_with_spark()
-            return
-        raise ImportError(
-            "Unable to read this Delta table. Install 'deltalake' or run inside a Spark environment (Databricks)."
-        )
-
-
-class DeltaLakeDataset:
-    """A dataset wrapper for Delta Lake tables that integrates with HuggingFace datasets.
-
-    This class provides a HuggingFace-compatible interface for Delta Lake tables,
-    supporting both iteration and indexing (when the table is small enough).
-
-    Args:
-        table_path: Path to the Delta Lake table. Can be:
-            - Local path: "/path/to/delta_table"
-            - Delta protocol: "delta:///path/to/delta_table"
-            - DBFS: "dbfs:/path/to/delta_table"
-            - S3: "s3://bucket/path/to/delta_table"
-            - Azure: "abfss://container@account.dfs.core.windows.net/path"
-            - GCS: "gs://bucket/path/to/delta_table"
-        columns: Optional list of column names to read.
-        storage_options: Optional dict of storage options for cloud authentication.
-        streaming: If True, returns an iterable dataset. If False, loads into memory.
-        version: Optional specific version of the Delta table to read.
-    """
-
-    def __init__(
-        self,
-        table_path: str,
-        columns: Optional[list] = None,
-        storage_options: Optional[Dict[str, str]] = None,
-        streaming: bool = False,
-        version: Optional[int] = None,
-        sql_query: Optional[str] = None,
-    ):
-        self.table_path = _normalize_delta_path(table_path)
-        self.columns = columns
-        self.storage_options = storage_options or {}
-        self.streaming = streaming
-        self.version = version
-        self.sql_query = sql_query
-        self._data: Optional[list] = None
-        self._length: Optional[int] = None
-
-        if not _check_delta_reader_available():
-            raise ImportError(
-                "A Delta Lake reader is required. Install one of:\n"
-                "  pip install deltalake\n"
-                "  pip install databricks-sql-connector  # for Unity Catalog access without Spark\n"
-                "Or run inside a Spark environment (Databricks) for deletion vectors / UC tables."
-            )
-
-        # Add environment-based storage options
-        self._iterator = DeltaLakeIterator(
-            table_path=table_path,
-            columns=columns,
-            storage_options=storage_options,
-            version=version,
-            sql_query=sql_query,
-        )
-
-        if not streaming:
-            self._load_data()
-
-    def _load_data(self):
-        """Load the entire Delta table into memory."""
-        self._data = list(self._iterator)
-        self._length = len(self._data)
-
-    def __len__(self) -> int:
-        """Return the number of rows in the table.
-
-        Raises:
-            RuntimeError: If streaming is enabled.
-        """
-        if self.streaming:
-            raise RuntimeError("__len__ is not supported in streaming mode. Use iteration instead.")
-        if self._length is None:
-            self._load_data()
-        return self._length  # type: ignore[return-value]
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """Get a specific row by index.
+    def shard(self, num_shards: int, index: int) -> "DeltaLakeIterator":
+        """Shard the iterator for distributed processing.
 
         Args:
-            idx: The row index.
-
-        Returns:
-            Dict containing column name to value mappings.
-
-        Raises:
-            RuntimeError: If streaming is enabled.
+            num_shards: Total number of shards.
+            index: Index of this shard (0-based).
         """
-        if self.streaming:
-            raise RuntimeError("__getitem__ is not supported in streaming mode. Use iteration instead.")
-        if self._data is None:
-            self._load_data()
-        return self._data[idx]  # type: ignore[index]
+        assert num_shards > 0, "num_shards must be > 0"
+        assert index >= 0 and index < num_shards, "index must be in [0, num_shards)"
+        self._shard_info = (num_shards, index)
+        return self
 
-    def __iter__(self) -> Iterator[Dict[str, Any]]:
-        """Iterate over rows in the dataset.
-
-        Yields:
-            Dict containing column name to value mappings for each row.
-        """
-        if self.streaming:
-            yield from self._iterator
-        else:
-            if self._data is None:
-                self._load_data()
-            yield from self._data  # type: ignore[misc]
-
-
-def load_delta_lake_dataset(
-    path: str,
-    columns: Optional[list] = None,
-    storage_options: Optional[Dict[str, str]] = None,
-    streaming: bool = False,
-    version: Optional[int] = None,
-    sql_query: Optional[str] = None,
-) -> Union[DeltaLakeDataset, "HFDeltaLakeDataset"]:
-    """Load a Delta Lake table as a HuggingFace-compatible dataset.
-
-    This function creates a dataset that can be used with the ColumnMappedTextInstructionDataset
-    and other HuggingFace-compatible dataset consumers.
-
-    Args:
-        path: Path to the Delta Lake table.
-        columns: Optional list of column names to read.
-        storage_options: Optional dict of storage options for cloud authentication.
-        streaming: If True, returns a streaming iterable dataset.
-        version: Optional specific version of the Delta table to read.
-
-    Returns:
-        A HuggingFace-compatible dataset object.
-
-    Example:
-        ```python
-        # Local Delta table
-        ds = load_delta_lake_dataset("/path/to/delta_table")
-
-        # Databricks table with authentication
-        ds = load_delta_lake_dataset(
-            "delta://catalog.schema.table",
-            storage_options={"DATABRICKS_TOKEN": "dapi..."},
-            streaming=True,
-        )
-        ```
-    """
-    if not _check_delta_reader_available():
-        raise ImportError(
-            "A Delta Lake reader is required. Install one of:\n"
-            "  pip install deltalake\n"
-            "  pip install databricks-sql-connector  # for Unity Catalog access without Spark\n"
-            "Or run inside a Spark environment (Databricks) for deletion vectors / UC tables."
-        )
-
-    # Return HF-compatible wrapper if datasets library is available
-    try:
-        return HFDeltaLakeDataset(
-            table_path=path,
-            columns=columns,
-            storage_options=storage_options,
-            streaming=streaming,
-            version=version,
-            sql_query=sql_query,
-        )
-    except ImportError:
-        return DeltaLakeDataset(
-            table_path=path,
-            columns=columns,
-            storage_options=storage_options,
-            streaming=streaming,
-            version=version,
-            sql_query=sql_query,
-        )
-
-
-class HFDeltaLakeDataset:
+class DeltaLakeDataset:
     """HuggingFace datasets-compatible wrapper for Delta Lake tables.
 
     This class provides better integration with the HuggingFace datasets library,
@@ -831,7 +702,6 @@ class HFDeltaLakeDataset:
         table_path: Path to the Delta Lake table.
         columns: Optional list of column names to read.
         storage_options: Optional dict of storage options for cloud authentication.
-        streaming: If True, returns a streaming iterable dataset.
         version: Optional specific version of the Delta table to read.
     """
 
@@ -840,23 +710,20 @@ class HFDeltaLakeDataset:
         table_path: str,
         columns: Optional[list] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        streaming: bool = False,
         version: Optional[int] = None,
         sql_query: Optional[str] = None,
     ):
         self.table_path = _normalize_delta_path(table_path)
         self.columns = columns
         self.storage_options = storage_options or {}
-        self.streaming = streaming
         self.version = version
         self.sql_query = sql_query
-        self._dataset: Optional[Any] = None
         self._epoch: int = 0
         self._shard_info: Optional[tuple] = None  # (num_shards, shard_index)
         self._shuffle_info: Optional[tuple] = None  # (buffer_size, seed)
 
         # Eagerly create the internal iterator to validate the table
-        self._base_iterator = DeltaLakeIterator(
+        self._data_iterator = DeltaLakeIterator(
             table_path=table_path,
             columns=columns,
             storage_options=storage_options,
@@ -864,64 +731,17 @@ class HFDeltaLakeDataset:
             sql_query=sql_query,
         )
 
-        if not streaming:
-            self._load_as_hf_dataset()
-
-    def _load_as_hf_dataset(self):
-        """Load the Delta table as a HuggingFace Dataset."""
-        from datasets import Dataset
-
-        iterator = DeltaLakeIterator(
-            table_path=self.table_path,
-            columns=self.columns,
-            storage_options=self._base_iterator.storage_options,
-            version=self.version,
-            sql_query=self.sql_query,
-        )
-        self._dataset = Dataset.from_list(list(iterator))
-
     def __len__(self) -> int:
         """Return the number of rows in the table."""
-        if self.streaming:
-            raise RuntimeError("__len__ is not supported in streaming mode.")
-        if self._dataset is None:
-            self._load_as_hf_dataset()
-        return len(self._dataset)
+        raise RuntimeError("__len__ is not supported in streaming mode.")
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Get a specific row by index."""
-        if self.streaming:
-            raise RuntimeError("__getitem__ is not supported in streaming mode.")
-        if self._dataset is None:
-            self._load_as_hf_dataset()
-        return self._dataset[idx]
+        raise RuntimeError("__getitem__ is not supported in streaming mode.")
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         """Iterate over rows in the dataset."""
-        if self.streaming:
-            iterator = DeltaLakeIterator(
-                table_path=self.table_path,
-                columns=self.columns,
-                storage_options=self._base_iterator.storage_options,
-                version=self.version,
-                sql_query=self.sql_query,
-            )
-
-            row_idx = 0
-            for row in iterator:
-                # Apply sharding if configured
-                if self._shard_info is not None:
-                    num_shards, shard_index = self._shard_info
-                    if row_idx % num_shards != shard_index:
-                        row_idx += 1
-                        continue
-
-                yield row
-                row_idx += 1
-        else:
-            if self._dataset is None:
-                self._load_as_hf_dataset()
-            yield from self._dataset
+        yield from self._data_iterator
 
     def set_epoch(self, epoch: int) -> None:
         """Set the current epoch for deterministic shuffling.
@@ -931,7 +751,7 @@ class HFDeltaLakeDataset:
         """
         self._epoch = epoch
 
-    def shard(self, num_shards: int, index: int) -> "HFDeltaLakeDataset":
+    def shard(self, num_shards: int, index: int) -> "DeltaLakeDataset":
         """Shard the dataset for distributed processing.
 
         Args:
@@ -941,10 +761,10 @@ class HFDeltaLakeDataset:
         Returns:
             Self for method chaining.
         """
-        self._shard_info = (num_shards, index)
+        self._base_iterator.shard(num_shards, index)
         return self
 
-    def shuffle(self, buffer_size: int = 1000, seed: Optional[int] = None) -> "HFDeltaLakeDataset":
+    def shuffle(self, buffer_size: int = 1000, seed: Optional[int] = None) -> "DeltaLakeDataset":
         """Configure shuffling for the dataset.
 
         Note: For streaming Delta Lake datasets, shuffling is performed on-the-fly
@@ -957,27 +777,26 @@ class HFDeltaLakeDataset:
         Returns:
             Self for method chaining.
         """
-        self._shuffle_info = (buffer_size, seed if seed is not None else self._epoch)
+        self._data_iterator = ReservoirSampler(self._data_iterator, buffer_size, seed)
         return self
 
-    def take(self, n: int) -> "HFDeltaLakeDataset":
+    def take(self, n: int) -> "DeltaLakeDataset":
         """Limit the dataset to the first n samples.
 
         Args:
             n: Number of samples to take.
 
         Returns:
-            A new HFDeltaLakeDataset limited to n samples.
+            A new DeltaLakeDataset limited to n samples.
         """
         # Create a wrapper that limits iteration
         limited = _LimitedDeltaLakeDataset(self, n)
         return limited  # type: ignore[return-value]
 
-
 class _LimitedDeltaLakeDataset:
     """Internal wrapper to limit a Delta Lake dataset to n samples."""
 
-    def __init__(self, base: HFDeltaLakeDataset, limit: int):
+    def __init__(self, base: DeltaLakeDataset, limit: int):
         self._base = base
         self._limit = limit
 
