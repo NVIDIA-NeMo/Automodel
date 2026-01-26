@@ -17,10 +17,10 @@ on:
   workflow_call:
     inputs:
       repo_name:
-      description: "The name of the repo to build container"
-      required: true
-      default: ""
-      type: string
+        description: "The name of the repo to build container"
+        required: true
+        default: ""
+        type: string
 
 jobs:
   steps:
