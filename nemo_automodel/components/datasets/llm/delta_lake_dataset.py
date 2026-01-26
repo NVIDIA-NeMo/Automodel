@@ -761,7 +761,7 @@ class DeltaLakeDataset:
         Returns:
             Self for method chaining.
         """
-        self._base_iterator.shard(num_shards, index)
+        self._data_iterator.shard(num_shards, index)
         return self
 
     def shuffle(self, buffer_size: int = 1000, seed: Optional[int] = None) -> "DeltaLakeDataset":
