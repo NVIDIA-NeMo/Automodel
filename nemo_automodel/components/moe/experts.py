@@ -33,27 +33,10 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
 )
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEConfig as MegatronMoEConfig
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher
+from nemo_automodel.components.moe.utils import MoEConfig
 
 if TYPE_CHECKING:
     from transformer_engine.pytorch import GroupedLinear
-
-    from nemo_automodel.components.moe.layers import MoEConfig
-
-
-__all__ = [
-    "swiglu",
-    "quick_geglu",
-    "get_expert_activation",
-    "GroupedExperts",
-    "quick_geglu_deepep",
-    "get_expert_activation_for_deepep",
-    "GroupedExpertsDeepEP",
-    "GroupedExpertsDeepGEMM",
-    "HAVE_DEEP_GEMM",
-    "HAVE_TE_PADDING",
-    "HAVE_TE_GROUPED_LINEAR",
-    "GroupedExpertsTE",
-]
 
 
 @torch.compile
@@ -97,7 +80,7 @@ def quick_geglu(
     return inter
 
 
-def get_expert_activation(config: "MoEConfig"):
+def get_expert_activation(config: MoEConfig):
     if config.expert_activation == "swiglu":
         return swiglu
     elif config.expert_activation == "quick_geglu":
@@ -124,7 +107,7 @@ def quick_geglu_deepep(
     return (inter * permuted_probs).to(x.dtype)
 
 
-def get_expert_activation_for_deepep(config: "MoEConfig"):
+def get_expert_activation_for_deepep(config: MoEConfig):
     if config.expert_activation == "swiglu":
         return weighted_bias_swiglu_impl
     elif config.expert_activation == "quick_geglu":
@@ -152,7 +135,7 @@ class GroupedExperts(nn.Module):
         down_projs (nn.Parameter): Linear layer for hidden-to-output transformation.
     """
 
-    def __init__(self, config: "MoEConfig"):
+    def __init__(self, config: MoEConfig):
         """
         Initializes the GroupedExperts module.
 
@@ -360,7 +343,7 @@ class GroupedExpertsDeepEP(nn.Module):
 
         return output
 
-    def __init__(self, config: "MoEConfig"):
+    def __init__(self, config: MoEConfig):
         """
         Initializes the GroupedExperts module.
 
@@ -500,7 +483,7 @@ class GroupedExpertsTE(nn.Module):
 
     def __init__(
         self,
-        config: "MoEConfig",
+        config: MoEConfig,
     ):
         """
         Initialize the GroupedExpertsTEGroupedLinear module.

@@ -28,9 +28,8 @@ from nemo_automodel.components.moe.layers import (
     FakeBalancedGate,
     Gate,
     MoE,
-    MoEConfig,
 )
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.moe.utils import BackendConfig, MoEConfig
 
 
 @pytest.fixture
@@ -619,21 +618,6 @@ class TestGate:
         torch.testing.assert_close(weights1, weights2)
         torch.testing.assert_close(indices1, indices2)
 
-    def test_backend_config_gate_precision_string_input_fp32(self):
-        """Test that BackendConfig gate_precision accepts string input and converts to torch.dtype."""
-        backend_config = BackendConfig(gate_precision="torch.float32")
-        assert backend_config.gate_precision == torch.float32
-
-    def test_backend_config_gate_precision_string_input_fp64(self):
-        """Test that BackendConfig gate_precision accepts fp64 string input."""
-        backend_config = BackendConfig(gate_precision="torch.float64")
-        assert backend_config.gate_precision == torch.float64
-
-    def test_backend_config_gate_precision_string_input_short_form(self):
-        """Test that BackendConfig gate_precision accepts short form string input."""
-        backend_config = BackendConfig(gate_precision="float32")
-        assert backend_config.gate_precision == torch.float32
-
     def test_dtype_string_input(self):
         """Test that dtype field accepts string input and converts to torch.dtype."""
         config = MoEConfig(
@@ -736,16 +720,6 @@ class TestMoE:
 
         assert isinstance(moe.gate, Gate)
         assert isinstance(moe.experts, GroupedExpertsDeepEP)
-
-    def test_backend_config_te_experts_requires_deepep(self):
-        """Test that BackendConfig validates te experts requires deepep dispatcher."""
-        with pytest.raises(ValueError, match="experts='te' requires dispatcher='deepep'"):
-            BackendConfig(experts="te", dispatcher="torch")
-
-    def test_backend_config_gmm_experts_requires_deepep(self):
-        """Test that BackendConfig validates gmm experts requires deepep dispatcher."""
-        with pytest.raises(ValueError, match="experts='gmm' requires dispatcher='deepep'"):
-            BackendConfig(experts="gmm", dispatcher="torch")
 
     def test_moe_init_with_shared_experts(self, moe_config, backend_config):
         """Test MoE initialization with shared experts."""

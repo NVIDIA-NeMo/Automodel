@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
-from dataclasses import dataclass
 from functools import partial
-from typing import Literal, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -34,41 +33,9 @@ from nemo_automodel.components.moe.experts import (
 from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
 )
-from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module
-from nemo_automodel.shared.utils import dtype_from_str
+from nemo_automodel.components.moe.utils import BackendConfig, MoEConfig, initialize_linear_module
 
 _shared_experts_stream: Optional[torch.cuda.Stream] = None
-
-
-@dataclass(kw_only=True)
-class MoEConfig:
-    n_routed_experts: int
-    n_shared_experts: int
-    n_activated_experts: int
-    n_expert_groups: int
-    n_limited_groups: int
-    train_gate: bool
-    gate_bias_update_factor: float
-    aux_loss_coeff: float
-    score_func: str
-    route_scale: float
-    dim: int
-    inter_dim: int
-    moe_inter_dim: int
-    norm_topk_prob: bool
-    router_bias: bool = False
-    expert_bias: bool = False
-    expert_activation: Literal["swiglu", "quick_geglu"] = "swiglu"
-    activation_alpha: float = 1.702
-    activation_limit: float = 7.0
-    softmax_before_topk: bool = False
-    dtype: str | torch.dtype = torch.bfloat16
-    shared_expert_gate: bool = False
-    shared_expert_inter_dim: int | None = None
-
-    def __post_init__(self):
-        if isinstance(self.dtype, str):
-            self.dtype = dtype_from_str(self.dtype, default=torch.bfloat16)
 
 
 class MLP(nn.Module):
