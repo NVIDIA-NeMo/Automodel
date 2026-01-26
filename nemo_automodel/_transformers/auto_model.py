@@ -446,6 +446,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             kwargs.pop("trust_remote_code", None)
             # TODO(@akoumpa): restore weights after initialization.
             model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
+            # Override config's torch_dtype with user-requested dtype so model __init__ uses correct dtype
+            if torch_dtype != "auto":
+                hf_config.torch_dtype = torch_dtype
             with local_torch_dtype(torch_dtype, model_cls.__name__):
                 return model_cls(hf_config, *model_args, **kwargs)
 
