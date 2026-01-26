@@ -404,7 +404,7 @@ slurm:
     - /lustre:/lustre
     - /shared:/shared
   # Optional: Specify custom HF_HOME location
-  hf_home: /shared/hf_cache # Custom Hugging Face cache directory on shared dist space.
+  hf_home: /shared/hf_cache # Custom Hugging Face cache directory on shared disk space.
   # Optional: Specify custom env vars
   env_vars: # Additional environment variables
     HF_DATASETS_CACHE: /shared/hf_cache  # similar to hf_home, useful when use a different directory for datasets.
