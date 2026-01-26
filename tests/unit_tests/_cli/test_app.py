@@ -64,18 +64,16 @@ def test_load_yaml_bad_format(tmp_path):
         module.load_yaml(bad_yaml)
 
 
-def test_main_slurm_resolves_env_vars(monkeypatch, tmp_path: Path):
-    # Prepare a YAML config with a slurm section that references env vars.
-    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf_home"))
-    monkeypatch.setenv("SLURM_JOB_DIR", str(tmp_path / "slurm_jobs"))
-
+def test_main_slurm_preserves_env_var_placeholders(monkeypatch, tmp_path: Path):
+    # The slurm section is passed through as-is (no env interpolation) so users can
+    # defer env expansion to the batch script runtime and avoid leaking secrets.
     cfg = tmp_path / "cfg.yaml"
     cfg.write_text(
-        """
+        f"""
         slurm:
           job_name: test_job
-          job_dir: ${SLURM_JOB_DIR}
-          hf_home: ${HF_HOME}
+          job_dir: {tmp_path / "slurm_jobs"}
+          hf_home: ${{HF_HOME}}
           nodes: 1
           ntasks_per_node: 2
         """
@@ -95,7 +93,7 @@ def test_main_slurm_resolves_env_vars(monkeypatch, tmp_path: Path):
     result = module.main()
     assert result == 0
     assert os.path.basename(captured["job_dir"]) == "1234567890"
-    assert captured["slurm_config"]["hf_home"] == str(tmp_path / "hf_home")
+    assert captured["slurm_config"]["hf_home"] == "${HF_HOME}"
     # job_dir is used to construct the job directory and should not be forwarded.
     assert "job_dir" not in captured["slurm_config"]
 
