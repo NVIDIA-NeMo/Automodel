@@ -81,6 +81,7 @@ runs:
         apt-get install -y gh
 
     - name: Get last merged PR
+      shell: bash
       id: cache_from
       env:
         GH_TOKEN: ${{ github.token }}
