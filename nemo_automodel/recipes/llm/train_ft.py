@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import pathlib
 import time
 from contextlib import nullcontext
@@ -40,6 +41,7 @@ from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
+from nemo_automodel.components.callbacks import CallbackRunner
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
@@ -887,13 +889,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     This class orchestrates training, from setup to main training loop.
     """
 
-    def __init__(self, cfg):
-        """Initialize the recipe with configuration.
+    def __init__(self, cfg, callbacks=None):
+        """
+        Initializes the recipe.
 
         Args:
             cfg: Configuration dictionary/object for training.
+            callbacks: Optional list of Callback instances.
         """
         self.cfg = cfg
+        self.callbacks = callbacks or []
 
     # ------------------ build phase ------------------
     def setup(self):
@@ -905,6 +910,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
         torch.cuda.reset_peak_memory_stats()
+        self.callback_runner = CallbackRunner(self.callbacks)
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
         # setups logging and adds the rankfilter to logging
         setup_logging()
@@ -1178,6 +1184,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         for mp in self.model_parts:
             mp.train()
+        self.callback_runner.on_train_start(self)
         self.timestamp = time.perf_counter()
 
         for epoch in self.step_scheduler.epochs:
@@ -1189,34 +1196,57 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # If QAT delayed fake-quant is configured, enable after threshold
                 self._enable_qat_if_delayed(self.step_scheduler.step)
                 train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                self.callback_runner.on_train_batch_end(self, train_log_data=train_log_data)
                 # log
                 self.log_train_metrics(train_log_data)
 
                 # Run validation every val_every_steps
                 val_losses = {}
+                val_results = {}
                 if self.step_scheduler.is_val_step:
                     for val_name, val_dataloader in self.val_dataloaders.items():
                         val_log_data = self._run_validation_epoch(val_dataloader)
                         val_losses[val_name] = val_log_data.metrics["val_loss"]
+                        val_results[val_name] = val_log_data
                         self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
+                    self.callback_runner.on_validation_end(self, val_results=val_results)
                     for mp in self.model_parts:
                         mp.train()
 
                 # Save the checkpoint every ckpt_every_steps
                 if self.step_scheduler.is_ckpt_step:
+                    step = self.step_scheduler.step
+                    train_loss = train_log_data.metrics["loss"]
+
                     self.save_checkpoint(
                         epoch,
-                        self.step_scheduler.step,
-                        train_log_data.metrics["loss"],
+                        step,
+                        train_loss,
                         val_losses,
                         best_metric_key=self.best_metric_key,
                     )
+
+                    # Prepare checkpoint info for callback
+                    checkpoint_path = os.path.join(
+                        self.checkpointer.config.checkpoint_dir, f"epoch_{epoch}_step_{step}"
+                    )
+                    checkpoint_info = {
+                        "epoch": epoch,
+                        "step": step,
+                        "train_loss": train_loss,
+                        "val_losses": val_losses,
+                        "checkpoint_path": checkpoint_path,
+                        "best_metric_key": self.best_metric_key,
+                    }
+                    self.callback_runner.on_save_checkpoint(self, checkpoint_info=checkpoint_info)
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():
             v.close()
 
         self.checkpointer.close()
+
+        self.callback_runner.on_train_end(self)
 
     # ------------------ helpers ------------------
     def _forward_backward_step(
@@ -1575,7 +1605,11 @@ def main(config_path=None):
     cfg = parse_args_and_load_config(config_path)
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
-    trainer.run_train_validation_loop()
+    try:
+        trainer.run_train_validation_loop()
+    except Exception as e:
+        trainer.callback_runner.on_exception(trainer, exception=e)
+        raise e
 
 
 if __name__ == "__main__":

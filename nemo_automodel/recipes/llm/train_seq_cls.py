@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import pathlib
 import time
 
@@ -22,6 +23,7 @@ import torch
 import wandb
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+from nemo_automodel.components.callbacks import CallbackRunner
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -44,11 +46,20 @@ logger = logging.getLogger(__name__)
 class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
     """Recipe for fine-tuning a model for sequence classification."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, callbacks=None):
+        """
+        Initializes the recipe.
+
+        Args:
+            cfg: Configuration dictionary/object for training.
+            callbacks: Optional list of Callback instances.
+        """
         self.cfg = cfg
+        self.callbacks = callbacks or []
 
     def setup(self):
         torch.cuda.reset_peak_memory_stats()
+        self.callback_runner = CallbackRunner(self.callbacks)
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
         setup_logging()
         apply_cache_compatibility_patches()
@@ -186,34 +197,58 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
     def run_train_validation_loop(self):
         for mp in self.model_parts:
             mp.train()
+        self.callback_runner.on_train_start(self)
         self.timestamp = time.perf_counter()
 
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
             for batches in self.step_scheduler:
                 train_log_data = self._run_train_optim_step(batches)
+                self.callback_runner.on_train_batch_end(self, train_log_data=train_log_data)
                 self.log_train_metrics(train_log_data)
 
                 val_loss = {}
+                val_results = {}
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     val_log_data = self._validate_one_epoch(self.val_dataloader)
                     val_loss["val_loss"] = val_log_data.metrics["val_loss"]
+                    val_results["validation"] = val_log_data
                     self.log_val_metrics(val_log_data)
+                    self.callback_runner.on_validation_end(self, val_results=val_results)
                     for mp in self.model_parts:
                         mp.train()
 
                 if self.step_scheduler.is_ckpt_step:
+                    step = self.step_scheduler.step
+                    train_loss = train_log_data.metrics["loss"]
+
                     self.save_checkpoint(
                         epoch,
-                        self.step_scheduler.step,
-                        train_log_data.metrics["loss"],
+                        step,
+                        train_loss,
                         val_loss,
                         best_metric_key=self.best_metric_key,
                     )
 
+                    # Prepare checkpoint info for callback
+                    checkpoint_path = os.path.join(
+                        self.checkpointer.config.checkpoint_dir, f"epoch_{epoch}_step_{step}"
+                    )
+                    checkpoint_info = {
+                        "epoch": epoch,
+                        "step": step,
+                        "train_loss": train_loss,
+                        "val_losses": val_loss,
+                        "checkpoint_path": checkpoint_path,
+                        "best_metric_key": self.best_metric_key,
+                    }
+                    self.callback_runner.on_save_checkpoint(self, checkpoint_info=checkpoint_info)
+
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
         self.checkpointer.close()
+
+        self.callback_runner.on_train_end(self)
 
     def _run_train_optim_step(self, batches):
         model = self.model_parts[0]
@@ -440,7 +475,11 @@ def main(config_path: str | None = None):
     cfg = parse_args_and_load_config(config_path)
     trainer = TrainFinetuneRecipeForSequenceClassification(cfg)
     trainer.setup()
-    trainer.run_train_validation_loop()
+    try:
+        trainer.run_train_validation_loop()
+    except Exception as e:
+        trainer.callback_runner.on_exception(trainer, exception=e)
+        raise e
 
 
 if __name__ == "__main__":

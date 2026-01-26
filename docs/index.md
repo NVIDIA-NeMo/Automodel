@@ -66,6 +66,7 @@ guides/pipelining.md
 guides/llm/knowledge-distillation.md
 guides/fp8-training.md
 guides/mlflow-logging.md
+guides/callbacks.md
 
 apidocs/index.rst
 ```

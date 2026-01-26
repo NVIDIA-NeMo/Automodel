@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import pathlib
 import time
 from contextlib import nullcontext
@@ -33,6 +34,7 @@ from wandb import Settings
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
+from nemo_automodel.components.callbacks import CallbackRunner
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
@@ -542,13 +544,15 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
 class FinetuneRecipeForVLM(BaseRecipe):
     """Recipe for fine-tuning a VLM model."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, callbacks=None):
         """Initialize the recipe with configuration.
 
         Args:
             cfg: Configuration dictionary/object for training.
+            callbacks: Optional list of Callback instances.
         """
         self.cfg = cfg
+        self.callbacks = callbacks or []
 
     # ------------------ build phase ------------------
     def setup(self):
@@ -560,6 +564,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
         torch.cuda.reset_peak_memory_stats()
+        self.callback_runner = CallbackRunner(self.callbacks)
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
         setup_logging()
 
@@ -696,11 +701,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
         and update model parameters when necessary. Also prints loss every gradient step.
         """
         self.model.train()
+        self.callback_runner.on_train_start(self)
         self.timestamp = time.perf_counter()
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
             for batch_idx, batches in enumerate(self.step_scheduler):
                 log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                self.callback_runner.on_train_batch_end(self, train_log_data=log_data)
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step(1)
 
@@ -708,26 +715,48 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 self.log_train_metrics(log_data)
 
                 val_loss = {}
+                val_results = {}
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     val_log_data = self._run_validation_epoch(self.val_dataloader)
                     val_loss["val_loss"] = val_log_data.metrics["val_loss"]
+                    val_results["validation"] = val_log_data
                     self.log_val_metrics(val_log_data)
+                    self.callback_runner.on_validation_end(self, val_results=val_results)
                     self.model.train()
 
                 if self.step_scheduler.is_ckpt_step:
+                    step = self.step_scheduler.step
+                    train_loss = log_data.metrics["loss"]
+
                     self.save_checkpoint(
                         epoch,
-                        self.step_scheduler.step,
-                        log_data.metrics["loss"],
+                        step,
+                        train_loss,
                         val_loss,
                         best_metric_key=self.best_metric_key,
                     )
+
+                    # Prepare checkpoint info for callback
+                    checkpoint_path = os.path.join(
+                        self.checkpointer.config.checkpoint_dir, f"epoch_{epoch}_step_{step}"
+                    )
+                    checkpoint_info = {
+                        "epoch": epoch,
+                        "step": step,
+                        "train_loss": train_loss,
+                        "val_losses": val_loss,
+                        "checkpoint_path": checkpoint_path,
+                        "best_metric_key": self.best_metric_key,
+                    }
+                    self.callback_runner.on_save_checkpoint(self, checkpoint_info=checkpoint_info)
 
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
 
         self.checkpointer.close()
+
+        self.callback_runner.on_train_end(self)
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
@@ -996,7 +1025,11 @@ def main(config_path=None):
     cfg = parse_args_and_load_config(config_path)
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()
-    trainer.run_train_validation_loop()
+    try:
+        trainer.run_train_validation_loop()
+    except Exception as e:
+        trainer.callback_runner.on_exception(trainer, exception=e)
+        raise e
 
 
 if __name__ == "__main__":
