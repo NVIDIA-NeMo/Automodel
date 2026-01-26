@@ -40,7 +40,11 @@ from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.checkpoint.checkpointing import (
+    Checkpointer,
+    CheckpointingConfig,
+    _maybe_adapt_state_dict_to_hf,
+)
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
@@ -243,7 +247,11 @@ def build_model_and_optimizer(
     }
 
     # hold a list copy of the model state dict keys before any parallelization
-    state_dict_keys = list(model.state_dict().keys())
+    state_dict_keys = list(
+        _maybe_adapt_state_dict_to_hf(
+            model, model.state_dict(), quantization=checkpointer.config.dequantize_base_checkpoint
+        ).keys()
+    )
 
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
