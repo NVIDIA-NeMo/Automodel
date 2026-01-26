@@ -283,18 +283,23 @@ def build_model_and_optimizer(
             parallelize_fn(
                 model,
                 world_mesh=model_wrapper.device_mesh,
-                moe_mesh=getattr(model_wrapper, "moe_mesh", None),
-                pp_enabled=False,
+                moe_mesh=model_wrapper.moe_mesh,
                 dp_axis_names=(
                     ("dp_replicate", "dp_shard_cp")
                     if "dp_replicate" in model_wrapper.device_mesh.mesh_dim_names
                     and "dp_shard_cp" in model_wrapper.device_mesh.mesh_dim_names
                     else ("dp_shard_cp",)
                 ),
-                cp_axis_name="cp",
-                tp_axis_name="tp",
-                ep_axis_name="ep",
-                ep_shard_axis_names=("ep_shard",),
+                cp_axis_name="cp" if "cp" in model_wrapper.device_mesh.mesh_dim_names else None,
+                tp_axis_name="tp" if "tp" in model_wrapper.device_mesh.mesh_dim_names else None,
+                ep_axis_name="ep"
+                if model_wrapper.moe_mesh is not None and "ep" in model_wrapper.moe_mesh.mesh_dim_names
+                else None,
+                ep_shard_axis_names=(
+                    ("ep_shard",)
+                    if model_wrapper.moe_mesh is not None and "ep_shard" in model_wrapper.moe_mesh.mesh_dim_names
+                    else None
+                ),
             )
             load_weights = True
         elif callable(getattr(model_wrapper, "parallelize", None)):
@@ -856,7 +861,6 @@ def parallelize_for_pp(
     *,
     world_mesh: DeviceMesh,
     moe_mesh: Optional[DeviceMesh] = None,
-    pp_enabled: bool = False,
     dp_axis_names: Union[tuple[str, ...], str] = ("data_parallel",),
     cp_axis_name: Optional[str] = None,
     tp_axis_name: Optional[str] = None,
