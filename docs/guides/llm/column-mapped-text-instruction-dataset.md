@@ -80,7 +80,7 @@ print(local_ds[0].keys())   # dict_keys(['input_ids', 'labels', 'attention_mask'
 ```
 
 You can configure the dataset entirely from your recipe YAML. For example:
-```text
+```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
   path_or_dataset_id:
