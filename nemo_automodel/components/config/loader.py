@@ -556,9 +556,7 @@ class ConfigNode:
             return repr(obj)
         return dotted
 
-    def to_yaml_dict(
-        self, *, resolve_env: bool = False, redact_sensitive: bool = False, use_orig_values: bool = False
-    ):
+    def to_yaml_dict(self, *, resolve_env: bool = False, redact_sensitive: bool = False, use_orig_values: bool = False):
         """
         Convert configuration to a YAML-ready dictionary:
         - Preserves typed scalars (ints, floats, bools)
@@ -604,9 +602,7 @@ class ConfigNode:
             return value
 
         # Walk live attributes to preserve translated scalars
-        out = {
-            k: _convert(k, v) for k, v in self.__dict__.items() if k not in ("raise_on_missing_attr", "_raw_config")
-        }
+        out = {k: _convert(k, v) for k, v in self.__dict__.items() if k not in ("raise_on_missing_attr", "_raw_config")}
         if resolve_env:
             out = resolve_yaml_env_vars(out)
         if redact_sensitive:
