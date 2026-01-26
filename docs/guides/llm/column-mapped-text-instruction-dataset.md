@@ -69,7 +69,7 @@ with the simple schema `{instruction, output}`.  A few sample rows:
 {"instruction": "Summarize the planet Neptune.", "output": "Neptune is the eighth planet from the Sun."}
 ```
 
-You can load it using python code like:
+You can load it using Python code like:
 
 ```python
 local_ds = ColumnMappedTextInstructionDataset(
