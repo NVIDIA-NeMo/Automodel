@@ -138,11 +138,18 @@ jobs:
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
       && !cancelled()
-    uses: ./.github/workflows/_build_container.yml
-    with:
-      environment_name: "nemo-ci"
-      repo_name: "Automodel"
-      runner_name: self-hosted-nemo
+    runs-on: self-hosted-nemo
+    environment: nemo-ci
+    steps:
+      - name: main
+        uses: ./.github/workflows/_build_container.yml
+        with:
+          repo_name: "Automodel"
+          has-azure-credentials: "true"
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          PAT: ${{ secrets.PAT }}
 
   cicd-unit-tests:
     strategy:
