@@ -73,7 +73,7 @@ You can load it using Python code like:
 
 ```python
 local_ds = ColumnMappedTextInstructionDataset(
-    path_or_dataset_id=["/data/my_corpus_1.jsonl", "/data/my_corpus_2.jsonl"]  # can also be a single path (string)
+    path_or_dataset_id=["/data/my_corpus_1.jsonl", "/data/my_corpus_2.jsonl"], # can also be a single path (string)
     column_mapping={
         "question": "instruction",
         "answer": "output",
