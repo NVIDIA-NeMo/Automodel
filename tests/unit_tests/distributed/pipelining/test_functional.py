@@ -150,7 +150,7 @@ class TestGenerateHfModelFqnPerModelPart:
 
     def test_include_multimodal_encoders(self):
         """Test that multimodal encoder suffixes are included in stage 0 when enabled."""
-        from nemo_automodel.components.utils.model_utils import MULTIMODAL_SUFFIXES
+        from nemo_automodel.components.distributed.pipelining.hf_utils import MULTIMODAL_SUFFIXES
 
         result = generate_hf_model_fqn_per_model_part(
             num_stages=2,
@@ -163,7 +163,7 @@ class TestGenerateHfModelFqnPerModelPart:
 
     def test_exclude_multimodal_encoders(self):
         """Test that multimodal encoder suffixes are excluded when disabled."""
-        from nemo_automodel.components.utils.model_utils import MULTIMODAL_SUFFIXES
+        from nemo_automodel.components.distributed.pipelining.hf_utils import MULTIMODAL_SUFFIXES
 
         result = generate_hf_model_fqn_per_model_part(
             num_stages=2,
