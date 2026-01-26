@@ -2907,6 +2907,7 @@ fa = [
 ]
 moe = [
     { name = "deep-ep" },
+    { name = "flash-attn", marker = "sys_platform == 'never'" },
     { name = "nv-grouped-gemm" },
     { name = "onnxscript" },
     { name = "transformer-engine", extra = ["pytorch"] },
@@ -2964,7 +2965,6 @@ requires-dist = [
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "deep-ep", marker = "extra == 'moe'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=e3908bf5bd0cc6265bcb225d15cd8c996d4759ef" },
     { name = "diffusers" },
-    { name = "flash-attn", marker = "extra == 'cuda'", specifier = "<=2.8.3" },
     { name = "flash-attn", marker = "extra == 'fa'", specifier = "<=2.8.3" },
     { name = "flash-linear-attention", marker = "extra == 'extra'" },
     { name = "ftfy" },
@@ -2973,7 +2973,9 @@ requires-dist = [
     { name = "megatron-fsdp" },
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'" },
     { name = "mlflow" },
+    { name = "nemo-automodel", extras = ["cuda"], marker = "extra == 'moe'" },
     { name = "nemo-automodel", extras = ["extra"], marker = "extra == 'all'" },
+    { name = "nemo-automodel", extras = ["fa"], marker = "extra == 'cuda'" },
     { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'all'" },
     { name = "numba", marker = "extra == 'vlm'" },
     { name = "numpy", marker = "extra == 'vlm'" },
@@ -2995,11 +2997,10 @@ requires-dist = [
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm'" },
     { name = "torchdata" },
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'cuda'", specifier = "==2.10.0" },
-    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'moe'", specifier = "==2.10.0" },
     { name = "transformers", specifier = "<=4.57.5" },
     { name = "wandb" },
 ]
-provides-extras = ["cuda", "vlm", "fa", "moe", "extra", "all"]
+provides-extras = ["fa", "cuda", "extra", "moe", "vlm", "all"]
 
 [package.metadata.requires-dev]
 build = [
