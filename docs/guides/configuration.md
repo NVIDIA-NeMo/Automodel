@@ -107,7 +107,7 @@ Printing a **leaf value** (for example, `print(cfg.dataset.delta_storage_options
 
 ---
 
-## SLURM (`automodel` CLI) configs
+## Configure Slurm (`automodel` CLI)
 
 The `automodel` CLI loads YAML via `yaml.safe_load()` and then extracts the `slurm:` section.
 Since the `slurm:` dict is not wrapped into a `ConfigNode`, **env placeholders are passed through as-is**. This lets you defer expansion to job runtime (and avoids embedding secrets into generated scripts).
