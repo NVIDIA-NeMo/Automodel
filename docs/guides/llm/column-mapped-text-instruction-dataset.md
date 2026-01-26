@@ -82,7 +82,7 @@ local_ds = ColumnMappedTextInstructionDataset(
     answer_only_loss_mask=False,  # compute loss over full sequence
 )
 
-print(remote_ds[0].keys())  # {'context', 'question', 'answer'}
+print(local_ds[0].keys())   # {'question', 'answer'}
 print(local_ds[0].keys())   # {'question', 'answer'}
 ```
 
