@@ -57,7 +57,7 @@ By default, resolving targets is restricted:
 
 ---
 
-## Environment variable interpolation in YAML
+## Interpolate Environment Variables in YAML
 
 NeMo Automodel supports env var interpolation inside YAML **string values**.
 
