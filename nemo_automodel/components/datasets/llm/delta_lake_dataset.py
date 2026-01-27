@@ -692,6 +692,7 @@ class DeltaLakeIterator:
         self._shard_info = (num_shards, index)
         return self
 
+
 class DeltaLakeDataset:
     """HuggingFace datasets-compatible wrapper for Delta Lake tables.
 
@@ -793,6 +794,7 @@ class DeltaLakeDataset:
         # Create a wrapper that limits iteration
         limited = _LimitedDeltaLakeDataset(self, n)
         return limited  # type: ignore[return-value]
+
 
 class _LimitedDeltaLakeDataset:
     """Internal wrapper to limit a Delta Lake dataset to n samples."""

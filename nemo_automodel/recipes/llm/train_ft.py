@@ -515,12 +515,11 @@ def build_dataloader(
         if isinstance(ds, IterableDataset):
             if callable(getattr(ds, "shard", None)):
                 ds = ds.shard(dp_world_size, dp_rank)
-                logging.info(
-                    f"Sharded IterableDataset via dataset.shard: world_size={dp_world_size}, rank={dp_rank}"
-                )
+                logging.info(f"Sharded IterableDataset via dataset.shard: world_size={dp_world_size}, rank={dp_rank}")
             elif hasattr(ds, "dataset"):
                 # HuggingFace streaming datasets: split by file shards when possible.
                 from datasets.distributed import split_dataset_by_node
+
                 assert hasattr(ds, "dataset"), "dataset must have a dataset attribute"
                 ds.dataset = split_dataset_by_node(ds.dataset, world_size=dp_world_size, rank=dp_rank)
                 logging.info(f"Sharded dataset via split_dataset_by_node: world_size={dp_world_size}")
