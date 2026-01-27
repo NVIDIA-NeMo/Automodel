@@ -43,7 +43,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
   backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    _target_: nemo_automodel.components.model.common.BackendConfig
     attn: te
     linear: te
     rms_norm: te

@@ -40,7 +40,7 @@ model:
   pretrained_model_name_or_path: Qwen/Qwen3-VL-30B-A3B-Instruct
   #example of setting backend to sdpa
   backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    _target_: nemo_automodel.components.model.common.BackendConfig
     attn: sdpa
     linear: te
     rms_norm: te
