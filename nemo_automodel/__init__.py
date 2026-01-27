@@ -11,56 +11,48 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import importlib
 
 from .package_info import __package_name__, __version__
 
-__all__ = [
-    "recipes",
-    "shared",
-    "components",
-    "__version__",
-    "__package_name__",
-]
+# Keep the base package import lightweight.
+# Heavy dependencies (e.g., torch/transformers) are intentionally imported lazily
+# via __getattr__ so importing tokenizers doesn't pull in the full training stack.
 
-# Promote NeMoAutoModelForCausalLM, AutoModelForImageTextToText into the top level
-# to enable: `from nemo_automodel import NeMoAutoModelForCausalLM`
-try:
-    # adjust this import path if your class lives somewhere else
-    from nemo_automodel._transformers.auto_model import (
-        NeMoAutoModelForCausalLM,
-        NeMoAutoModelForImageTextToText,
-        NeMoAutoModelForSequenceClassification,
-        NeMoAutoModelForTextToWaveform,
-    )  # noqa: I001
+_SUBMODULES = {"recipes", "shared", "components"}
 
-    globals()["NeMoAutoModelForCausalLM"] = NeMoAutoModelForCausalLM
-    globals()["NeMoAutoModelForImageTextToText"] = NeMoAutoModelForImageTextToText
-    globals()["NeMoAutoModelForSequenceClassification"] = NeMoAutoModelForSequenceClassification
-    globals()["NeMoAutoModelForTextToWaveform"] = NeMoAutoModelForTextToWaveform
-    __all__.append("NeMoAutoModelForCausalLM")
-    __all__.append("NeMoAutoModelForImageTextToText")
-    __all__.append("NeMoAutoModelForSequenceClassification")
-    __all__.append("NeMoAutoModelForTextToWaveform")
-except:
-    # optional dependency might be missing,
-    # leave the name off the module namespace so other imports still work
-    pass
+_LAZY_ATTRS: dict[str, tuple[str, str]] = {
+    "NeMoAutoModelForCausalLM": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForCausalLM"),
+    "NeMoAutoModelForImageTextToText": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForImageTextToText"),
+    "NeMoAutoModelForSequenceClassification": (
+        "nemo_automodel._transformers.auto_model",
+        "NeMoAutoModelForSequenceClassification",
+    ),
+    "NeMoAutoModelForTextToWaveform": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForTextToWaveform"),
+    "NeMoAutoTokenizer": ("nemo_automodel._transformers.auto_tokenizer", "NeMoAutoTokenizer"),
+}
+
+__all__ = sorted([*_SUBMODULES, "__version__", "__package_name__", *_LAZY_ATTRS.keys()])
 
 
 def __getattr__(name: str):
     """
-    Lazily import and cache submodules listed in __all__ when accessed.
+    Lazily import and cache selected submodules / exported symbols when accessed.
 
     Raises:
         AttributeError if the name isn’t in __all__.
     """
-    if name in __all__:
-        # import submodule on first access
+    if name in _SUBMODULES:
         module = importlib.import_module(f"{__name__}.{name}")
-        # cache it in globals() so future lookups do not re-import
         globals()[name] = module
         return module
+    if name in _LAZY_ATTRS:
+        module_name, attr_name = _LAZY_ATTRS[name]
+        module = importlib.import_module(module_name)
+        attr = getattr(module, attr_name)
+        globals()[name] = attr
+        return attr
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

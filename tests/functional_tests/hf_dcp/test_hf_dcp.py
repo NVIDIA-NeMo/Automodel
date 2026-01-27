@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from tests.utils.test_utils import run_test_script
+import shutil
 
 TEST_FOLDER = "hf_dcp"
 DCP_FSDP2_CHECKPOINT_FILENAME = "L2_DCP_FSDP2_Checkpoint.sh"
@@ -20,7 +21,11 @@ DCP_VLM_FSDP2_CHECKPOINT_FILENAME = "L2_DCP_VLM_FSDP2_Checkpoint.sh"
 HF_DCP_FSDP2_CHECKPOINT_FILENAME = "L2_HF_DCP_FSDP2_Checkpoint.sh"
 HF_DCP_VLM_FSDP2_CHECKPOINT_FILENAME = "L2_HF_DCP_VLM_FSDP2_Checkpoint.sh"
 HF_DCP_PP2_CHECKPOINT_FILENAME = "L2_DCP_PP2_Checkpoint.sh"
-import shutil
+# hf_consolidated_fsdp
+HF_CONSOLIDATED_FSDP2_LLM_FILENAME = "L2_HF_Consolidated_FSDP2_LLM_Checkpoint.sh"
+HF_CONSOLIDATED_FSDP2_VLM_FILENAME = "L2_HF_Consolidated_FSDP2_VLM_Checkpoint.sh"
+HF_CONSOLIDATED_FSDP2_LLM_SCALAR_WEIGHT_FILENAME = "L2_HF_Consolidated_FSDP2_LLM_Checkpoint_Scalar_Param.sh"
+HF_CONSOLIDATED_PP2_LLM_FILENAME = "L2_HF_Consolidated_PP2_LLM_Checkpoint.sh"
 
 
 class TestHFDCP:
@@ -55,6 +60,34 @@ class TestHFDCP:
     def test_hf_dcp_pp2_checkpoint(self):
         try:
             run_test_script(TEST_FOLDER, HF_DCP_PP2_CHECKPOINT_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_hf_consolidated_fsdp2_llm_checkpoint(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_CONSOLIDATED_FSDP2_LLM_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_hf_consolidated_fsdp2_vlm_checkpoint(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_CONSOLIDATED_FSDP2_VLM_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_hf_consolidated_fsdp2_llm_checkpoint_scalar_weight(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_CONSOLIDATED_FSDP2_LLM_SCALAR_WEIGHT_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_hf_consolidated_pp2_llm_checkpoint(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_CONSOLIDATED_PP2_LLM_FILENAME)
         finally:
             # remove the checkpoint directory
             shutil.rmtree("checkpoints/", ignore_errors=True)

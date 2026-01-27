@@ -12,21 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Functional tests for gradient clipping with various parallelism configurations.
-
-These tests validate that _clip_grad_norm_impl works correctly with
-TP, PP, EP, and combinations thereof.
-"""
-
 from tests.utils.test_utils import run_test_script
 
-TEST_FOLDER = "clip_grad_norm"
-TEST_FILENAME = "L2_ClipGradNorm_Test.sh"
+TEST_FOLDER = "llm_pretrain_and_kd/loss/"
+TE_PARALLEL_CE_DTENSOR_TP2_FILENAME = "L2_TEParallelCrossEntropy_DTENSOR_TP2.sh"
 
 
-class TestClipGradNorm:
-    """Test suite for gradient clipping with various parallelism strategies."""
+class TestTEParallelCrossEntropyDTensor:
+    def test_te_parallel_cross_entropy_dtensor_tp2(self):
+        run_test_script(TEST_FOLDER, TE_PARALLEL_CE_DTENSOR_TP2_FILENAME)
 
-    def test_clip_grad_norm_all_configs(self):
-        """Test gradient clipping with all parallelism configurations."""
-        run_test_script(TEST_FOLDER, TEST_FILENAME)

@@ -59,6 +59,7 @@ class ExpertParallel(ParallelStyle):
 
         for name, param in module.named_parameters(recurse=False):
             dist_param = nn.Parameter(distribute_tensor(param, device_mesh, [Shard(0)]))
+            dist_param.requires_grad = param.requires_grad
             module.register_parameter(name, dist_param)
 
         if isinstance(module, GroupedExpertsDeepEP):
@@ -90,8 +91,32 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh):
             )
 
 
-def apply_ac(model: nn.Module, ignore_router: bool = False, hidden_size: int = 7168, num_experts: int = 256):
-    """Apply activation checkpointing to the model."""
+def apply_ac(
+    model: nn.Module,
+    ignore_router: bool = False,
+    hidden_size: int | None = None,
+    num_experts: int | None = None,
+):
+    """Apply activation checkpointing to the model.
+
+    Args:
+        model: The model to apply activation checkpointing to.
+        ignore_router: If True, uses selective checkpointing that saves router outputs.
+        hidden_size: Hidden dimension size. If None, derived from model.config.hidden_size.
+        num_experts: Number of routed experts. If None, derived from model.config.num_experts.
+    """
+    # Derive hidden_size and num_experts from model.config if not provided
+    if hidden_size is None:
+        if hasattr(model, "config") and hasattr(model.config, "hidden_size"):
+            hidden_size = model.config.hidden_size
+        else:
+            raise ValueError("hidden_size must be provided or model must have config.hidden_size attribute")
+
+    if num_experts is None:
+        if hasattr(model, "config") and hasattr(model.config, "num_experts"):
+            num_experts = model.config.num_experts
+        else:
+            raise ValueError("num_experts must be provided or model must have config.num_experts attribute")
 
     def _custom_policy(ctx, func, *args, **kwargs):
         if func == torch.ops.aten.mm.default:
@@ -123,7 +148,6 @@ def apply_ac(model: nn.Module, ignore_router: bool = False, hidden_size: int = 7
 def apply_fsdp(
     model: torch.nn.Module,
     fsdp_mesh: DeviceMesh,
-    pp_enabled: bool,
     ep_enabled: bool,
     ep_shard_enabled: bool,
     ep_shard_mesh: DeviceMesh | None = None,
@@ -138,7 +162,10 @@ def apply_fsdp(
 
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=torch.bfloat16
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.bfloat16,
+            cast_forward_inputs=True,
         )
 
     fully_shard_default = functools.partial(
@@ -244,13 +271,13 @@ def parallelize_model(
     world_mesh: DeviceMesh,
     moe_mesh: DeviceMesh | None,
     *,
-    pp_enabled: bool,
     dp_axis_names: tuple[str, ...],
     cp_axis_name: str | None = None,
     tp_axis_name: str | None = None,
     ep_axis_name: str | None = None,
     ep_shard_axis_names: tuple[str, ...] | None = None,
     activation_checkpointing: bool = False,
+    ignore_router_for_ac: bool = False,
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
@@ -273,7 +300,7 @@ def parallelize_model(
         apply_ep(model, moe_mesh[ep_axis_name])
 
     if activation_checkpointing:
-        apply_ac(model)
+        apply_ac(model, ignore_router=ignore_router_for_ac)
 
     if ep_shard_axis_names is not None:
         ep_shard_mesh = moe_mesh[ep_shard_axis_names]
@@ -286,7 +313,6 @@ def parallelize_model(
         apply_fsdp(
             model,
             fsdp_mesh,
-            pp_enabled=pp_enabled,
             ep_enabled=ep_enabled,
             ep_shard_enabled=ep_shard_mesh is not None and ep_shard_mesh.size() > 1,
             ep_shard_mesh=ep_shard_mesh,

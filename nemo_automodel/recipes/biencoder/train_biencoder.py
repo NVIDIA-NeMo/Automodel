@@ -26,6 +26,7 @@ from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -39,6 +40,7 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -416,7 +418,23 @@ class TrainBiencoderRecipe(BaseRecipe):
                 "Pipeline parallelism is not yet supported for biencoder models. "
                 "Please disable pipeline parallelism in the distributed config."
             )
-        model = self.cfg.model.instantiate()
+
+        with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
+            model = self.cfg.model.instantiate()
+
+            # Apply PEFT (LoRA) if configured
+            if self.peft_config is not None:
+                tp_size = self.cfg.get("distributed.tp_size", 1)
+                if tp_size > 1:
+                    logger.info("Disabling Triton with TP ({})".format(tp_size))
+                    self.peft_config.use_triton = False
+                if autopipeline is not None:
+                    logger.info("Enabling PEFT with Pipeline Parallelism")
+                    logger.info("Disabling Triton with Pipeline Parallelism Enabled.")
+                    self.peft_config.use_triton = False
+
+                logger.info("Applying LoRA to biencoder model")
+                apply_lora_to_linear_modules(model, self.peft_config, quantization_config=None)
 
         # Apply parallelism wrapper if needed
         if self.model_wrapper is not None:
@@ -440,6 +458,9 @@ class TrainBiencoderRecipe(BaseRecipe):
         trainable_params = list(filter(lambda x: x.requires_grad, self.model_parts[0].parameters()))
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         self.optimizer = [self.cfg.optimizer.instantiate(params=trainable_params)]
+
+        # Print trainable parameters after model has been moved to device
+        trainable_params, total_params = print_trainable_parameters(self.model_parts[0])
 
         # Build tokenizer
         self.tokenizer = self.cfg.tokenizer.instantiate()
@@ -728,10 +749,12 @@ class TrainBiencoderRecipe(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        if wandb.run is not None:
-            wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+        # Log to remote services (WandB) according to step_scheduler frequency
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
+                wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
 
-        # JSONL training log
+        # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
 
         logging.info(
@@ -757,6 +780,7 @@ class TrainBiencoderRecipe(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
+        # Always log validation to remote services (validation is already infrequent via val_every_steps)
         if wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
 

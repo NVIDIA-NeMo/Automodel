@@ -23,7 +23,10 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
-from nemo_automodel.components.models.deepseek_v3.rope_utils import apply_rotary_emb, yarn_get_mscale
+from nemo_automodel.components.models.deepseek_v3.rope_utils import (
+    apply_rotary_emb_qk,
+    yarn_get_mscale,
+)
 from nemo_automodel.components.moe.utils import (
     BackendConfig,
     initialize_linear_module,
@@ -46,6 +49,7 @@ class MLA(nn.Module):
         self.v_head_dim = config.v_head_dim
 
         self.backend = backend
+        self.rope_fusion = backend.rope_fusion
         attn_impl = backend.attn
         linear_impl = backend.linear
         rms_norm_impl = backend.rms_norm
@@ -136,14 +140,34 @@ class MLA(nn.Module):
             q = q.view(bsz, local_seq_len, self.n_heads, self.qk_head_dim)
 
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_pe = apply_rotary_emb(q_pe, freqs_cis, qkv_format, unsqueeze_dim=None)
-
-        q = torch.cat([q_nope, q_pe], dim=-1)
 
         kv = self.kv_a_proj_with_mqa(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv = self.kv_a_layernorm(kv)
-        k_pe = apply_rotary_emb(k_pe, freqs_cis, qkv_format, unsqueeze_dim=2)
+
+        # For MLA, k_pe needs an extra head dimension for apply_rotary_emb_qk
+        # k_pe shape: (B, S, rope_dim) -> (B, S, 1, rope_dim) for bshd
+        # k_pe shape: (T, rope_dim) -> (T, 1, rope_dim) for thd
+        head_unsqueeze_dim = 2 if qkv_format == "bshd" else 1
+        k_pe = k_pe.unsqueeze(head_unsqueeze_dim)
+
+        # Apply rotary embeddings to q_pe and k_pe
+        cu_seqlens = attn_kwargs.get("cu_seqlens", None)
+        q_pe, k_pe = apply_rotary_emb_qk(
+            q_pe,
+            k_pe,
+            freqs_cis,
+            format=qkv_format,
+            rope_fusion=self.rope_fusion,
+            cu_seqlens=cu_seqlens,
+            cp_size=attn_kwargs.get("cp_size", 1),
+            cp_rank=attn_kwargs.get("cp_rank", 0),
+        )
+
+        # Remove the head dimension we added to k_pe
+        k_pe = k_pe.squeeze(head_unsqueeze_dim)
+
+        q = torch.cat([q_nope, q_pe], dim=-1)
 
         kv = self.kv_b_proj(kv)
         if qkv_format == "thd":

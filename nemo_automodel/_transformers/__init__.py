@@ -12,17 +12,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 
-from nemo_automodel._transformers.auto_model import (
-    NeMoAutoModelForCausalLM,
-    NeMoAutoModelForImageTextToText,
-    NeMoAutoModelForSequenceClassification,
-    NeMoAutoModelForTextToWaveform,
-)
+# Keep this package lightweight: importing `nemo_automodel._transformers.*` should not
+# automatically pull in torch + all model code unless a specific symbol is accessed.
+
+_LAZY_ATTRS: dict[str, tuple[str, str]] = {
+    "NeMoAutoModelForCausalLM": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForCausalLM"),
+    "NeMoAutoModelForImageTextToText": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForImageTextToText"),
+    "NeMoAutoModelForSequenceClassification": (
+        "nemo_automodel._transformers.auto_model",
+        "NeMoAutoModelForSequenceClassification",
+    ),
+    "NeMoAutoModelForTextToWaveform": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForTextToWaveform"),
+    "NeMoAutoTokenizer": ("nemo_automodel._transformers.auto_tokenizer", "NeMoAutoTokenizer"),
+}
 
 __all__ = [
     "NeMoAutoModelForCausalLM",
     "NeMoAutoModelForImageTextToText",
     "NeMoAutoModelForSequenceClassification",
     "NeMoAutoModelForTextToWaveform",
+    "NeMoAutoTokenizer",
 ]
+
+
+def __getattr__(name: str):
+    if name in _LAZY_ATTRS:
+        module_name, attr_name = _LAZY_ATTRS[name]
+        module = importlib.import_module(module_name)
+        attr = getattr(module, attr_name)
+        globals()[name] = attr
+        return attr
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(__all__)

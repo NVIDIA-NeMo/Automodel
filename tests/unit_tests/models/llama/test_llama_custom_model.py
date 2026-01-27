@@ -21,7 +21,7 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM, LlamaConfig
 
-from nemo_automodel.components.models.llama.model import build_llama_model
+from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -65,18 +65,22 @@ class TestLlamaModel:
         # Load HF model
         llama_model_hf = (
             AutoModelForCausalLM.from_pretrained(
-                tiny_llama_checkpoint, attn_implementation="eager", torch_dtype=torch.bfloat16
+                pretrained_model_name_or_path=tiny_llama_checkpoint,
+                attn_implementation="eager",
+                torch_dtype=torch.bfloat16,
             )
             .to("cuda")
-            .to(torch.bfloat16)  # need to manual cast to bfloat16 since HF initialize weights in float32 dtype
-        )
+            .to(torch.bfloat16)
+        )  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
+        llama_model_hf.eval()
 
         # Build custom model
-        llama_model_custom = build_llama_model(
+        llama_model_custom = NeMoAutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path=tiny_llama_checkpoint,
             attn_implementation="eager",
             torch_dtype=torch.bfloat16,
         ).to("cuda")
+        llama_model_custom.eval()
 
         # Verify parameter counts match
         num_params_hf = sum(p.numel() for p in llama_model_hf.parameters())
@@ -90,13 +94,25 @@ class TestLlamaModel:
         custom_state_dict_from_hf = adapter.from_hf(hf_state_dict)
         llama_model_custom.load_state_dict(custom_state_dict_from_hf, strict=True)
 
+        s = adapter.to_hf(llama_model_custom.state_dict())
+
+        for n1, p1 in hf_state_dict.items():
+            p2 = s[n1]
+            assert p1.shape == p2.shape, f"Parameter shape mismatch: {p1.shape} != {p2.shape}"
+            assert p1.dtype == p2.dtype, f"Parameter dtype mismatch: {p1.dtype} != {p2.dtype}"
+            assert p1.device == p2.device, f"Parameter device mismatch: {p1.device} != {p2.device}"
+            assert p1.requires_grad == p2.requires_grad, (
+                f"Parameter requires_grad mismatch: {p1.requires_grad} != {p2.requires_grad}"
+            )
+            assert torch.allclose(p1, p2, atol=1e-5, rtol=1e-5), f"Parameter mismatch: {p1} != {p2}"
+
         # Generate test inputs
         input_ids = torch.randint(0, config.vocab_size, (1, 10)).to("cuda")
         attention_mask = torch.ones((1, 10)).to("cuda")
 
         # Compare HF → Custom outputs
         with torch.no_grad():
-            output_hf = llama_model_hf(input_ids, attention_mask)
+            output_hf = llama_model_hf(input_ids.clone(), attention_mask.clone())
             output_custom = llama_model_custom(input_ids, attention_mask)
 
         np.testing.assert_allclose(
@@ -118,7 +134,8 @@ class TestLlamaModel:
             )
             .to("cuda")
             .to(torch.bfloat16)
-        )
+        )  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
+        llama_model_hf_converted.eval()
         llama_model_hf_converted.load_state_dict(hf_state_dict_from_custom, strict=True)
 
         # Compare Custom → HF outputs
@@ -141,7 +158,7 @@ class TestLlamaModel:
         # Load HF model and get state dict
         llama_model_hf = AutoModelForCausalLM.from_pretrained(
             tiny_llama_checkpoint, attn_implementation="eager", torch_dtype=torch.bfloat16
-        )
+        ).to(torch.bfloat16)  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
         hf_state_dict = llama_model_hf.state_dict()
 
         # Convert to custom format
@@ -161,7 +178,7 @@ class TestLlamaModel:
     def test_state_dict_adapter_to_hf(self, tiny_llama_checkpoint):
         """Test converting custom model state dict back to HF format."""
         # Build custom model (which uses adapter internally to load from HF checkpoint)
-        llama_model_custom = build_llama_model(
+        llama_model_custom = NeMoAutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path=tiny_llama_checkpoint,
             attn_implementation="eager",
             torch_dtype=torch.bfloat16,
@@ -187,11 +204,12 @@ class TestLlamaModel:
             export_path = os.path.join(tmpdir, "hf_checkpoint")
 
             # Build custom model
-            llama_model_custom = build_llama_model(
+            llama_model_custom = NeMoAutoModelForCausalLM.from_pretrained(
                 pretrained_model_name_or_path=tiny_llama_checkpoint,
                 attn_implementation="eager",
                 torch_dtype=torch.bfloat16,
             ).to("cuda")
+            llama_model_custom.eval()
 
             # Generate test input
             input_ids = torch.randint(0, config.vocab_size, (1, 10)).to("cuda")
@@ -213,7 +231,8 @@ class TestLlamaModel:
                 )
                 .to("cuda")
                 .to(torch.bfloat16)
-            )
+            )  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
+            llama_model_hf_loaded.eval()
 
             # Compare outputs
             with torch.no_grad():

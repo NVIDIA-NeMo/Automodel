@@ -22,6 +22,10 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+
+from nemo_automodel.shared.torch_patches import apply_torch_patches
+
+apply_torch_patches()
 import torch.distributed as dist
 import torch.nn as nn
 import yaml
@@ -36,7 +40,6 @@ except ImportError:
     # < v5
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
-from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.checkpoint.checkpointing import save_config
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
@@ -82,7 +85,7 @@ def is_tokenizer(object):
     Returns:
         bool: returns True if object is a tokenizer or VLM processor.
     """
-    return isinstance(object, (PreTrainedTokenizerBase, ProcessorMixin, NeMoAutoTokenizer))
+    return isinstance(object, (PreTrainedTokenizerBase, ProcessorMixin))
 
 
 def is_lr_scheduler(object):
@@ -302,7 +305,12 @@ class BaseRecipe:
         ckpt_root_abs = os.path.abspath(ckpt_root)
         target_abs = os.path.abspath(target_dir)
         relative_target = os.path.relpath(target_abs, start=ckpt_root_abs)
-        os.symlink(relative_target, link_path)
+        try:
+            os.symlink(relative_target, link_path)
+        except OSError:
+            # Fallback: write a text file containing the target path if symlinks aren't supported
+            with open(f"{link_path}.txt", "w") as f:
+                f.write(relative_target)
 
     def _update_latest_symlink(self, target_dir: str) -> None:
         """
@@ -540,7 +548,7 @@ def _find_latest_checkpoint(checkpoint_dir):
     Resolve the most recent checkpoint directory.
 
     Preference order:
-      1) Valid LATEST symlink under checkpoint_dir
+      1) Valid LATEST symlink or txt file under checkpoint_dir
       2) Highest step directory under checkpoint_dir matching *step_*
 
     Returns:
@@ -550,17 +558,26 @@ def _find_latest_checkpoint(checkpoint_dir):
     if not root.exists():
         return
 
-    # Try LATEST symlink first
+    # Try LATEST symlink or txt pointer first
     latest_link = os.path.join(os.fspath(root), "LATEST")
+    resolved = None
     if os.path.islink(latest_link):
         try:
             resolved = os.readlink(latest_link)
-            if not os.path.isabs(resolved):
-                resolved = os.path.abspath(os.path.join(os.fspath(root), resolved))
-            if os.path.isdir(resolved):
-                return resolved
         except OSError:
             pass
+    elif os.path.isfile(latest_link + ".txt"):
+        try:
+            with open(latest_link + ".txt", "r") as f:
+                resolved = f.read().strip()
+        except OSError:
+            pass
+
+    if resolved:
+        if not os.path.isabs(resolved):
+            resolved = os.path.abspath(os.path.join(os.fspath(root), resolved))
+        if os.path.isdir(resolved):
+            return resolved
 
     # Fallback to scanning
     checkpoint_files = list(root.glob("*step_*"))

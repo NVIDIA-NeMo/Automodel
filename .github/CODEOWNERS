@@ -1,8 +1,12 @@
 .github/ @nvidia-nemo/automation
+codecov.yml @nvidia-nemo/automation
 docker/ @nvidia-nemo/automation
 pyproject.toml @nvidia-nemo/automation
 
 docs @akoumpa @jgerh
-nemo_automodel @akoumpa @HuiyingLi @adil-a @hemildesai @ybabakhin @shan-nvidia @rnyak @oliverholworthy @gabrielspmoreira
-examples @akoumpa @HuiyingLi @adil-a @hemildesai @ybabakhin @shan-nvidia @rnyak @oliverholworthy @gabrielspmoreira
+nemo_automodel @akoumpa @HuiyingLi @adil-a @hemildesai
+examples @akoumpa @HuiyingLi @adil-a @hemildesai
 README.md @akoumpa @HuiyingLi @snowmanwwg
+
+nemo_automodel/components/datasets/llm/ @akoumpa @adil-a @NVIDIA-NeMo/automodel_retriever_maintainers
+biencoder/ @akoumpa @adil-a @NVIDIA-NeMo/automodel_retriever_maintainers

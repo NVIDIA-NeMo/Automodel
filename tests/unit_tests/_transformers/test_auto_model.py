@@ -103,6 +103,7 @@ class TestNeMoAutoModelForCausalLM:
             # Prepare a fake custom model class and return value
             custom_model_instance = Mock()
             custom_cls = Mock(return_value=custom_model_instance)
+            custom_cls.__name__ = "MockMockMock"
             mock_registry.model_arch_name_to_cls = {"CustomArch": custom_cls}
 
             returned = NeMoAutoModelForCausalLM.from_pretrained("dummy/path")
@@ -130,6 +131,7 @@ class TestNeMoAutoModelForCausalLM:
             # Registry provides a custom class
             custom_model_instance = Mock()
             custom_cls = Mock(return_value=custom_model_instance)
+            custom_cls.__name__ = "MockMockMock"
             mock_registry.model_arch_name_to_cls = {"CustomArch": custom_cls}
 
             returned = NeMoAutoModelForCausalLM.from_config(cfg)
@@ -159,6 +161,7 @@ class TestNeMoAutoModelForCausalLM:
             # Prepare a fake custom model class and return value
             custom_model_instance = Mock()
             custom_cls = Mock(return_value=custom_model_instance)
+            custom_cls.__name__ = "MockMockMock"
             mock_registry.model_arch_name_to_cls = {"CustomArch": custom_cls}
 
             returned = NeMoAutoModelForCausalLM.from_pretrained("dummy/repo-id")
@@ -194,6 +197,7 @@ class TestNeMoAutoModelForCausalLM:
             # Prepare a fake custom model class and return value
             custom_model_instance = Mock()
             custom_cls = Mock(return_value=custom_model_instance)
+            custom_cls.__name__ = "MockMockMock"
             mock_registry.model_arch_name_to_cls = {"CustomArch": custom_cls}
 
             returned = NeMoAutoModelForCausalLM.from_pretrained("dummy/repo-id")
@@ -245,7 +249,8 @@ class TestNeMoAutoModelForCausalLM:
             # Verify AutoConfig.from_pretrained was called with the string
             mock_autoconfig.assert_called_once_with(
                 "hf-internal-testing/tiny-random-gpt2",
-                trust_remote_code=False
+                trust_remote_code=False,
+                attn_implementation="flash_attention_2",
             )
             # Verify the model was returned
             assert model is mock_model
@@ -544,6 +549,7 @@ class TestNeMoAutoModelForCausalLM:
             else:
                 custom_model_instance = Mock()
                 custom_cls = Mock(return_value=custom_model_instance)
+                custom_cls.__name__ = "MockMockMock"
                 mock_registry.model_arch_name_to_cls = {"CustomArch": custom_cls}
 
             mock_hf_loader.return_value = MagicMock(config={})

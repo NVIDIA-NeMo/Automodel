@@ -162,7 +162,11 @@ class Qwen3MoeModel(nn.Module):
 
         # Compute freqs_cis from RotaryEmbedding inv_freq and current position_ids; then concat [cos, sin]
         freqs_cis = position_ids_to_freqs_cis(
-            self.rotary_emb, position_ids, qkv_format=attn_kwargs.get("qkv_format", "bshd")
+            self.rotary_emb,
+            position_ids,
+            qkv_format=attn_kwargs.get("qkv_format", "bshd"),
+            for_fused_rope=self.backend.rope_fusion,
+            cp_size=attn_kwargs.get("cp_size", 1),
         )
 
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
