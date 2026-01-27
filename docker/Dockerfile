@@ -134,6 +134,8 @@ RUN cd /opt/Automodel && \
     fi && \
     uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups
 
+WORKDIR /opt/Automodel
+
 COPY <<EOF /opt/venv/env.sh
 export UV_PROJECT_ENVIRONMENT=/opt/venv
 export PATH="/opt/venv/bin:$PATH"
