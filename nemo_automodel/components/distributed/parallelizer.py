@@ -52,6 +52,7 @@ def _is_transformers_v5_or_higher() -> bool:
     major_version = int(version.split(".")[0])
     return major_version >= 5
 
+
 from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
 from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
 from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
