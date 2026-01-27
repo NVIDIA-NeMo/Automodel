@@ -338,7 +338,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     hidden_states,
                     past_key_values if use_cache else None,
                     all_hidden_states,
-                    None if not output_attentions else None,
                 ]
                 if v is not None
             )
