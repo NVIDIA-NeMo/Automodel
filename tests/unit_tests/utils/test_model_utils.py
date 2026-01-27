@@ -241,3 +241,111 @@ def test_init_empty_weights_torchao_branch_with_fake_weight(monkeypatch):
     assert getattr(m.p, "_linear_mm_config") == "cfg"
     assert getattr(m.p, "_dtype") == torch.float32
     assert isinstance(getattr(m.p, "_precomputed_scale"), torch.Tensor)
+
+
+class TestGetTextModule:
+    """Tests for get_text_module function."""
+
+    def test_returns_language_model_when_present(self):
+        """Test that language_model attribute is returned when present."""
+        class VLMModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Linear(10, 10)
+                self.visual = nn.Linear(5, 5)
+
+        model = VLMModel()
+        result = model_utils.get_text_module(model)
+        assert result is model.language_model
+
+    def test_returns_text_model_when_present(self):
+        """Test that text_model attribute is returned when present."""
+        class VLMModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.text_model = nn.Linear(10, 10)
+                self.vision_encoder = nn.Linear(5, 5)
+
+        model = VLMModel()
+        result = model_utils.get_text_module(model)
+        assert result is model.text_model
+
+    def test_returns_text_decoder_when_present(self):
+        """Test that text_decoder attribute is returned when present."""
+        class VLMModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.text_decoder = nn.Linear(10, 10)
+
+        model = VLMModel()
+        result = model_utils.get_text_module(model)
+        assert result is model.text_decoder
+
+    def test_returns_model_when_no_text_attr(self):
+        """Test that model itself is returned when no text module attribute exists."""
+        class SimpleModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.Linear(10, 10)
+
+        model = SimpleModel()
+        result = model_utils.get_text_module(model)
+        assert result is model
+
+    def test_returns_none_when_model_is_none(self):
+        """Test that None is returned when model is None."""
+        result = model_utils.get_text_module(None)
+        assert result is None
+
+    def test_priority_order_language_model_first(self):
+        """Test that language_model has priority over text_model."""
+        class VLMModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Linear(10, 10)
+                self.text_model = nn.Linear(5, 5)
+
+        model = VLMModel()
+        result = model_utils.get_text_module(model)
+        assert result is model.language_model
+
+    def test_skips_none_attribute(self):
+        """Test that None attributes are skipped."""
+        class VLMModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = None
+                self.text_model = nn.Linear(10, 10)
+
+        model = VLMModel()
+        result = model_utils.get_text_module(model)
+        assert result is model.text_model
+
+
+class TestConstants:
+    """Tests for TEXT_MODULE_ATTRS and MULTIMODAL_SUFFIXES constants."""
+
+    def test_text_module_attrs_contains_expected_values(self):
+        """Test TEXT_MODULE_ATTRS contains the expected attribute names."""
+        assert "language_model" in model_utils.TEXT_MODULE_ATTRS
+        assert "text_model" in model_utils.TEXT_MODULE_ATTRS
+        assert "text_decoder" in model_utils.TEXT_MODULE_ATTRS
+
+    def test_multimodal_suffixes_contains_vision_attrs(self):
+        """Test MULTIMODAL_SUFFIXES contains vision-related suffixes."""
+        assert "vision_tower" in model_utils.MULTIMODAL_SUFFIXES
+        assert "visual" in model_utils.MULTIMODAL_SUFFIXES
+        assert "image_encoder" in model_utils.MULTIMODAL_SUFFIXES
+        assert "vision_encoder" in model_utils.MULTIMODAL_SUFFIXES
+
+    def test_multimodal_suffixes_contains_audio_attrs(self):
+        """Test MULTIMODAL_SUFFIXES contains audio-related suffixes."""
+        assert "audio_tower" in model_utils.MULTIMODAL_SUFFIXES
+        assert "audio_encoder" in model_utils.MULTIMODAL_SUFFIXES
+        assert "audio_model" in model_utils.MULTIMODAL_SUFFIXES
+
+    def test_multimodal_suffixes_contains_projector_attrs(self):
+        """Test MULTIMODAL_SUFFIXES contains projector-related suffixes."""
+        assert "mm_projector" in model_utils.MULTIMODAL_SUFFIXES
+        assert "multi_modal_projector" in model_utils.MULTIMODAL_SUFFIXES
+        assert "multimodal_projector" in model_utils.MULTIMODAL_SUFFIXES
