@@ -152,10 +152,6 @@ class TestDeltaLakeIterator:
                 pass
 
 
-@pytest.mark.skipif(
-    not _deltalake_available(),
-    reason="deltalake package not installed"
-)
 class TestDeltaLakeDataset:
     """Tests for the DeltaLakeDataset class (requires deltalake)."""
 
@@ -182,50 +178,50 @@ class TestDeltaLakeDataset:
             with pytest.raises(RuntimeError, match="streaming mode"):
                 _ = ds[0]
 
-
-class TestHFDeltaLakeDataset:
-    """Tests for the HFDeltaLakeDataset class."""
-
     def test_shard_returns_self(self):
-        """Test that shard() returns self for method chaining."""
-        from nemo_automodel.components.datasets.llm.delta_lake_dataset import HFDeltaLakeDataset
+        """Test that shard() returns self and delegates to the iterator."""
+        from nemo_automodel.components.datasets.llm.delta_lake_dataset import DeltaLakeDataset
 
-        # Create a minimal mock instance
-        with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset.DeltaLakeIterator"):
-            with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset._check_deltalake_available", return_value=True):
-                ds = HFDeltaLakeDataset.__new__(HFDeltaLakeDataset)
-                ds._shard_info = None
-                ds.streaming = True
+        # Patch the iterator to avoid touching real backends and to assert delegation
+        with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset.DeltaLakeIterator") as MockIter:
+            mock_iter = MagicMock()
+            MockIter.return_value = mock_iter
 
-                result = ds.shard(4, 1)
-                assert result is ds
-                assert ds._shard_info == (4, 1)
+            ds = DeltaLakeDataset("delta:///fake/table")
+            result = ds.shard(4, 1)
+            assert result is ds
+            mock_iter.shard.assert_called_once_with(4, 1)
 
     def test_shuffle_returns_self(self):
-        """Test that shuffle() returns self for method chaining."""
-        from nemo_automodel.components.datasets.llm.delta_lake_dataset import HFDeltaLakeDataset
+        """Test that shuffle() returns self and wraps iterator with ReservoirSampler."""
+        from nemo_automodel.components.datasets.llm.delta_lake_dataset import DeltaLakeDataset
 
-        with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset.DeltaLakeIterator"):
-            with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset._check_deltalake_available", return_value=True):
-                ds = HFDeltaLakeDataset.__new__(HFDeltaLakeDataset)
-                ds._shuffle_info = None
-                ds._epoch = 0
+        with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset.DeltaLakeIterator") as MockIter:
+            mock_iter = MagicMock()
+            MockIter.return_value = mock_iter
+
+            # Important: patch the symbol used inside delta_lake_dataset (module alias), not the origin
+            with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset.ReservoirSampler") as MockRS:
+                sentinel = object()
+                MockRS.return_value = sentinel
+
+                ds = DeltaLakeDataset("delta:///fake/table")
 
                 result = ds.shuffle(buffer_size=1000, seed=42)
                 assert result is ds
-                assert ds._shuffle_info == (1000, 42)
+                assert ds._data_iterator is sentinel
+                MockRS.assert_called_once_with(mock_iter, 1000, 42)
 
     def test_set_epoch(self):
         """Test that set_epoch() updates the epoch."""
-        from nemo_automodel.components.datasets.llm.delta_lake_dataset import HFDeltaLakeDataset
+        from nemo_automodel.components.datasets.llm.delta_lake_dataset import DeltaLakeDataset
 
         with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset.DeltaLakeIterator"):
-            with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset._check_deltalake_available", return_value=True):
-                ds = HFDeltaLakeDataset.__new__(HFDeltaLakeDataset)
-                ds._epoch = 0
+            ds = DeltaLakeDataset.__new__(DeltaLakeDataset)
+            ds._epoch = 0
 
-                ds.set_epoch(5)
-                assert ds._epoch == 5
+            ds.set_epoch(5)
+            assert ds._epoch == 5
 
 
 class TestLimitedDeltaLakeDataset:
@@ -270,66 +266,66 @@ class TestLoadDatasetWithDelta:
     """Tests for _load_dataset integration with Delta Lake."""
 
     def test_detects_delta_path(self):
-        """Test that _load_dataset detects Delta Lake paths."""
-        from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import _load_dataset
+        """Test that _load_streaming_dataset detects Delta Lake paths and constructs DeltaLakeDataset."""
+        from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset import (
+            _load_streaming_dataset,
+        )
 
         # Mock the delta lake module
         with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset.is_delta_lake_path", return_value=True):
-            with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset.load_delta_lake_dataset") as mock_load:
-                mock_load.return_value = MagicMock()
+            with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset.DeltaLakeDataset") as mock_cls:
+                instance = MagicMock()
+                mock_cls.return_value = instance
 
-                _load_dataset("delta:///path/to/table", streaming=True)
+                result = _load_streaming_dataset("delta:///path/to/table", streaming=True)
 
-                mock_load.assert_called_once_with(
-                    path="delta:///path/to/table",
-                    storage_options=None,
-                    streaming=True,
-                    version=None,
-                    sql_query=None,
+                mock_cls.assert_called_once_with(
+                    table_path="delta:///path/to/table", storage_options=None, version=None, sql_query=None
                 )
+                assert result is instance
 
     def test_passes_delta_options(self):
-        """Test that delta options are passed through."""
-        from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import _load_dataset
+        """Test that delta options are passed through to DeltaLakeDataset."""
+        from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset import (
+            _load_streaming_dataset,
+        )
 
         with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset.is_delta_lake_path", return_value=True):
-            with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset.load_delta_lake_dataset") as mock_load:
-                mock_load.return_value = MagicMock()
+            with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset.DeltaLakeDataset") as mock_cls:
+                instance = MagicMock()
+                mock_cls.return_value = instance
 
                 storage_opts = {"DATABRICKS_TOKEN": "dapi123"}
-                _load_dataset(
+                result = _load_streaming_dataset(
                     "delta:///path/to/table",
                     streaming=True,
                     delta_storage_options=storage_opts,
                     delta_version=5,
                 )
 
-                mock_load.assert_called_once_with(
-                    path="delta:///path/to/table",
-                    storage_options=storage_opts,
-                    streaming=True,
-                    version=5,
-                    sql_query=None,
+                mock_cls.assert_called_once_with(
+                    table_path="delta:///path/to/table", storage_options=storage_opts, version=5, sql_query=None
                 )
+                assert result is instance
 
     def test_passes_delta_sql_query(self):
-        """Test that delta SQL query is passed through."""
-        from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import _load_dataset
+        """Test that delta SQL query is passed through to DeltaLakeDataset."""
+        from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset import (
+            _load_streaming_dataset,
+        )
 
         with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset.is_delta_lake_path", return_value=True):
-            with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset.load_delta_lake_dataset") as mock_load:
-                mock_load.return_value = MagicMock()
+            with patch("nemo_automodel.components.datasets.llm.delta_lake_dataset.DeltaLakeDataset") as mock_cls:
+                instance = MagicMock()
+                mock_cls.return_value = instance
 
                 query = "SELECT 'q' AS question, 'a' AS answer"
-                _load_dataset("delta:///path/to/table", streaming=True, delta_sql_query=query)
+                result = _load_streaming_dataset("delta:///path/to/table", streaming=True, delta_sql_query=query)
 
-                mock_load.assert_called_once_with(
-                    path="delta:///path/to/table",
-                    storage_options=None,
-                    streaming=True,
-                    version=None,
-                    sql_query=query,
+                mock_cls.assert_called_once_with(
+                    table_path="delta:///path/to/table", storage_options=None, version=None, sql_query=query
                 )
+                assert result is instance
 
 
 class TestDeltaLakeSqlQueryExecution:
