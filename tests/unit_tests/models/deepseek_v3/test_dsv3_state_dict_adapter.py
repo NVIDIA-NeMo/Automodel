@@ -500,6 +500,151 @@ class TestDequantizeFromFp8:
         assert result.dtype == torch.float32
         assert result.shape == (1, 1)
 
+    def test_dequantize_non_contiguous_weight(self):
+        """Test dequantization with non-contiguous weight tensor."""
+        # Create a non-contiguous tensor by transposing
+        weight_base = torch.randn(128, 256, dtype=torch.float32).to(torch.float8_e4m3fn)
+        weight = weight_base.t()  # Transpose makes it non-contiguous
+        assert not weight.is_contiguous()
+
+        scale_inv = torch.ones((2, 1), dtype=torch.float32)
+
+        result = dequantize_from_fp8(weight, scale_inv, dtype=torch.float32)
+
+        assert result.dtype == torch.float32
+        assert result.shape == weight.shape
+
+    def test_dequantize_non_contiguous_scale(self):
+        """Test dequantization with non-contiguous scale tensor."""
+        weight = torch.randn(256, 128, dtype=torch.float32).to(torch.float8_e4m3fn)
+
+        # Create a non-contiguous scale tensor
+        scale_base = torch.ones((2, 2), dtype=torch.float32)
+        scale_inv = scale_base[:, :1]  # Slice makes it non-contiguous
+        assert not scale_inv.is_contiguous()
+
+        result = dequantize_from_fp8(weight, scale_inv, dtype=torch.float32)
+
+        assert result.dtype == torch.float32
+        assert result.shape == weight.shape
+
+    @skip_if_no_gpu
+    def test_dequantize_triton_fallback_on_exception(self):
+        """Test that dequantize_from_fp8 falls back to torch when triton fails."""
+        weight = torch.randn(256, 128, dtype=torch.float32, device="cuda").to(torch.float8_e4m3fn)
+        scale_inv = torch.ones((2, 1), dtype=torch.float32, device="cuda")
+
+        with patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter._dequantize_with_triton') as mock_triton, \
+             patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter._dequantize_with_torch') as mock_torch, \
+             patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter.logger') as mock_logger:
+
+            mock_triton.side_effect = RuntimeError("Triton kernel failed")
+            mock_torch.return_value = torch.randn(256, 128, dtype=torch.float32, device="cuda")
+
+            result = dequantize_from_fp8(weight, scale_inv, dtype=torch.float32)
+
+            mock_triton.assert_called_once()
+            mock_torch.assert_called_once()
+            mock_logger.warning.assert_called_once()
+            assert "Triton dequant failed" in mock_logger.warning.call_args[0][0]
+
+    def test_dequantize_cpu_uses_torch_implementation(self):
+        """Test that CPU tensors use torch implementation (not triton)."""
+        weight = torch.randn(256, 128, dtype=torch.float32).to(torch.float8_e4m3fn)
+        scale_inv = torch.ones((2, 1), dtype=torch.float32)
+
+        with patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter._dequantize_with_torch') as mock_torch, \
+             patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter._dequantize_with_triton') as mock_triton:
+
+            mock_torch.return_value = torch.randn(256, 128, dtype=torch.float32)
+
+            result = dequantize_from_fp8(weight, scale_inv, dtype=torch.float32)
+
+            mock_torch.assert_called_once()
+            mock_triton.assert_not_called()
+
+    def test_dequantize_dtensor_input(self):
+        """Test dequantization with DTensor input returns DTensor output."""
+        # Create mock local tensors
+        local_weight = torch.randn(256, 128, dtype=torch.float32).to(torch.float8_e4m3fn)
+        local_scale = torch.ones((2, 1), dtype=torch.float32)
+        dequantized_local = torch.randn(256, 128, dtype=torch.bfloat16)
+
+        # Create mock DTensor weight
+        mock_device_mesh = Mock()
+        mock_placements = Mock()
+        mock_weight = Mock()
+        mock_weight.to_local.return_value = local_weight
+        mock_weight.device_mesh = mock_device_mesh
+        mock_weight.placements = mock_placements
+
+        # Mock DTensor.from_local
+        mock_dtensor_result = Mock()
+
+        with patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter.is_dtensor') as mock_is_dtensor, \
+             patch('nemo_automodel.components.models.deepseek_v3.state_dict_adapter._dequantize_with_torch') as mock_dequant, \
+             patch('torch.distributed._tensor.DTensor.from_local') as mock_from_local:
+
+            # Configure mocks
+            mock_is_dtensor.side_effect = lambda x: x is mock_weight  # weight is DTensor, scale is not
+            mock_dequant.return_value = dequantized_local
+            mock_from_local.return_value = mock_dtensor_result
+
+            result = dequantize_from_fp8(mock_weight, local_scale, dtype=torch.bfloat16)
+
+            # Verify to_local was called on weight
+            mock_weight.to_local.assert_called_once()
+
+            # Verify DTensor.from_local was called with correct args
+            mock_from_local.assert_called_once_with(dequantized_local, mock_device_mesh, mock_placements)
+
+            # Verify result is the DTensor
+            assert result is mock_dtensor_result
+
+
+class TestDequantizeWithTorch:
+    """Tests for _dequantize_with_torch function directly."""
+
+    def test_basic_dequantization(self):
+        """Test basic dequantization on CPU."""
+        weight = torch.randn(128, 128, dtype=torch.float32).to(torch.float8_e4m3fn)
+        scale_inv = torch.ones((1, 1), dtype=torch.float32) * 2.0
+
+        result = _dequantize_with_torch(weight, scale_inv, torch.float32, BLOCK_SIZE)
+
+        assert result.dtype == torch.float32
+        assert result.shape == weight.shape
+
+    def test_multiple_blocks(self):
+        """Test dequantization with multiple blocks."""
+        weight = torch.randn(256, 256, dtype=torch.float32).to(torch.float8_e4m3fn)
+        scale_inv = torch.ones((2, 2), dtype=torch.float32)
+
+        result = _dequantize_with_torch(weight, scale_inv, torch.bfloat16, BLOCK_SIZE)
+
+        assert result.dtype == torch.bfloat16
+        assert result.shape == weight.shape
+
+    def test_partial_blocks(self):
+        """Test dequantization with partial blocks."""
+        weight = torch.randn(200, 100, dtype=torch.float32).to(torch.float8_e4m3fn)
+        scale_inv = torch.ones((2, 1), dtype=torch.float32)
+
+        result = _dequantize_with_torch(weight, scale_inv, torch.float32, BLOCK_SIZE)
+
+        assert result.dtype == torch.float32
+        assert result.shape == weight.shape
+
+    def test_varying_scales(self):
+        """Test dequantization with different scale values per block."""
+        weight = torch.ones(256, 256, dtype=torch.float32).to(torch.float8_e4m3fn)
+        scale_inv = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+
+        result = _dequantize_with_torch(weight, scale_inv, torch.float32, BLOCK_SIZE)
+
+        assert result.dtype == torch.float32
+        assert result.shape == weight.shape
+
 
 class TestConvertSingleTensorToHf:
     def create_mock_config(self, **overrides):
