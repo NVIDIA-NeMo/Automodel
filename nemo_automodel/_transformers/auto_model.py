@@ -37,7 +37,6 @@ from transformers import (
 )
 from transformers.modeling_utils import _get_resolved_checkpoint_files
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
-from transformers.utils.hub import DownloadKwargs
 
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel import __version__

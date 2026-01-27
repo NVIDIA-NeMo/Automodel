@@ -36,7 +36,6 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.utils import ContextManagers
 from wandb import Settings
 
-from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
