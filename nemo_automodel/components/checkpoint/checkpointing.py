@@ -583,19 +583,11 @@ class Checkpointer:
             # some HF models like Moonlight-16B have non-persistent buffers in the base checkpoint
             # however, HF initializes buffers with persistent=False, so we need to make sure these
             # buffer keys are not saved during checkpointing
-
-            # Temporary patch
-            keys_to_remove = [key for key in fqn_to_file_index_mapping.keys() if "inv_freq" in key]
+            keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - set(self.config.model_state_dict_keys))
+            if model_state.is_tied_lm_head:
+                keys_to_remove.append(model_state.lm_head_param_name)
             for key in keys_to_remove:
                 fqn_to_file_index_mapping.pop(key, None)
-
-            # The below does not work for custom models since the keys haven't been converted to HF.
-            # We need to create new methods in the adapter to cast the strings to HF keys.
-            # keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - set(self.config.model_state_dict_keys))
-            # if model_state.is_tied_lm_head:
-            #     keys_to_remove.append(model_state.lm_head_param_name)
-            # for key in keys_to_remove:
-            #     fqn_to_file_index_mapping.pop(key, None)
         else:
             fqn_to_file_index_mapping = {k: 1 for k in state_dict.keys()}
 
