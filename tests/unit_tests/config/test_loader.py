@@ -303,6 +303,90 @@ def test_load_yaml_config(tmp_path):
     assert cfg.scheduler.gamma == 0.5
 
 
+def test_load_yaml_config_resolves_oc_env(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("DATABRICKS_HOST", "https://example.databricks.local")
+    yml = tmp_path / "cfg.yaml"
+    yml.write_text(
+        """
+        dataset:
+          delta_storage_options:
+            DATABRICKS_HOST: ${oc.env:DATABRICKS_HOST}
+        """
+    )
+    cfg = load_yaml_config(str(yml))
+    assert cfg.dataset.delta_storage_options.DATABRICKS_HOST == "https://example.databricks.local"
+
+def test_load_yaml_config_oc_env_default(monkeypatch, tmp_path: Path):
+    monkeypatch.delenv("NOT_SET", raising=False)
+    yml = tmp_path / "cfg.yaml"
+    yml.write_text("x: ${oc.env:NOT_SET,default_value}\n")
+    cfg = load_yaml_config(str(yml))
+    assert cfg.x == "default_value"
+
+
+def test_load_yaml_config_oc_env_missing_raises(monkeypatch, tmp_path: Path):
+    monkeypatch.delenv("MISSING_ENV_VAR", raising=False)
+    yml = tmp_path / "cfg.yaml"
+    yml.write_text("x: ${oc.env:MISSING_ENV_VAR}\n")
+    with pytest.raises(KeyError, match="MISSING_ENV_VAR"):
+        _ = load_yaml_config(str(yml))
+
+
+def test_load_yaml_config_resolves_braced_env(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("FOO_ENV", "bar")
+    yml = tmp_path / "cfg.yaml"
+    yml.write_text("x: ${FOO_ENV}\n")
+    cfg = load_yaml_config(str(yml))
+    assert cfg.x == "bar"
+    assert "${FOO_ENV}" in str(cfg)
+    assert "bar" not in str(cfg)
+
+
+def test_load_yaml_config_resolves_dollar_env(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("FOO_ENV", "bar")
+    yml = tmp_path / "cfg.yaml"
+    yml.write_text("x: $FOO_ENV\n")
+    cfg = load_yaml_config(str(yml))
+    assert cfg.x == "bar"
+    assert "$FOO_ENV" in str(cfg)
+
+
+def test_load_yaml_config_resolves_dotted_env_var_name(monkeypatch, tmp_path: Path):
+    # Dots are treated as part of the env var name.
+    monkeypatch.setenv("foo.bar.baz", "qux")
+    yml = tmp_path / "cfg.yaml"
+    yml.write_text(
+        """
+        a: ${foo.bar.baz}
+        b: $foo.bar.baz
+        path: ${foo.bar.baz}/$foo.bar.baz
+        """
+    )
+    cfg = load_yaml_config(str(yml))
+    assert cfg.a == "qux"
+    assert cfg.b == "qux"
+    assert cfg.path == "qux/qux"
+    # Printing should show original placeholders.
+    s = str(cfg)
+    assert "${foo.bar.baz}" in s
+    assert "$foo.bar.baz" in s
+    assert "qux/qux" not in s
+
+
+def test_confignode_repr_uses_orig_value_for_oc_env(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("SECRET_ENV", "super_secret_value")
+    yml = tmp_path / "cfg.yaml"
+    yml.write_text("x: ${oc.env:SECRET_ENV}\n")
+    cfg = load_yaml_config(str(yml))
+
+    # Runtime value is resolved
+    assert cfg.x == "super_secret_value"
+    # But printing the config should not leak the resolved secret
+    s = str(cfg)
+    assert "${oc.env:SECRET_ENV}" in s
+    assert "super_secret_value" not in s
+
+
 def test_load_module_from_file(tmp_path):
     """Module is imported, its globals are accessible, and it gets a unique name."""
     py_file = tmp_path / "plugin.py"
