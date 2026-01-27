@@ -42,9 +42,6 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.models.qwen2.modeling_qwen2 import eager_attention_forward
-
-# Use shared rope_utils (same implementation as Llama, supports both config formats)
-from nemo_automodel.components.models.llama.rope_utils import Qwen2RotaryEmbedding, apply_rotary_pos_emb
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 
@@ -54,6 +51,9 @@ from nemo_automodel.components.models.common import (
     CombinedQKVAttentionMixin,
     initialize_rms_norm_module,
 )
+
+# Use shared rope_utils (same implementation as Llama, supports both config formats)
+from nemo_automodel.components.models.llama.rope_utils import Qwen2RotaryEmbedding, apply_rotary_pos_emb
 from nemo_automodel.components.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 

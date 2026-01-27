@@ -51,7 +51,7 @@ from nemo_automodel.components.models.common import (
     CombinedQKVAttentionMixin,
     initialize_rms_norm_module,
 )
-from nemo_automodel.components.models.llama.rope_utils import apply_rotary_pos_emb, LlamaRotaryEmbedding
+from nemo_automodel.components.models.llama.rope_utils import LlamaRotaryEmbedding, apply_rotary_pos_emb
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 
