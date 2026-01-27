@@ -647,6 +647,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
+                torch_dtype=torch_dtype,
                 **kwargs,
             )
 
