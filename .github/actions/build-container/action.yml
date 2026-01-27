@@ -81,6 +81,7 @@ runs:
         apt-get install -y gh
 
     - name: Normalize repo name to lowercase
+      shell: bash
       env:
         REPO: ${{ inputs.repo-name }}
       run: |
