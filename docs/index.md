@@ -7,6 +7,7 @@
 :hidden:
 repository-structure.md
 guides/installation.md
+guides/configuration.md
 launcher/local-workstation.md
 launcher/cluster.md
 ```
