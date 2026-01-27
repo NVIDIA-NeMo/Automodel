@@ -23,6 +23,10 @@ from typing import List, Optional, Union
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
+
+from nemo_automodel.shared.torch_patches import apply_torch_patches
+
+apply_torch_patches()
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -446,8 +450,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             kwargs.pop("trust_remote_code", None)
             # TODO(@akoumpa): restore weights after initialization.
             model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
+            # Override config's torch_dtype with user-requested dtype so model __init__ uses correct dtype
+            if torch_dtype != "auto":
+                hf_config.torch_dtype = torch_dtype
             with local_torch_dtype(torch_dtype, model_cls.__name__):
-                return model_cls(hf_config)
+                return model_cls(hf_config, *model_args, **kwargs)
 
         # 3. fallback to parent class
         model = None
@@ -599,7 +606,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         architectures = get_architectures(config)
         if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
             with local_torch_dtype(torch_dtype, ModelRegistry.model_arch_name_to_cls[architectures[0]].__name__):
-                return ModelRegistry.model_arch_name_to_cls[architectures[0]](config)
+                return ModelRegistry.model_arch_name_to_cls[architectures[0]](config, *model_args, **kwargs)
 
         # 3. fallback to parent class
         model = None

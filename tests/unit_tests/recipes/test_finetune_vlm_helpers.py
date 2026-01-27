@@ -83,7 +83,7 @@ class DummyOptConfig:
 
     def __init__(self, lr: float = 0.01):
         self.lr = lr
-        self.foreach = None 
+        self.foreach = None
     def instantiate(self, params):
         # Always return an SGD optimizer for the given params
         return torch.optim.SGD(params, lr=self.lr)
@@ -281,7 +281,7 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
 
 def test_autoprocessor_success():
     """Test successful AutoProcessor creation."""
-    
+
     with patch('transformers.AutoProcessor') as mock_auto_processor:
         mock_processor = MagicMock()
         mock_auto_processor.from_pretrained.return_value = mock_processor
@@ -289,7 +289,7 @@ def test_autoprocessor_success():
         model_id = "test/model"
 
         processor = mock_auto_processor.from_pretrained(model_id)
-        
+
         assert processor is mock_processor
         mock_auto_processor.from_pretrained.assert_called_once_with("test/model")
 
@@ -298,68 +298,283 @@ def test_autoprocessor_exception_handling(caplog):
     """Test AutoProcessor exception handling and logging in build_dataloader."""
     import logging
     from nemo_automodel.recipes.vlm.finetune import build_dataloader
-    
+
     with patch('transformers.AutoProcessor.from_pretrained') as mock_from_pretrained, \
          patch('nemo_automodel.components.training.rng.StatefulRNG'), \
          patch('torch.utils.data.distributed.DistributedSampler'), \
          patch('nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS', {'NoneType': MagicMock()}):
-        
+
         # Set up the exception
         mock_from_pretrained.side_effect = Exception("Model does not have AutoProcessor")
-        
+
         # Mock configurations - minimal setup
         cfg_ds = MagicMock()
         cfg_ds.instantiate.return_value = []
         cfg_ds.path_or_dataset = "test/dataset"
-        
+
         cfg_dl = MagicMock()
         cfg_dl.get.return_value = None  # No custom settings
         cfg_dl.instantiate.return_value = MagicMock()
-        
+
         cfg_processor = None  # This triggers the exception path
-        
+
         with caplog.at_level(logging.WARNING):
             dataloader, processor = build_dataloader(cfg_ds, cfg_dl, "test/model", cfg_processor, None, 123, 1)
-        
+
         # Verify the results
         assert processor is None
         mock_from_pretrained.assert_called_once_with("test/model")
-        
+
 
 
 def test_autoprocessor_with_processor_kwargs(caplog):
     """Test AutoProcessor exception handling when cfg_processor has no instantiate method."""
     import logging
     from nemo_automodel.recipes.vlm.finetune import build_dataloader
-    
+
     # Simple processor config class without instantiate method
     class ProcessorConfig:
         def to_dict(self):
             return {"trust_remote_code": True, "some_param": "value"}
-    
+
     with patch('transformers.AutoProcessor.from_pretrained') as mock_from_pretrained, \
          patch('nemo_automodel.components.training.rng.StatefulRNG'), \
          patch('torch.utils.data.distributed.DistributedSampler'), \
          patch('nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS', {'NoneType': MagicMock()}):
-        
+
         # Set up the exception
         mock_from_pretrained.side_effect = Exception("Model does not have AutoProcessor")
-        
+
         # Mock configurations - minimal setup
         cfg_ds = MagicMock()
         cfg_ds.instantiate.return_value = []
         cfg_ds.path_or_dataset = "test/dataset"
-        
+
         cfg_dl = MagicMock()
         cfg_dl.get.return_value = None  # No custom settings
         cfg_dl.instantiate.return_value = MagicMock()
-        
+
         cfg_processor = ProcessorConfig()  # This has to_dict but no instantiate
-        
+
         with caplog.at_level(logging.WARNING):
             dataloader, processor = build_dataloader(cfg_ds, cfg_dl, "test/model", cfg_processor, None, 123, 1)
-        
+
         # Verify the results
         assert processor is None
         mock_from_pretrained.assert_called_once_with("test/model", trust_remote_code=True, some_param="value")
-        
+
+
+# -----------------------------------------------------------------------------
+# State dict adapter tests for _maybe_adapt_state_dict_to_hf in VLM
+# -----------------------------------------------------------------------------
+
+
+class MockStateDictAdapter:
+    """Mock state dict adapter that transforms keys."""
+
+    def to_hf(self, state_dict, exclude_key_regex=None, quantization=False, **kwargs):
+        """Transform state dict keys by adding 'vlm_transformed_' prefix."""
+        return {f"vlm_transformed_{k}": v for k, v in state_dict.items()}
+
+
+class DummyModelWithAdapter(torch.nn.Module):
+    """VLM model with a state_dict_adapter for testing."""
+
+    def __init__(self):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(10, 4)
+        self.language_model = torch.nn.Linear(4, 4)
+        self.state_dict_adapter = MockStateDictAdapter()
+
+    def forward(self, x):
+        return self.language_model(self.embedding(x))
+
+
+class DummyModelConfigWithAdapter:
+    """Mock model config that returns a model with state_dict_adapter."""
+
+    def instantiate(self, **kwargs):
+        return DummyModelWithAdapter()
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+
+def test_vlm_build_model_state_dict_keys_uses_adapter():
+    """Test that state_dict_keys are transformed using _maybe_adapt_state_dict_to_hf when adapter is present in VLM."""
+
+    cfg_model = DummyModelConfigWithAdapter()
+    cfg_opt = DummyOptConfig(lr=0.01)
+
+    device = torch.device("cpu")
+    ckpt_cfg = CheckpointingConfig(
+        enabled=False,
+        checkpoint_dir="checkpoints/",
+        model_save_format="safetensors",
+        model_cache_dir=".",
+        model_repo_id="dummy/model",
+        save_consolidated=False,
+        is_peft=False,
+        dequantize_base_checkpoint=False,
+    )
+    checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    def _load_base_model_stub(model, device, *args, **kwargs):
+        if hasattr(model, "to_empty"):
+            model.to_empty(device=device)
+
+    with patch.object(checkpointer, 'load_base_model', new=_load_base_model_stub):
+        model, state_dict_keys, optim = build_model_and_optimizer(
+            device=device,
+            cfg_model=cfg_model,
+            cfg_opt=cfg_opt,
+            cfg_freeze=None,
+            cfg_peft=None,
+            model_wrapper=SimpleNamespace(parallelize=lambda m: m),
+            seed=123,
+            checkpointer=checkpointer,
+            tp_size=1,
+            freeze_embeddings=True,
+        )
+
+    # Verify that state_dict_keys are transformed (should have 'vlm_transformed_' prefix)
+    assert len(state_dict_keys) > 0, "state_dict_keys should not be empty"
+    for key in state_dict_keys:
+        assert key.startswith("vlm_transformed_"), f"Key '{key}' should be transformed by adapter"
+
+
+def test_vlm_build_model_state_dict_keys_without_adapter():
+    """Test that state_dict_keys are not transformed when no adapter is present in VLM."""
+
+    cfg_model = DummyModelConfig()  # DummyModel has no state_dict_adapter
+    cfg_opt = DummyOptConfig(lr=0.01)
+
+    device = torch.device("cpu")
+    ckpt_cfg = CheckpointingConfig(
+        enabled=False,
+        checkpoint_dir="checkpoints/",
+        model_save_format="safetensors",
+        model_cache_dir=".",
+        model_repo_id="dummy/model",
+        save_consolidated=False,
+        is_peft=False,
+        dequantize_base_checkpoint=False,
+    )
+    checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    def _load_base_model_stub(model, device, *args, **kwargs):
+        if hasattr(model, "to_empty"):
+            model.to_empty(device=device)
+
+    with patch.object(checkpointer, 'load_base_model', new=_load_base_model_stub):
+        model, state_dict_keys, optim = build_model_and_optimizer(
+            device=device,
+            cfg_model=cfg_model,
+            cfg_opt=cfg_opt,
+            cfg_freeze=None,
+            cfg_peft=None,
+            model_wrapper=SimpleNamespace(parallelize=lambda m: m),
+            seed=123,
+            checkpointer=checkpointer,
+            tp_size=1,
+            freeze_embeddings=True,
+        )
+
+    # Verify that state_dict_keys are not transformed (no 'vlm_transformed_' prefix)
+    assert len(state_dict_keys) > 0, "state_dict_keys should not be empty"
+    for key in state_dict_keys:
+        assert not key.startswith("vlm_transformed_"), f"Key '{key}' should not be transformed without adapter"
+
+
+def test_vlm_build_model_infers_dequantize_from_model_config():
+    """Test that dequantize_base_checkpoint is inferred from model.config.quantization_config in VLM."""
+
+    device = torch.device("cpu")
+    cfg_opt = DummyOptConfig(lr=0.01)
+
+    # Create a model config that returns a model with quantization_config
+    class DummyQuantizedVLMModelConfig:
+        def instantiate(self, **kwargs):
+            model = DummyModel()
+            # Add a config attribute with quantization_config
+            model.config = SimpleNamespace(quantization_config={"bits": 4})
+            return model
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = DummyQuantizedVLMModelConfig()
+
+    ckpt_cfg = CheckpointingConfig(
+        enabled=False,
+        checkpoint_dir="checkpoints/",
+        model_save_format="safetensors",
+        model_cache_dir=".",
+        model_repo_id="dummy/model",
+        save_consolidated=False,
+        is_peft=False,
+        dequantize_base_checkpoint=None,  # Should be inferred
+    )
+    checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    def _load_base_model_stub(model, device, *args, **kwargs):
+        if hasattr(model, "to_empty"):
+            model.to_empty(device=device)
+
+    with patch.object(checkpointer, 'load_base_model', new=_load_base_model_stub):
+        model, state_dict_keys, optim = build_model_and_optimizer(
+            device=device,
+            cfg_model=cfg_model,
+            cfg_opt=cfg_opt,
+            cfg_freeze=None,
+            cfg_peft=None,
+            model_wrapper=SimpleNamespace(parallelize=lambda m: m),
+            seed=123,
+            checkpointer=checkpointer,
+            tp_size=1,
+            freeze_embeddings=True,
+        )
+
+    # Verify that dequantize_base_checkpoint was inferred as True
+    assert checkpointer.config.dequantize_base_checkpoint is True
+
+
+def test_vlm_build_model_dequantize_defaults_to_false_without_quant_config():
+    """Test that dequantize_base_checkpoint defaults to False when VLM model has no quantization_config."""
+
+    device = torch.device("cpu")
+    cfg_model = DummyModelConfig()  # DummyModel has no config.quantization_config
+    cfg_opt = DummyOptConfig(lr=0.01)
+
+    ckpt_cfg = CheckpointingConfig(
+        enabled=False,
+        checkpoint_dir="checkpoints/",
+        model_save_format="safetensors",
+        model_cache_dir=".",
+        model_repo_id="dummy/model",
+        save_consolidated=False,
+        is_peft=False,
+        dequantize_base_checkpoint=None,  # Should be inferred as False
+    )
+    checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    def _load_base_model_stub(model, device, *args, **kwargs):
+        if hasattr(model, "to_empty"):
+            model.to_empty(device=device)
+
+    with patch.object(checkpointer, 'load_base_model', new=_load_base_model_stub):
+        model, state_dict_keys, optim = build_model_and_optimizer(
+            device=device,
+            cfg_model=cfg_model,
+            cfg_opt=cfg_opt,
+            cfg_freeze=None,
+            cfg_peft=None,
+            model_wrapper=SimpleNamespace(parallelize=lambda m: m),
+            seed=123,
+            checkpointer=checkpointer,
+            tp_size=1,
+            freeze_embeddings=True,
+        )
+
+    # Verify that dequantize_base_checkpoint was inferred as False
+    assert checkpointer.config.dequantize_base_checkpoint is False

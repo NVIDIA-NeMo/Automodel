@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,8 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Custom Qwen2 model implementation for NeMo Automodel."""
+from tests.utils.test_utils import run_test_script
 
-from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM
+TEST_FOLDER = "llm_pretrain_and_kd/loss/"
+TE_PARALLEL_CE_DTENSOR_TP2_FILENAME = "L2_TEParallelCrossEntropy_DTENSOR_TP2.sh"
 
-__all__ = ["Qwen2ForCausalLM"]
+
+class TestTEParallelCrossEntropyDTensor:
+    def test_te_parallel_cross_entropy_dtensor_tp2(self):
+        run_test_script(TEST_FOLDER, TE_PARALLEL_CE_DTENSOR_TP2_FILENAME)
+
