@@ -77,10 +77,49 @@ class Block(nn.Module):
             attention_mask=attention_mask,
             **attn_kwargs,
         )
+        
+        # DEBUG: Log attention output for layer 1 (MoE layer)
+        if self.layer_idx == 1 and not hasattr(self, '_attn_debug_logged'):
+            self._attn_debug_logged = True
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            if rank == 0:
+                h = attn_out.float()
+                print(f"[NEMO_LAYER1_DEBUG] === Layer 1 Attention Debug ===", flush=True)
+                print(f"[NEMO_LAYER1_DEBUG] attn_out.shape={attn_out.shape}", flush=True)
+                print(f"[NEMO_LAYER1_DEBUG] attn_out[0,0,:32]={h[0,0,:32].tolist()}", flush=True)
+                print(f"[NEMO_LAYER1_DEBUG] attn_out stats: mean={h.mean().item():.8f}, std={h.std().item():.8f}, min={h.min().item():.6f}, max={h.max().item():.6f}", flush=True)
+                print(f"[NEMO_LAYER1_DEBUG] attn_out[0,0] full vector stats: mean={h[0,0].mean().item():.8f}, std={h[0,0].std().item():.8f}", flush=True)
+        
         x = x + attn_out
+        
+        # # DEBUG: Log post-attention hidden states for layer 1
+        # if self.layer_idx == 1 and not hasattr(self, '_post_attn_debug_logged'):
+        #     self._post_attn_debug_logged = True
+        #     import torch.distributed as dist
+        #     rank = dist.get_rank() if dist.is_initialized() else 0
+        #     if rank == 0:
+        #         h = x.float()
+        #         print(f"[NEMO_LAYER1_DEBUG] x (after residual).shape={x.shape}", flush=True)
+        #         print(f"[NEMO_LAYER1_DEBUG] x (after residual)[0,0,:32]={h[0,0,:32].tolist()}", flush=True)
+        #         print(f"[NEMO_LAYER1_DEBUG] x (after residual) stats: mean={h.mean().item():.8f}, std={h.std().item():.8f}", flush=True)
+        
+        mlp_input = self.post_attention_layernorm(x)
+        
+        # # DEBUG: Log MoE input for layer 1
+        # if self.layer_idx == 1 and not hasattr(self, '_mlp_input_debug_logged'):
+        #     self._mlp_input_debug_logged = True
+        #     import torch.distributed as dist
+        #     rank = dist.get_rank() if dist.is_initialized() else 0
+        #     if rank == 0:
+        #         h = mlp_input.float()
+        #         print(f"[NEMO_LAYER1_DEBUG] mlp_input (post_attn_ln).shape={mlp_input.shape}", flush=True)
+        #         print(f"[NEMO_LAYER1_DEBUG] mlp_input (post_attn_ln)[0,0,:32]={h[0,0,:32].tolist()}", flush=True)
+        #         print(f"[NEMO_LAYER1_DEBUG] mlp_input stats: mean={h.mean().item():.8f}, std={h.std().item():.8f}, min={h.min().item():.6f}, max={h.max().item():.6f}", flush=True)
+        #         print(f"[NEMO_LAYER1_DEBUG] mlp_input[0,0] full vector stats: mean={h[0,0].mean().item():.8f}, std={h[0,0].std().item():.8f}", flush=True)
 
         mlp_out = self._mlp(
-            x=self.post_attention_layernorm(x),
+            x=mlp_input,
             padding_mask=padding_mask,
         )
         x = x + mlp_out
@@ -184,8 +223,34 @@ class DeepseekV3Model(nn.Module):
 
         h = inputs_embeds
 
+        # # ===== DEBUG: Per-layer logging =====
+        # import os
+        # import time
+        # _DEBUG_ACTIVATIONS = os.environ.get("DEBUG_ACTIVATIONS", "0") == "1"
+        # _DEBUG_DIR = "/lustre/fsw/portfolios/coreai/users/huiyingl/kimi/Automodel/debug"
+        # _rank = 0
+        # _should_log = False
+        # _is_shape_inference = False
+        # if _DEBUG_ACTIVATIONS:
+        #     import torch.distributed as dist
+        #     _rank = dist.get_rank() if dist.is_initialized() else 0
+        #     _layer_keys = list(self.layers.keys())
+        #     # Always log what this rank has
+        #     print(f"[FINETUNE][rank={_rank}] DeepseekV3Model.forward() called, layers on this rank: {_layer_keys}", flush=True)
+        #     # Detect shape inference: input is all zeros
+        #     _emb_max = inputs_embeds.max().item()
+        #     _emb_min = inputs_embeds.min().item()
+        #     if _emb_max == 0 and _emb_min == 0:
+        #         _is_shape_inference = True
+        #         print(f"[FINETUNE][rank={_rank}] Skipping LLM layer debug - shape inference (all-zero inputs_embeds)", flush=True)
+        #     else:
+        #         print(f"[FINETUNE][rank={_rank}] inputs_embeds stats: min={_emb_min:.6f}, max={_emb_max:.6f} (REAL DATA)", flush=True)
+        #     # Log on all ranks that have layers (PP distributes layers across ranks)
+        #     _should_log = len(self.layers) > 0 and not _is_shape_inference
+        # # ===== END DEBUG SETUP =====
+
         # Apply the transformer layers.
-        for layer in self.layers.values():
+        for layer_key, layer in self.layers.items():
             h = layer(
                 x=h,
                 freqs_cis=freqs_cis,
@@ -193,6 +258,23 @@ class DeepseekV3Model(nn.Module):
                 padding_mask=padding_mask,
                 **attn_kwargs,
             )
+        #     # ===== DEBUG: Log layer output =====
+        #     if _DEBUG_ACTIVATIONS and _should_log:
+        #         h_float = h.detach().float()
+        #         print(f"[FINETUNE][rank={_rank}] After LLM layer {layer_key}: shape={tuple(h.shape)}, dtype={h.dtype}, "
+        #               f"mean={h_float.mean().item():.6f}, min={h_float.min().item():.6f}, "
+        #               f"max={h_float.max().item():.6f}", flush=True)
+        #         # Save with rank to avoid overwrites in PP
+        #         _path = os.path.join(_DEBUG_DIR, f"finetune_hidden_states_layer{layer_key}_rank{_rank}.pt")
+        #         if not os.path.exists(_path):
+        #             torch.save(h.detach().cpu(), _path)
+        #             print(f"[FINETUNE][rank={_rank}] Saved hidden_states_layer{layer_key} to: {_path}", flush=True)
+        #     # ===== END DEBUG =====
+
+        # # ===== DEBUG: Log completion (no exit - PP schedule must complete) =====
+        # if _DEBUG_ACTIVATIONS and _should_log:
+        #     print(f"[FINETUNE][rank={_rank}] LLM layers on this rank complete. Files saved to {_DEBUG_DIR}/", flush=True)
+        # # ===== END DEBUG =====
 
         h = self.norm(h) if self.norm else h
         return h
