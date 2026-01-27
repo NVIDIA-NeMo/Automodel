@@ -38,6 +38,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _maybe_adapt_state_dict_from_hf,
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
+from nemo_automodel.components.utils.model_utils import _meta_init_context
 from transformers.utils import TRANSFORMERS_CACHE
 
 if TYPE_CHECKING:
@@ -45,6 +46,18 @@ if TYPE_CHECKING:
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 logger = logging.getLogger(__name__)
+
+
+def is_meta_init_context() -> bool:
+    """Check if currently inside init_empty_weights() context.
+
+    This allows HFCheckpointingMixin to detect whether model initialization
+    is happening on meta device, controlled by the caller (e.g., train_ft.py).
+
+    Returns:
+        bool: True if inside init_empty_weights() context, False otherwise.
+    """
+    return _meta_init_context.get()
 
 
 class HFCheckpointingMixin:
@@ -169,6 +182,16 @@ class HFCheckpointingMixin:
 
         For nn.Module subclasses (no parent from_pretrained):
         Falls back to manual config loading + Checkpointer
+
+        Note on meta device initialization:
+        - The caller controls meta device via init_empty_weights() context manager
+        - This method detects the context via is_meta_init_context()
+        - We don't set device_map='meta' here; the context manager handles it
+
+        Note on BitsAndBytes quantization:
+        - When quantization_config is provided, HF must handle weight loading directly
+        - BitsAndBytes quantizes weights during loading (not compatible with meta device)
+        - In this case, we skip Checkpointer.load_base_model() for weight loading
         """
         if checkpointer is None:
             raise ValueError("No checkpointer provided. Please pass the `checkpointer` argument.")
@@ -183,8 +206,6 @@ class HFCheckpointingMixin:
 
         if parent_has_from_pretrained:
             # Use HF's from_pretrained for: downloads, quantization setup, config handling
-            # But keep model on meta device (weights not loaded yet)
-            kwargs['device_map'] = 'meta'  # Prevents HF from loading weights
             model = super().from_pretrained(
                 pretrained_model_name_or_path,
                 *model_args,
@@ -195,11 +216,15 @@ class HFCheckpointingMixin:
             # nn.Module models: manual config + meta device init
             model = cls(hf_config, *model_args, **kwargs)
 
-        # Determine device
+        model._checkpointer = checkpointer
+
+        # For BitsAndBytes quantization, HF has already loaded and quantized weights
+        if not is_meta_init_context():
+            return model
+
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Use Checkpointer to load weights (handles distributed loading + format conversion)
         peft_config = kwargs.get("peft_config", None)
         peft_init_method = peft_config.get("lora_A_init", None) if peft_config else None
         checkpointer.load_base_model(
@@ -211,8 +236,6 @@ class HFCheckpointingMixin:
             load_base_model=True,
         )
 
-        # Store checkpointer for save_pretrained
-        model._checkpointer = checkpointer
         return model
 
     @classmethod

@@ -16,6 +16,7 @@ import inspect
 import logging
 import os
 from contextlib import contextmanager
+from contextvars import ContextVar
 
 from nemo_automodel.shared.import_utils import safe_import
 
@@ -25,6 +26,11 @@ import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
+
+# Context variable to track if we're inside init_empty_weights() context.
+# This allows other code (e.g., HFCheckpointingMixin) to detect whether
+# model initialization is happening on meta device.
+_meta_init_context: ContextVar[bool] = ContextVar('meta_init_context', default=False)
 
 
 def _supports_logits_to_keep(model: nn.Module) -> bool:
@@ -323,8 +329,10 @@ def init_empty_weights():
                 kwargs["requires_grad"] = param.requires_grad
             module._parameters[name] = param_cls(module._parameters[name].to(device), **kwargs)
 
+    token = _meta_init_context.set(True)
     try:
         nn.Module.register_parameter = register_empty_parameter
         yield
     finally:
         nn.Module.register_parameter = old_register_parameter
+        _meta_init_context.reset(token)

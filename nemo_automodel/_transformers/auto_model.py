@@ -18,10 +18,11 @@ import inspect
 import logging
 import os
 import types
-from contextlib import contextmanager
-from typing import List, Optional, Union
+from contextlib import contextmanager, nullcontext
+from typing import List, Optional, Union, Callable, TYPE_CHECKING
 
 import torch
+from nemo_automodel.components.utils.compile_utils import compile_model
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import (
     AutoConfig,
@@ -31,16 +32,28 @@ from transformers import (
     AutoModelForTextToWaveform,
     PreTrainedModel,
 )
-from transformers.modeling_utils import _get_resolved_checkpoint_files
+from transformers.modeling_utils import _get_resolved_checkpoint_files, no_init_weights
+from transformers.utils import ContextManagers, TRANSFORMERS_CACHE
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code
+from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code, init_empty_weights, print_trainable_parameters, _supports_logits_to_keep
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
+from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
+from nemo_automodel.components.distributed.ddp import DDPManager
+from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
+from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
+from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+if TYPE_CHECKING:
+    from torchao.quantization.qat.linear import Int4WeightOnlyQATQuantizer, Int8DynActInt4WeightQATQuantizer
+    from nemo_automodel.components.quantization.fp8 import FP8Config
+    from nemo_automodel.components.utils.compile_utils import CompileConfig
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 HAS_FA, _ = safe_import("flash_attn")
@@ -210,7 +223,7 @@ def _get_next_fallback_attn(attn_implementation: str) -> str:
         return priorities[0]
 
 
-def get_hf_config(pretrained_model_name_or_path, attn_implementation, kwargs):
+def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
     """
     Get the HF config for the model.
     """
@@ -313,6 +326,133 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
                 transformers_explicit_filename=None,
             )
 
+def _init_model(cls, pretrained_model_name_or_path, attn_implementation, torch_dtype, quantization_config, force_hf, *model_args, **kwargs):
+    torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
+    hf_config = get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs)
+
+    # 1. if force_hf is True, use HF model class wrapped with mixin
+    if force_hf:
+        if quantization_config is not None:
+            kwargs["quantization_config"] = quantization_config
+        model = cls._from_pretrained_parent_class(
+            pretrained_model_name_or_path,
+            *model_args,
+            torch_dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+            **kwargs,
+        )
+        # Get HF model class and wrap with mixin
+        hf_model_cls = cls._model_mapping[type(hf_config)]
+        model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
+        return model
+
+    architectures = get_architectures(hf_config)
+    # 2. If we have a custom model implementation available, we prioritize that over HF
+    if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
+        # if we are able to init the custom model, we will now download the model weights on local rank 0
+        _download_model_weights(hf_config, pretrained_model_name_or_path)
+        logger.info(f"Using custom model implementation for {architectures[0]}")
+        kwargs.pop("trust_remote_code", None)
+        model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
+        # Override config's torch_dtype with user-requested dtype so model __init__ uses correct dtype
+        if torch_dtype != "auto":
+            hf_config.torch_dtype = torch_dtype
+        with local_torch_dtype(torch_dtype, model_cls.__name__):
+            return model_cls(hf_config, *model_args, **kwargs)
+
+    # 3. fallback to HF model class wrapped with mixin
+    hf_model_cls = cls._model_mapping[type(hf_config)]
+
+    model = None
+    if quantization_config is not None:
+        kwargs["quantization_config"] = quantization_config
+    # Use mixin's from_pretrained which handles weight loading
+    model = cls._from_pretrained_parent_class(
+        pretrained_model_name_or_path,
+        *model_args,
+        torch_dtype=torch_dtype,
+        attn_implementation=attn_implementation,
+        **kwargs,
+    )
+
+    return model
+
+def _apply_peft_and_lower_precision(model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer):
+    if peft_config is not None:
+        if tp_size > 1:
+            logger.info("Disabling Triton with TP ({})".format(tp_size))
+            peft_config.use_triton = False
+        if autopipeline is not None:
+            logger.info("Enabling PEFT with Pipeline Parallelism")
+            logger.info("Disabling Triton with Pipeline Parallelism Enabled.")
+            peft_config.use_triton = False
+        apply_lora_to_linear_modules(
+            model, peft_config, quantization_config=quantization_config
+        )
+
+    # FP8
+    if fp8_config is not None:
+        model = apply_fp8_to_model(model, config=fp8_config)
+
+    # QAT
+    if qat_quantizer is not None:
+        from nemo_automodel.components.quantization.qat import prepare_qat_model
+
+        if any(map(lambda x: x.dtype != torch.bfloat16, model.parameters())):
+            logger.warning("QAT is only supported for bfloat16 models. Support will be added in future release.")
+            quit(code=0)
+        model, qat_mode = prepare_qat_model(model, qat_quantizer)
+        # Attach helpers for delayed fake-quant toggling if desired
+        model._qat_mode = qat_mode  # type: ignore[attr-defined]
+
+    return model
+
+def _shard_pp(autopipeline, model, loss_fn, checkpointer, pretrained_model_name_or_path, peft_config, parallelize_fn, **kwargs):
+    if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
+        logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
+        loss_fn = MaskedCrossEntropy()
+    print_trainable_parameters(model)
+    if get_world_size_safe() == 1:
+        logger.info("World size is 1, skipping autopipeline.")
+    else:
+        autopipeline.build(model, loss_fn=loss_fn, parallelize_fn=parallelize_fn)
+        model = autopipeline
+    return model
+
+def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, optimizer=None):
+    if parallelize_fn is not None and get_world_size_safe() > 1:
+        parallelize_fn(
+            model,
+            world_mesh=model_wrapper.device_mesh,
+            moe_mesh=model_wrapper.moe_mesh,
+            dp_axis_names=(
+                ("dp_replicate", "dp_shard_cp")
+                if "dp_replicate" in model_wrapper.device_mesh.mesh_dim_names
+                and "dp_shard_cp" in model_wrapper.device_mesh.mesh_dim_names
+                else ("dp_shard_cp",)
+            ),
+            cp_axis_name="cp" if "cp" in model_wrapper.device_mesh.mesh_dim_names else None,
+            tp_axis_name="tp" if "tp" in model_wrapper.device_mesh.mesh_dim_names else None,
+            ep_axis_name="ep"
+            if model_wrapper.moe_mesh is not None and "ep" in model_wrapper.moe_mesh.mesh_dim_names
+            else None,
+            ep_shard_axis_names=(
+                ("ep_shard",)
+                if model_wrapper.moe_mesh is not None and "ep_shard" in model_wrapper.moe_mesh.mesh_dim_names
+                else None
+            ),
+        )
+    elif callable(getattr(model_wrapper, "parallelize", None)):
+        # FSDP2 and MegatronFSDP should already be on the correct device
+        if isinstance(model_wrapper, MegatronFSDPManager):
+            assert optimizer is not None, "Optimizer is required for MegatronFSDP. Please pass it as an argument."
+            model, optimizer = model_wrapper.parallelize(model, optimizer)
+            return model, optimizer
+
+        else:
+            model = model_wrapper.parallelize(model)
+    return model
+
 
 def get_architectures(hf_config):
     """
@@ -347,6 +487,24 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     """
 
     @classmethod
+    def _from_pretrained_parent_class(cls, *args, **kwargs):
+        name = cls.__name__
+        if name.startswith("NeMo"):
+            cls.__name__ = name[4:]
+        model = super().from_pretrained(*args, **kwargs)
+        cls.__name__ = name
+        return model
+
+    @classmethod
+    def _from_config_parent_class(cls, *args, **kwargs):
+        name = cls.__name__
+        if name.startswith("NeMo"):
+            cls.__name__ = name[4:]
+        model = super().from_config(*args, **kwargs)
+        cls.__name__ = name
+        return model
+
+    @classmethod
     def from_pretrained(
         cls,
         pretrained_model_name_or_path,
@@ -358,7 +516,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = "flash_attention_2",
         quantization_config=None,
         force_hf: bool = False,
+        model_wrapper = None,
+        autopipeline: AutoPipeline | None = None,
+        parallelize_fn: Callable | None = None,
         checkpointer: Optional[Checkpointer] = None,
+        peft_config: Optional[dict] = None,
+        fp8_config: Optional["FP8Config"] = None,
+        qat_quantizer: Optional[Union["Int4WeightOnlyQATQuantizer", "Int8DynActInt4WeightQATQuantizer"]] = None,
+        loss_fn: Optional[Callable] = None,
+        compile_config: Optional["CompileConfig"] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -410,17 +576,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
               deleted and the method recurses once with
               `use_liger_kernel=False` or `use_sdpa_patching=False`
         """
-        torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
-        is_hf_model = get_is_hf_model(
-            get_hf_config(pretrained_model_name_or_path, attn_implementation, kwargs),
-            force_hf,
-        )
-        tp_size, cp_size, has_packed_sequence = _pop_tp_cp_has_packed(kwargs)
-        attn_implementation, use_liger_kernel = _apply_preload_overrides(
-            is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
-        )
-        hf_config = get_hf_config(pretrained_model_name_or_path, attn_implementation, kwargs)
-
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
             kwargs["quantization_config"] = quantization_config
@@ -438,65 +593,33 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
+                autopipeline=autopipeline,
+                parallelize_fn=parallelize_fn,
+                peft_config=peft_config,
+                fp8_config=fp8_config,
+                qat_quantizer=qat_quantizer,
+                loss_fn=loss_fn,
                 checkpointer=checkpointer,
+                compile_config=compile_config,
+                model_wrapper=model_wrapper,
                 **kwargs,
             )
+        is_hf_model = get_is_hf_model(
+            get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs),
+            force_hf,
+        )
+        tp_size, cp_size, has_packed_sequence = _pop_tp_cp_has_packed(kwargs)
+        attn_implementation, use_liger_kernel = _apply_preload_overrides(
+            is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
+        )
 
-        # 1. if force_hf is True, use HF model class wrapped with mixin
-        if force_hf:
-            # Get HF model class and wrap with mixin
-            hf_model_cls = cls._model_mapping[type(hf_config)]
-            wrapped_cls = _get_mixin_wrapped_class(hf_model_cls)
-            # Use mixin's from_pretrained which handles weight loading
-            model = wrapped_cls.from_pretrained(
-                pretrained_model_name_or_path,
-                *model_args,
-                checkpointer=checkpointer,
-                torch_dtype=torch_dtype,
-                hf_config=hf_config,
-                attn_implementation=attn_implementation,
-                quantization_config=quantization_config,
-                **kwargs,
-            )
-            return model
-        architectures = get_architectures(hf_config)
-        # 2. If we have a custom model implementation available, we prioritize that over HF
-        if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
-            # if we are able to init the custom model, we will now download the model weights on local rank 0
-            _download_model_weights(hf_config, pretrained_model_name_or_path)
-            logger.info(f"Using custom model implementation for {architectures[0]}")
-            kwargs.pop("trust_remote_code", None)
-            model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
+        # Neither of these parallelization methods support meta device initialization
+        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not force_hf
+        init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
-            # Use the mixin's from_pretrained which handles weight loading via Checkpointer
-            model = model_cls.from_pretrained(
-                pretrained_model_name_or_path,
-                *model_args,
-                checkpointer=checkpointer,
-                torch_dtype=torch_dtype,
-                hf_config=hf_config,
-                **kwargs,
-            )
-            return model
-
-        # 3. fallback to HF model class wrapped with mixin
-        hf_model_cls = cls._model_mapping[type(hf_config)]
-        wrapped_cls = _get_mixin_wrapped_class(hf_model_cls)
-
-        model = None
         try:
-            if quantization_config is not None:
-                kwargs["quantization_config"] = quantization_config
-            # Use mixin's from_pretrained which handles weight loading
-            model = wrapped_cls.from_pretrained(
-                pretrained_model_name_or_path,
-                *model_args,
-                checkpointer=checkpointer,
-                torch_dtype=torch_dtype,
-                hf_config=hf_config,
-                attn_implementation=attn_implementation,
-                **kwargs,
-            )
+            with init_ctx:
+                model = _init_model(cls, pretrained_model_name_or_path, attn_implementation, torch_dtype, quantization_config, force_hf, *model_args, **kwargs)
         except ValueError as e:
             if "does not support" in str(e):
                 if model is not None:
@@ -525,6 +648,52 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             return _retry(use_sdpa_patching=False)
 
         _verify_sdpa_support(model, is_hf_model, cp_size)
+
+        if checkpointer.config.dequantize_base_checkpoint is None:
+            # try to infer whether the base weights are quantized
+            try:
+                checkpointer.config.dequantize_base_checkpoint = hasattr(model.config, "quantization_config")
+            except:
+                checkpointer.config.dequantize_base_checkpoint = False
+
+        # Apply PEFT and lower precision if configured
+        model = _apply_peft_and_lower_precision(model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer)
+
+        # hold a list copy of the model state dict keys before any parallelization
+        checkpointer.config.model_state_dict_keys = list(model.state_dict(checkpointer=checkpointer).keys())
+
+        # Apply pipeline parallelism if configured. This is the outermost parallelization.
+        # Note: AutoPipeline takes care of applying PP + EP + FSDP. _shard_ep_fsdp will take care of applying EP + FSDP if no PP.
+        if autopipeline is not None:
+            model = _shard_pp(autopipeline, model, loss_fn, checkpointer, pretrained_model_name_or_path, peft_config, parallelize_fn, model_wrapper, **kwargs)
+        else:
+            model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn, kwargs.get("optimizer", None))
+            model.to(torch.cuda.current_device())
+            if compile_config is not None:
+                model = compile_model(model, compile_config)
+        
+        # Load the checkpoint if needed and return
+        should_load_checkpoint = is_meta_device and any([
+            parallelize_fn is not None and get_world_size_safe() > 1,  # Because weights have not yet been initialized. Coming from _shard_ep_fsdp
+            autopipeline is not None,  # Because weights have not yet been initialized. Coming from _shard_pp
+        ])
+        if should_load_checkpoint:
+            models_to_load = model.parts if hasattr(model, "parts") else [model]
+            device = torch.cuda.current_device()
+            cache_dir = kwargs.get("cache_dir", TRANSFORMERS_CACHE)
+            lora_a_init = getattr(peft_config, "lora_A_init", None)
+            for mp in models_to_load:
+                checkpointer.load_base_model(
+                    mp,
+                    device,
+                    cache_dir,
+                    pretrained_model_name_or_path,
+                    lora_a_init,
+                    load_base_model=True,
+                )
+        
+        if autopipeline is not None:
+            print_trainable_parameters(model)  # Once model's been sharded
 
         return model
 
