@@ -138,7 +138,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         sed -i '/\[tool\.uv\]/r /opt/Automodel/docker/common/uv-pytorch.toml' pyproject.toml && \
         mv /opt/Automodel/docker/common/uv-pytorch.lock /opt/Automodel/uv.lock; \
     fi && \
-    uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups
+    uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups && \
     uv cache prune
 
 COPY . /opt/Automodel
