@@ -38,7 +38,7 @@ model:
   pretrained_model_name_or_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
   # Customize this backend for fine grained control
   # backend:
-  #   _target_: nemo_automodel.components.moe.utils.BackendConfig
+  #   _target_: nemo_automodel.components.models.common.BackendConfig
   #   attn: sdpa
   #   linear: te
   #   rms_norm: te

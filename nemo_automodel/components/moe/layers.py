@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
-from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.shared.utils import dtype_from_str
 
 try:
