@@ -226,9 +226,7 @@ def _resolve_doc_to_example(doc: Any, corpus_id: str, corpus_dict: Dict[str, Any
         # Treat non-empty "id" as a corpus lookup.
         if doc_id:
             if corpus_id not in corpus_dict:
-                raise KeyError(
-                    f"Corpus '{corpus_id}' not found in corpus_dict (needed to resolve doc id '{doc_id}')."
-                )
+                raise KeyError(f"Corpus '{corpus_id}' not found in corpus_dict (needed to resolve doc id '{doc_id}').")
             return corpus_dict[corpus_id].get_document_by_id(str(doc_id))
 
         # Inline doc: copy supported fields over the template.
