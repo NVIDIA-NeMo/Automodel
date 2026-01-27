@@ -21,6 +21,7 @@ The table below shows training performance for full sequences with no padding ac
 
 The table below shows finetuning (LoRA) performance for full sequences with no padding across different model architectures and scales.
 
+### System: DGX-H100, Precision: BF16
 | Model | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec/GPU |
 |-------|------:|----:|----:|----:|---:|-----------:|---:|---:|---:|---:|---:|-----:|---------|-------------------------:|---------------------:|---------------:|
 | Llama3 8B | 1 | 32 | 2 | 2 | 16 | 4096 | 1 | 1 | 1 | - | 1 | 1 | - | 10.51 | 402 | 12472.87 |
