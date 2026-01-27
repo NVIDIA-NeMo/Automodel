@@ -24,6 +24,29 @@ benchmark:
   nsys_ranks: []
   num_nodes: 1
 
+generation:
+  # Text prompt for generation
+  prompt: "Once upon a time"
+
+  # Generation hyperparameters
+  max_new_tokens: 100
+  seed: 42
+
+  # Comparison and debugging options
+  compare_hf: true  # Set to true to compare with HuggingFace model
+  hf_model_path: null  # Optional: path to HF model (defaults to model.pretrained_model_name_or_path)
+
+  # Activation debugging
+  debug_activations: false  # Set to true to record and compare activations
+
+  # Layer limiting - set to a number to load only first N layers (useful for large models)
+  # When set, will override model.config.num_hidden_layers
+  max_layers: null
+
+  # Custom activation processing functions (optional)
+  # This should be a dict mapping regex patterns to processing functions
+  activation_processing_functions: null
+
 step_scheduler:
   global_batch_size: 512
   local_batch_size: 4
