@@ -7,7 +7,6 @@ NeMo Automodel recipes are configured with YAML. Under the hood, YAML is parsed 
 - Supports environment variable interpolation inside YAML strings.
 - Tries to make config printing safe by preserving original placeholders (to avoid leaking secrets).
 
----
 
 ## Load Model and Dataset Configs
 
@@ -30,7 +29,6 @@ Only **strings** are translated. Examples:
 
 YAML-native types (like `step_size: 10` without quotes) are already typed by the YAML parser and remain unchanged.
 
----
 
 ## Use `_target_` for Instantiation
 
@@ -55,7 +53,6 @@ By default, resolving targets is restricted:
 - Accessing private or dunder attributes is blocked by default.
 - Loading out-of-tree user code can be enabled with `NEMO_ENABLE_USER_MODULES=1` or by calling `set_enable_user_modules(True)`.
 
----
 
 ## Interpolate Environment Variables in YAML
 
@@ -92,7 +89,6 @@ dataset:
     DATABRICKS_HTTP_PATH: ${DATABRICKS_HTTP_PATH}
 ```
 
----
 
 ## Prevent Secret Leakage in Logs
 
@@ -105,7 +101,6 @@ When an env var placeholder is resolved, the config keeps the original placehold
 Printing a **leaf value** (for example, `print(cfg.dataset.delta_storage_options.DATABRICKS_TOKEN)`) outputs the resolved secret. Instead, print the full config or use a redacted YAML dict.
 :::
 
----
 
 ## Configure Slurm (`automodel` CLI)
 
