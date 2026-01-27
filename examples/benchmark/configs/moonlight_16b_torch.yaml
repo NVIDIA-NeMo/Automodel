@@ -66,7 +66,7 @@ model:
     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
   trust_remote_code: true
   backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
     linear: torch
     rms_norm: torch

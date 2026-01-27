@@ -41,21 +41,20 @@ from transformers.masking_utils import create_causal_mask, create_sliding_window
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.models.qwen2.modeling_qwen2 import (
-    Qwen2RMSNorm,
-    Qwen2RotaryEmbedding,
-    apply_rotary_pos_emb,
-    eager_attention_forward,
-)
+from transformers.models.qwen2.modeling_qwen2 import eager_attention_forward
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 
-from nemo_automodel.components.models.common.combined_projection import (
+from nemo_automodel.components.models.common import (
+    BackendConfig,
     CombinedGateUpMLP,
     CombinedQKVAttentionMixin,
+    initialize_rms_norm_module,
 )
+
+# Use shared rope_utils (same implementation as Llama, supports both config formats)
+from nemo_automodel.components.models.llama.rope_utils import Qwen2RotaryEmbedding, apply_rotary_pos_emb
 from nemo_automodel.components.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
-from nemo_automodel.components.moe.utils import BackendConfig
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 
 __all__ = ["Qwen2ForCausalLM"]
@@ -150,6 +149,7 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         self,
         config: Qwen2Config,
         layer_idx: int,
+        backend: BackendConfig,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -160,8 +160,12 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         # ALWAYS use combined gate_up MLP in custom implementation
         self.mlp = CombinedGateUpMLP(config=config)
 
-        self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
+        self.post_attention_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
         self.attention_type = config.layer_types[layer_idx]
 
     def forward(
@@ -228,6 +232,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
     def __init__(
         self,
         config: Qwen2Config,
+        backend: BackendConfig,
     ):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -240,11 +245,14 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 Qwen2DecoderLayer(
                     config=config,
                     layer_idx=layer_idx,
+                    backend=backend,
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
         self.rotary_emb = Qwen2RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
@@ -368,7 +376,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         super().__init__(config)
         self.backend = backend or BackendConfig()
         # ALWAYS use combined projections
-        self.model = Qwen2Model(config=config)
+        self.model = Qwen2Model(config=config, backend=self.backend)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 

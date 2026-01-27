@@ -22,7 +22,7 @@ from nemo_automodel.components.models.deepseek_v3.layers import (
     postprocess_output_for_attn,
     MLA,
 )
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig
 
 # Skip Transformer Engine tests by default unless explicitly enabled
 TE_AVAILABLE = False

@@ -20,7 +20,7 @@ from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from nemo_automodel.components.models.qwen3_moe.model import Block, Qwen3MoeForCausalLM, Qwen3MoeModel
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

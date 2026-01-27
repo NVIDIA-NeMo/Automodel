@@ -23,12 +23,12 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
-from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
-from nemo_automodel.components.moe.utils import (
+from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 
 
 class Glm4MoeAttention(nn.Module):

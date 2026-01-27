@@ -30,7 +30,7 @@ from nemo_automodel.components.moe.layers import (
     get_expert_activation_for_deepep,
     swiglu,
 )
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig
 
 
 @pytest.fixture
