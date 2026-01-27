@@ -58,7 +58,7 @@ This section provides practical usage examples, including how to load remote dat
 Assume you have a local newline-delimited JSON file at `/data/my_corpus.jsonl`
 with the simple schema `{instruction, output}`. A few sample rows:
 
-```jsonl
+```json
 {"instruction": "Translate 'Hello' to French", "output": "Bonjour"}
 {"instruction": "Summarize the planet Neptune.", "output": "Neptune is the eighth planet from the Sun."}
 ```
@@ -101,7 +101,7 @@ The dataset schema is `{task_name, id, definition, inputs, targets}`.
 
 The following are examples from the training split:
 
-```jsonl
+```json
 {
   "task_name": "task001_quoref_question_generation",
   "id": "task001-abc123",
