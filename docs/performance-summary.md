@@ -1,6 +1,6 @@
-# NeMo AutoModel Performance Summary
+# NeMo Automodel Performance Summary
 
-This document provides performance benchmarks for various large language models using NeMo Pytorch backend - i.e. NeMo Automodel.
+This document provides performance benchmarks for various large language models using NeMo Automodel with the PyTorch backend.
 
 ## Pre-Training Performance
 
@@ -19,7 +19,7 @@ The table below shows training performance for full sequences with no padding ac
 
 ---
 
-## Finetuning (LoRA) Performance
+## Fine-Tuning (LoRA) Performance
 
 The table below shows finetuning (LoRA) performance for full sequences with no padding across different model architectures and scales.
 
@@ -45,7 +45,7 @@ The table below shows finetuning (LoRA) performance for full sequences with no p
 - **GA**: Gradient Accumulation - number of local-batches before optimizer step
 - **TE**: Transformer Engine kernel optimizations - RMSNorm, Linear and DotProductAttention
 - **DeepEP**: Deep Expert Parallelism - advanced EP routing for MoE models
-- **FlexAttn**: Pytorch's [Flex Attention](https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html)
+- **FlexAttn**: PyTorch's [Flex Attention](https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html)
 
 ---
 
@@ -67,16 +67,17 @@ All benchmark configurations are available in [`examples/benchmark/configs/`](ht
 
 ---
 
-## Notes
-
-- All benchmarks use mock data for consistent performance measurement
-- Fake balanced gate is enabled to simulate ideal expert routing
-- No gradient clipping applied for pure performance measurement
-- MFU calculated using peak TFLOPs for the system (989 for BF16 H100)
-- Step times include forward and backward passes + optimizer step for the global batch
+:::{note}
+- All benchmarks use mock data for consistent performance measurement.
+- Fake balanced gate is enabled to simulate ideal expert routing.
+- No gradient clipping applied for pure performance measurement.
+- MFU calculated using peak TFLOPs for the system (989 for BF16 H100).
+- Step times include forward and backward passes + optimizer step for the global batch.
+:::
 
 ---
 
 
-**Last Updated**: 2025-10-02
-**NeMo AutoModel Version**: `main` Branch
+## Version Information
+- **Last Updated**: 2025-10-02
+- **NeMo AutoModel Version**: `main` Branch
