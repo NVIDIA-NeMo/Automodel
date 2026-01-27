@@ -149,12 +149,13 @@ jobs:
       - name: main
         uses: ./.github/actions/build-container
         with:
-          repo-name: "Automodel"
-          has-azure-credentials: "true"
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          dockerfile-path: "./docker/Dockerfile"
+          has-azure-credentials: "true"
           PAT: ${{ secrets.PAT }}
+          repo-name: "Automodel"
 
   cicd-unit-tests:
     strategy:
