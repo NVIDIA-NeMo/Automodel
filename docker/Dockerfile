@@ -127,6 +127,7 @@ WORKDIR /opt/Automodel
 
 COPY pyproject.toml uv.lock /opt/Automodel/
 COPY nemo_automodel/__init__.py nemo_automodel/package_info.py /opt/Automodel/nemo_automodel
+COPY docker/common/uv-pytorch.toml docker/common/uv-pytorch.lock /opt/Automodel/docker/common
 
 # Install Automodel
 ARG BASE_IMAGE=cuda
