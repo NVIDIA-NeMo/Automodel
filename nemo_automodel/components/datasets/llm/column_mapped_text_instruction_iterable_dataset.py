@@ -26,7 +26,6 @@ from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_datas
 logger = logging.getLogger(__name__)
 
 
-
 def _load_streaming_dataset(
     path_or_dataset_id: Union[str, List[str]],
     split: Optional[str] = None,
@@ -82,8 +81,8 @@ def _load_streaming_dataset(
     # Check for Delta Lake sources first
     if isinstance(path_or_dataset_id, str):
         from nemo_automodel.components.datasets.llm.delta_lake_dataset import (
-            is_delta_lake_path,
             DeltaLakeDataset,
+            is_delta_lake_path,
         )
 
         if is_delta_lake_path(path_or_dataset_id):

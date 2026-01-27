@@ -90,7 +90,8 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional, Union
+from typing import Any, Dict, Iterator, Optional
+
 from nemo_automodel.components.datasets.reservoir_sampler import ReservoirSampler
 
 logger = logging.getLogger(__name__)
