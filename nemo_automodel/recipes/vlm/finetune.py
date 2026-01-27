@@ -235,17 +235,22 @@ def build_model_and_optimizer(
                 model,
                 world_mesh=model_wrapper.device_mesh,
                 moe_mesh=getattr(model_wrapper, "moe_mesh", None),
-                pp_enabled=False,
                 dp_axis_names=(
                     ("dp_replicate", "dp_shard_cp")
                     if "dp_replicate" in model_wrapper.device_mesh.mesh_dim_names
                     and "dp_shard_cp" in model_wrapper.device_mesh.mesh_dim_names
                     else ("dp_shard_cp",)
                 ),
-                cp_axis_name="cp",
-                tp_axis_name="tp",
-                ep_axis_name="ep",
-                ep_shard_axis_names=("ep_shard",),
+                cp_axis_name="cp" if "cp" in model_wrapper.device_mesh.mesh_dim_names else None,
+                tp_axis_name="tp" if "tp" in model_wrapper.device_mesh.mesh_dim_names else None,
+                ep_axis_name="ep"
+                if model_wrapper.moe_mesh is not None and "ep" in model_wrapper.moe_mesh.mesh_dim_names
+                else None,
+                ep_shard_axis_names=(
+                    ("ep_shard",)
+                    if model_wrapper.moe_mesh is not None and "ep_shard" in model_wrapper.moe_mesh.mesh_dim_names
+                    else None
+                ),
             )
             load_weights = True
         elif callable(getattr(model_wrapper, "parallelize", None)):
@@ -903,8 +908,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 # VLM: Custom chunking for pixel_values and image_grid_hws
                 # These tensors have non-standard structure that can't be naively chunked by dim 0
-                # pixel_values: [total_patches, 3, 14, 14] where patches from different images are concatenated
-                # image_grid_hws: [num_images, 2] where each row is [H, W] for one image
+                # TODO: @HuiyingLi properly handle pixel_values split
                 pixel_values = batch.pop("pixel_values", None)
                 image_grid_hws = batch.pop("image_grid_hws", None)
 
@@ -914,39 +918,29 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     batch_size = input_ids.shape[0]
                     n_images = image_grid_hws.shape[0]
 
-                    # Calculate patch counts per image: H * W for each image
                     patch_counts = image_grid_hws[:, 0] * image_grid_hws[:, 1]
                     cumsum = torch.cumsum(patch_counts, dim=0)
 
-                    # Pre-chunk pixel_values and image_grid_hws aligned with image boundaries
                     pixel_values_chunks = []
                     image_grid_hws_chunks = []
 
-                    # Handle case where n_images != batch_size
-                    # This can happen if samples have 0 or multiple images
                     if n_images == batch_size:
-                        # 1 image per sample - chunk by samples
+                        # 1 image per sample
                         images_per_mb = batch_size // n_microbatches
                         for mb_idx in range(n_microbatches):
                             img_start = mb_idx * images_per_mb
                             img_end = min(img_start + images_per_mb, n_images)
 
-                            # Slice image_grid_hws
                             image_grid_hws_chunks.append(image_grid_hws[img_start:img_end])
 
-                            # Calculate patch boundaries
                             patch_start = 0 if img_start == 0 else cumsum[img_start - 1].item()
                             patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
-
-                            # Slice pixel_values at correct image boundaries
                             pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
                     else:
-                        # Irregular - give all images to first microbatch, empty to rest
-                        # This handles cases where n_images != batch_size
                         pixel_values_chunks.append(pixel_values)
                         image_grid_hws_chunks.append(image_grid_hws)
                         for _ in range(n_microbatches - 1):
-                            pixel_values_chunks.append(pixel_values[:0])  # Empty tensor with same structure
+                            pixel_values_chunks.append(pixel_values[:0])
                             image_grid_hws_chunks.append(image_grid_hws[:0])
                         logging.warning(
                             f"VLM chunking: n_images={n_images} != batch_size={batch_size}, giving all images to first microbatch"
