@@ -36,6 +36,9 @@ inputs:
     description: "GitHub Personal Access Token"
     required: true
 
+env:
+  container-registry: nemoci.azurecr.io
+
 runs:
   using: "composite"
   steps:

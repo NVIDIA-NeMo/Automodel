@@ -50,6 +50,10 @@ inputs:
   PAT:
     description: "GitHub Personal Access Token"
     required: true
+  container-image:
+    description: "Container image to use for test"
+    required: true
+
 runs:
   using: "composite"
   steps:
@@ -108,7 +112,7 @@ runs:
           --volume $(pwd)/NeMo-Automodel:/workspace \
           --workdir /workspace \
           --volume $MNT_PATH/TestData:/home/TestData \
-          automodel \
+          ${{ inputs.container-image }} \
           bash -c "sleep $(( ${{ inputs.timeout }} * 60 + 60 ))"
         RUN_TEST_EOF
         )

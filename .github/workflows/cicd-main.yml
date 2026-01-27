@@ -29,6 +29,9 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  container-registry: nemoci.azurecr.io
+
 jobs:
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.2
@@ -191,6 +194,7 @@ jobs:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
+          container-image: ${{ env.container-registry }}/automodel:${{ github.sha }}
 
   cicd-e2e-tests:
     strategy:
@@ -255,6 +259,8 @@ jobs:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
+          container-image: ${{ env.container-registry }}/automodel:${{ github.sha }}
+
 
   Nemo_CICD_Test:
     needs:
