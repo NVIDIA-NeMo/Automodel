@@ -30,7 +30,7 @@ model:
   trust_remote_code: true
   torch_dtype: bfloat16
   backend:
-    _target_: nemo_automodel.components.model.common.BackendConfig
+    _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: torch
     rms_norm: te
