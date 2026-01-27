@@ -44,6 +44,7 @@ dataset:
   - Sources: local JSON/JSONL or Hugging Face Hub dataset ID
   - Notes:
     - For tokenizers with chat templates and answer-only loss, you may set `answer_only_loss_mask: true` and provide `start_of_turn_token`.
+    - Supports streaming mode for large datasets (see [Streaming Datasets](#streaming-datasets) section below).
   - Example YAML:
 ```yaml
 dataset:
@@ -211,6 +212,146 @@ dataset:
   splits_to_build: "train"
 ```
 See the detailed [pretraining guide](llm/pretraining.md), which uses MegatronPretraining data.
+
+## Streaming Datasets
+
+Streaming datasets enable processing very large datasets without loading them entirely into memory. This is particularly useful when working with datasets that exceed available RAM or when you want to start training immediately without waiting for the full dataset to download.
+
+### What Are Streaming Datasets?
+
+Streaming datasets load and process data incrementally, one batch at a time, rather than loading the entire dataset into memory upfront. This approach:
+
+- **Reduces memory footprint**: Only the current batch resides in memory
+- **Enables training on massive datasets**: Process terabyte-scale datasets on machines with limited RAM
+- **Faster startup**: Begin training immediately without waiting for full dataset download
+- **Efficient for remote datasets**: Stream directly from Hugging Face Hub without local storage
+
+### When to Use Streaming
+
+Use streaming mode when:
+
+- Your dataset is very large (hundreds of GB or TB)
+- Available memory is limited compared to dataset size
+- You want to start training quickly without downloading the full dataset
+- You're experimenting with a subset of a large dataset
+
+Avoid streaming when:
+
+- Your dataset is small enough to fit comfortably in memory
+- You need random access to samples (e.g., for certain sampling strategies)
+- You need to know the exact dataset length upfront
+- Training requires multiple passes with different orderings
+
+### How to Enable Streaming
+
+For `ColumnMappedTextInstructionDataset`, use the streaming variant by changing the class to `ColumnMappedTextInstructionIterableDataset`:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset.ColumnMappedTextInstructionIterableDataset
+  path_or_dataset_id: Muennighoff/natural-instructions
+  split: train
+  column_mapping:
+    context: definition
+    question: inputs
+    answer: targets
+  answer_only_loss_mask: true
+  start_of_turn_token: "<|assistant|>"
+```
+
+For Hugging Face datasets loaded directly, set `streaming=True`:
+
+```python
+from datasets import load_dataset
+
+# Non-streaming (loads entire dataset into memory)
+dataset = load_dataset("large-dataset/corpus", split="train", streaming=False)
+
+# Streaming (loads data incrementally)
+dataset = load_dataset("large-dataset/corpus", split="train", streaming=True)
+```
+
+### Streaming Limitations
+
+When using streaming datasets, be aware of these limitations:
+
+1. **No random access**: You cannot use `dataset[index]` to access specific samples. Streaming datasets only support iteration.
+
+2. **No length information**: The `len(dataset)` operation is not available. You cannot determine the total number of samples upfront.
+
+3. **Single-pass iteration**: Each iteration consumes the stream. To iterate multiple times, you need to recreate the dataset or use the `repeat_on_exhaustion` parameter.
+
+4. **Limited shuffling**: Shuffling is done with a buffer (not the entire dataset), which may not provide perfect randomization.
+
+### Distributed Training with Streaming
+
+Streaming datasets support distributed training through sharding:
+
+```python
+from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset import (
+    ColumnMappedTextInstructionIterableDataset
+)
+
+dataset = ColumnMappedTextInstructionIterableDataset(
+    path_or_dataset_id="large-dataset/corpus",
+    column_mapping={"question": "input", "answer": "output"},
+    tokenizer=tokenizer,
+)
+
+# Shard the dataset across workers
+dataset = dataset.shard(num_shards=8, index=worker_id)
+
+# Enable shuffling with a buffer
+dataset = dataset.shuffle(buffer_size=10000, seed=42)
+
+# Set epoch for deterministic shuffling across epochs
+dataset.set_epoch(epoch_num)
+```
+
+### Performance Considerations
+
+**Memory vs. Speed Trade-offs**:
+- Streaming reduces memory usage but may be slower than in-memory datasets
+- Network latency can impact streaming performance for remote datasets
+- Use local caching when repeatedly accessing the same remote dataset
+
+**Buffer Size for Shuffling**:
+- Larger buffers provide better randomization but use more memory
+- A buffer size of 10,000-100,000 samples is typically a good balance
+- For perfect shuffling, you need a buffer size equal to the dataset size (defeating the purpose of streaming)
+
+**Prefetching**:
+- Most streaming implementations prefetch data in the background
+- This helps hide network latency and keeps GPUs busy
+- Adjust prefetch settings based on your network speed and batch size
+
+### Example: Streaming a Large Dataset
+
+Here's a complete example of using streaming for a large instruction-tuning dataset:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset.ColumnMappedTextInstructionIterableDataset
+  path_or_dataset_id: HuggingFaceH4/ultrachat_200k
+  split: train_sft
+  column_mapping:
+    question: prompt
+    answer: completion
+  answer_only_loss_mask: true
+  start_of_turn_token: "<|assistant|>"
+  repeat_on_exhaustion: true  # Automatically restart when stream ends
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  batch_size: 4
+  num_workers: 4
+```
+
+This configuration:
+- Streams the dataset without loading it fully into memory
+- Automatically repeats when the stream is exhausted
+- Uses multiple workers for efficient data loading
+- Applies answer-only loss masking during tokenization
 
 ## Packed Sequence Support
 To reduce padding and improve throughput with variable-length sequences:
