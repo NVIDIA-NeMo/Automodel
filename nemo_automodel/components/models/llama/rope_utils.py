@@ -121,7 +121,7 @@ def _compute_llama3_inv_freq(config, device: Optional[torch.device] = None) -> t
     return inv_freq, 1.0
 
 
-class RotaryEmbedding(nn.Module):
+class LlamaRotaryEmbedding(nn.Module):
     """Rotary Position Embedding module for Llama and Qwen2 models.
 
     Returns (cos, sin) tuple for use with apply_rotary_pos_emb.
@@ -139,14 +139,19 @@ class RotaryEmbedding(nn.Module):
         self.max_seq_len_cached = 0
         self.dtype = getattr(config, "torch_dtype", None) or torch.float32
 
+        # Map rope types to their respective computation functions
+        rope_functions = {
+            "default": _compute_default_inv_freq,
+            "llama3": _compute_llama3_inv_freq,
+        }
+
         # Determine rope_type and compute inv_freq
         _, rope_scaling = _get_rope_config(config)
         rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
 
-        if rope_type == "llama3":
-            inv_freq, self.attention_scaling = _compute_llama3_inv_freq(config, device)
-        else:
-            inv_freq, self.attention_scaling = _compute_default_inv_freq(config, device)
+        # Fallback to llama3 as the robust default if type is not in our map
+        compute_fn = rope_functions.get(rope_type, _compute_llama3_inv_freq)
+        inv_freq, self.attention_scaling = compute_fn(config, device)
 
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("_cos_cache", None, persistent=False)
@@ -190,12 +195,12 @@ class RotaryEmbedding(nn.Module):
         cos = self._cos_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
         sin = self._sin_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
 
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        return cos, sin
 
 
 # Aliases for HuggingFace compatibility
-LlamaRotaryEmbedding = RotaryEmbedding
-Qwen2RotaryEmbedding = RotaryEmbedding
+RotaryEmbedding = LlamaRotaryEmbedding
+Qwen2RotaryEmbedding = LlamaRotaryEmbedding
 
 
 __all__ = [

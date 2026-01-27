@@ -138,16 +138,15 @@ def initialize_rms_norm_module(
     rms_norm_impl: str,
     dim: int,
     eps: float = 1e-5,
-    device: torch.device | str = "meta",
+    device: torch.device | str | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> nn.Module:
     if rms_norm_impl == "te":
         return TENormWrapper(normalized_shape=dim, eps=eps, device=device, params_dtype=dtype)
     elif rms_norm_impl == "torch":
-        rms_norm_module = nn.RMSNorm(dim, eps=eps, device=device, dtype=dtype)
+        return nn.RMSNorm(dim, eps=eps, device=device, dtype=dtype)
     else:
         raise ValueError(f"Unsupported RMSNorm implementation: {rms_norm_impl}")
-    return rms_norm_module
 
 
 def initialize_linear_module(
@@ -155,7 +154,7 @@ def initialize_linear_module(
     in_features: int,
     out_features: int,
     bias: bool = False,
-    device: torch.device | str = "meta",
+    device: torch.device | str | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> nn.Module:
     if linear_impl == "torch":
