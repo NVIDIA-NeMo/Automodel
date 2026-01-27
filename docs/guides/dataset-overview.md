@@ -5,7 +5,6 @@ This page summarizes the datasets supported in NeMo Automodel for LLM and VLM an
 - See also: [LLM datasets](llm/dataset.md) and [VLM datasets](vlm/dataset.md) for deeper, task-specific guides.
 
 - If a dataset you need is missing, please open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) with a short description and example schema so we can prioritize support.
----
 
 ## LLM Datasets
 
@@ -228,7 +227,6 @@ dataloader:
     pad_seq_len_divisible: 16
 ```
 
----
 
 ## VLM Datasets (Vision/Audio + Language)
 VLM datasets are represented as conversations (message lists) that combine text with images or audio and are processed with the model's `AutoProcessor.apply_chat_template` and a suitable collate function.
@@ -276,7 +274,6 @@ If you want answer-only loss masking, provide a model-appropriate `start_of_resp
 
 See [Gemma-3n](omni/gemma3-3n.md) and [VLM dataset](vlm/dataset.md) for end-to-end examples.
 
----
 
 ## Bring Your Own Dataset
 You can integrate custom datasets with zero code changes to NeMo Automodel by using `_target_` in YAML. There are three approaches:
