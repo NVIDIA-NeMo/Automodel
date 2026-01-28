@@ -344,7 +344,7 @@ def _init_model(cls, pretrained_model_name_or_path, attn_implementation, torch_d
         # Get HF model class and wrap with mixin
         hf_model_cls = cls._model_mapping[type(hf_config)]
         model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
-        return model
+        return False, model
 
     architectures = get_architectures(hf_config)
     # 2. If we have a custom model implementation available, we prioritize that over HF
@@ -358,7 +358,7 @@ def _init_model(cls, pretrained_model_name_or_path, attn_implementation, torch_d
         if torch_dtype != "auto":
             hf_config.torch_dtype = torch_dtype
         with local_torch_dtype(torch_dtype, model_cls.__name__):
-            return model_cls(hf_config, *model_args, **kwargs)
+            return True, model_cls(hf_config, *model_args, **kwargs)
 
     # 3. fallback to HF model class wrapped with mixin
     hf_model_cls = cls._model_mapping[type(hf_config)]
@@ -375,7 +375,7 @@ def _init_model(cls, pretrained_model_name_or_path, attn_implementation, torch_d
         **kwargs,
     )
 
-    return model
+    return False, model
 
 def _apply_peft_and_lower_precision(model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer):
     if peft_config is not None:
@@ -407,10 +407,7 @@ def _apply_peft_and_lower_precision(model, tp_size, autopipeline, peft_config, q
 
     return model
 
-def _shard_pp(autopipeline, model, loss_fn, checkpointer, pretrained_model_name_or_path, peft_config, parallelize_fn, **kwargs):
-    if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
-        logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
-        loss_fn = MaskedCrossEntropy()
+def _shard_pp(autopipeline, model, loss_fn, parallelize_fn):
     print_trainable_parameters(model)
     if get_world_size_safe() == 1:
         logger.info("World size is 1, skipping autopipeline.")
@@ -419,7 +416,7 @@ def _shard_pp(autopipeline, model, loss_fn, checkpointer, pretrained_model_name_
         model = autopipeline
     return model
 
-def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, optimizer=None):
+def _shard_ep_fsdp(model, model_wrapper, parallelize_fn):
     if parallelize_fn is not None and get_world_size_safe() > 1:
         parallelize_fn(
             model,
@@ -443,14 +440,7 @@ def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, optimizer=None):
             ),
         )
     elif callable(getattr(model_wrapper, "parallelize", None)):
-        # FSDP2 and MegatronFSDP should already be on the correct device
-        if isinstance(model_wrapper, MegatronFSDPManager):
-            assert optimizer is not None, "Optimizer is required for MegatronFSDP. Please pass it as an argument."
-            model, optimizer = model_wrapper.parallelize(model, optimizer)
-            return model, optimizer
-
-        else:
-            model = model_wrapper.parallelize(model)
+        model = model_wrapper.parallelize(model)
     return model
 
 
@@ -619,7 +609,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         try:
             with init_ctx:
-                model = _init_model(cls, pretrained_model_name_or_path, attn_implementation, torch_dtype, quantization_config, force_hf, *model_args, **kwargs)
+                is_custom_model, model = _init_model(cls, pretrained_model_name_or_path, attn_implementation, torch_dtype, quantization_config, force_hf, *model_args, **kwargs)
         except ValueError as e:
             if "does not support" in str(e):
                 if model is not None:
@@ -631,7 +621,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         # Kernel patching
         try:
-            if use_liger_kernel:
+            if use_liger_kernel and not is_custom_model:
                 model = _patch_liger_kernel(model)
         except RuntimeError:
             logging.warning("Retrying without Liger kernels.")
@@ -641,7 +631,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         # Patch sdpa attention
         try:
-            if use_sdpa_patching:
+            if use_sdpa_patching and not is_custom_model:
                 model = _patch_attention(model, sdpa_method)  # noqa: F821
         except:
             logging.warning("Retrying without SDPA patching.")
@@ -660,22 +650,31 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         model = _apply_peft_and_lower_precision(model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer)
 
         # hold a list copy of the model state dict keys before any parallelization
-        checkpointer.config.model_state_dict_keys = list(model.state_dict(checkpointer=checkpointer).keys())
+        checkpointer.config.model_state_dict_keys = list(model.state_dict().keys())
+
+        # Loss function check
+        if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
+            loss_fn = MaskedCrossEntropy()
 
         # Apply pipeline parallelism if configured. This is the outermost parallelization.
         # Note: AutoPipeline takes care of applying PP + EP + FSDP. _shard_ep_fsdp will take care of applying EP + FSDP if no PP.
         if autopipeline is not None:
-            model = _shard_pp(autopipeline, model, loss_fn, checkpointer, pretrained_model_name_or_path, peft_config, parallelize_fn, model_wrapper, **kwargs)
+            model = _shard_pp(autopipeline, model, loss_fn, parallelize_fn)
         else:
-            model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn, kwargs.get("optimizer", None))
-            model.to(torch.cuda.current_device())
+            model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn)
+            # Only move to device if not on meta device (weights need to be loaded first for meta; handled by checkpointer)
+            if not is_meta_device:
+                model.to(torch.cuda.current_device())
             if compile_config is not None:
                 model = compile_model(model, compile_config)
         
         # Load the checkpoint if needed and return
+        # Weights need to be loaded for meta device models that were parallelized:
+        # 1. When parallelize_fn was used (which will internally apply FSDP2/EP sharding)
+        # 2. When FSDP2Manager.parallelize was used (but not MegatronFSDP which handles weights internally)
         should_load_checkpoint = is_meta_device and any([
-            parallelize_fn is not None and get_world_size_safe() > 1,  # Because weights have not yet been initialized. Coming from _shard_ep_fsdp
-            autopipeline is not None,  # Because weights have not yet been initialized. Coming from _shard_pp
+            parallelize_fn is not None and get_world_size_safe() > 1,
+            callable(getattr(model_wrapper, "parallelize", None)),
         ])
         if should_load_checkpoint:
             models_to_load = model.parts if hasattr(model, "parts") else [model]
@@ -692,7 +691,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     load_base_model=True,
                 )
         
-        if autopipeline is not None:
+        if autopipeline is None:
             print_trainable_parameters(model)  # Once model's been sharded
 
         return model
