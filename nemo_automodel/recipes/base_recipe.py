@@ -261,10 +261,11 @@ class BaseRecipe:
 
         # For multi-stage PP models, use checkpointer directly to handle all parts
         # For single models, use save_pretrained for HF-compatible API
-        if len(model) > 1:
+        if isinstance(model, list) and len(model) > 1:
             self.checkpointer.save_model(model, path, peft_config=self.peft_config, tokenizer=tokenizer)
         else:
-            model[0].save_pretrained(save_directory=path, checkpointer=self.checkpointer, tokenizer=tokenizer, peft_config=self.peft_config)
+            unwrapped_model = model[0] if isinstance(model, list) else model
+            unwrapped_model.save_pretrained(save_directory=path, checkpointer=self.checkpointer, tokenizer=tokenizer, peft_config=self.peft_config)
         self.checkpointer.save_optimizer(optimizer, model, path, scheduler)
         save_config(config.raw_config, path)
         if is_dist_initialized:

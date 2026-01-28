@@ -559,6 +559,9 @@ def apply_model_infrastructure(
 
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
+    
+    # Ensure model is on the correct device
+    model.to(device)
 
     return model
 
