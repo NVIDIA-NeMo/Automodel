@@ -18,13 +18,13 @@ import torch
 import torch.nn as nn
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
+from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.deepseek_v3.layers import MLA
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids, precompute_freqs_cis
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 

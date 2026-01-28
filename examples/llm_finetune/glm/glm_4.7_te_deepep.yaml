@@ -12,16 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/moonlight/moonlight_16b_te.yaml
-# Adjust --nproc-per-node to the number of GPUs available on your host machine.
-
-
 step_scheduler:
-  global_batch_size: 32
-  local_batch_size: 4
+  global_batch_size: 512
+  local_batch_size: 8
   ckpt_every_steps: 500
+  val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2
 
 dist_env:
@@ -36,42 +31,36 @@ rng:
 parallelizer:
   _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
   activation_checkpointing: false
+  wrap_outer_model: false
 
 model:
-  _target_: nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
-  backend:
-    _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: te
-    linear: te
-    rms_norm: te
-    enable_deepep: true
-    fake_balanced_gate: false
-    enable_hf_state_dict_adapter: true
-
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
-  pp_schedule: interleaved1f1b
-  pp_microbatch_size: 4
-  round_virtual_stages_to_pp_multiple: down
-  scale_grads_in_schedule: false
-  patch_inner_model: false
-  patch_causal_lm_model: false
-  layers_per_stage: 2
+  _target_: nemo_automodel.components.models.glm4_moe.model.Glm4MoeForCausalLM.from_pretrained
+  pretrained_model_name_or_path: zai-org/GLM-4.7
 
 checkpoint:
   enabled: false
-  checkpoint_dir: checkpoints/
-  model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  checkpoint_dir: /tmp/checkpoints/
+  model_save_format: safetensors # torch_save or safetensors
+  save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   tp_size: 1
   cp_size: 1
-  pp_size: 1
+  pp_size: 4
   dp_replicate_size: 1
-  ep_size: 8
+  ep_size: 32
+  sequence_parallel: false
+
+autopipeline:
+  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
+  pp_schedule: interleaved1f1b
+  pp_microbatch_size: 1
+  round_virtual_stages_to_pp_multiple: up
+  scale_grads_in_schedule: false
+  patch_inner_model: false
+  patch_causal_lm_model: false
+  layers_per_stage: 2
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -80,36 +69,42 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
-  pad_to_max_length: false
 
 packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences
-  packed_sequence_size: 1024
+  packed_sequence_size: 0
+  split_across_pack: false
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 160
   shuffle: true
+  drop_last: true
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  pad_to_max_length: false
+  num_samples_limit: 64
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 160
+  batch_size: 8
+  drop_last: true
 
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
-  eps: 1e-7
-  lr: 1.0e-4
-  weight_decay: 0
-  # min_lr: 1.0e-5
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0.0
 
-# # Uncomment and configure for W&B logging
+# Uncomment and configure for W&B logging
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>

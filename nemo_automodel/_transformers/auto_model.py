@@ -24,6 +24,10 @@ from typing import List, Optional, Union, Callable, TYPE_CHECKING
 import torch
 from nemo_automodel.components.utils.compile_utils import compile_model
 from torch.nn.attention import SDPBackend, sdpa_kernel
+
+from nemo_automodel.shared.torch_patches import apply_torch_patches
+
+apply_torch_patches()
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -37,7 +41,7 @@ from transformers.utils import ContextManagers, TRANSFORMERS_CACHE
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig, _maybe_adapt_state_dict_to_hf
 from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code, init_empty_weights, print_trainable_parameters, _supports_logits_to_keep
@@ -518,7 +522,11 @@ def apply_model_infrastructure(
     model = _apply_peft_and_lower_precision(model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer)
 
     # hold a list copy of the model state dict keys before any parallelization
-    checkpointer.config.model_state_dict_keys = list(model.state_dict().keys())
+    checkpointer.config.model_state_dict_keys = list(
+        _maybe_adapt_state_dict_to_hf(
+            model, model.state_dict(), quantization=checkpointer.config.dequantize_base_checkpoint
+        ).keys()
+    )
 
     # Loss function check
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
@@ -574,6 +582,66 @@ def get_architectures(hf_config):
     if hasattr(hf_config, "architectures"):
         architectures = hf_config.architectures or []
     return architectures
+
+
+def _get_init_param_names(model_cls) -> set[str]:
+    """
+    Best-effort extraction of explicit __init__ parameter names (excluding `self`).
+
+    Returns an empty set if the signature cannot be inspected.
+    """
+    try:
+        sig = inspect.signature(model_cls.__init__)
+    except (TypeError, ValueError):
+        return set()
+    return {k for k in sig.parameters.keys() if k != "self"}
+
+
+def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str] | None = None) -> None:
+    """
+    Mimic HF from_pretrained behavior: treat config-related kwargs as config overrides,
+    not model __init__ kwargs.
+
+    For custom model implementations we instantiate via `model_cls(config, **kwargs)`,
+    so passing config flags like `output_hidden_states` would crash. This helper moves
+    such keys onto the config and removes them from `kwargs`.
+    """
+    if init_param_names is None:
+        init_param_names = set()
+    # Prefer `to_dict()` to capture the canonical set of config fields.
+    try:
+        config_keys = set(config.to_dict().keys())
+    except Exception:
+        config_keys = set(getattr(config, "__dict__", {}).keys())
+
+    for k in list(kwargs.keys()):
+        # If the model explicitly declares this kwarg, keep it for __init__.
+        if k in init_param_names:
+            continue
+        # Otherwise, if it looks like a config field, apply it to config.
+        if k in config_keys:
+            setattr(config, k, kwargs.pop(k))
+
+
+def _filter_kwargs_for_init(model_cls, kwargs: dict) -> dict:
+    """
+    Filter kwargs down to what `model_cls.__init__` explicitly accepts.
+
+    If the constructor has a `**kwargs` parameter (VAR_KEYWORD) or signature cannot be
+    inspected, returns kwargs unchanged.
+    """
+    try:
+        sig = inspect.signature(model_cls.__init__)
+    except (TypeError, ValueError):
+        return kwargs
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return kwargs
+
+    allowed = set(sig.parameters.keys())
+    allowed.discard("self")
+    # We pass `config` positionally.
+    allowed.discard("config")
+    return {k: v for k, v in kwargs.items() if k in allowed}
 
 
 class _BaseNeMoAutoModelClass(_BaseAutoModelClass):

@@ -22,10 +22,31 @@ from nemo_automodel.components.models.common.combined_projection.state_dict_adap
     CombinedProjectionStateDictAdapter,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.te_utils import (
+    HAVE_DEEP_EP,
+    HAVE_TE,
+    BackendConfig,
+    TELinearWrapper,
+    TENormWrapper,
+    initialize_linear_module,
+    initialize_rms_norm_module,
+    is_tensor_unallocated,
+)
 
 __all__ = [
+    # Combined projection
     "CombinedQKVAttentionMixin",
     "CombinedGateUpMLP",
     "CombinedProjectionStateDictAdapter",
+    # HF checkpointing mixin
     "HFCheckpointingMixin",
+    # Backend utilities
+    "HAVE_TE",
+    "HAVE_DEEP_EP",
+    "BackendConfig",
+    "is_tensor_unallocated",
+    "TENormWrapper",
+    "TELinearWrapper",
+    "initialize_rms_norm_module",
+    "initialize_linear_module",
 ]
