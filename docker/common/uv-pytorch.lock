@@ -2150,19 +2150,6 @@ wheels = [
 ]
 
 [[package]]
-name = "liger-kernel"
-version = "0.6.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "torch", marker = "sys_platform == 'never'" },
-    { name = "triton", marker = "sys_platform == 'never'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/31/23/be0b4dcac42d77f99406c906567cde22a7a3d71b3f3ffdfda2ac6153ec36/liger_kernel-0.6.2.tar.gz", hash = "sha256:5c5bcffffa769bc26ae838f5a4954170dd5cacde036abb1b383039f39fa5fd69", size = 3679495, upload-time = "2025-08-22T00:15:28.456Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/94/2c/68d992835e8630c1b94cdcb246ea7eecad790a955037ca3f19b6c01e8215/liger_kernel-0.6.2-py3-none-any.whl", hash = "sha256:303b9bbf5c10f9289c3139afb41e4d989e8c809516624a106b89b064163d971d", size = 192815, upload-time = "2025-08-22T00:15:27.04Z" },
-]
-
-[[package]]
 name = "llvmlite"
 version = "0.45.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2846,7 +2833,6 @@ dependencies = [
     { name = "diffusers" },
     { name = "ftfy" },
     { name = "imageio-ffmpeg" },
-    { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "megatron-fsdp" },
     { name = "mlflow" },
     { name = "opencv-python-headless" },
@@ -2936,7 +2922,6 @@ requires-dist = [
     { name = "flash-linear-attention", marker = "extra == 'extra'" },
     { name = "ftfy" },
     { name = "imageio-ffmpeg" },
-    { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", specifier = ">=0.5.9" },
     { name = "megatron-fsdp" },
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'" },
     { name = "mlflow" },
