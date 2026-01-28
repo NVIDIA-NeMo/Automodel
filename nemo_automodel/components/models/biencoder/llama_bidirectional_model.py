@@ -37,6 +37,7 @@ from transformers.modeling_outputs import (
     ModelOutput,
     SequenceClassifierOutputWithPast,
 )
+from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import (
     LlamaForSequenceClassification,
@@ -181,9 +182,22 @@ class LlamaBidirectionalModel(LlamaModel):
     def _update_causal_mask(
         self,
         attention_mask: torch.Tensor,
+        input_tensor: torch.Tensor,
     ):
-        if attention_mask is not None and (attention_mask == 0.0).any():
-            return attention_mask
+        if attention_mask is not None and (attention_mask == 0).any():
+            # Check which attention implementation is being used
+            attn_impl = getattr(self.config, "_attn_implementation", "sdpa")
+
+            if attn_impl == "flash_attention_2":
+                # Flash Attention 2 expects: 1 = attend, 0 = mask out (same as input)
+                # It also handles unpadding internally, so we can return as-is
+                # but ensure it's the right dtype (int or bool where True=attend)
+                return attention_mask.bool()  # True = attend, False = mask out
+            else:
+                # SDPA expects: bool where True = mask out, False = attend
+                # Or float where 0.0 = attend, -inf = mask out
+                # We use bool format: invert so 0 -> True (mask out), 1 -> False (attend)
+                return _prepare_4d_attention_mask(attention_mask, dtype=input_tensor.dtype)
         return None
 
     @check_model_inputs
@@ -217,7 +231,7 @@ class LlamaBidirectionalModel(LlamaModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(attention_mask=attention_mask)
+        causal_mask = self._update_causal_mask(attention_mask=attention_mask, input_tensor=inputs_embeds)
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)

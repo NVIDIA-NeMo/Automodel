@@ -113,7 +113,7 @@ class NeMoAutoModelBiencoder(_BaseNeMoAutoModelClass):
             )
 
         # Use BiencoderModel.build to initialize model with base encoders
-        hf_kwargs = {"attn_implementation": "flash_attention_2"}
+        hf_kwargs = {} # {"attn_implementation": "flash_attention_2"}
         kwargs.update(hf_kwargs)
         model = BiencoderModel.build(
             model_name_or_path=pretrained_model_name_or_path,
