@@ -154,17 +154,24 @@ class DeepseekV3Model(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         *,
+        inputs_embeds: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
+
         if position_ids is None:
-            position_ids = (
-                torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
-            )
+            seq_len = inputs_embeds.shape[1]
+            position_ids = torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(0).expand(inputs_embeds.shape[0], -1)
+
 
         with torch.no_grad():
             freqs_cis = freqs_cis_from_position_ids(
@@ -175,7 +182,7 @@ class DeepseekV3Model(nn.Module):
                 cp_size=attn_kwargs.get("cp_size", 1),
             )
 
-        h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
+        h = inputs_embeds
 
         # Apply the transformer layers.
         for layer in self.layers.values():
