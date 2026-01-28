@@ -144,6 +144,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 COPY . /opt/Automodel
 
+WORKDIR /opt/Automodel
+
 COPY <<EOF /opt/venv/env.sh
 export UV_PROJECT_ENVIRONMENT=/opt/venv
 export PATH="/opt/venv/bin:$PATH"
