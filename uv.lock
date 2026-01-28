@@ -3054,6 +3054,7 @@ dependencies = [
 all = [
     { name = "albumentations" },
     { name = "backoff" },
+    { name = "databricks-sql-connector" },
     { name = "deltalake" },
     { name = "flash-linear-attention" },
     { name = "mistral-common", extra = ["opencv"] },
@@ -3070,9 +3071,6 @@ all = [
 cuda = [
     { name = "flash-attn" },
     { name = "transformer-engine", extra = ["pytorch"] },
-]
-delta = [
-    { name = "deltalake" },
 ]
 delta-databricks = [
     { name = "databricks-sql-connector" },
@@ -3132,7 +3130,6 @@ requires-dist = [
     { name = "backoff", marker = "extra == 'vlm'" },
     { name = "databricks-sql-connector", marker = "extra == 'delta-databricks'", specifier = ">=3.0.0" },
     { name = "datasets", specifier = ">=4.0.0" },
-    { name = "deltalake", marker = "extra == 'delta'", specifier = ">=1.0.0" },
     { name = "deltalake", marker = "extra == 'delta-databricks'", specifier = ">=1.0.0" },
     { name = "diffusers" },
     { name = "flash-attn", marker = "extra == 'cuda'", specifier = "<=2.8.3" },
@@ -3143,7 +3140,7 @@ requires-dist = [
     { name = "megatron-fsdp" },
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'" },
     { name = "mlflow" },
-    { name = "nemo-automodel", extras = ["delta"], marker = "extra == 'all'" },
+    { name = "nemo-automodel", extras = ["delta-databricks"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["extra"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'all'" },
     { name = "numba", marker = "extra == 'vlm'" },
@@ -3166,7 +3163,7 @@ requires-dist = [
     { name = "transformers", specifier = "<=4.57.5" },
     { name = "wandb" },
 ]
-provides-extras = ["cuda", "extra", "delta", "delta-databricks", "vlm", "all"]
+provides-extras = ["cuda", "extra", "delta-databricks", "vlm", "all"]
 
 [package.metadata.requires-dev]
 build = [
