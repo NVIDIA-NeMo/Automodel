@@ -358,15 +358,22 @@ class Checkpointer:
         # But because we initialize on meta device, these are erroneously set to True.
         # We need to set them to False and call initialize_weights to re-initialize the weights.
 
-        # Gemma3ForConditionalGeneration cannot be pretrained currently. The pinned torch version
-        # doesn't support initialize_weights when the model is sharded. This is because Gemma's
-        # initialize_weights method requires setting a row to zeros in the embedding matrix.
-        # This index selection op is not supported for DTensors in the pinned torch version.
+        # Some models cannot call initialize_weights when sharded with DTensors:
+        # - Gemma3ForConditionalGeneration: requires setting a row to zeros in the embedding matrix,
+        #   which is not supported for DTensors in the pinned torch version.
+        # - NemotronHForCausalLM: the HF remote code's _init_weights uses dt_bias.copy_()
+        #   which fails with DTensors. Note: v3 (MoE) has n_routed_experts and uses our custom
+        #   implementation which handles this correctly.
         try:
             model_class = model.config.architectures[0]
         except:
             model_class = ""
-        if model_class not in ["Gemma3ForConditionalGeneration"]:
+        is_nemotron_v2 = (
+            model_class == "NemotronHForCausalLM"
+            and not getattr(model.config, "n_routed_experts", None)
+        )
+        skip_initialize_weights = model_class in ["Gemma3ForConditionalGeneration"] or is_nemotron_v2
+        if not skip_initialize_weights:
             for _, module in model.named_modules():
                 if hasattr(module, "_is_hf_initialized"):
                     module._is_hf_initialized = False
