@@ -36,6 +36,15 @@ def _calculate_max_steps(
     return num_epochs * epoch_len
 
 
+def _calculate_num_epochs(max_steps: int, epoch_len: Optional[int], default_num_epochs: int = 10) -> int:
+    """
+    Calculate the number of epochs out of maximum number of steps.
+    """
+    if epoch_len is None:
+        return default_num_epochs
+    return ceil(max_steps / epoch_len)
+
+
 class StepScheduler(Stateful):
     """
     Scheduler for managing gradient accumulation and checkpointing steps.
@@ -68,7 +77,7 @@ class StepScheduler(Stateful):
             log_remote_every_steps (int): Frequency of remote logging (e.g., WandB, MLflow). Default: 1 (every step).
             start_step (int): Initial global step. Used when resuming from checkpoint. Default: 0.
             start_epoch (int): Initial epoch. Used when resuming from checkpoint. Default: 0.
-            num_epochs (Optional[int]): Total number of epochs. Default: None or 10 if max_steps and num_epochs are both None.
+            num_epochs (Optional[int]): Total number of epochs. Default: None or calculated from max_steps if num_epochs is None or 10 if max_steps and num_epochs are both None.
             max_steps (Optional[int]): Maximum number of steps to run. If None, calculated from num_epochs.
         """
         assert global_batch_size % (local_batch_size * dp_size) == 0, (
@@ -84,19 +93,27 @@ class StepScheduler(Stateful):
         self.epoch = start_epoch
         assert start_epoch >= 0, "start_epoch must be greater than or equal to 0"
 
-        # This is for backward compatibility in the sense that num_epochs's default value was 10
-        if num_epochs is None and max_steps is None:
-            num_epochs = 10
-
-        self.num_epochs = num_epochs
-        assert num_epochs is None or num_epochs > 0, (
-            "num_epochs must be greater than 0 or None if max_steps is provided"
-        )
         # Throws with IterableDataset.
         try:
             self.epoch_len = ceil(len(dataloader) / self.grad_acc_steps)
         except:
             self.epoch_len = None
+
+        # This is for backward compatibility in the sense that num_epochs's default value was 10
+        if num_epochs is None:
+            if max_steps is None:
+                num_epochs = 10
+            else:
+                num_epochs = _calculate_num_epochs(
+                    max_steps,
+                    self.epoch_len,
+                )
+
+        self.num_epochs = num_epochs
+        assert num_epochs is None or num_epochs > 0, (
+            "num_epochs must be greater than 0 or None if max_steps is provided"
+        )
+
         self.val_every_steps = val_every_steps
         assert val_every_steps is None or val_every_steps > 0, "val_every_steps must be greater than 0 if not None"
         self.log_remote_every_steps = log_remote_every_steps

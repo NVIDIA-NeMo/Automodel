@@ -362,3 +362,19 @@ def test_scheduler_max_steps_priority():
     assert scheduler_default.num_epochs == 10, (
         "Should default to 10 epochs if nothing is provided"
     )
+
+def test_scheduler_num_epochs_derived_from_max_steps():
+    dataloader = SizedDataLoader(num_batches=10)
+    scheduler = StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        ckpt_every_steps=10,
+        dataloader=dataloader,
+        max_steps=15,
+    )
+
+    print(scheduler.num_epochs)
+    assert scheduler.num_epochs == 2, (
+        "Derived number of epochs should be 2"
+    )
