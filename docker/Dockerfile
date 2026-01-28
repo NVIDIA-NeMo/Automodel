@@ -52,6 +52,20 @@ RUN if [ -f /usr/local/bin/torchrun ]; then \
 
 FROM update_base_container AS automodel_dep
 
+# Install TE
+ARG INSTALL_TE=False
+ARG TE_COMMIT=release_v2.11
+RUN if [ "$INSTALL_TE" = "True" ]; then \
+    git clone https://github.com/NVIDIA/TransformerEngine.git && \
+    cd TransformerEngine && \
+    git fetch origin $TE_COMMIT && \
+    git checkout FETCH_HEAD && \
+    git submodule init && git submodule update && \
+    pip install nvidia-mathdx==25.1.1 && \
+    env NVTE_CUDA_ARCHS="80;90;100;120" NVTE_BUILD_THREADS_PER_JOB=8 pip install --no-cache-dir --no-build-isolation -v . && \
+    cd ../ && rm -rf TransformerEngine; \
+    fi
+
 # Install Deepep
 COPY docker/common/deepep.patch /opt/deepep.patch
 ARG INSTALL_DEEPEP=False

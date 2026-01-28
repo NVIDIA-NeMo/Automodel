@@ -176,7 +176,6 @@ torch = [
     { index = "pytorch", marker = "sys_platform != 'darwin'" },
     { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
-transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "release_v2.11" }
 
 [tool.coverage.paths]
 source = [".", "/workspace", "/home/runner/work/Automodel/Automodel"]
