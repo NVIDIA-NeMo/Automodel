@@ -18,11 +18,15 @@ import sys
 import types
 import torch
 import torch.nn as nn
+import pytest
 from contextlib import AbstractContextManager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 from nemo_automodel.components.config.loader import ConfigNode
+
+# Skip decorator for tests that require CUDA
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     build_dataloader,
@@ -186,6 +190,7 @@ class DummyModelConfig:
         return getattr(self, key, default)
 
 
+@requires_cuda
 def test_peft_with_pipeline_parallelism_enabled(caplog):
     """Test that PEFT can be applied with pipeline parallelism enabled"""
 
@@ -238,6 +243,7 @@ def test_peft_with_pipeline_parallelism_enabled(caplog):
                                 assert "Enabling PEFT with Pipeline Parallelism" in caplog.text
 
 
+@requires_cuda
 def test_peft_without_pipeline_parallelism(caplog):
     """Test that PEFT works correctly without pipeline parallelism"""
 
@@ -290,6 +296,7 @@ def test_peft_without_pipeline_parallelism(caplog):
                             assert "Enabling PEFT with Pipeline Parallelism" not in caplog.text
 
 
+@requires_cuda
 def test_peft_with_tp_disables_triton(caplog):
     """Test that PEFT with tensor parallelism disables triton"""
 
@@ -406,6 +413,7 @@ class _FlagCM(AbstractContextManager):
         return False
 
 
+@requires_cuda
 def test_force_hf_true_disables_meta_init(monkeypatch):
     """When cfg_model.force_hf=True, meta-device init (init_empty_weights) should not be used.
     Note: Meta device init is now handled in auto_model.py for NeMoAutoModel targets.
@@ -1066,6 +1074,7 @@ class DummyModelConfigWithAdapter:
         return getattr(self, key, default)
 
 
+@requires_cuda
 def test_build_model_state_dict_keys_uses_adapter(caplog):
     """Test that state_dict_keys are transformed using _maybe_adapt_state_dict_to_hf when adapter is present.
     Note: state_dict_keys are now stored in checkpointer.config.model_state_dict_keys."""
@@ -1111,6 +1120,7 @@ def test_build_model_state_dict_keys_uses_adapter(caplog):
         assert key.startswith("transformed_"), f"Key '{key}' should be transformed by adapter"
 
 
+@requires_cuda
 def test_build_model_state_dict_keys_without_adapter():
     """Test that state_dict_keys are not transformed when no adapter is present.
     Note: state_dict_keys are now stored in checkpointer.config.model_state_dict_keys."""
@@ -1156,6 +1166,7 @@ def test_build_model_state_dict_keys_without_adapter():
         assert not key.startswith("transformed_"), f"Key '{key}' should not be transformed without adapter"
 
 
+@requires_cuda
 def test_build_model_infers_dequantize_from_model_config():
     """Test that dequantize_base_checkpoint is inferred from model.config.quantization_config."""
 
@@ -1211,6 +1222,7 @@ def test_build_model_infers_dequantize_from_model_config():
     assert mock_checkpointer_config.dequantize_base_checkpoint is True
 
 
+@requires_cuda
 def test_build_model_dequantize_defaults_to_false_without_quant_config():
     """Test that dequantize_base_checkpoint defaults to False when model has no quantization_config."""
 
@@ -1256,6 +1268,7 @@ def test_build_model_dequantize_defaults_to_false_without_quant_config():
 # =============================================================================
 
 
+@requires_cuda
 def test_build_model_disables_foreach_with_tp():
     """Test that when tp_size > 1, cfg_opt.foreach is set to False."""
     cfg_model = DummyModelConfig()
@@ -1288,6 +1301,7 @@ def test_build_model_disables_foreach_with_tp():
     assert cfg_opt.foreach is False
 
 
+@requires_cuda
 def test_build_model_returns_model_optimizer_loss_fn_tuple():
     """Test that build_model_and_optimizer returns (model, optimizer, loss_fn) 3-tuple."""
     cfg_model = DummyModelConfig()
@@ -1325,8 +1339,6 @@ def test_build_model_returns_model_optimizer_loss_fn_tuple():
 # =============================================================================
 # Tests for _get_model_name helper
 # =============================================================================
-
-import pytest
 
 @pytest.mark.parametrize("cfg_attrs,expected", [
     # String config
