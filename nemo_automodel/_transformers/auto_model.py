@@ -523,7 +523,11 @@ def apply_model_infrastructure(
         dequantize_base_checkpoint = checkpointer.config.dequantize_base_checkpoint
 
     # Apply PEFT and lower precision if configured
-    model = _apply_peft_and_lower_precision(model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer)
+    # When on meta device, wrap in init_empty_weights() so new LoRA modules are also on meta device
+    # This allows copy operations between meta tensors to succeed (they're no-ops)
+    peft_ctx = init_empty_weights() if is_meta_device else nullcontext()
+    with peft_ctx:
+        model = _apply_peft_and_lower_precision(model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer)
 
     # hold a list copy of the model state dict keys before any parallelization
     if checkpointer is not None:
