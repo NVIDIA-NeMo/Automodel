@@ -36,7 +36,7 @@ from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
 from transformers.utils.hub import TRANSFORMERS_CACHE
 from wandb import Settings
 
-from nemo_automodel._transformers import NeMoAutoModelForCausalLM
+from nemo_automodel._transformers import NeMoAutoModelForCausalLM, NeMoAutoModelForSequenceClassification
 from nemo_automodel._transformers.auto_model import apply_model_infrastructure
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
@@ -149,9 +149,8 @@ def build_model_and_optimizer(
     autopipeline: AutoPipeline | None = None,
     loss_fn=None,
     parallelize_fn=None,
-    load_base_model=True,
     unfreeze_modules: list[str] | None = None,
-) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module, dict]:  # noqa: F821
+) -> tuple[nn.Module | AutoPipeline, list["Optimizer"], nn.Module]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
 
@@ -204,6 +203,8 @@ def build_model_and_optimizer(
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
             NeMoAutoModelForCausalLM.from_config,
             NeMoAutoModelForCausalLM.from_pretrained,
+            NeMoAutoModelForSequenceClassification.from_config,
+            NeMoAutoModelForSequenceClassification.from_pretrained,
         )
 
         if is_nemo_auto_model:
@@ -282,7 +283,6 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
     if cfg_ckpt is not None:
         cfg_ckpt = cfg_ckpt.to_dict()
         cfg_ckpt.pop("restore_from", None)
-        cfg_ckpt.pop("load_base_model", None)
         ckpt_kwargs |= cfg_ckpt
     if ckpt_kwargs.get("is_peft", False) and ckpt_kwargs.get("model_save_format") == "torch_save":
         raise ValueError(
@@ -929,7 +929,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             autopipeline=autopipeline,
             loss_fn=self.loss_fn,
             parallelize_fn=parallelize_fn,
-            load_base_model=self.cfg.get("checkpoint.load_base_model", True),
             checkpointer=self.checkpointer,
         )
 

@@ -49,6 +49,7 @@ from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPi
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from huggingface_hub import snapshot_download
 
 if TYPE_CHECKING:
     from torchao.quantization.qat.linear import Int4WeightOnlyQATQuantizer, Int8DynActInt4WeightQATQuantizer
@@ -306,25 +307,7 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
         # Import via module reference (vs bound name) so unit tests can patch
         # `nemo_automodel.components.distributed.utils.FirstRankPerNode`.
         with dist_utils.FirstRankPerNode():
-            _get_resolved_checkpoint_files(
-                pretrained_model_name_or_path=pretrained_model_name_or_path,
-                subfolder="",
-                variant=None,
-                gguf_file=None,
-                from_tf=False,
-                from_flax=False,
-                use_safetensors=None,
-                cache_dir=None,
-                force_download=False,
-                proxies=None,
-                local_files_only=False,
-                token=None,
-                user_agent={"file_type": "model", "framework": "pytorch", "from_auto_class": False},
-                revision="main",
-                commit_hash=getattr(hf_config, "_commit_hash", None),
-                is_remote_code=False,
-                transformers_explicit_filename=None,
-            )
+            snapshot_download(pretrained_model_name_or_path)
 
 def _init_model(cls, pretrained_model_name_or_path_or_config, attn_implementation, torch_dtype, quantization_config, force_hf, *model_args, **kwargs):
     torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
@@ -361,7 +344,9 @@ def _init_model(cls, pretrained_model_name_or_path_or_config, attn_implementatio
     # 2. If we have a custom model implementation available, we prioritize that over HF
     if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
         # if we are able to init the custom model, we will now download the model weights on local rank 0
-        _download_model_weights(hf_config, pretrained_model_name_or_path)
+        # Skip download for from_config (no pretrained path) or local paths
+        if pretrained_model_name_or_path:
+            _download_model_weights(hf_config, pretrained_model_name_or_path)
         logger.info(f"Using custom model implementation for {architectures[0]}")
         kwargs.pop("trust_remote_code", None)
         model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
@@ -949,8 +934,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             )
 
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch.bfloat16
+        name_or_path = config if isinstance(config, str) else getattr(config, "name_or_path", None)
         kwargs["trust_remote_code"] = kwargs.get(
-            "trust_remote_code", resolve_trust_remote_code(getattr(config, "name_or_path", None) or config)
+            "trust_remote_code", resolve_trust_remote_code(name_or_path) if name_or_path else False
         )
         config = get_hf_config(config, attn_implementation, **kwargs) if isinstance(config, str) else config
         is_hf_model = get_is_hf_model(config, force_hf)
