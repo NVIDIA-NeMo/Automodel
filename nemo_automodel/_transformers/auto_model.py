@@ -326,21 +326,32 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
                 transformers_explicit_filename=None,
             )
 
-def _init_model(cls, pretrained_model_name_or_path, attn_implementation, torch_dtype, quantization_config, force_hf, *model_args, **kwargs):
+def _init_model(cls, pretrained_model_name_or_path_or_config, attn_implementation, torch_dtype, quantization_config, force_hf, *model_args, **kwargs):
     torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
-    hf_config = get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs)
+    is_pretrained_init = isinstance(pretrained_model_name_or_path_or_config, str)  # The caller is .from_pretrained
+    hf_config = get_hf_config(pretrained_model_name_or_path_or_config, attn_implementation, **kwargs) if is_pretrained_init else pretrained_model_name_or_path_or_config
+    pretrained_model_name_or_path = pretrained_model_name_or_path_or_config if is_pretrained_init else getattr(hf_config, "name_or_path")
 
     # 1. if force_hf is True, use HF model class wrapped with mixin
     if force_hf:
         if quantization_config is not None:
             kwargs["quantization_config"] = quantization_config
-        model = cls._from_pretrained_parent_class(
-            pretrained_model_name_or_path,
-            *model_args,
-            torch_dtype=torch_dtype,
-            attn_implementation=attn_implementation,
-            **kwargs,
-        )
+        if is_pretrained_init:
+            model = cls._from_pretrained_parent_class(
+                pretrained_model_name_or_path,
+                *model_args,
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_implementation,
+                **kwargs,
+            )
+        else:
+            model = cls._from_config_parent_class(
+                hf_config,
+                *model_args,
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_implementation,
+                **kwargs,
+            )
         # Get HF model class and wrap with mixin
         hf_model_cls = cls._model_mapping[type(hf_config)]
         model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
@@ -366,14 +377,22 @@ def _init_model(cls, pretrained_model_name_or_path, attn_implementation, torch_d
     model = None
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
-    # Use mixin's from_pretrained which handles weight loading
-    model = cls._from_pretrained_parent_class(
-        pretrained_model_name_or_path,
-        *model_args,
-        torch_dtype=torch_dtype,
-        attn_implementation=attn_implementation,
-        **kwargs,
-    )
+    if is_pretrained_init:
+        model = cls._from_pretrained_parent_class(
+            pretrained_model_name_or_path,
+            *model_args,
+            torch_dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+            **kwargs,
+        )
+    else:
+        model = cls._from_config_parent_class(
+            hf_config,
+            *model_args,
+            torch_dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+            **kwargs,
+        )
 
     return False, model
 
@@ -642,10 +661,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         if checkpointer.config.dequantize_base_checkpoint is None:
             # try to infer whether the base weights are quantized
-            try:
-                checkpointer.config.dequantize_base_checkpoint = hasattr(model.config, "quantization_config")
-            except:
-                checkpointer.config.dequantize_base_checkpoint = False
+            checkpointer.config.dequantize_base_checkpoint = hasattr(model.config, "quantization_config")
 
         # Apply PEFT and lower precision if configured
         model = _apply_peft_and_lower_precision(model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer)
@@ -708,6 +724,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = "flash_attention_2",
         quantization_config=None,
         force_hf: bool = False,
+        model_wrapper = None,
+        autopipeline: AutoPipeline | None = None,
+        parallelize_fn: Callable | None = None,
+        peft_config: Optional[dict] = None,
+        fp8_config: Optional["FP8Config"] = None,
+        qat_quantizer: Optional[Union["Int4WeightOnlyQATQuantizer", "Int8DynActInt4WeightQATQuantizer"]] = None,
+        loss_fn: Optional[Callable] = None,
+        compile_config: Optional["CompileConfig"] = None,
+        checkpointer: Optional[Checkpointer] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -751,18 +776,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
               deleted and the method recurses once with
               `use_liger_kernel=False` or `use_sdpa_patching=False`
         """
-        torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch.bfloat16
-        kwargs["trust_remote_code"] = kwargs.get(
-            "trust_remote_code", resolve_trust_remote_code(getattr(config, "name_or_path", None))
-        )
-
-        architectures = getattr(config, "architectures", None) or []
-        is_hf_model = (not architectures or architectures[0] not in ModelRegistry.model_arch_name_to_cls) or force_hf
-        tp_size, cp_size, has_packed_sequence = _pop_tp_cp_has_packed(kwargs)
-        attn_implementation, use_liger_kernel = _apply_preload_overrides(
-            is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
-        )
-
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
             if "quantization_config" in override:
@@ -777,72 +790,52 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
-                **kwargs,
-            )
-
-        # handle model_id passed as config
-        if isinstance(config, str):
-            config = AutoConfig.from_pretrained(
-                config,
-                trust_remote_code=kwargs.get("trust_remote_code", False),
-                attn_implementation=attn_implementation,
-            )
-        # 1. if force_hf is True, use HF model class wrapped with mixin
-        if force_hf:
-            # Get HF model class and wrap with mixin
-            hf_model_cls = cls._model_mapping[type(config)]
-            wrapped_cls = _get_mixin_wrapped_class(hf_model_cls)
-            # Use mixin's from_config which handles initialization
-            model = wrapped_cls.from_config(
-                config,
-                *model_args,
+                quantization_config=quantization_config,
                 torch_dtype=torch_dtype,
-                attn_implementation=attn_implementation,
+                force_hf=force_hf,
+                model_wrapper=model_wrapper,
+                autopipeline=autopipeline,
+                parallelize_fn=parallelize_fn,
+                peft_config=peft_config,
+                fp8_config=fp8_config,
+                qat_quantizer=qat_quantizer,
+                loss_fn=loss_fn,
+                compile_config=compile_config,
+                checkpointer=checkpointer,
                 **kwargs,
             )
-            return model
 
-        # 2. If we have a custom model implementation available, we prioritize that over HF
-        architectures = get_architectures(config)
-        if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
-            logger.info(f"Using custom model implementation for {architectures[0]}")
-            kwargs.pop("trust_remote_code", None)
-            model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
+        torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch.bfloat16
+        kwargs["trust_remote_code"] = kwargs.get(
+            "trust_remote_code", resolve_trust_remote_code(getattr(config, "name_or_path", None) or config)
+        )
+        config = get_hf_config(config, attn_implementation, **kwargs) if isinstance(config, str) else config
+        is_hf_model = get_is_hf_model(config, force_hf)
+        tp_size, cp_size, has_packed_sequence = _pop_tp_cp_has_packed(kwargs)
+        attn_implementation, use_liger_kernel = _apply_preload_overrides(
+            is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
+        )
+        device = torch.cuda.current_device()
 
-            # Use the mixin's from_config which handles initialization via Checkpointer
-            model = model_cls.from_config(
-                config,
-                *model_args,
-                torch_dtype=torch_dtype,
-                **kwargs,
-            )
-            return model
+        # Neither of these parallelization methods support meta device initialization
+        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not force_hf
+        init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
-        # 3. fallback to HF model class wrapped with mixin
-        hf_model_cls = cls._model_mapping[type(config)]
-        wrapped_cls = _get_mixin_wrapped_class(hf_model_cls)
-
-        model = None
         try:
-            if quantization_config is not None:
-                kwargs["quantization_config"] = quantization_config
-            # Use mixin's from_config which handles initialization
-            model = wrapped_cls.from_config(
-                config,
-                *model_args,
-                torch_dtype=torch_dtype,
-                attn_implementation=attn_implementation,
-                **kwargs,
-            )
+            with init_ctx:
+                is_custom_model, model = _init_model(cls, config, attn_implementation, torch_dtype, quantization_config, force_hf, *model_args, **kwargs)
         except ValueError as e:
             if "does not support" in str(e):
-                logging.warning("Falling back to eager attention.")
-                return _retry(attn_implementation="eager")
+                if model is not None:
+                    del model
+                attn_implementation = _get_next_fallback_attn(attn_implementation)
+                logging.warning("Falling back to {} attention.".format(attn_implementation))
+                return _retry(attn_implementation=attn_implementation)
             raise e
 
         # Kernel patching
         try:
-            if use_liger_kernel:
+            if use_liger_kernel and not is_custom_model:
                 model = _patch_liger_kernel(model)
         except RuntimeError:
             logging.warning("Retrying without Liger kernels.")
@@ -852,13 +845,65 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         # Patch sdpa attention
         try:
-            if use_sdpa_patching:
+            if use_sdpa_patching and not is_custom_model:
                 model = _patch_attention(model, sdpa_method)  # noqa: F821
         except:
             logging.warning("Retrying without SDPA patching.")
             return _retry(use_sdpa_patching=False)
 
         _verify_sdpa_support(model, is_hf_model, cp_size)
+
+        if checkpointer.config.dequantize_base_checkpoint is None:
+            # try to infer whether the base weights are quantized
+            checkpointer.config.dequantize_base_checkpoint = hasattr(model.config, "quantization_config")
+
+        # Apply PEFT and lower precision if configured
+        model = _apply_peft_and_lower_precision(model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer)
+        
+        # hold a list copy of the model state dict keys before any parallelization
+        checkpointer.config.model_state_dict_keys = list(model.state_dict().keys())
+
+        # Loss function check
+        if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
+            loss_fn = MaskedCrossEntropy()
+
+        # Apply pipeline parallelism if configured. This is the outermost parallelization.
+        # Note: AutoPipeline takes care of applying PP + EP + FSDP. _shard_ep_fsdp will take care of applying EP + FSDP if no PP.
+        if autopipeline is not None:
+            model = _shard_pp(autopipeline, model, loss_fn, parallelize_fn)
+        else:
+            model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn)
+            # Only move to device if not on meta device (weights need to be loaded first for meta; handled by checkpointer)
+            if not is_meta_device:
+                model.to(device)
+            if compile_config is not None:
+                model = compile_model(model, compile_config)
+        
+        # Load the checkpoint if needed and return
+        # Weights need to be loaded for meta device models that were parallelized:
+        # 1. When parallelize_fn was used (which will internally apply FSDP2/EP sharding)
+        # 2. When FSDP2Manager.parallelize was used (but not MegatronFSDP which handles weights internally)
+        should_load_checkpoint = is_meta_device and any([
+            parallelize_fn is not None and get_world_size_safe() > 1,
+            callable(getattr(model_wrapper, "parallelize", None)),
+        ])
+        if should_load_checkpoint:
+            models_to_load = model.parts if hasattr(model, "parts") else [model]
+            cache_dir = kwargs.get("cache_dir", TRANSFORMERS_CACHE)
+            lora_a_init = getattr(peft_config, "lora_A_init", None)
+            for mp in models_to_load:
+                checkpointer.load_base_model(
+                    mp,
+                    device,
+                    cache_dir,
+                    getattr(config, "name_or_path"),
+                    lora_a_init,
+                    load_base_model=False,
+                )
+        
+        if autopipeline is None:
+            print_trainable_parameters(model)  # Once model's been sharded
+
         return model
 
 

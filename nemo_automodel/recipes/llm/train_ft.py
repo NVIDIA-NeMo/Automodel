@@ -100,6 +100,8 @@ def _get_model_name(cfg_model):
     if cfg_model.get("pretrained_model_name_or_path", None) is not None:
         return cfg_model.pretrained_model_name_or_path
     elif cfg_model.get("config", None) is not None:
+        if isinstance(cfg_model.config, str):
+            return cfg_model.config
         return cfg_model.config.get("pretrained_model_name_or_path", None)
     else:
         return None
