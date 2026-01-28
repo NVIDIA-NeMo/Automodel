@@ -146,8 +146,8 @@ class DeepseekV3Model(nn.Module):
             precompute_freqs_cis(
                 config.qk_rope_head_dim,
                 self.max_seq_len,
-                config.rope_theta,
-                config.rope_scaling,
+                config.rope_parameters["rope_theta"] if hasattr(config, "rope_parameters") else config.rope_theta,
+                config.rope_parameters if hasattr(config, "rope_parameters") else config.rope_scaling,
             ),
             persistent=False,
         )

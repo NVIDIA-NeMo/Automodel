@@ -25,18 +25,23 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 import torch
 import torch.nn as nn
 import wandb
+from huggingface_hub import constants as hf_constants
 from torch.distributed.device_mesh import DeviceMesh
 from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoConfig
-from transformers.modeling_utils import no_init_weights
+
+try:
+    # transformers>=4.48 moved no_init_weights
+    from transformers.initialization import no_init_weights  # type: ignore
+except Exception:  # pragma: no cover
+    # Back-compat for older transformers
+    from transformers.modeling_utils import no_init_weights  # type: ignore
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
-from transformers.utils.hub import TRANSFORMERS_CACHE
+from transformers.utils import ContextManagers
 from wandb import Settings
 
-from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
@@ -178,14 +183,23 @@ def build_model_and_optimizer(
         "force_hf", False
     )
 
-    init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):
-        kwargs = {"tp_size": tp_size, "cp_size": cp_size, "has_packed_sequence": has_packed_sequence}
-        if not cfg_model.get("_target_", None) in (
-            NeMoAutoModelForCausalLM.from_config,
-            NeMoAutoModelForCausalLM.from_pretrained,
-        ):
+        # ConfigNode provides `get_as_string`, but unit tests may pass lightweight
+        # stub configs that only implement `get`.
+        if hasattr(cfg_model, "get_as_string"):
+            target = cfg_model.get_as_string("_target_", "")
+        elif hasattr(cfg_model, "get"):
+            target = cfg_model.get("_target_", "")
+        else:
+            target = getattr(cfg_model, "_target_", "")
+
+        if isinstance(target, str) and target.startswith("transformers"):
+            is_meta_device = False
             kwargs = {}
+        else:
+            kwargs = {"tp_size": tp_size, "cp_size": cp_size, "has_packed_sequence": has_packed_sequence}
+        init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
+
         if cfg_quantization is not None:
             logger.info("Model weight quantization enabled with BitsAndBytes")
             from nemo_automodel.components.quantization.qlora import create_bnb_config
@@ -269,7 +283,7 @@ def build_model_and_optimizer(
                 checkpointer.load_base_model(
                     mp,
                     device,
-                    cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
+                    cfg_model.get("cache_dir", hf_constants.HF_HUB_CACHE),
                     _get_model_name(cfg_model),
                     getattr(cfg_peft, "lora_A_init", None),
                     load_base_model=load_base_model,
@@ -338,7 +352,7 @@ def build_model_and_optimizer(
             checkpointer.load_base_model(
                 model,
                 device,
-                cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
+                cfg_model.get("cache_dir", hf_constants.HF_HUB_CACHE),
                 _get_model_name(cfg_model),
                 getattr(cfg_peft, "lora_A_init", None),
                 load_base_model=load_base_model,
@@ -395,7 +409,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         checkpoint_dir="checkpoints/",
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
-        model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
+        model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HUB_CACHE,
         save_consolidated=True,
         is_peft=is_peft,
     )
