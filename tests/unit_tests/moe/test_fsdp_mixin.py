@@ -25,7 +25,7 @@ from nemo_automodel.components.moe.fsdp_mixin import (
     patched_backward_maybe_with_nosync,
     set_is_optim_step,
 )
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig
 
 
 class MockFSDPModule:

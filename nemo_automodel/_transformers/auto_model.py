@@ -321,6 +321,66 @@ def get_architectures(hf_config):
     return architectures
 
 
+def _get_init_param_names(model_cls) -> set[str]:
+    """
+    Best-effort extraction of explicit __init__ parameter names (excluding `self`).
+
+    Returns an empty set if the signature cannot be inspected.
+    """
+    try:
+        sig = inspect.signature(model_cls.__init__)
+    except (TypeError, ValueError):
+        return set()
+    return {k for k in sig.parameters.keys() if k != "self"}
+
+
+def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str] | None = None) -> None:
+    """
+    Mimic HF from_pretrained behavior: treat config-related kwargs as config overrides,
+    not model __init__ kwargs.
+
+    For custom model implementations we instantiate via `model_cls(config, **kwargs)`,
+    so passing config flags like `output_hidden_states` would crash. This helper moves
+    such keys onto the config and removes them from `kwargs`.
+    """
+    if init_param_names is None:
+        init_param_names = set()
+    # Prefer `to_dict()` to capture the canonical set of config fields.
+    try:
+        config_keys = set(config.to_dict().keys())
+    except Exception:
+        config_keys = set(getattr(config, "__dict__", {}).keys())
+
+    for k in list(kwargs.keys()):
+        # If the model explicitly declares this kwarg, keep it for __init__.
+        if k in init_param_names:
+            continue
+        # Otherwise, if it looks like a config field, apply it to config.
+        if k in config_keys:
+            setattr(config, k, kwargs.pop(k))
+
+
+def _filter_kwargs_for_init(model_cls, kwargs: dict) -> dict:
+    """
+    Filter kwargs down to what `model_cls.__init__` explicitly accepts.
+
+    If the constructor has a `**kwargs` parameter (VAR_KEYWORD) or signature cannot be
+    inspected, returns kwargs unchanged.
+    """
+    try:
+        sig = inspect.signature(model_cls.__init__)
+    except (TypeError, ValueError):
+        return kwargs
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return kwargs
+
+    allowed = set(sig.parameters.keys())
+    allowed.discard("self")
+    # We pass `config` positionally.
+    allowed.discard("config")
+    return {k: v for k, v in kwargs.items() if k in allowed}
+
+
 class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     """
     Drop-in replacement for ``_BaseAutoModelClass`` that includes custom-kernels.
@@ -470,6 +530,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             kwargs.pop("trust_remote_code", None)
             # TODO(@akoumpa): restore weights after initialization.
             model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
+            # Treat config-related kwargs as config overrides (HF behavior) and
+            # avoid forwarding them into model __init__.
+            init_param_names = _get_init_param_names(model_cls)
+            _consume_config_overrides(hf_config, kwargs, init_param_names=init_param_names)
+            kwargs = _filter_kwargs_for_init(model_cls, kwargs)
             # Override config's torch_dtype with user-requested dtype so model __init__ uses correct dtype
             if torch_dtype != "auto":
                 hf_config.torch_dtype = torch_dtype
@@ -602,6 +667,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
+                torch_dtype=torch_dtype,
                 **kwargs,
             )
 
@@ -612,6 +678,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 trust_remote_code=kwargs.get("trust_remote_code", False),
                 attn_implementation=attn_implementation,
             )
+        # Treat config-related kwargs (e.g., output_hidden_states) as overrides on the
+        # config object, not as model __init__ kwargs.
+        _consume_config_overrides(config, kwargs)
         # 1. if force_hf is True, we will use the parent class to load and return the model as is
         if force_hf:
             return cls._from_config_parent_class(
@@ -625,8 +694,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # 2. If we have a custom model implementation available, we prioritize that over HF
         architectures = get_architectures(config)
         if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
-            with local_torch_dtype(torch_dtype, ModelRegistry.model_arch_name_to_cls[architectures[0]].__name__):
-                return ModelRegistry.model_arch_name_to_cls[architectures[0]](config, *model_args, **kwargs)
+            model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
+            init_param_names = _get_init_param_names(model_cls)
+            _consume_config_overrides(config, kwargs, init_param_names=init_param_names)
+            kwargs = _filter_kwargs_for_init(model_cls, kwargs)
+            with local_torch_dtype(torch_dtype, model_cls.__name__):
+                return model_cls(config, *model_args, **kwargs)
 
         # 3. fallback to parent class
         model = None

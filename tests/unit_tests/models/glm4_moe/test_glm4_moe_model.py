@@ -20,7 +20,7 @@ from transformers.models.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 
 from nemo_automodel.components.models.glm4_moe.model import Block, Glm4MoeForCausalLM, Glm4MoeModel
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
