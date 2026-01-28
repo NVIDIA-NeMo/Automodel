@@ -43,7 +43,6 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.models.llama.modeling_llama import eager_attention_forward
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
-from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -51,6 +50,7 @@ from nemo_automodel.components.models.common import (
     CombinedQKVAttentionMixin,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.llama.rope_utils import LlamaRotaryEmbedding, apply_rotary_pos_emb
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator

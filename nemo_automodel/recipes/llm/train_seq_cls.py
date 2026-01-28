@@ -122,7 +122,6 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )
 
-
         self.model_parts = [model]
 
         self.dataloader, self.tokenizer = build_dataloader(

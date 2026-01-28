@@ -269,7 +269,9 @@ class BaseRecipe:
             self.checkpointer.save_model(model, path, peft_config=self.peft_config, tokenizer=tokenizer)
         else:
             unwrapped_model = model[0] if isinstance(model, list) else model
-            unwrapped_model.save_pretrained(save_directory=path, checkpointer=self.checkpointer, tokenizer=tokenizer, peft_config=self.peft_config)
+            unwrapped_model.save_pretrained(
+                save_directory=path, checkpointer=self.checkpointer, tokenizer=tokenizer, peft_config=self.peft_config
+            )
         self.checkpointer.save_optimizer(optimizer, model, path, scheduler)
         save_config(config.raw_config, path)
         if is_dist_initialized:

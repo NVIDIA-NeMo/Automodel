@@ -28,18 +28,15 @@ Checkpointer is passed explicitly (dependency injection) - no global state.
 import logging
 from typing import TYPE_CHECKING, Optional
 
-import torch
-
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
-    CheckpointingConfig,
 )
 
 if TYPE_CHECKING:
-    from transformers.configuration_utils import PretrainedConfig
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 logger = logging.getLogger(__name__)
+
 
 class HFCheckpointingMixin:
     """Mixin providing HF-compatible API using NeMo's checkpointing infrastructure.
@@ -76,9 +73,7 @@ class HFCheckpointingMixin:
             **kwargs: Additional arguments
         """
         if checkpointer is None:
-            raise ValueError(
-                "No checkpointer provided. Please pass the `checkpointer` argument."
-            )
+            raise ValueError("No checkpointer provided. Please pass the `checkpointer` argument.")
 
         # Use Checkpointer.save_model() which handles:
         # - ModelState.state_dict()
