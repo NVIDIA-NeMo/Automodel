@@ -23,6 +23,15 @@ from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_datas
     ColumnMappedTextInstructionDataset,
 )
 
+class _DummyTokenizer:
+    """Minimal tokenizer stub used for init-time error paths."""
+
+    pad_token = None
+    eos_token = "</s>"
+    eos_token_id = 0
+    bos_token_id = 1
+    add_bos_token = False
+
 
 def _write_jsonl(tmp_path: Path) -> Path:
     """Create a small JSONL dataset for testing."""
@@ -88,6 +97,32 @@ def _load_tokenizer(path: Path):
 def _first_sample(ds: ColumnMappedTextInstructionDataset):
     it = iter(ds)
     return next(it)
+
+
+def test_dataset_rejects_delta_paths(tmp_path: Path):
+    """ColumnMappedTextInstructionDataset must reject Delta Lake paths (streaming-only support)."""
+    delta_dir = tmp_path / "delta_table"
+    (delta_dir / "_delta_log").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match=r"ColumnMappedTextInstructionIterableDataset"):
+        ColumnMappedTextInstructionDataset(
+            path_or_dataset_id=str(delta_dir),
+            column_mapping={"question": "q", "answer": "a"},
+            tokenizer=_DummyTokenizer(),
+        )
+
+
+def test_dataset_rejects_delta_options(tmp_path: Path):
+    """Map-style dataset must reject delta_* options even for non-delta sources."""
+    data_file = _write_jsonl(tmp_path)
+
+    with pytest.raises(ValueError, match=r"Delta Lake / Databricks options are not supported"):
+        ColumnMappedTextInstructionDataset(
+            path_or_dataset_id=str(data_file),
+            column_mapping={"context": "context", "question": "question", "answer": "answers"},
+            tokenizer=_DummyTokenizer(),
+            delta_storage_options={"DATABRICKS_TOKEN": "dapi..."},
+        )
 
 
 @pytest.mark.parametrize(

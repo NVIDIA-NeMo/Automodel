@@ -1,17 +1,21 @@
 # Use the ColumnMappedTextInstructionDataset
 
-This guide explains how to use `ColumnMappedTextInstructionDataset` to quickly and flexibly load instruction-answer datasets for LLM fine-tuning, with minimal code changes and support for various data formats and tokenization strategies.
+This guide explains how to use `ColumnMappedTextInstructionDataset` to quickly and flexibly load instruction-answer datasets for LLM fine-tuning, with minimal code changes and support for common tokenization strategies.
 
-The `ColumnMappedTextInstructionDataset` is a lightweight, plug-and-play helper that lets you train on instruction–answer style corpora without writing custom Python for every new schema. You simply specify which columns map to logical fields like `context`, `question`, and `answer`, and the loader handles the rest automatically. This enables:
+The `ColumnMappedTextInstructionDataset` is a lightweight, plug-and-play helper that lets you train on instruction-answer style corpora without writing custom Python for every new schema. You simply specify which columns map to logical fields like `context`, `question`, and `answer`, and the loader handles the rest automatically. This enables:
 
-* Quick prototyping across diverse instruction datasets
-* Schema flexibility without needing codebase changes
-* Consistent field names for training loops, regardless of dataset source
+- Quick prototyping across diverse instruction datasets
+- Schema flexibility without requiring code changes
+- Consistent field names for training loops, regardless of dataset source
 
-It supports two data sources out-of-the-box and optionally streams them so they never fully reside in memory:
+`ColumnMappedTextInstructionDataset` is a **map-style** dataset (`torch.utils.data.Dataset`): it supports `len(ds)` and `ds[i]`, and it loads data **non-streaming**.
 
-1. **Local JSON/JSONL files** - pass a single file path or a list of paths on disk. The newline-delimited JSON works great.
+It supports two data sources out-of-the-box:
+
+1. **Local JSON/JSONL files** - pass a single file path or a list of paths on disk. Newline-delimited JSON works great.
 2. **Hugging Face Hub** - point to any dataset repo (`org/dataset`) that contains the required columns.
+
+For **streaming** (including **Delta Lake / Databricks**), use [`ColumnMappedTextInstructionIterableDataset`](column-mapped-text-instruction-iterable-dataset.md). The iterable variant always streams by design to avoid accidentally materializing entire datasets to disk/memory.
 
 ---
 ## Quickstart
@@ -31,22 +35,15 @@ ds = ColumnMappedTextInstructionDataset(
       "answer": "targets"
     },
     tokenizer=tokenizer,
-    answer_only_loss_mask=False,
+    answer_only_loss_mask=True,
 )
 
-print(next(iter(ds)))
+sample = ds[0]
+print(sample.keys())
 
-# The above command will print:
-# {
-#   'input_ids': [128000, 12465, 425, 25, 578, 38413, 61941, ... 78863, 36373, 7217],
-#   'labels':    [12465, 425, 25, 578, 38413, 61941, ..., 78863, 36373, 7217, 30],
-#   'loss_mask': [1, 1, 1, 1, ..., 1, 1, 1, 1]
-# }
-
-# if you disable streaming (i.e., pass `streaming=False`), then you can inspect samples with
-# print(ds[0])
-# or inspect the length of the dataset
-# print(len(ds))
+# Typical keys include: input_ids, labels, attention_mask (and an internal ___PAD_TOKEN_IDS___ helper).
+# Note: when answer_only_loss_mask=True, prompt tokens are masked in labels with -100
+# (the standard CrossEntropy "ignore_index").
 ```
 
 The code above is intended only for a quick sanity check of the dataset and its tokenization output. For training or production use, configure the dataset using YAML as shown below. YAML offers a reproducible, maintainable, and scalable way to specify dataset and tokenization settings.
@@ -70,7 +67,7 @@ You can load it using Python code like:
 
 ```python
 local_ds = ColumnMappedTextInstructionDataset(
-    path_or_dataset_id=["/data/my_corpus_1.jsonl", "/data/my_corpus_2.jsonl"]  # can also be a single path (string)
+    path_or_dataset_id=["/data/my_corpus_1.jsonl", "/data/my_corpus_2.jsonl"], # can also be a single path (string)
     column_mapping={
         "question": "instruction",
         "answer": "output",
@@ -79,8 +76,7 @@ local_ds = ColumnMappedTextInstructionDataset(
     answer_only_loss_mask=False,  # compute loss over full sequence
 )
 
-print(remote_ds[0].keys())  # {'context', 'question', 'answer'}
-print(local_ds[0].keys())   # {'question', 'answer'}
+print(local_ds[0].keys())   # dict_keys(['input_ids', 'labels', 'attention_mask', '___PAD_TOKEN_IDS___'])
 ```
 
 You can configure the dataset entirely from your recipe YAML. For example:
@@ -136,13 +132,12 @@ remote_ds = ColumnMappedTextInstructionDataset(
     path_or_dataset_id="Muennighoff/natural-instructions",  # Hugging Face repo ID
     column_mapping={
         "context": "definition",  # high-level context
-        "question": "inputs",         # the actual prompt / input
-        "answer": "targets",          # expected answer string
+        "question": "inputs",      # the actual prompt / input
+        "answer": "targets",       # expected answer string
     },
     tokenizer=tokenizer,
-    split="train[:5%]",        # demo slice; omit (i.e. `split="train",`) for full data
+    split="train[:5%]",        # demo slice; omit (i.e., `split="train",`) for full data
     answer_only_loss_mask=True,
-    start_of_turn_token="<|assistant|>",
 )
 ```
 
@@ -158,64 +153,60 @@ dataset:
     question: inputs
     answer: targets
   answer_only_loss_mask: true
-  start_of_turn_token: "<|assistant|>"
 ```
+
+### Streaming / Delta Lake / Databricks
+
+:::{note}
+`ColumnMappedTextInstructionDataset` does not support streaming or Delta Lake / Databricks sources. For those, use [`ColumnMappedTextInstructionIterableDataset`](column-mapped-text-instruction-iterable-dataset.md).
+:::
+
+:::{note}
+Delta Lake / Databricks (including `delta_sql_query` and authentication) is supported only by `ColumnMappedTextInstructionIterableDataset`. See [`column-mapped-text-instruction-iterable-dataset.md`](column-mapped-text-instruction-iterable-dataset.md) for details.
+:::
 
 ### Advanced Options
 | Arg                     | Default | Description |
 |-------------------------|---------|-------------|
-| `split`                 | `None`  | Which split to pull from a HF repo (`train`, `validation`, *etc.*). Ignored for local files. |
-(`dataset[idx]`) are **not** available — iterate instead. |
-| `name`                  | `None`  | Name of the dataset configuration/subset to load |
-| `answer_only_loss_mask` | `True`  | Create a `loss_mask` where only the answer tokens contribute to the loss. Requires `start_of_turn_token`. |
-| `start_of_turn_token`   | `None`  | String token marking the assistant's response. Required when `answer_only_loss_mask=True` for tokenizers with chat template. |
+| `split`                 | `"train"` | Which split to pull from a HF repo (`train`, `validation`, etc.). Ignored for local JSON/JSONL. |
+| `name`                  | `None`    | Name of the Hugging Face dataset configuration/subset to load. |
+| `answer_only_loss_mask` | `True`    | Mask prompt tokens in `labels` with `-100` (the standard CrossEntropy `ignore_index`). |
+| `use_hf_chat_template`  | `False`   | If `True` and the tokenizer supports chat templates, format as a system/user/assistant conversation via `tokenizer.apply_chat_template(...)`. |
+| `seq_length`            | `None`    | Optional max sequence length; used for padding/truncation when enabled. |
+| `padding`               | `"do_not_pad"` | Padding strategy passed to the tokenizer (`"do_not_pad"`, `"max_length"`, `True`, etc.). |
+| `truncation`            | `"do_not_truncate"` | Truncation strategy passed to the tokenizer (`"do_not_truncate"`, `True`, etc.). |
+| `limit_dataset_samples` | `None`    | Optionally load only the first \(N\) samples (useful for debugging). |
 
 ---
 ## Tokenization Paths
-This section explains how the dataset tokenizes both inputs and outputs, and how it adapts to different tokenizers.
-`ColumnMappedTextInstructionDataset` automatically picks one of two tokenization
-strategies depending on the capabilities of the provided tokenizer:
+This section explains how the dataset formats and tokenizes samples.
 
-1. **Chat-template path**: if the tokenizer exposes a
-   `chat_template` attribute and an `apply_chat_template` method, the
-   dataset will:
+`ColumnMappedTextInstructionDataset` produces standard next-token training tensors:
 
-   * build a list of messages in the form
-      `[{"role": "user", "content": <prompt>}, {"role": "assistant", "content": <answer>}]`,
-   * call `tokenizer.apply_chat_template(messages)` to convert them to
-      `input_ids`,
-   * derive `labels` by shifting `input_ids` one position to the right, and
-   * compute `loss_mask` by locating the second occurrence of
-      `start_of_turn_token` (this marks the assistant response boundary).  All
-      tokens that belong to the user prompt are set to `0`, while the answer
-      tokens are `1`.
+- `input_ids`
+- `labels`
+- `attention_mask`
 
-2. **Plain prompt/completion path**: if the tokenizer has no chat template, the
-   dataset falls back to a classic prompt and answer concatenation:
+When `answer_only_loss_mask=True`, prompt tokens are masked in `labels` with `-100` (the standard CrossEntropy `ignore_index`).
 
-   ```text
-   "<context> <question> " + "<answer>"
-   ```
+The dataset supports two formatting paths:
 
-   The helper strips any trailing *eos* from the prompt and leading *bos* from
-   the answer so that the two halves join cleanly.
+1. **Chat-template path (opt-in)**: if `use_hf_chat_template=True` and the tokenizer exposes a `chat_template` and `apply_chat_template`, the dataset builds messages like:
 
-Regardless of the path, the output dict is always:
+   `[{"role": "system", "content": <context or "">}, {"role": "user", "content": <question or "">}, {"role": "assistant", "content": <answer>}]`
 
-```python
-{
-    "input_ids": [...],  # one token shorter than the full sequence
-    "labels":     [...], # next-token targets
-    "loss_mask":  [...], # 1 for tokens contributing to the loss
-}
-```
+   and tokenizes them via `tokenizer.apply_chat_template(..., tokenize=True, return_dict=True)`.
+
+2. **Plain prompt/completion path (default)**: otherwise the dataset concatenates prompt and answer and tokenizes the result.
+
+In both cases, `labels` are the next-token targets (shifted by one relative to `input_ids`). The dataset also includes an internal `___PAD_TOKEN_IDS___` field used downstream for padding.
 
 ---
 ## Parameter Requirements
 
 The following section lists important requirements and caveats for correct usage.
-* `answer_only_loss_mask=True` requires a `start_of_turn_token` string that exists in the tokenizer's vocabulary and can be successfully encoded when the helper performs a lookup. Otherwise, a `ValueError` is raised at instantiation time.
-* Each sample must include at least one of `context` or `question`; omitting both will result in a `ValueError`.
+- `column_mapping` must include `answer`, and must include at least one of `context` or `question` (2- or 3-column mapping only).
+- If `use_hf_chat_template=True`, the tokenizer must support chat templates (`chat_template` + `apply_chat_template`).
 
 ---
 ## Slurm Configuration for Distributed Training
@@ -259,7 +250,7 @@ slurm:
 ### Multi-Node Slurm Configuration
 
 :::{note}
-**Multi-Node Training**: When using Hugging Face datasets in multi-node setups, you need shared storage accessible by all nodes. Set the `HF_DATASETS_CACHE` environment variable to point to a shared directory (e.g., `HF_DATASETS_CACHE=/shared/hf_cache`) in the yaml file as shown, to ensure all nodes can access the cached datasets.
+**Multi-Node Training**: When using Hugging Face datasets in multi-node setups, you need shared storage accessible by all nodes. Set the `HF_DATASETS_CACHE` environment variable to point to a shared directory (e.g., `HF_DATASETS_CACHE=/shared/hf_cache`) in the YAML file as shown, to ensure all nodes can access the cached datasets.
 :::
 
 When using multiple nodes with Hugging Face datasets:
@@ -283,10 +274,10 @@ slurm:
     - /lustre:/lustre
     - /shared:/shared
   # Optional: Specify custom HF_HOME location
-  hf_home: /shared/hf_cache # Custom Hugging Face cache directory on shared dist space.
+  hf_home: /shared/hf_cache # Custom Hugging Face cache directory on shared disk space.
   # Optional: Specify custom env vars
   env_vars: # Additional environment variables
-    HF_DATASETS_CACHE: /shared/hf_cache  # similar to hf_home, useful when use a different directory for datasets.
+     HF_DATASETS_CACHE: /shared/hf_cache  # Similar to hf_home; useful when you use a different directory for datasets.
   # Optional: Specify custom job directory
   job_dir: /path/to/slurm/jobs
 ```
@@ -294,4 +285,4 @@ slurm:
 
 ---
 ### That's It!
-With the mapping specified, the rest of the NeMo Automodel pipeline (pre-tokenisation, packing, collate-fn, *etc.*) works as usual.
+With the mapping specified, the rest of the NeMo Automodel pipeline (pre-tokenization, packing, collate-fn, *etc.*) works as usual.
