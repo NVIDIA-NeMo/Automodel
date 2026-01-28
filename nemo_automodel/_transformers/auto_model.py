@@ -602,6 +602,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation, use_liger_kernel = _apply_preload_overrides(
             is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
         )
+        device = torch.cuda.current_device()
 
         # Neither of these parallelization methods support meta device initialization
         is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not force_hf
@@ -664,7 +665,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn)
             # Only move to device if not on meta device (weights need to be loaded first for meta; handled by checkpointer)
             if not is_meta_device:
-                model.to(torch.cuda.current_device())
+                model.to(device)
             if compile_config is not None:
                 model = compile_model(model, compile_config)
         
@@ -678,7 +679,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         ])
         if should_load_checkpoint:
             models_to_load = model.parts if hasattr(model, "parts") else [model]
-            device = torch.cuda.current_device()
             cache_dir = kwargs.get("cache_dir", TRANSFORMERS_CACHE)
             lora_a_init = getattr(peft_config, "lora_A_init", None)
             for mp in models_to_load:

@@ -53,6 +53,7 @@ from nemo_automodel.components.distributed.init_utils import (
     initialize_distributed,
 )
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
+from megatron_fsdp.fully_shard import fully_shard_optimizer
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -129,7 +130,6 @@ def _get_num_thd_chunks(pp_enabled, cfg):
 
 
 def build_model_and_optimizer(
-    device,
     cfg_model,
     cfg_opt,
     cfg_peft,
@@ -170,18 +170,34 @@ def build_model_and_optimizer(
     Returns:
         The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, the loss function, and param_info dict.
     """
-    is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not cfg_model.get(
-        "force_hf", False
-    )
-
-    init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):
-        kwargs = {"tp_size": tp_size, "cp_size": cp_size, "has_packed_sequence": has_packed_sequence}
+        kwargs = {
+            "tp_size": tp_size,
+            "cp_size": cp_size,
+            "has_packed_sequence": has_packed_sequence,
+            "autopipeline": autopipeline,
+            "parallelize_fn": parallelize_fn,
+            "checkpointer": checkpointer,
+            "peft_config": cfg_peft,
+            "model_wrapper": model_wrapper,
+            "loss_fn": loss_fn,
+        }
+        if cfg_fp8 is not None:
+            fp8_config = build_fp8_config(cfg_fp8)
+            kwargs["fp8_config"] = fp8_config
+        if cfg_qat is not None and cfg_qat.get("enabled", False):
+            if cfg_peft is not None:
+                raise ValueError("QAT with PEFT is not currently supported")
+            quantizer = cfg_qat.quantizer.instantiate(precision=torch.bfloat16, scales_precision=torch.bfloat16)
+            kwargs["qat_quantizer"] = quantizer
+        if cfg_compile is not None:
+            kwargs["compile_config"] = build_compile_config(cfg_compile)
         if not cfg_model.get("_target_", None) in (
             NeMoAutoModelForCausalLM.from_config,
             NeMoAutoModelForCausalLM.from_pretrained,
         ):
             kwargs = {}
+            # TODO: non-NemoAutoModel entry points aren't being supported by auto-sharding
         if cfg_quantization is not None:
             logger.info("Model weight quantization enabled with BitsAndBytes")
             from nemo_automodel.components.quantization.qlora import create_bnb_config
@@ -189,160 +205,18 @@ def build_model_and_optimizer(
             kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
 
         # Instantiate the model in meta device to avoid OOM
-        with init_ctx:
-            model = cfg_model.instantiate(**kwargs)
-
-            if checkpointer.config.dequantize_base_checkpoint is None:
-                # try to infer whether the base weights are quantized
-                try:
-                    checkpointer.config.dequantize_base_checkpoint = hasattr(model.config, "quantization_config")
-                except:
-                    checkpointer.config.dequantize_base_checkpoint = False
-
-            # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
-            if cfg_peft is not None:
-                if tp_size > 1:
-                    logger.info("Disabling Triton with TP ({})".format(tp_size))
-                    cfg_peft.use_triton = False
-                if autopipeline is not None:
-                    logger.info("Enabling PEFT with Pipeline Parallelism")
-                    logger.info("Disabling Triton with Pipeline Parallelism Enabled.")
-                    cfg_peft.use_triton = False
-                apply_lora_to_linear_modules(
-                    model, cfg_peft, quantization_config=kwargs.get("quantization_config", None)
-                )
-
-        if cfg_fp8 is not None:
-            fp8_config = build_fp8_config(cfg_fp8)
-            model = apply_fp8_to_model(model, config=fp8_config)
-
-        # Apply QAT if configured (torchao QAT)
-        if cfg_qat is not None and cfg_qat.get("enabled", False):
-            if cfg_peft is not None:
-                raise ValueError("QAT with PEFT is not supported in 25.11")
-            from nemo_automodel.components.quantization.qat import prepare_qat_model
-
-            if any(map(lambda x: x.dtype != torch.bfloat16, model.parameters())):
-                logger.warning("QAT is only supported for bfloat16 models. Support will be added in future release.")
-                quit(code=0)
-            quantizer = cfg_qat.quantizer.instantiate(precision=torch.bfloat16, scales_precision=torch.bfloat16)
-            model, qat_mode = prepare_qat_model(model, quantizer)
-            # Attach helpers for delayed fake-quant toggling if desired
-            model._qat_mode = qat_mode  # type: ignore[attr-defined]
-
-        # Explicitly unfreeze specified modules (e.g. task heads) that need full fine-tuning
-        if unfreeze_modules:
-            for name, param in model.named_parameters():
-                if any(module_name in name for module_name in unfreeze_modules):
-                    param.requires_grad_(True)
-            logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
-
-    param_info = {
-        "trainable_params": 0,
-        "total_params": 0,
-    }
-
-    # hold a list copy of the model state dict keys before any parallelization
-    state_dict_keys = list(model.state_dict().keys())
+        model = cfg_model.instantiate(**kwargs)
 
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
         loss_fn = MaskedCrossEntropy()
 
-    if autopipeline is not None:
-        trainable_params, total_params = print_trainable_parameters(model)
-        param_info["trainable_params"] = trainable_params
-        param_info["total_params"] = total_params
-        if get_world_size_safe() == 1:
-            logger.info("World size is 1, skipping autopipeline.")
-        else:
-            autopipeline.build(model, loss_fn=loss_fn, parallelize_fn=parallelize_fn)
-            for mp in autopipeline.parts:
-                checkpointer.load_base_model(
-                    mp,
-                    device,
-                    cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
-                    _get_model_name(cfg_model),
-                    getattr(cfg_peft, "lora_A_init", None),
-                    load_base_model=load_base_model,
-                )
-
-            # Create optimizer for all model parts
-            trainable_params = []
-            for i, model_part in enumerate(autopipeline.parts):
-                trainable_params.append(
-                    {
-                        "params": list(filter(lambda x: x.requires_grad, model_part.parameters())),
-                        "name": f"rank_{get_rank_safe()}_model_part_{i}",
-                    }
-                )
-            model = autopipeline
-    else:
-        load_weights = False
-        if parallelize_fn is not None and get_world_size_safe() > 1:
-            parallelize_fn(
-                model,
-                world_mesh=model_wrapper.device_mesh,
-                moe_mesh=model_wrapper.moe_mesh,
-                dp_axis_names=(
-                    ("dp_replicate", "dp_shard_cp")
-                    if "dp_replicate" in model_wrapper.device_mesh.mesh_dim_names
-                    and "dp_shard_cp" in model_wrapper.device_mesh.mesh_dim_names
-                    else ("dp_shard_cp",)
-                ),
-                cp_axis_name="cp" if "cp" in model_wrapper.device_mesh.mesh_dim_names else None,
-                tp_axis_name="tp" if "tp" in model_wrapper.device_mesh.mesh_dim_names else None,
-                ep_axis_name="ep"
-                if model_wrapper.moe_mesh is not None and "ep" in model_wrapper.moe_mesh.mesh_dim_names
-                else None,
-                ep_shard_axis_names=(
-                    ("ep_shard",)
-                    if model_wrapper.moe_mesh is not None and "ep_shard" in model_wrapper.moe_mesh.mesh_dim_names
-                    else None
-                ),
-            )
-            load_weights = True
-        elif callable(getattr(model_wrapper, "parallelize", None)):
-            # FSDP2 and MegatronFSDP should already be on the correct device
-            if isinstance(model_wrapper, MegatronFSDPManager):
-                # MegatronFSDP instantiate optimizer inside parallelize_function
-                trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
-                assert len(trainable_params) > 0, "trainable_params cannot be empty"
-                if tp_size > 1:
-                    # TP does not support foreach
-                    cfg_opt.foreach = False
-                optimizer = cfg_opt.instantiate(params=trainable_params)
-
-                model, optimizer = model_wrapper.parallelize(model, optimizer)
-
-                trainable_params, total_params = print_trainable_parameters(model)
-                param_info["trainable_params"] = trainable_params
-                param_info["total_params"] = total_params
-
-                return model, state_dict_keys, [optimizer], loss_fn, param_info
-
-            else:
-                load_weights = True
-                model = model_wrapper.parallelize(model)
-
-        # Load the weights into the model in parallel.
-        if is_meta_device and load_weights:
-            checkpointer.load_base_model(
-                model,
-                device,
-                cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
-                _get_model_name(cfg_model),
-                getattr(cfg_peft, "lora_A_init", None),
-                load_base_model=load_base_model,
-            )
-
-        # ensure the model is on device
-        model = model.to(device)
-
-        # Apply torch.compile if configured
-        if cfg_compile is not None:
-            compile_config = build_compile_config(cfg_compile)
-            model = compile_model(model, compile_config)
+    # Explicitly unfreeze specified modules (e.g. task heads) that need full fine-tuning
+    if unfreeze_modules:
+        for name, param in model.named_parameters():
+            if any(module_name in name for module_name in unfreeze_modules):
+                param.requires_grad_(True)
+        logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
 
     if tp_size > 1:
         # TP does not support foreach
@@ -357,15 +231,12 @@ def build_model_and_optimizer(
     else:
         trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
-        optimizer = [cfg_opt.instantiate(params=trainable_params)]
+        optimizer = cfg_opt.instantiate(params=trainable_params)
+        if isinstance(model_wrapper, MegatronFSDPManager):
+            optimizer = fully_shard_optimizer(model, optimizer)
+        optimizer = [optimizer]
 
-    # Print trainable parameters after model has been moved to device
-    if autopipeline is None:
-        trainable_params, total_params = print_trainable_parameters(model)
-        param_info["trainable_params"] = trainable_params
-        param_info["total_params"] = total_params
-
-    return model, state_dict_keys, optimizer, loss_fn, param_info
+    return model, optimizer, loss_fn
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
@@ -1025,8 +896,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
-        model, model_state_dict_keys, self.optimizer, self.loss_fn, self.param_info = build_model_and_optimizer(
-            self.dist_env.device,
+        model, self.optimizer, self.loss_fn = build_model_and_optimizer(
             self.cfg.model,
             self.cfg.optimizer,
             self.peft_config,
@@ -1045,7 +915,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             load_base_model=self.cfg.get("checkpoint.load_base_model", True),
             checkpointer=self.checkpointer,
         )
-        self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
 
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
