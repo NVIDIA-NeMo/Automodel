@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -29,7 +28,6 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeModelOutputWithPast,
 )
 
-from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.qwen3_vl_moe.model import (
     Fp32SafeQwen3VLMoeTextRotaryEmbedding,
     Fp32SafeQwen3VLMoeVisionRotaryEmbedding,
@@ -355,46 +353,4 @@ class TestQwen3VLMoeFromPretrainedAndModelClass:
 
     def test_modelclass_export_exists(self):
         assert ModelClass is Qwen3VLMoeForConditionalGeneration
-
-
-class TestQwen3VLMoeHFCheckpointingMixin:
-    """Tests for HFCheckpointingMixin integration."""
-
-    def test_model_inherits_hf_checkpointing_mixin(self):
-        """Test that Qwen3VLMoeForConditionalGeneration inherits from HFCheckpointingMixin."""
-        assert issubclass(Qwen3VLMoeForConditionalGeneration, HFCheckpointingMixin), (
-            "Qwen3VLMoeForConditionalGeneration should inherit from HFCheckpointingMixin"
-        )
-
-    def test_model_has_checkpointer_attribute(self, vl_config, backend_config, moe_config):
-        """Test that model has _checkpointer attribute."""
-        model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)
-
-        assert hasattr(model, "_checkpointer"), (
-            "Model should have _checkpointer attribute from HFCheckpointingMixin"
-        )
-
-    def test_save_pretrained_requires_checkpointer(self, vl_config, backend_config, moe_config):
-        """Test that save_pretrained raises error without checkpointer."""
-        model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)
-        model._checkpointer = None
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with pytest.raises(ValueError, match="No checkpointer provided"):
-                model.save_pretrained(tmpdir)
-
-    def test_save_pretrained_uses_checkpointer(self, vl_config, backend_config, moe_config):
-        """Test that save_pretrained delegates to Checkpointer.save_model."""
-        model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)
-
-        mock_checkpointer = MagicMock()
-        model._checkpointer = mock_checkpointer
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            model.save_pretrained(tmpdir)
-
-            mock_checkpointer.save_model.assert_called_once()
-            call_kwargs = mock_checkpointer.save_model.call_args[1]
-            assert call_kwargs["model"] is model
-            assert call_kwargs["weights_path"] == tmpdir
 

@@ -514,19 +514,24 @@ def apply_model_infrastructure(
     """
     _verify_sdpa_support(model, is_hf_model, cp_size)
 
-    if checkpointer.config.dequantize_base_checkpoint is None:
-        # try to infer whether the base weights are quantized
-        checkpointer.config.dequantize_base_checkpoint = hasattr(model.config, "quantization_config")
+    # Handle checkpointer config updates if checkpointer is provided
+    dequantize_base_checkpoint = False
+    if checkpointer is not None:
+        if checkpointer.config.dequantize_base_checkpoint is None:
+            # try to infer whether the base weights are quantized
+            checkpointer.config.dequantize_base_checkpoint = hasattr(model.config, "quantization_config")
+        dequantize_base_checkpoint = checkpointer.config.dequantize_base_checkpoint
 
     # Apply PEFT and lower precision if configured
     model = _apply_peft_and_lower_precision(model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer)
 
     # hold a list copy of the model state dict keys before any parallelization
-    checkpointer.config.model_state_dict_keys = list(
-        _maybe_adapt_state_dict_to_hf(
-            model, model.state_dict(), quantization=checkpointer.config.dequantize_base_checkpoint
-        ).keys()
-    )
+    if checkpointer is not None:
+        checkpointer.config.model_state_dict_keys = list(
+            _maybe_adapt_state_dict_to_hf(
+                model, model.state_dict(), quantization=dequantize_base_checkpoint
+            ).keys()
+        )
 
     # Loss function check
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
@@ -548,7 +553,7 @@ def apply_model_infrastructure(
     # Weights need to be loaded for meta device models that were parallelized:
     # 1. When parallelize_fn was used (which will internally apply FSDP2/EP sharding)
     # 2. When FSDP2Manager.parallelize was used (but not MegatronFSDP which handles weights internally)
-    should_load_checkpoint = is_meta_device and any([
+    should_load_checkpoint = is_meta_device and checkpointer is not None and any([
         parallelize_fn is not None and get_world_size_safe() > 1,
         callable(getattr(model_wrapper, "parallelize", None)),
     ])
@@ -818,7 +823,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         device = torch.cuda.current_device()
 
         # Neither of these parallelization methods support meta device initialization
-        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not force_hf
+        # Also require checkpointer for meta device init, as we need it to load weights
+        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not force_hf and checkpointer is not None
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
         try:
@@ -1018,7 +1024,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         device = torch.cuda.current_device()
 
         # Neither of these parallelization methods support meta device initialization
-        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not force_hf
+        # Also require checkpointer for meta device init, as we need it to load weights
+        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not force_hf and checkpointer is not None
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
         try:

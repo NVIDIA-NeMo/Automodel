@@ -14,7 +14,6 @@
 
 """Tests for Qwen3 Omni MoE model wrappers."""
 
-import tempfile
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -26,7 +25,6 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerForConditionalGeneration as HFQwen3OmniMoeThinkerForConditionalGeneration,
 )
 
-from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.qwen3_omni_moe.model import (
     Qwen3OmniMoeThinkerForConditionalGeneration,
     Qwen3OmniMoeThinkerTextModel,
@@ -260,55 +258,4 @@ def test_modelclass_export_exists():
 
     assert hasattr(omni_module, "ModelClass")
     assert omni_module.ModelClass is Qwen3OmniMoeThinkerForConditionalGeneration
-
-
-class TestQwen3OmniMoeHFCheckpointingMixin:
-    """Tests for HFCheckpointingMixin integration."""
-
-    def test_model_inherits_hf_checkpointing_mixin(self):
-        """Test that Qwen3OmniMoeThinkerForConditionalGeneration inherits from HFCheckpointingMixin."""
-        assert issubclass(Qwen3OmniMoeThinkerForConditionalGeneration, HFCheckpointingMixin), (
-            "Qwen3OmniMoeThinkerForConditionalGeneration should inherit from HFCheckpointingMixin"
-        )
-
-    @patch.object(HFQwen3OmniMoeThinkerForConditionalGeneration, "__init__", new=_stub_hf_init)
-    @patch("nemo_automodel.components.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
-    def test_model_has_checkpointer_attribute(self, rotary_cls, thinker_config, backend_config, moe_config):
-        """Test that model has _checkpointer attribute."""
-        rotary_cls.return_value = MagicMock(side_effect=lambda x, y: (torch.zeros_like(x), torch.zeros_like(x)))
-        model = Qwen3OmniMoeThinkerForConditionalGeneration(thinker_config, moe_config=moe_config, backend=backend_config)
-
-        assert hasattr(model, "_checkpointer"), (
-            "Model should have _checkpointer attribute from HFCheckpointingMixin"
-        )
-
-    @patch.object(HFQwen3OmniMoeThinkerForConditionalGeneration, "__init__", new=_stub_hf_init)
-    @patch("nemo_automodel.components.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
-    def test_save_pretrained_requires_checkpointer(self, rotary_cls, thinker_config, backend_config, moe_config):
-        """Test that save_pretrained raises error without checkpointer."""
-        rotary_cls.return_value = MagicMock(side_effect=lambda x, y: (torch.zeros_like(x), torch.zeros_like(x)))
-        model = Qwen3OmniMoeThinkerForConditionalGeneration(thinker_config, moe_config=moe_config, backend=backend_config)
-        model._checkpointer = None
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with pytest.raises(ValueError, match="No checkpointer provided"):
-                model.save_pretrained(tmpdir)
-
-    @patch.object(HFQwen3OmniMoeThinkerForConditionalGeneration, "__init__", new=_stub_hf_init)
-    @patch("nemo_automodel.components.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
-    def test_save_pretrained_uses_checkpointer(self, rotary_cls, thinker_config, backend_config, moe_config):
-        """Test that save_pretrained delegates to Checkpointer.save_model."""
-        rotary_cls.return_value = MagicMock(side_effect=lambda x, y: (torch.zeros_like(x), torch.zeros_like(x)))
-        model = Qwen3OmniMoeThinkerForConditionalGeneration(thinker_config, moe_config=moe_config, backend=backend_config)
-
-        mock_checkpointer = MagicMock()
-        model._checkpointer = mock_checkpointer
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            model.save_pretrained(tmpdir)
-
-            mock_checkpointer.save_model.assert_called_once()
-            call_kwargs = mock_checkpointer.save_model.call_args[1]
-            assert call_kwargs["model"] is model
-            assert call_kwargs["weights_path"] == tmpdir
 

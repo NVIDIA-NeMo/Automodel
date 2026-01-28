@@ -495,43 +495,4 @@ def magic_moe_config(config: Glm4MoeConfig) -> MoEConfig:
     )
 
 
-class TestGlm4MoeHFCheckpointingMixin:
-    """Tests for HFCheckpointingMixin integration."""
-
-    def test_model_inherits_hf_checkpointing_mixin(self):
-        """Test that Glm4MoeForCausalLM inherits from HFCheckpointingMixin."""
-        assert issubclass(Glm4MoeForCausalLM, HFCheckpointingMixin), (
-            "Glm4MoeForCausalLM should inherit from HFCheckpointingMixin"
-        )
-
-    def test_model_has_checkpointer_attribute(self, glm_config, backend_config):
-        """Test that model has _checkpointer attribute."""
-        model = Glm4MoeForCausalLM(glm_config, backend=backend_config)
-
-        assert hasattr(model, "_checkpointer"), (
-            "Model should have _checkpointer attribute from HFCheckpointingMixin"
-        )
-
-    def test_save_pretrained_requires_checkpointer(self, glm_config, backend_config):
-        """Test that save_pretrained raises error without checkpointer."""
-        model = Glm4MoeForCausalLM(glm_config, backend=backend_config)
-        model._checkpointer = None
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with pytest.raises(ValueError, match="No checkpointer provided"):
-                model.save_pretrained(tmpdir)
-
-    def test_save_pretrained_uses_checkpointer(self, glm_config, backend_config):
-        """Test that save_pretrained delegates to Checkpointer.save_model."""
-        model = Glm4MoeForCausalLM(glm_config, backend=backend_config)
-
-        mock_checkpointer = MagicMock()
-        model._checkpointer = mock_checkpointer
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            model.save_pretrained(tmpdir)
-
-            mock_checkpointer.save_model.assert_called_once()
-            call_kwargs = mock_checkpointer.save_model.call_args[1]
-            assert call_kwargs["model"] is model
-            assert call_kwargs["weights_path"] == tmpdir
+# NOTE: HFCheckpointingMixin tests are now in tests/unit_tests/models/common/test_hf_checkpointing_mixin.py

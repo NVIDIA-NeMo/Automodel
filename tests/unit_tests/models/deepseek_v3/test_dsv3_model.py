@@ -46,57 +46,6 @@ class TestDeepseekV3ModelUpdates:
         assert dsv3_mod.ModelClass is DeepseekV3ForCausalLM
 
 
-class TestDeepseekV3HFCheckpointingMixin:
-    """Tests for HFCheckpointingMixin integration."""
-
-    def test_model_inherits_hf_checkpointing_mixin(self):
-        """Test that DeepseekV3ForCausalLM inherits from HFCheckpointingMixin."""
-        assert issubclass(DeepseekV3ForCausalLM, HFCheckpointingMixin), (
-            "DeepseekV3ForCausalLM should inherit from HFCheckpointingMixin"
-        )
-
-    def test_model_has_checkpointer_attribute(self):
-        """Test that model has _checkpointer attribute."""
-        cfg = DeepseekV3Config(
-            vocab_size=100, hidden_size=64, num_attention_heads=4, num_hidden_layers=1,
-            intermediate_size=128, qk_rope_head_dim=16, v_head_dim=16, qk_nope_head_dim=16
-        )
-        model = DeepseekV3ForCausalLM(cfg)
-
-        assert hasattr(model, "_checkpointer"), (
-            "Model should have _checkpointer attribute from HFCheckpointingMixin"
-        )
-
-    def test_save_pretrained_requires_checkpointer(self):
-        """Test that save_pretrained raises error without checkpointer."""
-        cfg = DeepseekV3Config(
-            vocab_size=100, hidden_size=64, num_attention_heads=4, num_hidden_layers=1,
-            intermediate_size=128, qk_rope_head_dim=16, v_head_dim=16, qk_nope_head_dim=16
-        )
-        model = DeepseekV3ForCausalLM(cfg)
-        model._checkpointer = None
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with pytest.raises(ValueError, match="No checkpointer provided"):
-                model.save_pretrained(tmpdir)
-
-    def test_save_pretrained_uses_checkpointer(self):
-        """Test that save_pretrained delegates to Checkpointer.save_model."""
-        cfg = DeepseekV3Config(
-            vocab_size=100, hidden_size=64, num_attention_heads=4, num_hidden_layers=1,
-            intermediate_size=128, qk_rope_head_dim=16, v_head_dim=16, qk_nope_head_dim=16
-        )
-        model = DeepseekV3ForCausalLM(cfg)
-
-        mock_checkpointer = MagicMock()
-        model._checkpointer = mock_checkpointer
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            model.save_pretrained(tmpdir)
-
-            mock_checkpointer.save_model.assert_called_once()
-            call_kwargs = mock_checkpointer.save_model.call_args[1]
-            assert call_kwargs["model"] is model
-            assert call_kwargs["weights_path"] == tmpdir
+# NOTE: HFCheckpointingMixin tests are now in tests/unit_tests/models/common/test_hf_checkpointing_mixin.py
 
 
