@@ -153,12 +153,14 @@ def initialize_attention_module(
     qkv_hidden_size = (num_heads + 2 * num_kv_heads) * head_dim
 
     if attn_impl == "te":
-        # Use wrapper for auto-materialization during PP shape inference
-        return TELinearWrapper(
+        from transformer_engine.pytorch.module.linear import Linear as TransformerEngineLinear
+        
+        # Create TE module directly on meta device (same as GroupedExpertsTE)
+        return TransformerEngineLinear(
             in_features=hidden_size,
             out_features=qkv_hidden_size,
             bias=qkv_bias,
-            device=device,
+            device="meta",
             params_dtype=dtype
         )
     elif attn_impl in ("sdpa", "torch"):
@@ -179,11 +181,6 @@ def materialize_te_weights(model: nn.Module, device: torch.device | str = "cuda"
         model: The model to materialize weights for
         device: Target device to materialize weights on
     """
-# #region agent log
-    import json, time
-    with open('/lustre/fs1/portfolios/coreai/users/zhiyul/Automodel/.cursor/debug.log', 'a') as f:
-        f.write(json.dumps({"location":"utils.py:materialize_te_weights", "message":"Materializing weights", "data":{"model_type": str(type(model))}, "timestamp":time.time(), "hypothesisId":"C"}) + "\n")
-    # #endregion
     with torch.device(device):
         for name, module in model.named_modules():
             # Check if this is a TE module with weights on meta device
@@ -191,10 +188,6 @@ def materialize_te_weights(model: nn.Module, device: torch.device | str = "cuda"
             
             if is_te_module:
                 is_meta = hasattr(module, 'weight') and hasattr(module.weight, 'is_meta') and module.weight.is_meta
-                # #region agent log
-                with open('/lustre/fs1/portfolios/coreai/users/zhiyul/Automodel/.cursor/debug.log', 'a') as f:
-                    f.write(json.dumps({"location":"utils.py:materialize_te_weights", "message":"Found TE module", "data":{"name": name, "class": str(module.__class__), "is_meta": is_meta}, "timestamp":time.time(), "hypothesisId":"C"}) + "\n")
-                # #endregion
                 if is_meta and hasattr(module, 'reset_parameters'):
                     module.reset_parameters()
 

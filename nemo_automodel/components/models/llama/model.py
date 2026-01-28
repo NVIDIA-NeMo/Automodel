@@ -228,15 +228,26 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
     def init_weights(self, buffer_device: torch.device):
-        """Initialize weights by materializing TE modules from meta device.
+        """Initialize weights by materializing modules from meta device.
         
-        Following the GroupedExpertsTE pattern: call reset_parameters() on TE modules
-        to materialize them from meta device.
+        Uses named_modules() to ensure we find modules even if they are wrapped
+        (e.g., by CheckpointWrapper).
         """
-        # Materialize RMSNorm modules (may be TE modules on meta device)
-        for norm in (self.input_layernorm, self.post_attention_layernorm):
-            if hasattr(norm, 'reset_parameters'):
-                norm.reset_parameters()
+        with buffer_device:
+            for _, module in self.named_modules():
+                # 1. Handle modules with explicit reset_parameters (like TE modules)
+                if hasattr(module, 'reset_parameters'):
+                    module.reset_parameters()
+                
+                # 2. Handle standard modules on meta device that lack reset_parameters
+                elif hasattr(module, 'weight') and module.weight is not None and module.weight.is_meta:
+                    if isinstance(module, (nn.Linear, nn.Embedding)):
+                        nn.init.normal_(module.weight, std=0.02)
+                    elif "norm" in module.__class__.__name__.lower():
+                        nn.init.ones_(module.weight)
+                    
+                    if hasattr(module, 'bias') and module.bias is not None and module.bias.is_meta:
+                        nn.init.zeros_(module.bias)
 
 
 class LlamaPreTrainedModel(PreTrainedModel):
@@ -295,22 +306,38 @@ class LlamaModel(LlamaPreTrainedModel):
         self.post_init()
 
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        """Initialize weights by materializing TE modules from meta device.
+        """Initialize weights by materializing modules from meta device.
         
-        Following the GroupedExpertsTE pattern: call reset_parameters() on TE modules
-        to materialize them from meta device.
+        Uses named_modules() to ensure we find modules even if they are wrapped.
         """
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
         
         with buffer_device:
-            # Materialize final norm (may be TE module on meta device)
-            if hasattr(self.norm, 'reset_parameters'):
-                self.norm.reset_parameters()
+            for name, module in self.named_modules():
+                # Skip decoder layers as they have their own init_weights called below
+                if name.startswith('layers.'):
+                    continue
+                    
+                if hasattr(module, 'reset_parameters'):
+                    module.reset_parameters()
+                elif hasattr(module, 'weight') and module.weight is not None and module.weight.is_meta:
+                    if isinstance(module, (nn.Linear, nn.Embedding)):
+                        nn.init.normal_(module.weight, std=0.02)
+                    elif "norm" in module.__class__.__name__.lower():
+                        nn.init.ones_(module.weight)
+                    
+                    if hasattr(module, 'bias') and module.bias is not None and module.bias.is_meta:
+                        nn.init.zeros_(module.bias)
         
-        # Materialize norms in each decoder layer
+        # Materialize each decoder layer
         for layer in self.layers:
-            if hasattr(layer, 'init_weights'):
+            if layer is not None and hasattr(layer, 'init_weights'):
                 layer.init_weights(buffer_device=buffer_device)
+        
+        # Materialize final norm
+        if hasattr(self.norm, 'reset_parameters'):
+            with buffer_device:
+                self.norm.reset_parameters()
 
     @check_model_inputs
     def forward(
@@ -454,13 +481,35 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             print(f"[LlamaForCausalLM] torch_dtype: {self.config.torch_dtype}")
 
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        """Initialize weights by materializing TE modules from meta device.
+        """Initialize weights by materializing modules from meta device.
         
-        Following the GroupedExpertsTE pattern: call reset_parameters() on TE modules
-        to materialize them from meta device.
+        Uses named_modules() to ensure we find modules even if they are wrapped.
         """
+        # Materialize the base model
         if hasattr(self.model, 'init_weights'):
             self.model.init_weights(buffer_device=buffer_device)
+        
+        # Materialize lm_head and any other top-level modules
+        buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        with buffer_device:
+            for name, module in self.named_modules():
+                # Skip the base model as it was handled above
+                if name.startswith('model.') or name == 'model':
+                    continue
+                    
+                if hasattr(module, 'reset_parameters'):
+                    module.reset_parameters()
+                elif hasattr(module, 'weight') and module.weight is not None and module.weight.is_meta:
+                    if isinstance(module, nn.Linear):
+                        nn.init.normal_(module.weight, std=0.02)
+                    
+                    if hasattr(module, 'bias') and module.bias is not None and module.bias.is_meta:
+                        nn.init.zeros_(module.bias)
+
+    @torch.no_grad()
+    def initialize_weights(self, buffer_device: torch.device | None = None) -> None:
+        """Public API for weight initialization, matching DeepSeek-V3 pattern."""
+        self.init_weights(buffer_device=buffer_device)
 
     def save_pretrained_hf_format(self, save_directory: str, **kwargs):
         """Save model in HuggingFace-compatible format by converting combined projections.
@@ -573,6 +622,19 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         )
 
         hidden_states = outputs.last_hidden_state
+
+        # Handle meta tensors for PP shape inference
+        if hidden_states.is_meta:
+            # Return a dummy tensor with correct shape
+            # lm_head: hidden_size -> vocab_size
+            logits_shape = (*hidden_states.shape[:-1], self.config.vocab_size)
+            logits = torch.empty(logits_shape, device='meta', dtype=hidden_states.dtype)
+            return CausalLMOutputWithPast(
+                loss=None,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+            )
 
         # Only compute necessary logits (optimization for training and generation)
         # DTensor compatibility with pytorch 2.9.0: when logits_to_keep=0, slice(0, None, None) would select all
