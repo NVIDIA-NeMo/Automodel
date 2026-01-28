@@ -25,7 +25,8 @@ from nemo_automodel._transformers.auto_model import (
     _patch_liger_kernel,
 )
 
-from .llama_bidirectional_model import BiencoderModel
+# from .llama_bidirectional_model import BiencoderModel
+from .nemotron_bidirectional_model import BiencoderModel
 
 logger = logging.getLogger(__name__)
 
