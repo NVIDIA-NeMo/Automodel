@@ -92,7 +92,7 @@ class CustomizerCallback(Callback):
         requests.post('https://api.example.com/metrics', json=val_results)
 ```
 
-### Or Using Manual Rank Checking
+### Use Manual Rank Checking
 
 ```python
 def on_train_batch_end(self, recipe, **kwargs):
