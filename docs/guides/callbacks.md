@@ -77,7 +77,7 @@ recipe.run_train_validation_loop()
 
 In multi-GPU training, callbacks run on **all ranks**. Python `logging` (e.g., `logger.info()`) is automatically filtered to rank 0, but other operations need explicit handling.
 
-### Using `@rank_zero_only` Decorator
+### Use `@rank_zero_only` Decorator
 
 ```python
 from nemo_automodel.components.callbacks import Callback, rank_zero_only
