@@ -227,6 +227,17 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states
         return hidden_states
 
+    def init_weights(self, buffer_device: torch.device):
+        """Initialize weights by materializing TE modules from meta device.
+        
+        Following the GroupedExpertsTE pattern: call reset_parameters() on TE modules
+        to materialize them from meta device.
+        """
+        # Materialize RMSNorm modules (may be TE modules on meta device)
+        for norm in (self.input_layernorm, self.post_attention_layernorm):
+            if hasattr(norm, 'reset_parameters'):
+                norm.reset_parameters()
+
 
 class LlamaPreTrainedModel(PreTrainedModel):
     """
@@ -282,6 +293,24 @@ class LlamaModel(LlamaPreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def init_weights(self, buffer_device: torch.device | None = None) -> None:
+        """Initialize weights by materializing TE modules from meta device.
+        
+        Following the GroupedExpertsTE pattern: call reset_parameters() on TE modules
+        to materialize them from meta device.
+        """
+        buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        
+        with buffer_device:
+            # Materialize final norm (may be TE module on meta device)
+            if hasattr(self.norm, 'reset_parameters'):
+                self.norm.reset_parameters()
+        
+        # Materialize norms in each decoder layer
+        for layer in self.layers:
+            if hasattr(layer, 'init_weights'):
+                layer.init_weights(buffer_device=buffer_device)
 
     @check_model_inputs
     def forward(
@@ -423,6 +452,15 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             print(f"[LlamaForCausalLM] Attention implementation: {self.config._attn_implementation}")
             print("[LlamaForCausalLM] Custom implementation with COMBINED QKV and gate_up projections")
             print(f"[LlamaForCausalLM] torch_dtype: {self.config.torch_dtype}")
+
+    def init_weights(self, buffer_device: torch.device | None = None) -> None:
+        """Initialize weights by materializing TE modules from meta device.
+        
+        Following the GroupedExpertsTE pattern: call reset_parameters() on TE modules
+        to materialize them from meta device.
+        """
+        if hasattr(self.model, 'init_weights'):
+            self.model.init_weights(buffer_device=buffer_device)
 
     def save_pretrained_hf_format(self, save_directory: str, **kwargs):
         """Save model in HuggingFace-compatible format by converting combined projections.
