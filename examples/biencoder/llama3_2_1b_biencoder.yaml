@@ -117,12 +117,10 @@ dataloader:
 #   use_triton: true
 
 optimizer:
-  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  _target_: torch.optim.AdamW
   lr: 5.0e-6
   weight_decay: 0.01
-  adam_w_mode: true
-  bias_correction: true
-  master_weights: true
+  fused: true  # Use fused CUDA implementation if available
 
 # Learning rate scheduler
 lr_scheduler:
