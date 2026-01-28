@@ -463,6 +463,121 @@ def _shard_ep_fsdp(model, model_wrapper, parallelize_fn):
     return model
 
 
+def apply_model_infrastructure(
+    model,
+    *,
+    is_hf_model,
+    is_meta_device,
+    device,
+    checkpointer,
+    model_wrapper=None,
+    tp_size=1,
+    cp_size=1,
+    peft_config=None,
+    quantization_config=None,
+    fp8_config=None,
+    qat_quantizer=None,
+    loss_fn=None,
+    autopipeline=None,
+    parallelize_fn=None,
+    compile_config=None,
+    model_name_or_path=None,
+    load_base_model=False,
+    cache_dir=None,
+    **_kwargs,
+):
+    """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
+
+    This function contains the common post-init logic shared between from_pretrained
+    and from_config methods. It can also be called directly for models built via
+    custom builder functions (e.g., build_gpt2_model). It handles:
+    - SDPA support verification
+    - PEFT and lower precision application (LoRA, FP8, QAT)
+    - Loss function setup
+    - Pipeline parallelism or EP/FSDP sharding
+    - Device placement and compilation
+    - Checkpoint loading for meta device models
+
+    Args:
+        model: The model to apply infrastructure to
+        is_hf_model: Whether this is an HF model (vs custom implementation)
+        is_meta_device: Whether model was initialized on meta device
+        device: Target device for model
+        checkpointer: Checkpointer instance for weight loading
+        model_wrapper: Model wrapper (FSDP2Manager, DDPManager, etc.). Default: None
+        tp_size: Tensor parallelism size. Default: 1
+        cp_size: Context parallelism size. Default: 1
+        peft_config: PEFT/LoRA configuration dict. Default: None
+        quantization_config: Quantization configuration. Default: None
+        fp8_config: FP8 configuration. Default: None
+        qat_quantizer: QAT quantizer instance. Default: None
+        loss_fn: Loss function (may be replaced with MaskedCrossEntropy). Default: None
+        autopipeline: AutoPipeline instance for pipeline parallelism. Default: None
+        parallelize_fn: Function to apply parallelization (EP + FSDP2). Default: None
+        compile_config: Compilation configuration. Default: None
+        model_name_or_path: Model name or path for checkpoint loading. Default: None
+        load_base_model: Whether to load base model weights (True for from_pretrained). Default: False
+        cache_dir: Cache directory for model weights. Default: None
+        **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
+
+    Returns:
+        The model with all infrastructure applied
+    """
+    _verify_sdpa_support(model, is_hf_model, cp_size)
+
+    if checkpointer.config.dequantize_base_checkpoint is None:
+        # try to infer whether the base weights are quantized
+        checkpointer.config.dequantize_base_checkpoint = hasattr(model.config, "quantization_config")
+
+    # Apply PEFT and lower precision if configured
+    model = _apply_peft_and_lower_precision(model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer)
+
+    # hold a list copy of the model state dict keys before any parallelization
+    checkpointer.config.model_state_dict_keys = list(model.state_dict().keys())
+
+    # Loss function check
+    if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
+        loss_fn = MaskedCrossEntropy()
+
+    # Apply pipeline parallelism if configured. This is the outermost parallelization.
+    # Note: AutoPipeline takes care of applying PP + EP + FSDP. _shard_ep_fsdp will take care of applying EP + FSDP if no PP.
+    if autopipeline is not None:
+        model = _shard_pp(autopipeline, model, loss_fn, parallelize_fn)
+    else:
+        model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn)
+        # Only move to device if not on meta device (weights need to be loaded first for meta; handled by checkpointer)
+        if not is_meta_device:
+            model.to(device)
+        if compile_config is not None:
+            model = compile_model(model, compile_config)
+
+    # Load the checkpoint if needed and return
+    # Weights need to be loaded for meta device models that were parallelized:
+    # 1. When parallelize_fn was used (which will internally apply FSDP2/EP sharding)
+    # 2. When FSDP2Manager.parallelize was used (but not MegatronFSDP which handles weights internally)
+    should_load_checkpoint = is_meta_device and any([
+        parallelize_fn is not None and get_world_size_safe() > 1,
+        callable(getattr(model_wrapper, "parallelize", None)),
+    ])
+    if should_load_checkpoint:
+        models_to_load = model.parts if hasattr(model, "parts") else [model]
+        lora_a_init = getattr(peft_config, "lora_A_init", None)
+        for mp in models_to_load:
+            checkpointer.load_base_model(
+                mp,
+                device,
+                cache_dir,
+                model_name_or_path,
+                lora_a_init,
+                load_base_model=load_base_model,
+            )
+
+    if autopipeline is None:
+        print_trainable_parameters(model)  # Once model's been sharded
+
+    return model
+
+
 def get_architectures(hf_config):
     """
     Get the architectures from the HF config.
@@ -542,7 +657,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         This is a light wrapper around
         `transformers.AutoModelForCausalLM.from_pretrained` that can
         automatically apply Liger and/or SDPA (scaled-dot-product
-        attention) kernel optimizations.
+        attention) kernel optimizations, as well as PEFT, quantization,
+        and distributed parallelism.
 
         Args:
             pretrained_model_name_or_path (str | os.PathLike): Hugging Face
@@ -565,16 +681,38 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 will be applied to the model.
             force_hf (bool, default=False): If `True`, force the use of HF model implementation.
                 If `False`, the model will be loaded using the custom model implementation if available.
+            model_wrapper (optional): Parallelism wrapper instance (e.g., FSDP2Manager,
+                MegatronFSDPManager, DDPManager). Used for distributed training setup
+                and determines meta device initialization behavior.
+            autopipeline (AutoPipeline | None, optional): AutoPipeline instance for
+                pipeline parallelism. When provided, the model will be split across
+                pipeline stages. Default: None.
+            parallelize_fn (Callable | None, optional): Custom function to apply
+                parallelization (EP + FSDP2). Default: None.
             checkpointer (Checkpointer, optional): Checkpointer instance for loading weights
-                and enabling save_pretrained() functionality. If not provided for custom models,
-                the model will have randomly initialized weights. The checkpointer is stored
-                on the model for later use in save_pretrained().
-            **kwargs: Additional keyword arguments forwarded verbatim to
-                `AutoModelForCausalLM.from_pretrained`.
+                and enabling save_pretrained() functionality. Required for weight loading
+                and checkpoint management.
+            peft_config (dict | None, optional): PEFT/LoRA configuration dictionary.
+                If provided, LoRA adapters will be applied to the model. Default: None.
+            fp8_config (FP8Config | None, optional): FP8 quantization configuration.
+                If provided, FP8 quantization will be applied to the model. Default: None.
+            qat_quantizer (Int4WeightOnlyQATQuantizer | Int8DynActInt4WeightQATQuantizer | None, optional):
+                Quantization-Aware Training quantizer instance. If provided, QAT will be
+                applied to the model. Default: None.
+            loss_fn (Callable | None, optional): Loss function to use. If the model
+                doesn't support `logits_to_keep` and loss_fn is not MaskedCrossEntropy,
+                it will be replaced with MaskedCrossEntropy. This is passed to AutoPipeline. Default: None.
+            compile_config (CompileConfig | None, optional): Configuration for torch.compile.
+                If provided, the model will be compiled for improved performance. Default: None.
+            **kwargs: Additional keyword arguments. Notable ones include:
+                - tp_size (int): Tensor parallelism size. Default: 1.
+                - cp_size (int): Context parallelism size. Default: 1.
+                - has_packed_sequence (bool): Whether using packed sequences. Default: False.
+                - cache_dir (str): Cache directory for model weights.
 
         Returns:
             transformers.PreTrainedModel: The loaded (and possibly patched)
-            model instance.
+            model instance with all infrastructure applied.
 
         Warns:
             UserWarning: Emitted when `use_liger_kernel=True` but the Liger
@@ -582,8 +720,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         Notes:
             If kernel patching fails, the partially constructed model is
-              deleted and the method recurses once with
-              `use_liger_kernel=False` or `use_sdpa_patching=False`
+            deleted and the method recurses once with
+            `use_liger_kernel=False` or `use_sdpa_patching=False`.
         """
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
@@ -657,58 +795,27 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             logging.warning("Retrying without SDPA patching.")
             return _retry(use_sdpa_patching=False)
 
-        _verify_sdpa_support(model, is_hf_model, cp_size)
-
-        if checkpointer.config.dequantize_base_checkpoint is None:
-            # try to infer whether the base weights are quantized
-            checkpointer.config.dequantize_base_checkpoint = hasattr(model.config, "quantization_config")
-
-        # Apply PEFT and lower precision if configured
-        model = _apply_peft_and_lower_precision(model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer)
-
-        # hold a list copy of the model state dict keys before any parallelization
-        checkpointer.config.model_state_dict_keys = list(model.state_dict().keys())
-
-        # Loss function check
-        if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
-            loss_fn = MaskedCrossEntropy()
-
-        # Apply pipeline parallelism if configured. This is the outermost parallelization.
-        # Note: AutoPipeline takes care of applying PP + EP + FSDP. _shard_ep_fsdp will take care of applying EP + FSDP if no PP.
-        if autopipeline is not None:
-            model = _shard_pp(autopipeline, model, loss_fn, parallelize_fn)
-        else:
-            model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn)
-            # Only move to device if not on meta device (weights need to be loaded first for meta; handled by checkpointer)
-            if not is_meta_device:
-                model.to(device)
-            if compile_config is not None:
-                model = compile_model(model, compile_config)
-        
-        # Load the checkpoint if needed and return
-        # Weights need to be loaded for meta device models that were parallelized:
-        # 1. When parallelize_fn was used (which will internally apply FSDP2/EP sharding)
-        # 2. When FSDP2Manager.parallelize was used (but not MegatronFSDP which handles weights internally)
-        should_load_checkpoint = is_meta_device and any([
-            parallelize_fn is not None and get_world_size_safe() > 1,
-            callable(getattr(model_wrapper, "parallelize", None)),
-        ])
-        if should_load_checkpoint:
-            models_to_load = model.parts if hasattr(model, "parts") else [model]
-            cache_dir = kwargs.get("cache_dir", TRANSFORMERS_CACHE)
-            lora_a_init = getattr(peft_config, "lora_A_init", None)
-            for mp in models_to_load:
-                checkpointer.load_base_model(
-                    mp,
-                    device,
-                    cache_dir,
-                    pretrained_model_name_or_path,
-                    lora_a_init,
-                    load_base_model=True,
-                )
-        
-        if autopipeline is None:
-            print_trainable_parameters(model)  # Once model's been sharded
+        model = apply_model_infrastructure(
+            model=model,
+            is_hf_model=is_hf_model,
+            cp_size=cp_size,
+            tp_size=tp_size,
+            checkpointer=checkpointer,
+            peft_config=peft_config,
+            quantization_config=quantization_config,
+            fp8_config=fp8_config,
+            qat_quantizer=qat_quantizer,
+            loss_fn=loss_fn,
+            autopipeline=autopipeline,
+            parallelize_fn=parallelize_fn,
+            model_wrapper=model_wrapper,
+            is_meta_device=is_meta_device,
+            device=device,
+            compile_config=compile_config,
+            model_name_or_path=pretrained_model_name_or_path,
+            load_base_model=True,
+            cache_dir=kwargs.get("cache_dir", TRANSFORMERS_CACHE),
+        )
 
         return model
 
@@ -737,13 +844,17 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     ) -> PreTrainedModel:
         """
         Instantiate a model from a ``transformers.PretrainedConfig`` and optionally
-        patch it with Liger or SDPA-optimized kernels.
+        patch it with Liger or SDPA-optimized kernels, as well as apply PEFT,
+        quantization, and distributed parallelism.
+
+        This method creates a model with randomly initialized weights (no pretrained
+        weights are loaded). Use ``from_pretrained`` to load pretrained weights.
 
         Args:
             config (transformers.PretrainedConfig | str):
                 The configuration object used to build the model.
                 If config is passed as a string (e.g., model-id / local checkpoint),
-                it will be create a config internally using AutoConfig.
+                it will create a config internally using AutoConfig.
             *model_args:
                 Positional arguments forwarded to the underlying
                 ``transformers.AutoModelForCausalLM.from_config`` call.
@@ -757,24 +868,56 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 One or multiple SDPA back-ends to prefer when applying SDPA
                 patching. When ``None``, the default backend resolution logic is
                 used. Defaults to ``None``.
+            torch_dtype (str | torch.dtype, default="auto"):
+                Data type for model parameters. If "auto", defaults to torch.bfloat16.
             attn_implementation (str, optional):
                 Specifies which attention implementation to use (e.g.,
                 ``"flash_attention_2"``, ``"eager"``). Only applied when the
                 base model supports this kwarg. Defaults to ``"flash_attention_2"``.
-            force_hf (bool, default=False): If `True`, force the use of HF model implementation.
-                If `False`, the model will be loaded using the custom model implementation if available.
+            quantization_config (optional): BitsAndBytesConfig configuration object that
+                specifies all quantization settings. If provided, quantization
+                will be applied to the model.
+            force_hf (bool, default=False): If ``True``, force the use of HF model implementation.
+                If ``False``, the model will be loaded using the custom model implementation if available.
+            model_wrapper (optional): Parallelism wrapper instance (e.g., FSDP2Manager,
+                MegatronFSDPManager, DDPManager). Used for distributed training setup
+                and determines meta device initialization behavior.
+            autopipeline (AutoPipeline | None, optional): AutoPipeline instance for
+                pipeline parallelism. When provided, the model will be split across
+                pipeline stages. Default: None.
+            parallelize_fn (Callable | None, optional): Custom function to apply
+                parallelization (EP + FSDP2).
+                Called after model initialization. Default: None.
+            peft_config (dict | None, optional): PEFT/LoRA configuration dictionary.
+                If provided, LoRA adapters will be applied to the model. Default: None.
+            fp8_config (FP8Config | None, optional): FP8 quantization configuration.
+                If provided, FP8 quantization will be applied to the model. Default: None.
+            qat_quantizer (Int4WeightOnlyQATQuantizer | Int8DynActInt4WeightQATQuantizer | None, optional):
+                Quantization-Aware Training quantizer instance. If provided, QAT will be
+                applied to the model. Default: None.
+            loss_fn (Callable | None, optional): Loss function to use. If the model
+                doesn't support `logits_to_keep` and loss_fn is not MaskedCrossEntropy,
+                it will be replaced with MaskedCrossEntropy. This is passed to AutoPipeline. Default: None.
+            compile_config (CompileConfig | None, optional): Configuration for torch.compile.
+                If provided, the model will be compiled for improved performance. Default: None.
+            checkpointer (Checkpointer, optional): Checkpointer instance for checkpoint
+                management and enabling save_pretrained() functionality. Required for
+                proper checkpoint handling.
             **kwargs:
-                Additional keyword arguments forwarded to the superclass
-                constructor and underlying ``from_config`` logic.
+                Additional keyword arguments. Notable ones include:
+                - tp_size (int): Tensor parallelism size. Default: 1.
+                - cp_size (int): Context parallelism size. Default: 1.
+                - has_packed_sequence (bool): Whether using packed sequences. Default: False.
+                - cache_dir (str): Cache directory for model weights.
 
         Returns:
             transformers.PreTrainedModel: The instantiated (and possibly
-            kernel-patched) model.
+            kernel-patched) model with all infrastructure applied.
 
         Notes:
             If kernel patching fails, the partially constructed model is
-              deleted and the method recurses once with
-              `use_liger_kernel=False` or `use_sdpa_patching=False`
+            deleted and the method recurses once with
+            `use_liger_kernel=False` or `use_sdpa_patching=False`.
         """
         def _retry(**override):
             """Internal helper to re-enter this function with patched args."""
@@ -851,58 +994,27 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             logging.warning("Retrying without SDPA patching.")
             return _retry(use_sdpa_patching=False)
 
-        _verify_sdpa_support(model, is_hf_model, cp_size)
-
-        if checkpointer.config.dequantize_base_checkpoint is None:
-            # try to infer whether the base weights are quantized
-            checkpointer.config.dequantize_base_checkpoint = hasattr(model.config, "quantization_config")
-
-        # Apply PEFT and lower precision if configured
-        model = _apply_peft_and_lower_precision(model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer)
-        
-        # hold a list copy of the model state dict keys before any parallelization
-        checkpointer.config.model_state_dict_keys = list(model.state_dict().keys())
-
-        # Loss function check
-        if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
-            loss_fn = MaskedCrossEntropy()
-
-        # Apply pipeline parallelism if configured. This is the outermost parallelization.
-        # Note: AutoPipeline takes care of applying PP + EP + FSDP. _shard_ep_fsdp will take care of applying EP + FSDP if no PP.
-        if autopipeline is not None:
-            model = _shard_pp(autopipeline, model, loss_fn, parallelize_fn)
-        else:
-            model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn)
-            # Only move to device if not on meta device (weights need to be loaded first for meta; handled by checkpointer)
-            if not is_meta_device:
-                model.to(device)
-            if compile_config is not None:
-                model = compile_model(model, compile_config)
-        
-        # Load the checkpoint if needed and return
-        # Weights need to be loaded for meta device models that were parallelized:
-        # 1. When parallelize_fn was used (which will internally apply FSDP2/EP sharding)
-        # 2. When FSDP2Manager.parallelize was used (but not MegatronFSDP which handles weights internally)
-        should_load_checkpoint = is_meta_device and any([
-            parallelize_fn is not None and get_world_size_safe() > 1,
-            callable(getattr(model_wrapper, "parallelize", None)),
-        ])
-        if should_load_checkpoint:
-            models_to_load = model.parts if hasattr(model, "parts") else [model]
-            cache_dir = kwargs.get("cache_dir", TRANSFORMERS_CACHE)
-            lora_a_init = getattr(peft_config, "lora_A_init", None)
-            for mp in models_to_load:
-                checkpointer.load_base_model(
-                    mp,
-                    device,
-                    cache_dir,
-                    getattr(config, "name_or_path"),
-                    lora_a_init,
-                    load_base_model=False,
-                )
-        
-        if autopipeline is None:
-            print_trainable_parameters(model)  # Once model's been sharded
+        model = apply_model_infrastructure(
+            model=model,
+            is_hf_model=is_hf_model,
+            cp_size=cp_size,
+            tp_size=tp_size,
+            checkpointer=checkpointer,
+            peft_config=peft_config,
+            quantization_config=quantization_config,
+            fp8_config=fp8_config,
+            qat_quantizer=qat_quantizer,
+            loss_fn=loss_fn,
+            autopipeline=autopipeline,
+            parallelize_fn=parallelize_fn,
+            model_wrapper=model_wrapper,
+            is_meta_device=is_meta_device,
+            device=device,
+            compile_config=compile_config,
+            model_name_or_path=getattr(config, "name_or_path"),
+            load_base_model=False,
+            cache_dir=kwargs.get("cache_dir", TRANSFORMERS_CACHE),
+        )
 
         return model
 

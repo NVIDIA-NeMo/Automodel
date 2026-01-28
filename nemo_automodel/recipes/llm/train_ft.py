@@ -37,6 +37,7 @@ from transformers.utils.hub import TRANSFORMERS_CACHE
 from wandb import Settings
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
+from nemo_automodel._transformers.auto_model import apply_model_infrastructure
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
@@ -194,20 +195,34 @@ def build_model_and_optimizer(
             kwargs["qat_quantizer"] = quantizer
         if cfg_compile is not None:
             kwargs["compile_config"] = build_compile_config(cfg_compile)
-        if not cfg_model.get("_target_", None) in (
-            NeMoAutoModelForCausalLM.from_config,
-            NeMoAutoModelForCausalLM.from_pretrained,
-        ):
-            kwargs = {}
-            # TODO: non-NemoAutoModel entry points aren't being supported by auto-sharding
         if cfg_quantization is not None:
             logger.info("Model weight quantization enabled with BitsAndBytes")
             from nemo_automodel.components.quantization.qlora import create_bnb_config
 
             kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
 
-        # Instantiate the model in meta device to avoid OOM
-        model = cfg_model.instantiate(**kwargs)
+        is_nemo_auto_model = cfg_model.get("_target_", None) in (
+            NeMoAutoModelForCausalLM.from_config,
+            NeMoAutoModelForCausalLM.from_pretrained,
+        )
+
+        if is_nemo_auto_model:
+            # NeMoAutoModel handles infrastructure internally
+            model = cfg_model.instantiate(**kwargs)
+        else:
+            # For non-NemoAutoModel entry points (e.g., build_gpt2_model),
+            # instantiate the model first, then apply infrastructure separately
+            model = cfg_model.instantiate()
+            model = apply_model_infrastructure(
+                model,
+                is_hf_model=False,
+                is_meta_device=False,
+                device=torch.cuda.current_device(),
+                model_name_or_path=None,
+                load_base_model=False,
+                cache_dir=TRANSFORMERS_CACHE,
+                **kwargs,
+            )
 
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
