@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.moe.utils import initialize_rms_norm_module
+from nemo_automodel.components.models.common import initialize_rms_norm_module
 
 
 class NemotronV3Attention(nn.Module):
