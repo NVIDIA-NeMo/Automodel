@@ -75,16 +75,14 @@ class MoESplitExpertsStateDictMixin:
             required_experts = list(range(n_experts))
             rank_info = ""
 
-        uses_model_prefix = any(key.startswith("model.") for key in hf_state_dict.keys() if ".mlp.experts." in key)
-        key_prefix = "model." if uses_model_prefix else ""
-
-        layers_with_experts = set()
-        pattern = rf"{re.escape(key_prefix)}layers\.(\d+)\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight"
+        layers_with_experts: dict[int, set[str]] = {}
+        pattern = r"(?P<prefix>(?:model\.)?(?:language_model\.)?)layers\.(\d+)\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight"
         for key in hf_state_dict.keys():
             match = re.match(pattern, key)
             if match:
-                layer_num = int(match.group(1))
-                layers_with_experts.add(layer_num)
+                prefix = match.group("prefix") or ""
+                layer_num = int(match.group(2))
+                layers_with_experts.setdefault(layer_num, set()).add(prefix)
 
         if not layers_with_experts:
             return
@@ -92,12 +90,13 @@ class MoESplitExpertsStateDictMixin:
         missing_weights = []
         projection_types = ["gate_proj", "up_proj", "down_proj"]
 
-        for layer_num in layers_with_experts:
-            for expert_id in required_experts:
-                for proj_type in projection_types:
-                    expected_key = f"{key_prefix}layers.{layer_num}.mlp.experts.{expert_id}.{proj_type}.weight"
-                    if expected_key not in hf_state_dict:
-                        missing_weights.append(expected_key)
+        for layer_num, prefixes in layers_with_experts.items():
+            for prefix in prefixes:
+                for expert_id in required_experts:
+                    for proj_type in projection_types:
+                        expected_key = f"{prefix}layers.{layer_num}.mlp.experts.{expert_id}.{proj_type}.weight"
+                        if expected_key not in hf_state_dict:
+                            missing_weights.append(expected_key)
 
         if missing_weights:
             missing_count = len(missing_weights)
@@ -211,13 +210,15 @@ class MoESplitExpertsStateDictMixin:
                 # - model.layers.{L}.mlp.experts.{E}.gate_proj.weight (with model prefix)
                 # - layers.{L}.mlp.experts.{E}.gate_proj.weight (without model prefix)
                 m = re.match(
-                    r"(?:model\.)?layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight", key
+                    r"(?P<prefix>(?:model\.)?(?:language_model\.)?)layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight",
+                    key,
                 )
                 if m is None:
                     state_dict[key] = value
                     continue
 
-                layer_num, expert_num, which = m.groups()
+                prefix = m.group("prefix") or ""
+                layer_num, expert_num, which = m.group(2), m.group(3), m.group(4)
                 expert_num = int(expert_num)
 
                 if not should_load_expert_for_rank(expert_num, device_mesh, n_experts):
@@ -227,9 +228,9 @@ class MoESplitExpertsStateDictMixin:
                     expert_weights_by_layer[layer_num] = {}
 
                 if which in ["gate_proj", "up_proj"]:
-                    native_key = f"model.layers.{layer_num}.mlp.experts.gate_and_up_projs"
+                    native_key = f"{prefix}layers.{layer_num}.mlp.experts.gate_and_up_projs"
                 else:  # down_proj
-                    native_key = f"model.layers.{layer_num}.mlp.experts.down_projs"
+                    native_key = f"{prefix}layers.{layer_num}.mlp.experts.down_projs"
 
                 if native_key not in expert_weights_by_layer[layer_num]:
                     expert_weights_by_layer[layer_num][native_key] = {}

@@ -789,6 +789,8 @@ def test_dcp_checkpoint():
     cfg = parse_args_and_load_config(cfg_path)
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
+
+    print("================================================")
     trainer.run_train_validation_loop()
 
     # checkpoint is saved at this point
@@ -979,6 +981,8 @@ def test_dcp_checkpoint():
         # delete the checkpoint directory
         if Path(trainer.checkpointer.config.checkpoint_dir).exists():
             shutil.rmtree(Path(trainer.checkpointer.config.checkpoint_dir))
+
+    print("================================================")
     torch.distributed.barrier()
 
 

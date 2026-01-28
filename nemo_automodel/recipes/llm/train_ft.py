@@ -275,7 +275,6 @@ def build_model_and_optimizer(
                     load_base_model=load_base_model,
                 )
 
-            # Create optimizer for all model parts
             trainable_params = []
             for i, model_part in enumerate(autopipeline.parts):
                 trainable_params.append(
