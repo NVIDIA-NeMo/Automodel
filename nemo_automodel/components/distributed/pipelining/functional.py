@@ -135,9 +135,9 @@ def generate_hf_model_fqn_per_model_part(
             stage_layer_count += 1
 
         # First stage: add embeddings and multimodal encoders if requested
-        if stage_idx == 0 and include_embeddings:
-            stage_modules.append(f"{fqn_prefix}embed_tokens")
         if stage_idx == 0:
+            if include_embeddings:
+                stage_modules.append(f"{fqn_prefix}embed_tokens")
             if include_multimodal_encoders:
                 stage_modules.extend([f"{fqn_prefix}{suffix}" for suffix in MULTIMODAL_SUFFIXES])
             if extra_module_fqns:
@@ -300,7 +300,7 @@ def split_model_into_stages(
     include_multimodal_encoders = True
     extra_module_fqns = None
 
-    text_model_attr_prefix = text_model_attr_name + "."
+    text_model_attr_prefix = text_model_attr_name + "." if text_model_attr_name else ""
     layers_prefix = (
         f"{base_prefix}{text_model_attr_prefix}model."
         if text_model_has_model_attr
