@@ -71,6 +71,7 @@ class MoEConfig:
     shared_expert_gate: bool = False
     shared_expert_inter_dim: int | None = None
     shared_expert_activation: str = "swiglu"  # Activation for shared experts ("swiglu" or "relu2")
+    force_e_score_correction_bias: bool = False  # Force creation of e_score_correction_bias buffer
 
     def __post_init__(self):
         if isinstance(self.dtype, str):
@@ -726,13 +727,15 @@ class Gate(nn.Module):
         else:
             self.bias = None
 
-        # e_score_correction_bias must be created and be float32.
-        # HF models have trained bias values saved in checkpoints that affect routing.
-        # We must create the buffer to load these values, even if bias_update_factor=0.
-        # The bias_update_factor only controls whether we UPDATE the bias during training,
-        # not whether we create/load it from checkpoints.
-        # Small quantization errors in bf16 can cause completely different expert routing.
-        self.register_buffer("e_score_correction_bias", torch.zeros((self.n_experts), dtype=torch.float32))
+        # e_score_correction_bias is only created when bias_update_factor > 0 (for training)
+        # or when force_e_score_correction_bias is True (for loading HF checkpoints that have it).
+        # This flag is useful in cases where we want to load the bias but not update it.
+        # Must be float32 when created - small quantization errors in bf16 can cause
+        # completely different expert routing.
+        if self.bias_update_factor > 0 or config.force_e_score_correction_bias:
+            self.register_buffer("e_score_correction_bias", torch.zeros((self.n_experts), dtype=torch.float32))
+        else:
+            self.e_score_correction_bias = None
 
         self.e_score_correction_bias_master = None
 
@@ -788,12 +791,15 @@ class Gate(nn.Module):
             original_scores = scores
 
             # Add correction bias to balance tokens across gates.
-            # Bias is always present (loaded from checkpoint or initialized to zeros).
-            scores = scores + self.e_score_correction_bias
+            if self.e_score_correction_bias is not None:
+                scores = scores + self.e_score_correction_bias
 
             if self.n_groups > 1:
                 scores = scores.view(x.size(0), self.n_groups, -1)
-                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+                if self.e_score_correction_bias is None:
+                    group_scores = scores.amax(dim=-1)
+                else:
+                    group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
 
                 indices = group_scores.topk(self.topk_groups, dim=-1)[1]
                 mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
