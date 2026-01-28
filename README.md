@@ -20,6 +20,8 @@
 </div>
 
 ## 📣 News and Discussions
+- [12/18/2025][FunctionGemma](https://huggingface.co/google/functiongemma-270m-it) is out! Finetune it with [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/toolcalling.md)!
+- [12/15/2025][NVIDIA-Nemotron-3-Nano-30B-A3B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8) is out! Finetune it with [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel/discussions/976)!
 - [11/6/2025][Accelerating Large-Scale Mixture-of-Experts Training in PyTorch](https://developer.nvidia.com/blog/accelerating-large-scale-mixture-of-experts-training-in-pytorch/)
 - [10/6/2025][Enabling PyTorch Native Pipeline Parallelism for 🤗 Hugging Face Transformer Models](https://github.com/NVIDIA-NeMo/Automodel/discussions/589)
 - [9/22/2025][Fine-tune Hugging Face Models Instantly with Day-0 Support with NVIDIA NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel/discussions/477)
@@ -94,7 +96,7 @@ What you can expect:
 
 ## Feature Roadmap
 
-✅ _Available now_ | 🔜 _Coming in 25.11_
+✅ _Available now_ | 🔜 _Coming in 26.02_
 
 - ✅ **Advanced Parallelism** - PyTorch native FSDP2, TP, CP, and SP for distributed training.
 - ✅ **HSDP** - Multi-node Hybrid Sharding Data Parallelism based on FSDP2.
@@ -108,10 +110,16 @@ What you can expect:
 - ✅ **FP8 and mixed precision** - FP8 support with torchao, requires torch.compile-supported models.
 - ✅ **DCP** - Distributed Checkpoint support with SafeTensors output.
 - ✅ **VLM**: Support for finetuning VLMs (e.g., Qwen2-VL, Gemma-3-VL). More families to be included in the future.
+- ✅ **Extended MoE support** - GPT-OSS, Qwen3 (Coder-480B-A35B, etc), Qwen-next.
 
-
-- 🔜 **Extended MoE support** - GPT-OSS, Qwen3 (Coder-480B-A35B, etc), Qwen-next.
-- 🔜 **Kubernetes** - MUlti-node job launch with k8s.
+- 🔜 **Transformers v5 🤗** - Support for transformers v5 🤗 with device-mesh driven parallelism.
+- 🔜 **Muon & Dion** - Support for Muon and Dion optimizers.
+- 🔜 **SonicMoE** - Optimized MoE implementation for faster expert computation.
+- 🔜 **FP8 MoE** - FP8 precision training and inference for MoE models.
+- 🔜 **Cudagraph with MoE** - CUDA graph support for MoE layers to reduce kernel launch overhead.
+- 🔜 **Extended VLM Support** - DeepSeek OCR, Qwen3 VL 235B, Kimi-VL, GLM4.5V
+- 🔜 **Extended LLM Support** - QWENCoder 480B Instruct, MiniMax2.1, and more
+- 🔜 **Kubernetes** - Multi-node job launch with k8s.
 
 
 ## Getting Started

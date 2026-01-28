@@ -19,12 +19,12 @@ import torch
 import torch.nn as nn
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
+from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 logger = logging.getLogger(__name__)
@@ -153,7 +153,11 @@ class GptOssModel(nn.Module):
 
         # Compute cos/sin from RotaryEmbedding inv_freq and current position_ids; then concat [cos, sin]
         freqs_cis = position_ids_to_freqs_cis(
-            self.rotary_emb, position_ids, qkv_format=attn_kwargs.get("qkv_format", "bshd")
+            self.rotary_emb,
+            position_ids,
+            qkv_format=attn_kwargs.get("qkv_format", "bshd"),
+            for_fused_rope=self.backend.rope_fusion,
+            cp_size=attn_kwargs.get("cp_size", 1),
         )
 
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids

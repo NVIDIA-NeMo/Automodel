@@ -20,7 +20,7 @@ from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
 from nemo_automodel.components.models.gpt_oss.model import Block, GptOssForCausalLM, GptOssModel
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig
 
 @pytest.fixture
 def device():
@@ -92,6 +92,7 @@ def backend_config():
         enable_deepep=False,
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
+        rope_fusion=False,
     )
 
 

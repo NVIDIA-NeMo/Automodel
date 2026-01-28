@@ -18,12 +18,12 @@ import torch
 import torch.nn as nn
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
+from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention
 from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3MoeStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -156,7 +156,11 @@ class Qwen3MoeModel(nn.Module):
 
         # Compute freqs_cis from RotaryEmbedding inv_freq and current position_ids; then concat [cos, sin]
         freqs_cis = position_ids_to_freqs_cis(
-            self.rotary_emb, position_ids, qkv_format=attn_kwargs.get("qkv_format", "bshd")
+            self.rotary_emb,
+            position_ids,
+            qkv_format=attn_kwargs.get("qkv_format", "bshd"),
+            for_fused_rope=self.backend.rope_fusion,
+            cp_size=attn_kwargs.get("cp_size", 1),
         )
 
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids

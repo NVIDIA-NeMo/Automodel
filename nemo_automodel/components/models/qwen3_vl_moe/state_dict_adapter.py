@@ -16,12 +16,13 @@ import re
 from typing import Any, Optional
 
 import torch
+import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe import state_dict_utils
 from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig
 
 
 class Qwen3VLMoeStateDictAdapter(StateDictAdapter):
@@ -49,27 +50,74 @@ class Qwen3VLMoeStateDictAdapter(StateDictAdapter):
         quantization: bool = False,
         **kwargs,
     ) -> dict[str, Any]:
+        self._uses_model_prefix = any(key.startswith("model.") for key in state_dict.keys())
         prefix = "model." if self._uses_model_prefix else ""
         hf_state_dict: dict[str, Any] = {}
+        device_mesh: Optional["DeviceMesh"] = kwargs.get("device_mesh")
 
         for fqn, tensor in state_dict.items():
-            if ".mlp.experts.gate_and_up_projs" in fqn:
+            if ".mlp.experts.gate_and_up_projs" in fqn or ".mlp.experts.down_projs" in fqn:
                 layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
-                hf_state_dict[f"{prefix}language_model.layers.{layer_num}.mlp.experts.gate_up_proj"] = torch.empty(
-                    (self.moe_config.n_routed_experts, tensor.shape[1], tensor.shape[2]),
-                    dtype=self.dtype,
-                )
-                continue
+                which = "gate_up_proj" if "gate_and_up_projs" in fqn else "down_proj"
+                if device_mesh is not None:
+                    n_experts = self.moe_config.n_routed_experts
+                    # Aggregate this layer's expert tensor only for the current key, then free temps.
+                    global_tensor = torch.zeros(
+                        (n_experts, tensor.shape[1], tensor.shape[2]), dtype=self.dtype, device="cpu"
+                    )
 
-            if ".mlp.experts.down_projs" in fqn:
-                layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
-                hf_state_dict[f"{prefix}language_model.layers.{layer_num}.mlp.experts.down_proj"] = torch.empty(
-                    (self.moe_config.n_routed_experts, tensor.shape[1], tensor.shape[2]),
-                    dtype=self.dtype,
-                )
-                continue
+                    if state_dict_utils.is_dtensor(tensor):
+                        split_weights, expert_ids = state_dict_utils.split_experts_weights_dtensor_aware(
+                            tensor, n_experts
+                        )
+                    else:
+                        start_expert, end_expert = state_dict_utils.get_expert_range_for_rank_from_mesh(
+                            device_mesh, n_experts
+                        )
+                        split_weights = [tensor[i].to(self.dtype).cpu() for i in range(tensor.shape[0])]
+                        expert_ids = list(range(start_expert, end_expert))
 
-            hf_state_dict[fqn] = tensor
+                    # If distributed is initialized and we have an ep dimension, gather all slices.
+                    if dist.is_initialized() and "ep" in device_mesh.mesh_dim_names:
+                        try:
+                            ep_dim = device_mesh.mesh_dim_names.index("ep")
+                            ep_group = device_mesh.get_group(ep_dim)
+                        except Exception:
+                            ep_group = None
+
+                        if ep_group is not None:
+                            payload = (expert_ids, [w.cpu() for w in split_weights])
+                            gathered: list[tuple[list[int], list[torch.Tensor]]] = [None] * dist.get_world_size(
+                                ep_group
+                            )
+                            dist.all_gather_object(gathered, payload, group=ep_group)
+                            for ids, weights in gathered:
+                                for eid, w in zip(ids, weights):
+                                    global_tensor[eid].copy_(w.to(self.dtype).cpu())
+                        else:
+                            for weight, expert_id in zip(split_weights, expert_ids):
+                                global_tensor[expert_id].copy_(weight.to(self.dtype).cpu())
+                    else:
+                        for weight, expert_id in zip(split_weights, expert_ids):
+                            global_tensor[expert_id].copy_(weight.to(self.dtype).cpu())
+                    del split_weights
+                    del expert_ids
+
+                    key = f"{prefix}language_model.layers.{layer_num}.mlp.experts.{which}"
+                    hf_state_dict[key] = global_tensor
+                    del global_tensor
+                else:
+                    converted_tensors = self.convert_single_tensor_to_hf(
+                        fqn, tensor, exclude_key_regex=exclude_key_regex, quantization=quantization, **kwargs
+                    )
+                    for key, value in converted_tensors:
+                        hf_state_dict[key] = value
+            else:
+                converted_tensors = self.convert_single_tensor_to_hf(
+                    fqn, tensor, exclude_key_regex=exclude_key_regex, quantization=quantization, **kwargs
+                )
+                for key, value in converted_tensors:
+                    hf_state_dict[key] = value
 
         if exclude_key_regex:
             import re as _re
@@ -114,8 +162,6 @@ class Qwen3VLMoeStateDictAdapter(StateDictAdapter):
             if match:
                 _, layer_num, which = match.groups()
                 tensor = value
-                if state_dict_utils.is_dtensor(tensor):
-                    tensor = tensor.to_local()
                 local_tensor = tensor[start_expert:end_expert].to(self.dtype)
                 native_key = f"{model_prefix}language_model.layers.{layer_num}.mlp.experts."
                 native_key += "gate_and_up_projs" if which == "gate_up_proj" else "down_projs"
@@ -155,5 +201,4 @@ class Qwen3VLMoeStateDictAdapter(StateDictAdapter):
 
         if exclude_key_regex:
             result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
-
         return result

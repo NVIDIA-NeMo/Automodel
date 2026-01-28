@@ -173,7 +173,15 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
 
         model = self.model_parts[0]
-        sync_ctx = get_sync_ctx(model, idx == num_batches - 1) if is_train else nullcontext()
+        sync_ctx = (
+            get_sync_ctx(
+                model,
+                idx == num_batches - 1,
+                defer_fsdp_grad_sync=getattr(self.model_wrapper, "defer_fsdp_grad_sync", True),
+            )
+            if is_train
+            else nullcontext()
+        )
         with train_ctx(), sync_ctx:
             # No grad for teacher forward
             with (
@@ -413,9 +421,11 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         """
         if not self.dist_env.is_main:
             return
-        # log_data
-        if wandb.run is not None:
-            wandb.log(log_data.to_dict(), step=log_data.step)
+
+        # Log to remote services (WandB) according to step_scheduler frequency
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
+                wandb.log(log_data.to_dict(), step=log_data.step)
 
         logging.info(
             "step {} | epoch {} | "

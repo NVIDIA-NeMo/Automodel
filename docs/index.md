@@ -7,6 +7,7 @@
 :hidden:
 repository-structure.md
 guides/installation.md
+guides/configuration.md
 launcher/local-workstation.md
 launcher/cluster.md
 ```
@@ -30,10 +31,13 @@ Fine-tune Hugging Face Models Instantly with Day-0 Support with NVIDIA NeMo Auto
 :hidden:
 guides/overview.md
 guides/llm/finetune.md
-guides/llm/mcore-pretraining.md
+guides/llm/toolcalling.md
 guides/llm/pretraining.md
+guides/llm/nanogpt-pretraining.md
 guides/llm/sequence-classification.md
 guides/omni/gemma3-3n.md
+guides/quantization-aware-training.md
+guides/llm/databricks.md
 ```
 
 ```{toctree}
@@ -62,6 +66,7 @@ guides/gradient-checkpointing.md
 guides/pipelining.md
 guides/llm/knowledge-distillation.md
 guides/fp8-training.md
+guides/mlflow-logging.md
 
 apidocs/index.rst
 ```

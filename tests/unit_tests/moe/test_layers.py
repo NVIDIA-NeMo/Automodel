@@ -30,7 +30,7 @@ from nemo_automodel.components.moe.layers import (
     get_expert_activation_for_deepep,
     swiglu,
 )
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig
 
 
 @pytest.fixture
@@ -764,6 +764,345 @@ class TestGate:
         assert gate.gate_precision == torch.float32
 
 
+class TestGroupedExpertsZeroActiveExperts:
+    """Test GroupedExperts handling of zero active local experts.
+
+    When using expert parallelism, it's possible for no tokens to be routed
+    to the local experts on a particular rank. This test class verifies that
+    the GroupedExperts module correctly handles this edge case by:
+    1. Returning correct output shape (all zeros for the local contribution)
+    2. Maintaining gradient flow through expert parameters
+    """
+
+    @pytest.fixture
+    def initialized_experts(self, moe_config, device):
+        """Create GroupedExperts with properly initialized weights."""
+        experts = GroupedExperts(moe_config)
+        experts = experts.to(device)
+        # Initialize weights to avoid NaN issues
+        with torch.no_grad():
+            experts.gate_and_up_projs.normal_(0, 0.02)
+            experts.down_projs.normal_(0, 0.02)
+        return experts
+
+    @pytest.fixture
+    def initialized_experts_with_bias(self, moe_config, device):
+        """Create GroupedExperts with bias and properly initialized weights."""
+        moe_config.expert_bias = True
+        experts = GroupedExperts(moe_config)
+        experts = experts.to(device)
+        # Initialize weights to avoid NaN issues
+        with torch.no_grad():
+            experts.gate_and_up_projs.normal_(0, 0.02)
+            experts.down_projs.normal_(0, 0.02)
+            experts.gate_up_proj_bias.zero_()
+            experts.down_proj_bias.zero_()
+        return experts
+
+    def test_zero_active_experts_forward_shape(self, initialized_experts, moe_config, device):
+        """Test forward pass returns correct shape when no tokens select any expert."""
+        experts = initialized_experts
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, moe_config.n_activated_experts, dtype=torch.bfloat16, device=device)
+
+        # Set indices to an expert ID that doesn't exist (out of range)
+        # This simulates the case where all tokens select experts on other ranks
+        # In EP scenario, experts_start_idx to experts_end_idx defines local experts
+        # Setting indices outside this range means no local experts are selected
+        indices = torch.full(
+            (num_tokens, moe_config.n_activated_experts),
+            fill_value=moe_config.n_routed_experts + 100,  # Non-existent expert
+            dtype=torch.long,
+            device=device,
+        )
+
+        output = experts(x, token_mask, weights, indices)
+
+        assert output.shape == x.shape
+        assert output.device == device
+        # Check that output doesn't contain NaN
+        assert not torch.isnan(output).any(), "Output should not contain NaN values"
+
+    def test_zero_active_experts_backward_no_error(self, moe_config, device):
+        """Test backward pass completes without error when no tokens select any expert.
+
+        When combined with other model outputs (like residual connections), the backward
+        pass should complete without errors even when no local experts are active.
+        """
+        # Use float32 dtype for gradient computation
+        moe_config.dtype = torch.float32
+        experts = GroupedExperts(moe_config)
+        experts = experts.to(device)
+        # Initialize weights
+        with torch.no_grad():
+            experts.gate_and_up_projs.normal_(0, 0.02)
+            experts.down_projs.normal_(0, 0.02)
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.float32, device=device, requires_grad=True)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, moe_config.n_activated_experts, dtype=torch.float32, device=device)
+
+        # Set indices to non-existent expert (simulates all tokens routed elsewhere)
+        indices = torch.full(
+            (num_tokens, moe_config.n_activated_experts),
+            fill_value=moe_config.n_routed_experts + 100,
+            dtype=torch.long,
+            device=device,
+        )
+
+        output = experts(x, token_mask, weights, indices)
+
+        # Verify forward pass produces correct output
+        assert output.shape == x.shape
+        assert not torch.isnan(output).any(), "Output should not contain NaN values"
+
+        # Simulate real training: MoE output combined with other model components
+        # (e.g., residual connection). This ensures backward can run without error.
+        residual = x.mean(dim=-1, keepdim=True).expand_as(x)
+        combined = output + residual
+        loss = combined.sum()
+        loss.backward()
+
+        # Input should have gradients from the residual path
+        assert x.grad is not None, "Input should have gradients from residual path"
+
+    def test_zero_active_experts_with_bias_backward_no_error(self, moe_config, device):
+        """Test backward pass completes without error with bias when no tokens select any expert.
+
+        When combined with other model outputs (like residual connections), the backward
+        pass should complete without errors even when no local experts are active.
+        """
+        # Use float32 dtype for gradient computation
+        moe_config.dtype = torch.float32
+        moe_config.expert_bias = True
+        experts = GroupedExperts(moe_config)
+        experts = experts.to(device)
+        # Initialize weights and biases
+        with torch.no_grad():
+            experts.gate_and_up_projs.normal_(0, 0.02)
+            experts.down_projs.normal_(0, 0.02)
+            experts.gate_up_proj_bias.zero_()
+            experts.down_proj_bias.zero_()
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.float32, device=device, requires_grad=True)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, moe_config.n_activated_experts, dtype=torch.float32, device=device)
+
+        # Set indices to non-existent expert
+        indices = torch.full(
+            (num_tokens, moe_config.n_activated_experts),
+            fill_value=moe_config.n_routed_experts + 100,
+            dtype=torch.long,
+            device=device,
+        )
+
+        output = experts(x, token_mask, weights, indices)
+
+        # Verify forward pass produces correct output
+        assert output.shape == x.shape
+        assert not torch.isnan(output).any(), "Output should not contain NaN values"
+
+        # Simulate real training: MoE output combined with other model components
+        residual = x.mean(dim=-1, keepdim=True).expand_as(x)
+        combined = output + residual
+        loss = combined.sum()
+        loss.backward()
+
+        # Input should have gradients from the residual path
+        assert x.grad is not None, "Input should have gradients from residual path"
+
+    def test_zero_active_experts_partial_token_mask(self, initialized_experts, moe_config, device):
+        """Test zero active experts case with partial token mask (some masked tokens)."""
+        experts = initialized_experts
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        # Mask half the tokens
+        token_mask = torch.zeros(num_tokens, dtype=torch.bool, device=device)
+        token_mask[: num_tokens // 2] = True
+        weights = torch.rand(num_tokens, moe_config.n_activated_experts, dtype=torch.bfloat16, device=device)
+
+        # Non-existent expert indices
+        indices = torch.full(
+            (num_tokens, moe_config.n_activated_experts),
+            fill_value=moe_config.n_routed_experts + 100,
+            dtype=torch.long,
+            device=device,
+        )
+
+        output = experts(x, token_mask, weights, indices)
+
+        assert output.shape == x.shape
+        # Check that output doesn't contain NaN
+        assert not torch.isnan(output).any(), "Output should not contain NaN values"
+
+    def test_zero_active_experts_quick_geglu_activation(self, moe_config, device):
+        """Test zero active experts case with quick_geglu activation function."""
+        # Use float32 dtype for gradient computation
+        moe_config.dtype = torch.float32
+        moe_config.expert_activation = "quick_geglu"
+        experts = GroupedExperts(moe_config)
+        experts = experts.to(device)
+        # Initialize weights
+        with torch.no_grad():
+            experts.gate_and_up_projs.normal_(0, 0.02)
+            experts.down_projs.normal_(0, 0.02)
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.float32, device=device, requires_grad=True)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, moe_config.n_activated_experts, dtype=torch.float32, device=device)
+
+        indices = torch.full(
+            (num_tokens, moe_config.n_activated_experts),
+            fill_value=moe_config.n_routed_experts + 100,
+            dtype=torch.long,
+            device=device,
+        )
+
+        output = experts(x, token_mask, weights, indices)
+
+        # Verify forward pass produces correct output
+        assert output.shape == x.shape
+        assert not torch.isnan(output).any(), "Output should not contain NaN values"
+
+        # Simulate real training: MoE output combined with other model components
+        residual = x.mean(dim=-1, keepdim=True).expand_as(x)
+        combined = output + residual
+        loss = combined.sum()
+        loss.backward()
+
+        # Input should have gradients from the residual path
+        assert x.grad is not None, "Input should have gradients from residual path"
+
+    def test_mixed_active_and_inactive_experts(self, initialized_experts, moe_config, device):
+        """Test when some tokens select local experts and others don't."""
+        experts = initialized_experts
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, moe_config.n_activated_experts, dtype=torch.bfloat16, device=device)
+
+        # Half tokens go to valid experts, half to non-existent
+        indices = torch.zeros((num_tokens, moe_config.n_activated_experts), dtype=torch.long, device=device)
+        indices[: num_tokens // 2] = torch.randint(
+            0, moe_config.n_routed_experts, (num_tokens // 2, moe_config.n_activated_experts), device=device
+        )
+        indices[num_tokens // 2 :] = moe_config.n_routed_experts + 100  # Non-existent
+
+        output = experts(x, token_mask, weights, indices)
+
+        assert output.shape == x.shape
+        # Check that output doesn't contain NaN
+        assert not torch.isnan(output).any(), "Output should not contain NaN values"
+
+    def test_zero_active_experts_output_is_minimal(self, initialized_experts, moe_config, device):
+        """Test that output contribution from zero-active-experts path is minimal.
+
+        When no tokens select any expert, the dummy computation should contribute
+        minimally to the output (the contribution is multiplied by weights which
+        could be small, and uses zeros as input).
+        """
+        experts = initialized_experts
+
+        num_tokens = 8
+        # Use bfloat16 to match the initialized_experts dtype
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        # Use small weights to ensure minimal contribution
+        weights = torch.full(
+            (num_tokens, moe_config.n_activated_experts), 0.01, dtype=torch.bfloat16, device=device
+        )
+
+        # Non-existent expert indices
+        indices = torch.full(
+            (num_tokens, moe_config.n_activated_experts),
+            fill_value=moe_config.n_routed_experts + 100,
+            dtype=torch.long,
+            device=device,
+        )
+
+        output = experts(x, token_mask, weights, indices)
+
+        # The output should be very small since we're using zeros as input
+        # and multiplying by small weights
+        assert output.abs().max() < 1.0, "Output magnitude should be small for zero active experts"
+
+    def test_zero_active_experts_grad_norm_no_hang(self, moe_config, device):
+        """Test that computing gradient norm doesn't hang when no tokens select any expert.
+
+        This test verifies that torch.nn.utils.clip_grad_norm_ completes without hanging,
+        which is important for distributed training where all ranks must participate in
+        gradient synchronization.
+        """
+        # Use float32 dtype for gradient computation
+        moe_config.dtype = torch.float32
+        experts = GroupedExperts(moe_config)
+        experts = experts.to(device)
+        # Initialize weights
+        with torch.no_grad():
+            experts.gate_and_up_projs.normal_(0, 0.02)
+            experts.down_projs.normal_(0, 0.02)
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.float32, device=device, requires_grad=True)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, moe_config.n_activated_experts, dtype=torch.float32, device=device)
+
+        # Set indices to non-existent expert (simulates all tokens routed elsewhere)
+        indices = torch.full(
+            (num_tokens, moe_config.n_activated_experts),
+            fill_value=moe_config.n_routed_experts + 100,
+            dtype=torch.long,
+            device=device,
+        )
+
+        output = experts(x, token_mask, weights, indices)
+
+        # Simulate real training: MoE output combined with residual connection
+        residual = x.mean(dim=-1, keepdim=True).expand_as(x)
+        combined = output + residual
+        loss = combined.sum()
+        loss.backward()
+
+        # This is the critical test: clip_grad_norm_ should complete without hanging
+        # In distributed training, if gradients don't exist, this could cause a hang
+        grad_norm = torch.nn.utils.clip_grad_norm_(experts.parameters(), max_norm=1.0)
+
+        # Verify grad_norm is a valid finite number (not NaN or Inf)
+        assert torch.isfinite(grad_norm), f"Gradient norm should be finite, got {grad_norm}"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_zero_active_experts_has_expert_gradients(self, moe_config, device):
+        """Test that expert parameters have gradients when no tokens select any expert.
+
+        Note: This test runs in a subprocess to avoid caching issues
+        when run alongside other tests. The test code is in run_zero_active_experts_gradient_test.py.
+        """
+        import subprocess
+        import sys
+
+        # Run test as a module to avoid path resolution issues with torch.compile caching
+        result = subprocess.run(
+            [sys.executable, "-m", "tests.unit_tests.moe.run_zero_active_experts_gradient_test", str(device)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, (
+            f"Subprocess test failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        assert "SUCCESS" in result.stdout, (
+            f"Test did not complete successfully:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+
+
 class TestGroupedExperts:
     """Test GroupedExperts module."""
 
@@ -919,10 +1258,20 @@ class TestMoE:
         assert isinstance(moe.gate, FakeBalancedGate)
         assert isinstance(moe.experts, GroupedExperts)
 
-    def test_moe_init_with_deepep(self, moe_config, backend_config):
-        """Test MoE initialization with DeepEP."""
+    def test_moe_init_with_deepep_single_device(self, moe_config, backend_config):
+        """DeepEP enabled but world size == 1 should fall back to GroupedExperts."""
         backend_config.enable_deepep = True
-        moe = MoE(moe_config, backend_config)
+        with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=1):
+            moe = MoE(moe_config, backend_config)
+
+        assert isinstance(moe.gate, Gate)
+        assert isinstance(moe.experts, GroupedExperts)
+
+    def test_moe_init_with_deepep_multi_device(self, moe_config, backend_config):
+        """DeepEP enabled and world size > 1 should use GroupedExpertsDeepEP."""
+        backend_config.enable_deepep = True
+        with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=2):
+            moe = MoE(moe_config, backend_config)
 
         assert isinstance(moe.gate, Gate)
         assert isinstance(moe.experts, GroupedExpertsDeepEP)

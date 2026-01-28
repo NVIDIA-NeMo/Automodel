@@ -24,7 +24,37 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 
+from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
+
 _PREFIX = "model."
+
+
+def _is_quantized_param(param: torch.Tensor) -> bool:
+    """Check if a parameter is a BitsAndBytes quantized type.
+
+    Detects quantization by checking for `quant_state` attribute which is
+    common across BitsAndBytes quantized parameter types (Params4bit, Int8Params, etc.).
+    """
+    return getattr(param, "quant_state", None) is not None
+
+
+def _has_quantized_params(model: torch.nn.Module) -> bool:
+    """Check if model has any BitsAndBytes quantized parameters."""
+    return any(map(_is_quantized_param, model.parameters()))
+
+
+def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
+    """Extract only trainable PEFT adapter weights, bypassing DCP for quantized models.
+
+    This function directly iterates over model parameters to collect trainable weights,
+    avoiding PyTorch DCP's state_dict traversal which fails on BitsAndBytes quantized
+    parameters (Params4bit, Int8Params, etc.).
+    """
+    state_dict = {}
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            state_dict[name] = param.detach().cpu()
+    return state_dict
 
 
 def _drop_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX) -> None:
@@ -92,16 +122,7 @@ class ModelState:
                 - ["score."] for some classification heads
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
-        self.is_tied_lm_head = getattr(getattr(self.model[0], "config", {}), "tie_word_embeddings", False)
-
-        non_tied_lm_head_models = {
-            "Qwen3OmniMoeThinkerForConditionalGeneration",  # complicated config structure
-            "InternVLForConditionalGeneration",  # even tho config says tie_word_embeddings=True, it's not
-        }
-        for m in non_tied_lm_head_models:
-            if m in type(self.model[0]).__name__:
-                self.is_tied_lm_head = False
-                break
+        self.is_tied_lm_head = is_tied_word_embeddings(self.model[0])
 
         if self.is_tied_lm_head:
             _, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
@@ -120,18 +141,25 @@ class ModelState:
         if self.is_init_step:
             return self._get_base_model_state_dict()
 
-        options = None
-        if self.is_peft:
-            options = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=True)
+        # For PEFT models with quantized parameters (e.g., QLoRA with BitsAndBytes),
+        # bypass PyTorch DCP's get_model_state_dict() which fails when traversing
+        # quantized parameter types like Params4bit. Instead, directly collect
+        # trainable PEFT adapter weights.
+        if self.is_peft and _has_quantized_params(self.model[0]):
+            model_state_dict = {k: v for sd in map(_get_peft_state_dict, self.model) for k, v in sd.items()}
+        else:
+            options = None
+            if self.is_peft:
+                options = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=True)
 
-        func = partial(get_model_state_dict, options=options)
-        model_state_dict = {k: v for sd in map(func, self.model) for k, v in sd.items()}
+            func = partial(get_model_state_dict, options=options)
+            model_state_dict = {k: v for sd in map(func, self.model) for k, v in sd.items()}
 
         if self.is_tied_lm_head:
             # PP models don't have tied embeddings. Safe to pass in model[0] here.
             model_state_dict.pop(self.lm_head_param_name, None)
 
-        if self.is_peft:
+        if self.is_peft and not _has_quantized_params(self.model[0]):
             # HF PEFT models are saved with a "base.model." prefix. This is so they can be loaded
             # correctly with the HF PEFT API.
             _add_outer_prefix(model_state_dict, "base_model.model.")

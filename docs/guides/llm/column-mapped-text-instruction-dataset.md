@@ -59,14 +59,14 @@ This section provides practical usage examples, including how to load remote dat
 ### Local JSONL Example
 
 Assume you have a local newline-delimited JSON file at `/data/my_corpus.jsonl`
-with the simple schema `{instruction, output}`.  A few sample rows:
+with the simple schema `{instruction, output}`. A few sample rows:
 
 ```json
 {"instruction": "Translate 'Hello' to French", "output": "Bonjour"}
 {"instruction": "Summarize the planet Neptune.", "output": "Neptune is the eighth planet from the Sun."}
 ```
 
-You can load it using python code like:
+You can load it using Python code like:
 
 ```python
 local_ds = ColumnMappedTextInstructionDataset(
@@ -83,7 +83,7 @@ print(remote_ds[0].keys())  # {'context', 'question', 'answer'}
 print(local_ds[0].keys())   # {'question', 'answer'}
 ```
 
-You can configure the dataset entirely from your recipe YAML.  For example:
+You can configure the dataset entirely from your recipe YAML. For example:
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
@@ -171,7 +171,7 @@ dataset:
 | `start_of_turn_token`   | `None`  | String token marking the assistant's response. Required when `answer_only_loss_mask=True` for tokenizers with chat template. |
 
 ---
-## Tokenisation Paths
+## Tokenization Paths
 This section explains how the dataset tokenizes both inputs and outputs, and how it adapts to different tokenizers.
 `ColumnMappedTextInstructionDataset` automatically picks one of two tokenization
 strategies depending on the capabilities of the provided tokenizer:
@@ -214,7 +214,7 @@ Regardless of the path, the output dict is always:
 ## Parameter Requirements
 
 The following section lists important requirements and caveats for correct usage.
-* `answer_only_loss_mask=True` requires a start_of_turn_token string that exists in the tokenizer's vocabulary and can be successfully encoded when the helper performs a lookup. Otherwise, a `ValueError` is raised at instantiation time.
+* `answer_only_loss_mask=True` requires a `start_of_turn_token` string that exists in the tokenizer's vocabulary and can be successfully encoded when the helper performs a lookup. Otherwise, a `ValueError` is raised at instantiation time.
 * Each sample must include at least one of `context` or `question`; omitting both will result in a `ValueError`.
 
 ---
@@ -252,14 +252,14 @@ slurm:
   time: 00:30:00
   account: your_account
   partition: gpu
-  container_image: nvcr.io/nvidia/nemo:25.07
+  container_image: nvcr.io/nvidia/nemo-automodel:25.11.00
   gpus_per_node: 8
 ```
 
 ### Multi-Node Slurm Configuration
 
-:::note
-**Note for Multi-Node Training**: When using Hugging Face datasets in multi-node setups, you need shared storage accessible by all nodes. Set the `HF_DATASETS_CACHE` environment variable to point to a shared directory (e.g., `HF_DATASETS_CACHE=/shared/hf_cache`) in the yaml file as shown, to ensure all nodes can access the cached datasets.
+:::{note}
+**Multi-Node Training**: When using Hugging Face datasets in multi-node setups, you need shared storage accessible by all nodes. Set the `HF_DATASETS_CACHE` environment variable to point to a shared directory (e.g., `HF_DATASETS_CACHE=/shared/hf_cache`) in the yaml file as shown, to ensure all nodes can access the cached datasets.
 :::
 
 When using multiple nodes with Hugging Face datasets:
@@ -276,7 +276,7 @@ slurm:
   time: 02:00:00 # Maximum job runtime (format: `HH:MM:SS`)
   account: your_account # Slurm account to charge resources to
   partition: gpu # Slurm partition to submit to
-  container_image: nvcr.io/nvidia/nemo:25.07 # Container image to use for the job
+  container_image: nvcr.io/nvidia/nemo-automodel:25.11.00 # Container image to use for the job
   gpus_per_node: 8 # Number of GPUs per node (adds `#SBATCH --gpus-per-node=N`)
   # Optional: Add extra mount points if needed
   extra_mounts: # Additional mount points for the container

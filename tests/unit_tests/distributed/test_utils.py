@@ -117,7 +117,7 @@ def test_get_sync_ctx(monkeypatch, patch_dist):
     class Plain(torch.nn.Linear):
         pass
 
-    ctx = du.get_sync_ctx(Plain(2, 2), is_optim_step=False)
+    ctx = du.get_sync_ctx(Plain(2, 2), is_optim_step=False, defer_fsdp_grad_sync=False)
     # entering/exiting the context must be a no-op
     with ctx:
         pass

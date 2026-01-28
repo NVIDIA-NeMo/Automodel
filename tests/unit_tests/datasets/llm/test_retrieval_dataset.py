@@ -31,8 +31,18 @@ class DummyImage:
 
 
 class DummyCorpus(rd.AbstractDataset):
-    def __init__(self, id_to_doc: Dict[str, Dict[str, Any]]):
+    def __init__(self, id_to_doc: Dict[str, Dict[str, Any]], query_instruction: str = "", passage_instruction: str = ""):
         self._id_to_doc = id_to_doc
+        self._query_instruction = query_instruction
+        self._passage_instruction = passage_instruction
+
+    @property
+    def query_instruction(self):
+        return self._query_instruction
+
+    @property
+    def passage_instruction(self):
+        return self._passage_instruction
 
     def get_document_by_id(self, id):
         return self._id_to_doc[str(id)]
@@ -157,7 +167,7 @@ def test_load_datasets_normalizes_and_errors(tmp_path, monkeypatch):
         rd.load_datasets(str(f_bad))
 
 
-def test_transform_func_single_batched_and_limits():
+def test_transform_func_single_batched():
     corpus_dict = {
         "corpusA": DummyCorpus(
             {
@@ -189,10 +199,6 @@ def test_transform_func_single_batched_and_limits():
     out_single = rd._transform_func(examples_single, num_neg_docs=1, corpus_dict=corpus_dict)
     assert out_single["question"] == "Q"
     assert out_single["doc_text"] == ["pos", "neg1"]
-
-    # Limit error
-    with pytest.raises(Exception):
-        rd._transform_func(examples_batched, num_neg_docs=3, corpus_dict=corpus_dict)
 
 
 def test_transform_func_image_conversion():
@@ -255,14 +261,14 @@ def test_make_retrieval_dataset_train_and_eval(tmp_path, monkeypatch):
     ds_eval = rd.make_retrieval_dataset(data_dir_list=str(train_file), data_type="eval", eval_negative_size=2)
     ex_e = ds_eval[0]
     assert len(ex_e["doc_text"]) == 3
- 
- 
+
+
 def test_abstract_dataset_methods_cover_pass():
      # Directly call abstract methods as unbound functions to execute 'pass' lines
      assert rd.AbstractDataset.get_document_by_id(None, None) is None
      assert rd.AbstractDataset.get_all_ids(None) is None
- 
- 
+
+
 def test_textqa_get_all_ids(tmp_path, monkeypatch):
      corpus_dir = tmp_path / "corpusB"
      corpus_dir.mkdir()
@@ -279,27 +285,27 @@ def test_textqa_get_all_ids(tmp_path, monkeypatch):
      )
      _, corpus = rd.load_corpus(str(corpus_dir))
      assert corpus.get_all_ids() == ["1", "2"]
- 
- 
+
+
 def test_load_corpus_metadata_missing_file(tmp_path):
      empty_dir = tmp_path / "empty_corpus"
      empty_dir.mkdir()
      with pytest.raises(ValueError) as e:
          rd.load_corpus_metadata(str(empty_dir))
      assert "merlin_metadata.json" in str(e.value)
- 
- 
+
+
 def test_load_corpus_invalid_class():
      with pytest.raises(ValueError) as e:
          rd.load_corpus("/unused", metadata={"class": "UnknownDataset", "corpus_id": "x"})
      assert "DatasetClass is not implemented" in str(e.value)
- 
- 
+
+
 def test_add_corpus_requires_dict(tmp_path):
      with pytest.raises(ValueError):
          rd.add_corpus({"path": str(tmp_path)}, None)
- 
- 
+
+
 def test_load_datasets_type_coercion_and_concatenate_false(tmp_path, monkeypatch):
      corpus_dir = tmp_path / "corpusC"
      corpus_dir.mkdir()
@@ -335,8 +341,8 @@ def test_load_datasets_type_coercion_and_concatenate_false(tmp_path, monkeypatch
      assert row["pos_doc"][0]["id"] == "101"
      assert [d["id"] for d in row["neg_doc"]] == ["202", "x"]
      assert "C" in corpus_dict
- 
- 
+
+
 def test_transform_func_positive_else_and_text_empty_branch():
      # Covers line 198 (positives not list) and 228 (text empty and no image)
      corpus = DummyCorpus({"p": {"text": "", "image": "", "nr_ocr": ""}, "n": {"text": "n", "image": "", "nr_ocr": ""}})
@@ -346,8 +352,8 @@ def test_transform_func_positive_else_and_text_empty_branch():
      out = rd._transform_func(examples_single, num_neg_docs=1, corpus_dict=corpus_dict)
      # Positive text becomes "" (line 228), negative is "n"
      assert out["doc_text"] == ["", "n"]
- 
- 
+
+
 def test_make_retrieval_dataset_shuffle_branch(tmp_path, monkeypatch):
     corpus_dir = tmp_path / "corpusD"
     corpus_dir.mkdir()
@@ -369,8 +375,8 @@ def test_make_retrieval_dataset_shuffle_branch(tmp_path, monkeypatch):
     )
     ex0 = ds[0]
     assert len(ex0["doc_text"]) == 2
- 
- 
+
+
 def test_make_retrieval_dataset_invalid_type(tmp_path, monkeypatch):
     corpus_dir = tmp_path / "corpusE"
     corpus_dir.mkdir()
@@ -386,6 +392,7 @@ def test_make_retrieval_dataset_invalid_type(tmp_path, monkeypatch):
 
 
 def test_transform_func_epoch_cycling():
+    """Test epoch-based cycling through multiple positive documents."""
     corpus_dict = {
         "corpusA": DummyCorpus(
             {
@@ -396,7 +403,7 @@ def test_transform_func_epoch_cycling():
             }
         )
     }
-    
+
     # Example with multiple positive docs
     examples = {
         "question": ["Q"],
@@ -425,8 +432,20 @@ def test_transform_func_epoch_cycling():
     out_3 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict)
     assert out_3["doc_text"][0][0] == "pos1"
 
-    # Test update_dataset_epoch helper
-    # Create a dummy dataset with metadata
+
+def test_retrieval_transform_set_epoch():
+    """Test the RetrievalTransform stateful class and set_epoch method."""
+    corpus_dict = {
+        "corpusA": DummyCorpus(
+            {
+                "p1": {"text": "pos1", "image": "", "nr_ocr": ""},
+                "p2": {"text": "pos2", "image": "", "nr_ocr": ""},
+                "n1": {"text": "neg1", "image": "", "nr_ocr": ""},
+            }
+        )
+    }
+
+    # Create a dataset with multiple positive docs
     dataset = Dataset.from_list([
         {
             "question_id": "q1",
@@ -436,17 +455,117 @@ def test_transform_func_epoch_cycling():
             "neg_doc": [{"id": "n1"}]
         }
     ])
-    dataset.corpus_dict = corpus_dict
-    dataset.num_neg_docs = 1
-    
+
+    # Use the RetrievalTransform class
+    transform = rd.RetrievalTransform(num_neg_docs=1, corpus_dict=corpus_dict)
+    dataset.set_transform(transform)
+    dataset.set_epoch = transform.set_epoch
+
     # Initial transform (epoch 0 default)
-    rd.update_dataset_epoch(dataset, epoch=0)
-    # Verify transform is set (we can't easily inspect the closure, but we can run it)
-    # The dataset transform is applied when accessing items
     item_0 = dataset[0]
     assert item_0["doc_text"][0] == "pos1"
-    
-    # Update to epoch 1
-    rd.update_dataset_epoch(dataset, epoch=1)
+
+    # Update to epoch 1 using the exposed set_epoch method
+    dataset.set_epoch(1)
     item_1 = dataset[0]
     assert item_1["doc_text"][0] == "pos2"
+
+    # Cycle back to epoch 0
+    dataset.set_epoch(0)
+    item_back = dataset[0]
+    assert item_back["doc_text"][0] == "pos1"
+
+
+def test_use_dataset_instruction_from_metadata(tmp_path, monkeypatch):
+    """Test that use_dataset_instruction correctly loads and applies instructions from metadata."""
+    corpus_dir = tmp_path / "squad_corpus"
+    corpus_dir.mkdir()
+
+    # Create metadata with query and passage instructions as in merlin_metadata.json
+    metadata = {
+        "corpus_id": "squad",
+        "class": "TextQADataset",
+        "query_instruction": "Instruct: Given a question, retrieve Wikipedia passages that answer the question\nQuery:",
+        "passage_instruction": "",
+        "task_type": "Retrieval",
+    }
+    (corpus_dir / "merlin_metadata.json").write_text(json.dumps(metadata))
+
+    # Mock HF dataset
+    monkeypatch.setattr(
+        rd,
+        "load_dataset",
+        _mock_hf_load_dataset_returning(
+            [
+                {"id": "doc1", "text": "Paris is the capital of France"},
+                {"id": "doc2", "text": "London is the capital of England"},
+            ]
+        ),
+    )
+
+    # Use add_corpus to properly create CorpusInfo object
+    corpus_dict = {}
+    rd.add_corpus({"path": str(corpus_dir)}, corpus_dict)
+
+    # Verify metadata properties are accessible through CorpusInfo
+    assert "squad" in corpus_dict
+    corpus_info = corpus_dict["squad"]
+    assert corpus_info.corpus_id == "squad"
+    assert corpus_info.query_instruction == metadata["query_instruction"]
+    assert corpus_info.passage_instruction == metadata["passage_instruction"]
+    assert corpus_info.task_type == metadata["task_type"]
+
+
+def test_transform_func_with_use_dataset_instruction():
+    """Test that _transform_func includes query and passage instructions when use_dataset_instruction=True."""
+
+    query_instruction = "Instruct: Given a question, retrieve Wikipedia passages that answer the question\nQuery:"
+    passage_instruction = ""
+
+    corpus_dict = {
+        "squad": DummyCorpus(
+            {
+                "p1": {"text": "positive doc", "image": "", "nr_ocr": ""},
+                "n1": {"text": "negative doc", "image": "", "nr_ocr": ""},
+            },
+            query_instruction=query_instruction,
+            passage_instruction=passage_instruction,
+        )
+    }
+
+    # Test with use_dataset_instruction=True
+    examples_with_instruction = {
+        "question": ["What is the capital?"],
+        "corpus_id": ["squad"],
+        "pos_doc": [[{"id": "p1"}]],
+        "neg_doc": [[{"id": "n1"}]],
+    }
+
+    out_with_instruction = rd._transform_func(
+        examples_with_instruction,
+        num_neg_docs=1,
+        corpus_dict=corpus_dict,
+        use_dataset_instruction=True,
+    )
+
+    # Verify that query_instruction and passage_instruction fields are populated
+    assert "query_instruction" in out_with_instruction
+    assert "passage_instruction" in out_with_instruction
+    assert out_with_instruction["query_instruction"][0] == query_instruction
+    assert out_with_instruction["passage_instruction"][0] == passage_instruction
+
+    # Test with use_dataset_instruction=False
+    out_without_instruction = rd._transform_func(
+        examples_with_instruction,
+        num_neg_docs=1,
+        corpus_dict=corpus_dict,
+        use_dataset_instruction=False,
+    )
+
+    # Verify that instruction fields are empty strings when disabled
+    assert out_without_instruction["query_instruction"][0] == ""
+    assert out_without_instruction["passage_instruction"][0] == ""
+
+    # Both should have same question and doc_text content
+    assert out_with_instruction["question"] == out_without_instruction["question"]
+    assert out_with_instruction["doc_text"] == out_without_instruction["doc_text"]

@@ -21,7 +21,7 @@ Example (YAML):
 
 ```yaml
 model:
-  _target_: nemo_automodel.components.models.llama.build_llama_model
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
 ```
 """
@@ -29,11 +29,10 @@ model:
 from __future__ import annotations
 
 import os
-from typing import Any, Callable, Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import LlamaConfig
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask
@@ -41,26 +40,22 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 
-# Import HuggingFace's Llama components directly to ensure exact same behavior
-from transformers.models.llama.modeling_llama import (
-    LlamaRMSNorm,
-    LlamaRotaryEmbedding,
-    apply_rotary_pos_emb,
-    eager_attention_forward,
-)
+# Import HuggingFace's Llama components for attention
+from transformers.models.llama.modeling_llama import eager_attention_forward
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
-from transformers.utils.generic import check_model_inputs
 
-from nemo_automodel.components.models.common.combined_projection import (
+from nemo_automodel.components.models.common import (
+    BackendConfig,
     CombinedGateUpMLP,
     CombinedQKVAttentionMixin,
+    initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.llama.rope_utils import LlamaRotaryEmbedding, apply_rotary_pos_emb
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
-from nemo_automodel.components.moe.utils import BackendConfig
-from nemo_automodel.shared.utils import dtype_from_str
+from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 
-__all__ = ["build_llama_model", "LlamaForCausalLM"]
+check_model_inputs = get_check_model_inputs_decorator()
 
 
 class LlamaAttention(CombinedQKVAttentionMixin, nn.Module):
@@ -179,6 +174,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         self,
         config: LlamaConfig,
         layer_idx: int,
+        backend: BackendConfig,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -191,8 +187,12 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         # ALWAYS use combined gate_up MLP for efficiency
         self.mlp = CombinedGateUpMLP(config=config)
 
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
+        self.post_attention_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
 
     def forward(
         self,
@@ -257,6 +257,7 @@ class LlamaModel(LlamaPreTrainedModel):
     def __init__(
         self,
         config: LlamaConfig,
+        backend: BackendConfig,
     ):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -268,18 +269,21 @@ class LlamaModel(LlamaPreTrainedModel):
                 LlamaDecoderLayer(
                     config=config,
                     layer_idx=layer_idx,
+                    backend=backend,
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs()
+    @check_model_inputs
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -288,9 +292,19 @@ class LlamaModel(LlamaPreTrainedModel):
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+
         # Validate inputs
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -327,8 +341,12 @@ class LlamaModel(LlamaPreTrainedModel):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
+        all_hidden_states = () if output_hidden_states else None
+
         # Decoder layers (slice to support partial layer execution like in HF)
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -342,9 +360,25 @@ class LlamaModel(LlamaPreTrainedModel):
 
         hidden_states = self.norm(hidden_states)
 
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        if not return_dict:
+            return tuple(
+                v
+                for v in [
+                    hidden_states,
+                    past_key_values if use_cache else None,
+                    all_hidden_states,
+                ]
+                if v is not None
+            )
+
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=past_key_values,
+            past_key_values=past_key_values if use_cache else None,
+            hidden_states=all_hidden_states,
+            attentions=None,
         )
 
 
@@ -355,6 +389,15 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
+    @classmethod
+    def from_config(
+        cls,
+        config: LlamaConfig,
+        backend: Optional[BackendConfig] = None,
+        **kwargs,
+    ):
+        return cls(config, backend, **kwargs)
+
     def __init__(
         self,
         config: LlamaConfig,
@@ -363,16 +406,23 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         super().__init__(config)
         self.config = config
         self.backend = backend or BackendConfig()
-        self.model = LlamaModel(config=config)
+        self.model = LlamaModel(config=config, backend=self.backend)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        # Create state_dict_adapter if enabled
-        if self.backend.enable_hf_state_dict_adapter:
-            self.state_dict_adapter = LlamaStateDictAdapter(config=self.config)
-
+        # Create state_dict_adapter
+        self.state_dict_adapter = LlamaStateDictAdapter(config=self.config)
         # Initialize weights and apply final processing
         self.post_init()
+
+        # Convert to configured dtype if specified
+        if hasattr(config, "torch_dtype") and config.torch_dtype is not None:
+            self.to(dtype=config.torch_dtype)
+
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            print(f"[LlamaForCausalLM] Attention implementation: {self.config._attn_implementation}")
+            print("[LlamaForCausalLM] Custom implementation with COMBINED QKV and gate_up projections")
+            print(f"[LlamaForCausalLM] torch_dtype: {self.config.torch_dtype}")
 
     def save_pretrained_hf_format(self, save_directory: str, **kwargs):
         """Save model in HuggingFace-compatible format by converting combined projections.
@@ -439,6 +489,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[TransformersKwargs],
@@ -460,6 +513,13 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         Returns:
             CausalLMOutputWithPast with loss, logits, past_key_values
         """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # Always use return_dict internally so we can reliably access fields.
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -467,6 +527,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
             cache_position=cache_position,
             **kwargs,
         )
@@ -474,104 +537,27 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         hidden_states = outputs.last_hidden_state
 
         # Only compute necessary logits (optimization for training and generation)
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        # DTensor compatibility with pytorch 2.9.0: when logits_to_keep=0, slice(0, None, None) would select all
+        # elements but DTensor cannot handle sliced DTensor. Skip slicing when logits_to_keep=0.
+        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            logits = self.lm_head(hidden_states)
+        else:
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        return CausalLMOutputWithPast(
+        out = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
         )
+        if return_dict:
+            return out
+        return out.to_tuple()
 
 
-def build_llama_model(pretrained_model_name_or_path: str, **kwargs: Any) -> nn.Module:
-    """Build a custom Llama model with combined projections for efficiency.
-
-    This function loads the config from a HuggingFace model card and builds
-    a custom Llama model with combined QKV and gate_up projections for improved efficiency.
-
-    Args:
-        pretrained_model_name_or_path: HuggingFace model card name (e.g., "meta-llama/Meta-Llama-3-70B")
-        **kwargs: Override config parameters. Common parameters include:
-                  - vocab_size: Vocabulary size
-                  - hidden_size: Hidden dimension size
-                  - num_hidden_layers: Number of transformer layers (useful for testing)
-                  - num_attention_heads: Number of attention heads
-                  - num_key_value_heads: Number of key/value heads for GQA
-                  - intermediate_size: MLP intermediate size
-                  - max_position_embeddings: Maximum sequence length
-                  - rms_norm_eps: RMSNorm epsilon
-                  - rope_theta: RoPE base frequency
-                  - attention_dropout: Attention dropout probability
-                  - pad_token_id: Padding token ID
-                  - attn_implementation: Attention backend ("eager", "sdpa", "flash_attention_2")
-                  - torch_dtype: Model dtype (default: bfloat16)
-
-    Returns:
-        LlamaForCausalLM model instance with combined projections
-
-    Example:
-        # Load with default settings (combined projections, bfloat16)
-        model = build_llama_model("meta-llama/Meta-Llama-3-70B")
-
-        # Use SDPA for faster attention
-        model = build_llama_model("meta-llama/Meta-Llama-3-70B",
-                                   attn_implementation="sdpa")
-
-        # Override for testing with fewer layers
-        model = build_llama_model("meta-llama/Meta-Llama-3-70B", num_hidden_layers=4)
-    """
-    # Extract and convert torch_dtype
-    torch_dtype = kwargs.pop("torch_dtype", None)
-    if torch_dtype is not None and isinstance(torch_dtype, str):
-        torch_dtype = dtype_from_str(torch_dtype)
-    elif torch_dtype is None:
-        torch_dtype = torch.bfloat16  # Default to bf16
-
-    # Extract attention implementation if specified, otherwise auto-detect
-    # This matches nemo_automodel/_transformers/auto_model.py approach
-    attn_implementation = kwargs.pop("attn_implementation", None)
-
-    # Load config from HuggingFace (with any overrides from kwargs)
-    config = LlamaConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
-
-    # Ensure architectures is set for LoRA compatibility
-    if not hasattr(config, "architectures") or config.architectures is None:
-        config.architectures = ["LlamaForCausalLM"]
-
-    # Set attention implementation with auto-detection
-    # Priority: user-specified > existing in config > auto-detect (flash_attention_2 > sdpa > eager)
-    # This matches the logic in nemo_automodel/_transformers/auto_model.py
-    if attn_implementation is not None:
-        config._attn_implementation = attn_implementation
-    elif not hasattr(config, "_attn_implementation") or config._attn_implementation is None:
-        # Auto-detect best available implementation (same as nemo_automodel default)
-        try:
-            # Try flash_attention_2 first (fastest)
-            config._attn_implementation = "flash_attention_2"
-        except (ImportError, ModuleNotFoundError):
-            # Fall back to SDPA if available (PyTorch 2.0+)
-            if hasattr(F, "scaled_dot_product_attention"):
-                config._attn_implementation = "sdpa"
-            else:
-                # Final fallback to eager
-                config._attn_implementation = "eager"
-
-    if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-        print(f"[build_llama_model] Attention implementation: {config._attn_implementation}")
-        print(f"[build_llama_model] torch_dtype: {torch_dtype}")
-
-    # Create backend config with HF state dict adapter enabled
-    backend = BackendConfig(enable_hf_state_dict_adapter=True)
-
-    # Create model with combined projections
-    model = LlamaForCausalLM(config=config, backend=backend)
-
-    # need to convert model manually since LlamaForCausalLM does not support to(dtype=...)
-    model = model.to(dtype=torch_dtype)
-
-    return model
+ModelClass = LlamaForCausalLM

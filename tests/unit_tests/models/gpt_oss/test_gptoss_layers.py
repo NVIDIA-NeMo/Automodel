@@ -21,7 +21,7 @@ from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 from nemo_automodel.components.models.gpt_oss.layers import (
     GptOssAttention,
 )
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.shared.import_utils import is_te_min_version
 
 
@@ -53,6 +53,27 @@ def gpt_config():
 
 
 @pytest.fixture
+def gpt_config_with_rope_scaling():
+    return GptOssConfig(
+        vocab_size=1000,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=32,
+        num_hidden_layers=2,
+        intermediate_size=256,
+        max_position_embeddings=512,
+        rms_norm_eps=1e-6,
+        sliding_window=None,
+        layer_types=["full_attention", "full_attention"],
+        num_local_experts=8,
+        num_experts_per_tok=2,
+        router_aux_loss_coef=0.01,
+        rope_scaling={"factor": 2.0, "type": "yarn"},
+    )
+
+
+@pytest.fixture
 def backend_config():
     return BackendConfig(
         linear="torch",
@@ -61,6 +82,20 @@ def backend_config():
         enable_deepep=False,
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
+        rope_fusion=False,
+    )
+
+
+@pytest.fixture
+def backend_config_with_rope_fusion():
+    return BackendConfig(
+        linear="torch",
+        attn="flex",
+        rms_norm="torch",
+        enable_deepep=False,
+        fake_balanced_gate=False,
+        enable_hf_state_dict_adapter=False,
+        rope_fusion=True,
     )
 
 
@@ -188,6 +223,49 @@ class TestGptOssAttention:
         except Exception as e:
             pytest.fail(f"Forward pass failed with rotary embedding: {e}")
 
+    def test_yarn_concentration_not_set_without_rope_fusion(self, gpt_config, backend_config):
+        """Test that yarn_concentration is None when rope_fusion is False."""
+        attention = GptOssAttention(gpt_config, backend_config)
+
+        assert attention.yarn_concentration is None
+
+    def test_yarn_concentration_set_with_rope_fusion(self, gpt_config_with_rope_scaling, backend_config_with_rope_fusion):
+        """Test that yarn_concentration is correctly computed when rope_fusion is True."""
+        import math
+        attention = GptOssAttention(gpt_config_with_rope_scaling, backend_config_with_rope_fusion)
+
+        assert hasattr(attention, "yarn_concentration")
+        # yarn_get_mscale(2.0) = 0.1 * 1.0 * math.log(2.0) + 1.0
+        expected_concentration = 0.1 * math.log(2.0) + 1.0
+        assert abs(attention.yarn_concentration - expected_concentration) < 1e-6
+
+    def test_yarn_concentration_different_scaling_factors(self, backend_config_with_rope_fusion):
+        """Test yarn_concentration with different scaling factors."""
+        import math
+        for factor in [1.5, 2.0, 4.0, 8.0]:
+            config = GptOssConfig(
+                vocab_size=1000,
+                hidden_size=128,
+                num_attention_heads=4,
+                num_key_value_heads=4,
+                head_dim=32,
+                num_hidden_layers=2,
+                intermediate_size=256,
+                max_position_embeddings=512,
+                rms_norm_eps=1e-6,
+                sliding_window=None,
+                layer_types=["full_attention", "full_attention"],
+                num_local_experts=8,
+                num_experts_per_tok=2,
+                router_aux_loss_coef=0.01,
+                rope_scaling={"factor": factor, "type": "yarn"},
+            )
+
+            attention = GptOssAttention(config, backend_config_with_rope_fusion)
+
+            expected_concentration = 0.1 * math.log(factor) + 1.0
+            assert abs(attention.yarn_concentration - expected_concentration) < 1e-6
+
 
 @pytest.mark.skipif(not is_te_min_version("2.8.0"), reason="TE version 2.8.0 or higher is required")
 class TestGptOssAttentionWithTE:
@@ -202,6 +280,7 @@ class TestGptOssAttentionWithTE:
             enable_deepep=False,
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
+            rope_fusion=False,
         )
 
     def test_te_backend_requires_min_version(self, gpt_config):
