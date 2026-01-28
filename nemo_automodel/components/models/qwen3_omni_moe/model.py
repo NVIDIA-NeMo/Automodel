@@ -177,6 +177,26 @@ class Qwen3OmniMoeThinkerTextModel(
 class Qwen3OmniMoeThinkerForConditionalGeneration(HFCheckpointingMixin, HFQwen3OmniMoeThinkerForConditionalGeneration, MoEFSDPSyncMixin):
     """Qwen3OmniMoe Thinker for Conditional Generation with multimodal support."""
 
+    @classmethod
+    def from_config(
+        cls,
+        config: Qwen3OmniMoeThinkerConfig,
+        moe_config: MoEConfig | None = None,
+        backend: BackendConfig | None = None,
+        **kwargs,
+    ):
+        return cls(config, moe_config, backend, **kwargs)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *model_args,
+        **kwargs,
+    ):
+        config = Qwen3OmniMoeThinkerConfig.from_pretrained(pretrained_model_name_or_path)
+        return cls.from_config(config, *model_args, **kwargs)
+
     def __init__(
         self,
         config: Qwen3OmniMoeThinkerConfig,
