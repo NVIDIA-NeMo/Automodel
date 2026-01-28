@@ -94,6 +94,35 @@ class TestValidateExpertAvailability:
 
         mixin._validate_expert_availability(hf_state_dict, 8)
 
+    def test_with_language_model_prefix(self):
+        """Test validation with model.language_model. prefix (VLM models)."""
+        mixin = MockMoEStateDictMixin()
+        hf_state_dict = {}
+
+        # Add experts with "model.language_model." prefix (VLM style)
+        for layer in range(2):
+            for expert in range(8):
+                for proj in ["gate_proj", "up_proj", "down_proj"]:
+                    key = f"model.language_model.layers.{layer}.mlp.experts.{expert}.{proj}.weight"
+                    hf_state_dict[key] = torch.randn(512, 1024)
+
+        mixin._validate_expert_availability(hf_state_dict, 8)
+
+    def test_missing_experts_with_language_model_prefix(self):
+        """Test validation fails when experts missing with language_model prefix."""
+        mixin = MockMoEStateDictMixin()
+        hf_state_dict = {}
+
+        # Only add experts 0-6, missing expert 7 with language_model prefix
+        for layer in range(2):
+            for expert in range(7):  # Missing expert 7
+                for proj in ["gate_proj", "up_proj", "down_proj"]:
+                    key = f"model.language_model.layers.{layer}.mlp.experts.{expert}.{proj}.weight"
+                    hf_state_dict[key] = torch.randn(512, 1024)
+
+        with pytest.raises(RuntimeError, match="Expert weights missing from checkpoint"):
+            mixin._validate_expert_availability(hf_state_dict, 8)
+
     @skip_if_no_gpu
     @patch("nemo_automodel.components.moe.state_dict_mixin.get_expert_range_for_rank_from_mesh")
     @patch("nemo_automodel.components.moe.state_dict_mixin.get_submesh")
@@ -460,8 +489,50 @@ class TestFromHfWMergedExperts:
                 with patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local", side_effect=lambda x, *args: x):
                     result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
-        expected_key = "model.layers.0.mlp.experts.gate_and_up_projs"
+        # Result key preserves the empty prefix from input
+        expected_key = "layers.0.mlp.experts.gate_and_up_projs"
         assert expected_key in result
+
+    def test_with_language_model_prefix(self):
+        """Test conversion with model.language_model. prefix (VLM models)."""
+        mixin = MockMoEStateDictMixin(n_experts=2, dtype=torch.float32)
+
+        hf_state_dict = {}
+        # Add weights with "model.language_model." prefix (VLM style)
+        for expert_id in range(2):
+            key = f"model.language_model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
+            hf_state_dict[key] = torch.randn(512, 1024)
+            key_up = f"model.language_model.layers.0.mlp.experts.{expert_id}.up_proj.weight"
+            hf_state_dict[key_up] = torch.randn(512, 1024)
+
+        with patch.object(mixin, '_validate_expert_availability'):
+            with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank", return_value=True):
+                with patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local", side_effect=lambda x, *args: x):
+                    result = mixin._from_hf_w_merged_experts(hf_state_dict)
+
+        # Result key should preserve the language_model prefix
+        expected_key = "model.language_model.layers.0.mlp.experts.gate_and_up_projs"
+        assert expected_key in result
+        assert result[expected_key].shape == (2, 1024, 1024)
+
+    def test_with_language_model_prefix_down_proj(self):
+        """Test down_proj conversion with model.language_model. prefix."""
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512, dtype=torch.float32)
+
+        hf_state_dict = {}
+        for expert_id in range(2):
+            key = f"model.language_model.layers.0.mlp.experts.{expert_id}.down_proj.weight"
+            hf_state_dict[key] = torch.randn(1024, 512)  # [dim, inter_dim]
+
+        with patch.object(mixin, '_validate_expert_availability'):
+            with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank", return_value=True):
+                with patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local", side_effect=lambda x, *args: x):
+                    result = mixin._from_hf_w_merged_experts(hf_state_dict)
+
+        # Result key should preserve the language_model prefix
+        expected_key = "model.language_model.layers.0.mlp.experts.down_projs"
+        assert expected_key in result
+        assert result[expected_key].shape == (2, 512, 1024)  # [n_experts, inter_dim, dim]
 
     @skip_if_no_gpu
     @patch("nemo_automodel.components.moe.state_dict_mixin.get_expert_range_for_rank_from_mesh")
