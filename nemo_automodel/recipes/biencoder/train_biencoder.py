@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any, Dict
 import torch
 from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-from transformers.utils.hub import TRANSFORMERS_CACHE
+from huggingface_hub.constants import HF_HUB_CACHE as TRANSFORMERS_CACHE
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules

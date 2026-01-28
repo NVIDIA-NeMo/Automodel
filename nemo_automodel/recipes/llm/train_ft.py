@@ -32,8 +32,8 @@ from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoConfig
 from transformers.modeling_utils import no_init_weights
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
-from transformers.utils.hub import TRANSFORMERS_CACHE
+from transformers.utils import ContextManagers
+from huggingface_hub.constants import HF_HUB_CACHE as TRANSFORMERS_CACHE
 from wandb import Settings
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM

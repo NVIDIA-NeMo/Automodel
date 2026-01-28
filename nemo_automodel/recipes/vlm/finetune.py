@@ -28,7 +28,8 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
 from transformers.modeling_utils import no_init_weights
 from transformers.processing_utils import ProcessorMixin
-from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
+from transformers.utils import ContextManagers
+from huggingface_hub.constants import HF_HUB_CACHE as TRANSFORMERS_CACHE
 from wandb import Settings
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches

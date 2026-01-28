@@ -26,7 +26,7 @@ from packaging.version import parse
 from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
-from transformers.utils import TRANSFORMERS_CACHE
+from huggingface_hub.constants import HF_HUB_CACHE as TRANSFORMERS_CACHE
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
@@ -43,7 +43,7 @@ from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
 
 if TYPE_CHECKING:
     from peft import PeftConfig
-    from transformers.tokenization_utils import PreTrainedTokenizerBase
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 
 def _is_geq_torch_2_9() -> bool:
