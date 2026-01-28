@@ -14,11 +14,43 @@
 
 import logging
 import os
+import sys
+import types
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from diffusers import DiffusionPipeline
+
+# diffusers is an optional dependency. Some CI environments may have it missing
+# or installed with incompatible transitive deps. Import defensively so that
+# helper functions in this module (and unit tests) can run without diffusers.
+from nemo_automodel.shared.import_utils import safe_import
+
+try:  # pragma: no cover - exercised indirectly via unit tests
+    ok, diffusers = safe_import("diffusers")
+except Exception:
+    # diffusers can fail with non-ImportError exceptions (e.g. missing optional deps).
+    ok, diffusers = False, None
+
+if ok and hasattr(diffusers, "DiffusionPipeline"):
+    DiffusionPipeline = diffusers.DiffusionPipeline
+else:  # pragma: no cover
+    # Provide a minimal stub module/class so tests can patch
+    # `diffusers.DiffusionPipeline.from_pretrained` even when diffusers fails to import.
+    diffusers_stub = sys.modules.get("diffusers")
+    if diffusers_stub is None:
+        diffusers_stub = types.ModuleType("diffusers")
+        sys.modules["diffusers"] = diffusers_stub
+
+    class DiffusionPipeline:  # type: ignore[no-redef]
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            raise RuntimeError(
+                "diffusers is required for NeMoAutoDiffusionPipeline.from_pretrained. "
+                "Install a compatible diffusers + deps stack to use this feature."
+            )
+
+    setattr(diffusers_stub, "DiffusionPipeline", DiffusionPipeline)
 
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 from nemo_automodel.shared.utils import dtype_from_str

@@ -272,7 +272,8 @@ class Qwen3VLMoeForConditionalGeneration(HFQwen3VLMoeForConditionalGeneration, M
         self.model.moe_config = self.model.language_model.moe_config
 
         self.vocab_size = text_config.vocab_size
-        self.pad_token_id = text_config.pad_token_id if text_config.pad_token_id is not None else -1
+        pad_token_id = getattr(text_config, "pad_token_id", None)
+        self.pad_token_id = pad_token_id if pad_token_id is not None else -1
 
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3VLMoeStateDictAdapter(

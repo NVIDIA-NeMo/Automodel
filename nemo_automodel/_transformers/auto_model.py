@@ -52,6 +52,13 @@ HAS_FA, _ = safe_import("flash_attn")
 logger = logging.getLogger(__name__)
 
 
+class DownloadKwargs(types.SimpleNamespace):
+    """Backwards-compatible container for download-related kwargs.
+
+    Kept as a stable symbol for unit tests / downstream integrations.
+    """
+
+
 @contextmanager
 def local_torch_dtype(
     dtype: torch.dtype, model_class_name: str | None = None, default_dtype: torch.dtype = torch.bfloat16
@@ -147,6 +154,12 @@ def _patch_liger_kernel(model):
     """
     if not HAS_LIGER_KERNEL:
         logging.warning("Asked to use Liger Kernel, but could not import")
+        return model
+
+    # Unit tests may pass lightweight mocks; skip patching in that case.
+    # (The wrapper logic itself is tested separately by patching this function.)
+    if not isinstance(model, torch.nn.Module):
+        logging.warning("Skipping Liger Kernel patch for non-nn.Module model: %s", type(model))
         return model
 
     try:
@@ -267,9 +280,7 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
                 f"""Downloading model weights on {num_nodes} nodes. This incurs high storage usage.
                 It is recommended to download once with `hf download` and pass in the downloaded path to the `pretrained_model_name_or_path` argument."""
             )
-        # Import via module reference (vs bound name) so unit tests can patch
-        # `nemo_automodel.components.distributed.utils.FirstRankPerNode`.
-        with dist_utils.FirstRankPerNode():
+        def _download():
             _get_resolved_checkpoint_files(
                 pretrained_model_name_or_path=pretrained_model_name_or_path,
                 subfolder="",
@@ -289,6 +300,15 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
                 is_remote_code=False,
                 transformers_explicit_filename=None,
             )
+
+        # Barrier only makes sense when distributed is initialized.
+        # Import via module reference (vs bound name) so unit tests can patch
+        # `nemo_automodel.components.distributed.utils.FirstRankPerNode`.
+        if torch.distributed.is_initialized():
+            with dist_utils.FirstRankPerNode():
+                _download()
+        else:
+            _download()
 
 
 def get_architectures(hf_config):

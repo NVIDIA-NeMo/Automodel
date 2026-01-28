@@ -70,12 +70,28 @@ class NemotronParseTextConfig(PretrainedConfig):
         use_cache: bool = True,
         num_labels: int = 3,
         forced_eos_token_id: int = 2,
+        pad_token_id: int = 1,
+        bos_token_id: int = 0,
+        eos_token_id: int = 2,
+        decoder_start_token_id: int = 2,
         add_cross_attention: bool = True,
         is_decoder: bool = True,
         max_sequence_length: int = 9000,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        # Populate special token ids on the config so downstream components
+        # (e.g., mBART decoder layers) can rely on them.
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            decoder_start_token_id=decoder_start_token_id,
+            forced_eos_token_id=forced_eos_token_id,
+            add_cross_attention=add_cross_attention,
+            is_decoder=is_decoder,
+            use_cache=use_cache,
+            **kwargs,
+        )
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.encoder_layers = encoder_layers
@@ -98,7 +114,6 @@ class NemotronParseTextConfig(PretrainedConfig):
         self.add_cross_attention = add_cross_attention
         self.is_decoder = is_decoder
         self.hidden_size = self.d_model
-        self.forced_eos_token_id = forced_eos_token_id
         self.num_attention_heads = self.encoder_attention_heads
         self.max_sequence_length = max_sequence_length
 

@@ -31,9 +31,12 @@ from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoConfig
-
-# from transformers.modeling_utils import no_init_weights
-from transformers.initialization import no_init_weights
+try:
+    # transformers>=4.48 moved no_init_weights
+    from transformers.initialization import no_init_weights  # type: ignore
+except Exception:  # pragma: no cover
+    # Back-compat for older transformers
+    from transformers.modeling_utils import no_init_weights  # type: ignore
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.utils import ContextManagers
 from wandb import Settings
@@ -180,7 +183,16 @@ def build_model_and_optimizer(
     )
 
     with ScopedRNG(seed=seed, ranked=True):
-        if cfg_model.get_as_string("_target_", "").startswith("transformers"):
+        # ConfigNode provides `get_as_string`, but unit tests may pass lightweight
+        # stub configs that only implement `get`.
+        if hasattr(cfg_model, "get_as_string"):
+            target = cfg_model.get_as_string("_target_", "")
+        elif hasattr(cfg_model, "get"):
+            target = cfg_model.get("_target_", "")
+        else:
+            target = getattr(cfg_model, "_target_", "")
+
+        if isinstance(target, str) and target.startswith("transformers"):
             is_meta_device = False
             kwargs = {}
         else:
