@@ -368,10 +368,7 @@ class Checkpointer:
             model_class = model.config.architectures[0]
         except:
             model_class = ""
-        is_nemotron_v2 = (
-            model_class == "NemotronHForCausalLM"
-            and not getattr(model.config, "n_routed_experts", None)
-        )
+        is_nemotron_v2 = model_class == "NemotronHForCausalLM" and not getattr(model.config, "n_routed_experts", None)
         skip_initialize_weights = model_class in ["Gemma3ForConditionalGeneration"] or is_nemotron_v2
         if not skip_initialize_weights:
             for _, module in model.named_modules():
