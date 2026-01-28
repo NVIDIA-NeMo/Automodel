@@ -32,7 +32,7 @@ from nemo_automodel.components.moe.layers import (
     relu2,
     swiglu,
 )
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig
 
 
 @pytest.fixture
