@@ -338,20 +338,24 @@ def nemotron_parse_collate_fn(
 def default_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
+    max_length: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """Default collate function for multimodal VLM datasets."""
     if not HAVE_QWEN_VL_UTILS:
         raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
 
     conversations = [example["conversation"] for example in examples]
-    batch = processor.apply_chat_template(
-        conversations,
-        tokenize=True,
-        padding=True,
-        truncation=True,
-        return_tensors="pt",
-        return_dict=True,
-    )
+    processor_kwargs = {
+        "tokenize": True,
+        "padding": True,
+        "truncation": True,
+        "return_tensors": "pt",
+        "return_dict": True,
+    }
+    if max_length is not None:
+        processor_kwargs["max_length"] = max_length
+        processor_kwargs["padding"] = "max_length"
+    batch = processor.apply_chat_template(conversations, **processor_kwargs)
 
     if "position_ids" not in batch:
         batch_size, seq_len = batch["input_ids"].shape

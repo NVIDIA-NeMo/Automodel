@@ -356,3 +356,51 @@ def test_import_error_when_qwen_utils_missing(collate_mod, fn_name, monkeypatch)
 
     with pytest.raises(ImportError):
         func([], None)
+
+
+def test_default_collate_fn_with_max_length(collate_mod, fake_qwen_utils, monkeypatch):
+    """Test that default_collate_fn passes max_length and sets padding to 'max_length'."""
+    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
+
+    captured_kwargs = {}
+
+    class MaxLengthProcessor:
+        tokenizer = DummyTokenizer()
+
+        def apply_chat_template(self, conv_list, **kwargs):
+            captured_kwargs.update(kwargs)
+            batch_size = len(conv_list)
+            input_ids = torch.arange(1, 5).unsqueeze(0).repeat(batch_size, 1)
+            pixel_values = torch.ones(batch_size, 3, 64, 64, dtype=torch.float32)
+            return {"input_ids": input_ids, "pixel_values": pixel_values}
+
+    processor = MaxLengthProcessor()
+    collate_mod.default_collate_fn(
+        [{"conversation": CONVERSATION}], processor, max_length=512
+    )
+
+    assert captured_kwargs.get("max_length") == 512
+    assert captured_kwargs.get("padding") == "max_length"
+
+
+def test_default_collate_fn_without_max_length(collate_mod, fake_qwen_utils, monkeypatch):
+    """Test that default_collate_fn uses padding=True when max_length is not provided."""
+    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
+
+    captured_kwargs = {}
+
+    class NoMaxLengthProcessor:
+        tokenizer = DummyTokenizer()
+
+        def apply_chat_template(self, conv_list, **kwargs):
+            captured_kwargs.update(kwargs)
+            batch_size = len(conv_list)
+            input_ids = torch.arange(1, 5).unsqueeze(0).repeat(batch_size, 1)
+            pixel_values = torch.ones(batch_size, 3, 64, 64, dtype=torch.float32)
+            return {"input_ids": input_ids, "pixel_values": pixel_values}
+
+    processor = NoMaxLengthProcessor()
+    collate_mod.default_collate_fn([{"conversation": CONVERSATION}], processor)
+
+    assert "max_length" not in captured_kwargs
+    assert captured_kwargs.get("padding") is True
