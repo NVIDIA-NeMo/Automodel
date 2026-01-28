@@ -28,12 +28,10 @@ Checkpointer is passed explicitly (dependency injection) - no global state.
 import logging
 from typing import TYPE_CHECKING, Optional
 
-from nemo_automodel.components.checkpoint.checkpointing import (
-    Checkpointer,
-)
-
 if TYPE_CHECKING:
     from transformers.tokenization_utils import PreTrainedTokenizerBase
+
+    from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +56,7 @@ class HFCheckpointingMixin:
     def save_pretrained(
         self,
         save_directory: str,
-        checkpointer: Optional[Checkpointer] = None,
+        checkpointer: Optional["Checkpointer"] = None,
         tokenizer: Optional["PreTrainedTokenizerBase"] = None,
         **kwargs,
     ) -> None:
