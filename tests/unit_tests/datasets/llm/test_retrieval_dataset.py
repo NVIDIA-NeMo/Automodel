@@ -413,23 +413,19 @@ def test_transform_func_epoch_cycling():
     }
 
     # Epoch 0: Should select first positive (p1)
-    examples["epoch"] = 0
-    out_0 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict)
+    out_0 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, epoch=0)
     assert out_0["doc_text"][0][0] == "pos1"
 
     # Epoch 1: Should select second positive (p2)
-    examples["epoch"] = 1
-    out_1 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict)
+    out_1 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, epoch=1)
     assert out_1["doc_text"][0][0] == "pos2"
 
     # Epoch 2: Should select third positive (p3)
-    examples["epoch"] = 2
-    out_2 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict)
+    out_2 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, epoch=2)
     assert out_2["doc_text"][0][0] == "pos3"
 
     # Epoch 3: Should cycle back to first positive (p1)
-    examples["epoch"] = 3
-    out_3 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict)
+    out_3 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, epoch=3)
     assert out_3["doc_text"][0][0] == "pos1"
 
 
