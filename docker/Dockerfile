@@ -88,7 +88,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         mv /opt/Automodel/docker/common/uv-pytorch.lock /opt/Automodel/uv.lock; \
     fi && \
     uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups && \
-    uv cache prune
+    uv cache prune --ci
 
 COPY . /opt/Automodel
 
