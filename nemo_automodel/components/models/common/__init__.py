@@ -21,15 +21,14 @@ from nemo_automodel.components.models.common.combined_projection import (
 from nemo_automodel.components.models.common.combined_projection.state_dict_adapter import (
     CombinedProjectionStateDictAdapter,
 )
-from nemo_automodel.components.models.common.te_utils import (
+from nemo_automodel.components.models.common.utils import (
     HAVE_DEEP_EP,
     HAVE_TE,
     BackendConfig,
-    TELinearWrapper,
-    TENormWrapper,
+    initialize_attention_module,
     initialize_linear_module,
     initialize_rms_norm_module,
-    is_tensor_unallocated,
+    materialize_te_weights,
 )
 
 __all__ = [
@@ -41,9 +40,8 @@ __all__ = [
     "HAVE_TE",
     "HAVE_DEEP_EP",
     "BackendConfig",
-    "is_tensor_unallocated",
-    "TENormWrapper",
-    "TELinearWrapper",
     "initialize_rms_norm_module",
     "initialize_linear_module",
+    "initialize_attention_module",
+    "materialize_te_weights",
 ]
