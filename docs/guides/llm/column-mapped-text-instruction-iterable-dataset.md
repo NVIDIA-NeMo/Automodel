@@ -4,7 +4,6 @@ This guide explains how to use `ColumnMappedTextInstructionIterableDataset` to *
 
 Unlike `ColumnMappedTextInstructionDataset` (map-style, non-streaming), this class is a `torch.utils.data.IterableDataset` and **always** loads data in streaming mode. This is intentional: it helps ensure data is consumed as a stream and avoids accidentally materializing full datasets/tables to disk or memory (which is especially important for large or sensitive corpora).
 
----
 ## When to Use This Dataset
 
 Use `ColumnMappedTextInstructionIterableDataset` when you need:
@@ -15,7 +14,6 @@ Use `ColumnMappedTextInstructionIterableDataset` when you need:
 
 If you do *not* need streaming (and you want `len(ds)` / `ds[i]`), use [`ColumnMappedTextInstructionDataset`](column-mapped-text-instruction-dataset.md).
 
----
 ## Key Differences vs ColumnMappedTextInstructionDataset
 
 - **Iterable**: you iterate (`for sample in ds:`); you cannot rely on `len(ds)` or `ds[i]`.
@@ -25,7 +23,6 @@ If you do *not* need streaming (and you want `len(ds)` / `ds[i]`), use [`ColumnM
 
 The column mapping and tokenization logic are shared with `ColumnMappedTextInstructionDataset`. See [Tokenization Paths](column-mapped-text-instruction-dataset.md#tokenization-paths) for details on output fields (`input_ids`, `labels`, `attention_mask`) and masking behavior.
 
----
 ## Quickstart (Hugging Face Streaming)
 
 ```python
@@ -55,7 +52,6 @@ sample = next(iter(ds))
 print(sample.keys())  # input_ids / labels / attention_mask (and ___PAD_TOKEN_IDS___)
 ```
 
----
 ## Delta Lake/Databricks
 
 `ColumnMappedTextInstructionIterableDataset` supports Delta Lake tables from:
@@ -155,7 +151,6 @@ dataset:
     # DATABRICKS_HTTP_PATH: ${oc.env:DATABRICKS_HTTP_PATH}
 ```
 
----
 ## Streaming from a Delta SQL Query (Computed/Aliased Columns)
 
 If you want to generate columns dynamically (joins, filters, computed prompt strings, etc.), pass a SQL query that returns the fields referenced by your `column_mapping`.
@@ -207,7 +202,6 @@ dataset:
 **Authentication:** The Delta Lake loader automatically picks up credentials from environment variables (`DATABRICKS_TOKEN`, `AWS_ACCESS_KEY_ID`, `AZURE_STORAGE_ACCOUNT_KEY`, etc.) if not explicitly provided in `delta_storage_options`.
 :::
 
----
 ## Common Arguments
 
 | Arg                     | Default | Description |
