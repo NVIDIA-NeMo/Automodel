@@ -131,6 +131,30 @@ def _patch_attention(obj, sdpa_method=None):
     return obj
 
 
+def _is_config_compatible_with_custom_model(arch_name: str, config) -> bool:
+    """
+    Check if a HuggingFace config is compatible with our custom model implementation.
+
+    Some architectures (e.g., NemotronHForCausalLM) are shared between different model versions
+    (v2 vs v3) but our custom implementation only supports specific versions. This function
+    validates that the config has the required attributes for the custom implementation.
+
+    Args:
+        arch_name: The architecture name (e.g., "NemotronHForCausalLM")
+        config: The HuggingFace config object
+
+    Returns:
+        True if the config is compatible with our custom implementation, False otherwise
+    """
+    # NemotronHForCausalLM: Our custom implementation is for v3 (MoE model)
+    # v3 requires n_routed_experts, v2 does not have this attribute
+    if arch_name == "NemotronHForCausalLM":
+        return hasattr(config, "n_routed_experts") and config.n_routed_experts is not None
+
+    # All other architectures are assumed compatible
+    return True
+
+
 def _patch_liger_kernel(model):
     """
     Patches a model with liger-kernel and sdpa_kernel
@@ -443,7 +467,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             )
         architectures = get_architectures(hf_config)
         # 2. If we have a custom model implementation available, we prioritize that over HF
-        if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
+        arch_name = architectures[0] if len(architectures) > 0 else None
+        if (
+            arch_name is not None
+            and arch_name in ModelRegistry.model_arch_name_to_cls
+            and _is_config_compatible_with_custom_model(arch_name, hf_config)
+        ):
             # if we are able to init the custom model, we will now download the model weights on local rank 0
             _download_model_weights(hf_config, pretrained_model_name_or_path)
             logger.info(f"Using custom model implementation for {architectures[0]}")
@@ -604,9 +633,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         # 2. If we have a custom model implementation available, we prioritize that over HF
         architectures = get_architectures(config)
-        if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
-            with local_torch_dtype(torch_dtype, ModelRegistry.model_arch_name_to_cls[architectures[0]].__name__):
-                return ModelRegistry.model_arch_name_to_cls[architectures[0]](config, *model_args, **kwargs)
+        arch_name = architectures[0] if len(architectures) > 0 else None
+        if (
+            arch_name is not None
+            and arch_name in ModelRegistry.model_arch_name_to_cls
+            and _is_config_compatible_with_custom_model(arch_name, config)
+        ):
+            with local_torch_dtype(torch_dtype, ModelRegistry.model_arch_name_to_cls[arch_name].__name__):
+                return ModelRegistry.model_arch_name_to_cls[arch_name](config, *model_args, **kwargs)
 
         # 3. fallback to parent class
         model = None
