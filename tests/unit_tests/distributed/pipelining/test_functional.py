@@ -384,6 +384,74 @@ class TestSplitModelIntoStages:
             # Verify FQN generation was called
             mock_generate_fqn.assert_called_once()
 
+    @patch('nemo_automodel.components.distributed.pipelining.functional.get_text_module')
+    @patch('nemo_automodel.components.distributed.pipelining.functional.calculate_virtual_stages')
+    @patch('nemo_automodel.components.distributed.pipelining.functional.generate_hf_model_fqn_per_model_part')
+    @pytest.mark.parametrize("lm_head_on_top_level", [True, False])
+    def test_nested_language_model_structure(self, mock_generate_fqn, mock_calc_stages, mock_get_text_module, lm_head_on_top_level):
+        """Test split_model_into_stages with nested language_model structure (covers lines 311-318)."""
+        mock_pp_mesh = Mock()
+        mock_pp_mesh.get_local_rank.return_value = 0
+        mock_pp_mesh.size.return_value = 2
+
+        # Create mock text_model with nested .model attribute (like LlamaForCausalLM)
+        mock_text_model = Mock()
+        mock_text_model.model = Mock()  # Has .model attr -> text_model_has_model_attr=True
+        mock_text_model.model.layers = [Mock() for _ in range(4)]
+        mock_text_model.rotary_emb = Mock()
+
+        mock_get_text_module.return_value = mock_text_model
+
+        # Create model with language_model attribute (triggers nested path)
+        mock_model = Mock()
+        mock_model.model = Mock()
+        mock_model.model.language_model = mock_text_model  # TEXT_MODULE_ATTRS match
+
+        # Configure lm_head location
+        if lm_head_on_top_level:
+            mock_model.lm_head = Mock()
+            del mock_text_model.lm_head
+        else:
+            mock_text_model.lm_head = Mock()
+            del mock_model.lm_head
+
+        # Remove other TEXT_MODULE_ATTRS to ensure language_model is matched
+        del mock_model.text_model
+        del mock_model.text_decoder
+        del mock_model.model.text_model
+        del mock_model.model.text_decoder
+
+        mock_calc_stages.return_value = (2, 1)
+        mock_generate_fqn.return_value = [
+            ["model.language_model.model.embed_tokens", "model.language_model.model.layers.0"],
+            ["model.language_model.model.layers.1", "model.language_model.model.norm"],
+        ]
+
+        with patch('nemo_automodel.components.distributed.pipelining.functional.PipelineStage'), \
+             patch('nemo_automodel.components.distributed.pipelining.functional.get_schedule_class') as mock_get_schedule, \
+             patch('nemo_automodel.components.distributed.pipelining.functional.stage_ids_this_rank') as mock_stage_ids, \
+             patch('copy.deepcopy') as mock_deepcopy:
+
+            mock_get_schedule.return_value = PipelineScheduleSingle
+            mock_stage_ids.return_value = (0,)
+            mock_copy = Mock()
+            mock_copy.named_children.return_value = []
+            mock_deepcopy.return_value = mock_copy
+
+            stages, models = split_model_into_stages(
+                mock_model, mock_pp_mesh, "pp", "PipelineScheduleSingle",
+                torch.device("cuda:0"), layers_per_stage=2,
+            )
+
+            # Verify generate_fqn was called with correct parameters for nested model
+            call_kwargs = mock_generate_fqn.call_args[1]
+            assert call_kwargs['include_multimodal_encoders'] is False
+            assert any('model.' in fqn for fqn in call_kwargs['extra_module_fqns'])
+            if lm_head_on_top_level:
+                assert call_kwargs['lm_head_fqn'] == "lm_head"
+            else:
+                assert "language_model.lm_head" in call_kwargs['lm_head_fqn']
+
 
 class TestBuildPipelineSchedule:
     """Test build_pipeline_schedule function."""
