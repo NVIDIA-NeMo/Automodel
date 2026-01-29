@@ -2317,6 +2317,19 @@ wheels = [
 ]
 
 [[package]]
+name = "liger-kernel"
+version = "0.6.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "torch", version = "2.8.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
+    { name = "triton", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/25/c8/9bfa2871c35ee49dd4e63e237fb5c9159913b58ed3c4eb9109805f21b573/liger_kernel-0.6.3.tar.gz", hash = "sha256:436f5164e5cf94a5cf4c6b8e7831d755b74d2fba5a61e2378ddfb779a5f4e25a", size = 3705621, upload-time = "2025-10-27T18:30:26.019Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/26/47/62b22927ee77c2294ee4cb422eda50f4aa5bec049a42f3ec9c4a437b0700/liger_kernel-0.6.3-py3-none-any.whl", hash = "sha256:7be6f5498d9f7a7c1ae4191c1829e815154963b7b5cc9fec6e14063fd41461ae", size = 210999, upload-time = "2025-10-27T18:30:24.231Z" },
+]
+
+[[package]]
 name = "llvmlite"
 version = "0.45.1"
 source = { registry = "https://pypi.org/simple" }
@@ -3077,6 +3090,7 @@ dependencies = [
     { name = "diffusers" },
     { name = "ftfy" },
     { name = "imageio-ffmpeg" },
+    { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "megatron-fsdp" },
     { name = "mlflow" },
     { name = "opencv-python-headless" },
@@ -3189,11 +3203,8 @@ requires-dist = [
     { name = "flash-linear-attention", marker = "extra == 'extra'" },
     { name = "ftfy" },
     { name = "imageio-ffmpeg" },
-<<<<<<< HEAD
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", specifier = ">=0.5.9" },
     { name = "mamba-ssm", marker = "extra == 'cuda'" },
-=======
->>>>>>> akoumparouli/ci_upgrade_min_liger_version
     { name = "megatron-fsdp" },
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'" },
     { name = "mlflow" },
