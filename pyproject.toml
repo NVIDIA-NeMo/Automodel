@@ -92,8 +92,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cuda = ["flash-attn<=2.8.3", "transformer-engine[pytorch]==2.8.0"]
+cuda = ["flash-attn<=2.8.3", "transformer-engine[pytorch]==2.8.0", "mamba-ssm", "causal-conv1d"]
 extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
+delta-databricks = [
+    "deltalake>=1.0.0",  # For Delta Lake metadata
+    "databricks-sql-connector>=3.0.0",  # For Unity Catalog streaming access
+]
 vlm = [
     "pillow",
     "qwen-vl-utils[decord]; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
@@ -107,6 +111,7 @@ vlm = [
     "albumentations"
 ]
 all = [
+    "nemo_automodel[delta-databricks]",
     "nemo_automodel[extra]",
     "nemo_automodel[vlm]",
 ]
@@ -140,7 +145,14 @@ dev = ["cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87
 
 [tool.uv]
 default-groups = ["build", "docs", "test"]
-no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "flash-attn", "grouped_gemm"]
+no-build-isolation-package = [
+    "transformer-engine-torch",
+    "transformer-engine",
+    "causal-conv1d",
+    "flash-attn",
+    "grouped_gemm",
+    "mamba-ssm",
+]
 constraint-dependencies = [
     "starlette>=0.49.1", # Address CVE GHSA-7f5h-v6xp-fcq8
 ]
@@ -178,6 +190,8 @@ omit = [
     "config-3.py",
     # transformer v5 backports
     "nemo_automodel/_transformers/tokenization/tokenization_mistral_common.py",
+    # requires databricks
+    "nemo_automodel/components/datasets/llm/delta_lake_dataset.py",
 ]
 
 [tool.ruff]
