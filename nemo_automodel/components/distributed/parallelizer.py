@@ -1100,7 +1100,7 @@ def megatron_fsdp_strategy_parallelize(
         return model, optimizer
 
     # Wrap model with MegatronFSDP.
-    fsdp_kwargs = dict(
+    model, optimizer = megatron_fsdp_fully_shard(
         module=model,
         optimizer=optimizer,
         fsdp_unit_modules=megatron_fsdp_unit_modules,
@@ -1122,7 +1122,6 @@ def megatron_fsdp_strategy_parallelize(
         fsdp_double_buffer=fsdp_double_buffer,
     )
 
-    model, optimizer = megatron_fsdp_fully_shard(**fsdp_kwargs)
     return model, optimizer
 
 
