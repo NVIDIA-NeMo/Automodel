@@ -40,7 +40,11 @@ from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.checkpoint.checkpointing import (
+    Checkpointer,
+    CheckpointingConfig,
+    _maybe_adapt_state_dict_to_hf,
+)
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
@@ -243,7 +247,11 @@ def build_model_and_optimizer(
     }
 
     # hold a list copy of the model state dict keys before any parallelization
-    state_dict_keys = list(model.state_dict().keys())
+    state_dict_keys = list(
+        _maybe_adapt_state_dict_to_hf(
+            model, model.state_dict(), quantization=checkpointer.config.dequantize_base_checkpoint
+        ).keys()
+    )
 
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
@@ -267,7 +275,6 @@ def build_model_and_optimizer(
                     load_base_model=load_base_model,
                 )
 
-            # Create optimizer for all model parts
             trainable_params = []
             for i, model_part in enumerate(autopipeline.parts):
                 trainable_params.append(
@@ -513,19 +520,18 @@ def build_dataloader(
 
         # If using an IterableDataset, per-rank sharding for unique samples
         if isinstance(ds, IterableDataset):
-            try:
-                if ds.num_shards >= dp_world_size:
-                    ds = ds.shard(dp_world_size, dp_rank)
-                    logging.info(
-                        f"Sharded IterableDataset via dataset.shard: world_size={dp_world_size}, rank={dp_rank}"
-                    )
-                else:
-                    from datasets.distributed import split_dataset_by_node
+            if callable(getattr(ds, "shard", None)):
+                ds = ds.shard(dp_world_size, dp_rank)
+                logging.info(f"Sharded IterableDataset via dataset.shard: world_size={dp_world_size}, rank={dp_rank}")
+            elif hasattr(ds, "dataset"):
+                # HuggingFace streaming datasets: split by file shards when possible.
+                from datasets.distributed import split_dataset_by_node
 
-                    ds.dataset = split_dataset_by_node(ds.dataset, world_size=dp_world_size, rank=dp_rank)
-                    logging.info(f"Sharded dataset via split_dataset_by_node: world_size={dp_world_size}")
-            except Exception as e:
-                logging.warning(f"IterableDataset sharding skipped due to error: {e}")
+                assert hasattr(ds, "dataset"), "dataset must have a dataset attribute"
+                ds.dataset = split_dataset_by_node(ds.dataset, world_size=dp_world_size, rank=dp_rank)
+                logging.info(f"Sharded dataset via split_dataset_by_node: world_size={dp_world_size}")
+            else:
+                logging.warning("IterableDataset does not support sharding; Data may be duplicated across ranks.")
 
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
 

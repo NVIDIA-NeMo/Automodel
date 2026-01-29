@@ -30,7 +30,7 @@ from nemo_automodel.components.models.qwen3_omni_moe.model import (
     Qwen3OmniMoeThinkerTextModel,
 )
 from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
