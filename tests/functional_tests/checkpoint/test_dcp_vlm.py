@@ -541,12 +541,12 @@ def test_vlm_dcp_checkpoint():
     # first extract the in-memory checkpoint
     model_state_dict = to_cpu(
         ModelState(
-            trainer.model,
+            trainer.model_parts[0],
         ).state_dict()
     )
     optimizer_state_dict = to_cpu(
         OptimizerState(
-            trainer.model,
+            trainer.model_parts[0],
             trainer.optimizer,
             trainer.lr_scheduler,
         ).state_dict()["optim"]
@@ -619,10 +619,10 @@ def test_vlm_dcp_checkpoint():
 
     # check if new model and current model give the same CE loss
     val_batch = next(iter(trainer.val_dataloader))
-    restored_model = FinetuneRecipeForVLM(cfg)
-    restored_model.setup()
-    restored_model = restored_model.model
-    source_model_loss = get_validation_loss(trainer.model, val_batch, trainer.loss_fn, trainer.dist_env.device)
+    restored_trainer = FinetuneRecipeForVLM(cfg)
+    restored_trainer.setup()
+    restored_model = restored_trainer.model_parts[0]
+    source_model_loss = get_validation_loss(trainer.model_parts[0], val_batch, trainer.loss_fn, trainer.dist_env.device)
     restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
     assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
 

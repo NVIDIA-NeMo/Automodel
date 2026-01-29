@@ -70,6 +70,34 @@ class Fp32SafeQwen3VLMoeVisionRotaryEmbedding(Qwen3VLMoeVisionRotaryEmbedding):
         return result
 
 
+class Qwen3VLMoeBlock(Block):
+    """Qwen3-VL block adapter that accepts HF-style position embeddings."""
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        freqs_cis: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **attn_kwargs: Any,
+    ) -> torch.Tensor:
+        if freqs_cis is None and position_embeddings is not None:
+            cos, sin = position_embeddings
+            head_dim = cos.shape[-1] // 2
+            freqs_cis = torch.cat((cos[..., :head_dim], sin[..., :head_dim]), dim=-1)
+        if freqs_cis is None:
+            raise ValueError("Qwen3VLMoeBlock requires freqs_cis or position_embeddings.")
+        return super().forward(
+            x=x,
+            freqs_cis=freqs_cis,
+            attention_mask=attention_mask,
+            padding_mask=padding_mask,
+            **attn_kwargs,
+        )
+
+
 class Qwen3VLMoeModel(HFQwen3VLMoeModel):
     @property
     def layers(self):
@@ -118,8 +146,11 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
 
         embed_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx, dtype=embed_dtype)
-        self.layers = nn.ModuleList(
-            [Block(layer_id, config, self.moe_config, backend) for layer_id in range(config.num_hidden_layers)]
+        self.layers = nn.ModuleDict(
+            {
+                str(layer_id): Qwen3VLMoeBlock(layer_id, config, self.moe_config, backend)
+                for layer_id in range(config.num_hidden_layers)
+            }
         )
         self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Fp32SafeQwen3VLMoeTextRotaryEmbedding(config=config)
@@ -168,7 +199,8 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
         head_dim = cos.shape[-1] // 2
         freqs_cis = torch.cat((cos[..., :head_dim], sin[..., :head_dim]), dim=-1)
 
-        for layer_idx, decoder_layer in enumerate(self.layers):
+        for layer_id_str, decoder_layer in self.layers.items():
+            layer_idx = int(layer_id_str)
             hidden_states = decoder_layer(
                 x=hidden_states,
                 freqs_cis=freqs_cis,
@@ -225,7 +257,7 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
                 self.norm.reset_parameters()
             self.rotary_emb.device = buffer_device
 
-        for layer in self.layers:
+        for layer in self.layers.values():
             layer.init_weights(buffer_device=buffer_device)
 
 
