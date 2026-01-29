@@ -78,7 +78,6 @@ dependencies = [
     "diffusers",
     "ftfy",
     "imageio-ffmpeg",
-    "liger-kernel>=0.5.9; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "megatron-fsdp",
     "opencv-python-headless==4.10.0.84",
     "pybind11",
@@ -149,7 +148,7 @@ linting = [
     "import-linter~=2.4",
 ]
 test = ["coverage", "pytest", "peft"]
-dev = ["cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab"]
+dev = ["cut-cross-entropy", "liger_kernel"]
 
 [tool.uv]
 default-groups = ["build", "docs", "test"]
@@ -181,6 +180,8 @@ torch = [
     { index = "pytorch", marker = "sys_platform != 'darwin'" },
     { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
+cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
+liger_kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "49e63538e64b00780e424e34bc4f193dcfeba75c" }
 
 [tool.coverage.paths]
 source = [".", "/workspace", "/home/runner/work/Automodel/Automodel"]
