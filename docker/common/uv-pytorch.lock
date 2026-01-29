@@ -3155,6 +3155,7 @@ requires-dist = [
     { name = "albumentations", marker = "extra == 'vlm'" },
     { name = "backoff", marker = "extra == 'vlm'" },
     { name = "causal-conv1d", marker = "extra == 'cuda'" },
+    { name = "databricks-sql-connector", marker = "extra == 'delta-databricks'", specifier = ">=3.0.0" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "deltalake", marker = "extra == 'delta-databricks'", specifier = ">=1.0.0" },
     { name = "diffusers" },
