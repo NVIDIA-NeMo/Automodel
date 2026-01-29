@@ -22,6 +22,10 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+
+from nemo_automodel.shared.torch_patches import apply_torch_patches
+
+apply_torch_patches()
 import torch.distributed as dist
 import torch.nn as nn
 import yaml
@@ -368,7 +372,7 @@ class BaseRecipe:
         self.checkpointer.load_optimizer(optimizer, model, ckpt_dir, scheduler)
 
     def _log_experiment_details(self):
-        """Log metadata and resolved config on main rank using YAML markers."""
+        """Log metadata and config on main rank using YAML markers."""
         if not getattr(self, "dist_env", None) or not getattr(self.dist_env, "is_main", False):
             return
         details = {
@@ -387,16 +391,28 @@ class BaseRecipe:
                 logging.info(line)
         except Exception:
             logging.info(f"Experiment details: {details}")
-        # Resolved config
+        # Config (print original placeholders for reproducibility)
         try:
             cfg_obj = getattr(self, "cfg", None)
             # Prefer YAML-ready dict that converts callables/classes to dotted paths and preserves typed scalars
             if hasattr(cfg_obj, "to_yaml_dict"):
-                cfg_dict = cfg_obj.to_yaml_dict()
+                cfg_dict = cfg_obj.to_yaml_dict(use_orig_values=True)
             elif hasattr(cfg_obj, "to_dict"):
                 cfg_dict = cfg_obj.to_dict()
             else:
                 cfg_dict = dict(cfg_obj) if cfg_obj is not None else {}
+
+            # If any leaf values carry `_orig_value`, prefer it for printing.
+            def _prefer_orig_values(x):
+                if hasattr(x, "_orig_value"):
+                    return getattr(x, "_orig_value")
+                if isinstance(x, dict):
+                    return {k: _prefer_orig_values(v) for k, v in x.items()}
+                if isinstance(x, list):
+                    return [_prefer_orig_values(v) for v in x]
+                return x
+
+            cfg_dict = _prefer_orig_values(cfg_dict)
 
             # Print as clean YAML on stdout for easy copy/paste and readability
             cfg_yaml = yaml.safe_dump(cfg_dict, sort_keys=False, default_flow_style=False).strip()

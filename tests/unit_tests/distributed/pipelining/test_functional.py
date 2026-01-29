@@ -148,6 +148,60 @@ class TestGenerateHfModelFqnPerModelPart:
         with pytest.raises(ValueError):
             generate_hf_model_fqn_per_model_part(5, 4)  # More stages than layers
 
+    def test_include_multimodal_encoders(self):
+        """Test that multimodal encoder suffixes are included in stage 0 when enabled."""
+        from nemo_automodel.components.distributed.pipelining.hf_utils import MULTIMODAL_SUFFIXES
+
+        result = generate_hf_model_fqn_per_model_part(
+            num_stages=2,
+            num_layers=4,
+            include_multimodal_encoders=True,
+        )
+        # Check multimodal suffixes are in first stage
+        for suffix in MULTIMODAL_SUFFIXES:
+            assert f"model.{suffix}" in result[0]
+
+    def test_exclude_multimodal_encoders(self):
+        """Test that multimodal encoder suffixes are excluded when disabled."""
+        from nemo_automodel.components.distributed.pipelining.hf_utils import MULTIMODAL_SUFFIXES
+
+        result = generate_hf_model_fqn_per_model_part(
+            num_stages=2,
+            num_layers=4,
+            include_multimodal_encoders=False,
+        )
+        # Check multimodal suffixes are NOT in first stage
+        for suffix in MULTIMODAL_SUFFIXES:
+            assert f"model.{suffix}" not in result[0]
+
+    def test_extra_module_fqns(self):
+        """Test that extra_module_fqns are included in stage 0."""
+        extra_fqns = ["model.custom_encoder", "model.special_module"]
+        result = generate_hf_model_fqn_per_model_part(
+            num_stages=2,
+            num_layers=4,
+            extra_module_fqns=extra_fqns,
+        )
+        # Check extra FQNs are in first stage
+        for fqn in extra_fqns:
+            assert fqn in result[0]
+        # Check they are NOT in other stages
+        assert "model.custom_encoder" not in result[1]
+
+    def test_custom_lm_head_fqn(self):
+        """Test that custom lm_head_fqn is used in last stage."""
+        result = generate_hf_model_fqn_per_model_part(
+            num_stages=2,
+            num_layers=4,
+            include_lm_head=True,
+            lm_head_fqn="model.language_model.lm_head",
+        )
+        # Check custom lm_head FQN is in last stage
+        assert "model.language_model.lm_head" in result[1]
+        # Check the bare "lm_head" (default) is NOT present as a standalone entry
+        lm_head_entries = [m for m in result[1] if m == "lm_head"]
+        assert len(lm_head_entries) == 0
+
 
 class TestCalculateVirtualStages:
     """Test calculate_virtual_stages function - no mocks needed."""
@@ -262,19 +316,36 @@ class TestCalculateVirtualStages:
 
 class TestSplitModelIntoStages:
     """Test split_model_into_stages function with mocks."""
+    @patch('nemo_automodel.components.distributed.pipelining.functional.get_text_module')
     @patch('nemo_automodel.components.distributed.pipelining.functional.calculate_virtual_stages')
     @patch('nemo_automodel.components.distributed.pipelining.functional.generate_hf_model_fqn_per_model_part')
-    def test_auto_generate_module_names(self, mock_generate_fqn, mock_calc_stages):
+    def test_auto_generate_module_names(self, mock_generate_fqn, mock_calc_stages, mock_get_text_module):
         # Setup mocks
         mock_pp_mesh = Mock()
         mock_pp_mesh.get_local_rank.return_value = 0
         mock_pp_mesh.size.return_value = 2
+
+        # Create a mock text_model that get_text_module will return
+        mock_text_model = Mock()
+        mock_text_model.layers = [Mock() for _ in range(4)]
+        mock_text_model.rotary_emb = Mock()
+        # Ensure text_model doesn't have 'model' attr (simple model structure)
+        del mock_text_model.model
+
+        mock_get_text_module.return_value = mock_text_model
 
         mock_model = Mock()
         mock_model.model = Mock()
         mock_model.model.layers = [Mock() for _ in range(4)]
         mock_model.model.rotary_emb = Mock()
         mock_model.lm_head = Mock()
+        # Ensure model doesn't have TEXT_MODULE_ATTRS attributes
+        del mock_model.language_model
+        del mock_model.text_model
+        del mock_model.text_decoder
+        del mock_model.model.language_model
+        del mock_model.model.text_model
+        del mock_model.model.text_decoder
 
         # Mock virtual stages calculation
         mock_calc_stages.return_value = (2, 1)
@@ -312,6 +383,74 @@ class TestSplitModelIntoStages:
 
             # Verify FQN generation was called
             mock_generate_fqn.assert_called_once()
+
+    @patch('nemo_automodel.components.distributed.pipelining.functional.get_text_module')
+    @patch('nemo_automodel.components.distributed.pipelining.functional.calculate_virtual_stages')
+    @patch('nemo_automodel.components.distributed.pipelining.functional.generate_hf_model_fqn_per_model_part')
+    @pytest.mark.parametrize("lm_head_on_top_level", [True, False])
+    def test_nested_language_model_structure(self, mock_generate_fqn, mock_calc_stages, mock_get_text_module, lm_head_on_top_level):
+        """Test split_model_into_stages with nested language_model structure (covers lines 311-318)."""
+        mock_pp_mesh = Mock()
+        mock_pp_mesh.get_local_rank.return_value = 0
+        mock_pp_mesh.size.return_value = 2
+
+        # Create mock text_model with nested .model attribute (like LlamaForCausalLM)
+        mock_text_model = Mock()
+        mock_text_model.model = Mock()  # Has .model attr -> text_model_has_model_attr=True
+        mock_text_model.model.layers = [Mock() for _ in range(4)]
+        mock_text_model.rotary_emb = Mock()
+
+        mock_get_text_module.return_value = mock_text_model
+
+        # Create model with language_model attribute (triggers nested path)
+        mock_model = Mock()
+        mock_model.model = Mock()
+        mock_model.model.language_model = mock_text_model  # TEXT_MODULE_ATTRS match
+
+        # Configure lm_head location
+        if lm_head_on_top_level:
+            mock_model.lm_head = Mock()
+            del mock_text_model.lm_head
+        else:
+            mock_text_model.lm_head = Mock()
+            del mock_model.lm_head
+
+        # Remove other TEXT_MODULE_ATTRS to ensure language_model is matched
+        del mock_model.text_model
+        del mock_model.text_decoder
+        del mock_model.model.text_model
+        del mock_model.model.text_decoder
+
+        mock_calc_stages.return_value = (2, 1)
+        mock_generate_fqn.return_value = [
+            ["model.language_model.model.embed_tokens", "model.language_model.model.layers.0"],
+            ["model.language_model.model.layers.1", "model.language_model.model.norm"],
+        ]
+
+        with patch('nemo_automodel.components.distributed.pipelining.functional.PipelineStage'), \
+             patch('nemo_automodel.components.distributed.pipelining.functional.get_schedule_class') as mock_get_schedule, \
+             patch('nemo_automodel.components.distributed.pipelining.functional.stage_ids_this_rank') as mock_stage_ids, \
+             patch('copy.deepcopy') as mock_deepcopy:
+
+            mock_get_schedule.return_value = PipelineScheduleSingle
+            mock_stage_ids.return_value = (0,)
+            mock_copy = Mock()
+            mock_copy.named_children.return_value = []
+            mock_deepcopy.return_value = mock_copy
+
+            stages, models = split_model_into_stages(
+                mock_model, mock_pp_mesh, "pp", "PipelineScheduleSingle",
+                torch.device("cuda:0"), layers_per_stage=2,
+            )
+
+            # Verify generate_fqn was called with correct parameters for nested model
+            call_kwargs = mock_generate_fqn.call_args[1]
+            assert call_kwargs['include_multimodal_encoders'] is False
+            assert any('model.' in fqn for fqn in call_kwargs['extra_module_fqns'])
+            if lm_head_on_top_level:
+                assert call_kwargs['lm_head_fqn'] == "lm_head"
+            else:
+                assert "language_model.lm_head" in call_kwargs['lm_head_fqn']
 
 
 class TestBuildPipelineSchedule:
@@ -564,5 +703,4 @@ class TestPipelineModel:
         # Verify parallelize_fn was called
         mock_parallelize_fn.assert_called_once()
         call_kwargs = mock_parallelize_fn.call_args[1]
-        assert call_kwargs['pp_enabled'] is True
         assert call_kwargs['dp_axis_names'] == ("dp",)

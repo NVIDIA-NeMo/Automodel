@@ -1,0 +1,861 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for KimiVL model components."""
+
+import torch
+from unittest.mock import MagicMock, patch
+
+import pytest
+from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+
+from nemo_automodel.components.models.kimivl.model import (
+    KimiVLConfig,
+    KimiVLForConditionalGeneration,
+    MoonViTConfig,
+)
+
+
+class TestMoonViTConfig:
+    """Tests for MoonViTConfig."""
+
+    def test_default_initialization(self):
+        """Test MoonViTConfig initializes with correct defaults."""
+        config = MoonViTConfig()
+        
+        assert config.patch_size == 14
+        assert config.init_pos_emb_height == 64
+        assert config.init_pos_emb_width == 64
+        assert config.num_attention_heads == 16
+        assert config.num_hidden_layers == 27
+        assert config.hidden_size == 1152
+        assert config.intermediate_size == 4304
+        assert config.merge_kernel_size == [2, 2]
+        assert config.model_type == "moonvit"
+
+    def test_custom_initialization(self):
+        """Test MoonViTConfig with custom values."""
+        config = MoonViTConfig(
+            patch_size=16,
+            hidden_size=768,
+            num_hidden_layers=12,
+            merge_kernel_size=(4, 4),
+        )
+        
+        assert config.patch_size == 16
+        assert config.hidden_size == 768
+        assert config.num_hidden_layers == 12
+        assert config.merge_kernel_size == [4, 4]
+
+    def test_merge_kernel_size_tuple_to_list(self):
+        """Test that tuple merge_kernel_size is converted to list."""
+        config = MoonViTConfig(merge_kernel_size=(3, 3))
+        assert config.merge_kernel_size == [3, 3]
+        assert isinstance(config.merge_kernel_size, list)
+
+
+class TestKimiVLConfig:
+    """Tests for KimiVLConfig."""
+
+    def test_default_initialization(self):
+        """Test KimiVLConfig initializes with defaults."""
+        config = KimiVLConfig()
+        
+        assert isinstance(config.vision_config, MoonViTConfig)
+        assert isinstance(config.text_config, DeepseekV3Config)
+        assert config.ignore_index == -100
+        assert config.media_placeholder_token_id == 163605
+        assert config.pad_token_id == 0
+        assert config.architectures == ["KimiVLForConditionalGeneration"]
+        assert config.model_type == "kimi_vl"
+
+    def test_initialization_with_dict_configs(self):
+        """Test KimiVLConfig initializes correctly from dict configs."""
+        vision_dict = {"hidden_size": 768, "patch_size": 16}
+        text_dict = {"hidden_size": 1024, "vocab_size": 50000}
+        
+        config = KimiVLConfig(
+            vision_config=vision_dict,
+            text_config=text_dict,
+        )
+        
+        assert isinstance(config.vision_config, MoonViTConfig)
+        assert config.vision_config.hidden_size == 768
+        assert config.vision_config.patch_size == 16
+        
+        assert isinstance(config.text_config, DeepseekV3Config)
+        assert config.text_config.hidden_size == 1024
+        assert config.text_config.vocab_size == 50000
+
+    def test_initialization_with_config_objects(self):
+        """Test KimiVLConfig initializes correctly from config objects."""
+        vision_config = MoonViTConfig(hidden_size=512)
+        text_config = DeepseekV3Config(hidden_size=2048)
+        
+        config = KimiVLConfig(
+            vision_config=vision_config,
+            text_config=text_config,
+        )
+        
+        assert config.vision_config is vision_config
+        assert config.text_config is text_config
+
+    def test_to_dict(self):
+        """Test KimiVLConfig.to_dict() includes nested configs."""
+        config = KimiVLConfig()
+        config_dict = config.to_dict()
+        
+        assert "vision_config" in config_dict
+        assert "text_config" in config_dict
+        assert isinstance(config_dict["vision_config"], dict)
+        assert isinstance(config_dict["text_config"], dict)
+        assert config_dict["vision_config"]["model_type"] == "moonvit"
+
+    def test_custom_architectures(self):
+        """Test KimiVLConfig with custom architectures."""
+        config = KimiVLConfig(architectures=["CustomArch"])
+        assert config.architectures == ["CustomArch"]
+
+
+class TestKimiVLForConditionalGeneration:
+    """Tests for KimiVLForConditionalGeneration."""
+
+    def test_from_pretrained_delegates_to_from_config(self):
+        """Test from_pretrained loads config and delegates to from_config."""
+        mock_config = MagicMock(spec=KimiVLConfig)
+        mock_config.vision_config = MoonViTConfig()
+        mock_config.text_config = DeepseekV3Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
+        )
+        mock_config.media_placeholder_token_id = 163605
+        
+        with patch.object(KimiVLConfig, "from_pretrained", return_value=mock_config):
+            with patch.object(
+                KimiVLForConditionalGeneration, "from_config"
+            ) as mock_from_config:
+                mock_from_config.return_value = MagicMock()
+                
+                KimiVLForConditionalGeneration.from_pretrained("dummy/path")
+                
+                KimiVLConfig.from_pretrained.assert_called_once_with("dummy/path")
+                mock_from_config.assert_called_once()
+                assert mock_from_config.call_args[0][0] is mock_config
+
+    def test_modelclass_export_exists(self):
+        """Test ModelClass is exported and points to correct class."""
+        from nemo_automodel.components.models.kimivl import model as kimivl_mod
+        
+        assert hasattr(kimivl_mod, "ModelClass")
+        assert kimivl_mod.ModelClass is KimiVLForConditionalGeneration
+
+
+class TestKimiVLUsesDeepseekV3Config:
+    """Tests to verify KimiVL properly uses HuggingFace's DeepseekV3Config."""
+
+    def test_text_config_is_hf_deepseek_v3_config(self):
+        """Verify text_config uses HF's DeepseekV3Config, not a custom class."""
+        config = KimiVLConfig()
+        
+        # Should be the actual HuggingFace DeepseekV3Config class
+        assert type(config.text_config).__name__ == "DeepseekV3Config"
+        assert type(config.text_config).__module__ == "transformers.models.deepseek_v3.configuration_deepseek_v3"
+
+    def test_text_config_from_dict_creates_hf_config(self):
+        """Verify creating from dict still uses HF's DeepseekV3Config."""
+        config = KimiVLConfig(text_config={"hidden_size": 512})
+        
+        assert type(config.text_config).__name__ == "DeepseekV3Config"
+        assert config.text_config.hidden_size == 512
+
+
+class TestVisionTowerComponents:
+    """Tests for MoonVit vision tower components."""
+
+    def test_apply_rope_vision_output_shape(self):
+        """Test _apply_rope_vision produces correct output shapes."""
+        from nemo_automodel.components.models.kimivl.model import _apply_rope_vision
+
+        batch_seq = 16
+        num_heads = 4
+        head_dim = 32
+        xq = torch.randn(batch_seq, num_heads, head_dim)
+        xk = torch.randn(batch_seq, num_heads, head_dim)
+        freqs_cis = torch.randn(batch_seq, head_dim // 2, dtype=torch.complex64)
+
+        xq_out, xk_out = _apply_rope_vision(xq, xk, freqs_cis)
+
+        assert xq_out.shape == xq.shape
+        assert xk_out.shape == xk.shape
+        assert xq_out.dtype == xq.dtype
+        assert xk_out.dtype == xk.dtype
+
+    def test_learnable_2d_interp_pos_emb_same_size(self):
+        """Test Learnable2DInterpPosEmb with same size (no interpolation)."""
+        from nemo_automodel.components.models.kimivl.model import Learnable2DInterpPosEmb
+
+        height, width, dim = 8, 8, 64
+        pos_emb = Learnable2DInterpPosEmb(height, width, dim)
+
+        seq_len = height * width
+        x = torch.randn(seq_len, dim)
+        grid_hws = torch.tensor([[height, width]])
+
+        output = pos_emb(x, grid_hws)
+        assert output.shape == (seq_len, dim)
+
+    def test_learnable_2d_interp_pos_emb_interpolation(self):
+        """Test Learnable2DInterpPosEmb with different size (requires interpolation)."""
+        from nemo_automodel.components.models.kimivl.model import Learnable2DInterpPosEmb
+
+        height, width, dim = 8, 8, 64
+        pos_emb = Learnable2DInterpPosEmb(height, width, dim)
+
+        # Different size triggers interpolation
+        new_h, new_w = 4, 4
+        seq_len = new_h * new_w
+        x = torch.randn(seq_len, dim)
+        grid_hws = torch.tensor([[new_h, new_w]])
+
+        output = pos_emb(x, grid_hws)
+        assert output.shape == (seq_len, dim)
+
+    def test_rope_2d_pos_emb_freqs_cis_shape(self):
+        """Test Rope2DPosEmb generates correct freqs_cis shape."""
+        from nemo_automodel.components.models.kimivl.model import Rope2DPosEmb
+
+        dim = 64
+        max_height, max_width = 16, 16
+        rope = Rope2DPosEmb(dim, max_height, max_width)
+
+        grid_hws = torch.tensor([[8, 8], [4, 4]])
+        freqs_cis = rope.get_freqs_cis(grid_hws)
+
+        # Total tokens = 8*8 + 4*4 = 64 + 16 = 80
+        expected_seq_len = 8 * 8 + 4 * 4
+        assert freqs_cis.shape == (expected_seq_len, dim // 2)
+
+    def test_moonvit_mlp_forward(self):
+        """Test MoonVitMLP forward pass."""
+        from nemo_automodel.components.models.kimivl.model import MoonVitMLP
+        import torch.nn.functional as F
+
+        dims = [64, 128, 64]
+        mlp = MoonVitMLP(dims, activation=F.gelu)
+
+        x = torch.randn(16, 64)
+        output = mlp(x)
+
+        assert output.shape == (16, 64)
+
+    def test_patch_merger_output_structure(self):
+        """Test patch_merger produces correct output structure."""
+        from nemo_automodel.components.models.kimivl.model import patch_merger
+
+        hidden_dim = 64
+        h1, w1 = 8, 8
+        h2, w2 = 4, 4
+        total_tokens = h1 * w1 + h2 * w2
+
+        x = torch.randn(total_tokens, hidden_dim)
+        grid_hws = torch.tensor([[h1, w1], [h2, w2]])
+        merge_kernel = [2, 2]
+
+        outputs = patch_merger(x, grid_hws, merge_kernel)
+
+        assert len(outputs) == 2
+        # First image: 8x8 -> 4x4 after 2x2 merge = 16 patches
+        assert outputs[0].shape == (16, 4, hidden_dim)  # (new_h*new_w, kh*kw, dim)
+        # Second image: 4x4 -> 2x2 after 2x2 merge = 4 patches
+        assert outputs[1].shape == (4, 4, hidden_dim)
+
+
+class TestMoonVitPretrainedModel:
+    """Tests for MoonVitPretrainedModel."""
+
+    @pytest.fixture
+    def small_vit_config(self):
+        """Create a small MoonViT config for testing."""
+        return MoonViTConfig(
+            patch_size=14,
+            init_pos_emb_height=8,
+            init_pos_emb_width=8,
+            num_attention_heads=4,
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            merge_kernel_size=[2, 2],
+        )
+
+    def test_moonvit_initialization(self, small_vit_config):
+        """Test MoonVitPretrainedModel initializes correctly."""
+        from nemo_automodel.components.models.kimivl.model import MoonVitPretrainedModel
+
+        model = MoonVitPretrainedModel(small_vit_config)
+
+        assert model.config is small_vit_config
+        assert model.merge_kernel_size == [2, 2]
+        assert hasattr(model, "patch_embed")
+        assert hasattr(model, "encoder")
+
+    def test_moonvit_dtype_property(self, small_vit_config):
+        """Test MoonVitPretrainedModel dtype property."""
+        from nemo_automodel.components.models.kimivl.model import MoonVitPretrainedModel
+
+        model = MoonVitPretrainedModel(small_vit_config)
+        assert model.dtype == torch.float32
+
+        model = model.to(torch.bfloat16)
+        assert model.dtype == torch.bfloat16
+
+
+class TestKimiVLMultiModalProjector:
+    """Tests for KimiVLMultiModalProjector."""
+
+    @pytest.fixture
+    def projector_config(self):
+        """Create config for projector testing."""
+        vision_config = MoonViTConfig(hidden_size=64, merge_kernel_size=[2, 2])
+        text_config = DeepseekV3Config(hidden_size=128)
+        return KimiVLConfig(vision_config=vision_config, text_config=text_config)
+
+    def test_projector_initialization(self, projector_config):
+        """Test KimiVLMultiModalProjector initializes correctly."""
+        from nemo_automodel.components.models.kimivl.model import KimiVLMultiModalProjector
+
+        projector = KimiVLMultiModalProjector(projector_config)
+
+        # hidden_size = vision_hidden * merge_h * merge_w = 64 * 2 * 2 = 256
+        assert projector.hidden_size == 256
+        assert projector.linear_1.in_features == 256
+        assert projector.linear_1.out_features == 256
+        assert projector.linear_2.in_features == 256
+        assert projector.linear_2.out_features == 128  # text hidden size
+
+    def test_projector_forward(self, projector_config):
+        """Test KimiVLMultiModalProjector forward pass."""
+        from nemo_automodel.components.models.kimivl.model import KimiVLMultiModalProjector
+
+        projector = KimiVLMultiModalProjector(projector_config)
+
+        # Simulate merged patches: list of (num_patches, merge_tokens, vision_dim)
+        image_features = [
+            torch.randn(16, 4, 64),  # 16 patches, 4 merged tokens (2x2), 64 dim
+            torch.randn(4, 4, 64),   # 4 patches
+        ]
+
+        output = projector(image_features)
+
+        # Total tokens = 16 + 4 = 20
+        assert output.shape == (20, 128)  # (total_tokens, text_hidden_size)
+
+
+class TestKimiVLModel:
+    """Tests for KimiVLModel."""
+
+    @pytest.fixture
+    def small_kimivl_config(self):
+        """Create a small KimiVL config for testing."""
+        vision_config = MoonViTConfig(
+            patch_size=14,
+            init_pos_emb_height=4,
+            init_pos_emb_width=4,
+            num_attention_heads=2,
+            num_hidden_layers=1,
+            hidden_size=32,
+            intermediate_size=64,
+            merge_kernel_size=[2, 2],
+        )
+        text_config = DeepseekV3Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=2,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            qk_rope_head_dim=8,
+            v_head_dim=8,
+            qk_nope_head_dim=8,
+            n_routed_experts=4,
+            n_group=2,
+            topk_group=2,
+            num_experts_per_tok=2,
+            first_k_dense_replace=0,
+        )
+        return KimiVLConfig(
+            vision_config=vision_config,
+            text_config=text_config,
+            media_placeholder_token_id=99,
+        )
+
+    def test_kimivl_model_raises_when_both_inputs(self, small_kimivl_config):
+        """Test KimiVLModel raises error when both input_ids and inputs_embeds provided."""
+        from nemo_automodel.components.models.kimivl.model import KimiVLModel
+        from nemo_automodel.components.models.common import BackendConfig
+
+        backend = BackendConfig(linear="torch", rms_norm="torch", attn="sdpa", rope_fusion=False)
+        model = KimiVLModel(small_kimivl_config, backend=backend)
+
+        input_ids = torch.randint(0, 100, (1, 8))
+        inputs_embeds = torch.randn(1, 8, 64)
+
+        with pytest.raises(ValueError, match="exactly one of input_ids or inputs_embeds"):
+            model(input_ids=input_ids, inputs_embeds=inputs_embeds)
+
+    def test_kimivl_model_raises_when_neither_inputs(self, small_kimivl_config):
+        """Test KimiVLModel raises error when neither input_ids nor inputs_embeds provided."""
+        from nemo_automodel.components.models.kimivl.model import KimiVLModel
+        from nemo_automodel.components.models.common import BackendConfig
+
+        backend = BackendConfig(linear="torch", rms_norm="torch", attn="sdpa", rope_fusion=False)
+        model = KimiVLModel(small_kimivl_config, backend=backend)
+
+        with pytest.raises(ValueError, match="exactly one of input_ids or inputs_embeds"):
+            model(input_ids=None, inputs_embeds=None)
+
+
+class TestKimiVLForConditionalGenerationForward:
+    """Tests for KimiVLForConditionalGeneration forward pass."""
+
+    @pytest.fixture
+    def small_config_and_backend(self):
+        """Create small config and backend for testing."""
+        from nemo_automodel.components.models.common import BackendConfig
+
+        vision_config = MoonViTConfig(
+            patch_size=14,
+            init_pos_emb_height=4,
+            init_pos_emb_width=4,
+            num_attention_heads=2,
+            num_hidden_layers=1,
+            hidden_size=32,
+            intermediate_size=64,
+            merge_kernel_size=[2, 2],
+        )
+        text_config = DeepseekV3Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=2,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            qk_rope_head_dim=8,
+            v_head_dim=8,
+            qk_nope_head_dim=8,
+            n_routed_experts=4,
+            n_group=2,
+            topk_group=2,
+            num_experts_per_tok=2,
+            first_k_dense_replace=0,
+        )
+        config = KimiVLConfig(
+            vision_config=vision_config,
+            text_config=text_config,
+            media_placeholder_token_id=99,
+        )
+        backend = BackendConfig(linear="torch", rms_norm="torch", attn="sdpa", rope_fusion=False)
+        return config, backend
+
+    def test_forward_text_only(self, small_config_and_backend):
+        """Test forward pass with text only (no images)."""
+        config, backend = small_config_and_backend
+        model = KimiVLForConditionalGeneration(config, backend=backend)
+        model.eval()
+
+        batch_size, seq_len = 2, 8
+        input_ids = torch.randint(0, 98, (batch_size, seq_len))  # Avoid media token 99
+
+        with torch.no_grad():
+            output = model(input_ids=input_ids, return_dict=False)
+
+        assert output.shape == (batch_size, seq_len, config.text_config.vocab_size)
+
+    def test_forward_returns_dict(self, small_config_and_backend):
+        """Test forward pass returns dict when return_dict=True."""
+        config, backend = small_config_and_backend
+        model = KimiVLForConditionalGeneration(config, backend=backend)
+        model.eval()
+
+        input_ids = torch.randint(0, 98, (1, 4))
+
+        with torch.no_grad():
+            output = model(input_ids=input_ids, return_dict=True)
+
+        assert hasattr(output, "logits")
+        assert hasattr(output, "loss")
+        assert output.loss is None  # No labels provided
+
+    def test_forward_with_labels_computes_loss(self, small_config_and_backend):
+        """Test forward pass computes loss when labels provided."""
+        config, backend = small_config_and_backend
+        model = KimiVLForConditionalGeneration(config, backend=backend)
+        model.eval()
+
+        batch_size, seq_len = 2, 8
+        input_ids = torch.randint(0, 98, (batch_size, seq_len))
+        labels = torch.randint(0, 98, (batch_size, seq_len))
+
+        with torch.no_grad():
+            output = model(input_ids=input_ids, labels=labels, return_dict=True)
+
+        assert output.loss is not None
+        assert output.loss.dim() == 0  # Scalar loss
+
+    def test_get_input_embeddings(self, small_config_and_backend):
+        """Test get_input_embeddings returns embed_tokens."""
+        config, backend = small_config_and_backend
+        model = KimiVLForConditionalGeneration(config, backend=backend)
+
+        embed = model.get_input_embeddings()
+        assert embed is not None
+        assert embed.num_embeddings == config.text_config.vocab_size
+
+    def test_get_output_embeddings(self, small_config_and_backend):
+        """Test get_output_embeddings returns lm_head."""
+        config, backend = small_config_and_backend
+        model = KimiVLForConditionalGeneration(config, backend=backend)
+
+        lm_head = model.get_output_embeddings()
+        assert lm_head is not None
+        assert lm_head.out_features == config.text_config.vocab_size
+
+    def test_lm_head_property(self, small_config_and_backend):
+        """Test lm_head property provides convenient access."""
+        config, backend = small_config_and_backend
+        model = KimiVLForConditionalGeneration(config, backend=backend)
+
+        assert model.lm_head is model.model.language_model.lm_head
+
+
+class TestKimiVLStateDictAdapter:
+    """Tests for KimiVLStateDictAdapter."""
+
+    @pytest.fixture
+    def adapter_setup(self):
+        """Create adapter setup for testing."""
+        from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel.components.models.kimivl.model import KimiVLStateDictAdapter
+        from nemo_automodel.components.moe.layers import MoEConfig
+
+        config = KimiVLConfig(
+            vision_config=MoonViTConfig(hidden_size=64),
+            text_config=DeepseekV3Config(
+                hidden_size=64,
+                num_hidden_layers=1,
+                n_routed_experts=4,
+                n_group=2,
+                topk_group=2,
+            ),
+        )
+        moe_config = MoEConfig(
+            dim=64,
+            inter_dim=128,
+            moe_inter_dim=64,
+            n_routed_experts=4,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=2,
+            n_limited_groups=2,
+            train_gate=True,
+            gate_bias_update_factor=0.001,
+            aux_loss_coeff=0.0,
+            score_func="sigmoid",
+            route_scale=1.0,
+            norm_topk_prob=True,
+        )
+        backend = BackendConfig(linear="torch", rms_norm="torch")
+        adapter = KimiVLStateDictAdapter(config, moe_config, backend)
+        return adapter
+
+    def test_adapter_from_hf_vision_keys(self, adapter_setup):
+        """Test adapter correctly transforms vision tower keys."""
+        adapter = adapter_setup
+
+        hf_state_dict = {
+            "vision_tower.patch_embed.proj.weight": torch.randn(64, 3, 14, 14),
+            "vision_tower.encoder.blocks.0.norm0.weight": torch.randn(64),
+        }
+
+        native_dict = adapter.from_hf(hf_state_dict)
+
+        assert "model.vision_tower.patch_embed.proj.weight" in native_dict
+        assert "model.vision_tower.encoder.blocks.0.norm0.weight" in native_dict
+
+    def test_adapter_from_hf_projector_keys(self, adapter_setup):
+        """Test adapter correctly transforms projector keys."""
+        adapter = adapter_setup
+
+        hf_state_dict = {
+            "multi_modal_projector.linear_1.weight": torch.randn(256, 256),
+            "multi_modal_projector.linear_2.weight": torch.randn(64, 256),
+        }
+
+        native_dict = adapter.from_hf(hf_state_dict)
+
+        assert "model.multi_modal_projector.linear_1.weight" in native_dict
+        assert "model.multi_modal_projector.linear_2.weight" in native_dict
+
+    def test_adapter_from_hf_lm_head_keys(self, adapter_setup):
+        """Test adapter correctly transforms lm_head keys."""
+        adapter = adapter_setup
+
+        hf_state_dict = {
+            "language_model.lm_head.weight": torch.randn(100, 64),
+        }
+
+        native_dict = adapter.from_hf(hf_state_dict)
+
+        assert "lm_head.weight" in native_dict
+
+    def test_adapter_to_hf_roundtrip_vision(self, adapter_setup):
+        """Test to_hf/from_hf roundtrip preserves vision keys."""
+        adapter = adapter_setup
+
+        original = {
+            "model.vision_tower.patch_embed.proj.weight": torch.randn(64, 3, 14, 14),
+        }
+
+        hf_dict = adapter.to_hf(original)
+        restored = adapter.from_hf(hf_dict)
+
+        assert "model.vision_tower.patch_embed.proj.weight" in restored
+
+
+class TestKimiVLPipelineParallelismChunking:
+    """Tests for VLM chunking logic used in pipeline parallelism.
+    
+    These tests mock the vision tower to focus on testing the PP chunking
+    attribute retrieval logic, not the vision processing itself.
+    """
+
+    @pytest.fixture
+    def model_with_config(self):
+        """Create a small KimiVL model for PP chunking tests."""
+        from nemo_automodel.components.models.common import BackendConfig
+
+        vision_config = MoonViTConfig(
+            patch_size=14,
+            init_pos_emb_height=4,
+            init_pos_emb_width=4,
+            num_attention_heads=2,
+            num_hidden_layers=1,
+            hidden_size=32,
+            intermediate_size=64,
+            merge_kernel_size=[2, 2],
+        )
+        text_config = DeepseekV3Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=2,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            qk_rope_head_dim=8,
+            v_head_dim=8,
+            qk_nope_head_dim=8,
+            n_routed_experts=4,
+            n_group=2,
+            topk_group=2,
+            num_experts_per_tok=2,
+            first_k_dense_replace=0,
+        )
+        config = KimiVLConfig(
+            vision_config=vision_config,
+            text_config=text_config,
+            media_placeholder_token_id=99,
+        )
+        backend = BackendConfig(linear="torch", rms_norm="torch", attn="sdpa", rope_fusion=False)
+        model = KimiVLForConditionalGeneration(config, backend=backend)
+        model.eval()
+        return model, config
+
+    def test_pp_chunking_retrieves_pixel_values_when_media_tokens_present(self, model_with_config):
+        """Test that PP chunking retrieves pixel_values when input has media tokens."""
+        model, config = model_with_config
+
+        # Mock vision tower to return dummy features matching expected shape and dtype
+        def mock_extract_features(pixel_values, grid_hws):
+            return torch.randn(1, config.text_config.hidden_size, dtype=torch.bfloat16)
+
+        model.model._extract_image_features = mock_extract_features
+
+        # Set up pre-chunked VLM inputs
+        chunk1 = torch.randn(1, 3, 56, 56)
+        chunk2 = torch.randn(1, 3, 56, 56)
+        grid1 = torch.tensor([[4, 4]])
+        grid2 = torch.tensor([[4, 4]])
+
+        model._vlm_pixel_values_chunks = [chunk1, chunk2]
+        model._vlm_image_grid_hws_chunks = [grid1, grid2]
+        model._vlm_chunk_idx = 0
+
+        # Input with media placeholder token
+        input_ids = torch.tensor([[1, 2, 99, 3, 4]])  # 99 is media_placeholder_token_id
+
+        with torch.no_grad():
+            _ = model(input_ids=input_ids, return_dict=False)
+
+        assert model._vlm_chunk_idx == 1, "chunk_idx should be incremented after forward"
+
+    def test_pp_chunking_increments_idx_per_forward(self, model_with_config):
+        """Test that chunk_idx increments with each forward call."""
+        model, config = model_with_config
+
+        def mock_extract_features(pixel_values, grid_hws):
+            return torch.randn(1, config.text_config.hidden_size, dtype=torch.bfloat16)
+
+        model.model._extract_image_features = mock_extract_features
+
+        # Set up 3 chunks
+        chunks = [torch.randn(1, 3, 56, 56) for _ in range(3)]
+        grids = [torch.tensor([[4, 4]]) for _ in range(3)]
+
+        model._vlm_pixel_values_chunks = chunks
+        model._vlm_image_grid_hws_chunks = grids
+        model._vlm_chunk_idx = 0
+
+        input_ids = torch.tensor([[1, 99, 2]])  # Has media token
+
+        with torch.no_grad():
+            _ = model(input_ids=input_ids, return_dict=False)
+            assert model._vlm_chunk_idx == 1
+
+            _ = model(input_ids=input_ids, return_dict=False)
+            assert model._vlm_chunk_idx == 2
+
+            _ = model(input_ids=input_ids, return_dict=False)
+            assert model._vlm_chunk_idx == 3
+
+    def test_pp_chunking_skipped_when_no_media_tokens(self, model_with_config):
+        """Test that PP chunking is skipped when input has no media tokens."""
+        model, config = model_with_config
+
+        chunk1 = torch.randn(1, 3, 56, 56)
+        grid1 = torch.tensor([[4, 4]])
+
+        model._vlm_pixel_values_chunks = [chunk1]
+        model._vlm_image_grid_hws_chunks = [grid1]
+        model._vlm_chunk_idx = 0
+
+        # Input WITHOUT media placeholder token
+        input_ids = torch.tensor([[1, 2, 3, 4, 5]])  # No 99
+
+        with torch.no_grad():
+            _ = model(input_ids=input_ids, return_dict=False)
+
+        # chunk_idx should NOT be incremented since no media tokens
+        assert model._vlm_chunk_idx == 0, "chunk_idx should not change without media tokens"
+
+    def test_pp_chunking_bypassed_when_pixel_values_provided(self, model_with_config):
+        """Test that explicit pixel_values bypasses PP chunking logic."""
+        model, config = model_with_config
+
+        def mock_extract_features(pixel_values, grid_hws):
+            return torch.randn(1, config.text_config.hidden_size, dtype=torch.bfloat16)
+
+        model.model._extract_image_features = mock_extract_features
+
+        # Set up chunks
+        chunk1 = torch.randn(1, 3, 56, 56)
+        grid1 = torch.tensor([[4, 4]])
+
+        model._vlm_pixel_values_chunks = [chunk1]
+        model._vlm_image_grid_hws_chunks = [grid1]
+        model._vlm_chunk_idx = 0
+
+        # Input with media token BUT also explicit pixel_values
+        input_ids = torch.tensor([[1, 99, 2]])
+        explicit_pixel_values = torch.randn(1, 3, 56, 56)
+        explicit_grid = torch.tensor([[4, 4]])
+
+        with torch.no_grad():
+            _ = model(
+                input_ids=input_ids,
+                pixel_values=explicit_pixel_values,
+                image_grid_hws=explicit_grid,
+                return_dict=False,
+            )
+
+        # chunk_idx should NOT be incremented since pixel_values was explicitly provided
+        assert model._vlm_chunk_idx == 0, "chunk_idx should not change when pixel_values provided"
+
+    def test_pp_chunking_stops_at_end_of_chunks(self, model_with_config):
+        """Test that PP chunking stops incrementing when all chunks consumed."""
+        model, config = model_with_config
+
+        def mock_extract_features(pixel_values, grid_hws):
+            return torch.randn(1, config.text_config.hidden_size, dtype=torch.bfloat16)
+
+        model.model._extract_image_features = mock_extract_features
+
+        # Only 1 chunk
+        chunk1 = torch.randn(1, 3, 56, 56)
+        grid1 = torch.tensor([[4, 4]])
+
+        model._vlm_pixel_values_chunks = [chunk1]
+        model._vlm_image_grid_hws_chunks = [grid1]
+        model._vlm_chunk_idx = 0
+
+        input_ids = torch.tensor([[1, 99, 2]])
+
+        with torch.no_grad():
+            # First call consumes the chunk
+            _ = model(input_ids=input_ids, return_dict=False)
+            assert model._vlm_chunk_idx == 1
+
+            # Second call - no more chunks, idx should not increment further
+            _ = model(input_ids=input_ids, return_dict=False)
+            assert model._vlm_chunk_idx == 1, "chunk_idx should stay at 1 when no more chunks"
+
+    def test_pp_chunking_not_triggered_without_chunks_attribute(self, model_with_config):
+        """Test that PP chunking is not triggered when _vlm_pixel_values_chunks not set."""
+        model, config = model_with_config
+
+        # Don't set _vlm_pixel_values_chunks
+        input_ids = torch.tensor([[1, 99, 2]])  # Has media token
+
+        with torch.no_grad():
+            # Should not raise, just process without vision
+            output = model(input_ids=input_ids, return_dict=False)
+
+        assert output is not None
+        assert not hasattr(model, "_vlm_chunk_idx") or model._vlm_chunk_idx == 0
+
+
+class TestKimiVLRegistration:
+    """Tests for KimiVL registration with transformers."""
+
+    def test_registration_executed_on_import(self):
+        """Test that registration happens when module is imported."""
+        from transformers import AutoConfig
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+        # After importing kimivl.model, kimi_vl should be registered
+        assert "kimi_vl" in CONFIG_MAPPING
+
+    def test_autoconfig_recognizes_kimi_vl(self):
+        """Test AutoConfig can create KimiVLConfig."""
+        from transformers import AutoConfig
+
+        # Create a config using the registered model type
+        # AutoConfig.for_model uses model_type as first positional arg
+        config = AutoConfig.for_model(
+            "kimi_vl",
+            vision_config={"hidden_size": 64},
+            text_config={"hidden_size": 128},
+        )
+        assert type(config).__name__ == "KimiVLConfig"

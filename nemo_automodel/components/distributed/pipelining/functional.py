@@ -32,11 +32,11 @@ from torch.distributed.pipelining.schedules import (
     get_schedule_class,
 )
 
-from nemo_automodel.components.distributed.pipelining.hf_utils import patch_hf_model_for_pp
-from nemo_automodel.components.utils.model_utils import (
+from nemo_automodel.components.distributed.pipelining.hf_utils import (
     MULTIMODAL_SUFFIXES,
     TEXT_MODULE_ATTRS,
     get_text_module,
+    patch_hf_model_for_pp,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,7 +49,6 @@ class ParallelizeFnProtocol(Protocol):
         world_mesh: DeviceMesh,
         moe_mesh: DeviceMesh,
         *,
-        pp_enabled: bool,
         dp_axis_names: tuple[str, ...],
         cp_axis_name: str | None = None,
         tp_axis_name: str | None = None,
@@ -136,9 +135,9 @@ def generate_hf_model_fqn_per_model_part(
             stage_layer_count += 1
 
         # First stage: add embeddings and multimodal encoders if requested
-        if stage_idx == 0 and include_embeddings:
-            stage_modules.append(f"{fqn_prefix}embed_tokens")
         if stage_idx == 0:
+            if include_embeddings:
+                stage_modules.append(f"{fqn_prefix}embed_tokens")
             if include_multimodal_encoders:
                 stage_modules.extend([f"{fqn_prefix}{suffix}" for suffix in MULTIMODAL_SUFFIXES])
             if extra_module_fqns:
@@ -301,9 +300,12 @@ def split_model_into_stages(
     include_multimodal_encoders = True
     extra_module_fqns = None
 
-    text_model_attr_prefix = text_model_attr_name+"."
-    layers_prefix = f"{base_prefix}{text_model_attr_prefix}model." if text_model_has_model_attr else f"{base_prefix}{text_model_attr_prefix}"
-
+    text_model_attr_prefix = text_model_attr_name + "." if text_model_attr_name else ""
+    layers_prefix = (
+        f"{base_prefix}{text_model_attr_prefix}model."
+        if text_model_has_model_attr
+        else f"{base_prefix}{text_model_attr_prefix}"
+    )
 
     # If layers live under a nested language_model, keep multimodal encoders at the base prefix
     if layers_prefix != base_prefix:
@@ -379,14 +381,18 @@ def split_model_into_stages(
                         elif isinstance(module, nn.ModuleList):
                             setattr(parent_module, name, nn.ModuleDict())
 
+                # If this module is explicitly in modules_to_keep, keep it and all its children
+                # (don't recurse to avoid removing PEFT adapters like lora_A, lora_B)
+                elif full_name in modules_to_keep:
+                    # Keep this module and all its children intact
+                    pass
+
                 # Handle other modules
-                elif full_name not in modules_to_keep and not any(
-                    kept_name.startswith(full_name + ".") for kept_name in modules_to_keep
-                ):
+                elif not any(kept_name.startswith(full_name + ".") for kept_name in modules_to_keep):
                     # This module and its children are not needed
                     setattr(parent_module, name, None)
                 else:
-                    # Recursively process children
+                    # This module has descendants that need to be kept, recurse into it
                     _process_module(module, full_name)
 
         # Process the model
@@ -550,7 +556,6 @@ def pipeline_model(
                 m,
                 world_mesh=world_mesh,
                 moe_mesh=moe_mesh,
-                pp_enabled=True,
                 dp_axis_names=dp_axis_names,
                 cp_axis_name=cp_axis_name,
                 tp_axis_name=tp_axis_name,

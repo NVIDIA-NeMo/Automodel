@@ -40,7 +40,11 @@ from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.checkpoint.checkpointing import (
+    Checkpointer,
+    CheckpointingConfig,
+    _maybe_adapt_state_dict_to_hf,
+)
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
@@ -243,7 +247,11 @@ def build_model_and_optimizer(
     }
 
     # hold a list copy of the model state dict keys before any parallelization
-    state_dict_keys = list(model.state_dict().keys())
+    state_dict_keys = list(
+        _maybe_adapt_state_dict_to_hf(
+            model, model.state_dict(), quantization=checkpointer.config.dequantize_base_checkpoint
+        ).keys()
+    )
 
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
@@ -282,18 +290,23 @@ def build_model_and_optimizer(
             parallelize_fn(
                 model,
                 world_mesh=model_wrapper.device_mesh,
-                moe_mesh=getattr(model_wrapper, "moe_mesh", None),
-                pp_enabled=False,
+                moe_mesh=model_wrapper.moe_mesh,
                 dp_axis_names=(
                     ("dp_replicate", "dp_shard_cp")
                     if "dp_replicate" in model_wrapper.device_mesh.mesh_dim_names
                     and "dp_shard_cp" in model_wrapper.device_mesh.mesh_dim_names
                     else ("dp_shard_cp",)
                 ),
-                cp_axis_name="cp",
-                tp_axis_name="tp",
-                ep_axis_name="ep",
-                ep_shard_axis_names=("ep_shard",),
+                cp_axis_name="cp" if "cp" in model_wrapper.device_mesh.mesh_dim_names else None,
+                tp_axis_name="tp" if "tp" in model_wrapper.device_mesh.mesh_dim_names else None,
+                ep_axis_name="ep"
+                if model_wrapper.moe_mesh is not None and "ep" in model_wrapper.moe_mesh.mesh_dim_names
+                else None,
+                ep_shard_axis_names=(
+                    ("ep_shard",)
+                    if model_wrapper.moe_mesh is not None and "ep_shard" in model_wrapper.moe_mesh.mesh_dim_names
+                    else None
+                ),
             )
             load_weights = True
         elif callable(getattr(model_wrapper, "parallelize", None)):
@@ -507,19 +520,18 @@ def build_dataloader(
 
         # If using an IterableDataset, per-rank sharding for unique samples
         if isinstance(ds, IterableDataset):
-            try:
-                if ds.num_shards >= dp_world_size:
-                    ds = ds.shard(dp_world_size, dp_rank)
-                    logging.info(
-                        f"Sharded IterableDataset via dataset.shard: world_size={dp_world_size}, rank={dp_rank}"
-                    )
-                else:
-                    from datasets.distributed import split_dataset_by_node
+            if callable(getattr(ds, "shard", None)):
+                ds = ds.shard(dp_world_size, dp_rank)
+                logging.info(f"Sharded IterableDataset via dataset.shard: world_size={dp_world_size}, rank={dp_rank}")
+            elif hasattr(ds, "dataset"):
+                # HuggingFace streaming datasets: split by file shards when possible.
+                from datasets.distributed import split_dataset_by_node
 
-                    ds.dataset = split_dataset_by_node(ds.dataset, world_size=dp_world_size, rank=dp_rank)
-                    logging.info(f"Sharded dataset via split_dataset_by_node: world_size={dp_world_size}")
-            except Exception as e:
-                logging.warning(f"IterableDataset sharding skipped due to error: {e}")
+                assert hasattr(ds, "dataset"), "dataset must have a dataset attribute"
+                ds.dataset = split_dataset_by_node(ds.dataset, world_size=dp_world_size, rank=dp_rank)
+                logging.info(f"Sharded dataset via split_dataset_by_node: world_size={dp_world_size}")
+            else:
+                logging.warning("IterableDataset does not support sharding; Data may be duplicated across ranks.")
 
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
 
@@ -857,7 +869,6 @@ def parallelize_for_pp(
     *,
     world_mesh: DeviceMesh,
     moe_mesh: Optional[DeviceMesh] = None,
-    pp_enabled: bool = False,
     dp_axis_names: Union[tuple[str, ...], str] = ("data_parallel",),
     cp_axis_name: Optional[str] = None,
     tp_axis_name: Optional[str] = None,
@@ -1190,13 +1201,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # Run validation every val_every_steps
                 val_losses = {}
                 if self.step_scheduler.is_val_step:
-                    if self.pp_enabled:
-                        logger.warning("Validation is not supported for pipeline parallelism")
-                    else:
-                        for val_name, val_dataloader in self.val_dataloaders.items():
-                            val_log_data = self._run_validation_epoch(val_dataloader)
-                            val_losses[val_name] = val_log_data.metrics["val_loss"]
-                            self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
+                    for val_name, val_dataloader in self.val_dataloaders.items():
+                        val_log_data = self._run_validation_epoch(val_dataloader)
+                        val_losses[val_name] = val_log_data.metrics["val_loss"]
+                        self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
                     for mp in self.model_parts:
                         mp.train()
 
@@ -1246,10 +1254,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         labels = batch.pop("labels")
 
         if self.pp_enabled:
-            if not is_train:
-                logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")
-                return
-
             with train_ctx():
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
@@ -1259,10 +1263,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     targets = None
 
                 input_ids = batch.pop("input_ids")
-                if self.pp.info.has_first_stage:
-                    self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
+                if is_train:
+                    # Use step for training (forward + backward)
+                    if self.pp.info.has_first_stage:
+                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
+                    else:
+                        self.pp.info.schedule.step(target=targets, losses=losses, **batch)
                 else:
-                    self.pp.info.schedule.step(target=targets, losses=losses, **batch)
+                    # Use eval for validation (forward only, no backward)
+                    if self.pp.info.has_first_stage:
+                        self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch)
+                    else:
+                        self.pp.info.schedule.eval(target=targets, losses=losses, **batch)
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))
@@ -1446,9 +1458,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 total_loss += torch.sum(torch.stack(loss_buffer)).item()
                 total_num_label_tokens += num_label_tokens
 
-        total_loss = self._dp_allreduce(total_loss, include_cp=True).item()
+        total_loss = self._dp_allreduce(total_loss, include_cp=True)
         total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
+
+        # For PP, send val_loss from last stage to main rank for logging
+        if self.pp_enabled:
+            val_loss = val_loss.to(self.dist_env.device)
+            # Send loss to first rank from the last stage
+            src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
+            if self.dist_env.rank == src_rank:
+                torch.distributed.send(val_loss, dst=0)
+            elif self.dist_env.is_main:
+                torch.distributed.recv(val_loss, src=src_rank)
+
+        val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
 
         return MetricsSample(
             step=self.step_scheduler.step,
@@ -1474,7 +1498,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     "mem": Memory allocated.
         """
 
-        # Pipeline parallelism does not support validation -> log_data is None
         if not self.dist_env.is_main or log_data is None:
             return
 

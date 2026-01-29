@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 import wandb
 from torch.distributed.device_mesh import DeviceMesh
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
 from transformers.modeling_utils import no_init_weights
@@ -35,7 +35,11 @@ from wandb import Settings
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.checkpoint.checkpointing import (
+    Checkpointer,
+    CheckpointingConfig,
+    _maybe_adapt_state_dict_to_hf,
+)
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
@@ -183,15 +187,27 @@ def build_model_and_optimizer(
                     logger.info("Enabling PEFT with Pipeline Parallelism")
                     logger.info("Disabling Triton with Pipeline Parallelism Enabled.")
                     cfg_peft.use_triton = False
-                apply_lora_to_linear_modules(model, cfg_peft, quantization_config=kwargs.get("quantization_config", None))
-
+                apply_lora_to_linear_modules(
+                    model, cfg_peft, quantization_config=kwargs.get("quantization_config", None)
+                )
 
         if cfg_fp8 is not None:
             fp8_config = build_fp8_config(cfg_fp8)
             model = apply_fp8_to_model(model, config=fp8_config)
 
-    # hold a copy of the model state dict keys before any parallelization
-    state_dict_keys = list(model.state_dict().keys())
+            if checkpointer.config.dequantize_base_checkpoint is None:
+                # try to infer whether the base weights are quantized
+                try:
+                    checkpointer.config.dequantize_base_checkpoint = hasattr(model.config, "quantization_config")
+                except:
+                    checkpointer.config.dequantize_base_checkpoint = False
+
+        # hold a copy of the model state dict keys before any parallelization
+        state_dict_keys = list(
+            _maybe_adapt_state_dict_to_hf(
+                model, model.state_dict(), quantization=checkpointer.config.dequantize_base_checkpoint
+            ).keys()
+        )
 
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
@@ -219,17 +235,22 @@ def build_model_and_optimizer(
                 model,
                 world_mesh=model_wrapper.device_mesh,
                 moe_mesh=getattr(model_wrapper, "moe_mesh", None),
-                pp_enabled=False,
                 dp_axis_names=(
                     ("dp_replicate", "dp_shard_cp")
                     if "dp_replicate" in model_wrapper.device_mesh.mesh_dim_names
                     and "dp_shard_cp" in model_wrapper.device_mesh.mesh_dim_names
                     else ("dp_shard_cp",)
                 ),
-                cp_axis_name="cp",
-                tp_axis_name="tp",
-                ep_axis_name="ep",
-                ep_shard_axis_names=("ep_shard",),
+                cp_axis_name="cp" if "cp" in model_wrapper.device_mesh.mesh_dim_names else None,
+                tp_axis_name="tp" if "tp" in model_wrapper.device_mesh.mesh_dim_names else None,
+                ep_axis_name="ep"
+                if model_wrapper.moe_mesh is not None and "ep" in model_wrapper.moe_mesh.mesh_dim_names
+                else None,
+                ep_shard_axis_names=(
+                    ("ep_shard",)
+                    if model_wrapper.moe_mesh is not None and "ep_shard" in model_wrapper.moe_mesh.mesh_dim_names
+                    else None
+                ),
             )
             load_weights = True
         elif callable(getattr(model_wrapper, "parallelize", None)):
@@ -574,6 +595,7 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
 
     return loss_fn(**loss_fn_kwargs)
 
+
 def parallelize_for_pp(
     model: nn.Module,
     *,
@@ -866,7 +888,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for k, v in batch.items()
         }
 
-
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
 
@@ -887,53 +908,44 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 # VLM: Custom chunking for pixel_values and image_grid_hws
                 # These tensors have non-standard structure that can't be naively chunked by dim 0
-                # pixel_values: [total_patches, 3, 14, 14] where patches from different images are concatenated
-                # image_grid_hws: [num_images, 2] where each row is [H, W] for one image
+                # TODO: @HuiyingLi properly handle pixel_values split
                 pixel_values = batch.pop("pixel_values", None)
                 image_grid_hws = batch.pop("image_grid_hws", None)
-                
+
                 if self.pp.info.has_first_stage and pixel_values is not None and image_grid_hws is not None:
                     stage0_model = self.model_parts[0]
                     n_microbatches = self.pp._info.schedule._n_microbatches
                     batch_size = input_ids.shape[0]
                     n_images = image_grid_hws.shape[0]
-                    
-                    # Calculate patch counts per image: H * W for each image
+
                     patch_counts = image_grid_hws[:, 0] * image_grid_hws[:, 1]
                     cumsum = torch.cumsum(patch_counts, dim=0)
-                    
-                    # Pre-chunk pixel_values and image_grid_hws aligned with image boundaries
+
                     pixel_values_chunks = []
                     image_grid_hws_chunks = []
-                    
-                    # Handle case where n_images != batch_size
-                    # This can happen if samples have 0 or multiple images
+
                     if n_images == batch_size:
-                        # 1 image per sample - chunk by samples
+                        # 1 image per sample
                         images_per_mb = batch_size // n_microbatches
                         for mb_idx in range(n_microbatches):
                             img_start = mb_idx * images_per_mb
                             img_end = min(img_start + images_per_mb, n_images)
-                            
-                            # Slice image_grid_hws
+
                             image_grid_hws_chunks.append(image_grid_hws[img_start:img_end])
-                            
-                            # Calculate patch boundaries
+
                             patch_start = 0 if img_start == 0 else cumsum[img_start - 1].item()
                             patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
-                            
-                            # Slice pixel_values at correct image boundaries
-                            pixel_values_chunks.append(pixel_values[int(patch_start):int(patch_end)])
+                            pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
                     else:
-                        # Irregular - give all images to first microbatch, empty to rest
-                        # This handles cases where n_images != batch_size
                         pixel_values_chunks.append(pixel_values)
                         image_grid_hws_chunks.append(image_grid_hws)
                         for _ in range(n_microbatches - 1):
-                            pixel_values_chunks.append(pixel_values[:0])  # Empty tensor with same structure
+                            pixel_values_chunks.append(pixel_values[:0])
                             image_grid_hws_chunks.append(image_grid_hws[:0])
-                        logging.warning(f"VLM chunking: n_images={n_images} != batch_size={batch_size}, giving all images to first microbatch")
-                    
+                        logging.warning(
+                            f"VLM chunking: n_images={n_images} != batch_size={batch_size}, giving all images to first microbatch"
+                        )
+
                     # Store pre-chunked tensors on model for forward to use
                     stage0_model._vlm_pixel_values_chunks = pixel_values_chunks
                     stage0_model._vlm_image_grid_hws_chunks = image_grid_hws_chunks
@@ -1066,7 +1078,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model.install_optimized_model_weights()
         # self.model.zero_grad_buffer()
-            
+
         t = time.perf_counter()
         time_delta = t - self.timestamp
         self.timestamp = t
