@@ -319,8 +319,13 @@ def init_empty_weights():
                     if k in fp8_parameter_mapping:
                         kwargs[fp8_parameter_mapping[k]] = getattr(module._parameters[name], k)
             else:
-                kwargs = module._parameters[name].__dict__
-                kwargs["requires_grad"] = param.requires_grad
+                # Standard nn.Parameter only accepts requires_grad, not arbitrary __dict__ attributes
+                # (e.g., TransformerEngine sets tensor_model_parallel on weights)
+                if param_cls is nn.Parameter:
+                    kwargs = {"requires_grad": param.requires_grad}
+                else:
+                    kwargs = module._parameters[name].__dict__.copy()
+                    kwargs["requires_grad"] = param.requires_grad
             module._parameters[name] = param_cls(module._parameters[name].to(device), **kwargs)
 
     try:
