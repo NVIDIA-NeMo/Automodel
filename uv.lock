@@ -1154,7 +1154,7 @@ wheels = [
 [[package]]
 name = "cut-cross-entropy"
 version = "25.3.2"
-source = { git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86ab#87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
+source = { git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86aba72cfd2f0d8abecaf81c13c4528ea07d8#87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
 dependencies = [
     { name = "setuptools" },
     { name = "torch", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
@@ -2318,15 +2318,12 @@ wheels = [
 
 [[package]]
 name = "liger-kernel"
-version = "0.6.3"
-source = { registry = "https://pypi.org/simple" }
+version = "0.6.4"
+source = { git = "https://github.com/linkedin/Liger-Kernel.git?rev=49e63538e64b00780e424e34bc4f193dcfeba75c#49e63538e64b00780e424e34bc4f193dcfeba75c" }
 dependencies = [
-    { name = "torch", version = "2.8.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-    { name = "triton", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/25/c8/9bfa2871c35ee49dd4e63e237fb5c9159913b58ed3c4eb9109805f21b573/liger_kernel-0.6.3.tar.gz", hash = "sha256:436f5164e5cf94a5cf4c6b8e7831d755b74d2fba5a61e2378ddfb779a5f4e25a", size = 3705621, upload-time = "2025-10-27T18:30:26.019Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/26/47/62b22927ee77c2294ee4cb422eda50f4aa5bec049a42f3ec9c4a437b0700/liger_kernel-0.6.3-py3-none-any.whl", hash = "sha256:7be6f5498d9f7a7c1ae4191c1829e815154963b7b5cc9fec6e14063fd41461ae", size = 210999, upload-time = "2025-10-27T18:30:24.231Z" },
+    { name = "torch", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.8.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin'" },
+    { name = "triton" },
 ]
 
 [[package]]
@@ -3090,7 +3087,6 @@ dependencies = [
     { name = "diffusers" },
     { name = "ftfy" },
     { name = "imageio-ffmpeg" },
-    { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "megatron-fsdp" },
     { name = "mlflow" },
     { name = "opencv-python-headless" },
@@ -3167,6 +3163,7 @@ build = [
 ]
 dev = [
     { name = "cut-cross-entropy" },
+    { name = "liger-kernel" },
 ]
 docs = [
     { name = "myst-parser" },
@@ -3203,7 +3200,6 @@ requires-dist = [
     { name = "flash-linear-attention", marker = "extra == 'extra'" },
     { name = "ftfy" },
     { name = "imageio-ffmpeg" },
-    { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", specifier = ">=0.5.9" },
     { name = "mamba-ssm", marker = "extra == 'cuda'" },
     { name = "megatron-fsdp" },
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'" },
@@ -3241,7 +3237,10 @@ build = [
     { name = "torch", marker = "sys_platform != 'darwin'", specifier = "<=2.10.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = "<=2.10.0", index = "https://pypi.org/simple" },
 ]
-dev = [{ name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86ab" }]
+dev = [
+    { name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" },
+    { name = "liger-kernel", git = "https://github.com/linkedin/Liger-Kernel.git?rev=49e63538e64b00780e424e34bc4f193dcfeba75c" },
+]
 docs = [
     { name = "myst-parser" },
     { name = "nvidia-sphinx-theme" },
