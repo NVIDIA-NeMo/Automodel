@@ -1,0 +1,47 @@
+# Copyright (c) 2020-2025, NVIDIA CORPORATION.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#!/bin/bash
+set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
+
+export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
+export CUDA_VISIBLE_DEVICES="0,1"
+
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
+examples/llm_finetune/finetune.py \
+    --config tests/functional_tests/hf_transformer_finetune/nemotron_nano_v3_4layer_custom.yaml \
+    --step_scheduler.max_steps 4 \
+    --step_scheduler.global_batch_size 8 \
+    --step_scheduler.local_batch_size 4 \
+    --step_scheduler.val_every_steps 2 \
+    --model.config.pretrained_model_name_or_path $TEST_DATA_DIR/hf_nemotron_nano_v3_4l/ \
+    --dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_nemotron_nano_v3_4l/ \
+    --validation_dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_nemotron_nano_v3_4l/ \
+    --dataset.dataset_name $HF_CACHE/squad/ \
+    --validation_dataset.dataset_name $HF_CACHE/squad/ \
+    --dataset.limit_dataset_samples 64 \
+    --dataset.seq_length 512 \
+    --dataset.padding true \
+    --validation_dataset.seq_length 512 \
+    --validation_dataset.padding true \
+    --validation_dataset.limit_dataset_samples 16 \
+    --model.is_meta_device true \
+    --checkpoint.enabled false \
+    --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
+    --distributed.tp_size 1 \
+    --distributed.cp_size 1 \
+    --distributed.dp_replicate_size 1 \
+    --distributed.pp_size 1 \
+    --distributed.ep_size 2 \
+    --distributed.sequence_parallel false

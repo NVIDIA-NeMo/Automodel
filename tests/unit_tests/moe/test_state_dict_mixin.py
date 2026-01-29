@@ -23,9 +23,10 @@ from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateD
 
 
 class MockMoEConfig:
-    def __init__(self, n_routed_experts=8, moe_inter_dim=512):
+    def __init__(self, n_routed_experts=8, moe_inter_dim=512, expert_activation="swiglu"):
         self.n_routed_experts = n_routed_experts
         self.moe_inter_dim = moe_inter_dim
+        self.expert_activation = expert_activation
 
 
 class MockConfig:
