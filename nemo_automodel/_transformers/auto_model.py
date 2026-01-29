@@ -182,6 +182,30 @@ def _patch_attention(obj, sdpa_method=None):
     return obj
 
 
+def _is_config_compatible_with_custom_model(arch_name: str, config) -> bool:
+    """
+    Check if a HuggingFace config is compatible with our custom model implementation.
+
+    Some architectures (e.g., NemotronHForCausalLM) are shared between different model versions
+    (v2 vs v3) but our custom implementation only supports specific versions. This function
+    validates that the config has the required attributes for the custom implementation.
+
+    Args:
+        arch_name: The architecture name (e.g., "NemotronHForCausalLM")
+        config: The HuggingFace config object
+
+    Returns:
+        True if the config is compatible with our custom implementation, False otherwise
+    """
+    # NemotronHForCausalLM: Our custom implementation is for v3 (MoE model)
+    # v3 requires n_routed_experts, v2 does not have this attribute
+    if arch_name == "NemotronHForCausalLM":
+        return hasattr(config, "n_routed_experts") and config.n_routed_experts is not None
+
+    # All other architectures are assumed compatible
+    return True
+
+
 def _patch_liger_kernel(model):
     """
     Patches a model with liger-kernel and sdpa_kernel
@@ -380,6 +404,11 @@ def _init_model(
         logger.info(f"Using custom model implementation for {architectures[0]}")
         kwargs.pop("trust_remote_code", None)
         model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
+        # Treat config-related kwargs as config overrides (HF behavior) and
+        # avoid forwarding them into model __init__.
+        init_param_names = _get_init_param_names(model_cls)
+        _consume_config_overrides(hf_config, kwargs, init_param_names=init_param_names)
+        kwargs = _filter_kwargs_for_init(model_cls, kwargs)
         # Override config's torch_dtype with user-requested dtype so model __init__ uses correct dtype
         if torch_dtype != "auto":
             hf_config.torch_dtype = torch_dtype
@@ -1077,6 +1106,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             "trust_remote_code", resolve_trust_remote_code(name_or_path) if name_or_path else False
         )
         config = get_hf_config(config, attn_implementation, **kwargs) if isinstance(config, str) else config
+        # Treat config-related kwargs (e.g., output_hidden_states) as overrides on the
+        # config object, not as model __init__ kwargs.
+        _consume_config_overrides(config, kwargs)
         is_hf_model = get_is_hf_model(config, force_hf)
         tp_size, cp_size, has_packed_sequence = _pop_tp_cp_has_packed(kwargs)
         attn_implementation, use_liger_kernel = _apply_preload_overrides(
