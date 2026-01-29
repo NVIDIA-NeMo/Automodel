@@ -91,7 +91,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-fa = ["flash-attn<=2.8.3"]
 # nvidia-cudnn-cu12 pin: This is required for GPTOSS TE support + faster cudnn attention (only on Linux where CUDA is available)
 # "nvidia-cudnn-cu12>=9.18.0.0; sys_platform == 'linux'",
 # Flash-attn version should be selected to satisfy TE requirements
@@ -107,9 +106,11 @@ cuda = [
     "transformer-engine[pytorch]<=2.11.0",
 ]
 extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
+fa = ["flash-attn<=2.8.3"]
 delta-databricks = [
     "deltalake>=1.0.0",  # For Delta Lake metadata
     "databricks-sql-connector>=3.0.0",  # For Unity Catalog streaming access
+]
 moe = [
     "nemo_automodel[cuda]",
     "deep_ep",
