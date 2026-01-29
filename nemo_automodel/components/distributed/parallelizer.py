@@ -1113,7 +1113,6 @@ def megatron_fsdp_strategy_parallelize(
         preserve_fp32_weights=preserve_fp32_weights,
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
-        sync_grads_each_step=False,  # For better performance, avoid sync every step
         check_for_nan_in_grad=check_for_nan_in_grad,
         average_in_collective=average_in_collective,
         disable_bucketing=disable_bucketing,
@@ -1123,26 +1122,7 @@ def megatron_fsdp_strategy_parallelize(
         fsdp_double_buffer=fsdp_double_buffer,
     )
 
-    # Compatibility: older `megatron_fsdp.fully_shard` versions don't accept
-    # `sync_grads_each_step`. Prefer filtering by signature, but also retry on
-    # TypeError for cases where the callable's signature can't be inspected.
-    try:
-        sig = inspect.signature(megatron_fsdp_fully_shard)
-    except (TypeError, ValueError):
-        sig = None
-    if sig is not None and "sync_grads_each_step" not in sig.parameters:
-        fsdp_kwargs.pop("sync_grads_each_step", None)
-
-    try:
-        model, optimizer = megatron_fsdp_fully_shard(**fsdp_kwargs)
-    except TypeError as e:
-        # Example: "fully_shard() got an unexpected keyword argument 'sync_grads_each_step'"
-        if "sync_grads_each_step" in str(e) and "unexpected keyword argument" in str(e):
-            fsdp_kwargs.pop("sync_grads_each_step", None)
-            model, optimizer = megatron_fsdp_fully_shard(**fsdp_kwargs)
-        else:
-            raise
-
+    model, optimizer = megatron_fsdp_fully_shard(**fsdp_kwargs)
     return model, optimizer
 
 
