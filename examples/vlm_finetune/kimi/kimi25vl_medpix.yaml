@@ -1,0 +1,116 @@
+# Test config for Kimi K2.5 2-layer model testing
+# Uses local_batch_size=4, pp_microbatch_size=2 so n_microbatches=2
+# Custom VLM chunking in recipe handles pixel_values/image_grid_hws alignment
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 512
+  local_batch_size: 8
+  ckpt_every_steps: 100
+  val_every_steps: 100
+  max_steps: 200
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  tp_size: 1
+  cp_size: 1
+  pp_size: 8
+  dp_replicate_size: 1
+  ep_size: 32
+  sequence_parallel: false
+
+autopipeline:
+  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
+  pp_schedule: interleaved1f1b
+  pp_microbatch_size: 1
+  round_virtual_stages_to_pp_multiple: down
+  scale_grads_in_schedule: false
+  layers_per_stage: 2  # 2 layers / 1 layer_per_stage = 2 stages total; 2 stages / 2 pp_ranks = 1 stage/rank (required for 1f1b)
+  patch_inner_model: false      
+  patch_causal_lm_model: false 
+
+parallelizer:
+  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
+  activation_checkpointing: false
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/huiyingl/kimi/Automodel/kimi-k2.5-test-weights_vv1
+  torch_dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: torch
+    rms_norm: torch
+    rope_fusion: false
+    enable_deepep: true
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/huiyingl/kimi/Automodel/kimi-k2.5-test-weights_vv1
+  trust_remote_code: true
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: vlm_checkpoints/kimi_k25_2layer/
+  model_save_format: safetensors
+  save_consolidated: true
+  load_base_model: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  pin_memory: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.kimi_k25_vl_collate_fn
+    max_length: 1024
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: validation[:100]
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-05
+  weight_decay: 0.01
+  betas:
+  - 0.9
+  - 0.95
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_language_model: false
+
+# wandb:
+#   project: <your_project_name>
+#   entity: <your_entity_name>
+#   name: <your_exp_name>
