@@ -299,3 +299,78 @@ def test_set_epoch():
     )
     scheduler.set_epoch(2)
     assert scheduler.epoch == 2
+
+
+def test_val_every_steps_disabled():
+    """Test that val_every_steps=-1 disables validation entirely."""
+    dataloader = SizedDataLoader(num_batches=10)
+    scheduler = StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        ckpt_every_steps=1000,
+        val_every_steps=-1,  # Disable validation
+        dataloader=dataloader,
+        num_epochs=1,
+        max_steps=10,
+    )
+
+    # Iterate through all steps and verify is_val_step is always False
+    for _ in scheduler:
+        assert scheduler.is_val_step is False
+
+
+def test_val_every_steps_disabled_even_on_ckpt_step():
+    """Test that val_every_steps=-1 disables validation even on checkpoint steps."""
+    dataloader = SizedDataLoader(num_batches=10)
+    scheduler = StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        ckpt_every_steps=5,  # Checkpoint every 5 steps
+        val_every_steps=-1,  # Disable validation
+        dataloader=dataloader,
+        num_epochs=1,
+        max_steps=10,
+    )
+
+    ckpt_steps_seen = []
+    for _ in scheduler:
+        # Even when is_ckpt_step is True, is_val_step should be False
+        assert scheduler.is_val_step is False
+        if scheduler.is_ckpt_step:
+            ckpt_steps_seen.append(scheduler.step)
+
+    # Verify we did hit checkpoint steps
+    assert len(ckpt_steps_seen) > 0
+
+
+@pytest.mark.parametrize(
+    "val_every_steps, expected_val_steps",
+    [
+        (None, [9]),  # None means no periodic validation, but still validates on ckpt steps (last step)
+        (-1, []),  # -1 means disabled entirely, no validation even on ckpt steps
+        (3, [2, 5, 8, 9]),  # Every 3 steps (0-indexed: 2, 5, 8) plus last step (ckpt)
+        (5, [4, 9]),  # Every 5 steps (0-indexed: 4, 9)
+    ],
+)
+def test_val_every_steps_parametrized(val_every_steps, expected_val_steps):
+    """Test various val_every_steps configurations."""
+    dataloader = SizedDataLoader(num_batches=10)
+    scheduler = StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        ckpt_every_steps=1000,  # High value to not interfere with periodic ckpt
+        val_every_steps=val_every_steps,
+        dataloader=dataloader,
+        num_epochs=1,
+        max_steps=10,
+    )
+
+    val_steps_seen = []
+    for _ in scheduler:
+        if scheduler.is_val_step:
+            val_steps_seen.append(scheduler.step)
+
+    assert val_steps_seen == expected_val_steps

@@ -89,7 +89,9 @@ class StepScheduler(Stateful):
         except:
             self.epoch_len = None
         self.val_every_steps = val_every_steps
-        assert val_every_steps is None or val_every_steps > 0, "val_every_steps must be greater than 0 if not None"
+        assert val_every_steps is None or val_every_steps == -1 or val_every_steps > 0, (
+            "val_every_steps must be greater than 0, -1 (disabled), or None"
+        )
         self.log_remote_every_steps = log_remote_every_steps
         assert log_remote_every_steps > 0, "log_remote_every_steps must be greater than 0"
         if max_steps is None:
@@ -155,7 +157,11 @@ class StepScheduler(Stateful):
     def is_val_step(self):
         """
         Returns whether this step needs to call the validation.
+        Set val_every_steps to -1 to disable validation entirely.
         """
+        # val_every_steps == -1 means validation is disabled
+        if self.val_every_steps == -1:
+            return False
         is_val = False
         if self.val_every_steps and self.val_every_steps > 0:
             is_val = self.step % self.val_every_steps == self.val_every_steps - 1
