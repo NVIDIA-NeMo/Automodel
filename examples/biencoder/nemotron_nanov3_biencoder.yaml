@@ -1,0 +1,95 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# To run this recipe, please use the following command:
+# python examples/biencoder/finetune.py --config examples/biencoder/llama3_2_1b_biencoder.yaml
+# Or with torchrun for multi-GPU:
+# torchrun --nproc-per-node=8 examples/biencoder/finetune.py --config examples/biencoder/llama3_2_1b_biencoder.yaml
+
+seed: 125
+
+step_scheduler:
+  global_batch_size: 128
+  local_batch_size: 1
+  ckpt_every_steps: 3000
+  val_every_steps: 3000
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 1
+
+model:
+  _target_: nemo_automodel.components.models.biencoder.NeMoAutoModelBiencoder.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-Nano-9B-v2
+  train_n_passages: 5
+  pooling: last
+  t: 0.02
+  torch_dtype: bfloat16
+  attn_implementation: eager
+  
+
+tokenizer:
+  _target_: transformers.AutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-Nano-9B-v2
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
+    data_dir_list:
+      - ./embed_nemotron_dataset_v1/TriviaQA/TriviaQA.json
+      - ./embed_nemotron_dataset_v1/SyntheticClassificationData/SyntheticClassificationData.json
+    
+    data_type: train
+    train_n_passages: 5
+    seed: 125
+    do_shuffle: true
+    use_dataset_instruction: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.RetrievalBiencoderCollator
+    q_max_len: 512
+    p_max_len: 512
+    query_prefix: ""
+    passage_prefix: ""
+    pad_to_multiple_of: 8
+    use_dataset_instruction: true
+  shuffle: true
+  num_workers: 8
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2.0e-6
+  weight_decay: 0.01
+
+lr_scheduler:
+  lr_warmup_steps: 2
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./output/llama_embed_nemotron_8b
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  dp_replicate_size: 1
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30

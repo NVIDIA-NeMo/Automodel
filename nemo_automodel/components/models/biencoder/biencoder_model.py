@@ -15,6 +15,7 @@
 import gc
 import logging
 from typing import List, Optional
+import torch
 
 from torch.nn.attention import SDPBackend
 
@@ -114,8 +115,9 @@ class NeMoAutoModelBiencoder(_BaseNeMoAutoModelClass):
             )
 
         # Use BiencoderModel.build to initialize model with base encoders
-        hf_kwargs = {"attn_implementation": "flash_attention_2"}
-        kwargs.update(hf_kwargs)
+        # Only set attn_implementation if not already provided in kwargs
+        if "attn_implementation" not in kwargs:
+            kwargs["attn_implementation"] = "eager"
         model = BiencoderModel.build(
             model_name_or_path=pretrained_model_name_or_path,
             share_encoder=share_encoder,

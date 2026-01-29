@@ -27,6 +27,12 @@ import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
+import torch
+from torch import Tensor
+import torch.nn as nn
+import torch.nn.functional as F
+import pdb
+
 from transformers import PreTrainedModel
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import (
@@ -34,8 +40,12 @@ from transformers.modeling_outputs import (
     ModelOutput,
     SequenceClassifierOutputWithPast,
 )
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs, logging
+
 from nemo_automodel.components.models.nemotron.configuration_nemotron_h import NemotronHConfig
 from nemo_automodel.components.models.nemotron.modeling_nemotron_h import (
+    HybridMambaAttentionDynamicCache,
     NemotronHModel,
     NemotronHOutput,
 )
@@ -49,6 +59,9 @@ from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 
 logger = logging.get_logger(__name__)
 check_model_inputs = get_check_model_inputs_decorator()
+
+
+
 
 def contrastive_scores_and_labels(
     query: torch.Tensor, key: torch.Tensor, current_train_n_passages: int
@@ -132,7 +145,7 @@ class NemotronBidirectionalConfig(NemotronHConfig):
         self.pooling = kwargs.get("pooling", "last")
         self.temperature = kwargs.get("temperature", 1.0)
         self.use_cache = kwargs.get("use_cache", False)
-        logger.info(f"NemotronBidirectionalConfig initialized with pooling: {pooling} and temperature: {temperature}")
+        logger.info(f"NemotronBidirectionalConfig initialized with pooling: {self.pooling} and temperature: {self.temperature}")
         logger.info(f"NemotronBidirectionalConfig initialized with kwargs: {kwargs}")
 
 
@@ -144,6 +157,7 @@ class NemotronBidirectionalModel(NemotronHModel):
     This model is a bidirectional Nemotron model for embedding tasks.
     """
     config_class = NemotronBidirectionalConfig
+    main_input_name = "input_ids"
 
     def __init__(self, config: NemotronBidirectionalConfig):
         super().__init__(config)
@@ -152,22 +166,22 @@ class NemotronBidirectionalModel(NemotronHModel):
         self.tokenizer = None
 
 
-    @check_model_inputs
-    @auto_docstring
+    # @check_model_inputs
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         cache_params: Optional[HybridMambaAttentionDynamicCache] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        use_cache: Optional[bool] = False,
+        output_attentions: Optional[bool] = False,
+        output_hidden_states: Optional[bool] = True,
+        return_dict: Optional[bool] = True,
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[Tuple, NemotronHOutput]:
+        
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -179,7 +193,6 @@ class NemotronBidirectionalModel(NemotronHModel):
 
         if (input_ids is None) ^ (inputs_embeds is not None):  # ^ is python for xor
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
         if inputs_embeds is None:
             inputs_embeds = self.embeddings(input_ids)
 
@@ -197,7 +210,7 @@ class NemotronBidirectionalModel(NemotronHModel):
             )
 
         hidden_states = inputs_embeds
-
+        
         if cache_position is None:
             cache_position = torch.arange(hidden_states.shape[1], device=hidden_states.device)
         if position_ids is None:
@@ -209,8 +222,8 @@ class NemotronBidirectionalModel(NemotronHModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         # Until HERE
-
-        for layer_idx, mixer_block in enumerate(self.layers):
+        
+        for mixer_block in self.layers:
             # Depending on the layer type we opt for 2D base attention mask (Mamba) or 4D causal mask (Attention)
             if mixer_block.block_type == "mamba":
                 layer_mask = mamba_mask
@@ -223,12 +236,13 @@ class NemotronBidirectionalModel(NemotronHModel):
 
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-
+            
             if self.gradient_checkpointing and self.training:
                 hidden_states = self._gradient_checkpointing_func(
                     mixer_block.__call__, hidden_states, cache_params, cache_position, layer_mask
                 )
             else:
+            
                 hidden_states = mixer_block(
                     hidden_states,
                     cache_params=cache_params,
@@ -345,20 +359,24 @@ class BiencoderModel(nn.Module):
             return None
 
         import inspect
-
+      
         # Remove token_type_ids if encoder doesn't support it
         if (
             "token_type_ids" not in inspect.getfullargspec(encoder.forward).args
             and "token_type_ids" in input_dict.keys()
         ):
             input_dict = {k: v for k, v in input_dict.items() if k != "token_type_ids"}
-
+       
         # Get encoder outputs
-        outputs = encoder(
-            **{k: v for k, v in input_dict.items() if k not in ["kd_labels"]},
-            return_dict=True,
-            output_hidden_states=True,
-        )
+        # outputs = encoder(
+        #     **{k: v for k, v in input_dict.items() if k not in ["kd_labels"]},
+        #     return_dict=True,
+        #     output_hidden_states=True,
+        # )
+        outputs = encoder(input_ids=input_dict["input_ids"],
+                          attention_mask=input_dict["attention_mask"],
+                          output_hidden_states=True,
+                          return_dict=True,)
 
         # Extract hidden states
         if hasattr(outputs, "last_hidden_state"):
