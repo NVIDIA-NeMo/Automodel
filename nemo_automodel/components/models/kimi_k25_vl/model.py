@@ -21,8 +21,6 @@ This is a self-contained implementation that includes all necessary components:
 - Language model backend (DeepseekV3)
 """
 
-import json
-import os
 import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -31,6 +29,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from transformers import AutoConfig
 from transformers.activations import GELUActivation
 from transformers.configuration_utils import PretrainedConfig
@@ -43,6 +42,7 @@ LOGGER = logging.getLogger(__name__)
 # =============================================================================
 # Configuration Classes
 # =============================================================================
+
 
 class MoonViT3dConfig(PretrainedConfig):
     """Configuration for MoonViT3d vision encoder with temporal support."""
@@ -82,7 +82,7 @@ class MoonViT3dConfig(PretrainedConfig):
 
 class KimiK25VLConfig(PretrainedConfig):
     """Configuration for KimiK25VL model.
-    
+
     Supports both 'kimi_k25_vl' and 'kimi_k25' model types for compatibility
     with original checkpoints.
     """
@@ -119,23 +119,20 @@ class KimiK25VLConfig(PretrainedConfig):
 
         self.ignore_index = ignore_index
         self.media_placeholder_token_id = media_placeholder_token_id
-        
+
         # MM Projector config
         self.mm_projector_type = mm_projector_type
         self.mm_hidden_size = mm_hidden_size if mm_hidden_size is not None else vision_config.hidden_size
         self.projector_hidden_act = projector_hidden_act
         self.projector_ln_eps = projector_ln_eps
-        
+
         # Ensure architectures is set for ModelRegistry matching
         # Include both original and our architecture names
         if architectures is None:
             architectures = ["KimiK25ForConditionalGeneration", "KimiK25VLForConditionalGeneration"]
 
         super().__init__(
-            pad_token_id=pad_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            architectures=architectures,
-            **kwargs
+            pad_token_id=pad_token_id, tie_word_embeddings=tie_word_embeddings, architectures=architectures, **kwargs
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -145,19 +142,19 @@ class KimiK25VLConfig(PretrainedConfig):
         return output
 
 
-
-from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3Model, DeepseekV3ForCausalLM
+from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3Model
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids
 from nemo_automodel.components.models.kimi_k25_vl.state_dict_adapter import KimiK25VLStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 # Check for flash attention
 try:
     from flash_attn import flash_attn_varlen_func
+
     FLASH_ATTN_AVAILABLE = True
 except ImportError:
     FLASH_ATTN_AVAILABLE = False
@@ -167,6 +164,7 @@ except ImportError:
 # Vision Tower Components (MoonViT3d with temporal support)
 # =============================================================================
 
+
 def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.ndarray:
     """Generate 1D sinusoidal positional embedding from grid positions."""
     assert embed_dim % 2 == 0
@@ -175,7 +173,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.nda
     omega = 1.0 / 10000**omega
 
     pos = pos.reshape(-1)
-    out = np.einsum('m,d->md', pos, omega)
+    out = np.einsum("m,d->md", pos, omega)
     emb_sin = np.sin(out)
     emb_cos = np.cos(out)
     emb = np.concatenate([emb_sin, emb_cos], axis=1)
@@ -191,7 +189,9 @@ def get_1d_sincos_pos_embed(embed_dim: int, t_size: int, cls_token: bool = False
     return pos_embed
 
 
-def _apply_rope_vision(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def _apply_rope_vision(
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary position embedding for vision."""
     freqs_cis = freqs_cis.unsqueeze(-2)
     xq_ = torch.view_as_complex(xq.float().view(*xq.shape[:-1], -1, 2))
@@ -218,7 +218,7 @@ def vision_attention_sdpa(q, k, v, q_cu_seqlens, k_cu_seqlens, **kwargs):
     seq_length = q.shape[0]
     attention_mask = torch.zeros([1, seq_length, seq_length], device=q.device, dtype=torch.bool)
     for i in range(1, len(q_cu_seqlens)):
-        attention_mask[..., q_cu_seqlens[i - 1]:q_cu_seqlens[i], q_cu_seqlens[i - 1]:q_cu_seqlens[i]] = True
+        attention_mask[..., q_cu_seqlens[i - 1] : q_cu_seqlens[i], q_cu_seqlens[i - 1] : q_cu_seqlens[i]] = True
     q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
     attn_output = F.scaled_dot_product_attention(q, k, v, attention_mask, dropout_p=0.0)
     return attn_output.transpose(0, 1).reshape(seq_length, -1)
@@ -236,25 +236,26 @@ class Learnable2DInterpPosEmbDividedFixed(nn.Module):
         self.interpolation_mode = interpolation_mode
         self.weight = nn.Parameter(torch.empty(height, width, dim))
         self.register_buffer(
-            'time_weight',
+            "time_weight",
             torch.from_numpy(get_1d_sincos_pos_embed(dim, num_frames)).float().unsqueeze(1),
-            persistent=False
+            persistent=False,
         )
         nn.init.normal_(self.weight)
 
     def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
         pos_embs = []
         for t, h, w in grid_thws.tolist():
-            assert t <= self.num_frames, f't:{t} > self.num_frames:{self.num_frames}'
-            
+            assert t <= self.num_frames, f"t:{t} > self.num_frames:{self.num_frames}"
+
             if (h, w) == (self.height, self.width):
                 pos_emb_2d = self.weight.flatten(end_dim=1)
             else:
-                pos_emb_2d = F.interpolate(
-                    self.weight.permute(2, 0, 1).unsqueeze(0),
-                    size=(h, w),
-                    mode=self.interpolation_mode
-                ).squeeze(0).permute(1, 2, 0).flatten(end_dim=1)
+                pos_emb_2d = (
+                    F.interpolate(self.weight.permute(2, 0, 1).unsqueeze(0), size=(h, w), mode=self.interpolation_mode)
+                    .squeeze(0)
+                    .permute(1, 2, 0)
+                    .flatten(end_dim=1)
+                )
 
             if t == 1:
                 pos_emb_3d = pos_emb_2d
@@ -296,10 +297,9 @@ class Rope2DPosEmbRepeated(nn.Module):
             self.freqs_cis = self._precompute_freqs_cis(device)
         shapes = grid_thws.tolist()
         # Repeat spatial RoPE for each temporal frame
-        freqs_cis = torch.cat([
-            self.freqs_cis[:h, :w].reshape(-1, self.dim // 2).repeat(t, 1)
-            for t, h, w in shapes
-        ], dim=0)
+        freqs_cis = torch.cat(
+            [self.freqs_cis[:h, :w].reshape(-1, self.dim // 2).repeat(t, 1) for t, h, w in shapes], dim=0
+        )
         return freqs_cis
 
 
@@ -346,11 +346,7 @@ class MoonViT3dEncoderLayer(nn.Module):
         self.wo = nn.Linear(hidden_dim, hidden_dim, bias=attn_bias)
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
-        rope_freqs_cis: torch.Tensor
+        self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int, rope_freqs_cis: torch.Tensor
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
@@ -382,12 +378,14 @@ class MoonViT3dEncoder(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
         rope_freqs_cis = self.rope_2d.get_freqs_cis(grid_thws, device=hidden_states.device)
-        
+
         # Compute cumulative sequence lengths: t * h * w for each sample
-        lengths = torch.cat((
-            torch.zeros(1, device=hidden_states.device, dtype=grid_thws.dtype),
-            grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]
-        ))
+        lengths = torch.cat(
+            (
+                torch.zeros(1, device=hidden_states.device, dtype=grid_thws.dtype),
+                grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2],
+            )
+        )
         max_seqlen = lengths.max().item()
         cu_seqlens = lengths.cumsum(dim=0, dtype=torch.int32)
 
@@ -411,9 +409,7 @@ class MoonVision3dPatchEmbed(nn.Module):
         super().__init__()
         self.patch_size = (patch_size, patch_size) if isinstance(patch_size, int) else patch_size
         self.proj = nn.Conv2d(in_dim, out_dim, kernel_size=self.patch_size, stride=self.patch_size)
-        self.pos_emb = Learnable2DInterpPosEmbDividedFixed(
-            pos_emb_height, pos_emb_width, pos_emb_time, out_dim
-        )
+        self.pos_emb = Learnable2DInterpPosEmbDividedFixed(pos_emb_height, pos_emb_width, pos_emb_time, out_dim)
 
     def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
         x = self.proj(x).view(x.size(0), -1)
@@ -421,20 +417,18 @@ class MoonVision3dPatchEmbed(nn.Module):
 
 
 def tpool_patch_merger(
-    x: torch.Tensor,
-    grid_thws: torch.Tensor,
-    merge_kernel_size: List[int] = [2, 2]
+    x: torch.Tensor, grid_thws: torch.Tensor, merge_kernel_size: List[int] = [2, 2]
 ) -> List[torch.Tensor]:
     """Merge patches with temporal pooling."""
     d_model = x.size(-1)
     outputs = []
     pre_sum = 0
-    
+
     for t, h, w in grid_thws.tolist():
-        seq = x[pre_sum:pre_sum + t * h * w]
+        seq = x[pre_sum : pre_sum + t * h * w]
         kh, kw = merge_kernel_size
         new_h, new_w = h // kh, w // kw
-        
+
         # Reshape: (t, h, w, d) -> (t, new_h, kh, new_w, kw, d)
         reshaped = seq.view(t, new_h, kh, new_w, kw, d_model)
         # Permute and temporal pooling (mean over temporal dimension)
@@ -443,7 +437,7 @@ def tpool_patch_merger(
         padded_seq = reshaped.view(new_h * new_w, kh * kw, -1)
         outputs.append(padded_seq)
         pre_sum += t * h * w
-    
+
     return outputs
 
 
@@ -455,7 +449,7 @@ class MoonViT3dPretrainedModel(nn.Module):
         self.config = config
         self.merge_kernel_size = config.merge_kernel_size
         self.merge_type = config.merge_type
-        
+
         self.patch_embed = MoonVision3dPatchEmbed(
             out_dim=config.hidden_size,
             patch_size=config.patch_size,
@@ -483,7 +477,7 @@ class MoonViT3dPretrainedModel(nn.Module):
     def forward(self, pixel_values: torch.Tensor, grid_thws: torch.Tensor) -> List[torch.Tensor]:
         hidden_states = self.patch_embed(pixel_values, grid_thws)
         hidden_states = self.encoder(hidden_states, grid_thws)
-        
+
         if self.merge_type == "sd2_tpool":
             return tpool_patch_merger(hidden_states, grid_thws, self.merge_kernel_size)
         else:
@@ -494,6 +488,7 @@ class MoonViT3dPretrainedModel(nn.Module):
 # Multi-Modal Projector (PatchMergerMLP style)
 # =============================================================================
 
+
 class KimiK25VLMultiModalProjector(nn.Module):
     """Projects vision features to language model dimension using patch merger MLP."""
 
@@ -501,10 +496,10 @@ class KimiK25VLMultiModalProjector(nn.Module):
         super().__init__()
         vision_config = config.vision_config
         text_config = config.text_config
-        
+
         mm_hidden_size = config.mm_hidden_size
         merge_kernel_size = vision_config.merge_kernel_size
-        
+
         self.hidden_size = mm_hidden_size * merge_kernel_size[0] * merge_kernel_size[1]
         self.pre_norm = nn.LayerNorm(mm_hidden_size, eps=config.projector_ln_eps)
         self.linear_1 = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
@@ -528,17 +523,18 @@ class KimiK25VLMultiModalProjector(nn.Module):
 # Rotary Embedding Adapter (Non-Module callable for PP/FSDP compatibility)
 # =============================================================================
 
+
 class DeepSeekV3RotaryEmbeddingAdapter:
     """Callable adapter that wraps DeepseekV3's freqs_cis-based RoPE."""
-    
+
     def __init__(self, parent_module: nn.Module, rope_fusion: bool = False):
         self._parent = parent_module
         self.rope_fusion = rope_fusion
-    
+
     @property
     def freqs_cis(self):
         return self._parent.freqs_cis
-    
+
     def __call__(self, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         freqs = self.freqs_cis
         if freqs is None:
@@ -556,6 +552,7 @@ class DeepSeekV3RotaryEmbeddingAdapter:
 # Language Model Backend
 # =============================================================================
 
+
 class KimiK25VLLanguageModelBackend(nn.Module):
     """Backend-aware language model wrapper using DeepseekV3 architecture."""
 
@@ -567,9 +564,7 @@ class KimiK25VLLanguageModelBackend(nn.Module):
         self.moe_config = self.model.moe_config
         self.register_buffer("freqs_cis", self.model.freqs_cis, persistent=False)
 
-        self.rotary_emb = DeepSeekV3RotaryEmbeddingAdapter(
-            parent_module=self, rope_fusion=backend.rope_fusion
-        )
+        self.rotary_emb = DeepSeekV3RotaryEmbeddingAdapter(parent_module=self, rope_fusion=backend.rope_fusion)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -621,6 +616,7 @@ class KimiK25VLLanguageModelBackend(nn.Module):
 # Main Model
 # =============================================================================
 
+
 class KimiK25VLModel(nn.Module):
     """KimiK25VL multimodal backbone with a DeepseekV3 text decoder."""
 
@@ -631,7 +627,9 @@ class KimiK25VLModel(nn.Module):
 
         self.vision_tower = MoonViT3dPretrainedModel(config.vision_config)
         self.multi_modal_projector = KimiK25VLMultiModalProjector(config)
-        self.language_model = KimiK25VLLanguageModelBackend(config.text_config, backend=self.backend, moe_config=moe_config)
+        self.language_model = KimiK25VLLanguageModelBackend(
+            config.text_config, backend=self.backend, moe_config=moe_config
+        )
 
         self.moe_config = self.language_model.moe_config
         self.media_placeholder_token_id = config.media_placeholder_token_id
@@ -650,13 +648,13 @@ class KimiK25VLModel(nn.Module):
 
     def _compute_num_image_tokens_from_grid(self, grid_thws: torch.Tensor) -> List[int]:
         """Pre-compute number of image tokens from grid_thws without running vision tower.
-        
+
         For 1 image per sample: num_tokens = (h // merge_h) * (w // merge_w)
         With default merge_kernel_size=(2,2): num_tokens = (h // 2) * (w // 2)
-        
+
         Args:
             grid_thws: Tensor of shape (batch_size, 3) with [t, h, w] per sample
-            
+
         Returns:
             List of expected image token counts per sample
         """
@@ -678,12 +676,12 @@ class KimiK25VLModel(nn.Module):
         target_seq_length: Optional[int] = None,
     ):
         """Merge image features into input embeddings.
-        
+
         Supports two modes:
         1. Pre-expanded (PP mode): input_ids already has N placeholder tokens per image,
            where N = number of image features. Does simple 1:1 replacement.
         2. Dynamic expansion: input_ids has 1 placeholder per image, expands to N tokens.
-        
+
         Args:
             image_features: List of image feature tensors, one per image
             inputs_embeds: Text embeddings (batch_size, seq_len, embed_dim)
@@ -702,32 +700,32 @@ class KimiK25VLModel(nn.Module):
         ignore_index = self.config.ignore_index
 
         batch_size, sequence_length = input_ids.shape
-        
+
         # Count placeholder tokens in input_ids
         num_placeholders = (input_ids == image_token_index).sum().item()
-        
+
         # Check if tokens are pre-expanded (PP mode with collate-time expansion)
         if num_placeholders == total_image_features:
             # Pre-expanded mode: simple 1:1 replacement, no sequence length change
             final_embedding = inputs_embeds.clone()
             image_mask = input_ids == image_token_index
-            
+
             # Replace placeholder embeddings with image features
             final_embedding[image_mask] = image_features_cat.to(inputs_embeds.dtype)
-            
+
             # Attention mask and labels stay the same (no expansion)
             final_attention_mask = attention_mask
             position_ids = (attention_mask.cumsum(-1) - 1).masked_fill_((attention_mask == 0), 1)
-            
+
             if labels is not None:
                 # Mask out image positions in labels (don't compute loss on image tokens)
                 final_labels = labels.clone()
                 final_labels[image_mask] = ignore_index
             else:
                 final_labels = None
-            
+
             return final_embedding, final_attention_mask, final_labels, position_ids
-        
+
         # Dynamic expansion mode (original behavior)
         left_padding = not torch.sum(input_ids[:, -1] == torch.tensor(pad_token_id))
 
@@ -741,7 +739,7 @@ class KimiK25VLModel(nn.Module):
         # Calculate natural expanded length, but use target if provided (for PP)
         natural_max_embed_dim = _token_occupation_table.sum(-1).max().item()
         max_embed_dim = target_seq_length if target_seq_length is not None else natural_max_embed_dim
-        
+
         batch_indices, non_image_indices = torch.where(input_ids != image_token_index)
 
         # Compute new positions for text tokens
@@ -753,17 +751,14 @@ class KimiK25VLModel(nn.Module):
 
         # Create final embeddings (with target_seq_length for PP consistency)
         final_embedding = torch.zeros(
-            batch_size, max_embed_dim, embed_dim,
-            dtype=inputs_embeds.dtype, device=inputs_embeds.device
+            batch_size, max_embed_dim, embed_dim, dtype=inputs_embeds.dtype, device=inputs_embeds.device
         )
         final_attention_mask = torch.zeros(
-            batch_size, max_embed_dim,
-            dtype=attention_mask.dtype, device=inputs_embeds.device
+            batch_size, max_embed_dim, dtype=attention_mask.dtype, device=inputs_embeds.device
         )
         if labels is not None:
             final_labels = torch.full(
-                (batch_size, max_embed_dim), ignore_index,
-                dtype=input_ids.dtype, device=input_ids.device
+                (batch_size, max_embed_dim), ignore_index, dtype=input_ids.dtype, device=input_ids.device
             )
 
         target_device = inputs_embeds.device
@@ -816,14 +811,14 @@ class KimiK25VLModel(nn.Module):
         **kwargs,
     ):
         """Forward pass with optional fixed sequence length for pipeline parallelism.
-        
+
         Args:
             target_seq_length: If provided, the output after image token expansion will be
                               padded to this fixed length. Required for PP with varying image sizes.
                               Can be pre-computed as: max_text_len - 1 + max_image_tokens
                               where max_image_tokens = (h // 2) * (w // 2) for each image.
         """
-        
+
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -850,18 +845,22 @@ class KimiK25VLModel(nn.Module):
                 inputs_embeds = embed_tokens(input_ids)
 
         # Check if we should process vision
-        has_vision = (self.vision_tower is not None and self.multi_modal_projector is not None)
-        has_pixels = (pixel_values is not None and pixel_values.size(0) > 0)
-        not_generation = (input_ids.shape[1] != 1)
-        
+        has_vision = self.vision_tower is not None and self.multi_modal_projector is not None
+        has_pixels = pixel_values is not None and pixel_values.size(0) > 0
+        not_generation = input_ids.shape[1] != 1
+
         if has_pixels and has_vision and not_generation:
             pixel_values = pixel_values.to(self.vision_tower.dtype)
             image_features = self._extract_image_features(pixel_values, grid_thws)
-            
+
             inputs_embeds = inputs_embeds.to(image_features[0].dtype)
-            
+
             inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
-                image_features, inputs_embeds, input_ids, attention_mask, labels,
+                image_features,
+                inputs_embeds,
+                input_ids,
+                attention_mask,
+                labels,
                 target_seq_length=target_seq_length,
             )
 
@@ -892,36 +891,38 @@ class KimiK25VLForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
         """Load model from pretrained path.
-        
+
         Creates the model structure. Weights are loaded by DCP which calls the
-        state_dict_adapter.to_hf() to get checkpoint-format keys (including 
+        state_dict_adapter.to_hf() to get checkpoint-format keys (including
         *_packed/*_scale/*_shape for INT4), then from_hf() to dequantize.
         """
-        config = kwargs.pop('config', None)
-        torch_dtype = kwargs.pop('torch_dtype', torch.bfloat16)
-        num_hidden_layers_override = kwargs.pop('num_hidden_layers', None)
-        
+        config = kwargs.pop("config", None)
+        torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)
+        num_hidden_layers_override = kwargs.pop("num_hidden_layers", None)
+
         if isinstance(torch_dtype, str):
-            torch_dtype = getattr(torch, torch_dtype) if torch_dtype != 'auto' else torch.bfloat16
-        
+            torch_dtype = getattr(torch, torch_dtype) if torch_dtype != "auto" else torch.bfloat16
+
         if config is None:
             config = KimiK25VLConfig.from_pretrained(pretrained_model_name_or_path)
-        
+
         # Ensure _name_or_path is set for the adapter to find checkpoint path
         config._name_or_path = pretrained_model_name_or_path
-        
+
         if num_hidden_layers_override is not None:
-            LOGGER.info(f"Overriding num_hidden_layers: {config.text_config.num_hidden_layers} -> {num_hidden_layers_override}")
+            LOGGER.info(
+                f"Overriding num_hidden_layers: {config.text_config.num_hidden_layers} -> {num_hidden_layers_override}"
+            )
             config.text_config.num_hidden_layers = num_hidden_layers_override
-        
-        num_layers = getattr(config.text_config, 'num_hidden_layers', 61)
+
+        num_layers = getattr(config.text_config, "num_hidden_layers", 61)
         LOGGER.info(f"Model config has {num_layers} layers")
-        
+
         config.torch_dtype = torch_dtype
         model = cls.from_config(config, torch_dtype=torch_dtype, *model_args, **kwargs)
         model.name_or_path = pretrained_model_name_or_path
         model = model.to(dtype=torch_dtype)
-        
+
         LOGGER.info(f"Model created with dtype={torch_dtype}. Weights loaded by DCP via adapter.")
         return model
 
@@ -988,7 +989,11 @@ class KimiK25VLForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
         **kwargs,
     ):
         # Retrieve pre-chunked VLM inputs from model attributes (set by finetune.py for PP)
-        if pixel_values is None and hasattr(self, "_vlm_pixel_values_chunks") and self._vlm_pixel_values_chunks is not None:
+        if (
+            pixel_values is None
+            and hasattr(self, "_vlm_pixel_values_chunks")
+            and self._vlm_pixel_values_chunks is not None
+        ):
             has_media_tokens = (
                 input_ids is not None
                 and self.media_placeholder_token_id is not None
@@ -1002,7 +1007,9 @@ class KimiK25VLForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
                     image_grid_hws = self._vlm_image_grid_hws_chunks[chunk_idx]
                     if image_grid_hws.shape[-1] == 2:
                         # Convert [N, 2] (H, W) -> [N, 3] (T, H, W) with T=1
-                        ones = torch.ones(image_grid_hws.shape[0], 1, dtype=image_grid_hws.dtype, device=image_grid_hws.device)
+                        ones = torch.ones(
+                            image_grid_hws.shape[0], 1, dtype=image_grid_hws.dtype, device=image_grid_hws.device
+                        )
                         grid_thws = torch.cat([ones, image_grid_hws], dim=-1)
                     else:
                         grid_thws = image_grid_hws  # Already [N, 3]
@@ -1057,14 +1064,16 @@ class KimiK25VLForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
 
 ModelClass = KimiK25VLForConditionalGeneration
 
+
 def _register_kimi_k25_vl_with_transformers():
     """Register KimiK25VLConfig and model with transformers Auto classes."""
     import logging
+
     from transformers import AutoModelForImageTextToText
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-    
+
     _logger = logging.getLogger(__name__)
-    
+
     # Register for kimi_k25_vl model type
     if "kimi_k25_vl" not in CONFIG_MAPPING:
         try:
@@ -1092,19 +1101,19 @@ def compute_expanded_seq_length(
     num_images: int = 1,
 ) -> int:
     """Compute the expanded sequence length after image token insertion.
-    
+
     For pipeline parallelism, this can be used to pre-compute the target_seq_length
     parameter needed for fixed-shape outputs.
-    
+
     Args:
         text_seq_length: Original text sequence length (including 1 placeholder per image)
         grid_thws: Tensor of shape (num_images, 3) with [t, h, w] per image
         merge_kernel_size: Vision tower's patch merge kernel size, default (2, 2)
         num_images: Number of images (placeholders) in the sequence
-        
+
     Returns:
         Expected sequence length after image features are inserted
-        
+
     Example:
         # For 1 image per sample with grid_thws = [[1, 28, 28]]:
         # num_image_tokens = (28 // 2) * (28 // 2) = 196
@@ -1115,11 +1124,11 @@ def compute_expanded_seq_length(
     """
     merge_h, merge_w = merge_kernel_size
     total_image_tokens = 0
-    
+
     for t, h, w in grid_thws.tolist():
         num_tokens = (h // merge_h) * (w // merge_w)
         total_image_tokens += num_tokens
-    
+
     # Each placeholder (1 token) is replaced by num_image_tokens
     # So: expanded = original - num_placeholders + total_image_tokens
     expanded_length = text_seq_length - num_images + total_image_tokens
