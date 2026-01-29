@@ -130,6 +130,7 @@ runs:
         context: .
         build-args: |
           BASE_IMAGE=pytorch
+          INSTALL_MAMBA=True
         cache-from: |
           type=registry,ref=${{ env.container-registry }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
           type=registry,ref=${{ env.container-registry }}/${{ env.REPO_LOWER }}:main-buildcache,mode=max
