@@ -36,11 +36,11 @@ def _calculate_max_steps(
     return num_epochs * epoch_len
 
 
-def _calculate_num_epochs(max_steps: int, epoch_len: Optional[int], default_num_epochs: int = 10) -> int:
+def _calculate_num_epochs(max_steps: Optional[int], epoch_len: Optional[int], default_num_epochs: int = 10) -> int:
     """
     Calculate the number of epochs out of maximum number of steps.
     """
-    if epoch_len is None:
+    if epoch_len is None or max_steps is None:
         return default_num_epochs
     return ceil(max_steps / epoch_len)
 
@@ -101,13 +101,10 @@ class StepScheduler(Stateful):
 
         # This is for backward compatibility in the sense that num_epochs's default value was 10
         if num_epochs is None:
-            if max_steps is None:
-                num_epochs = 10
-            else:
-                num_epochs = _calculate_num_epochs(
-                    max_steps,
-                    self.epoch_len,
-                )
+            num_epochs = _calculate_num_epochs(
+                max_steps,
+                self.epoch_len,
+            )
 
         self.num_epochs = num_epochs
         assert num_epochs is None or num_epochs > 0, (
