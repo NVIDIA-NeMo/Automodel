@@ -914,80 +914,6 @@ class KimiK25VLModel(nn.Module):
                               Can be pre-computed as: max_text_len - 1 + max_image_tokens
                               where max_image_tokens = (h // 2) * (w // 2) for each image.
         """
-        # # ===== DEBUG: Dump input batch and log activations =====
-        # import os
-        # _DEBUG_ACTIVATIONS = os.environ.get("DEBUG_ACTIVATIONS", "0") == "1"
-        # _DEBUG_DIR = "/lustre/fsw/portfolios/coreai/users/huiyingl/kimi/Automodel/debug"
-        
-        # # Skip debug during shape inference (detected by all-zero input_ids or missing pixel_values with grid_thws)
-        # _is_shape_inference = False
-        # if _DEBUG_ACTIVATIONS and input_ids is not None:
-        #     # Shape inference uses dummy zero tensors
-        #     if input_ids.max().item() == 0 and input_ids.min().item() == 0:
-        #         _is_shape_inference = True
-        #         import torch.distributed as dist
-        #         _r = dist.get_rank() if dist.is_initialized() else 0
-        #         if _r == 0:
-        #             print("[FINETUNE] Skipping debug - detected shape inference pass (all-zero input_ids)", flush=True)
-        
-        # if _DEBUG_ACTIVATIONS and not _is_shape_inference:
-        #     import torch.distributed as dist
-        #     import sys
-        #     _rank = dist.get_rank() if dist.is_initialized() else 0
-            
-        #     # Create debug directory
-        #     if _rank == 0:
-        #         os.makedirs(_DEBUG_DIR, exist_ok=True)
-            
-            
-        #     def _log_tensor(name, t):
-        #         if t is None:
-        #             print(f"[FINETUNE][rank={_rank}] {name}: None", flush=True)
-        #             return
-        #         t_float = t.detach().float()
-        #         print(f"[FINETUNE][rank={_rank}] {name}: shape={tuple(t.shape)}, dtype={t.dtype}, "
-        #               f"mean={t_float.mean().item():.6f}, min={t_float.min().item():.6f}, "
-        #               f"max={t_float.max().item():.6f}", flush=True)
-        #         print(f"[FINETUNE][rank={_rank}] {name} tensor:\n{t}", flush=True)
-            
-        #     def _save_tensor(name, t):
-        #         if t is None:
-        #             return
-        #         safe_name = name.replace("/", "_").replace(" ", "_").replace("(", "").replace(")", "")
-        #         path = os.path.join(_DEBUG_DIR, f"finetune_{safe_name}.pt")
-        #         if os.path.exists(path):
-        #             return  # Skip - file already exists
-        #         torch.save(t.detach().cpu(), path)
-        #         print(f"[FINETUNE][rank={_rank}] Saved {name} to: {path}", flush=True)
-            
-        #     if _rank == 0:
-        #         print("=" * 80, flush=True)
-        #         print("[FINETUNE] DEBUG: Logging activations for comparison (REAL DATA)", flush=True)
-        #         _log_tensor("input_ids", input_ids)
-        #         _log_tensor("attention_mask", attention_mask)
-        #         _log_tensor("pixel_values", pixel_values)
-        #         _log_tensor("grid_thws", grid_thws)
-                
-        #         # Save tensors to debug/
-        #         _save_tensor("input_ids", input_ids)
-        #         _save_tensor("attention_mask", attention_mask)
-        #         _save_tensor("pixel_values", pixel_values)
-        #         _save_tensor("grid_thws", grid_thws)
-        #         _save_tensor("labels", labels)
-                
-        #         # Dump input batch to file (legacy, for debug_hf_inference.py)
-        #         _dump_path = os.path.join(_DEBUG_DIR, f"input_batch.pt")
-        #         if not os.path.exists(_dump_path):
-        #             _dump_dict = {
-        #                 "input_ids": input_ids.cpu() if input_ids is not None else None,
-        #                 "attention_mask": attention_mask.cpu() if attention_mask is not None else None,
-        #                 "pixel_values": pixel_values.cpu() if pixel_values is not None else None,
-        #                 "grid_thws": grid_thws.cpu() if grid_thws is not None else None,
-        #                 "labels": labels.cpu() if labels is not None else None,
-        #             }
-        #             torch.save(_dump_dict, _dump_path)
-        #             print(f"[FINETUNE] Dumped input batch to: {_dump_path}", flush=True)
-        # # ===== END DEBUG DUMP =====
         
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1013,11 +939,6 @@ class KimiK25VLModel(nn.Module):
                     raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
             else:
                 inputs_embeds = embed_tokens(input_ids)
-        # else:
-        #     # Non-first PP stage: inputs_embeds is provided, attention_mask from kwargs is stale
-        #     # (it has original length, not expanded length after image token insertion)
-        #     attention_mask = None
-        #     padding_mask = None
 
         # Check if we should process vision
         has_vision = (self.vision_tower is not None and self.multi_modal_projector is not None)
@@ -1026,23 +947,7 @@ class KimiK25VLModel(nn.Module):
         
         if has_pixels and has_vision and not_generation:
             pixel_values = pixel_values.to(self.vision_tower.dtype)
-            
-            # # ===== DEBUG: Log vision tower INPUT =====
-            # if _DEBUG_ACTIVATIONS and not _is_shape_inference and _rank == 0:
-            #     print("[FINETUNE] Vision tower INPUT:", flush=True)
-            #     _log_tensor("vision_tower_input (pixel_values)", pixel_values)
-            #     _save_tensor("vision_tower_input", pixel_values)
-            # # ===== END DEBUG =====
-            
             image_features = self._extract_image_features(pixel_values, grid_thws)
-            
-            # # ===== DEBUG: Log vision output =====
-            # if _DEBUG_ACTIVATIONS and not _is_shape_inference and _rank == 0:
-            #     print("[FINETUNE] After vision tower + projector:", flush=True)
-            #     for i, feat in enumerate(image_features):
-            #         _log_tensor(f"image_features[{i}]", feat)
-            #         _save_tensor(f"image_features_{i}", feat)
-            # # ===== END DEBUG =====
             
             inputs_embeds = inputs_embeds.to(image_features[0].dtype)
             
@@ -1050,16 +955,6 @@ class KimiK25VLModel(nn.Module):
                 image_features, inputs_embeds, input_ids, attention_mask, labels,
                 target_seq_length=target_seq_length,
             )
-            
-            # # ===== DEBUG: Log merged embeddings =====
-            # if _DEBUG_ACTIVATIONS and not _is_shape_inference and _rank == 0:
-            #     print("[FINETUNE] After merging image features with text:", flush=True)
-            #     _log_tensor("inputs_embeds (merged)", inputs_embeds)
-            #     _save_tensor("inputs_embeds_merged", inputs_embeds)
-            # # ===== END DEBUG =====
-
-        # ===== DEBUG: Note - layer-by-layer logging is in deepseek_v3/model.py =====
-        # ===== END DEBUG =====
 
         hidden_states = self.language_model(
             inputs_embeds=inputs_embeds,
@@ -1068,12 +963,6 @@ class KimiK25VLModel(nn.Module):
             padding_mask=padding_mask,
             **kwargs,
         )
-
-        # # ===== DEBUG: Log completion (no exit - let training continue) =====
-        # if _DEBUG_ACTIVATIONS and not _is_shape_inference and _rank == 0:
-        #     print("=" * 80, flush=True)
-        #     print(f"[FINETUNE] DEBUG iteration complete - tensors saved to {_DEBUG_DIR}/", flush=True)
-        # # ===== END DEBUG =====
 
         return hidden_states
 
@@ -1328,5 +1217,4 @@ def compute_expanded_seq_length(
     return expanded_length
 
 
-# Perform registration at module import time
 _register_kimi_k25_vl_with_transformers()

@@ -31,7 +31,7 @@ from nemo_automodel.components.moe.utils import BackendConfig
 LOGGER = logging.getLogger(__name__)
 
 
-def dequantize_int4(weight_packed: torch.Tensor, weight_scale: torch.Tensor, weight_shape: torch.Tensor, group_size: int = 32, device: str = "cuda", debug_key: str = "") -> torch.Tensor:
+def dequantize_int4(weight_packed: torch.Tensor, weight_scale: torch.Tensor, weight_shape: torch.Tensor, group_size: int = 32, device: str = "cuda",) -> torch.Tensor:
     """Dequantize INT4 packed weights to bfloat16.
     
     Extracts local tensors from DTensors before unpacking (bitwise ops don't work on DTensor).
@@ -44,65 +44,32 @@ def dequantize_int4(weight_packed: torch.Tensor, weight_scale: torch.Tensor, wei
         weight_shape: Original shape [2], stores global dimensions
         group_size: Elements per scale group (default 32)
         device: Target device for computation
-        debug_key: Key name for debug logging
     """
-    import torch.distributed as dist
-    rank = dist.get_rank() if dist.is_initialized() else 0
     
-    # DEBUG: Log input types and shapes
     is_packed_dtensor = hasattr(weight_packed, 'device_mesh')
     is_scale_dtensor = hasattr(weight_scale, 'device_mesh')
     
-    # print(f"[dequant][rank={rank}] START {debug_key}", flush=True)
-    # print(f"[dequant][rank={rank}]   packed: type={packed_type}, is_dtensor={is_packed_dtensor}, dtype={weight_packed.dtype}", flush=True)
-    # print(f"[dequant][rank={rank}]   scale: type={scale_type}, is_dtensor={is_scale_dtensor}, shape={weight_scale.shape}, dtype={weight_scale.dtype}", flush=True)
-    # print(f"[dequant][rank={rank}]   shape_tensor: type={shape_type}, value={weight_shape.tolist() if hasattr(weight_shape, 'tolist') else weight_shape}", flush=True)
-    
-    # CRITICAL: Extract local tensors BEFORE any operations
-    # Bitwise ops (>>, &) don't work on DTensor - must use local tensors
-    # Both packed and scale should have same sharding, so .to_local() gives corresponding slices
     if is_packed_dtensor:
-        #print(f"[dequant][rank={rank}]   extracting local from packed DTensor...", flush=True)
         weight_packed = weight_packed.to_local()
-        #print(f"[dequant][rank={rank}]   packed local shape: {weight_packed.shape}", flush=True)
     
     if is_scale_dtensor:
-        #print(f"[dequant][rank={rank}]   extracting local from scale DTensor...", flush=True)
         weight_scale = weight_scale.to_local()
-        #print(f"[dequant][rank={rank}]   scale local shape: {weight_scale.shape}", flush=True)
     
-    # Now working with local tensors - get LOCAL dimensions
     local_out, local_packed_in = weight_packed.shape
     local_in = local_packed_in * 8  # 8 INT4 values per int32
-    #print(f"[dequant][rank={rank}]   local packed.shape={weight_packed.shape}, local_in_features={local_in}", flush=True)
     
-    # Move to GPU for faster computation if available
     use_cuda = device == "cuda" and torch.cuda.is_available()
-    #print(f"[dequant][rank={rank}]   use_cuda={use_cuda}, device arg={device}", flush=True)
     
     if use_cuda:
         weight_packed = weight_packed.cuda()
         weight_scale = weight_scale.cuda()
     
-    # DEBUG: Check device after potential move
-    #print(f"[dequant][rank={rank}]   after cuda: packed.device={weight_packed.device}", flush=True)
-    
     # Unpack INT4: [out, packed_in] -> [out, packed_in, 8] -> [out, in_features]
     shifts = torch.arange(8, device=weight_packed.device) * 4
-    #print(f"[dequant][rank={rank}]   shifts created, device={shifts.device}", flush=True)
     
-    #print(f"[dequant][rank={rank}]   about to unsqueeze...", flush=True)
     packed_unsqueezed = weight_packed.unsqueeze(-1)
-    #print(f"[dequant][rank={rank}]   unsqueezed shape={packed_unsqueezed.shape}", flush=True)
-    
-    #print(f"[dequant][rank={rank}]   about to do bitwise ops (>> and &)...", flush=True)
     unpacked = ((packed_unsqueezed >> shifts) & 0xF).float()
-    #print(f"[dequant][rank={rank}]   bitwise ops done, unpacked.shape={unpacked.shape}", flush=True)
-    
-    # Reshape to [local_out, local_in]
-    #print(f"[dequant][rank={rank}]   about to reshape to ({local_out}, {local_in})...", flush=True)
     unpacked = unpacked.reshape(local_out, local_in)
-    #print(f"[dequant][rank={rank}]   reshape done, shape={unpacked.shape}", flush=True)
     
     # Convert unsigned 4-bit (0-15) to signed (-8 to 7) using OFFSET BINARY
     # This matches compressed-tensors library which packs as: value + 8
@@ -130,12 +97,8 @@ def dequantize_int4(weight_packed: torch.Tensor, weight_scale: torch.Tensor, wei
             value=scale_expanded[:, -1:].mean()
         )
     scale_expanded = scale_expanded[:, :local_in]
-    
-    # Multiply local tensors
     result = unpacked * scale_expanded
     
-    # Return result - keep on same device, convert to bf16
-    # For DTensor, this preserves the DTensor structure
     result = result.to(torch.bfloat16)
     
     return result
@@ -206,54 +169,6 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         self._uses_model_prefix = True
         self._quant_shapes_cache: dict[str, tuple] | None = None
 
-    def _maybe_debug_hf_key_diff(self, expected_keys: set[str], phase: str) -> None:
-        import os
-
-        if not os.getenv("KIMIK25VL_STATE_DICT_DEBUG"):
-            return
-
-        self._last_expected_hf_keys = expected_keys
-        hf_index_path = os.getenv("KIMIK25VL_HF_INDEX_PATH")
-        if not hf_index_path:
-            LOGGER.info(
-                "KimiK25VL state_dict debug (%s): expected HF keys=%d. Set KIMIK25VL_HF_INDEX_PATH to compare.",
-                phase,
-                len(expected_keys),
-            )
-            return
-
-        try:
-            index_path = (
-                os.path.join(hf_index_path, "model.safetensors.index.json")
-                if os.path.isdir(hf_index_path)
-                else hf_index_path
-            )
-            with open(index_path, "r", encoding="utf-8") as f:
-                index = json.load(f)
-            hf_keys = set(index.get("weight_map", {}).keys())
-            if not hf_keys:
-                LOGGER.info(
-                    "KimiK25VL state_dict debug (%s): empty or missing weight_map in %s",
-                    phase,
-                    index_path,
-                )
-                return
-            missing = sorted(expected_keys - hf_keys)
-            extra = sorted(hf_keys - expected_keys)
-            LOGGER.info(
-                "KimiK25VL state_dict debug (%s): expected=%d hf=%d missing=%d extra=%d",
-                phase,
-                len(expected_keys),
-                len(hf_keys),
-                len(missing),
-                len(extra),
-            )
-            if missing:
-                LOGGER.info("KimiK25VL state_dict debug (%s): missing sample=%s", phase, missing[:20])
-            if extra:
-                LOGGER.info("KimiK25VL state_dict debug (%s): extra sample=%s", phase, extra[:20])
-        except Exception as exc:
-            LOGGER.info("KimiK25VL state_dict debug (%s): failed to read HF index: %s", phase, exc)
 
     def to_hf(
         self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
@@ -292,7 +207,7 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         # model.vision_tower.* → vision_tower.*
         # model.multi_modal_projector.* → mm_projector.*
         if fqn.startswith("model."):
-            fqn = fqn[6:]  # Strip "model." prefix
+            fqn = fqn[6:]
         
         # MM Projector key conversion:
         # multi_modal_projector.linear_1.* → mm_projector.proj.0.*
@@ -325,18 +240,6 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                     base = key[:-7] if key.endswith('.weight') else key
                     
                     if is_dtensor:
-                        # Loading mode: create DTensor placeholders with SAME sharding as original weight
-                        # This allows DCP to load checkpoint data and auto-shard correctly!
-                        #
-                        # Like DSV3's FP8 approach:
-                        # - weight_packed: DTensor (sharded, DCP loads into this)
-                        # - weight_scale: Regular tensor (like DSV3's _scale_inv)
-                        # - weight_shape: Regular tensor
-                        #
-                        # The dequantize_int4 function is rewritten to work on DTensor directly
-                        # without .to_local(), using per-row operations that preserve sharding.
-                        
-                        # Get global shape from DTensor
                         out_features, in_features = value.shape
                         
                         # INT4 packing: 8 values per int32
@@ -345,12 +248,10 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                         group_size = 32
                         num_groups = in_features // group_size
                         
-                        # Get local shape for DTensor placeholder
                         local_tensor = value._local_tensor if hasattr(value, '_local_tensor') else value.to_local()
                         local_out, local_in = local_tensor.shape
                         local_packed_in = local_in // 8
                         
-                        # Get placements from original DTensor
                         placements = value.placements if hasattr(value, 'placements') else [Shard(0)]
                         mesh = value.device_mesh if hasattr(value, 'device_mesh') else device_mesh
                         
@@ -373,13 +274,10 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                             quantized_result.append((f"{base}.weight_scale", scale_dtensor))
                             quantized_result.append((f"{base}.weight_shape", weight_shape))
                         else:
-                            # No mesh, fall back to regular tensors
                             quantized_result.append((f"{base}.weight_packed", torch.empty(out_features, packed_in_features, dtype=torch.int32)))
                             quantized_result.append((f"{base}.weight_scale", torch.empty(out_features, num_groups, dtype=torch.float16)))
                             quantized_result.append((f"{base}.weight_shape", torch.tensor([out_features, in_features], dtype=torch.int64)))
                     else:
-                        # Loading mode with regular tensors (e.g., ep_size=8, no column sharding)
-                        # Just create placeholders - DCP will load checkpoint data into them
                         out_features, in_features = value.shape
                         packed_in_features = in_features // 8
                         group_size = 32
@@ -396,11 +294,6 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         return result
 
     def _is_quantized_expert_key(self, key: str) -> bool:
-        """Check if key is a quantized MoE expert weight.
-        
-        MoE expert weights (except shared_experts) are INT4 quantized.
-        Layer 0 uses dense MLP, not MoE.
-        """
         if "mlp.experts." in key and ".weight" in key:
             if "shared_experts" in key:
                 return False
@@ -473,7 +366,6 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                 scale_tensor,
                 shape_tensor,
                 device="cuda",
-                debug_key=base
             )
             return base, weight, list(parts.values())
 
@@ -482,18 +374,14 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                        if all(p in parts for p in ['packed', 'scale', 'shape'])]
 
 
-        t0 = time.time()
         dequantized = {}
         
-        # # DEBUG: Try without ThreadPoolExecutor first to catch errors properly
         for i, (base, parts) in enumerate(valid_groups):
             base_result, weight, keys = dequant_one((base, parts))
             if weight is not None:
                 dequantized[base_result] = weight
                 processed_keys.update(keys)
 
-        
-        elapsed = time.time() - t0
         
         # Merge dequantized weights back into state_dict view
         effective_state_dict = {k: v for k, v in state_dict.items() if k not in processed_keys}
@@ -537,11 +425,6 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
 
             
             converted_llm = self.llm_adapter.from_hf(llm_keys, **kwargs)
-            # Check what comes out - should be fused keys
-            fused_keys = [k for k in converted_llm.keys() if "gate_and_up_projs" in k or "down_projs" in k]
-            # Debug: show fused key shapes immediately after llm_adapter
-            for k in fused_keys[:4]:
-                v = converted_llm[k]
             for k, v in converted_llm.items():
                 native_state_dict[k.replace("model.", "model.language_model.model.")] = v
         
