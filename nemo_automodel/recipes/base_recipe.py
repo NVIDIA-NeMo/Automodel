@@ -29,6 +29,7 @@ apply_torch_patches()
 import torch.distributed as dist
 import torch.nn as nn
 import yaml
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.processing_utils import ProcessorMixin
@@ -269,6 +270,9 @@ class BaseRecipe:
             self.checkpointer.save_model(model, path, peft_config=self.peft_config, tokenizer=tokenizer)
         else:
             unwrapped_model = model[0] if isinstance(model, list) else model
+            # Unwrap DDP if present
+            if isinstance(unwrapped_model, DistributedDataParallel):
+                unwrapped_model = unwrapped_model.module
             unwrapped_model.save_pretrained(
                 save_directory=path, checkpointer=self.checkpointer, tokenizer=tokenizer, peft_config=self.peft_config
             )

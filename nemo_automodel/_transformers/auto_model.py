@@ -409,6 +409,7 @@ def _init_model(
             **kwargs,
         )
 
+    model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
     return False, model
 
 
@@ -444,7 +445,11 @@ def _apply_peft_and_lower_precision(
 
 
 def _shard_pp(autopipeline, model, loss_fn, parallelize_fn):
-    print_trainable_parameters(model)
+    trainable_params, total_params = print_trainable_parameters(model)
+    # Store param info on autopipeline before splitting so it can be accessed later
+    # This captures the full model's param counts before PP shards it across ranks
+    autopipeline.trainable_params_before_pp = trainable_params
+    autopipeline.total_params_before_pp = total_params
     if get_world_size_safe() == 1:
         logger.info("World size is 1, skipping autopipeline.")
     else:
@@ -478,6 +483,9 @@ def _shard_ep_fsdp(model, model_wrapper, parallelize_fn):
         )
     elif callable(getattr(model_wrapper, "parallelize", None)):
         model = model_wrapper.parallelize(model)
+        model = (
+            model[0] if isinstance(model, tuple) else model
+        )  # MegatronFSDP will return (model, None) since we don't pass optimizer here
     return model
 
 
@@ -548,7 +556,9 @@ def apply_model_infrastructure(
     if checkpointer is not None:
         if checkpointer.config.dequantize_base_checkpoint is None:
             # try to infer whether the base weights are quantized
-            checkpointer.config.dequantize_base_checkpoint = hasattr(model.config, "quantization_config")
+            checkpointer.config.dequantize_base_checkpoint = hasattr(
+                getattr(model, "config", None), "quantization_config"
+            )
         dequantize_base_checkpoint = checkpointer.config.dequantize_base_checkpoint
 
     # Apply PEFT and lower precision if configured
@@ -576,9 +586,6 @@ def apply_model_infrastructure(
         model = _shard_pp(autopipeline, model, loss_fn, parallelize_fn)
     else:
         model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn)
-        # Only move to device if not on meta device (weights need to be loaded first for meta; handled by checkpointer)
-        if not is_meta_device:
-            model.to(device)
         if compile_config is not None:
             model = compile_model(model, compile_config)
 
@@ -611,9 +618,8 @@ def apply_model_infrastructure(
 
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
-
-    # Ensure model is on the correct device
-    model.to(device)
+        # Ensure model is on the correct device; AutoPipeline takes care of it internally
+        model.to(device)
 
     return model
 
