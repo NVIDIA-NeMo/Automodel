@@ -110,7 +110,9 @@ class MoESplitExpertsStateDictMixin:
         # Create pattern with all prefixes
         escaped_prefixes = [re.escape(p) for p in prefixes]
         prefix_pattern = "(?P<prefix>" + "|".join(escaped_prefixes) + ")"
-        pattern = rf"{prefix_pattern}layers\.(\d+)\.{re.escape(expert_segment)}\.\d+\.(gate_proj|up_proj|down_proj)\.weight"
+        pattern = (
+            rf"{prefix_pattern}layers\.(\d+)\.{re.escape(expert_segment)}\.\d+\.(gate_proj|up_proj|down_proj)\.weight"
+        )
         for key in hf_state_dict.keys():
             match = re.match(pattern, key)
             if match:
