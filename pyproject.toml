@@ -181,7 +181,11 @@ torch = [
     { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
-liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "49e63538e64b00780e424e34bc4f193dcfeba75c" }
+liger-kernel = {
+    git = "https://github.com/linkedin/Liger-Kernel.git",
+    rev = "49e63538e64b00780e424e34bc4f193dcfeba75c",
+    marker = "platform_machine == 'x86_64' and platform_system != 'Darwin'",
+}
 
 [tool.coverage.paths]
 source = [".", "/workspace", "/home/runner/work/Automodel/Automodel"]
