@@ -372,10 +372,7 @@ def kimi_k25_vl_collate_fn(
     1. Processes each sample to get input_ids with 1 placeholder per image
     2. Pre-expands the placeholder to N tokens (N = (h//2)*(w//2) from grid_thws)
     3. Pads all sequences to fixed max_length
-    
     This ensures the model forward pass doesn't change sequence length dynamically.
-    
-    Assumes 1 image per sample for simplicity.
     """
     conversations = [example["conversation"] for example in examples]
     
@@ -441,15 +438,6 @@ def kimi_k25_vl_collate_fn(
             "input_ids": input_ids,
             "attention_mask": attention_mask,
         })
-    
-    # === Reorder batch: longest (no padding) sample first ===
-    expanded_lens = [b["input_ids"].shape[0] for b in all_expanded]
-    sorted_indices = sorted(range(len(expanded_lens)), key=lambda i: expanded_lens[i], reverse=True)
-    all_expanded = [all_expanded[i] for i in sorted_indices]
-    all_pixel_values = [all_pixel_values[i] for i in sorted_indices] if all_pixel_values else []
-    all_grid_thws = [all_grid_thws[i] for i in sorted_indices] if all_grid_thws else []
-    conversations = [conversations[i] for i in sorted_indices]
-    # === End reorder ===
     
     # Determine target length for padding
     expanded_lens = [b["input_ids"].shape[0] for b in all_expanded]

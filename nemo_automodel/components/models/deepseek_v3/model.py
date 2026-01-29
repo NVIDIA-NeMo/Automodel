@@ -77,26 +77,10 @@ class Block(nn.Module):
             attention_mask=attention_mask,
             **attn_kwargs,
         )
-        
-        # DEBUG: Log attention output for layer 1 (MoE layer)
-        if self.layer_idx == 1 and not hasattr(self, '_attn_debug_logged'):
-            self._attn_debug_logged = True
-            import torch.distributed as dist
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            if rank == 0:
-                h = attn_out.float()
-                print(f"[NEMO_LAYER1_DEBUG] === Layer 1 Attention Debug ===", flush=True)
-                print(f"[NEMO_LAYER1_DEBUG] attn_out.shape={attn_out.shape}", flush=True)
-                print(f"[NEMO_LAYER1_DEBUG] attn_out[0,0,:32]={h[0,0,:32].tolist()}", flush=True)
-                print(f"[NEMO_LAYER1_DEBUG] attn_out stats: mean={h.mean().item():.8f}, std={h.std().item():.8f}, min={h.min().item():.6f}, max={h.max().item():.6f}", flush=True)
-                print(f"[NEMO_LAYER1_DEBUG] attn_out[0,0] full vector stats: mean={h[0,0].mean().item():.8f}, std={h[0,0].std().item():.8f}", flush=True)
-        
         x = x + attn_out
-        
-        mlp_input = self.post_attention_layernorm(x)
-        
+
         mlp_out = self._mlp(
-            x=mlp_input,
+            x=self.post_attention_layernorm(x),
             padding_mask=padding_mask,
         )
         x = x + mlp_out
@@ -202,7 +186,7 @@ class DeepseekV3Model(nn.Module):
 
 
         # Apply the transformer layers.
-        for layer_key, layer in self.layers.items():
+        for layer in self.layers.values():
             h = layer(
                 x=h,
                 freqs_cis=freqs_cis,
