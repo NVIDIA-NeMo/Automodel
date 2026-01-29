@@ -368,11 +368,7 @@ class BiencoderModel(nn.Module):
             input_dict = {k: v for k, v in input_dict.items() if k != "token_type_ids"}
        
         # Get encoder outputs
-        # outputs = encoder(
-        #     **{k: v for k, v in input_dict.items() if k not in ["kd_labels"]},
-        #     return_dict=True,
-        #     output_hidden_states=True,
-        # )
+      
         outputs = encoder(input_ids=input_dict["input_ids"],
                           attention_mask=input_dict["attention_mask"],
                           output_hidden_states=True,

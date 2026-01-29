@@ -22,8 +22,8 @@ seed: 125
 step_scheduler:
   global_batch_size: 128
   local_batch_size: 1
-  ckpt_every_steps: 100
-  val_every_steps: 100
+  ckpt_every_steps: 2
+  val_every_steps: 2
   num_epochs: 1
 
 dist_env:
