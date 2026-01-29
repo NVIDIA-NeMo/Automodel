@@ -589,4 +589,3 @@ if __name__ == "__main__":
     if len(example["doc_text"]) > 1:
         print(f"First negative: {example['doc_text'][1][:100] if example['doc_text'][1] else '(empty)'}...")
     print(f"{'=' * 60}\n")
-
