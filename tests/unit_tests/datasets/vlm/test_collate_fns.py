@@ -167,7 +167,11 @@ class DummyKimiVLProcessor:
         assert add_generation_prompt is False
         assert tokenize is False
         self.chat_calls.append({"conversation": conversation, "kwargs": kwargs})
-        return "chat:" + conversation[0]["content"][0]["text"]
+        # Extract first text content from conversation
+        for item in conversation[0]["content"]:
+            if isinstance(item, dict) and item.get("type") == "text":
+                return "chat:" + item["text"]
+        return "chat:default"
 
     def __call__(self, *, text, return_tensors, padding, truncation, **kwargs):
         assert return_tensors == "pt"
@@ -449,7 +453,8 @@ def test_kimi_vl_collate_fn_shapes(collate_mod, monkeypatch):
     processor = DummyKimiVLProcessor()
 
     # Stub build_labels to return deterministic labels
-    labels_stub = torch.tensor([[10, 11, 12, 13]], dtype=torch.long)
+    # The collate fn does labels[:, 1:] so we need 5 elements to get 4 after shift
+    labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
 
     def fake_build_labels(input_ids, conversations, processor_arg):
         assert processor_arg is processor
@@ -460,9 +465,9 @@ def test_kimi_vl_collate_fn_shapes(collate_mod, monkeypatch):
     examples = [{"conversation": CONVERSATION}]
     batch = collate_mod.kimi_vl_collate_fn(examples, processor)
 
-    # Input should be trimmed by 1
+    # Input starts at [1, 5], trimmed by [:, :-1] to [1, 4]
     assert batch["input_ids"].shape == (1, 4)
-    # Labels should also be trimmed (shifted)
+    # Labels start at [1, 5], shifted by [:, 1:] to [1, 4]
     assert batch["labels"].shape == (1, 4)
 
 
@@ -470,7 +475,7 @@ def test_kimi_vl_collate_fn_with_max_length(collate_mod, monkeypatch):
     """Test kimi_vl_collate_fn passes max_length correctly."""
     processor = DummyKimiVLProcessor()
 
-    labels_stub = torch.tensor([[10, 11, 12, 13]], dtype=torch.long)
+    labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
     monkeypatch.setattr(
         collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True
     )
@@ -488,7 +493,7 @@ def test_kimi_vl_collate_fn_extracts_images(collate_mod, monkeypatch):
     """Test kimi_vl_collate_fn extracts images from conversation content."""
     processor = DummyKimiVLProcessor()
 
-    labels_stub = torch.tensor([[10, 11, 12, 13]], dtype=torch.long)
+    labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
     monkeypatch.setattr(
         collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True
     )

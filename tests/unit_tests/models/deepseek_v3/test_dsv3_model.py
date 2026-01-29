@@ -63,6 +63,8 @@ class TestDeepseekV3ModelInputsEmbeds:
             v_head_dim=16,
             qk_nope_head_dim=16,
             n_routed_experts=4,
+            n_group=2,
+            topk_group=2,
             num_experts_per_tok=2,
             first_k_dense_replace=0,
         )
@@ -78,7 +80,7 @@ class TestDeepseekV3ModelInputsEmbeds:
         model.eval()
 
         batch_size, seq_len = 2, 8
-        inputs_embeds = torch.randn(batch_size, seq_len, small_config.hidden_size)
+        inputs_embeds = torch.randn(batch_size, seq_len, small_config.hidden_size, dtype=torch.bfloat16)
 
         # Should work with inputs_embeds and no input_ids
         with torch.no_grad():
@@ -92,7 +94,7 @@ class TestDeepseekV3ModelInputsEmbeds:
 
         batch_size, seq_len = 2, 8
         input_ids = torch.randint(0, small_config.vocab_size, (batch_size, seq_len))
-        inputs_embeds = torch.randn(batch_size, seq_len, small_config.hidden_size)
+        inputs_embeds = torch.randn(batch_size, seq_len, small_config.hidden_size, dtype=torch.bfloat16)
 
         with pytest.raises(ValueError, match="exactly one of input_ids or inputs_embeds"):
             model(input_ids=input_ids, inputs_embeds=inputs_embeds)
