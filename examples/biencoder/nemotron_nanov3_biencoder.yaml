@@ -22,8 +22,8 @@ seed: 125
 step_scheduler:
   global_batch_size: 128
   local_batch_size: 1
-  ckpt_every_steps: 3000
-  val_every_steps: 3000
+  ckpt_every_steps: 100
+  val_every_steps: 100
   num_epochs: 1
 
 dist_env:
@@ -78,9 +78,19 @@ lr_scheduler:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: ./output/llama_embed_nemotron_8b
+  checkpoint_dir: ./output/nemotron_nano_9b_biencoder
   model_save_format: safetensors
   save_consolidated: true
+
+wandb:
+  project: nemotron-finetuning
+  entity: nvidia-merlin  # Replace with your wandb entity/username
+  name: nemotron_nano_9b_biencoder
+  tags:
+    - biencoder
+    - nemotron
+    - retrieval
+  notes: "Finetuning Nemotron Nano 9B for biencoder retrieval"
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
