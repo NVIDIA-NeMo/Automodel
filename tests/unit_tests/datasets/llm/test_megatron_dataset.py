@@ -80,5 +80,3 @@ def test_get_list_of_files_raises_for_empty_glob(tmp_path):
     pattern = str(tmp_path / "no_match_*.bin")
     with pytest.raises(ValueError, match="No files matching glob"):
         get_list_of_files(pattern)
-
-

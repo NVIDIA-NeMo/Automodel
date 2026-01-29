@@ -441,4 +441,3 @@ class TestQwen3VLMoeFromPretrainedAndModelClass:
 
     def test_modelclass_export_exists(self):
         assert ModelClass is Qwen3VLMoeForConditionalGeneration
-

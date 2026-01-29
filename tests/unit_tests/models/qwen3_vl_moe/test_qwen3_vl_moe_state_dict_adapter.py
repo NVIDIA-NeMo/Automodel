@@ -346,5 +346,3 @@ class TestConvertSingleTensorToHf:
         result = adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r"exclude.*")
 
         assert result == []
-
-
