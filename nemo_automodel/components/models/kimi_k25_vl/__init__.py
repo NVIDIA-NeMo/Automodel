@@ -11,19 +11,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-from nemo_automodel.components.models.kimi_k25_vl.model import (
-    KimiK25VLForConditionalGeneration,
-    KimiK25VLConfig,
-    MoonViT3dConfig,
-    DeepseekV3TextConfig,
-    ModelClass,
-)
-
-__all__ = [
-    "KimiK25VLForConditionalGeneration",
-    "KimiK25VLConfig",
-    "MoonViT3dConfig",
-    "DeepseekV3TextConfig",
-    "ModelClass",
-]

@@ -34,6 +34,7 @@ import torch.nn.functional as F
 from transformers import AutoConfig
 from transformers.activations import GELUActivation
 from transformers.configuration_utils import PretrainedConfig
+from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
 
 LOGGER = logging.getLogger(__name__)
@@ -42,98 +43,6 @@ LOGGER = logging.getLogger(__name__)
 # =============================================================================
 # Configuration Classes
 # =============================================================================
-
-class DeepseekV3TextConfig(PretrainedConfig):
-    """Configuration for DeepseekV3 text model (used as KimiK25VL's LLM)."""
-
-    model_type = "deepseek_v3"
-
-    def __init__(
-        self,
-        vocab_size: int = 163840,
-        hidden_size: int = 7168,
-        intermediate_size: int = 18432,
-        moe_intermediate_size: int = 2048,
-        num_hidden_layers: int = 61,
-        num_attention_heads: int = 128,
-        num_key_value_heads: int = 128,
-        n_shared_experts: int = 1,
-        n_routed_experts: int = 256,
-        ep_size: int = 1,
-        routed_scaling_factor: float = 2.5,
-        kv_lora_rank: int = 512,
-        q_lora_rank: Optional[int] = 1536,
-        qk_rope_head_dim: int = 64,
-        v_head_dim: int = 128,
-        qk_nope_head_dim: int = 128,
-        topk_method: str = "noaux_tc",
-        n_group: int = 8,
-        topk_group: int = 4,
-        num_experts_per_tok: int = 8,
-        moe_layer_freq: int = 1,
-        first_k_dense_replace: int = 3,
-        norm_topk_prob: bool = True,
-        scoring_func: str = "sigmoid",
-        aux_loss_alpha: float = 0.001,
-        seq_aux: bool = True,
-        hidden_act: str = "silu",
-        max_position_embeddings: int = 163840,
-        initializer_range: float = 0.02,
-        rms_norm_eps: float = 1e-6,
-        use_cache: bool = True,
-        rope_theta: float = 10000.0,
-        rope_scaling: Optional[Dict] = None,
-        attention_bias: bool = False,
-        attention_dropout: float = 0.0,
-        tie_word_embeddings: bool = False,
-        pad_token_id: Optional[int] = None,
-        bos_token_id: int = 0,
-        eos_token_id: int = 1,
-        **kwargs,
-    ):
-        self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.moe_intermediate_size = moe_intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.num_key_value_heads = num_key_value_heads
-        self.n_shared_experts = n_shared_experts
-        self.n_routed_experts = n_routed_experts
-        self.ep_size = ep_size
-        self.routed_scaling_factor = routed_scaling_factor
-        self.kv_lora_rank = kv_lora_rank
-        self.q_lora_rank = q_lora_rank
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.v_head_dim = v_head_dim
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.topk_method = topk_method
-        self.n_group = n_group
-        self.topk_group = topk_group
-        self.num_experts_per_tok = num_experts_per_tok
-        self.moe_layer_freq = moe_layer_freq
-        self.first_k_dense_replace = first_k_dense_replace
-        self.norm_topk_prob = norm_topk_prob
-        self.scoring_func = scoring_func
-        self.aux_loss_alpha = aux_loss_alpha
-        self.seq_aux = seq_aux
-        self.hidden_act = hidden_act
-        self.max_position_embeddings = max_position_embeddings
-        self.initializer_range = initializer_range
-        self.rms_norm_eps = rms_norm_eps
-        self.use_cache = use_cache
-        self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
-        self.attention_bias = attention_bias
-        self.attention_dropout = attention_dropout
-        super().__init__(
-            tie_word_embeddings=tie_word_embeddings,
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            **kwargs,
-        )
-
 
 class MoonViT3dConfig(PretrainedConfig):
     """Configuration for MoonViT3d vision encoder with temporal support."""
@@ -183,7 +92,7 @@ class KimiK25VLConfig(PretrainedConfig):
     def __init__(
         self,
         vision_config: Optional[Union[Dict, MoonViT3dConfig]] = None,
-        text_config: Optional[Union[Dict, DeepseekV3TextConfig]] = None,
+        text_config: Optional[Union[Dict, DeepseekV3Config]] = None,
         ignore_index: int = -100,
         media_placeholder_token_id: int = 163605,
         pad_token_id: int = 0,
@@ -203,9 +112,9 @@ class KimiK25VLConfig(PretrainedConfig):
         self.vision_config = vision_config
 
         if text_config is None:
-            text_config = DeepseekV3TextConfig()
+            text_config = DeepseekV3Config()
         elif isinstance(text_config, dict):
-            text_config = DeepseekV3TextConfig(**text_config)
+            text_config = DeepseekV3Config(**text_config)
         self.text_config = text_config
 
         self.ignore_index = ignore_index
@@ -242,7 +151,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_fr
 from nemo_automodel.components.models.kimi_k25_vl.state_dict_adapter import KimiK25VLStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
