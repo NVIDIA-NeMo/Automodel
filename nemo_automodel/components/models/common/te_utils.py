@@ -81,6 +81,11 @@ class TENormWrapper(nn.Module):
         object.__setattr__(self, "te_norm", te_norm)
         object.__setattr__(self, "torch_norm", torch_norm)
 
+    def reset_parameters(self) -> None:
+        """Reset parameters by delegating to the underlying torch norm."""
+        torch_norm = object.__getattribute__(self, "torch_norm")
+        torch_norm.reset_parameters()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if is_tensor_unallocated(x):
             # Shape inference only - return empty tensor with same shape
@@ -113,6 +118,8 @@ class TELinearWrapper(nn.Module):
         if bias:
             self.bias = te_linear.bias
             torch_linear.bias = self.bias
+        else:
+            self.bias = None
 
         # Use object.__setattr__ to prevent submodules from being registered in self._modules.
         object.__setattr__(self, "te_linear", te_linear)
