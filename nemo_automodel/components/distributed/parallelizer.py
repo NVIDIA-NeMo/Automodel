@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib
+import inspect
 import logging
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -1078,8 +1079,28 @@ def megatron_fsdp_strategy_parallelize(
     # Import MegatronFSDP unit modules specified by the user.
     megatron_fsdp_unit_modules = import_classes_from_paths(megatron_fsdp_unit_modules)
 
+    # MegatronFSDP requires a sharded DP dimension to create its param/grad buffers.
+    # In practice, configurations like world_size=2,tp=2 -> dp=1 frequently hit
+    # DTensor metadata assertions inside megatron_fsdp. In that case, we still
+    # support training by applying TP-only and skipping the MegatronFSDP wrapper.
+    if dp_mesh.size() == 1:
+        logger.warning(
+            "MegatronFSDP DP shard group size is 1; skipping MegatronFSDP wrapping and returning the "
+            "TP-parallelized model. To enable MegatronFSDP sharding, use dp_size>1 (e.g., tp_size=1 "
+            "for world_size=2)."
+        )
+        # `parallelize_module` only moves/shards modules covered by the TP plan.
+        # Ensure the remaining (non-sharded) parameters/buffers are on the local device.
+        if getattr(device_mesh, "device_type", None) == "cuda" and torch.cuda.is_available():
+            try:
+                model = model.to(torch.device("cuda", torch.cuda.current_device()))
+            except Exception:
+                # Best-effort fallback (e.g., if current_device isn't set).
+                model = model.to("cuda")
+        return model, optimizer
+
     # Wrap model with MegatronFSDP.
-    model, optimizer = megatron_fsdp_fully_shard(
+    fsdp_kwargs = dict(
         module=model,
         optimizer=optimizer,
         fsdp_unit_modules=megatron_fsdp_unit_modules,
@@ -1101,6 +1122,26 @@ def megatron_fsdp_strategy_parallelize(
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer,
     )
+
+    # Compatibility: older `megatron_fsdp.fully_shard` versions don't accept
+    # `sync_grads_each_step`. Prefer filtering by signature, but also retry on
+    # TypeError for cases where the callable's signature can't be inspected.
+    try:
+        sig = inspect.signature(megatron_fsdp_fully_shard)
+    except (TypeError, ValueError):
+        sig = None
+    if sig is not None and "sync_grads_each_step" not in sig.parameters:
+        fsdp_kwargs.pop("sync_grads_each_step", None)
+
+    try:
+        model, optimizer = megatron_fsdp_fully_shard(**fsdp_kwargs)
+    except TypeError as e:
+        # Example: "fully_shard() got an unexpected keyword argument 'sync_grads_each_step'"
+        if "sync_grads_each_step" in str(e) and "unexpected keyword argument" in str(e):
+            fsdp_kwargs.pop("sync_grads_each_step", None)
+            model, optimizer = megatron_fsdp_fully_shard(**fsdp_kwargs)
+        else:
+            raise
 
     return model, optimizer
 

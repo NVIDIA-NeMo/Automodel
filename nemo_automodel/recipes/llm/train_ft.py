@@ -312,15 +312,35 @@ def build_model_and_optimizer(
         elif callable(getattr(model_wrapper, "parallelize", None)):
             # FSDP2 and MegatronFSDP should already be on the correct device
             if isinstance(model_wrapper, MegatronFSDPManager):
-                # MegatronFSDP instantiate optimizer inside parallelize_function
-                trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
-                assert len(trainable_params) > 0, "trainable_params cannot be empty"
+                # NOTE: When running TP-only (dp_size==1), `parallelize_module(...)` may replace
+                # parameters in-place. Creating the optimizer *before* parallelization can then
+                # leave the optimizer referencing stale parameter objects, which breaks
+                # distributed checkpointing (`get_optimizer_state_dict`) and can silently prevent
+                # updates. So we parallelize first in that case, then build the optimizer.
+                try:
+                    dp_size = int(getattr(model_wrapper, "dp_size", 0) or 0)
+                except Exception:
+                    dp_size = 0
+                if dp_size <= 0:
+                    try:
+                        dp_size = int(model_wrapper.device_mesh["dp"].size())
+                    except Exception:
+                        dp_size = 0
+
                 if tp_size > 1:
                     # TP does not support foreach
                     cfg_opt.foreach = False
-                optimizer = cfg_opt.instantiate(params=trainable_params)
 
-                model, optimizer = model_wrapper.parallelize(model, optimizer)
+                if dp_size == 1:
+                    model, _ = model_wrapper.parallelize(model, optimizer=None)
+                    trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
+                    assert len(trainable_params) > 0, "trainable_params cannot be empty"
+                    optimizer = cfg_opt.instantiate(params=trainable_params)
+                else:
+                    trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
+                    assert len(trainable_params) > 0, "trainable_params cannot be empty"
+                    optimizer = cfg_opt.instantiate(params=trainable_params)
+                    model, optimizer = model_wrapper.parallelize(model, optimizer)
 
                 trainable_params, total_params = print_trainable_parameters(model)
                 param_info["trainable_params"] = trainable_params
