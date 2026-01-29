@@ -101,13 +101,22 @@ class MoESplitExpertsStateDictMixin:
                 key_prefix = key[: key.index("layers.")]
                 break
 
-        layers_with_experts = set()
-        pattern = rf"{re.escape(key_prefix)}layers\.(\d+)\.{re.escape(expert_segment)}\.\d+\.(gate_proj|up_proj|down_proj)\.weight"
+        # Build list of all possible prefixes
+        prefixes = ["model.language_model.", "model.", "language_model.", ""]
+        if key_prefix and key_prefix not in prefixes:
+            prefixes.insert(0, key_prefix)
+
+        layers_with_experts: dict[int, set[str]] = {}
+        # Create pattern with all prefixes
+        escaped_prefixes = [re.escape(p) for p in prefixes]
+        prefix_pattern = "(?P<prefix>" + "|".join(escaped_prefixes) + ")"
+        pattern = rf"{prefix_pattern}layers\.(\d+)\.{re.escape(expert_segment)}\.\d+\.(gate_proj|up_proj|down_proj)\.weight"
         for key in hf_state_dict.keys():
             match = re.match(pattern, key)
             if match:
-                layer_num = int(match.group(1))
-                layers_with_experts.add(layer_num)
+                prefix = match.group("prefix") or ""
+                layer_num = int(match.group(2))
+                layers_with_experts.setdefault(layer_num, set()).add(prefix)
 
         if not layers_with_experts:
             return
@@ -115,12 +124,13 @@ class MoESplitExpertsStateDictMixin:
         missing_weights = []
         projection_types = ["gate_proj", "up_proj", "down_proj"] if self._is_gated_moe else ["up_proj", "down_proj"]
 
-        for layer_num in layers_with_experts:
-            for expert_id in required_experts:
-                for proj_type in projection_types:
-                    expected_key = f"{key_prefix}layers.{layer_num}.{expert_segment}.{expert_id}.{proj_type}.weight"
-                    if expected_key not in hf_state_dict:
-                        missing_weights.append(expected_key)
+        for layer_num, prefixes in layers_with_experts.items():
+            for prefix in prefixes:
+                for expert_id in required_experts:
+                    for proj_type in projection_types:
+                        expected_key = f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.{proj_type}.weight"
+                        if expected_key not in hf_state_dict:
+                            missing_weights.append(expected_key)
 
         if missing_weights:
             missing_count = len(missing_weights)
@@ -238,9 +248,10 @@ class MoESplitExpertsStateDictMixin:
 
         # Handle both formats:
         # - model.layers.{L}.{expert_segment}.{E}.gate_proj.weight (with model prefix)
+        # - language_model.layers.{L}.{expert_segment}.{E}.gate_proj.weight (with language_model prefix)
         # - layers.{L}.{expert_segment}.{E}.gate_proj.weight (without model prefix)
         expert_pattern = re.compile(
-            rf"(?:model\.)?layers\.(\d+)\.{re.escape(expert_segment)}\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
+            rf"(?P<prefix>(?:model\.)?(?:language_model\.)?)layers\.(\d+)\.{re.escape(expert_segment)}\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
         )
 
         for key, value in hf_state_dict.items():
@@ -250,7 +261,8 @@ class MoESplitExpertsStateDictMixin:
                     state_dict[key] = value
                     continue
 
-                layer_num, expert_num, which = m.groups()
+                prefix = m.group("prefix") or ""
+                layer_num, expert_num, which = m.group(2), m.group(3), m.group(4)
                 expert_num = int(expert_num)
 
                 if not should_load_expert_for_rank(expert_num, device_mesh, n_experts):
@@ -260,10 +272,9 @@ class MoESplitExpertsStateDictMixin:
                     expert_weights_by_layer[layer_num] = {}
 
                 if which in ["gate_proj", "up_proj"]:
-                    # Both gated and non-gated use gate_and_up_projs
-                    native_key = f"model.layers.{layer_num}.{expert_segment}.gate_and_up_projs"
+                    native_key = f"{prefix}layers.{layer_num}.{expert_segment}.gate_and_up_projs"
                 else:  # down_proj
-                    native_key = f"model.layers.{layer_num}.{expert_segment}.down_projs"
+                    native_key = f"{prefix}layers.{layer_num}.{expert_segment}.down_projs"
 
                 if native_key not in expert_weights_by_layer[layer_num]:
                     expert_weights_by_layer[layer_num][native_key] = {}

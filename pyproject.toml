@@ -94,6 +94,10 @@ dependencies = [
 [project.optional-dependencies]
 cuda = ["flash-attn<=2.8.3", "transformer-engine[pytorch]==2.8.0", "mamba-ssm", "causal-conv1d"]
 extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
+delta-databricks = [
+    "deltalake>=1.0.0",  # For Delta Lake metadata
+    "databricks-sql-connector>=3.0.0",  # For Unity Catalog streaming access
+]
 vlm = [
     "pillow",
     "qwen-vl-utils[decord]; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
@@ -107,6 +111,7 @@ vlm = [
     "albumentations"
 ]
 all = [
+    "nemo_automodel[delta-databricks]",
     "nemo_automodel[extra]",
     "nemo_automodel[vlm]",
 ]
@@ -184,6 +189,8 @@ omit = [
     "config-3.py",
     # transformer v5 backports
     "nemo_automodel/_transformers/tokenization/tokenization_mistral_common.py",
+    # requires databricks
+    "nemo_automodel/components/datasets/llm/delta_lake_dataset.py",
 ]
 
 [tool.ruff]
