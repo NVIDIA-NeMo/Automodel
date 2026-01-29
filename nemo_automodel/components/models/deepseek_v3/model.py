@@ -170,8 +170,9 @@ class DeepseekV3Model(nn.Module):
 
         if position_ids is None:
             seq_len = inputs_embeds.shape[1]
-            position_ids = torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(0).expand(inputs_embeds.shape[0], -1)
-
+            position_ids = (
+                torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(0).expand(inputs_embeds.shape[0], -1)
+            )
 
         with torch.no_grad():
             freqs_cis = freqs_cis_from_position_ids(

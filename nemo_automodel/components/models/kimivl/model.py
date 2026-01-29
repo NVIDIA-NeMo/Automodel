@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import json
-import os
 import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -33,6 +32,7 @@ LOGGER = logging.getLogger(__name__)
 # =============================================================================
 # Configuration Classes
 # =============================================================================
+
 
 class MoonViTConfig(PretrainedConfig):
     """Configuration for MoonVit vision encoder."""
@@ -91,7 +91,7 @@ class KimiVLConfig(PretrainedConfig):
 
         self.ignore_index = ignore_index
         self.media_placeholder_token_id = media_placeholder_token_id
-        
+
         # Ensure architectures is set for ModelRegistry matching
         if architectures is None:
             architectures = ["KimiVLForConditionalGeneration"]
@@ -105,19 +105,19 @@ class KimiVLConfig(PretrainedConfig):
         return output
 
 
-
-from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3Model, DeepseekV3ForCausalLM
+from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3Model
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 # Check for flash attention
 try:
     from flash_attn import flash_attn_varlen_func
+
     FLASH_ATTN_AVAILABLE = True
 except ImportError:
     FLASH_ATTN_AVAILABLE = False
@@ -127,7 +127,10 @@ except ImportError:
 # Vision Tower Components (MoonVit)
 # =============================================================================
 
-def _apply_rope_vision(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+
+def _apply_rope_vision(
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary position embedding for vision."""
     freqs_cis = freqs_cis.unsqueeze(-2)
     xq_ = torch.view_as_complex(xq.float().view(*xq.shape[:-1], -1, 2))
@@ -150,7 +153,7 @@ def vision_attention_sdpa(q, k, v, q_cu_seqlens, k_cu_seqlens):
     seq_length = q.shape[0]
     attention_mask = torch.zeros([1, seq_length, seq_length], device=q.device, dtype=torch.bool)
     for i in range(1, len(q_cu_seqlens)):
-        attention_mask[..., q_cu_seqlens[i - 1]:q_cu_seqlens[i], q_cu_seqlens[i - 1]:q_cu_seqlens[i]] = True
+        attention_mask[..., q_cu_seqlens[i - 1] : q_cu_seqlens[i], q_cu_seqlens[i - 1] : q_cu_seqlens[i]] = True
     q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
     attn_output = F.scaled_dot_product_attention(q, k, v, attention_mask, dropout_p=0.0)
     return attn_output.transpose(0, 1).reshape(seq_length, -1)
@@ -175,13 +178,14 @@ class Learnable2DInterpPosEmb(nn.Module):
             else:
                 pos_embs.append(
                     F.interpolate(self.weight.permute(2, 0, 1).unsqueeze(0), size=shape, mode=self.interpolation_mode)
-                    .squeeze(0).permute(1, 2, 0).flatten(end_dim=1)
+                    .squeeze(0)
+                    .permute(1, 2, 0)
+                    .flatten(end_dim=1)
                 )
         return x + torch.cat(pos_embs)
 
 
 class Rope2DPosEmb(nn.Module):
-
     def __init__(self, dim: int, max_height: int, max_width: int, theta_base: float = 10000):
         super().__init__()
         self.dim = dim
@@ -253,7 +257,9 @@ class MoonVitEncoderLayer(nn.Module):
         self.wqkv = nn.Linear(hidden_dim, hidden_dim * 3, bias=attn_bias)
         self.wo = nn.Linear(hidden_dim, hidden_dim, bias=attn_bias)
 
-    def forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor, rope_freqs_cis: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor, rope_freqs_cis: torch.Tensor
+    ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
 
@@ -284,7 +290,9 @@ class MoonVitEncoder(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, grid_hws: torch.Tensor) -> torch.Tensor:
         rope_freqs_cis = self.rope_2d.get_freqs_cis(grid_hws)
-        lengths = torch.cat((torch.zeros(1, device=hidden_states.device, dtype=grid_hws.dtype), grid_hws[:, 0] * grid_hws[:, 1]))
+        lengths = torch.cat(
+            (torch.zeros(1, device=hidden_states.device, dtype=grid_hws.dtype), grid_hws[:, 0] * grid_hws[:, 1])
+        )
         cu_seqlens = lengths.cumsum(dim=0, dtype=torch.int32)
 
         for block in self.blocks:
@@ -295,7 +303,9 @@ class MoonVitEncoder(nn.Module):
 class MoonVisionPatchEmbed(nn.Module):
     """Patch embedding for MoonVit."""
 
-    def __init__(self, out_dim: int, in_dim: int = 3, patch_size: int = 14, pos_emb_height: int = 64, pos_emb_width: int = 64):
+    def __init__(
+        self, out_dim: int, in_dim: int = 3, patch_size: int = 14, pos_emb_height: int = 64, pos_emb_width: int = 64
+    ):
         super().__init__()
         self.patch_size = (patch_size, patch_size) if isinstance(patch_size, int) else patch_size
         self.proj = nn.Conv2d(in_dim, out_dim, kernel_size=self.patch_size, stride=self.patch_size)
@@ -312,7 +322,7 @@ def patch_merger(x: torch.Tensor, grid_hws: torch.Tensor, merge_kernel_size: Lis
     outputs = []
     pre_sum = 0
     for h, w in grid_hws.tolist():
-        seq = x[pre_sum:pre_sum + h * w]
+        seq = x[pre_sum : pre_sum + h * w]
         kh, kw = merge_kernel_size
         new_h, new_w = h // kh, w // kw
         reshaped = seq.view(new_h, kh, new_w, kw, d_model).permute(0, 2, 1, 3, 4).contiguous()
@@ -363,6 +373,7 @@ class MoonVitPretrainedModel(nn.Module):
 # Multi-Modal Projector
 # =============================================================================
 
+
 class KimiVLMultiModalProjector(nn.Module):
     """Projects vision features to language model dimension."""
 
@@ -371,7 +382,9 @@ class KimiVLMultiModalProjector(nn.Module):
         vision_config = config.vision_config
         text_config = config.text_config
 
-        self.hidden_size = vision_config.hidden_size * vision_config.merge_kernel_size[0] * vision_config.merge_kernel_size[1]
+        self.hidden_size = (
+            vision_config.hidden_size * vision_config.merge_kernel_size[0] * vision_config.merge_kernel_size[1]
+        )
         self.pre_norm = nn.LayerNorm(vision_config.hidden_size, eps=1e-05)
         self.linear_1 = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.act = GELUActivation()
@@ -389,34 +402,35 @@ class KimiVLMultiModalProjector(nn.Module):
 # Rotary Embedding Adapter (Non-Module callable for PP/FSDP compatibility)
 # =============================================================================
 
+
 class DeepSeekV3RotaryEmbeddingAdapter:
     """Callable adapter that wraps DeepseekV3's freqs_cis-based RoPE.
-    
+
     This is NOT an nn.Module to avoid being pruned during PP split.
     It holds a reference to the parent module's freqs_cis buffer and computes
     position embeddings on demand.
-    
+
     The parent module (KimiVLLanguageModelBackend) owns the freqs_cis buffer,
     and this adapter accesses it via the reference.
     """
-    
+
     def __init__(self, parent_module: nn.Module, rope_fusion: bool = False):
         # Store weak reference to avoid circular dependencies
         self._parent = parent_module
         self.rope_fusion = rope_fusion
-    
+
     @property
     def freqs_cis(self):
         """Access freqs_cis from the parent module."""
         return self._parent.freqs_cis
-    
+
     def __call__(self, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         """Compute position embeddings from pre-computed freqs_cis.
-        
+
         Args:
             hidden_states: Input tensor (used only for device/dtype inference)
             position_ids: Position indices tensor
-            
+
         Returns:
             Position embeddings tensor compatible with DeepseekV3 Block layers
         """
@@ -439,10 +453,11 @@ class DeepSeekV3RotaryEmbeddingAdapter:
 # Language Model Backend
 # =============================================================================
 
+
 class KimiVLLanguageModelBackend(nn.Module):
     """Backend-aware language model wrapper using DeepseekV3 architecture.
-    
-    Note: lm_head is NOT included here - it's at the top level of 
+
+    Note: lm_head is NOT included here - it's at the top level of
     KimiVLForConditionalGeneration to match HF checkpoint structure.
     """
 
@@ -455,9 +470,7 @@ class KimiVLLanguageModelBackend(nn.Module):
         self.moe_config = self.model.moe_config
         self.register_buffer("freqs_cis", self.model.freqs_cis, persistent=False)
 
-        self.rotary_emb = DeepSeekV3RotaryEmbeddingAdapter(
-            parent_module=self, rope_fusion=backend.rope_fusion
-        )
+        self.rotary_emb = DeepSeekV3RotaryEmbeddingAdapter(parent_module=self, rope_fusion=backend.rope_fusion)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -509,6 +522,7 @@ class KimiVLLanguageModelBackend(nn.Module):
 # Main Model
 # =============================================================================
 
+
 class KimiVLModel(nn.Module):
     """KimiVL multimodal backbone with a DeepseekV3 text decoder."""
 
@@ -519,12 +533,13 @@ class KimiVLModel(nn.Module):
 
         self.vision_tower = MoonVitPretrainedModel(config.vision_config)
         self.multi_modal_projector = KimiVLMultiModalProjector(config)
-        self.language_model = KimiVLLanguageModelBackend(config.text_config, backend=self.backend, moe_config=moe_config)
+        self.language_model = KimiVLLanguageModelBackend(
+            config.text_config, backend=self.backend, moe_config=moe_config
+        )
 
         self.moe_config = self.language_model.moe_config
 
         self.media_placeholder_token_id = config.media_placeholder_token_id
-
 
     @property
     def layers(self):
@@ -584,9 +599,7 @@ class KimiVLModel(nn.Module):
                     # PP middle stages may receive hidden states as input_ids
                     inputs_embeds = input_ids
                 else:
-                    raise ValueError(
-                        "inputs_embeds must be provided for pipeline stages without embed_tokens"
-                    )
+                    raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
             else:
                 inputs_embeds = embed_tokens(input_ids)
 
@@ -621,7 +634,7 @@ class KimiVLForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
         """Load model from pretrained path.
-        
+
         Uses our registered KimiVLConfig which is registered with AutoConfig,
         so trust_remote_code is not needed.
         """
@@ -636,7 +649,6 @@ class KimiVLForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
         self.model = KimiVLModel(config, moe_config=moe_config, backend=self.backend)
         self.moe_config = self.model.moe_config
 
-    
         self.model.language_model.lm_head = initialize_linear_module(
             self.backend.linear, config.text_config.hidden_size, config.text_config.vocab_size, bias=False
         )
@@ -694,7 +706,11 @@ class KimiVLForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
         # Retrieve pre-chunked VLM inputs from model attributes
         # This allows native forward to work with pipeline parallelism
         # finetune.py stores chunks on model, we retrieve them here per microbatch
-        if pixel_values is None and hasattr(self, "_vlm_pixel_values_chunks") and self._vlm_pixel_values_chunks is not None:
+        if (
+            pixel_values is None
+            and hasattr(self, "_vlm_pixel_values_chunks")
+            and self._vlm_pixel_values_chunks is not None
+        ):
             # Check if we have media tokens to process
             has_media_tokens = (
                 input_ids is not None
@@ -815,26 +831,29 @@ class KimiVLStateDictAdapter:
 
     def to_hf(self, state_dict: dict, **kwargs) -> dict:
         import re
+
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
-        
+
         hf_state_dict = {}
         llm_keys = {}
         for key, value in state_dict.items():
             if exclude_key_regex and re.match(exclude_key_regex, key):
                 continue
-            
+
             if key.startswith("model.model."):
                 continue
             if key.startswith("model.language_model."):
                 key = key.replace("model.", "", 1)
             if key.startswith("model.") and not key.startswith("model.language_model."):
                 key = key.replace("model.", "", 1)
-                
+
             if key.startswith("language_model.model."):
                 llm_key = key.replace("language_model.model.", "model.")
                 llm_keys[llm_key] = value
-            elif key.startswith("language_model.embed_tokens.") or key.startswith("language_model.layers.") or key.startswith(
-                "language_model.norm."
+            elif (
+                key.startswith("language_model.embed_tokens.")
+                or key.startswith("language_model.layers.")
+                or key.startswith("language_model.norm.")
             ):
                 llm_key = "model." + key.replace("language_model.", "", 1)
                 llm_keys[llm_key] = value
@@ -842,7 +861,7 @@ class KimiVLStateDictAdapter:
                 hf_state_dict["language_model." + key] = value
             else:
                 hf_state_dict[key] = value
-                
+
         if llm_keys:
             for k, v in self.llm_adapter.to_hf(llm_keys, **kwargs).items():
                 hf_state_dict[k.replace("model.", "language_model.model.")] = v
@@ -851,7 +870,7 @@ class KimiVLStateDictAdapter:
 
     def from_hf(self, state_dict: dict, **kwargs) -> dict:
         native_state_dict = {}
-        
+
         llm_keys = {}
         for key, value in state_dict.items():
             if key.startswith("language_model.model."):
@@ -865,32 +884,34 @@ class KimiVLStateDictAdapter:
                 native_state_dict["model." + key] = value
             else:
                 native_state_dict[key] = value
-        
+
         # Process all LLM keys at once through the adapter
         if llm_keys:
             converted_llm = self.llm_adapter.from_hf(llm_keys, **kwargs)
             for k, v in converted_llm.items():
                 native_state_dict[k.replace("model.", "model.language_model.model.")] = v
-        
+
         return native_state_dict
 
 
 ModelClass = KimiVLForConditionalGeneration
 
+
 def _register_kimi_vl_with_transformers():
     """
     Register KimiVLConfig and model with transformers Auto classes.
-    
+
     This uses the official transformers registration API. When registered,
     AutoModelForImageTextToText.from_pretrained will use our local implementation
     directly, bypassing the trust_remote_code mechanism entirely.
     """
     import logging
+
     from transformers import AutoModelForImageTextToText
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-    
+
     _logger = logging.getLogger(__name__)
-    
+
     # Register config with AutoConfig
     if "kimi_vl" not in CONFIG_MAPPING:
         try:
