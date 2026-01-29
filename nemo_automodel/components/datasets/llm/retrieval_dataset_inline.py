@@ -520,9 +520,9 @@ def make_retrieval_dataset(
 
     # Apply same processing as _get_processed_dataset
     if data_type == "train":
+        if do_shuffle:
+            dataset = dataset.shuffle(seed=seed)
         if max_train_samples is not None:
-            if do_shuffle:
-                dataset = dataset.shuffle(seed=seed)
             dataset = dataset.select(
                 range(train_data_select_offset, min(train_data_select_offset + max_train_samples, len(dataset)))
             )
