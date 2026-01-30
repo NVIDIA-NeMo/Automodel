@@ -22,8 +22,8 @@ seed: 125
 step_scheduler:
   global_batch_size: 128
   local_batch_size: 1
-  ckpt_every_steps: 2
-  val_every_steps: 2
+  ckpt_every_steps: 100
+  val_every_steps: 100
   num_epochs: 1
 
 dist_env:
@@ -34,10 +34,27 @@ model:
   _target_: nemo_automodel.components.models.biencoder.NeMoAutoModelBiencoder.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-Nano-9B-v2
   train_n_passages: 5
-  pooling: last
+  pooling: avg
   t: 0.02
   torch_dtype: bfloat16
   attn_implementation: eager
+  
+  # Bidirectional processing strategy for Mamba layers
+  # Options: 
+  #   - average: Simple average of forward and backward passes
+  #   - concat: Concatenate forward and backward (doubles hidden size)
+  #   - weighted: Weighted average using forward_weight
+  #   - gated: Learned gating mechanism (requires training)
+  mamba_bidirectional_strategy: average
+  
+  # Forward weight (only used if mamba_bidirectional_strategy=weighted)
+  # Value between 0 and 1, backward_weight = 1 - forward_weight
+  forward_weight: 0.5
+  
+  # Bidirectional attention for attention layers
+  # If true, attention layers use bidirectional attention (all tokens attend to all tokens)
+  # If false, attention layers use causal attention (tokens only attend to past tokens)
+  bidirectional_attention: true
   
 
 tokenizer:

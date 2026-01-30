@@ -142,10 +142,15 @@ class NemotronBidirectionalConfig(NemotronHConfig):
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.pooling = kwargs.get("pooling", "last")
+        self.pooling = kwargs.get("pooling", "avg")
         self.temperature = kwargs.get("temperature", 1.0)
         self.use_cache = kwargs.get("use_cache", False)
+        self.mamba_bidirectional_strategy = kwargs.get("mamba_bidirectional_strategy", "average")  # Options: average, concat, weighted, gated
+        self.forward_weight = kwargs.get("forward_weight", 0.5)  # For weighted strategy
+        self.bidirectional_attention = kwargs.get("bidirectional_attention", True)  # Use bidirectional attention for attention layers
         logger.info(f"NemotronBidirectionalConfig initialized with pooling: {self.pooling} and temperature: {self.temperature}")
+        logger.info(f"NemotronBidirectionalConfig initialized with mamba_bidirectional_strategy: {self.mamba_bidirectional_strategy}")
+        logger.info(f"NemotronBidirectionalConfig initialized with bidirectional_attention: {self.bidirectional_attention}")
         logger.info(f"NemotronBidirectionalConfig initialized with kwargs: {kwargs}")
 
 
@@ -164,7 +169,62 @@ class NemotronBidirectionalModel(NemotronHModel):
         self.config = config
         self.model = None
         self.tokenizer = None
+        
+        # Initialize gating layer if using gated bidirectional strategy
+        if hasattr(config, 'mamba_bidirectional_strategy') and config.mamba_bidirectional_strategy == "gated":
+            self.gate_layer = nn.Linear(config.hidden_size * 2, 1)
 
+    def _update_causal_mask(self, attention_mask, input_tensor, cache_position):
+        """
+        Override parent's causal mask to optionally create a bidirectional attention mask.
+        If bidirectional_attention is True, all tokens can attend to all other tokens (no causal masking).
+        If bidirectional_attention is False, uses standard causal masking (parent behavior).
+        In both cases, padding tokens are properly masked.
+        """
+        # If bidirectional attention is disabled, use parent's causal mask
+        use_bidirectional = getattr(self.config, 'bidirectional_attention', True)
+        if not use_bidirectional:
+            return super()._update_causal_mask(attention_mask, input_tensor, cache_position)
+        
+        # Bidirectional attention implementation
+        if self.config._attn_implementation == "flash_attention_2":
+            if attention_mask is not None and 0.0 in attention_mask:
+                return attention_mask
+            return None
+
+        dtype, device = input_tensor.dtype, input_tensor.device
+        min_dtype = torch.finfo(dtype).min
+        batch_size, sequence_length = input_tensor.shape[0], input_tensor.shape[1]
+        target_length = cache_position[-1] + 1
+
+        # Create a full attention mask (all zeros, meaning all tokens can attend to all tokens)
+        # This is the key difference from causal attention
+        bidirectional_mask = torch.zeros((sequence_length, target_length), dtype=dtype, device=device)
+        
+        # Expand to 4D: [batch, 1, seq_len, target_len]
+        bidirectional_mask = bidirectional_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+        
+        # Apply padding mask if provided
+        if attention_mask is not None:
+            bidirectional_mask = bidirectional_mask.clone()  # copy to contiguous memory for in-place edit
+            if attention_mask.dim() == 2:
+                mask_length = attention_mask.shape[-1]
+                # Mask out padding tokens (where attention_mask is 0)
+                padding_mask = attention_mask[:, None, None, :].eq(0.0)
+                bidirectional_mask[..., :mask_length] = bidirectional_mask[..., :mask_length].masked_fill(
+                    padding_mask, min_dtype
+                )
+
+        if (
+            self.config._attn_implementation == "sdpa"
+            and attention_mask is not None
+            and attention_mask.device.type == "cuda"
+        ):
+            # For SDPA memory-efficient attention path
+            from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+            bidirectional_mask = AttentionMaskConverter._unmask_unattended(bidirectional_mask, min_dtype)
+
+        return bidirectional_mask
 
     # @check_model_inputs
     def forward(
@@ -227,28 +287,66 @@ class NemotronBidirectionalModel(NemotronHModel):
             # Depending on the layer type we opt for 2D base attention mask (Mamba) or 4D causal mask (Attention)
             if mixer_block.block_type == "mamba":
                 layer_mask = mamba_mask
+                
+                # Bidirectional processing for Mamba layers
+                strategy = getattr(self.config, 'mamba_bidirectional_strategy', 'average')
+                
+                # Forward pass
+                hidden_states_forward = mixer_block(
+                    hidden_states,
+                    cache_params=cache_params,
+                    cache_position=cache_position,
+                    attention_mask=layer_mask,
+                )
+                
+                # Backward pass (flip input and output)
+                hidden_states_reverse = hidden_states.flip(dims=[1])
+                hidden_states_reverse = mixer_block(
+                    hidden_states_reverse,
+                    cache_params=cache_params,
+                    cache_position=cache_position,
+                    attention_mask=layer_mask,
+                )
+                hidden_states_backward = hidden_states_reverse.flip(dims=[1])  # Flip back to align positions
+                
+                # Combine forward and backward based on strategy
+                if strategy == "average":
+                    hidden_states = (hidden_states_forward + hidden_states_backward) / 2
+                elif strategy == "concat":
+                    hidden_states = torch.cat([hidden_states_forward, hidden_states_backward], dim=-1)
+                elif strategy == "weighted":
+                    forward_weight = getattr(self.config, 'forward_weight', 0.5)
+                    backward_weight = 1.0 - forward_weight
+                    hidden_states = forward_weight * hidden_states_forward + backward_weight * hidden_states_backward
+                elif strategy == "gated":
+                    # Learned gating mechanism
+                    combined = torch.cat([hidden_states_forward, hidden_states_backward], dim=-1)
+                    gate = torch.sigmoid(self.gate_layer(combined))
+                    hidden_states = gate * hidden_states_forward + (1 - gate) * hidden_states_backward
+                else:
+                    raise ValueError(f"Invalid mamba_bidirectional_strategy: {strategy}. Choose from: average, concat, weighted, gated")
+                    
             elif mixer_block.block_type == "attention":
                 layer_mask = causal_mask
-            elif mixer_block.block_type == "mlp":
-                layer_mask = None
-            else:
-                raise ValueError(f"Invalid block_type: {self.block_type}")
-
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-            
-            if self.gradient_checkpointing and self.training:
-                hidden_states = self._gradient_checkpointing_func(
-                    mixer_block.__call__, hidden_states, cache_params, cache_position, layer_mask
-                )
-            else:
-            
                 hidden_states = mixer_block(
                     hidden_states,
                     cache_params=cache_params,
                     cache_position=cache_position,
                     attention_mask=layer_mask,
                 )
+            elif mixer_block.block_type == "mlp":
+                layer_mask = None
+                hidden_states = mixer_block(
+                    hidden_states,
+                    cache_params=cache_params,
+                    cache_position=cache_position,
+                    attention_mask=layer_mask,
+                )
+            else:
+                raise ValueError(f"Invalid block_type: {mixer_block.block_type}")
+
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
 
   
         hidden_states = self.norm_f(hidden_states)
