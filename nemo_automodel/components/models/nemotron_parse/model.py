@@ -38,6 +38,8 @@ from transformers.models.mbart.modeling_mbart import (
     MBartScaledWordEmbedding,
 )
 
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+
 # -----------------------------------------------------------------------------
 # NemotronParse configuration
 # -----------------------------------------------------------------------------
@@ -426,7 +428,7 @@ class NemotronParsePreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
 
 
-class NemotronParseForConditionalGeneration(NemotronParsePreTrainedModel, GenerationMixin):
+class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParsePreTrainedModel, GenerationMixin):
     """NemotronParse model for conditional generation tasks."""
 
     def __init__(self, config: NemotronParseConfig, **kwargs):

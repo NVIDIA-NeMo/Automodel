@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import types
+from unittest.mock import MagicMock
 
+import pytest
 import torch
 from transformers.models.donut.modeling_donut_swin import DonutSwinModelOutput
 

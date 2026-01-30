@@ -43,6 +43,7 @@ from typing import Any, Dict, Optional
 import torch
 import wandb
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
+from transformers.utils import TRANSFORMERS_CACHE
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -67,31 +68,80 @@ def _build_kd_loss_fn(cfg_kd):
     return cfg_kd.instantiate()
 
 
-def _build_teacher_model(cfg_teacher, seed, has_packed_sequence, device, model_wrapper, device_mesh):
+def _build_teacher_model(
+    cfg_teacher,
+    seed,
+    has_packed_sequence,
+    model_wrapper,
+    tp_size=1,
+    cp_size=1,
+    parallelize_fn=None,
+    device=None,
+    dp_rank=0,
+    tp_rank=0,
+    pp_rank=0,
+    moe_mesh=None,
+):
+    """Build and initialize the teacher model for knowledge distillation.
+
+    Uses the same infrastructure as student model (NeMoAutoModelForCausalLM) but without
+    PEFT, FP8, or QAT since the teacher should be frozen in full precision.
+
+    Args:
+        cfg_teacher: Configuration for teacher model instantiation.
+        seed: Random seed for reproducibility.
+        has_packed_sequence: Whether using packed sequences.
+        model_wrapper: Parallelism wrapper (FSDP2Manager, etc.).
+        tp_size: Tensor parallelism size.
+        cp_size: Context parallelism size.
+        parallelize_fn: Custom parallelization function.
+        device: Device to place the teacher model on.
+
+    Returns:
+        The frozen teacher model ready for inference.
+
+    Note:
+        The `offload_teacher_model` config option is not supported with this approach.
+        Device placement is handled internally by NeMoAutoModelForCausalLM infrastructure.
+    """
+    from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+
     assert cfg_teacher is not None, "`teacher_model` section missing from YAML config"
     logger.info("Instantiating teacher model")
 
-    # Build teacher model using the same approach as student model
+    # Create a simple checkpointer for the teacher (just for weight loading)
+    teacher_checkpointer = Checkpointer(
+        CheckpointingConfig(
+            model_repo_id=cfg_teacher.get("pretrained_model_name_or_path"),
+            model_cache_dir=cfg_teacher.get("cache_dir", TRANSFORMERS_CACHE),
+            # Dummy values
+            is_peft=False,
+            enabled=False,
+            checkpoint_dir="",
+            model_save_format="safetensors",
+            save_consolidated=False,
+        ),
+        dp_rank=dp_rank,
+        tp_rank=tp_rank,
+        pp_rank=pp_rank,
+        moe_mesh=moe_mesh,
+    )
+
+    # Build teacher model using the same infrastructure as student
+    # but without PEFT/FP8/QAT (teacher should be frozen in full precision)
     with ScopedRNG(seed=seed, ranked=True):
-        kwargs: Dict[str, Any] = {}
-        if has_packed_sequence > 0:
-            kwargs["attn_implementation"] = "flash_attention_2"
+        kwargs: Dict[str, Any] = {
+            "tp_size": tp_size,
+            "cp_size": cp_size,
+            "has_packed_sequence": has_packed_sequence,
+            "checkpointer": teacher_checkpointer,
+            "model_wrapper": model_wrapper,
+            "parallelize_fn": parallelize_fn,
+        }
 
         teacher_model = cfg_teacher.instantiate(**kwargs)
 
-        # For teacher model, we'll apply FSDP2 sharding if the same model_wrapper is available
-        # but we need to be careful about device placement and parallelization
-        if model_wrapper is not None and hasattr(model_wrapper, "parallelize"):
-            logger.info("Applying FSDP2 sharding to teacher model")
-            # Create a new model wrapper instance for the teacher to avoid conflicts
-            # with the student model's parallelization
-            try:
-                teacher_model = model_wrapper.parallelize(teacher_model)
-            except Exception as e:
-                logger.warning(f"Failed to parallelize teacher model with FSDP2: {e}")
-                logger.info("Falling back to simple device placement for teacher model")
-                teacher_model = teacher_model.to(device)
-        # ensure on device
+        # Ensure the teacher model is on the correct device
         teacher_model = teacher_model.to(device)
 
         # Set teacher to eval mode and freeze parameters
@@ -135,15 +185,21 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             raise ValueError("Pipeline parallelism support will be added in the future for knowledge distillation")
 
         self._offload_teacher_model = self.cfg.get("offload_teacher_model", False)
-        # teacher specific
         teacher_device = self.dist_env.device if not self._offload_teacher_model else "cpu"
+
         self.teacher_model = _build_teacher_model(
-            self.cfg.get("teacher_model", None),
-            self.cfg.get("seed", 42),
-            self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
-            teacher_device,
-            self.model_wrapper,
-            self.device_mesh,
+            cfg_teacher=self.cfg.get("teacher_model", None),
+            seed=self.cfg.get("seed", 42),
+            has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
+            model_wrapper=self.model_wrapper,
+            tp_size=self.cfg.get("distributed.tp_size", 1),
+            cp_size=self.cfg.get("distributed.cp_size", 1),
+            parallelize_fn=getattr(self.cfg.get("parallelizer", None), "instantiate", None),
+            device=teacher_device,
+            dp_rank=self._get_dp_rank(include_cp=True),
+            tp_rank=self._get_tp_rank(),
+            pp_rank=self._get_pp_rank(),
+            moe_mesh=self.moe_mesh,
         )
         logger.info("Teacher Model: " + str(self.teacher_model))
         # KD
