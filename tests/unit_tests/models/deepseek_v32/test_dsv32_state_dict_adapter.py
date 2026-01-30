@@ -108,6 +108,7 @@ class TestDeepSeekV32StateDictAdapter:
         # Should include V3.2 indexer keys
         assert "indexer.k_norm.weight" in non_quantized
         assert "indexer.k_norm.bias" in non_quantized
+        assert "indexer.weights_proj.weight" in non_quantized
 
 
 class TestDeepSeekV32StateDictAdapterQuantization:
@@ -213,14 +214,14 @@ class TestDeepSeekV32StateDictAdapterQuantization:
             assert result[0][1].dtype == tensor_bias.dtype
 
     def test_convert_tensor_quantization_indexer_linear_weights(self):
-        """Test that indexer linear weights (wq_b, wk, weights_proj) are quantized."""
+        """Test that indexer linear weights (wq_b, wk) are quantized but weights_proj is not."""
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
         backend = self.create_mock_backend_config()
 
         adapter = DeepSeekV32StateDictAdapter(config, moe_config, backend)
 
-        # Test wq_b weight
+        # Test wq_b weight - should be quantized
         tensor = torch.randn(256, 128)
         fqn = "model.layers.0.self_attn.indexer.wq_b.weight"
 
@@ -231,6 +232,37 @@ class TestDeepSeekV32StateDictAdapterQuantization:
             assert result[0][0] == fqn
             assert result[0][1].dtype == torch.float8_e4m3fn
             assert result[1][0] == fqn + "_scale_inv"
+
+        # Test wk weight - should be quantized
+        tensor_wk = torch.randn(256, 128)
+        fqn_wk = "model.layers.0.self_attn.indexer.wk.weight"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+            result = adapter.convert_single_tensor_to_hf(fqn_wk, tensor_wk, quantization=True)
+
+            assert len(result) == 2
+            assert result[0][0] == fqn_wk
+            assert result[0][1].dtype == torch.float8_e4m3fn
+            assert result[1][0] == fqn_wk + "_scale_inv"
+
+    def test_convert_tensor_quantization_skips_indexer_weights_proj(self):
+        """Test that indexer weights_proj is not quantized."""
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+
+        adapter = DeepSeekV32StateDictAdapter(config, moe_config, backend)
+
+        # Test weights_proj weight - should NOT be quantized
+        tensor = torch.randn(256, 128)
+        fqn = "model.layers.0.self_attn.indexer.weights_proj.weight"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+
+            assert len(result) == 1
+            assert result[0][0] == fqn
+            assert result[0][1].dtype == tensor.dtype  # Should not be quantized
 
 
 class TestDeepSeekV32StateDictAdapterAddQuantization:
@@ -293,7 +325,7 @@ class TestDeepSeekV32StateDictAdapterAddQuantization:
         assert "model.layers.0.input_layernorm.weight_scale_inv" not in result
 
     def test_add_quantization_scale_inv_skips_indexer_k_norm(self):
-        """Test that _add_quantization_scale_inv_tensors skips indexer k_norm."""
+        """Test that _add_quantization_scale_inv_tensors skips indexer k_norm and weights_proj."""
         config = self.create_mock_config()
         moe_config = self.create_mock_moe_config()
         backend = self.create_mock_backend_config()
@@ -302,8 +334,10 @@ class TestDeepSeekV32StateDictAdapterAddQuantization:
 
         state_dict = {
             "model.layers.0.self_attn.indexer.wq_b.weight": torch.randn(256, 128),
+            "model.layers.0.self_attn.indexer.wk.weight": torch.randn(256, 128),
             "model.layers.0.self_attn.indexer.k_norm.weight": torch.randn(64),
             "model.layers.0.self_attn.indexer.k_norm.bias": torch.randn(64),
+            "model.layers.0.self_attn.indexer.weights_proj.weight": torch.randn(64, 256),
         }
 
         result = adapter._add_quantization_scale_inv_tensors(state_dict)
@@ -313,6 +347,11 @@ class TestDeepSeekV32StateDictAdapterAddQuantization:
         assert result["model.layers.0.self_attn.indexer.wq_b.weight"].dtype == torch.float8_e4m3fn
         assert "model.layers.0.self_attn.indexer.wq_b.weight_scale_inv" in result
 
+        # wk should be quantized
+        assert "model.layers.0.self_attn.indexer.wk.weight" in result
+        assert result["model.layers.0.self_attn.indexer.wk.weight"].dtype == torch.float8_e4m3fn
+        assert "model.layers.0.self_attn.indexer.wk.weight_scale_inv" in result
+
         # k_norm weight should NOT be quantized
         assert "model.layers.0.self_attn.indexer.k_norm.weight" in result
         assert result["model.layers.0.self_attn.indexer.k_norm.weight"].dtype != torch.float8_e4m3fn
@@ -321,3 +360,8 @@ class TestDeepSeekV32StateDictAdapterAddQuantization:
         # k_norm bias should NOT have scale_inv (not .weight)
         assert "model.layers.0.self_attn.indexer.k_norm.bias" in result
         assert "model.layers.0.self_attn.indexer.k_norm.bias_scale_inv" not in result
+
+        # weights_proj should NOT be quantized
+        assert "model.layers.0.self_attn.indexer.weights_proj.weight" in result
+        assert result["model.layers.0.self_attn.indexer.weights_proj.weight"].dtype != torch.float8_e4m3fn
+        assert "model.layers.0.self_attn.indexer.weights_proj.weight_scale_inv" not in result
