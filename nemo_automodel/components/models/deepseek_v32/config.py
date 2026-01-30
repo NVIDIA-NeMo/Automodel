@@ -12,28 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DeepSeek V3.2 Configuration.
-
-Since the V3.2 config is not yet available in HuggingFace transformers,
-we define it here based on the HuggingFace transformers PR #41251.
-"""
-
 from transformers import PretrainedConfig
 
 
 class DeepseekV32Config(PretrainedConfig):
-    """Configuration class for DeepSeek V3.2 model.
-
-    Key differences from DeepSeek V3:
-    - q_lora_rank: 1536 (V3 has None, direct projection)
-    - kv_lora_rank: 512 (V3 has 1024)
-    - qk_nope_head_dim: 128 (V3 has 48)
-    - qk_rope_head_dim: 64 (V3 has 16)
-    - v_head_dim: 128 (V3 has 64)
-    - n_routed_experts: 64 (V3 has 256)
-    - New Indexer mechanism for sparse attention with top-k selection
-    """
-
     model_type = "deepseek_v32"
     keys_to_ignore_at_inference = ["past_key_values"]
 
