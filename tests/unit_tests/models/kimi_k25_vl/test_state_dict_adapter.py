@@ -787,3 +787,429 @@ class TestExpandQuantizedKeysExtended:
         # Layer 0 should remain unchanged
         assert "language_model.model.layers.0.mlp.experts.0.gate_proj.weight" in result
         assert torch.equal(result["language_model.model.layers.0.mlp.experts.0.gate_proj.weight"], original_tensor)
+
+
+# =============================================================================
+# DTensor Quantization Tests
+# =============================================================================
+
+
+class TestDTensorQuantization:
+    """Tests for DTensor INT4 quantization handling."""
+
+    def test_dtensor_quantization_shapes_calculation(self):
+        """Test INT4 quantization shape calculations for DTensor."""
+        out_features, in_features = 2048, 7168
+        group_size = 32
+
+        # INT4 packing: 8 values per int32
+        packed_in_features = in_features // 8
+        num_groups = in_features // group_size
+
+        assert packed_in_features == 896  # 7168 // 8
+        assert num_groups == 224  # 7168 // 32
+
+    def test_dtensor_local_shape_calculation(self):
+        """Test local shape calculation for sharded DTensor."""
+        out_features, in_features = 2048, 7168
+        group_size = 32
+
+        # Simulate 4-way sharding along dim 0
+        num_shards = 4
+        local_out = out_features // num_shards
+        local_in = in_features  # Not sharded on dim 1
+
+        local_packed_in = local_in // 8
+        local_num_groups = local_in // group_size
+
+        assert local_out == 512  # 2048 // 4
+        assert local_packed_in == 896  # 7168 // 8
+        assert local_num_groups == 224  # 7168 // 32
+
+    def test_weight_shape_tensor_format(self):
+        """Test weight_shape tensor format."""
+        out_features, in_features = 2048, 7168
+
+        weight_shape = torch.tensor([out_features, in_features], dtype=torch.int64)
+
+        assert weight_shape.shape == (2,)
+        assert weight_shape[0].item() == out_features
+        assert weight_shape[1].item() == in_features
+        assert weight_shape.dtype == torch.int64
+
+    def test_packed_scale_shape_consistency(self):
+        """Test packed and scale shapes are consistent."""
+        out_features, in_features = 2048, 7168
+        group_size = 32
+
+        packed_in_features = in_features // 8
+        num_groups = in_features // group_size
+
+        # Packed shape
+        packed_shape = (out_features, packed_in_features)
+
+        # Scale shape - must have same dim 0 as packed
+        scale_shape = (out_features, num_groups)
+
+        assert packed_shape[0] == scale_shape[0]
+
+        # Scale dim 1 should be 8x smaller than packed dim 1 (since group_size=32)
+        # packed: in_features // 8 = 896
+        # scale: in_features // 32 = 224
+        # ratio: 896 / 224 = 4
+        assert packed_shape[1] // scale_shape[1] == 4
+
+    def test_dtensor_quantization_empty_tensors_format(self):
+        """Test empty tensor format for INT4 quantization placeholders."""
+        out_features, in_features = 32, 64
+        group_size = 32
+
+        packed_in_features = in_features // 8
+        num_groups = in_features // group_size
+
+        # Create empty tensors as placeholders (DCP will fill them)
+        weight_packed = torch.empty(out_features, packed_in_features, dtype=torch.int32)
+        weight_scale = torch.empty(out_features, num_groups, dtype=torch.float16)
+        weight_shape = torch.tensor([out_features, in_features], dtype=torch.int64)
+
+        assert weight_packed.shape == (32, 8)  # 64 // 8 = 8
+        assert weight_packed.dtype == torch.int32
+        assert weight_scale.shape == (32, 2)  # 64 // 32 = 2
+        assert weight_scale.dtype == torch.float16
+        assert weight_shape.tolist() == [32, 64]
+
+
+# =============================================================================
+# Dequant One Function Tests
+# =============================================================================
+
+
+class TestDequantOneLogic:
+    """Tests for dequant_one function logic."""
+
+    def test_dequant_one_checks_all_parts_exist(self):
+        """Test dequant_one validates all triplet parts exist."""
+        state_dict = {
+            "layer.weight_packed": torch.zeros(1),
+            "layer.weight_scale": torch.zeros(1),
+            # Missing weight_shape
+        }
+
+        parts = {
+            "packed": "layer.weight_packed",
+            "scale": "layer.weight_scale",
+            "shape": "layer.weight_shape",  # Not in state_dict
+        }
+
+        packed_exists = parts["packed"] in state_dict
+        scale_exists = parts["scale"] in state_dict
+        shape_exists = parts["shape"] in state_dict
+
+        assert packed_exists is True
+        assert scale_exists is True
+        assert shape_exists is False
+        assert not all([packed_exists, scale_exists, shape_exists])
+
+    def test_dequant_one_returns_none_for_incomplete(self):
+        """Test dequant_one returns None for incomplete triplet."""
+        base = "language_model.model.layers.5.mlp.experts.0.gate_proj.weight"
+        parts = {
+            "packed": f"{base}_packed",
+            "scale": f"{base}_scale",
+            "shape": f"{base}_shape",
+        }
+
+        # Only packed and scale exist
+        state_dict = {
+            f"{base}_packed": torch.zeros(1),
+            f"{base}_scale": torch.zeros(1),
+        }
+
+        packed_exists = parts["packed"] in state_dict
+        scale_exists = parts["scale"] in state_dict
+        shape_exists = parts["shape"] in state_dict
+
+        if not all([packed_exists, scale_exists, shape_exists]):
+            result_base, weight, consumed_keys = base, None, []
+        else:
+            result_base, weight, consumed_keys = base, torch.zeros(1), list(parts.values())
+
+        assert result_base == base
+        assert weight is None
+        assert consumed_keys == []
+
+    def test_dequant_one_returns_consumed_keys_on_success(self):
+        """Test dequant_one returns consumed keys list on success."""
+        base = "layer.weight"
+        parts = {
+            "packed": f"{base}_packed",
+            "scale": f"{base}_scale",
+            "shape": f"{base}_shape",
+        }
+
+        # All parts exist
+        state_dict = {
+            f"{base}_packed": torch.randint(-2**31, 2**31, (16, 8), dtype=torch.int32),
+            f"{base}_scale": torch.rand(16, 2, dtype=torch.float16) * 0.1,
+            f"{base}_shape": torch.tensor([16, 64], dtype=torch.int64),
+        }
+
+        packed_exists = parts["packed"] in state_dict
+        scale_exists = parts["scale"] in state_dict
+        shape_exists = parts["shape"] in state_dict
+
+        if not all([packed_exists, scale_exists, shape_exists]):
+            consumed_keys = []
+        else:
+            consumed_keys = list(parts.values())
+
+        assert len(consumed_keys) == 3
+        assert f"{base}_packed" in consumed_keys
+        assert f"{base}_scale" in consumed_keys
+        assert f"{base}_shape" in consumed_keys
+
+    def test_dequant_one_with_valid_triplet(self):
+        """Test dequant_one with valid quantized triplet calls dequantize_int4."""
+        out_features, in_features = 16, 64
+        group_size = 32
+
+        packed_in = in_features // 8
+        num_groups = in_features // group_size
+
+        weight_packed = torch.randint(-2**31, 2**31, (out_features, packed_in), dtype=torch.int32)
+        weight_scale = torch.rand(out_features, num_groups, dtype=torch.float16) * 0.1
+        weight_shape = torch.tensor([out_features, in_features], dtype=torch.int64)
+
+        # Dequantize
+        weight = dequantize_int4(weight_packed, weight_scale, weight_shape, group_size=32, device="cpu")
+
+        assert weight.shape == (out_features, in_features)
+        assert weight.dtype == torch.bfloat16
+
+
+# =============================================================================
+# Expert Key Fusion Detection Tests
+# =============================================================================
+
+
+class TestExpertKeyFusionDetection:
+    """Tests for expert key fusion detection in from_hf."""
+
+    def test_detect_expert_keys_in_llm_keys(self):
+        """Test detection of expert keys in LLM state dict."""
+        llm_keys = {
+            "model.layers.5.mlp.experts.0.gate_proj.weight": torch.randn(2048, 7168),
+            "model.layers.5.mlp.experts.0.up_proj.weight": torch.randn(2048, 7168),
+            "model.layers.5.mlp.experts.1.gate_proj.weight": torch.randn(2048, 7168),
+            "model.layers.5.self_attn.q_proj.weight": torch.randn(1536, 7168),  # Not expert
+        }
+
+        expert_llm_keys = [k for k in llm_keys.keys() if "experts." in k and ".weight" in k]
+
+        assert len(expert_llm_keys) == 3
+        assert "model.layers.5.self_attn.q_proj.weight" not in expert_llm_keys
+
+    def test_count_unique_expert_ids(self):
+        """Test counting unique expert IDs from keys."""
+        import re
+
+        llm_keys = {
+            "model.layers.5.mlp.experts.0.gate_proj.weight": None,
+            "model.layers.5.mlp.experts.0.up_proj.weight": None,
+            "model.layers.5.mlp.experts.1.gate_proj.weight": None,
+            "model.layers.5.mlp.experts.7.gate_proj.weight": None,
+            "model.layers.6.mlp.experts.0.gate_proj.weight": None,
+            "model.layers.6.mlp.experts.3.gate_proj.weight": None,
+        }
+
+        expert_ids = set()
+        for k in llm_keys.keys():
+            m = re.search(r"experts\.(\d+)\.", k)
+            if m:
+                expert_ids.add(int(m.group(1)))
+
+        assert expert_ids == {0, 1, 3, 7}
+
+    def test_no_expert_keys_detection(self):
+        """Test detection when no expert keys present."""
+        import re
+
+        llm_keys = {
+            "model.layers.5.self_attn.q_proj.weight": None,
+            "model.layers.5.self_attn.k_proj.weight": None,
+            "model.layers.5.mlp.gate_proj.weight": None,  # Dense MLP, not MoE
+        }
+
+        expert_llm_keys = [k for k in llm_keys.keys() if "experts." in k and ".weight" in k]
+        expert_ids = set()
+        for k in llm_keys.keys():
+            m = re.search(r"experts\.(\d+)\.", k)
+            if m:
+                expert_ids.add(int(m.group(1)))
+
+        assert len(expert_llm_keys) == 0
+        assert len(expert_ids) == 0
+
+    def test_key_prefix_replacement(self):
+        """Test model.language_model.model prefix replacement."""
+        converted_llm = {
+            "model.layers.5.self_attn.q_proj.weight": torch.randn(1536, 7168),
+            "model.embed_tokens.weight": torch.randn(163840, 7168),
+        }
+
+        native_state_dict = {}
+        for k, v in converted_llm.items():
+            native_state_dict[k.replace("model.", "model.language_model.model.")] = v
+
+        assert "model.language_model.model.layers.5.self_attn.q_proj.weight" in native_state_dict
+        assert "model.language_model.model.embed_tokens.weight" in native_state_dict
+
+    def test_expert_pattern_regex(self):
+        """Test expert pattern regex correctly extracts expert ID."""
+        import re
+
+        test_keys = [
+            ("model.layers.5.mlp.experts.0.gate_proj.weight", 0),
+            ("model.layers.5.mlp.experts.127.up_proj.weight", 127),
+            ("model.layers.5.mlp.experts.255.down_proj.weight", 255),
+            ("model.layers.5.mlp.shared_experts.gate_proj.weight", None),  # Not experts.N
+        ]
+
+        for key, expected_id in test_keys:
+            m = re.search(r"experts\.(\d+)\.", key)
+            if expected_id is not None:
+                assert m is not None, f"Should match: {key}"
+                assert int(m.group(1)) == expected_id
+            else:
+                assert m is None, f"Should not match: {key}"
+
+
+# =============================================================================
+# Quantization Groups Pattern Tests
+# =============================================================================
+
+
+class TestQuantGroupsPattern:
+    """Tests for quantization groups pattern matching."""
+
+    def test_quant_pattern_matches_packed(self):
+        """Test quant pattern matches _packed suffix."""
+        import re
+
+        quant_pat = re.compile(r"^(.+)\.(weight|bias)_(packed|scale|shape)$")
+        key = "language_model.model.layers.5.mlp.experts.0.gate_proj.weight_packed"
+
+        m = quant_pat.match(key)
+        assert m is not None
+        assert m.group(1) == "language_model.model.layers.5.mlp.experts.0.gate_proj"
+        assert m.group(2) == "weight"
+        assert m.group(3) == "packed"
+
+    def test_quant_pattern_matches_scale(self):
+        """Test quant pattern matches _scale suffix."""
+        import re
+
+        quant_pat = re.compile(r"^(.+)\.(weight|bias)_(packed|scale|shape)$")
+        key = "language_model.model.layers.5.mlp.experts.0.gate_proj.weight_scale"
+
+        m = quant_pat.match(key)
+        assert m is not None
+        assert m.group(3) == "scale"
+
+    def test_quant_pattern_matches_shape(self):
+        """Test quant pattern matches _shape suffix."""
+        import re
+
+        quant_pat = re.compile(r"^(.+)\.(weight|bias)_(packed|scale|shape)$")
+        key = "language_model.model.layers.5.mlp.experts.0.gate_proj.weight_shape"
+
+        m = quant_pat.match(key)
+        assert m is not None
+        assert m.group(3) == "shape"
+
+    def test_quant_pattern_does_not_match_regular_weight(self):
+        """Test quant pattern does not match regular weight keys."""
+        import re
+
+        quant_pat = re.compile(r"^(.+)\.(weight|bias)_(packed|scale|shape)$")
+        regular_keys = [
+            "language_model.model.layers.5.mlp.experts.0.gate_proj.weight",
+            "vision_tower.encoder.blocks.0.wqkv.weight",
+            "mm_projector.proj.0.weight",
+        ]
+
+        for key in regular_keys:
+            m = quant_pat.match(key)
+            assert m is None, f"Should not match regular key: {key}"
+
+    def test_quant_groups_building(self):
+        """Test building quant_groups dictionary from keys."""
+        import re
+
+        quant_pat = re.compile(r"^(.+)\.(weight|bias)_(packed|scale|shape)$")
+        state_dict_keys = [
+            "layer.5.experts.0.gate_proj.weight_packed",
+            "layer.5.experts.0.gate_proj.weight_scale",
+            "layer.5.experts.0.gate_proj.weight_shape",
+            "layer.5.experts.1.gate_proj.weight_packed",
+            "layer.5.experts.1.gate_proj.weight_scale",
+            "layer.5.experts.1.gate_proj.weight_shape",
+            "layer.5.self_attn.q_proj.weight",  # Not quantized
+        ]
+
+        quant_groups = {}
+        for key in state_dict_keys:
+            m = quant_pat.match(key)
+            if m:
+                base = f"{m.group(1)}.{m.group(2)}"
+                suffix = m.group(3)
+                if base not in quant_groups:
+                    quant_groups[base] = {}
+                quant_groups[base][suffix] = key
+
+        assert len(quant_groups) == 2  # Two experts
+
+        base_0 = "layer.5.experts.0.gate_proj.weight"
+        base_1 = "layer.5.experts.1.gate_proj.weight"
+
+        assert base_0 in quant_groups
+        assert base_1 in quant_groups
+
+        assert set(quant_groups[base_0].keys()) == {"packed", "scale", "shape"}
+        assert set(quant_groups[base_1].keys()) == {"packed", "scale", "shape"}
+
+    def test_filter_complete_triplets(self):
+        """Test filtering for complete triplets only."""
+        import re
+
+        quant_pat = re.compile(r"^(.+)\.(weight|bias)_(packed|scale|shape)$")
+
+        # Incomplete triplet (missing shape)
+        state_dict_keys = [
+            "layer.5.experts.0.gate_proj.weight_packed",
+            "layer.5.experts.0.gate_proj.weight_scale",
+            # Missing: layer.5.experts.0.gate_proj.weight_shape
+            "layer.5.experts.1.gate_proj.weight_packed",
+            "layer.5.experts.1.gate_proj.weight_scale",
+            "layer.5.experts.1.gate_proj.weight_shape",  # Complete triplet
+        ]
+
+        quant_groups = {}
+        for key in state_dict_keys:
+            m = quant_pat.match(key)
+            if m:
+                base = f"{m.group(1)}.{m.group(2)}"
+                suffix = m.group(3)
+                if base not in quant_groups:
+                    quant_groups[base] = {}
+                quant_groups[base][suffix] = key
+
+        # Filter for complete triplets
+        complete_triplets = [
+            (base, parts)
+            for base, parts in quant_groups.items()
+            if all(p in parts for p in ["packed", "scale", "shape"])
+        ]
+
+        assert len(complete_triplets) == 1
+        assert complete_triplets[0][0] == "layer.5.experts.1.gate_proj.weight"

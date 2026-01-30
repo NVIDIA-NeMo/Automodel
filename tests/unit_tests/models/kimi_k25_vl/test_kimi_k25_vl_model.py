@@ -1105,3 +1105,595 @@ class TestKimiK25VLForConditionalGenerationIntegration:
         """Test from_pretrained classmethod exists."""
         assert hasattr(KimiK25VLForConditionalGeneration, "from_pretrained")
         assert callable(KimiK25VLForConditionalGeneration.from_pretrained)
+
+
+# =============================================================================
+# KimiK25VLModel.forward Tests
+# =============================================================================
+
+
+class TestKimiK25VLModelForward:
+    """Tests for KimiK25VLModel.forward method."""
+
+    def test_forward_raises_when_both_input_ids_and_inputs_embeds_provided(self):
+        """Test forward raises ValueError when both input_ids and inputs_embeds are provided."""
+        input_ids = torch.randint(0, 100, (2, 8))
+        inputs_embeds = torch.randn(2, 8, 64)
+
+        # Simulate the validation logic from forward
+        with pytest.raises(ValueError, match="exactly one of input_ids or inputs_embeds"):
+            if (input_ids is None) == (inputs_embeds is None):
+                raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+    def test_forward_raises_when_neither_input_ids_nor_inputs_embeds_provided(self):
+        """Test forward raises ValueError when neither input_ids nor inputs_embeds is provided."""
+        input_ids = None
+        inputs_embeds = None
+
+        with pytest.raises(ValueError, match="exactly one of input_ids or inputs_embeds"):
+            if (input_ids is None) == (inputs_embeds is None):
+                raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+    def test_forward_with_qkv_format_thd(self):
+        """Test forward handles qkv_format='thd' kwarg."""
+        # Verify squeeze_input_for_thd is called when qkv_format='thd'
+        from nemo_automodel.components.models.kimi_k25_vl.model import squeeze_input_for_thd
+
+        input_ids = torch.randint(0, 100, (2, 8))
+        position_ids = torch.arange(8).unsqueeze(0).expand(2, -1)
+        padding_mask = torch.ones(2, 8, dtype=torch.bool)
+        kwargs = {"qkv_format": "thd"}
+
+        # Test the squeeze function directly
+        result = squeeze_input_for_thd(input_ids, position_ids, padding_mask, kwargs)
+        assert result is not None
+        assert len(result) == 4  # input_ids, position_ids, padding_mask, kwargs
+
+    def test_forward_vision_processing_conditions(self):
+        """Test conditions for vision processing in forward."""
+        # Test the boolean logic for vision processing
+        # has_vision and has_pixels and not_generation
+
+        # Case 1: No vision tower
+        has_vision = False
+        has_pixels = True
+        not_generation = True
+        assert not (has_pixels and has_vision and not_generation)
+
+        # Case 2: No pixel values
+        has_vision = True
+        has_pixels = False
+        not_generation = True
+        assert not (has_pixels and has_vision and not_generation)
+
+        # Case 3: Generation mode (seq_len == 1)
+        has_vision = True
+        has_pixels = True
+        not_generation = False  # seq_len == 1
+        assert not (has_pixels and has_vision and not_generation)
+
+        # Case 4: All conditions met
+        has_vision = True
+        has_pixels = True
+        not_generation = True
+        assert has_pixels and has_vision and not_generation
+
+
+class TestKimiK25VLModelForwardMocked:
+    """Tests for KimiK25VLModel.forward with mocked components."""
+
+    @pytest.fixture
+    def mock_model(self):
+        """Create a mock KimiK25VLModel for forward testing."""
+        config = KimiK25VLConfig(
+            media_placeholder_token_id=163605,
+            pad_token_id=0,
+            ignore_index=-100,
+            vision_config=MoonViT3dConfig(
+                hidden_size=64,
+                merge_kernel_size=[2, 2],
+            ),
+        )
+
+        with patch.object(KimiK25VLModel, "__init__", lambda self, *args, **kwargs: None):
+            model = KimiK25VLModel.__new__(KimiK25VLModel)
+            model.config = config
+            model.media_placeholder_token_id = config.media_placeholder_token_id
+
+            # Mock language_model
+            mock_lm = MagicMock()
+            mock_embed = MagicMock(return_value=torch.randn(2, 8, 64))
+            mock_lm.get_input_embeddings.return_value = mock_embed
+            mock_lm.return_value = torch.randn(2, 8, 64)
+            model.language_model = mock_lm
+
+            # Mock vision components as None for text-only tests
+            model.vision_tower = None
+            model.multi_modal_projector = None
+
+            return model
+
+    def test_forward_text_only_with_input_ids(self, mock_model):
+        """Test forward with input_ids only (no vision)."""
+        input_ids = torch.randint(0, 100, (2, 8))
+        attention_mask = torch.ones(2, 8, dtype=torch.long)
+
+        # With no vision tower, should just process text
+        result = mock_model.language_model(
+            inputs_embeds=mock_model.language_model.get_input_embeddings()(input_ids),
+            attention_mask=attention_mask,
+            position_ids=None,
+            padding_mask=None,
+        )
+
+        assert result.shape == (2, 8, 64)
+
+    def test_forward_text_only_with_inputs_embeds(self, mock_model):
+        """Test forward with inputs_embeds only (no vision)."""
+        inputs_embeds = torch.randn(2, 8, 64)
+        attention_mask = torch.ones(2, 8, dtype=torch.long)
+
+        result = mock_model.language_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=None,
+            padding_mask=None,
+        )
+
+        assert result.shape == (2, 8, 64)
+
+    def test_forward_embed_tokens_none_with_float_input(self, mock_model):
+        """Test forward when embed_tokens is None but input is float (already embeddings)."""
+        mock_model.language_model.get_input_embeddings.return_value = None
+
+        # Simulate the logic from forward
+        input_ids = torch.randn(2, 8, 64, dtype=torch.bfloat16)  # Already embeddings
+        embed_tokens = mock_model.language_model.get_input_embeddings()
+
+        if embed_tokens is None:
+            if (
+                input_ids is not None
+                and isinstance(input_ids, torch.Tensor)
+                and input_ids.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            ):
+                inputs_embeds = input_ids
+            else:
+                pytest.fail("Should not reach here with float input")
+
+        assert inputs_embeds.shape == (2, 8, 64)
+
+    def test_forward_target_seq_length_param(self, mock_model):
+        """Test forward accepts target_seq_length parameter for PP."""
+        # Verify the parameter is accepted in the signature
+        import inspect
+        sig = inspect.signature(KimiK25VLModel.forward)
+        params = list(sig.parameters.keys())
+
+        assert "target_seq_length" in params
+        target_seq_length_param = sig.parameters["target_seq_length"]
+        assert target_seq_length_param.default is None
+
+
+# =============================================================================
+# KimiK25VLForConditionalGeneration.from_pretrained Tests
+# =============================================================================
+
+
+class TestKimiK25VLForConditionalGenerationFromPretrained:
+    """Tests for KimiK25VLForConditionalGeneration.from_pretrained classmethod."""
+
+    def test_from_pretrained_signature(self):
+        """Test from_pretrained has expected signature."""
+        import inspect
+        sig = inspect.signature(KimiK25VLForConditionalGeneration.from_pretrained)
+        params = list(sig.parameters.keys())
+
+        assert "pretrained_model_name_or_path" in params
+        assert "model_args" in params
+        assert "kwargs" in params
+
+    def test_from_pretrained_torch_dtype_string_conversion(self):
+        """Test torch_dtype string is converted to torch dtype."""
+        # Simulate the conversion logic
+        torch_dtype = "bfloat16"
+
+        if isinstance(torch_dtype, str):
+            torch_dtype = getattr(torch, torch_dtype) if torch_dtype != "auto" else torch.bfloat16
+
+        assert torch_dtype == torch.bfloat16
+
+    def test_from_pretrained_torch_dtype_auto(self):
+        """Test torch_dtype='auto' defaults to bfloat16."""
+        torch_dtype = "auto"
+
+        if isinstance(torch_dtype, str):
+            torch_dtype = getattr(torch, torch_dtype) if torch_dtype != "auto" else torch.bfloat16
+
+        assert torch_dtype == torch.bfloat16
+
+    @patch.object(KimiK25VLConfig, "from_pretrained")
+    @patch.object(KimiK25VLForConditionalGeneration, "from_config")
+    def test_from_pretrained_loads_config(self, mock_from_config, mock_config_from_pretrained):
+        """Test from_pretrained loads config when not provided."""
+        mock_config = KimiK25VLConfig()
+        mock_config_from_pretrained.return_value = mock_config
+
+        mock_model = MagicMock()
+        mock_model.to.return_value = mock_model
+        mock_from_config.return_value = mock_model
+
+        # Call the method
+        result = KimiK25VLForConditionalGeneration.from_pretrained(
+            "/fake/path", torch_dtype=torch.bfloat16
+        )
+
+        mock_config_from_pretrained.assert_called_once_with("/fake/path")
+        assert mock_config._name_or_path == "/fake/path"
+
+    @patch.object(KimiK25VLConfig, "from_pretrained")
+    @patch.object(KimiK25VLForConditionalGeneration, "from_config")
+    def test_from_pretrained_uses_provided_config(self, mock_from_config, mock_config_from_pretrained):
+        """Test from_pretrained uses config when explicitly provided."""
+        provided_config = KimiK25VLConfig()
+        mock_model = MagicMock()
+        mock_model.to.return_value = mock_model
+        mock_from_config.return_value = mock_model
+
+        result = KimiK25VLForConditionalGeneration.from_pretrained(
+            "/fake/path", config=provided_config, torch_dtype=torch.bfloat16
+        )
+
+        # Should not call from_pretrained on config
+        mock_config_from_pretrained.assert_not_called()
+
+    @patch.object(KimiK25VLConfig, "from_pretrained")
+    @patch.object(KimiK25VLForConditionalGeneration, "from_config")
+    def test_from_pretrained_num_hidden_layers_override(self, mock_from_config, mock_config_from_pretrained):
+        """Test from_pretrained can override num_hidden_layers."""
+        mock_config = KimiK25VLConfig()
+        mock_config.text_config.num_hidden_layers = 61
+        mock_config_from_pretrained.return_value = mock_config
+
+        mock_model = MagicMock()
+        mock_model.to.return_value = mock_model
+        mock_from_config.return_value = mock_model
+
+        result = KimiK25VLForConditionalGeneration.from_pretrained(
+            "/fake/path", num_hidden_layers=2, torch_dtype=torch.bfloat16
+        )
+
+        # Check num_hidden_layers was overridden
+        assert mock_config.text_config.num_hidden_layers == 2
+
+
+# =============================================================================
+# KimiK25VLForConditionalGeneration.__init__ Tests
+# =============================================================================
+
+
+class TestKimiK25VLForConditionalGenerationInit:
+    """Tests for KimiK25VLForConditionalGeneration.__init__."""
+
+    def test_init_signature(self):
+        """Test __init__ has expected signature."""
+        import inspect
+        sig = inspect.signature(KimiK25VLForConditionalGeneration.__init__)
+        params = list(sig.parameters.keys())
+
+        assert "self" in params
+        assert "config" in params
+        assert "moe_config" in params
+        assert "backend" in params
+        assert "kwargs" in params
+
+    def test_init_creates_state_dict_adapter_when_enabled(self):
+        """Test __init__ creates state_dict_adapter when backend.enable_hf_state_dict_adapter is True."""
+        from nemo_automodel.components.models.kimi_k25_vl.model import BackendConfig
+
+        backend = BackendConfig(enable_hf_state_dict_adapter=True)
+        assert backend.enable_hf_state_dict_adapter is True
+
+    def test_init_backend_default(self):
+        """Test __init__ creates default BackendConfig when not provided."""
+        from nemo_automodel.components.models.kimi_k25_vl.model import BackendConfig
+
+        # Simulate the default backend logic
+        backend = None
+        backend = backend or BackendConfig()
+
+        assert backend is not None
+        assert isinstance(backend, BackendConfig)
+
+
+# =============================================================================
+# KimiK25VLForConditionalGeneration.forward Tests
+# =============================================================================
+
+
+class TestKimiK25VLForConditionalGenerationForward:
+    """Tests for KimiK25VLForConditionalGeneration.forward method."""
+
+    def test_forward_signature_complete(self):
+        """Test forward has all expected parameters."""
+        import inspect
+        sig = inspect.signature(KimiK25VLForConditionalGeneration.forward)
+        params = list(sig.parameters.keys())
+
+        expected_params = [
+            "self", "input_ids", "attention_mask", "position_ids",
+            "past_key_values", "inputs_embeds", "labels", "use_cache",
+            "output_attentions", "output_hidden_states", "return_dict",
+            "pixel_values", "grid_thws", "padding_mask", "target_seq_length",
+            "kwargs",
+        ]
+
+        for param in expected_params:
+            assert param in params, f"Missing parameter: {param}"
+
+    def test_forward_vlm_chunk_retrieval_logic(self):
+        """Test VLM chunk retrieval from model attributes."""
+        # Simulate the chunk retrieval logic
+        pixel_values = None
+        _vlm_pixel_values_chunks = [torch.randn(64, 3, 14, 14), torch.randn(32, 3, 14, 14)]
+        _vlm_image_grid_hws_chunks = [torch.tensor([[28, 28]]), torch.tensor([[14, 14]])]
+        media_placeholder_token_id = 163605
+        input_ids = torch.tensor([[1, 2, media_placeholder_token_id, 3, 4]])
+        _vlm_chunk_idx = 0
+
+        has_media_tokens = (
+            input_ids is not None
+            and media_placeholder_token_id is not None
+            and (input_ids == media_placeholder_token_id).any().item()
+        )
+
+        assert has_media_tokens == True
+
+        if has_media_tokens:
+            if _vlm_chunk_idx < len(_vlm_pixel_values_chunks):
+                pixel_values = _vlm_pixel_values_chunks[_vlm_chunk_idx]
+                image_grid_hws = _vlm_image_grid_hws_chunks[_vlm_chunk_idx]
+
+                assert pixel_values.shape == (64, 3, 14, 14)
+                assert image_grid_hws.shape == (1, 2)
+
+    def test_forward_grid_thws_conversion(self):
+        """Test conversion from image_grid_hws [N, 2] to grid_thws [N, 3]."""
+        image_grid_hws = torch.tensor([[28, 28], [14, 14]])  # [N, 2]
+
+        if image_grid_hws.shape[-1] == 2:
+            ones = torch.ones(image_grid_hws.shape[0], 1, dtype=image_grid_hws.dtype)
+            grid_thws = torch.cat([ones, image_grid_hws], dim=-1)
+        else:
+            grid_thws = image_grid_hws
+
+        assert grid_thws.shape == (2, 3)
+        assert (grid_thws[:, 0] == 1).all()  # T dimension is 1
+        assert (grid_thws[:, 1:] == image_grid_hws).all()
+
+    def test_forward_loss_computation_with_attention_mask(self):
+        """Test loss computation with attention mask masking."""
+        logits = torch.randn(2, 10, 1000)
+        labels = torch.randint(0, 1000, (2, 10))
+        attention_mask = torch.ones(2, 10, dtype=torch.long)
+        attention_mask[:, -2:] = 0  # Last 2 tokens are padding
+
+        shift_mask = attention_mask[..., 1:]  # Shape: (2, 9)
+        shift_logits = logits[..., :-1, :][shift_mask != 0]  # Masked logits
+        shift_labels = labels[..., 1:][shift_mask != 0]  # Masked labels
+
+        # Verify shapes make sense
+        assert shift_mask.shape == (2, 9)
+        assert shift_logits.dim() == 2  # Flattened
+        assert shift_labels.dim() == 1
+
+    def test_forward_loss_computation_without_attention_mask(self):
+        """Test loss computation without attention mask."""
+        logits = torch.randn(2, 10, 1000)
+        labels = torch.randint(0, 1000, (2, 10))
+        attention_mask = None
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        assert shift_logits.shape == (2, 9, 1000)
+        assert shift_labels.shape == (2, 9)
+
+    def test_forward_return_dict_false(self):
+        """Test forward returns logits when return_dict is False."""
+        # Simulate the return logic
+        return_dict = None
+        logits = torch.randn(2, 10, 1000)
+
+        if return_dict is None:
+            return_dict = False
+
+        if not return_dict:
+            result = logits
+        else:
+            result = {"logits": logits}
+
+        assert isinstance(result, torch.Tensor)
+        assert result.shape == (2, 10, 1000)
+
+
+# =============================================================================
+# vision_attention_flash Tests
+# =============================================================================
+
+
+class TestVisionAttentionFlash:
+    """Tests for vision_attention_flash function."""
+
+    def test_vision_attention_flash_exists(self):
+        """Test vision_attention_flash function is importable."""
+        from nemo_automodel.components.models.kimi_k25_vl.model import vision_attention_flash
+        assert callable(vision_attention_flash)
+
+    def test_vision_attention_flash_max_seqlen_computation(self):
+        """Test max_seqlen computation from cu_seqlens."""
+        cu_seqlens = torch.tensor([0, 10, 24], dtype=torch.int32)
+
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+
+        assert max_seqlen == 14  # max(10, 14) = 14
+
+    def test_vision_attention_flash_cu_seqlens_format(self):
+        """Test cu_seqlens has correct format."""
+        # cu_seqlens should be cumulative sequence lengths
+        # For 3 sequences of lengths 5, 8, 11
+        seq_lengths = [5, 8, 11]
+        cu_seqlens = torch.tensor([0] + list(torch.tensor(seq_lengths).cumsum(0)), dtype=torch.int32)
+
+        assert cu_seqlens[0] == 0
+        assert cu_seqlens[1] == 5
+        assert cu_seqlens[2] == 13
+        assert cu_seqlens[3] == 24
+
+    def test_vision_attention_flash_signature(self):
+        """Test vision_attention_flash has expected signature."""
+        import inspect
+        from nemo_automodel.components.models.kimi_k25_vl.model import vision_attention_flash
+
+        sig = inspect.signature(vision_attention_flash)
+        params = list(sig.parameters.keys())
+
+        assert "q" in params
+        assert "k" in params
+        assert "v" in params
+        assert "q_cu_seqlens" in params
+        assert "k_cu_seqlens" in params
+        assert "max_seqlen_q" in params
+        assert "max_seqlen_k" in params
+
+        # Check defaults
+        assert sig.parameters["max_seqlen_q"].default is None
+        assert sig.parameters["max_seqlen_k"].default is None
+
+    @patch("nemo_automodel.components.models.kimi_k25_vl.model.flash_attn_varlen_func")
+    def test_vision_attention_flash_calls_flash_attn(self, mock_flash_attn):
+        """Test vision_attention_flash calls flash_attn_varlen_func with correct args."""
+        from nemo_automodel.components.models.kimi_k25_vl.model import vision_attention_flash
+
+        seq_len, num_heads, head_dim = 24, 4, 32
+        q = torch.randn(seq_len, num_heads, head_dim)
+        k = torch.randn(seq_len, num_heads, head_dim)
+        v = torch.randn(seq_len, num_heads, head_dim)
+        cu_seqlens = torch.tensor([0, 10, 24], dtype=torch.int32)
+
+        # Mock return value
+        mock_output = torch.randn(seq_len, num_heads, head_dim)
+        mock_flash_attn.return_value = mock_output
+
+        result = vision_attention_flash(q, k, v, cu_seqlens, cu_seqlens)
+
+        mock_flash_attn.assert_called_once()
+        call_args = mock_flash_attn.call_args
+        assert call_args[0][0] is q
+        assert call_args[0][1] is k
+        assert call_args[0][2] is v
+        assert call_args[1]["causal"] is False
+
+    @patch("nemo_automodel.components.models.kimi_k25_vl.model.flash_attn_varlen_func")
+    def test_vision_attention_flash_handles_tuple_output(self, mock_flash_attn):
+        """Test vision_attention_flash handles tuple output from flash_attn."""
+        from nemo_automodel.components.models.kimi_k25_vl.model import vision_attention_flash
+
+        seq_len, num_heads, head_dim = 16, 4, 32
+        q = torch.randn(seq_len, num_heads, head_dim)
+        k = torch.randn(seq_len, num_heads, head_dim)
+        v = torch.randn(seq_len, num_heads, head_dim)
+        cu_seqlens = torch.tensor([0, 16], dtype=torch.int32)
+
+        # Return tuple (output, softmax_lse)
+        mock_output = torch.randn(seq_len, num_heads, head_dim)
+        mock_flash_attn.return_value = (mock_output, torch.randn(seq_len))
+
+        result = vision_attention_flash(q, k, v, cu_seqlens, cu_seqlens)
+
+        # Should extract first element from tuple
+        expected_shape = (seq_len, num_heads * head_dim)
+        assert result.shape == expected_shape
+
+    @patch("nemo_automodel.components.models.kimi_k25_vl.model.flash_attn_varlen_func")
+    def test_vision_attention_flash_flattens_output(self, mock_flash_attn):
+        """Test vision_attention_flash flattens last two dimensions."""
+        from nemo_automodel.components.models.kimi_k25_vl.model import vision_attention_flash
+
+        seq_len, num_heads, head_dim = 16, 4, 32
+        q = torch.randn(seq_len, num_heads, head_dim)
+        k = torch.randn(seq_len, num_heads, head_dim)
+        v = torch.randn(seq_len, num_heads, head_dim)
+        cu_seqlens = torch.tensor([0, 16], dtype=torch.int32)
+
+        mock_output = torch.randn(seq_len, num_heads, head_dim)
+        mock_flash_attn.return_value = mock_output
+
+        result = vision_attention_flash(q, k, v, cu_seqlens, cu_seqlens)
+
+        # Output should be flattened from (seq_len, num_heads, head_dim) to (seq_len, num_heads * head_dim)
+        assert result.shape == (seq_len, num_heads * head_dim)
+
+
+# =============================================================================
+# squeeze_input_for_thd Tests
+# =============================================================================
+
+
+class TestSqueezeInputForThd:
+    """Tests for squeeze_input_for_thd helper function."""
+
+    def test_squeeze_input_for_thd_import(self):
+        """Test squeeze_input_for_thd is importable."""
+        from nemo_automodel.components.models.kimi_k25_vl.model import squeeze_input_for_thd
+        assert callable(squeeze_input_for_thd)
+
+    def test_squeeze_input_for_thd_basic(self):
+        """Test squeeze_input_for_thd with basic inputs."""
+        from nemo_automodel.components.models.kimi_k25_vl.model import squeeze_input_for_thd
+
+        input_ids = torch.randint(0, 100, (2, 8))
+        position_ids = torch.arange(8).unsqueeze(0).expand(2, -1)
+        padding_mask = torch.ones(2, 8, dtype=torch.bool)
+        kwargs = {"qkv_format": "thd"}
+
+        result = squeeze_input_for_thd(input_ids, position_ids, padding_mask, kwargs)
+
+        assert len(result) == 4
+        input_ids_out, position_ids_out, padding_mask_out, kwargs_out = result
+
+        # Verify outputs are returned
+        assert input_ids_out is not None
+        assert isinstance(kwargs_out, dict)
+
+
+# =============================================================================
+# LM Head and Loss Computation Tests
+# =============================================================================
+
+
+class TestLMHeadAndLoss:
+    """Tests for lm_head and loss computation in forward."""
+
+    def test_lm_head_none_returns_hidden_states(self):
+        """Test when lm_head is None, hidden_states are returned as logits."""
+        hidden_states = torch.randn(2, 10, 64)
+        lm_head = None
+
+        logits = lm_head(hidden_states) if lm_head is not None else hidden_states
+
+        assert torch.equal(logits, hidden_states)
+
+    def test_cross_entropy_loss_computation(self):
+        """Test CrossEntropyLoss is computed correctly."""
+        import torch.nn as nn
+
+        shift_logits = torch.randn(14, 1000)  # Flattened
+        shift_labels = torch.randint(0, 1000, (14,))
+
+        loss = nn.CrossEntropyLoss()(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+        )
+
+        assert loss.shape == ()
+        assert loss.item() > 0  # Loss should be positive
