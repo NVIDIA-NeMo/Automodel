@@ -632,11 +632,6 @@ class KimiVLForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
-        """Load model from pretrained path.
-
-        Uses our registered KimiVLConfig which is registered with AutoConfig,
-        so trust_remote_code is not needed.
-        """
         config = KimiVLConfig.from_pretrained(pretrained_model_name_or_path)
         return cls.from_config(config, *model_args, **kwargs)
 
@@ -779,55 +774,6 @@ class KimiVLStateDictAdapter:
         self.llm_adapter = DeepSeekV3StateDictAdapter(config.text_config, moe_config, backend, dtype)
         self._last_expected_hf_keys: set[str] | None = None
 
-    # def _maybe_debug_hf_key_diff(self, expected_keys: set[str], phase: str) -> None:
-    #     import os
-
-    #     if not os.getenv("KIMIVL_STATE_DICT_DEBUG"):
-    #         return
-
-    #     self._last_expected_hf_keys = expected_keys
-    #     hf_index_path = os.getenv("KIMIVL_HF_INDEX_PATH")
-    #     if not hf_index_path:
-    #         LOGGER.info(
-    #             "KimiVL state_dict debug (%s): expected HF keys=%d. Set KIMIVL_HF_INDEX_PATH to compare.",
-    #             phase,
-    #             len(expected_keys),
-    #         )
-    #         return
-
-    #     try:
-    #         index_path = (
-    #             os.path.join(hf_index_path, "model.safetensors.index.json")
-    #             if os.path.isdir(hf_index_path)
-    #             else hf_index_path
-    #         )
-    #         with open(index_path, "r", encoding="utf-8") as f:
-    #             index = json.load(f)
-    #         hf_keys = set(index.get("weight_map", {}).keys())
-    #         if not hf_keys:
-    #             LOGGER.info(
-    #                 "KimiVL state_dict debug (%s): empty or missing weight_map in %s",
-    #                 phase,
-    #                 index_path,
-    #             )
-    #             return
-    #         missing = sorted(expected_keys - hf_keys)
-    #         extra = sorted(hf_keys - expected_keys)
-    #         LOGGER.info(
-    #             "KimiVL state_dict debug (%s): expected=%d hf=%d missing=%d extra=%d",
-    #             phase,
-    #             len(expected_keys),
-    #             len(hf_keys),
-    #             len(missing),
-    #             len(extra),
-    #         )
-    #         if missing:
-    #             LOGGER.info("KimiVL state_dict debug (%s): missing sample=%s", phase, missing[:20])
-    #         if extra:
-    #             LOGGER.info("KimiVL state_dict debug (%s): extra sample=%s", phase, extra[:20])
-    #     except Exception as exc:
-    #         LOGGER.info("KimiVL state_dict debug (%s): failed to read HF index: %s", phase, exc)
-
     def to_hf(self, state_dict: dict, **kwargs) -> dict:
         import re
 
@@ -864,7 +810,6 @@ class KimiVLStateDictAdapter:
         if llm_keys:
             for k, v in self.llm_adapter.to_hf(llm_keys, **kwargs).items():
                 hf_state_dict[k.replace("model.", "language_model.model.")] = v
-        # self._maybe_debug_hf_key_diff(set(hf_state_dict.keys()), phase="to_hf")
         return hf_state_dict
 
     def from_hf(self, state_dict: dict, **kwargs) -> dict:
@@ -884,7 +829,6 @@ class KimiVLStateDictAdapter:
             else:
                 native_state_dict[key] = value
 
-        # Process all LLM keys at once through the adapter
         if llm_keys:
             converted_llm = self.llm_adapter.from_hf(llm_keys, **kwargs)
             for k, v in converted_llm.items():
