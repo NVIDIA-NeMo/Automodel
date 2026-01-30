@@ -74,10 +74,35 @@ def _restore_rng_state(state):
     Args:
         state (dict): RNG states as returned by state_dict().
     """
+    import logging
+
+    logger = logging.getLogger(__name__)
+
     random.setstate(state.random_rng_state)
     np.random.set_state(state.np_rng_state)
     torch.set_rng_state(state.torch_rng_state)
-    torch.cuda.set_rng_state_all(state.cuda_rng_state)
+
+    # Handle GPU count mismatch between checkpoint save and restore
+    # This can happen when resuming on a different machine or container
+    saved_gpu_count = len(state.cuda_rng_state) if state.cuda_rng_state else 0
+    current_gpu_count = torch.cuda.device_count()
+
+    if saved_gpu_count == current_gpu_count:
+        torch.cuda.set_rng_state_all(state.cuda_rng_state)
+    elif saved_gpu_count > 0 and current_gpu_count > 0:
+        logger.warning(
+            f"GPU count mismatch: checkpoint saved with {saved_gpu_count} GPU(s), "
+            f"but resuming with {current_gpu_count} GPU(s). "
+            f"CUDA RNG state will be partially restored for available GPUs."
+        )
+        # Restore RNG state for available GPUs (up to the minimum of saved/current)
+        for i in range(min(saved_gpu_count, current_gpu_count)):
+            torch.cuda.set_rng_state(state.cuda_rng_state[i], i)
+    elif current_gpu_count == 0:
+        logger.warning(
+            f"No CUDA devices available. Skipping CUDA RNG state restoration "
+            f"(checkpoint had {saved_gpu_count} GPU(s))."
+        )
 
 
 class StatefulRNG:
