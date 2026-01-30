@@ -186,7 +186,6 @@ class DeepseekV3Model(nn.Module):
 
         h = inputs_embeds
 
-
         # Apply the transformer layers.
         for layer in self.layers.values():
             h = layer(
