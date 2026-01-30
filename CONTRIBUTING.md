@@ -40,7 +40,7 @@ uv sync --locked --extra all --all-groups
 ```
 
 > [!WARNING]
-> Ensure `bash docker/common/update_pyproject_pytorch.sh /opt/Automodel` is executed. Wihtout this command, uv sync will attempt to reinstall `torch`. This leads to errors relating to CUDA version mismatch, TE import failures, etc. This work around is required as uv cannot recognize the torch installed in the PyTorch base container.
+> Ensure `bash docker/common/update_pyproject_pytorch.sh /opt/Automodel` is executed. Without this command, uv sync will attempt to reinstall `torch`. This leads to errors relating to CUDA version mismatch, TE import failures, etc. This work around is required as uv cannot recognize the torch installed in the PyTorch base container.
 
 ### 2. Developing with uv sync/pip install
 
