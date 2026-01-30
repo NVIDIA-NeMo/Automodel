@@ -22,7 +22,6 @@ checkpoint:
   checkpoint_dir: checkpoints/
   model_save_format: safetensors
   save_consolidated: true
-  load_base_model: true
   # Skip classifier head when loading base roberta-large (it doesn't have these layers)
   skip_task_head_prefixes_for_base_model: ["classifier."]
 

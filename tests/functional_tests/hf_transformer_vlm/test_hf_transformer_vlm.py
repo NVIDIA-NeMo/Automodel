@@ -15,6 +15,7 @@
 import pytest
 
 from tests.utils.test_utils import run_test_script
+import shutil
 
 TEST_FOLDER = "hf_transformer_vlm"
 HF_TRANSFORMER_VLM_FSDP2_TP2_FILENAME = "L2_HF_Transformer_VLM_FSDP2_TP2.sh"
@@ -35,13 +36,25 @@ class TestHFTransformerVLM:
         run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_MegatronFSDP_TP2_FILENAME)
 
     def test_hf_transformer_vlm_fused_ce_sft(self):
-        run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_FUSED_CE_SFT_FILENAME)
+        try:
+            run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_FUSED_CE_SFT_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("vlm_checkpoints/", ignore_errors=True)
 
     def test_hf_transformer_vlm_peft(self):
-        run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_PEFT_FILENAME)
+        try:
+            run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_PEFT_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("vlm_checkpoints/", ignore_errors=True)
 
     def test_hf_transformer_vlm_sft(self):
-        run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_SFT_FILENAME)
+        try:
+            run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_SFT_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("vlm_checkpoints/", ignore_errors=True)
 
     @pytest.mark.pleasefixme
     def test_hf_transformer_vlm_sft_megatron_fsdp(self):

@@ -37,6 +37,8 @@ from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditiona
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple, logging
 
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+
 logger = logging.get_logger(__name__)
 
 
@@ -497,7 +499,7 @@ class Ministral3Model(Ministral3PreTrainedModel):
         )
 
 
-class Ministral3ForCausalLM(Ministral3PreTrainedModel, GenerationMixin):
+class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}

@@ -15,12 +15,13 @@ dist_env:
 # Model
 # Option 1 – shorthand builder
 model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: /home/TestData/automodel/hf_gemma3_2l/
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.AutoConfig.from_pretrained
+    pretrained_model_name_or_path: /home/TestData/automodel/hf_gemma3_2l/
 
 checkpoint:
   enabled: false
-  load_base_model: false
 
 # Dataset
 # Point this to the location where your *.bin shards live.

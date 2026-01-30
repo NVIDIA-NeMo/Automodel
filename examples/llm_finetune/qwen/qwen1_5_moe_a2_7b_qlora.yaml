@@ -34,22 +34,21 @@ rng:
   ranked: true
 
 model:
-  # Explicitly use Qwen3Moe implementation for Qwen1.5/2 weights to enable custom optimizations
-  _target_: nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM.from_pretrained
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen1.5-MoE-A2.7B
   trust_remote_code: true
   torch_dtype: bfloat16
+  force_hf: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  target_modules: ["*.experts"]
+  target_modules: ["*.experts.*"]
   dim: 16
   alpha: 32
   dropout: 0.05
 
 checkpoint:
   enabled: true
-  load_base_model: false
   checkpoint_dir: checkpoints/qwen_moe_lora
   model_save_format: safetensors
 

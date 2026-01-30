@@ -79,7 +79,6 @@ model:
 
 checkpoint:
   enabled: false
-  load_base_model: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
