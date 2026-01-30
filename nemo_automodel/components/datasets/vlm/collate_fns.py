@@ -62,11 +62,30 @@ def _extract_assistant_text(message: Dict[str, Any]) -> str:
     return ""
 
 
+def _decode_single_token(tokenizer, token_id: int) -> str:
+    """Decode a single token id across tokenizer implementations.
+
+    Some tokenizers accept an `int` token id, while others require a sequence of
+    ids (e.g., `List[int]`). We try the common forms in order.
+    """
+    try:
+        return tokenizer.decode(token_id)
+    except Exception:
+        try:
+            return tokenizer.decode([token_id])
+        except Exception:
+            try:
+                return tokenizer.decode(torch.tensor([token_id]))
+            except Exception:
+                # Best-effort fallback; stop-token detection will likely fail.
+                return str(token_id)
+
+
 def build_labels(
     input_ids_batch: torch.Tensor,
     conversations: Sequence[Sequence[Dict[str, Any]]],
     processor,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> torch.Tensor:
     """Construct label and optional loss-mask tensors aligned to assistant responses."""
     tokenizer = getattr(processor, "tokenizer", processor)
 
@@ -93,9 +112,8 @@ def build_labels(
             answer_start, answer_end = _find_pattern_indices(encoded, assistant_tokens, search_start_index)
 
             if answer_end < len(encoded):
-                # Convert tensor to list for tokenizers that don't accept tensors (e.g., tiktoken)
-                next_token_id = encoded[answer_end].item() if hasattr(encoded[answer_end], 'item') else encoded[answer_end]
-                next_token_str = tokenizer.decode([next_token_id])
+                next_token_id = int(encoded[answer_end].item())
+                next_token_str = _decode_single_token(tokenizer, next_token_id)
                 if next_token_str.strip() in default_stop_tokens(processor):
                     answer_end += 1
 
@@ -200,6 +218,15 @@ def qwen3_omni_collate_fn(
             "qwen_omni_utils is required for qwen3_omni_collate_fn. Install it with: pip install qwen-omni-utils"
         )
 
+    # Import at call-time to support environments/tests that inject the module
+    # after this file is initially imported.
+    try:
+        from qwen_omni_utils import process_mm_info as _process_mm_info
+    except ImportError as exc:
+        raise ImportError(
+            "qwen_omni_utils is required for qwen3_omni_collate_fn. Install it with: pip install qwen-omni-utils"
+        ) from exc
+
     conversations = [example["conversation"] for example in examples]
     texts = [
         processor.apply_chat_template(conversation, add_generation_prompt=False, tokenize=False)
@@ -210,7 +237,7 @@ def qwen3_omni_collate_fn(
     all_images = []
     all_videos = []
     for conversation in conversations:
-        audios, images, videos = process_mm_info(conversation, use_audio_in_video=use_audio_in_video)
+        audios, images, videos = _process_mm_info(conversation, use_audio_in_video=use_audio_in_video)
         all_audios.append(audios)
         all_images.append(images)
         all_videos.append(videos)
