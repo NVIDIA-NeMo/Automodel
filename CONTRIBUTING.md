@@ -2,7 +2,7 @@
 
 ## Environment setup for Automodel
 
-Commone workflows used for setting up Automodel environment:
+Common workflows used for setting up Automodel environment:
 
 1. [Developing with Automodel container](#1-developing-with-automodel-container)
 2. [Developing with UV sync/pip install]($2-developing-with-uv-syncpip-install)
@@ -18,7 +18,7 @@ The container can be run with the following docker command:
 docker run --gpus all --network=host -it --rm --shm-size=32g nvcr.io/nvidia/nemo-automodel:25.11.00 /bin/bash
 ```
 
-#### Mounting local Automodel directory into container
+#### Mounting local Automodel directory into the container
 
 To sync local Automodel directory into the container, mount the local directory into `/opt/Automodel` and override the installed Automodel repository.
 Example docker command:
@@ -27,7 +27,7 @@ Example docker command:
 docker run --gpus all --network=host -it --rm -v <local-Automodel-path>:/opt/Automodel --shm-size=32g nvcr.io/nvidia/nemo-automodel:25.11.00 /bin/bash
 ```
 
-Within the container cd into `/opt/Automodel/` and update the pyproject.toml and uv.lock file by running the following command:
+Within the container, cd into `/opt/Automodel/` and update the pyproject.toml and uv.lock file by running the following command:
 
 ```bash
 bash docker/common/update_pyproject_pytorch.sh /opt/Automodel
@@ -40,7 +40,7 @@ uv sync --locked --extra all --all-groups
 ```
 
 > [!WARNING]
-> Ensure `bash docker/common/update_pyproject_pytorch.sh /opt/Automodel` is executed. Wihtout this command, uv sync will attempt to reinstall `torch`. This leads to errors relating to CUDA version mismatch, TE import failures, etc. This work around is required as uv cannot recognize the torch installed in Automodel's base container.
+> Ensure `bash docker/common/update_pyproject_pytorch.sh /opt/Automodel` is executed. Wihtout this command, uv sync will attempt to reinstall `torch`. This leads to errors relating to CUDA version mismatch, TE import failures, etc. This work around is required as uv cannot recognize the torch installed in the PyTorch base container.
 
 ### 2. Developing with uv sync/pip install
 
@@ -56,11 +56,11 @@ The following optional dependencies are available, please see `[project.optional
 
 - cuda (all dependencies that require cuda)
 - extra (additional dependencies for model coverage)
-- fa (flast attention)
+- fa (flash attention)
 - delta-databricks
 - moe
 - vlm
-- all (install cuda, delta-databricks, extra and vlm)
+- all (installs cuda, delta-databricks, extra and vlm)
 
 Example, installing vlm dependencies:
 
@@ -91,14 +91,6 @@ docker build -f docker/Dockerfile \
     --build-arg INSTALL_DEEPEP=$INSTALL_DEEPEP \
     --build-arg INSTALL_MAMBA=$INSTALL_MAMBA \
     -t automodel --target=automodel_final .
-```
-
-* All testing is currently executed with PyTorch base image. This is the recommended installation path.
-
-* Run the following command to start your container:
-
-```bash
-docker run --rm -it --entrypoint bash --runtime nvidia --gpus all automodel
 ```
 
 ## MoE Dependency
