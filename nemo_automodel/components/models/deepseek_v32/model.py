@@ -22,6 +22,7 @@ the use of DeepseekV32MLA (with Indexer) instead of the standard MLA.
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.deepseek_v3.model import (
     Block,
     DeepseekV3ForCausalLM,
@@ -32,7 +33,6 @@ from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Conf
 from nemo_automodel.components.models.deepseek_v32.layers import DeepseekV32MLA
 from nemo_automodel.components.models.deepseek_v32.state_dict_adapter import DeepSeekV32StateDictAdapter
 from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -56,8 +56,8 @@ class DeepseekV32Block(Block):
         self.self_attn = DeepseekV32MLA(config, backend)
 
         # Import here to avoid circular imports
+        from nemo_automodel.components.models.common import initialize_rms_norm_module
         from nemo_automodel.components.moe.layers import MLP, MoE
-        from nemo_automodel.components.moe.utils import initialize_rms_norm_module
 
         if layer_idx < config.first_k_dense_replace:
             self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear)
@@ -105,8 +105,6 @@ class DeepseekV32Model(DeepseekV3Model):
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
         )
-
-        from nemo_automodel.components.moe.utils import initialize_rms_norm_module
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
@@ -166,7 +164,7 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         # Call grandparent __init__ to skip DeepseekV3ForCausalLM's __init__
         nn.Module.__init__(self)
 
-        from nemo_automodel.components.moe.utils import initialize_linear_module
+        from nemo_automodel.components.models.common import initialize_linear_module
 
         self.config = config
         self.backend = backend or BackendConfig()

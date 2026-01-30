@@ -54,10 +54,11 @@ class DeepSeekV32StateDictAdapter(DeepSeekV3StateDictAdapter):
         "mlp.gate.weight",
     ]
 
-    # V3.2 indexer LayerNorm keys that should not be quantized
+    # V3.2 indexer keys that should not be quantized
     _indexer_non_quantized_keys = [
         "indexer.k_norm.weight",
         "indexer.k_norm.bias",
+        "indexer.weights_proj.weight",
     ]
 
     @property
