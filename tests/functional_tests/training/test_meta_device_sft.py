@@ -72,13 +72,9 @@ def test_consolidated_llm_checkpoint():
     else:
         raise ValueError(f"Unable to infer trainer from config path: {cfg_path}")
 
-    recipe_module_path = (
-        "nemo_automodel.recipes.llm.train_ft" if recipe_cls is TrainFinetuneRecipeForNextTokenPrediction else "nemo_automodel.recipes.vlm.finetune"
-    )
-
     # Build a trainer that uses non-meta initialization by patching ContextManagers to no-op.
     cfg_non_meta = parse_args_and_load_config(default_cfg_path)
-    with patch(f"{recipe_module_path}.ContextManagers", new=lambda *_args, **_kwargs: nullcontext()):
+    with patch("nemo_automodel._transformers.auto_model.ContextManagers", new=lambda *_args, **_kwargs: nullcontext()):
         trainer = recipe_cls(cfg_non_meta)
         trainer.setup()
 

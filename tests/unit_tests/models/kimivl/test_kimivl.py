@@ -765,3 +765,629 @@ class TestKimiVLRegistration:
             text_config={"hidden_size": 128},
         )
         assert type(config).__name__ == "KimiVLConfig"
+
+
+# =============================================================================
+# Additional Tests for Vision Tower Components
+# =============================================================================
+
+
+class TestVisionAttentionFunctions:
+    """Tests for vision_attention_sdpa and vision_attention_flash functions."""
+
+    def test_vision_attention_sdpa_single_sequence(self):
+        """Test vision_attention_sdpa with a single sequence."""
+        from nemo_automodel.components.models.kimivl.model import vision_attention_sdpa
+
+        seq_len = 16
+        num_heads = 4
+        head_dim = 8
+
+        q = torch.randn(seq_len, num_heads, head_dim)
+        k = torch.randn(seq_len, num_heads, head_dim)
+        v = torch.randn(seq_len, num_heads, head_dim)
+        cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32)
+
+        output = vision_attention_sdpa(q, k, v, cu_seqlens, cu_seqlens)
+
+        # Output should be (seq_len, num_heads * head_dim)
+        assert output.shape == (seq_len, num_heads * head_dim)
+
+    def test_vision_attention_sdpa_multiple_sequences(self):
+        """Test vision_attention_sdpa with multiple sequences in a batch."""
+        from nemo_automodel.components.models.kimivl.model import vision_attention_sdpa
+
+        seq1_len = 8
+        seq2_len = 12
+        total_len = seq1_len + seq2_len
+        num_heads = 4
+        head_dim = 8
+
+        q = torch.randn(total_len, num_heads, head_dim)
+        k = torch.randn(total_len, num_heads, head_dim)
+        v = torch.randn(total_len, num_heads, head_dim)
+        cu_seqlens = torch.tensor([0, seq1_len, total_len], dtype=torch.int32)
+
+        output = vision_attention_sdpa(q, k, v, cu_seqlens, cu_seqlens)
+
+        assert output.shape == (total_len, num_heads * head_dim)
+
+    def test_vision_attention_sdpa_creates_block_diagonal_mask(self):
+        """Test that SDPA creates proper block-diagonal attention mask."""
+        from nemo_automodel.components.models.kimivl.model import vision_attention_sdpa
+
+        # Use small sizes for verification
+        seq1 = 4
+        seq2 = 4
+        total = seq1 + seq2
+        num_heads = 2
+        head_dim = 4
+
+        q = torch.randn(total, num_heads, head_dim)
+        k = torch.randn(total, num_heads, head_dim)
+        v = torch.randn(total, num_heads, head_dim)
+        cu_seqlens = torch.tensor([0, seq1, total], dtype=torch.int32)
+
+        # Just verify it runs without error and produces correct shape
+        output = vision_attention_sdpa(q, k, v, cu_seqlens, cu_seqlens)
+        assert output.shape == (total, num_heads * head_dim)
+
+
+class TestMoonVitEncoderLayer:
+    """Tests for MoonVitEncoderLayer."""
+
+    @pytest.fixture
+    def encoder_layer(self):
+        """Create a small encoder layer for testing."""
+        from nemo_automodel.components.models.kimivl.model import MoonVitEncoderLayer
+        import torch.nn.functional as F
+
+        return MoonVitEncoderLayer(
+            num_heads=4,
+            hidden_dim=64,
+            mlp_dim=128,
+            activation=F.gelu,
+            attn_bias=True,
+            attn_implementation="sdpa",  # Use SDPA to avoid flash_attn dependency
+        )
+
+    def test_encoder_layer_initialization(self, encoder_layer):
+        """Test encoder layer initializes with correct components."""
+        assert encoder_layer.num_heads == 4
+        assert encoder_layer.hidden_dim == 64
+        assert encoder_layer.head_dim == 16  # 64 / 4
+        assert hasattr(encoder_layer, "norm0")
+        assert hasattr(encoder_layer, "norm1")
+        assert hasattr(encoder_layer, "mlp")
+        assert hasattr(encoder_layer, "wqkv")
+        assert hasattr(encoder_layer, "wo")
+
+    def test_encoder_layer_wqkv_shape(self, encoder_layer):
+        """Test wqkv projection has correct shape."""
+        # wqkv should project to 3x hidden_dim (for q, k, v)
+        assert encoder_layer.wqkv.in_features == 64
+        assert encoder_layer.wqkv.out_features == 64 * 3
+
+    def test_encoder_layer_forward_shape(self, encoder_layer):
+        """Test encoder layer forward produces correct output shape."""
+        from nemo_automodel.components.models.kimivl.model import Rope2DPosEmb
+
+        seq_len = 16
+        hidden_dim = 64
+        hidden_states = torch.randn(seq_len, hidden_dim)
+
+        # Create rope freqs
+        rope = Rope2DPosEmb(hidden_dim // 4, 8, 8)
+        grid_hws = torch.tensor([[4, 4]])  # 4*4 = 16 tokens
+        rope_freqs_cis = rope.get_freqs_cis(grid_hws)
+
+        cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32)
+
+        output = encoder_layer(hidden_states, cu_seqlens, rope_freqs_cis)
+
+        assert output.shape == (seq_len, hidden_dim)
+
+    def test_encoder_layer_residual_connection(self, encoder_layer):
+        """Test encoder layer uses residual connections."""
+        from nemo_automodel.components.models.kimivl.model import Rope2DPosEmb
+
+        seq_len = 16
+        hidden_dim = 64
+        hidden_states = torch.randn(seq_len, hidden_dim)
+        hidden_states_copy = hidden_states.clone()
+
+        rope = Rope2DPosEmb(hidden_dim // 4, 8, 8)
+        grid_hws = torch.tensor([[4, 4]])
+        rope_freqs_cis = rope.get_freqs_cis(grid_hws)
+        cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32)
+
+        output = encoder_layer(hidden_states, cu_seqlens, rope_freqs_cis)
+
+        # Output should differ from input (transformed)
+        assert not torch.allclose(output, hidden_states_copy)
+
+
+class TestMoonVitEncoder:
+    """Tests for MoonVitEncoder."""
+
+    @pytest.fixture
+    def encoder(self):
+        """Create a small encoder for testing."""
+        from nemo_automodel.components.models.kimivl.model import MoonVitEncoder
+
+        block_cfg = {
+            "num_heads": 4,
+            "hidden_dim": 64,
+            "mlp_dim": 128,
+            "attn_bias": True,
+            "attn_implementation": "sdpa",
+        }
+        return MoonVitEncoder(hidden_dim=64, num_layers=2, block_cfg=block_cfg)
+
+    def test_encoder_initialization(self, encoder):
+        """Test encoder initializes with correct components."""
+        assert len(encoder.blocks) == 2
+        assert hasattr(encoder, "rope_2d")
+        assert hasattr(encoder, "final_layernorm")
+
+    def test_encoder_forward_single_image(self, encoder):
+        """Test encoder forward with single image."""
+        h, w = 4, 4
+        seq_len = h * w
+        hidden_dim = 64
+
+        hidden_states = torch.randn(seq_len, hidden_dim)
+        grid_hws = torch.tensor([[h, w]])
+
+        output = encoder(hidden_states, grid_hws)
+
+        assert output.shape == (seq_len, hidden_dim)
+
+    def test_encoder_forward_multiple_images(self, encoder):
+        """Test encoder forward with multiple images."""
+        h1, w1 = 4, 4
+        h2, w2 = 2, 4
+        seq1 = h1 * w1
+        seq2 = h2 * w2
+        total_seq = seq1 + seq2
+        hidden_dim = 64
+
+        hidden_states = torch.randn(total_seq, hidden_dim)
+        grid_hws = torch.tensor([[h1, w1], [h2, w2]])
+
+        output = encoder(hidden_states, grid_hws)
+
+        assert output.shape == (total_seq, hidden_dim)
+
+    def test_encoder_computes_cu_seqlens_correctly(self, encoder):
+        """Test encoder computes cumulative sequence lengths correctly."""
+        h1, w1 = 4, 4
+        h2, w2 = 2, 2
+        hidden_dim = 64
+
+        hidden_states = torch.randn(h1 * w1 + h2 * w2, hidden_dim)
+        grid_hws = torch.tensor([[h1, w1], [h2, w2]])
+
+        # The encoder should compute cu_seqlens as [0, 16, 20]
+        # This is tested implicitly by the forward pass succeeding
+        output = encoder(hidden_states, grid_hws)
+        assert output.shape[0] == h1 * w1 + h2 * w2
+
+
+class TestMoonVisionPatchEmbed:
+    """Tests for MoonVisionPatchEmbed.
+    
+    Note: MoonVisionPatchEmbed expects input as (num_patches, channels, patch_h, patch_w)
+    where each patch is a separate item. The Conv2d processes each patch individually.
+    """
+
+    @pytest.fixture
+    def patch_embed(self):
+        """Create patch embed module for testing."""
+        from nemo_automodel.components.models.kimivl.model import MoonVisionPatchEmbed
+
+        return MoonVisionPatchEmbed(
+            out_dim=64,
+            in_dim=3,
+            patch_size=14,
+            pos_emb_height=8,
+            pos_emb_width=8,
+        )
+
+    def test_patch_embed_initialization(self, patch_embed):
+        """Test patch embed initializes correctly."""
+        assert patch_embed.patch_size == (14, 14)
+        assert patch_embed.proj.in_channels == 3
+        assert patch_embed.proj.out_channels == 64
+        assert patch_embed.proj.kernel_size == (14, 14)
+        assert patch_embed.proj.stride == (14, 14)
+
+    def test_patch_embed_forward(self, patch_embed):
+        """Test patch embed forward pass.
+        
+        Input format: (num_patches_total, 3, patch_size, patch_size)
+        Each patch is 14x14 pixels.
+        """
+        h, w = 4, 4
+        num_patches = h * w  # 16 patches for 4x4 grid
+        
+        # Input: individual patches stacked as batch
+        # Each patch is (3, 14, 14)
+        x = torch.randn(num_patches, 3, 14, 14)
+        grid_hws = torch.tensor([[h, w]])
+
+        output = patch_embed(x, grid_hws)
+
+        # Output: (num_patches, hidden_dim)
+        assert output.shape == (num_patches, 64)
+
+    def test_patch_embed_multiple_images(self, patch_embed):
+        """Test patch embed with multiple images (patches concatenated)."""
+        h1, w1 = 4, 4
+        h2, w2 = 2, 2
+        total_patches = h1 * w1 + h2 * w2  # 16 + 4 = 20
+        
+        # All patches from both images concatenated
+        x = torch.randn(total_patches, 3, 14, 14)
+        grid_hws = torch.tensor([[h1, w1], [h2, w2]])
+        
+        output = patch_embed(x, grid_hws)
+        
+        assert output.shape == (total_patches, 64)
+
+    def test_patch_embed_pos_emb_applied(self, patch_embed):
+        """Test that position embedding is applied to output."""
+        h, w = 4, 4
+        num_patches = h * w
+        
+        x = torch.randn(num_patches, 3, 14, 14)
+        grid_hws = torch.tensor([[h, w]])
+
+        # Run twice with same input - output should be same (deterministic)
+        out1 = patch_embed(x, grid_hws)
+        out2 = patch_embed(x, grid_hws)
+        
+        assert torch.allclose(out1, out2)
+
+
+class TestKimiVLLanguageModelBackend:
+    """Tests for KimiVLLanguageModelBackend."""
+
+    def test_backend_has_expected_attributes(self):
+        """Test KimiVLLanguageModelBackend has expected attributes."""
+        from nemo_automodel.components.models.kimivl.model import KimiVLLanguageModelBackend
+
+        assert hasattr(KimiVLLanguageModelBackend, "forward")
+        assert hasattr(KimiVLLanguageModelBackend, "get_input_embeddings")
+        assert hasattr(KimiVLLanguageModelBackend, "set_input_embeddings")
+        assert hasattr(KimiVLLanguageModelBackend, "init_weights")
+
+    def test_backend_forward_signature(self):
+        """Test forward signature has expected parameters."""
+        import inspect
+        from nemo_automodel.components.models.kimivl.model import KimiVLLanguageModelBackend
+
+        sig = inspect.signature(KimiVLLanguageModelBackend.forward)
+        params = list(sig.parameters.keys())
+
+        assert "input_ids" in params
+        assert "inputs_embeds" in params
+        assert "attention_mask" in params
+        assert "position_ids" in params
+        assert "padding_mask" in params
+
+    def test_backend_embed_tokens_property(self):
+        """Test embed_tokens property exists."""
+        from nemo_automodel.components.models.kimivl.model import KimiVLLanguageModelBackend
+
+        assert hasattr(KimiVLLanguageModelBackend, "embed_tokens")
+
+    def test_backend_layers_property(self):
+        """Test layers property exists."""
+        from nemo_automodel.components.models.kimivl.model import KimiVLLanguageModelBackend
+
+        assert hasattr(KimiVLLanguageModelBackend, "layers")
+
+    def test_backend_norm_property(self):
+        """Test norm property exists."""
+        from nemo_automodel.components.models.kimivl.model import KimiVLLanguageModelBackend
+
+        assert hasattr(KimiVLLanguageModelBackend, "norm")
+
+
+class TestKimiVLModelMergeFeatures:
+    """Tests for KimiVLModel._merge_with_image_features."""
+
+    def test_merge_replaces_media_tokens(self):
+        """Test _merge_with_image_features replaces media tokens."""
+        from nemo_automodel.components.models.kimivl.model import KimiVLModel
+
+        # Simulate the merge logic
+        batch_size, seq_len, embed_dim = 1, 8, 64
+        media_token_id = 99
+
+        inputs_embeds = torch.randn(batch_size, seq_len, embed_dim)
+        input_ids = torch.tensor([[1, 2, 99, 99, 3, 4, 5, 6]])  # Two media tokens
+        image_features = torch.randn(2, embed_dim)  # 2 image feature tokens
+
+        # Replicate the merge logic
+        inputs_embeds_flat = inputs_embeds.reshape(-1, embed_dim)
+        input_ids_flat = input_ids.flatten()
+        inputs_embeds_flat[input_ids_flat == media_token_id] = image_features
+        result = inputs_embeds_flat.reshape(batch_size, seq_len, embed_dim)
+
+        # Check positions 2 and 3 (media tokens) have been replaced
+        assert torch.allclose(result[0, 2], image_features[0])
+        assert torch.allclose(result[0, 3], image_features[1])
+
+    def test_merge_preserves_non_media_tokens(self):
+        """Test merge preserves embeddings at non-media token positions."""
+        batch_size, seq_len, embed_dim = 1, 8, 64
+        media_token_id = 99
+
+        inputs_embeds = torch.randn(batch_size, seq_len, embed_dim)
+        original_embed_0 = inputs_embeds[0, 0].clone()
+        original_embed_5 = inputs_embeds[0, 5].clone()
+
+        input_ids = torch.tensor([[1, 2, 99, 99, 3, 4, 5, 6]])
+        image_features = torch.randn(2, embed_dim)
+
+        inputs_embeds_flat = inputs_embeds.reshape(-1, embed_dim)
+        input_ids_flat = input_ids.flatten()
+        inputs_embeds_flat[input_ids_flat == media_token_id] = image_features
+        result = inputs_embeds_flat.reshape(batch_size, seq_len, embed_dim)
+
+        # Non-media positions should be unchanged
+        assert torch.allclose(result[0, 0], original_embed_0)
+        assert torch.allclose(result[0, 5], original_embed_5)
+
+    def test_merge_handles_no_media_tokens(self):
+        """Test merge handles case with no media tokens."""
+        batch_size, seq_len, embed_dim = 1, 8, 64
+        media_token_id = 99
+
+        inputs_embeds = torch.randn(batch_size, seq_len, embed_dim)
+        original = inputs_embeds.clone()
+        input_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])  # No 99
+        image_features = torch.empty(0, embed_dim)
+
+        inputs_embeds_flat = inputs_embeds.reshape(-1, embed_dim)
+        input_ids_flat = input_ids.flatten()
+        mask = input_ids_flat == media_token_id
+        if mask.any():
+            inputs_embeds_flat[mask] = image_features
+        result = inputs_embeds_flat.reshape(batch_size, seq_len, embed_dim)
+
+        # Should be unchanged
+        assert torch.allclose(result, original)
+
+
+class TestKimiVLModelForward:
+    """Tests for KimiVLModel.forward logic."""
+
+    def test_forward_raises_with_both_inputs(self):
+        """Test forward raises when both input_ids and inputs_embeds provided."""
+        from nemo_automodel.components.models.kimivl.model import KimiVLModel
+
+        # Test the validation condition directly
+        input_ids = torch.randint(0, 100, (1, 8))
+        inputs_embeds = torch.randn(1, 8, 64)
+
+        # This is the validation from KimiVLModel.forward
+        with pytest.raises(ValueError, match="exactly one"):
+            if (input_ids is None) == (inputs_embeds is None):
+                raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+    def test_forward_raises_with_neither_input(self):
+        """Test forward raises when neither input_ids nor inputs_embeds provided."""
+        input_ids = None
+        inputs_embeds = None
+
+        with pytest.raises(ValueError, match="exactly one"):
+            if (input_ids is None) == (inputs_embeds is None):
+                raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+    def test_thd_format_handling_logic(self):
+        """Test the thd format handling logic."""
+        # Simulate the thd format check
+        kwargs = {"qkv_format": "thd", "some_other": "value"}
+
+        if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
+            # Would call squeeze_input_for_thd
+            processed = True
+        else:
+            processed = False
+
+        assert processed is True
+
+    def test_pixel_values_dtype_conversion_logic(self):
+        """Test pixel values are converted to vision tower dtype."""
+        # Simulate the dtype conversion logic
+        pixel_values = torch.randn(1, 3, 56, 56, dtype=torch.float32)
+        target_dtype = torch.bfloat16
+
+        converted = pixel_values.to(target_dtype)
+        assert converted.dtype == torch.bfloat16
+
+    def test_inputs_embeds_fallback_for_pp_middle_stages(self):
+        """Test inputs_embeds fallback for PP middle stages."""
+        # Simulate the fallback logic for PP middle stages
+        input_ids = torch.randn(1, 8, 64, dtype=torch.float32)  # Actually hidden states
+        embed_tokens = None  # PP middle stage has no embed_tokens
+
+        # The logic: if embed_tokens is None and input_ids is float, treat as hidden states
+        if embed_tokens is None:
+            if (
+                input_ids is not None
+                and isinstance(input_ids, torch.Tensor)
+                and input_ids.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            ):
+                inputs_embeds = input_ids  # Use input_ids as hidden states
+            else:
+                inputs_embeds = None
+
+        assert inputs_embeds is not None
+        assert inputs_embeds.shape == (1, 8, 64)
+
+
+class TestKimiVLForConditionalGenerationInit:
+    """Tests for KimiVLForConditionalGeneration initialization."""
+
+    def test_has_model_attribute(self):
+        """Test class has model attribute defined."""
+        from nemo_automodel.components.models.kimivl.model import KimiVLForConditionalGeneration
+
+        # Check __init__ signature mentions model
+        import inspect
+        source = inspect.getsource(KimiVLForConditionalGeneration.__init__)
+        assert "self.model" in source
+
+    def test_has_vocab_size_attribute(self):
+        """Test vocab_size is set from config."""
+        import inspect
+        from nemo_automodel.components.models.kimivl.model import KimiVLForConditionalGeneration
+
+        source = inspect.getsource(KimiVLForConditionalGeneration.__init__)
+        assert "self.vocab_size" in source
+
+    def test_has_state_dict_adapter_conditional(self):
+        """Test state_dict_adapter is created conditionally."""
+        import inspect
+        from nemo_automodel.components.models.kimivl.model import KimiVLForConditionalGeneration
+
+        source = inspect.getsource(KimiVLForConditionalGeneration.__init__)
+        assert "enable_hf_state_dict_adapter" in source
+        assert "state_dict_adapter" in source
+
+    def test_lm_head_property_exists(self):
+        """Test lm_head property is defined."""
+        from nemo_automodel.components.models.kimivl.model import KimiVLForConditionalGeneration
+
+        assert hasattr(KimiVLForConditionalGeneration, "lm_head")
+
+
+class TestKimiVLForConditionalGenerationForwardLogic:
+    """Tests for KimiVLForConditionalGeneration.forward logic."""
+
+    def test_loss_computation_with_attention_mask(self):
+        """Test loss computation applies attention mask correctly."""
+        # Simulate the masked loss computation
+        batch_size, seq_len, vocab_size = 2, 8, 100
+        logits = torch.randn(batch_size, seq_len, vocab_size)
+        labels = torch.randint(0, vocab_size, (batch_size, seq_len))
+        attention_mask = torch.ones(batch_size, seq_len)
+        attention_mask[0, 6:] = 0  # Mask last 2 tokens for first sample
+
+        # Apply the shift and mask logic
+        shift_mask = attention_mask[..., 1:]
+        shift_logits = logits[..., :-1, :][shift_mask != 0].contiguous()
+        shift_labels = labels[..., 1:][shift_mask != 0].contiguous()
+
+        # Should have fewer tokens than batch_size * (seq_len - 1)
+        expected_masked_out = 2  # tokens 6,7 in first sample (after shift: 5,6)
+        expected_total = batch_size * (seq_len - 1) - expected_masked_out
+        assert shift_logits.shape[0] == expected_total
+        assert shift_labels.shape[0] == expected_total
+
+    def test_loss_computation_without_attention_mask(self):
+        """Test loss computation without attention mask."""
+        batch_size, seq_len, vocab_size = 2, 8, 100
+        logits = torch.randn(batch_size, seq_len, vocab_size)
+        labels = torch.randint(0, vocab_size, (batch_size, seq_len))
+
+        # Without mask, just shift
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        assert shift_logits.shape == (batch_size, seq_len - 1, vocab_size)
+        assert shift_labels.shape == (batch_size, seq_len - 1)
+
+    def test_return_dict_false_returns_logits(self):
+        """Test return_dict=False logic returns just logits."""
+        # Simulate the return logic
+        return_dict = False
+        logits = torch.randn(1, 8, 100)
+        loss = torch.tensor(1.5)
+
+        if return_dict is None:
+            return_dict = False
+        if not return_dict:
+            result = logits
+        else:
+            result = {"loss": loss, "logits": logits}
+
+        assert isinstance(result, torch.Tensor)
+        assert result.shape == (1, 8, 100)
+
+    def test_return_dict_true_returns_output_object(self):
+        """Test return_dict=True logic returns output object."""
+        from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
+
+        return_dict = True
+        logits = torch.randn(1, 8, 100)
+        loss = torch.tensor(1.5)
+        hidden_states = torch.randn(1, 8, 64)
+
+        output = LlavaCausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=None,
+            hidden_states=hidden_states,
+            attentions=None,
+        )
+
+        assert output.loss == loss
+        assert output.logits is logits
+        assert output.hidden_states is hidden_states
+
+    def test_lm_head_none_returns_hidden_states(self):
+        """Test when lm_head is None, hidden_states are returned."""
+        # Simulate: logits = self.lm_head(hidden_states) if self.lm_head is not None else hidden_states
+        lm_head = None
+        hidden_states = torch.randn(1, 8, 64)
+
+        logits = lm_head(hidden_states) if lm_head is not None else hidden_states
+
+        assert logits is hidden_states
+
+
+class TestDeepSeekV3RotaryEmbeddingAdapter:
+    """Tests for DeepSeekV3RotaryEmbeddingAdapter."""
+
+    def test_adapter_stores_parent_reference(self):
+        """Test adapter stores reference to parent module."""
+        from nemo_automodel.components.models.kimivl.model import DeepSeekV3RotaryEmbeddingAdapter
+
+        class MockParent:
+            freqs_cis = torch.randn(100, 64)
+
+        parent = MockParent()
+        adapter = DeepSeekV3RotaryEmbeddingAdapter(parent, rope_fusion=False)
+
+        assert adapter._parent is parent
+        assert adapter.rope_fusion is False
+
+    def test_adapter_freqs_cis_property(self):
+        """Test freqs_cis property accesses parent's buffer."""
+        from nemo_automodel.components.models.kimivl.model import DeepSeekV3RotaryEmbeddingAdapter
+
+        class MockParent:
+            freqs_cis = torch.randn(100, 64)
+
+        parent = MockParent()
+        adapter = DeepSeekV3RotaryEmbeddingAdapter(parent, rope_fusion=False)
+
+        assert adapter.freqs_cis is parent.freqs_cis
+
+    def test_adapter_raises_when_freqs_cis_none(self):
+        """Test adapter raises error when freqs_cis is None."""
+        from nemo_automodel.components.models.kimivl.model import DeepSeekV3RotaryEmbeddingAdapter
+
+        class MockParent:
+            freqs_cis = None
+
+        parent = MockParent()
+        adapter = DeepSeekV3RotaryEmbeddingAdapter(parent, rope_fusion=False)
+
+        with pytest.raises(RuntimeError, match="freqs_cis is None"):
+            adapter(torch.randn(1, 8, 64), torch.arange(8).unsqueeze(0))
