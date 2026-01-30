@@ -155,6 +155,42 @@ class DummyNemotronParseProcessor:
         return {"input_ids": input_ids, "attention_mask": attention_mask, "pixel_values": pixel_values}
 
 
+class DummyKimiVLProcessor:
+    """Dummy processor for KimiVL collate function tests."""
+
+    def __init__(self):
+        self.tokenizer = DummyTokenizer(pad_token_id=0)
+        self.chat_calls = []
+        self.forward_calls = []
+
+    def apply_chat_template(self, conversation, *, add_generation_prompt, tokenize, **kwargs):
+        assert add_generation_prompt is False
+        assert tokenize is False
+        self.chat_calls.append({"conversation": conversation, "kwargs": kwargs})
+        # Extract first text content from conversation
+        for item in conversation[0]["content"]:
+            if isinstance(item, dict) and item.get("type") == "text":
+                return "chat:" + item["text"]
+        return "chat:default"
+
+    def __call__(self, *, text, return_tensors, padding, truncation, **kwargs):
+        assert return_tensors == "pt"
+        assert padding is True or padding == "max_length"
+        assert truncation is True
+        self.forward_calls.append(
+            {
+                "text": list(text),
+                "return_tensors": return_tensors,
+                "padding": padding,
+                "truncation": truncation,
+                **kwargs,
+            }
+        )
+        batch_size = len(text)
+        input_ids = torch.arange(1, 6).unsqueeze(0).repeat(batch_size, 1)
+        return {"input_ids": input_ids}
+
+
 def test_build_labels_includes_stop_token(collate_mod, monkeypatch):
     """
     Ensure `build_labels` copies the trailing stop token when it matches the configured set.
@@ -404,3 +440,97 @@ def test_default_collate_fn_without_max_length(collate_mod, fake_qwen_utils, mon
 
     assert "max_length" not in captured_kwargs
     assert captured_kwargs.get("padding") is True
+
+
+def test_kimi_vl_collate_fn_registered(collate_mod):
+    """Test that kimi_vl_collate_fn is registered in COLLATE_FNS."""
+    assert "KimiVLProcessor" in collate_mod.COLLATE_FNS
+    assert collate_mod.COLLATE_FNS["KimiVLProcessor"] is collate_mod.kimi_vl_collate_fn
+
+
+def test_kimi_vl_collate_fn_shapes(collate_mod, monkeypatch):
+    """Test kimi_vl_collate_fn produces correct output shapes."""
+    processor = DummyKimiVLProcessor()
+
+    # Stub build_labels to return deterministic labels
+    # The collate fn does labels[:, 1:] so we need 5 elements to get 4 after shift
+    labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        assert processor_arg is processor
+        return labels_stub
+
+    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+
+    examples = [{"conversation": CONVERSATION}]
+    batch = collate_mod.kimi_vl_collate_fn(examples, processor)
+
+    # Input starts at [1, 5], trimmed by [:, :-1] to [1, 4]
+    assert batch["input_ids"].shape == (1, 4)
+    # Labels start at [1, 5], shifted by [:, 1:] to [1, 4]
+    assert batch["labels"].shape == (1, 4)
+
+
+def test_kimi_vl_collate_fn_with_max_length(collate_mod, monkeypatch):
+    """Test kimi_vl_collate_fn passes max_length correctly."""
+    processor = DummyKimiVLProcessor()
+
+    labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
+    monkeypatch.setattr(
+        collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True
+    )
+
+    examples = [{"conversation": CONVERSATION}]
+    collate_mod.kimi_vl_collate_fn(examples, processor, max_length=2048)
+
+    assert len(processor.forward_calls) == 1
+    forward_call = processor.forward_calls[0]
+    assert forward_call["max_length"] == 2048
+    assert forward_call["padding"] == "max_length"
+
+
+def test_kimi_vl_collate_fn_extracts_images(collate_mod, monkeypatch):
+    """Test kimi_vl_collate_fn extracts images from conversation content."""
+    processor = DummyKimiVLProcessor()
+
+    labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
+    monkeypatch.setattr(
+        collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True
+    )
+
+    conversation_with_image = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": "test_image.jpg"},
+                {"type": "text", "text": "What is this?"},
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "text", "text": "A test image"}]},
+    ]
+
+    examples = [{"conversation": conversation_with_image}]
+    collate_mod.kimi_vl_collate_fn(examples, processor)
+
+    assert len(processor.forward_calls) == 1
+    forward_call = processor.forward_calls[0]
+    assert "images" in forward_call
+    assert forward_call["images"] == ["test_image.jpg"]
+
+
+def test_kimi_vl_collate_fn_multiple_examples(collate_mod, monkeypatch):
+    """Test kimi_vl_collate_fn handles multiple examples."""
+    processor = DummyKimiVLProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size = input_ids.shape[0]
+        return torch.arange(1, 6).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+
+    examples = [{"conversation": CONVERSATION} for _ in range(3)]
+    batch = collate_mod.kimi_vl_collate_fn(examples, processor)
+
+    assert batch["input_ids"].shape[0] == 3
+    assert batch["labels"].shape[0] == 3
+    assert len(processor.chat_calls) == 3

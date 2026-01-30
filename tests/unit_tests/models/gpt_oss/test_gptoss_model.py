@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import Mock, patch
+import tempfile
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.gpt_oss.model import Block, GptOssForCausalLM, GptOssModel
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.models.common import BackendConfig
@@ -463,3 +465,6 @@ class TestGptOssForCausalLM:
                 # from_config should have been called with the returned config
                 called_cfg = mock_from_config.call_args[0][0]
                 assert called_cfg is gpt_config
+
+
+# NOTE: HFCheckpointingMixin tests are now in tests/unit_tests/models/common/test_hf_checkpointing_mixin.py
