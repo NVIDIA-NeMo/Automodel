@@ -425,10 +425,6 @@ def kimi_k25_vl_collate_fn(
             input_ids, attention_mask = _expand_image_tokens(
                 input_ids, attention_mask, grid_thws, media_token_id
             )
-            
-            if rank == 0 and i == 0:
-                print(f"  Actual expanded len: {input_ids.shape[0]}")
-            
             all_grid_thws.append(grid_thws)
         
         if "pixel_values" in sample_batch:

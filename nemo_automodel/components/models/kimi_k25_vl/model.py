@@ -35,6 +35,7 @@ from transformers.activations import GELUActivation
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
 LOGGER = logging.getLogger(__name__)
 
@@ -875,7 +876,7 @@ class KimiK25VLModel(nn.Module):
         return hidden_states
 
 
-class KimiK25VLForConditionalGeneration(nn.Module, MoEFSDPSyncMixin):
+class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """KimiK25VL model with backend-aware DeepseekV3 language model."""
 
     config_class = KimiK25VLConfig

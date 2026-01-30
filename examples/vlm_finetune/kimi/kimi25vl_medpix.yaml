@@ -76,7 +76,6 @@ checkpoint:
   checkpoint_dir: vlm_checkpoints/kimi_k25_2layer/
   model_save_format: safetensors
   save_consolidated: true
-  load_base_model: true
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
