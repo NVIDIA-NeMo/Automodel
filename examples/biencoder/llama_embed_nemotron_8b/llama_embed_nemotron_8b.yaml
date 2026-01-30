@@ -13,9 +13,9 @@
 # limitations under the License.
 
 # To run this recipe, please use the following command:
-# python examples/biencoder/finetune.py --config examples/biencoder/llama3_2_1b_biencoder.yaml
+# python examples/biencoder/finetune.py --config examples/biencoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml
 # Or with torchrun for multi-GPU:
-# torchrun --nproc-per-node=8 examples/biencoder/finetune.py --config examples/biencoder/llama3_2_1b_biencoder.yaml
+# torchrun --nproc-per-node=8 examples/biencoder/finetune.py --config examples/biencoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml
 
 seed: 125
 
@@ -28,7 +28,7 @@ step_scheduler:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 1
+  timeout_minutes: 30
 
 model:
   _target_: nemo_automodel.components.models.biencoder.NeMoAutoModelBiencoder.from_pretrained
@@ -101,7 +101,3 @@ distributed:
   tp_size: 1
   cp_size: 1
   sequence_parallel: false
-
-dist_env:
-  backend: nccl
-  timeout_minutes: 30
