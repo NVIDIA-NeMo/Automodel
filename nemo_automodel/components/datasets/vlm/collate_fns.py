@@ -384,8 +384,7 @@ def kimi_k25_vl_collate_fn(
         media_token_id = 163605  # Default for Kimi K2.5
     
     pad_token_id = getattr(processor.tokenizer, "pad_token_id", 0) or 0
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    
+
     # Process each sample individually
     all_expanded = []
     all_pixel_values = []
