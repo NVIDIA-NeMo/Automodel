@@ -30,6 +30,17 @@ torchrun --nproc-per-node=8 examples/biencoder/finetune.py \
 
 The final model checkpoint in Hugging Face format will be stored in `output/llama_embed_nemotron_8b/epoch_0_step_28614/model/consolidated`
 
+## Fine-tune `nvidia/llama-nemotron-embed-1b-v2` (Biencoder)
+
+If you want to fine-tune NVIDIA's smaller embedding model, you can use the same biencoder recipe with:
+
+```bash
+torchrun --nproc-per-node=8 examples/biencoder/finetune.py \
+    --config examples/biencoder/llama_nemotron_embed_1b_v2_biencoder.yaml
+```
+
+This config expects the same `./embed_nemotron_dataset_v1/...` JSON files produced by the dataset preparation step above.
+
 ## Citation
 
 If you use this model or training pipeline in your research, please cite:
