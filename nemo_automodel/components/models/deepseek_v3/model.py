@@ -156,7 +156,9 @@ class DeepseekV3Model(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
         *,
+        inputs_embeds: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
@@ -169,9 +171,17 @@ class DeepseekV3Model(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
 
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
+
         if position_ids is None:
             seq_len = inputs_embeds.shape[1]
+            seq_len = inputs_embeds.shape[1]
             position_ids = (
+                torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(0).expand(inputs_embeds.shape[0], -1)
                 torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(0).expand(inputs_embeds.shape[0], -1)
             )
 
