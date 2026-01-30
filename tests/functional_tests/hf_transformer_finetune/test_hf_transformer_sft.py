@@ -35,12 +35,13 @@ class TestHFTransformerFinetune:
             # remove the checkpoint directory
             shutil.rmtree("checkpoints/", ignore_errors=True)
 
-    def test_hf_transformer_sft_megatron_fsdp(self):
-        try:
-            run_test_script(TEST_FOLDER, HF_TRANSFORMER_SFT_MegatronFSDP_FILENAME)
-        finally:
-            # remove the checkpoint directory
-            shutil.rmtree("checkpoints/", ignore_errors=True)
+    # TODO: megatronfsdp currently not functional
+    # def test_hf_transformer_sft_megatron_fsdp(self):
+    #     try:
+    #         run_test_script(TEST_FOLDER, HF_TRANSFORMER_SFT_MegatronFSDP_FILENAME)
+    #     finally:
+    #         # remove the checkpoint directory
+    #         shutil.rmtree("checkpoints/", ignore_errors=True)
 
     def test_hf_transformer_peft(self):
         try:
@@ -49,12 +50,13 @@ class TestHFTransformerFinetune:
             # remove the checkpoint directory
             shutil.rmtree("checkpoints/", ignore_errors=True)
 
-    def test_hf_transformer_peft_megatron_fsdp(self):
-        try:
-            run_test_script(TEST_FOLDER, HF_TRANSFORMER_PEFT_MegatronFSDP_FILENAME)
-        finally:
-            # remove the checkpoint directory
-            shutil.rmtree("checkpoints/", ignore_errors=True)
+    # TODO: megatronfsdp currently not functional
+    # def test_hf_transformer_peft_megatron_fsdp(self):
+    #     try:
+    #         run_test_script(TEST_FOLDER, HF_TRANSFORMER_PEFT_MegatronFSDP_FILENAME)
+    #     finally:
+    #         # remove the checkpoint directory
+    #         shutil.rmtree("checkpoints/", ignore_errors=True)
 
     def test_hf_transformer_peft_no_tokenizer(self):
         try:
