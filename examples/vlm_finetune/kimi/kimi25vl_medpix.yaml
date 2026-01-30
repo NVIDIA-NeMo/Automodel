@@ -53,7 +53,7 @@ parallelizer:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/huiyingl/kimi/Automodel/kimi-k2.5-test-weights_vv1
+  pretrained_model_name_or_path: /your/path/to/kimi-K25-VL-weights
   torch_dtype: bfloat16
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
@@ -68,7 +68,7 @@ model:
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/huiyingl/kimi/Automodel/kimi-k2.5-test-weights_vv1
+  pretrained_model_name_or_path: /your/path/to/kimi-K25-VL-weights
   trust_remote_code: true
 
 checkpoint:
