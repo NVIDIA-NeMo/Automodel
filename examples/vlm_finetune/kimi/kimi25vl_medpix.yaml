@@ -98,7 +98,7 @@ dataloader:
 validation_dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
   path_or_dataset: mmoukouba/MedPix-VQA
-  split: validation[:100]
+  split: validation
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
