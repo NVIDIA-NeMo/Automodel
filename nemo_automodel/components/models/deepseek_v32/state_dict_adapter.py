@@ -30,19 +30,7 @@ from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import (
 
 
 class DeepSeekV32StateDictAdapter(DeepSeekV3StateDictAdapter):
-    """State dict adapter for DeepSeek V3.2.
-
-    Extends the V3 adapter with support for the new Indexer weights:
-    - self_attn.indexer.wq_b.weight
-    - self_attn.indexer.wk.weight
-    - self_attn.indexer.k_norm.weight (LayerNorm)
-    - self_attn.indexer.k_norm.bias (LayerNorm)
-    - self_attn.indexer.weights_proj.weight
-
-    The indexer weights use the same naming convention between HF and native format,
-    so no special key mapping is needed. The main difference is handling the
-    k_norm LayerNorm which should not be quantized.
-    """
+    """State dict adapter for DeepSeek V3.2."""
 
     # Base non-quantized keys from V3
     _base_non_quantized_keys = [
