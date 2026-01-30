@@ -21,24 +21,57 @@ and DeepseekV32MLA which integrates the indexer with Multi-head Latent Attention
 from typing import Any
 
 import torch
-from fast_hadamard_transform import hadamard_transform
 from torch import nn
+
+# Try to import fast_hadamard_transform, fall back to torch implementation
+try:
+    from fast_hadamard_transform import hadamard_transform
+
+    _FAST_HADAMARD_AVAILABLE = True
+except ImportError:
+    _FAST_HADAMARD_AVAILABLE = False
+
+    # Taken from https://github.com/HazyResearch/structured-nets/blob/master/pytorch/structure/hadamard.py#L26
+    def hadamard_transform_torch(u, scale: float, normalize=False):
+        """Multiply H_n @ u where H_n is the Hadamard matrix of dimension n x n.
+        n must be a power of 2.
+        Parameters:
+            u: Tensor of shape (..., n)
+            normalize: if True, divide the result by 2^{m/2} where m = log_2(n).
+        Returns:
+            product: Tensor of shape (..., n)
+        """
+        import numpy as np
+
+        batch_size, n = u.shape
+        m = int(np.log2(n))
+        assert n == 1 << m, "n must be a power of 2"
+        x = u[..., np.newaxis]
+        for d in range(m)[::-1]:
+            x = torch.cat((x[..., ::2, :] + x[..., 1::2, :], x[..., ::2, :] - x[..., 1::2, :]), dim=-1)
+        x = x.squeeze(-2) / 2 ** (m / 2) if normalize else x.squeeze(-2)
+        return x * scale
+
+    def hadamard_transform(x: torch.Tensor, scale: float) -> torch.Tensor:
+        """Fallback hadamard_transform when fast_hadamard_transform is not available."""
+        return hadamard_transform_torch(x, scale)
+
 
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
+from nemo_automodel.components.models.common import (
+    BackendConfig,
+    initialize_linear_module,
+    initialize_rms_norm_module,
+)
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     apply_rotary_emb,
     yarn_get_mscale,
 )
 from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Config
-from nemo_automodel.components.moe.utils import (
-    BackendConfig,
-    initialize_linear_module,
-    initialize_rms_norm_module,
-)
 
 
 def _rotate_activation(x: torch.Tensor) -> torch.Tensor:

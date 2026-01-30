@@ -21,11 +21,10 @@ seed: 1234
 
 step_scheduler:
   global_batch_size: 512
-  local_batch_size: 8
+  local_batch_size: 4
   ckpt_every_steps: 1000
   val_every_steps: 1000
-  num_epochs: 1
-  max_steps: 30
+  num_epochs: 2
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
@@ -64,7 +63,7 @@ model:
   trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.moe.utils.BackendConfig
-    attn: te
+    attn: sdpa # TE requires the latest cudnn version so disabling by default
     linear: te
     rms_norm: te
     rope_fusion: true
@@ -100,7 +99,7 @@ dataloader:
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
-  split: validation
+  split: train
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -116,5 +115,5 @@ optimizer:
   - 0.9
   - 0.999
   eps: 1e-8
-  lr: 0.0001
+  lr: 1e-5
   weight_decay: 0
