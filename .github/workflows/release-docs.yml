@@ -13,21 +13,24 @@
 # limitations under the License.
 name: Release docs
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/**'
+
   workflow_dispatch:
     inputs:
       dry-run:
         description: Whether to run the workflow in dry-run mode
         required: true
         type: boolean
-        default: true
-      version-number:
-        description: Version number to release this as (use `latest` for main branch)
-        required: true
-        type: string
+        default: false
       notify-emails:
         description: Email addresses to send the notification to. Format as "me@me.com,you@you.com".
         required: true
         type: string
+        default: "akoumparouli@nvidia.com"
       aws-region:
         description: AWS region
         required: false
