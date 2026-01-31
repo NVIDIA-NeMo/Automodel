@@ -239,7 +239,7 @@ class MegatronFSDPManager:
             dp_shard_dim = "dp"
         tp_dim = "tp"
 
-        model = megatron_fsdp_strategy_parallelize(
+        model, optimizer = megatron_fsdp_strategy_parallelize(
             model,
             device_mesh=self.device_mesh,
             optimizer=optimizer,
@@ -262,4 +262,4 @@ class MegatronFSDPManager:
             tp_dim=tp_dim,
         )
 
-        return model
+        return model, optimizer
