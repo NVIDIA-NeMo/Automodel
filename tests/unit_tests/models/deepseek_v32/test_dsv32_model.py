@@ -102,3 +102,394 @@ class TestDeepseekV32Config:
         assert cfg.hidden_size == 256
         assert cfg.q_lora_rank == 128
         assert cfg.index_topk == 512
+
+    def test_config_rope_scaling(self):
+        """Test that config handles rope_scaling parameter."""
+        rope_scaling = {
+            "factor": 2.0,
+            "mscale": 1.0,
+            "original_max_position_embeddings": 4096
+        }
+        cfg = DeepseekV32Config(rope_scaling=rope_scaling)
+
+        assert cfg.rope_scaling == rope_scaling
+        assert cfg.rope_scaling["factor"] == 2.0
+
+    def test_config_keys_to_ignore_at_inference(self):
+        """Test that keys_to_ignore_at_inference is set correctly."""
+        cfg = DeepseekV32Config()
+        assert cfg.keys_to_ignore_at_inference == ["past_key_values"]
+
+
+class TestDeepseekV32Block:
+    def create_moe_config(self):
+        """Create a valid MoEConfig for tests."""
+        from nemo_automodel.components.moe.layers import MoEConfig
+        return MoEConfig(
+            dim=64,
+            inter_dim=128,
+            moe_inter_dim=64,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0.001,
+            aux_loss_coeff=0.0,
+            score_func="sigmoid",
+            route_scale=1.0,
+            norm_topk_prob=True,
+        )
+
+    def test_block_with_dense_layer(self):
+        """Test DeepseekV32Block initialization with dense layer (layer_idx < first_k_dense_replace)."""
+        from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32Block
+        from nemo_automodel.components.models.common import BackendConfig
+
+        cfg = DeepseekV32Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=4,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
+            qk_head_dim=32,
+            kv_lora_rank=32,
+            q_lora_rank=64,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            first_k_dense_replace=3,
+            index_n_heads=4,
+            index_head_dim=32,
+            index_topk=16,
+        )
+
+        moe_config = self.create_moe_config()
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
+
+        # Layer 0 should be dense (0 < 3)
+        block = DeepseekV32Block(layer_idx=0, config=cfg, moe_config=moe_config, backend=backend)
+
+        assert block.layer_idx == 0
+        assert hasattr(block, 'self_attn')
+        assert hasattr(block, 'mlp')
+        assert hasattr(block, 'input_layernorm')
+        assert hasattr(block, 'post_attention_layernorm')
+
+        # Check that MLP is dense (not MoE)
+        from nemo_automodel.components.moe.layers import MLP
+        assert isinstance(block.mlp, MLP)
+
+    def test_block_with_moe_layer(self):
+        """Test DeepseekV32Block initialization with MoE layer (layer_idx >= first_k_dense_replace)."""
+        from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32Block
+        from nemo_automodel.components.models.common import BackendConfig
+
+        cfg = DeepseekV32Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=4,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
+            qk_head_dim=32,
+            kv_lora_rank=32,
+            q_lora_rank=64,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            first_k_dense_replace=3,
+            index_n_heads=4,
+            index_head_dim=32,
+            index_topk=16,
+        )
+
+        moe_config = self.create_moe_config()
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
+
+        # Layer 3 should be MoE (3 >= 3)
+        block = DeepseekV32Block(layer_idx=3, config=cfg, moe_config=moe_config, backend=backend)
+
+        assert block.layer_idx == 3
+
+        # Check that MLP is MoE (not dense)
+        from nemo_automodel.components.moe.layers import MoE
+        assert isinstance(block.mlp, MoE)
+
+
+class TestDeepseekV32Model:
+    def test_model_initialization(self):
+        """Test DeepseekV32Model initialization."""
+        from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32Model
+        from nemo_automodel.components.models.common import BackendConfig
+
+        cfg = DeepseekV32Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
+            qk_head_dim=32,
+            kv_lora_rank=32,
+            q_lora_rank=64,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            index_n_heads=4,
+            index_head_dim=32,
+            index_topk=16,
+        )
+
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
+        model = DeepseekV32Model(cfg, backend)
+
+        assert hasattr(model, 'embed_tokens')
+        assert hasattr(model, 'layers')
+        assert hasattr(model, 'norm')
+        assert hasattr(model, 'freqs_cis')
+        assert len(model.layers) == 2
+
+    def test_model_initialization_with_moe_config(self):
+        """Test DeepseekV32Model initialization with explicit MoE config."""
+        from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32Model
+        from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel.components.moe.layers import MoEConfig
+
+        cfg = DeepseekV32Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
+            qk_head_dim=32,
+            kv_lora_rank=32,
+            q_lora_rank=64,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            index_n_heads=4,
+            index_head_dim=32,
+            index_topk=16,
+        )
+
+        moe_config = MoEConfig(
+            dim=64,
+            inter_dim=128,
+            moe_inter_dim=64,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0.001,
+            aux_loss_coeff=0.0,
+            score_func="sigmoid",
+            route_scale=1.0,
+            norm_topk_prob=True,
+        )
+
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
+        model = DeepseekV32Model(cfg, backend, moe_config=moe_config)
+
+        assert model.moe_config == moe_config
+
+
+class TestDeepseekV32ForCausalLM:
+    def test_from_config_with_explicit_backend(self):
+        """Test from_config with explicit backend parameter."""
+        from nemo_automodel.components.models.common import BackendConfig
+
+        cfg = DeepseekV32Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
+            qk_head_dim=32,
+            kv_lora_rank=32,
+            q_lora_rank=64,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            index_n_heads=4,
+            index_head_dim=32,
+            index_topk=16,
+        )
+
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
+        model = DeepseekV32ForCausalLM.from_config(cfg, backend=backend)
+
+        assert isinstance(model, DeepseekV32ForCausalLM)
+        assert model.backend == backend
+
+    def test_from_config_with_moe_config(self):
+        """Test from_config with explicit MoE config."""
+        from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel.components.moe.layers import MoEConfig
+
+        cfg = DeepseekV32Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
+            qk_head_dim=32,
+            kv_lora_rank=32,
+            q_lora_rank=64,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            index_n_heads=4,
+            index_head_dim=32,
+            index_topk=16,
+        )
+
+        moe_config = MoEConfig(
+            dim=64,
+            inter_dim=128,
+            moe_inter_dim=64,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0.001,
+            aux_loss_coeff=0.0,
+            score_func="sigmoid",
+            route_scale=1.0,
+            norm_topk_prob=True,
+        )
+
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
+        model = DeepseekV32ForCausalLM.from_config(cfg, moe_config=moe_config, backend=backend)
+
+        assert isinstance(model, DeepseekV32ForCausalLM)
+        assert model.model.moe_config == moe_config
+
+    def test_init_with_state_dict_adapter_disabled(self):
+        """Test initialization without state dict adapter."""
+        from nemo_automodel.components.models.common import BackendConfig
+
+        cfg = DeepseekV32Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
+            qk_head_dim=32,
+            kv_lora_rank=32,
+            q_lora_rank=64,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            index_n_heads=4,
+            index_head_dim=32,
+            index_topk=16,
+        )
+
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", enable_hf_state_dict_adapter=False)
+        model = DeepseekV32ForCausalLM(cfg, backend=backend)
+
+        assert not hasattr(model, 'state_dict_adapter')
+
+    def test_init_with_state_dict_adapter_enabled(self):
+        """Test initialization with state dict adapter enabled."""
+        from nemo_automodel.components.models.common import BackendConfig
+
+        cfg = DeepseekV32Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
+            qk_head_dim=32,
+            kv_lora_rank=32,
+            q_lora_rank=64,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            index_n_heads=4,
+            index_head_dim=32,
+            index_topk=16,
+        )
+
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", enable_hf_state_dict_adapter=True)
+        model = DeepseekV32ForCausalLM(cfg, backend=backend)
+
+        assert hasattr(model, 'state_dict_adapter')
+        from nemo_automodel.components.models.deepseek_v32.state_dict_adapter import DeepSeekV32StateDictAdapter
+        assert isinstance(model.state_dict_adapter, DeepSeekV32StateDictAdapter)
+
+    def test_model_has_lm_head(self):
+        """Test that model has lm_head for language modeling."""
+        from nemo_automodel.components.models.common import BackendConfig
+
+        cfg = DeepseekV32Config(
+            vocab_size=100,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
+            qk_head_dim=32,
+            kv_lora_rank=32,
+            q_lora_rank=64,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            index_n_heads=4,
+            index_head_dim=32,
+            index_topk=16,
+        )
+
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
+        model = DeepseekV32ForCausalLM(cfg, backend=backend)
+
+        assert hasattr(model, 'lm_head')
+        # lm_head should project from hidden_size to vocab_size
+        assert model.lm_head.in_features == cfg.hidden_size
+        assert model.lm_head.out_features == cfg.vocab_size

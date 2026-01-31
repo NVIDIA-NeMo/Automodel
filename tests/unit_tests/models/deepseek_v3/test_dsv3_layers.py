@@ -359,7 +359,6 @@ class TestMLAForward:
         config.hidden_size = 1024
         config.rope_scaling = None
         config.max_position_embeddings = 4096
-        config.rms_norm_eps = 1e-6
 
         for key, value in overrides.items():
             setattr(config, key, value)

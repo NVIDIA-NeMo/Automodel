@@ -365,3 +365,238 @@ class TestDeepSeekV32StateDictAdapterAddQuantization:
         assert "model.layers.0.self_attn.indexer.weights_proj.weight" in result
         assert result["model.layers.0.self_attn.indexer.weights_proj.weight"].dtype != torch.float8_e4m3fn
         assert "model.layers.0.self_attn.indexer.weights_proj.weight_scale_inv" not in result
+
+
+class TestDeepSeekV32StateDictAdapterExcludeKeyRegex:
+    def create_mock_config(self, **overrides):
+        config = Mock(spec=DeepseekV32Config)
+        config.num_layers = 2
+        config.hidden_size = 1024
+        config.num_attention_heads = 16
+        config.intermediate_size = 2048
+
+        for key, value in overrides.items():
+            setattr(config, key, value)
+
+        return config
+
+    def create_mock_moe_config(self, **overrides):
+        moe_config = Mock(spec=MoEConfig)
+        moe_config.num_experts = 8
+        moe_config.n_routed_experts = 8
+        moe_config.moe_inter_dim = 512
+        moe_config.topk = 2
+
+        for key, value in overrides.items():
+            setattr(moe_config, key, value)
+
+        return moe_config
+
+    def create_mock_backend_config(self, **overrides):
+        backend = Mock(spec=BackendConfig)
+        backend.enable_deepep = False
+
+        for key, value in overrides.items():
+            setattr(backend, key, value)
+
+        return backend
+
+    def test_convert_tensor_with_exclude_regex(self):
+        """Test that exclude_key_regex filters out matching keys."""
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+
+        adapter = DeepSeekV32StateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(256, 128)
+        fqn = "model.layers.0.self_attn.q_a_proj.weight"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+            # With regex that matches the key
+            result = adapter.convert_single_tensor_to_hf(
+                fqn, tensor, quantization=False, exclude_key_regex=r".*q_a_proj.*"
+            )
+
+            # Should be empty since the key matches the exclusion regex
+            assert len(result) == 0
+
+    def test_convert_tensor_with_exclude_regex_no_match(self):
+        """Test that exclude_key_regex doesn't filter non-matching keys."""
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+
+        adapter = DeepSeekV32StateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(256, 128)
+        fqn = "model.layers.0.self_attn.q_a_proj.weight"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+            # With regex that doesn't match the key
+            result = adapter.convert_single_tensor_to_hf(
+                fqn, tensor, quantization=False, exclude_key_regex=r".*kv_proj.*"
+            )
+
+            # Should have the key since regex doesn't match
+            assert len(result) == 1
+            assert result[0][0] == fqn
+
+    def test_convert_tensor_without_quantization(self):
+        """Test tensor conversion without quantization."""
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+
+        adapter = DeepSeekV32StateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(256, 128)
+        fqn = "model.layers.0.self_attn.q_a_proj.weight"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=False)
+
+            # Without quantization, should just return the tensor
+            assert len(result) == 1
+            assert result[0][0] == fqn
+            assert result[0][1].dtype == tensor.dtype  # Original dtype preserved
+
+
+class TestDeepSeekV32StateDictAdapterInheritance:
+    """Test that V32 adapter properly inherits from V3 adapter."""
+
+    def create_mock_config(self, **overrides):
+        config = Mock(spec=DeepseekV32Config)
+        config.num_layers = 2
+        config.hidden_size = 1024
+        config.num_attention_heads = 16
+        config.intermediate_size = 2048
+
+        for key, value in overrides.items():
+            setattr(config, key, value)
+
+        return config
+
+    def create_mock_moe_config(self, **overrides):
+        moe_config = Mock(spec=MoEConfig)
+        moe_config.num_experts = 8
+        moe_config.n_routed_experts = 8
+        moe_config.moe_inter_dim = 512
+        moe_config.topk = 2
+
+        for key, value in overrides.items():
+            setattr(moe_config, key, value)
+
+        return moe_config
+
+    def create_mock_backend_config(self, **overrides):
+        backend = Mock(spec=BackendConfig)
+        backend.enable_deepep = False
+
+        for key, value in overrides.items():
+            setattr(backend, key, value)
+
+        return backend
+
+    def test_inherits_from_v3_adapter(self):
+        """Test that DeepSeekV32StateDictAdapter inherits from DeepSeekV3StateDictAdapter."""
+        from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
+
+        assert issubclass(DeepSeekV32StateDictAdapter, DeepSeekV3StateDictAdapter)
+
+    def test_base_non_quantized_keys_preserved(self):
+        """Test that base non-quantized keys from V3 are preserved."""
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+
+        adapter = DeepSeekV32StateDictAdapter(config, moe_config, backend)
+
+        # Check base V3 keys are in _non_quantized_keys
+        base_keys = [
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "norm.weight",
+            "lm_head.weight",
+            "embed_tokens.weight",
+            "mlp.gate.weight",
+        ]
+
+        for key in base_keys:
+            assert key in adapter._non_quantized_keys, f"{key} should be in non_quantized_keys"
+
+
+class TestDeepSeekV32StateDictAdapterBlockSize:
+    """Test block size calculation for quantization scales."""
+
+    def create_mock_config(self, **overrides):
+        config = Mock(spec=DeepseekV32Config)
+        config.num_layers = 2
+        config.hidden_size = 1024
+        config.num_attention_heads = 16
+        config.intermediate_size = 2048
+
+        for key, value in overrides.items():
+            setattr(config, key, value)
+
+        return config
+
+    def create_mock_moe_config(self, **overrides):
+        moe_config = Mock(spec=MoEConfig)
+        moe_config.num_experts = 8
+        moe_config.n_routed_experts = 8
+        moe_config.moe_inter_dim = 512
+        moe_config.topk = 2
+
+        for key, value in overrides.items():
+            setattr(moe_config, key, value)
+
+        return moe_config
+
+    def create_mock_backend_config(self, **overrides):
+        backend = Mock(spec=BackendConfig)
+        backend.enable_deepep = False
+
+        for key, value in overrides.items():
+            setattr(backend, key, value)
+
+        return backend
+
+    def test_scale_shape_calculation(self):
+        """Test that scale shape is calculated correctly."""
+        from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import (
+            calculate_scale_shape,
+            BLOCK_SIZE,
+        )
+
+        # Test with tensor that divides evenly by block size
+        tensor = torch.randn(256, 128)
+        scale_shape = calculate_scale_shape(tensor, BLOCK_SIZE)
+
+        # Scale should be smaller than tensor
+        assert scale_shape[0] <= tensor.shape[0]
+        assert scale_shape[1] <= tensor.shape[1]
+
+    def test_quantized_weights_have_correct_scale_shape(self):
+        """Test that quantized weights have correctly shaped scale tensors."""
+        config = self.create_mock_config()
+        moe_config = self.create_mock_moe_config()
+        backend = self.create_mock_backend_config()
+
+        adapter = DeepSeekV32StateDictAdapter(config, moe_config, backend)
+
+        tensor = torch.randn(256, 128)
+        fqn = "model.layers.0.self_attn.q_a_proj.weight"
+
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+
+            # Should have weight and scale_inv
+            assert len(result) == 2
+
+            weight_key, weight_tensor = result[0]
+            scale_key, scale_tensor = result[1]
+
+            assert weight_key == fqn
+            assert scale_key == fqn + "_scale_inv"
+            assert scale_tensor.dtype == torch.float32
