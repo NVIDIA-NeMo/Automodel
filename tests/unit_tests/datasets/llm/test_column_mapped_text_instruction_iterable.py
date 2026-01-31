@@ -98,7 +98,7 @@ def test_iterable_dataset_shard_and_shuffle_smoke(monkeypatch, tmp_path: Path):
         column_mapping={"question": "q", "answer": "a"},
         tokenizer=_DummyTokenizer(),
         answer_only_loss_mask=False,
-        repeat_on_exhaustion=False,
+        repeat_on_exhaustion=True,
     ).shard(2, 1).shuffle(buffer_size=2, seed=0)
 
     first = next(iter(ds))
@@ -120,7 +120,7 @@ def test_iterable_dataset_pad_token_fallback_with_eos(tmp_path: Path):
         column_mapping={"question": "q", "answer": "a"},
         tokenizer=tok,
         answer_only_loss_mask=False,
-        repeat_on_exhaustion=False,
+        repeat_on_exhaustion=True,
     )
     assert tok.pad_token == tok.eos_token
 
@@ -139,7 +139,7 @@ def test_iterable_dataset_pad_token_fallback_without_eos(tmp_path: Path):
         column_mapping={"question": "q", "answer": "a"},
         tokenizer=tok,
         answer_only_loss_mask=False,
-        repeat_on_exhaustion=False,
+        repeat_on_exhaustion=True,
     )
     assert tok.pad_token == " "
 

@@ -19,6 +19,7 @@ import torch.nn as nn
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.deepseek_v3.layers import MLA
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids, precompute_freqs_cis
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
@@ -154,16 +155,24 @@ class DeepseekV3Model(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         *,
+        inputs_embeds: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
+
         if position_ids is None:
+            seq_len = inputs_embeds.shape[1]
             position_ids = (
-                torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
+                torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(0).expand(inputs_embeds.shape[0], -1)
             )
 
         with torch.no_grad():
@@ -175,7 +184,7 @@ class DeepseekV3Model(nn.Module):
                 cp_size=attn_kwargs.get("cp_size", 1),
             )
 
-        h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
+        h = inputs_embeds
 
         # Apply the transformer layers.
         for layer in self.layers.values():
@@ -218,7 +227,7 @@ class DeepseekV3Model(nn.Module):
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class DeepseekV3ForCausalLM(nn.Module, MoEFSDPSyncMixin):
+class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     @classmethod
     def from_config(
         cls,

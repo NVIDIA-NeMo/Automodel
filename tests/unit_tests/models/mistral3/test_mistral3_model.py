@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
+import tempfile
+from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from transformers import AutoConfig, AutoModel
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.mistral3 import model as mistral_mod
 from nemo_automodel.components.models.mistral3.model import (
     Ministral3Config,
@@ -97,4 +100,7 @@ class TestMinistral3ForCausalLM:
 
         assert outputs.logits.shape == (batch, seq_len, cfg.vocab_size)
         mock_forward.assert_called_once()
+
+
+# NOTE: HFCheckpointingMixin tests are now in tests/unit_tests/models/common/test_hf_checkpointing_mixin.py
 

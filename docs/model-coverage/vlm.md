@@ -25,6 +25,7 @@ NeMo Automodel supports [AutoModelForImageTextToText](https://huggingface.co/doc
 
 | Model                              | Dataset                     | FSDP2      | PEFT       | Example YAML |
 |------------------------------------|-----------------------------|------------|------------|--------------|
+| Kimi-VL-A3B-Instruct               | cord-v2                     | Supported  | Supported  | [kimi2vl_cordv2.yaml](../../examples/vlm_finetune/kimi/kimi2vl_cordv2.yaml) |
 | Gemma 3-4B & 27B                   | naver-clova-ix & rdr-items  | Supported  | Supported  | [gemma3_vl_4b_cord_v2.yaml](../../examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml) |
 | Gemma 3n                           | naver-clova-ix & rdr-items  | Supported  | Supported  | [gemma3n_vl_4b_medpix.yaml](../../examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml) |
 | Qwen2-VL-2B-Instruct & Qwen2.5-VL-3B-Instruct | cord-v2          | Supported  | Supported  | [qwen2_5_vl_3b_rdr.yaml](../../examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml) |

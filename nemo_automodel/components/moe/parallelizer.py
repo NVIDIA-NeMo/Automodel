@@ -30,6 +30,7 @@ from torch.distributed.tensor import Shard, distribute_module, distribute_tensor
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
+from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
 from nemo_automodel.components.moe.layers import (
     GroupedExpertsDeepEP,
     MoE,
@@ -81,6 +82,8 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh):
         _model = model.model
     else:
         _model = model
+    # Prefer nested text modules when present
+    _model = get_text_module(_model)
 
     for _, block in _model.layers.named_children():
         if isinstance(block.mlp, MoE):
@@ -180,6 +183,8 @@ def apply_fsdp(
         _model = model.model
     else:
         _model = model
+    # handle VLM
+    _model = get_text_module(_model)
 
     for _, block in _model.layers.named_children():
         if isinstance(block.mlp, MoE) and ep_shard_enabled:
