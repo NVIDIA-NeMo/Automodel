@@ -54,6 +54,8 @@ If you are running Transformers v5 in another environment, you can still use NeM
 
 ## API mapping (Transformers ⇔ NeMo Automodel)
 
+### API name mapping
+
 :::{raw} html
 <table>
   <thead>
@@ -64,8 +66,48 @@ If you are running Transformers v5 in another environment, you can still use NeM
   </thead>
   <tbody>
     <tr>
-      <td colspan="2"><strong>Load a model and tokenizer (full snippet)</strong></td>
+      <td><code>transformers.AutoModelForCausalLM</code></td>
+      <td><code>nemo_automodel.NeMoAutoModelForCausalLM</code></td>
     </tr>
+    <tr>
+      <td><code>transformers.AutoModelForImageTextToText</code></td>
+      <td><code>nemo_automodel.NeMoAutoModelForImageTextToText</code></td>
+    </tr>
+    <tr>
+      <td><code>transformers.AutoModelForSequenceClassification</code></td>
+      <td><code>nemo_automodel.NeMoAutoModelForSequenceClassification</code></td>
+    </tr>
+    <tr>
+      <td><code>transformers.AutoModelForTextToWaveform</code></td>
+      <td><code>nemo_automodel.NeMoAutoModelForTextToWaveform</code></td>
+    </tr>
+    <tr>
+      <td><code>transformers.AutoTokenizer.from_pretrained(...)</code></td>
+      <td><code>nemo_automodel.NeMoAutoTokenizer.from_pretrained(...)</code></td>
+    </tr>
+    <tr>
+      <td><code>model.generate(...)</code></td>
+      <td><code>model.generate(...)</code></td>
+    </tr>
+    <tr>
+      <td><code>model.save_pretrained(path)</code></td>
+      <td><code>model.save_pretrained(path, checkpointer=...)</code></td>
+    </tr>
+  </tbody>
+</table>
+:::
+
+### Load a model and tokenizer
+
+:::{raw} html
+<table>
+  <thead>
+    <tr>
+      <th style="width: 50%;">Hugging Face (<code>transformers</code>)</th>
+      <th style="width: 50%;">NeMo Automodel (<code>nemo_automodel</code>)</th>
+    </tr>
+  </thead>
+  <tbody>
     <tr>
       <td>
         <pre><code>import torch
@@ -96,95 +138,52 @@ model = NeMoAutoModelForCausalLM.from_pretrained(
 model = model.eval()</code></pre>
       </td>
     </tr>
+  </tbody>
+</table>
+:::
+
+### Text generation
+
+This snippet assumes you already have a `model` and `tokenizer` (see the loading snippet above).
+
+:::{raw} html
+<table>
+  <thead>
     <tr>
-      <td><code>transformers.AutoModelForCausalLM</code></td>
-      <td><code>nemo_automodel.NeMoAutoModelForCausalLM</code></td>
+      <th style="width: 50%;">Hugging Face (<code>transformers</code>)</th>
+      <th style="width: 50%;">NeMo Automodel (<code>nemo_automodel</code>)</th>
     </tr>
+  </thead>
+  <tbody>
     <tr>
-      <td><code>transformers.AutoModelForImageTextToText</code></td>
-      <td><code>nemo_automodel.NeMoAutoModelForImageTextToText</code></td>
-    </tr>
-    <tr>
-      <td><code>transformers.AutoModelForSequenceClassification</code></td>
-      <td><code>nemo_automodel.NeMoAutoModelForSequenceClassification</code></td>
-    </tr>
-    <tr>
-      <td><code>transformers.AutoModelForTextToWaveform</code></td>
-      <td><code>nemo_automodel.NeMoAutoModelForTextToWaveform</code></td>
-    </tr>
-    <tr>
-      <td><code>transformers.AutoTokenizer</code></td>
-      <td><code>nemo_automodel.NeMoAutoTokenizer</code></td>
-    </tr>
-    <tr>
-      <td><code>model.generate(...)</code></td>
-      <td><code>model.generate(...)</code></td>
-    </tr>
-    <tr>
-      <td><code>model.save_pretrained(path)</code></td>
-      <td><code>model.save_pretrained(path, checkpointer=...)</code></td>
+      <td>
+        <pre><code>import torch
+
+prompt = "Write a haiku about GPU kernels."
+inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+with torch.inference_mode():
+    out = model.generate(**inputs, max_new_tokens=64)
+
+print(tokenizer.decode(out[0], skip_special_tokens=True))</code></pre>
+      </td>
+      <td>
+        <pre><code>import torch
+
+prompt = "Write a haiku about GPU kernels."
+inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+with torch.inference_mode():
+    out = model.generate(**inputs, max_new_tokens=64)
+
+print(tokenizer.decode(out[0], skip_special_tokens=True))</code></pre>
+      </td>
     </tr>
   </tbody>
 </table>
 :::
 
 ## Side-by-side examples
-
-### Text generation (Transformers vs NeMo Automodel)
-
-The core code stays the same: load model + tokenizer, tokenize, `generate`, decode. The main difference is the import and the class name.
-
-:::{list-table}
-:header-rows: 1
-:widths: 1 1
-
-* - Hugging Face (`transformers`)
-  - NeMo Automodel (`nemo_automodel`)
-* - :::{code-block} python
-      import torch
-      from transformers import AutoModelForCausalLM, AutoTokenizer
-
-      model_id = "gpt2"
-
-      tokenizer = AutoTokenizer.from_pretrained(model_id)
-      model = AutoModelForCausalLM.from_pretrained(
-          model_id,
-          torch_dtype=torch.bfloat16,
-      ).to("cuda")
-
-      prompt = "Write a haiku about GPU kernels."
-      inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-
-      with torch.inference_mode():
-          out = model.generate(**inputs, max_new_tokens=64)
-
-      print(tokenizer.decode(out[0], skip_special_tokens=True))
-    :::
-  - :::{code-block} python
-      import torch
-      from nemo_automodel import NeMoAutoModelForCausalLM, NeMoAutoTokenizer
-
-      model_id = "gpt2"
-
-      tokenizer = NeMoAutoTokenizer.from_pretrained(model_id)
-      model = NeMoAutoModelForCausalLM.from_pretrained(
-          model_id,
-          torch_dtype=torch.bfloat16,
-          # Optional knobs (defaults shown):
-          # attn_implementation="flash_attention_2",
-          # use_liger_kernel=True,
-          # use_sdpa_patching=True,
-      )
-
-      prompt = "Write a haiku about GPU kernels."
-      inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-
-      with torch.inference_mode():
-          out = model.generate(**inputs, max_new_tokens=64)
-
-      print(tokenizer.decode(out[0], skip_special_tokens=True))
-    :::
-:::
 
 ### Tokenizers (Transformers vs NeMo Automodel)
 
