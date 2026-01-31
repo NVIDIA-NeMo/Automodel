@@ -127,11 +127,39 @@ ap = AutoPipeline(
     layers_per_stage=None,          # Layers per stage (None for auto)
     module_fqns_per_model_part=None,  # Manual module assignment
 
-    # Model patching
-    patch_inner_model=True,         # Patch HF model internals
-    patch_causal_lm_model=True,     # Patch causal LM wrapper
+    # Model patching (HF-specific)
+    patch_inner_model=True,         # Make decoder forward stage-friendly
+    patch_causal_lm_model=True,     # Make CausalLM wrapper return tensors (hidden/logits)
 ).build(model, loss_fn=loss_fn)
 ```
+
+### Model patching (`patch_inner_model`, `patch_causal_lm_model`)
+
+AutoPipeline splits a model by deep-copying it per stage and pruning away modules that don't belong to that stage. Many HuggingFace models assume the full module tree is present and return `ModelOutput` objects; after pruning, their original `forward()` often breaks (or returns objects that are awkward to pipeline).
+
+These two flags switch AutoPipeline to lightweight, pipeline-friendly `forward()` implementations that return tensors (see `nemo_automodel.components.distributed.pipelining.hf_utils.patch_hf_model_for_pp`):
+
+- **`patch_inner_model`**: patches the *decoder module* (`model.model` for `...ForCausalLM`, otherwise the module itself) so each stage can run even after pruning.
+  - **Stage 0** (has `embed_tokens`): takes token IDs and produces hidden states.
+  - **Middle stages** (no `embed_tokens`): take hidden states from the previous stage (via `inputs_embeds`, or a float tensor passed through `input_ids`) and produce hidden states.
+  - Handles sliced layer containers (e.g., `layers` becoming dict-like after stage pruning) and returns a **tensor** of hidden states so stages can be chained.
+
+  For compilation/performance, this patched forward prefers a precomputed `causal_mask_mapping` dict (it will fall back to computing masks and warn if you don't provide it).
+
+- **`patch_causal_lm_model`**: patches the *`...ForCausalLM` wrapper* forward (the module that owns `lm_head`) so pipeline stages return tensors:
+  - Returns **hidden states** when `lm_head` is absent on that stage.
+  - Returns **logits** when `lm_head` is present (typically only the last stage).
+  - Supports `logits_to_keep` to compute logits for only the last `k` tokens.
+  
+  Note: this is only used when the module you pipeline is a `...ForCausalLM`-style wrapper (i.e., it has a `.model` attribute). If you pass a base decoder module directly, `patch_causal_lm_model` typically has no effect.
+
+#### When should I change these?
+
+- **Leave both `True` (default)** for standard HuggingFace `AutoModelForCausalLM` / `...ForCausalLM` models. This is the common case and gives the expected behavior: token IDs -> hidden states -> logits across stages.
+- **Set both `False`** when your model already has a pipeline-friendly forward (returns tensors and can accept hidden states when embeddings are absent) or it needs custom kwargs/paths that the HF patch doesn't preserve (common for NeMo AutoModel-native model implementations, packed-sequence/`thd` paths, extra args like `padding_mask`, etc.). Many benchmark configs for NeMo-native models do this (for example `examples/benchmark/configs/qwen3_moe_30b_torch.yaml`).
+- **Set `patch_inner_model=False, patch_causal_lm_model=True`** when your inner model is already stage-friendly, but the wrapper forward still returns a `ModelOutput` and you only want the wrapper simplified to “hidden states or logits”.
+
+If you disable `patch_causal_lm_model`, your last stage will typically output hidden states instead of logits; in that case, make sure your `loss_fn` (or your last-stage module) applies the LM head explicitly.
 
 ### Automatic vs Manual Layer Distribution
 
@@ -477,8 +505,8 @@ schedule, model_parts, has_first, has_last, stages = pipeline_model(
     loss_fn=loss_fn,
     parallelize_fn=custom_parallelize_fn,
     module_fqns_per_model_part=None,  # Provide custom module names
-    patch_inner_model=False,  # Disable HF-specific patching
-    patch_causal_lm_model=False,  # Disable HF-specific patching
+    patch_inner_model=False,  # Custom model: don't apply HF forward patches
+    patch_causal_lm_model=False,  # Custom model: don't apply HF forward patches
 )
 ```
 
