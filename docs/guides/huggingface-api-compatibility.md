@@ -119,9 +119,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 model = AutoModelForCausalLM.from_pretrained(
     model_id,
     torch_dtype=torch.bfloat16,
-)
-
-model = model.to("cuda").eval()</code></pre></div>
+)</code></pre></div>
       </td>
       <td style="vertical-align: top;">
         <div class="highlight"><pre><code>import torch
@@ -133,9 +131,7 @@ tokenizer = NeMoAutoTokenizer.from_pretrained(model_id)
 model = NeMoAutoModelForCausalLM.from_pretrained(
     model_id,
     torch_dtype=torch.bfloat16,
-)
-
-model = model.eval()</code></pre></div>
+)</code></pre></div>
       </td>
     </tr>
   </tbody>
