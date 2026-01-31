@@ -189,27 +189,34 @@ print(tokenizer.decode(out[0], skip_special_tokens=True))</code></pre></div>
 
 NeMo Automodel provides `NeMoAutoTokenizer` as a Transformers-like auto-tokenizer with a small registry for specialized backends (and a safe fallback when no specialization is needed).
 
-:::{list-table}
-:header-rows: 1
-:widths: 1 1
+:::{raw} html
+<table>
+  <thead>
+    <tr>
+      <th style="width: 50%;">🤗 Hugging Face (<code>transformers</code>)</th>
+      <th style="width: 50%;">NeMo Automodel (<code>nemo_automodel</code>)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="vertical-align: top;">
+        <div class="highlight"><pre><code>from transformers import AutoTokenizer
 
-* - 🤗 Hugging Face (`transformers`)
-  - NeMo Automodel (`nemo_automodel`)
-* - :::{code-block} python
-      from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")</code></pre></div>
+      </td>
+      <td style="vertical-align: top;">
+        <div class="highlight"><pre><code>from nemo_automodel import NeMoAutoTokenizer
 
-      tok = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
-    :::
-  - :::{code-block} python
-      from nemo_automodel import NeMoAutoTokenizer
+# Default: use NeMo Automodel's dispatch logic (custom backend if registered,
+# otherwise a HF-compatible fallback).
+tok = NeMoAutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 
-      # Default: use NeMo Automodel's dispatch logic (custom backend if registered,
-      # otherwise a HF-compatible fallback).
-      tok = NeMoAutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
-
-      # If you want the raw HF tokenizer (no wrapping/dispatch):
-      # tok = NeMoAutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", force_hf=True)
-    :::
+# If you want the raw HF tokenizer (no wrapping/dispatch):
+# tok = NeMoAutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", force_hf=True)</code></pre></div>
+      </td>
+    </tr>
+  </tbody>
+</table>
 :::
 
 ## Checkpoints: save in Automodel, load everywhere
