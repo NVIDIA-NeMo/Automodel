@@ -1,6 +1,6 @@
 # Hugging Face compatibility (Transformers v4 & v5)
 
-NeMo Automodel is built to work with the Hugging Face ecosystem.
+NeMo Automodel is built to work with the 🤗 Hugging Face ecosystem.
 In practice, compatibility comes in two layers:
 
 - **API compatibility**: for many workflows you can keep your existing `transformers` code and swap in NeMo Automodel “drop-in” wrappers (`NeMoAutoModel*`, `NeMoAutoTokenizer`) with minimal changes.
@@ -44,9 +44,9 @@ If you are running Transformers v5 in another environment, you can still use NeM
 
 ### Differences (where NeMo Automodel adds value or has constraints)
 
-- **Performance features**: NeMo Automodel can automatically apply optional kernel patches/optimizations (e.g., SDPA selection, Liger kernels) while keeping the public model API the same.
+- **Performance features**: NeMo Automodel can automatically apply optional kernel patches/optimizations (e.g., SDPA selection, Liger kernels, DeepEP, etc) while keeping the public model API the same.
 - **Distributed training stack**: NeMo Automodel’s recipes/CLI are designed for multi-GPU/multi-node fine-tuning with PyTorch-native distributed features (FSDP2, pipeline parallelism, etc.).
-- **CUDA expectation**: NeMo Automodel’s `NeMoAutoModel*` wrappers are primarily intended for GPU workflows.
+- **CUDA expectation**: NeMo Automodel’s `NeMoAutoModel*` wrappers are primarily intended for NVIDIA GPU workflows.
 
 :::{important}
 `NeMoAutoModelForCausalLM.from_pretrained(...)` currently assumes CUDA is available (it uses `torch.cuda.current_device()` internally). If you need CPU-only inference, use Hugging Face `transformers` directly.
@@ -60,7 +60,7 @@ If you are running Transformers v5 in another environment, you can still use NeM
 <table>
   <thead>
     <tr>
-      <th style="width: 50%;">Hugging Face (<code>transformers</code>)</th>
+      <th style="width: 50%;">🤗 Hugging Face (<code>transformers</code>)</th>
       <th style="width: 50%;">NeMo Automodel (<code>nemo_automodel</code>)</th>
     </tr>
   </thead>
@@ -103,14 +103,14 @@ If you are running Transformers v5 in another environment, you can still use NeM
 <table>
   <thead>
     <tr>
-      <th style="width: 50%;">Hugging Face (<code>transformers</code>)</th>
+      <th style="width: 50%;">🤗 Hugging Face (<code>transformers</code>)</th>
       <th style="width: 50%;">NeMo Automodel (<code>nemo_automodel</code>)</th>
     </tr>
   </thead>
   <tbody>
     <tr>
-      <td>
-        <pre><code>import torch
+      <td style="vertical-align: top;">
+        <div class="highlight"><pre><code>import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 model_id = "gpt2"
@@ -121,10 +121,10 @@ model = AutoModelForCausalLM.from_pretrained(
     torch_dtype=torch.bfloat16,
 )
 
-model = model.to("cuda").eval()</code></pre>
+model = model.to("cuda").eval()</code></pre></div>
       </td>
-      <td>
-        <pre><code>import torch
+      <td style="vertical-align: top;">
+        <div class="highlight"><pre><code>import torch
 from nemo_automodel import NeMoAutoModelForCausalLM, NeMoAutoTokenizer
 
 model_id = "gpt2"
@@ -135,7 +135,7 @@ model = NeMoAutoModelForCausalLM.from_pretrained(
     torch_dtype=torch.bfloat16,
 )
 
-model = model.eval()</code></pre>
+model = model.eval()</code></pre></div>
       </td>
     </tr>
   </tbody>
@@ -150,14 +150,14 @@ This snippet assumes you already have a `model` and `tokenizer` (see the loading
 <table>
   <thead>
     <tr>
-      <th style="width: 50%;">Hugging Face (<code>transformers</code>)</th>
+      <th style="width: 50%;">🤗 Hugging Face (<code>transformers</code>)</th>
       <th style="width: 50%;">NeMo Automodel (<code>nemo_automodel</code>)</th>
     </tr>
   </thead>
   <tbody>
     <tr>
-      <td>
-        <pre><code>import torch
+      <td style="vertical-align: top;">
+        <div class="highlight"><pre><code>import torch
 
 prompt = "Write a haiku about GPU kernels."
 inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -165,10 +165,10 @@ inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 with torch.inference_mode():
     out = model.generate(**inputs, max_new_tokens=64)
 
-print(tokenizer.decode(out[0], skip_special_tokens=True))</code></pre>
+print(tokenizer.decode(out[0], skip_special_tokens=True))</code></pre></div>
       </td>
-      <td>
-        <pre><code>import torch
+      <td style="vertical-align: top;">
+        <div class="highlight"><pre><code>import torch
 
 prompt = "Write a haiku about GPU kernels."
 inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -176,7 +176,7 @@ inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 with torch.inference_mode():
     out = model.generate(**inputs, max_new_tokens=64)
 
-print(tokenizer.decode(out[0], skip_special_tokens=True))</code></pre>
+print(tokenizer.decode(out[0], skip_special_tokens=True))</code></pre></div>
       </td>
     </tr>
   </tbody>
@@ -193,7 +193,7 @@ NeMo Automodel provides `NeMoAutoTokenizer` as a Transformers-like auto-tokenize
 :header-rows: 1
 :widths: 1 1
 
-* - Hugging Face (`transformers`)
+* - 🤗 Hugging Face (`transformers`)
   - NeMo Automodel (`nemo_automodel`)
 * - :::{code-block} python
       from transformers import AutoTokenizer
