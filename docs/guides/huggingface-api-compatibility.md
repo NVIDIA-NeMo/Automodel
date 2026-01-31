@@ -156,8 +156,8 @@ This snippet assumes you already have a `model` and `tokenizer` (see the loading
   </thead>
   <tbody>
     <tr>
-      <td style="vertical-align: top;">
-        <div class="highlight"><pre><code>import torch
+      <td style="vertical-align: top; padding-top: 0;">
+        <div class="highlight" style="margin-top: 0;"><pre style="margin: 0;"><code>import torch
 
 prompt = "Write a haiku about GPU kernels."
 inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -167,8 +167,8 @@ with torch.inference_mode():
 
 print(tokenizer.decode(out[0], skip_special_tokens=True))</code></pre></div>
       </td>
-      <td style="vertical-align: top;">
-        <div class="highlight"><pre><code>import torch
+      <td style="vertical-align: top; padding-top: 0;">
+        <div class="highlight" style="margin-top: 0;"><pre style="margin: 0;"><code>import torch
 
 prompt = "Write a haiku about GPU kernels."
 inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
