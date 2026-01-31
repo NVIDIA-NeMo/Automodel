@@ -12,17 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/nemotron/llama3_3_nemotron_super_49B_squad_peft.yaml
-
-
 step_scheduler:
   global_batch_size: 16
-  local_batch_size: 1
+  local_batch_size: 4
   ckpt_every_steps: 1000
-  val_every_steps: 1000  # will run every x number of gradient steps
-  max_steps: 100
+  val_every_steps: 2
+  num_epochs: 1
 
 dist_env:
   backend: nccl
@@ -33,17 +28,22 @@ rng:
   seed: 1111
   ranked: true
 
-model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+parallelizer:
+  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
+  activation_checkpointing: false
 
-# torch.compile configuration
-compile:
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.AutoConfig.from_pretrained
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    trust_remote_code: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    enable_deepep: false
+  
+checkpoint:
   enabled: false
-  mode: "default"  # Options: "default", "reduce-overhead", "max-autotune"
-  fullgraph: false
-  dynamic: true  # Set to false for better performance with fixed shapes
-  backend: null  # Use default backend (inductor)
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
@@ -51,6 +51,7 @@ distributed:
   dp_replicate_size: 1 # dp_shard_size = dp_size / dp_replicate_size and dp_shard_size < dp_size. For DDP usecase, use DDPManager
   tp_size: 1
   cp_size: 1
+  ep_size: 2
   sequence_parallel: false
   defer_fsdp_grad_sync: false
 
@@ -86,13 +87,3 @@ optimizer:
   eps: 1e-8
   lr: 1.0e-5
   weight_decay: 0
-
-lr_scheduler:
-  lr_decay_style: cosine
-  min_lr: 1.0e-6
-
-# wandb:
-#   project: <your_wandb_project>
-#   entity: <your_wandb_entity>
-#   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 

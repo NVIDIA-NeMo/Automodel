@@ -25,7 +25,6 @@ model:
 
 checkpoint:
   enabled: false
-  load_base_model: false
 
 # Dataset
 # Point this to the location where your *.bin shards live.

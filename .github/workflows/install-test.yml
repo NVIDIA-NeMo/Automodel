@@ -92,7 +92,7 @@ jobs:
       - name: Set up UV
         uses: astral-sh/setup-uv@v1
         with:
-          version: 0.7.2
+          version: 0.9.26
 
       - name: Set up yq
         shell: bash
@@ -100,7 +100,7 @@ jobs:
           wget https://github.com/mikefarah/yq/releases/download/v4.45.4/yq_linux_amd64.tar.gz
           tar -xzf yq_linux_amd64.tar.gz
           mkdir -p ./bin
-          mv yq_linux_amd64 ./bin/yq 
+          mv yq_linux_amd64 ./bin/yq
           chmod +x ./bin/yq
 
       - name: Install project
@@ -110,7 +110,7 @@ jobs:
         shell: bash
         run: |
           echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
-          chmod 600 ~/.netrc 
+          chmod 600 ~/.netrc
 
           uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
           source ./venv/bin/activate
@@ -208,7 +208,7 @@ jobs:
       - name: Set up UV
         uses: astral-sh/setup-uv@v1
         with:
-          version: 0.7.2
+          version: 0.9.26
 
       - name: Install dependencies with UV
         env:
@@ -217,7 +217,7 @@ jobs:
         run: |
 
           echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
-          chmod 600 ~/.netrc 
+          chmod 600 ~/.netrc
 
           export PATH="${UV_PROJECT_ENVIRONMENT}/bin/:$PATH"
 

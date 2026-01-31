@@ -29,6 +29,7 @@ apply_torch_patches()
 import torch.distributed as dist
 import torch.nn as nn
 import yaml
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.processing_utils import ProcessorMixin
@@ -263,7 +264,18 @@ class BaseRecipe:
                         os.path.join(path, f"{key}.pt"),
                     )
 
-        self.checkpointer.save_model(model, path, peft_config=self.peft_config, tokenizer=tokenizer)
+        # For multi-stage PP models, use checkpointer directly to handle all parts
+        # For single models, use save_pretrained for HF-compatible API
+        if isinstance(model, list) and len(model) > 1:
+            self.checkpointer.save_model(model, path, peft_config=self.peft_config, tokenizer=tokenizer)
+        else:
+            unwrapped_model = model[0] if isinstance(model, list) else model
+            # Unwrap DDP if present
+            if isinstance(unwrapped_model, DistributedDataParallel):
+                unwrapped_model = unwrapped_model.module
+            unwrapped_model.save_pretrained(
+                save_directory=path, checkpointer=self.checkpointer, tokenizer=tokenizer, peft_config=self.peft_config
+            )
         self.checkpointer.save_optimizer(optimizer, model, path, scheduler)
         save_config(config.raw_config, path)
         if is_dist_initialized:
@@ -372,7 +384,7 @@ class BaseRecipe:
         self.checkpointer.load_optimizer(optimizer, model, ckpt_dir, scheduler)
 
     def _log_experiment_details(self):
-        """Log metadata and resolved config on main rank using YAML markers."""
+        """Log metadata and config on main rank using YAML markers."""
         if not getattr(self, "dist_env", None) or not getattr(self.dist_env, "is_main", False):
             return
         details = {
@@ -391,16 +403,28 @@ class BaseRecipe:
                 logging.info(line)
         except Exception:
             logging.info(f"Experiment details: {details}")
-        # Resolved config
+        # Config (print original placeholders for reproducibility)
         try:
             cfg_obj = getattr(self, "cfg", None)
             # Prefer YAML-ready dict that converts callables/classes to dotted paths and preserves typed scalars
             if hasattr(cfg_obj, "to_yaml_dict"):
-                cfg_dict = cfg_obj.to_yaml_dict()
+                cfg_dict = cfg_obj.to_yaml_dict(use_orig_values=True)
             elif hasattr(cfg_obj, "to_dict"):
                 cfg_dict = cfg_obj.to_dict()
             else:
                 cfg_dict = dict(cfg_obj) if cfg_obj is not None else {}
+
+            # If any leaf values carry `_orig_value`, prefer it for printing.
+            def _prefer_orig_values(x):
+                if hasattr(x, "_orig_value"):
+                    return getattr(x, "_orig_value")
+                if isinstance(x, dict):
+                    return {k: _prefer_orig_values(v) for k, v in x.items()}
+                if isinstance(x, list):
+                    return [_prefer_orig_values(v) for v in x]
+                return x
+
+            cfg_dict = _prefer_orig_values(cfg_dict)
 
             # Print as clean YAML on stdout for easy copy/paste and readability
             cfg_yaml = yaml.safe_dump(cfg_dict, sort_keys=False, default_flow_style=False).strip()

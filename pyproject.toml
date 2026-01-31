@@ -78,7 +78,6 @@ dependencies = [
     "diffusers",
     "ftfy",
     "imageio-ffmpeg",
-    "liger-kernel>=0.5.9; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "megatron-fsdp",
     "opencv-python-headless==4.10.0.84",
     "pybind11",
@@ -92,8 +91,30 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cuda = ["flash-attn<=2.8.3", "transformer-engine[pytorch]==2.8.0"]
+# nvidia-cudnn-cu12 pin: This is required for GPTOSS TE support + faster cudnn attention (only on Linux where CUDA is available)
+# "nvidia-cudnn-cu12>=9.18.0.0; sys_platform == 'linux'",
+# Flash-attn version should be selected to satisfy TE requirements
+# https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
+# "flash-attn==2.8.1",
+cuda = [
+    "bitsandbytes",
+    "causal-conv1d",
+    "mamba-ssm",
+    "nv-grouped-gemm",
+    # This is required to prevent ONNX errors arising from TE
+    "onnxscript>=0.5.6",
+    "transformer-engine[pytorch]<=2.11.0",
+]
 extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
+fa = ["flash-attn<=2.8.3"]
+delta-databricks = [
+    "deltalake>=1.0.0",  # For Delta Lake metadata
+    "databricks-sql-connector>=3.0.0",  # For Unity Catalog streaming access
+]
+moe = [
+    "nemo_automodel[cuda]",
+    "deep_ep",
+]
 vlm = [
     "pillow",
     "qwen-vl-utils[decord]; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
@@ -107,10 +128,11 @@ vlm = [
     "albumentations"
 ]
 all = [
+    "nemo_automodel[cuda]",
+    "nemo_automodel[delta-databricks]",
     "nemo_automodel[extra]",
     "nemo_automodel[vlm]",
 ]
-
 
 [project.urls]
 Homepage = "https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/"
@@ -121,7 +143,7 @@ Download = "https://github.com/NVIDIA/NeMo-Automodel/releases"
 automodel = "nemo_automodel._cli.app:main"
 
 [dependency-groups]
-build = ["setuptools", "torch<=2.10.0"]
+build = ["setuptools", "torch<=2.10.0", "packaging", "psutil"]
 docs = [
     "sphinx",
     "sphinx-autobuild",    # For live doc serving while editing docs
@@ -136,13 +158,32 @@ linting = [
     "import-linter~=2.4",
 ]
 test = ["coverage", "pytest", "peft"]
-dev = ["cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@87a86ab"]
+dev = ["cut-cross-entropy", "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
 
 [tool.uv]
 default-groups = ["build", "docs", "test"]
-no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "flash-attn", "grouped_gemm"]
+no-build-isolation-package = [
+    "bitsandbytes",
+    "causal-conv1d",
+    "deep_ep",
+    "flash-attn",
+    "mamba-ssm",
+    "nv-grouped-gemm",
+    "transformer-engine",
+    "transformer-engine-torch",
+]
 constraint-dependencies = [
     "starlette>=0.49.1", # Address CVE GHSA-7f5h-v6xp-fcq8
+]
+
+[tool.uv.sources]
+deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "e3908bf5bd0cc6265bcb225d15cd8c996d4759ef" }
+cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
+liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "49e63538e64b00780e424e34bc4f193dcfeba75c" }
+torch = [
+  { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
+  { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
+  { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 
 [[tool.uv.index]]
@@ -151,16 +192,39 @@ url = "https://pypi.org/simple"
 explicit = true
 
 [[tool.uv.index]]
-name = "pytorch"
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
 url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
-[tool.uv.sources]
-torch = [
-    { index = "pytorch", marker = "sys_platform != 'darwin'" },
-    { index = "pypi", marker = "sys_platform == 'darwin'" },
-]
-grouped_gemm = { git = "https://github.com/fanshiqing/grouped_gemm", rev = "v1.1.4" }
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+# Augment build dependencies for packages that need torch at build time
+[tool.uv.extra-build-dependencies]
+deep_ep = [{ requirement = "torch", match-runtime = true }]
+transformer-engine = [{ requirement = "torch", match-runtime = true }]
+transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
+nv_grouped_gemm = ["setuptools"]
+
+# Needed when building from source
+[[tool.uv.dependency-metadata]]
+name = "deep_ep"
+# This version has to match the version in the commit/rev/tag used
+version = "v1.1.0+e3908bf"
+requires-dist = ["torch", "packaging", "ninja"]
+
+[[tool.uv.dependency-metadata]]
+name = "nv_grouped_gemm"
+# This version has to match the version in the commit/rev/tag used
+version = "1.1.4.post8"
+requires-dist = ["torch", "packaging", "ninja", "setuptools"]
 
 [tool.coverage.paths]
 source = [".", "/workspace", "/home/runner/work/Automodel/Automodel"]
@@ -177,6 +241,8 @@ omit = [
     "config-3.py",
     # transformer v5 backports
     "nemo_automodel/_transformers/tokenization/tokenization_mistral_common.py",
+    # requires databricks
+    "nemo_automodel/components/datasets/llm/delta_lake_dataset.py",
 ]
 
 [tool.ruff]

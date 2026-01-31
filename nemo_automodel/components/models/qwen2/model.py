@@ -30,7 +30,6 @@ model:
 
 from __future__ import annotations
 
-import os
 from typing import Callable, Optional, Union
 
 import torch
@@ -41,21 +40,21 @@ from transformers.masking_utils import create_causal_mask, create_sliding_window
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.models.qwen2.modeling_qwen2 import (
-    Qwen2RMSNorm,
-    Qwen2RotaryEmbedding,
-    apply_rotary_pos_emb,
-    eager_attention_forward,
-)
+from transformers.models.qwen2.modeling_qwen2 import eager_attention_forward
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 
-from nemo_automodel.components.models.common.combined_projection import (
+from nemo_automodel.components.models.common import (
+    BackendConfig,
     CombinedGateUpMLP,
     CombinedQKVAttentionMixin,
+    initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+
+# Use shared rope_utils (same implementation as Llama, supports both config formats)
+from nemo_automodel.components.models.llama.rope_utils import Qwen2RotaryEmbedding, apply_rotary_pos_emb
 from nemo_automodel.components.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
-from nemo_automodel.components.moe.utils import BackendConfig
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 
 __all__ = ["Qwen2ForCausalLM"]
@@ -150,6 +149,7 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         self,
         config: Qwen2Config,
         layer_idx: int,
+        backend: BackendConfig,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -160,8 +160,12 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         # ALWAYS use combined gate_up MLP in custom implementation
         self.mlp = CombinedGateUpMLP(config=config)
 
-        self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
+        self.post_attention_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
         self.attention_type = config.layer_types[layer_idx]
 
     def forward(
@@ -228,6 +232,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
     def __init__(
         self,
         config: Qwen2Config,
+        backend: BackendConfig,
     ):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -240,11 +245,14 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 Qwen2DecoderLayer(
                     config=config,
                     layer_idx=layer_idx,
+                    backend=backend,
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
         self.rotary_emb = Qwen2RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
@@ -261,9 +269,19 @@ class Qwen2Model(Qwen2PreTrainedModel):
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -301,7 +319,11 @@ class Qwen2Model(Qwen2PreTrainedModel):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
+        all_hidden_states = () if output_hidden_states else None
+
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
@@ -314,13 +336,29 @@ class Qwen2Model(Qwen2PreTrainedModel):
             )
 
         hidden_states = self.norm(hidden_states)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        if not return_dict:
+            return tuple(
+                v
+                for v in [
+                    hidden_states,
+                    past_key_values if use_cache else None,
+                    all_hidden_states,
+                ]
+                if v is not None
+            )
+
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
+            hidden_states=all_hidden_states,
+            attentions=None,
         )
 
 
-class Qwen2ForCausalLM(Qwen2PreTrainedModel):
+class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
     """Qwen2 model with causal language modeling head.
 
     ALWAYS uses combined projections - this is the whole point of the custom implementation.
@@ -338,7 +376,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         super().__init__(config)
         self.backend = backend or BackendConfig()
         # ALWAYS use combined projections
-        self.model = Qwen2Model(config=config)
+        self.model = Qwen2Model(config=config, backend=self.backend)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -373,11 +411,21 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         """Forward pass returning CausalLMOutputWithPast."""
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # Always use return_dict internally so we can reliably access fields.
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -385,6 +433,9 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
             cache_position=cache_position,
             **kwargs,
         )
@@ -405,49 +456,15 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        return CausalLMOutputWithPast(
+        out = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=hidden_states,
+            hidden_states=outputs.hidden_states,
         )
-
-    def save_pretrained_hf_format(self, save_directory: str, **kwargs):
-        """Save model in HuggingFace-compatible format by converting combined projections.
-
-        This method converts the custom model's combined projections (qkv_proj, gate_up_proj)
-        back to HuggingFace's separate projections format before saving, making the checkpoint
-        loadable with AutoModelForCausalLM.from_pretrained().
-
-        Args:
-            save_directory: Directory where the model will be saved
-            **kwargs: Additional arguments passed to config.save_pretrained and save_file
-        """
-        from safetensors.torch import save_file
-
-        os.makedirs(save_directory, exist_ok=True)
-
-        # Save config
-        self.config.save_pretrained(save_directory)
-
-        # Convert state dict to HF format
-        if hasattr(self, "state_dict_adapter"):
-            custom_state_dict = self.state_dict()
-            hf_state_dict = self.state_dict_adapter.to_hf(custom_state_dict)
-        else:
-            hf_state_dict = self.state_dict()
-
-        # Handle tied weights: remove duplicate tied weights before saving
-        # In Qwen2, lm_head.weight is tied to model.embed_tokens.weight
-        # HuggingFace expects only model.embed_tokens.weight to be saved
-        if "lm_head.weight" in hf_state_dict and "model.embed_tokens.weight" in hf_state_dict:
-            # Check if they actually share memory
-            if hf_state_dict["lm_head.weight"].data_ptr() == hf_state_dict["model.embed_tokens.weight"].data_ptr():
-                # Remove lm_head.weight as it's tied to embed_tokens
-                hf_state_dict = {k: v for k, v in hf_state_dict.items() if k != "lm_head.weight"}
-
-        # Save weights in safetensors format
-        save_file(hf_state_dict, os.path.join(save_directory, "model.safetensors"), metadata={"format": "pt"})
+        if return_dict:
+            return out
+        return out.to_tuple()
 
 
 ModelClass = Qwen2ForCausalLM

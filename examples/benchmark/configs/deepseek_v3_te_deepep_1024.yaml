@@ -49,7 +49,7 @@ model:
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
   trust_remote_code: true
   backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
     rms_norm: te
@@ -61,7 +61,6 @@ model:
 
 checkpoint:
   enabled: false
-  load_base_model: false
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager

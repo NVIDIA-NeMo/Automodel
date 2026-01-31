@@ -18,12 +18,13 @@ import torch
 import torch.nn as nn
 from transformers.models.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 
+from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.glm4_moe.layers import Glm4MoeAttention
 from nemo_automodel.components.models.glm4_moe.state_dict_adapter import Glm4MoeStateDictAdapter
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -192,7 +193,7 @@ class Glm4MoeModel(nn.Module):
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class Glm4MoeForCausalLM(nn.Module, MoEFSDPSyncMixin):
+class Glm4MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     @classmethod
     def from_config(
         cls,
