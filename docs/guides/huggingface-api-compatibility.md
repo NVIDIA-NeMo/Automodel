@@ -52,6 +52,49 @@ If you are running Transformers v5 in another environment, you can still use NeM
 `NeMoAutoModelForCausalLM.from_pretrained(...)` currently assumes CUDA is available (it uses `torch.cuda.current_device()` internally). If you need CPU-only inference, use Hugging Face `transformers` directly.
 :::
 
+## API mapping (Transformers ⇔ NeMo Automodel)
+
+:::{raw} html
+<table>
+  <thead>
+    <tr>
+      <th style="width: 50%;">Hugging Face (<code>transformers</code>)</th>
+      <th style="width: 50%;">NeMo Automodel (<code>nemo_automodel</code>)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>transformers.AutoModelForCausalLM</code></td>
+      <td><code>nemo_automodel.NeMoAutoModelForCausalLM</code></td>
+    </tr>
+    <tr>
+      <td><code>transformers.AutoModelForImageTextToText</code></td>
+      <td><code>nemo_automodel.NeMoAutoModelForImageTextToText</code></td>
+    </tr>
+    <tr>
+      <td><code>transformers.AutoModelForSequenceClassification</code></td>
+      <td><code>nemo_automodel.NeMoAutoModelForSequenceClassification</code></td>
+    </tr>
+    <tr>
+      <td><code>transformers.AutoModelForTextToWaveform</code></td>
+      <td><code>nemo_automodel.NeMoAutoModelForTextToWaveform</code></td>
+    </tr>
+    <tr>
+      <td><code>transformers.AutoTokenizer</code></td>
+      <td><code>nemo_automodel.NeMoAutoTokenizer</code></td>
+    </tr>
+    <tr>
+      <td><code>model.generate(...)</code></td>
+      <td><code>model.generate(...)</code></td>
+    </tr>
+    <tr>
+      <td><code>model.save_pretrained(path)</code></td>
+      <td><code>model.save_pretrained(path, checkpointer=...)</code></td>
+    </tr>
+  </tbody>
+</table>
+:::
+
 ## Side-by-side examples
 
 ### Text generation (Transformers vs NeMo Automodel)
