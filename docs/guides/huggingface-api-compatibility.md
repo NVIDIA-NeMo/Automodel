@@ -207,8 +207,7 @@ tok = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")</code></pre></d
       <td style="vertical-align: top;">
         <div class="highlight"><pre><code>from nemo_automodel import NeMoAutoTokenizer
 
-tok = NeMoAutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
-</code></pre></div>
+tok = NeMoAutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")</code></pre></div>
       </td>
     </tr>
   </tbody>
