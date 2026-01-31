@@ -64,6 +64,39 @@ If you are running Transformers v5 in another environment, you can still use NeM
   </thead>
   <tbody>
     <tr>
+      <td colspan="2"><strong>Load a model and tokenizer (full snippet)</strong></td>
+    </tr>
+    <tr>
+      <td>
+        <pre><code>import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model_id = "gpt2"
+
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16,
+)
+
+model = model.to("cuda").eval()</code></pre>
+      </td>
+      <td>
+        <pre><code>import torch
+from nemo_automodel import NeMoAutoModelForCausalLM, NeMoAutoTokenizer
+
+model_id = "gpt2"
+
+tokenizer = NeMoAutoTokenizer.from_pretrained(model_id)
+model = NeMoAutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16,
+)
+
+model = model.eval()</code></pre>
+      </td>
+    </tr>
+    <tr>
       <td><code>transformers.AutoModelForCausalLM</code></td>
       <td><code>nemo_automodel.NeMoAutoModelForCausalLM</code></td>
     </tr>
