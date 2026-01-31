@@ -207,12 +207,8 @@ tok = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")</code></pre></d
       <td style="vertical-align: top;">
         <div class="highlight"><pre><code>from nemo_automodel import NeMoAutoTokenizer
 
-# Default: use NeMo Automodel's dispatch logic (custom backend if registered,
-# otherwise a HF-compatible fallback).
 tok = NeMoAutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
-
-# If you want the raw HF tokenizer (no wrapping/dispatch):
-# tok = NeMoAutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", force_hf=True)</code></pre></div>
+</code></pre></div>
       </td>
     </tr>
   </tbody>
