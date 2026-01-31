@@ -86,18 +86,26 @@ def _get_model_name(cfg_model):
         return None
 
 
-def _freeze_model(model: nn.Module, cfg_freeze: Optional[Dict[str, Any]] = None, freeze_embeddings: bool = True):
+def _freeze_model(
+    model: Union[nn.Module, AutoPipeline], cfg_freeze: Optional[Dict[str, Any]] = None, freeze_embeddings: bool = True
+):
     """
     Freeze the model.
 
     Args:
-        model: The model to freeze.
+        model: The model to freeze (can be nn.Module or AutoPipeline).
         cfg_freeze: The configuration for freezing the model.
         freeze_embeddings: Whether to freeze embeddings.
 
     Returns:
-        nn.Module: The frozen model.
+        nn.Module or AutoPipeline: The frozen model.
     """
+    # Handle AutoPipeline by applying freezing to each part
+    if isinstance(model, AutoPipeline):
+        for part in model.parts:
+            _freeze_model(part, cfg_freeze, freeze_embeddings)
+        return model
+
     if cfg_freeze is not None:
         apply_parameter_freezing(model, cfg_freeze)
     elif freeze_embeddings:
