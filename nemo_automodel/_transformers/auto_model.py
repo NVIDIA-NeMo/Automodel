@@ -907,7 +907,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         device = torch.cuda.current_device()
 
         # Neither of these parallelization methods support meta device initialization
-        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not force_hf
+        is_meta_device = (
+            not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager))
+            and not force_hf
+            and get_world_size_safe() > 1
+        )
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
         try:
@@ -1115,7 +1119,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         device = torch.cuda.current_device()
 
         # Neither of these parallelization methods support meta device initialization
-        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not force_hf
+        is_meta_device = (
+            not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager))
+            and not force_hf
+            and get_world_size_safe() > 1
+        )
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
         try:
