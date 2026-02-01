@@ -557,6 +557,7 @@ class TrainBiencoderRecipe(BaseRecipe):
                         self.step_scheduler.step,
                         train_loss=train_log_data.metrics["loss"],
                         val_loss=val_loss,
+                        is_final=self.step_scheduler.is_final_ckpt_step,
                     )
 
         # Close JSONL loggers after training loop completes

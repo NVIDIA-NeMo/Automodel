@@ -50,7 +50,7 @@ def _is_geq_torch_2_9() -> bool:
     """
     Check if the current torch version is greater than or equal to 2.9.0.
     """
-    return parse(torch.__version__).base_version >= "2.9.0"
+    return parse(torch.__version__) >= parse("2.9.0")
 
 
 if _is_geq_torch_2_9():

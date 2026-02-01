@@ -168,6 +168,7 @@ class BaseRecipe:
         train_loss: float,
         val_loss: dict[str, float] | None = None,
         best_metric_key: str = "default",
+        is_final: bool = False,
     ):
         """
         Save the current training state as a checkpoint.
@@ -180,6 +181,8 @@ class BaseRecipe:
             train_loss (float): The current training loss.
             val_loss (dict[str, float]): The current validation losses.
             best_metric_key (str): The validation metric key used to select the best checkpoint.
+            is_final (bool): If True, wait for async checkpoint to complete and update symlinks
+                immediately. Use this for the last checkpoint before closing.
         """
         if not self.checkpointer.config.enabled:
             return

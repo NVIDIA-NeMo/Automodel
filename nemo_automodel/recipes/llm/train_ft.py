@@ -1089,6 +1089,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         train_log_data.metrics["loss"],
                         val_losses,
                         best_metric_key=self.best_metric_key,
+                        is_final=self.step_scheduler.is_final_ckpt_step,
                     )
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()

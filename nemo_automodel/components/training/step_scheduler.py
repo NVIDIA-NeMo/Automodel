@@ -196,6 +196,25 @@ class StepScheduler(Stateful):
         return is_ckpt_step or self.is_last_batch or self.is_last_step or self.sigterm_received
 
     @property
+    def is_final_ckpt_step(self):
+        """
+        Returns whether this is the final checkpoint step of training.
+
+        This is necessary for async checkpointing to correctly wait at the final
+        checkpoint step before updating the symlinks.
+
+        This is true when training is about to end due to:
+        - Reaching max_steps
+        - Receiving SIGTERM
+        - Completing the final epoch
+
+        Returns:
+            bool: if true, this is the final checkpoint and async checkpointing
+                should wait for completion before updating symlinks.
+        """
+        return self.is_last_step or self.sigterm_received or (self.is_last_batch and self.epoch == self.num_epochs - 1)
+
+    @property
     def is_last_step(self):
         """
         Returns whether the training is finished.
