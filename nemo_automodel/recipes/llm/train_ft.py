@@ -133,7 +133,6 @@ def build_model_and_optimizer(
     cfg_peft,
     model_wrapper,
     seed,
-    checkpointer: Checkpointer,
     has_packed_sequence=False,
     tp_size=1,
     cp_size=1,
@@ -174,7 +173,6 @@ def build_model_and_optimizer(
             "has_packed_sequence": has_packed_sequence,
             "autopipeline": autopipeline,
             "parallelize_fn": parallelize_fn,
-            "checkpointer": checkpointer,
             "peft_config": cfg_peft,
             "model_wrapper": model_wrapper,
             "loss_fn": loss_fn,
@@ -923,7 +921,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             autopipeline=autopipeline,
             loss_fn=self.loss_fn,
             parallelize_fn=parallelize_fn,
-            checkpointer=self.checkpointer,
         )
 
         if isinstance(model, AutoPipeline):

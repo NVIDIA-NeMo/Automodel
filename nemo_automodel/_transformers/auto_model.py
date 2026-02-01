@@ -46,6 +46,7 @@ from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
+    CheckpointingConfig,
     _maybe_adapt_state_dict_to_hf,
 )
 from nemo_automodel.components.distributed.ddp import DDPManager
@@ -524,7 +525,6 @@ def apply_model_infrastructure(
     is_hf_model,
     is_meta_device,
     device,
-    checkpointer,
     model_wrapper=None,
     tp_size=1,
     cp_size=1,
@@ -539,6 +539,7 @@ def apply_model_infrastructure(
     model_name_or_path=None,
     load_base_model=False,
     cache_dir=None,
+    pretrained_model_name_or_path="",
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -558,7 +559,6 @@ def apply_model_infrastructure(
         is_hf_model: Whether this is an HF model (vs custom implementation)
         is_meta_device: Whether model was initialized on meta device
         device: Target device for model
-        checkpointer: Checkpointer instance for weight loading
         model_wrapper: Model wrapper (FSDP2Manager, DDPManager, etc.). Default: None
         tp_size: Tensor parallelism size. Default: 1
         cp_size: Context parallelism size. Default: 1
@@ -580,6 +580,24 @@ def apply_model_infrastructure(
     """
     _verify_sdpa_support(model, is_hf_model, cp_size)
 
+    # Create a dummy checkpointer. We can pass in dummy values here since we are only loading the base weights.
+    ckpt_config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir="",
+        model_save_format="safetensors",
+        model_cache_dir=cache_dir,
+        model_repo_id=pretrained_model_name_or_path,
+        save_consolidated=True,
+        is_peft=peft_config is not None,
+    )
+    checkpointer = Checkpointer(
+        ckpt_config,
+        0,
+        0,
+        0,
+        getattr(model_wrapper, "moe_mesh", None) if model_wrapper else None,
+    )
+
     # Handle checkpointer config updates if checkpointer is provided
     dequantize_base_checkpoint = False
     if checkpointer is not None:
@@ -600,10 +618,9 @@ def apply_model_infrastructure(
         )
 
     # hold a list copy of the model state dict keys before any parallelization
-    if checkpointer is not None:
-        checkpointer.config.model_state_dict_keys = list(
-            _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=dequantize_base_checkpoint).keys()
-        )
+    checkpointer.config.model_state_dict_keys = list(
+        _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=dequantize_base_checkpoint).keys()
+    )
 
     # Loss function check
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
@@ -622,15 +639,11 @@ def apply_model_infrastructure(
     # Weights need to be loaded for meta device models that were parallelized:
     # 1. When parallelize_fn was used (which will internally apply FSDP2/EP sharding)
     # 2. When FSDP2Manager.parallelize was used (but not MegatronFSDP which handles weights internally)
-    should_load_checkpoint = (
-        is_meta_device
-        and checkpointer is not None
-        and any(
-            [
-                parallelize_fn is not None and get_world_size_safe() > 1,
-                callable(getattr(model_wrapper, "parallelize", None)),
-            ]
-        )
+    should_load_checkpoint = is_meta_device and any(
+        [
+            parallelize_fn is not None and get_world_size_safe() > 1,
+            callable(getattr(model_wrapper, "parallelize", None)),
+        ]
     )
     if should_load_checkpoint:
         models_to_load = model.parts if hasattr(model, "parts") else [model]
@@ -778,7 +791,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         model_wrapper=None,
         autopipeline: AutoPipeline | None = None,
         parallelize_fn: Callable | None = None,
-        checkpointer: Optional[Checkpointer] = None,
         peft_config: Optional[dict] = None,
         fp8_config: Optional["FP8Config"] = None,
         qat_quantizer: Optional[Union["Int4WeightOnlyQATQuantizer", "Int8DynActInt4WeightQATQuantizer"]] = None,
@@ -824,9 +836,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 pipeline stages. Default: None.
             parallelize_fn (Callable | None, optional): Custom function to apply
                 parallelization (EP + FSDP2). Default: None.
-            checkpointer (Checkpointer, optional): Checkpointer instance for loading weights
-                and enabling save_pretrained() functionality. Required for weight loading
-                and checkpoint management.
             peft_config (dict | None, optional): PEFT/LoRA configuration dictionary.
                 If provided, LoRA adapters will be applied to the model. Default: None.
             fp8_config (FP8Config | None, optional): FP8 quantization configuration.
@@ -882,7 +891,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 fp8_config=fp8_config,
                 qat_quantizer=qat_quantizer,
                 loss_fn=loss_fn,
-                checkpointer=checkpointer,
                 compile_config=compile_config,
                 model_wrapper=model_wrapper,
                 **kwargs,
@@ -899,12 +907,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         device = torch.cuda.current_device()
 
         # Neither of these parallelization methods support meta device initialization
-        # Also require checkpointer for meta device init, as we need it to load weights
-        is_meta_device = (
-            not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager))
-            and not force_hf
-            and checkpointer is not None
-        )
+        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not force_hf
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
         try:
@@ -948,10 +951,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         model = apply_model_infrastructure(
             model=model,
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
             is_hf_model=is_hf_model,
             cp_size=cp_size,
             tp_size=tp_size,
-            checkpointer=checkpointer,
             peft_config=peft_config,
             quantization_config=quantization_config,
             fp8_config=fp8_config,
@@ -990,7 +993,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         qat_quantizer: Optional[Union["Int4WeightOnlyQATQuantizer", "Int8DynActInt4WeightQATQuantizer"]] = None,
         loss_fn: Optional[Callable] = None,
         compile_config: Optional["CompileConfig"] = None,
-        checkpointer: Optional[Checkpointer] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -1051,9 +1053,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 it will be replaced with MaskedCrossEntropy. This is passed to AutoPipeline. Default: None.
             compile_config (CompileConfig | None, optional): Configuration for torch.compile.
                 If provided, the model will be compiled for improved performance. Default: None.
-            checkpointer (Checkpointer, optional): Checkpointer instance for checkpoint
-                management and enabling save_pretrained() functionality. Required for
-                proper checkpoint handling.
             **kwargs:
                 Additional keyword arguments. Notable ones include:
                 - tp_size (int): Tensor parallelism size. Default: 1.
@@ -1096,7 +1095,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 qat_quantizer=qat_quantizer,
                 loss_fn=loss_fn,
                 compile_config=compile_config,
-                checkpointer=checkpointer,
                 **kwargs,
             )
 
@@ -1117,12 +1115,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         device = torch.cuda.current_device()
 
         # Neither of these parallelization methods support meta device initialization
-        # Also require checkpointer for meta device init, as we need it to load weights
-        is_meta_device = (
-            not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager))
-            and not force_hf
-            and checkpointer is not None
-        )
+        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not force_hf
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
         try:
@@ -1162,7 +1155,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             is_hf_model=is_hf_model,
             cp_size=cp_size,
             tp_size=tp_size,
-            checkpointer=checkpointer,
             peft_config=peft_config,
             quantization_config=quantization_config,
             fp8_config=fp8_config,
