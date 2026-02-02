@@ -28,6 +28,7 @@ from nemo_automodel.components.utils.compile_utils import compile_model
 from nemo_automodel.shared.torch_patches import apply_torch_patches
 
 apply_torch_patches()
+from huggingface_hub import constants as hf_constants
 from huggingface_hub import snapshot_download
 from transformers import (
     AutoConfig,
@@ -40,7 +41,6 @@ from transformers import (
 from transformers.initialization import no_init_weights
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 from transformers.utils import ContextManagers
-from huggingface_hub import constants as hf_constants
 
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry
@@ -75,6 +75,7 @@ HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 HAS_FA, _ = safe_import("flash_attn")
 
 logger = logging.getLogger(__name__)
+
 
 def _get_mixin_wrapped_class(model_class: type) -> type:
     """

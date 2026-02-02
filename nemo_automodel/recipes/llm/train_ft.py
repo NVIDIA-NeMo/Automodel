@@ -32,12 +32,6 @@ from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoConfig
-
-from transformers.initialization import no_init_weights
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers.utils import ContextManagers
-from wandb import Settings
-
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from wandb import Settings
 
