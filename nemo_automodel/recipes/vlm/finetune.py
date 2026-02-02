@@ -123,7 +123,6 @@ def build_model_and_optimizer(
     cfg_peft,
     model_wrapper,
     seed,
-    checkpointer: Checkpointer,
     tp_size=1,
     cp_size=1,
     freeze_embeddings=True,
@@ -144,7 +143,6 @@ def build_model_and_optimizer(
             "tp_size": tp_size,
             "cp_size": cp_size,
             "parallelize_fn": parallelize_fn,
-            "checkpointer": checkpointer,
             "peft_config": cfg_peft,
             "model_wrapper": model_wrapper,
             "loss_fn": loss_fn,
@@ -653,7 +651,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             cfg_compile=self.cfg.get("compile", None),
             loss_fn=self.loss_fn,
             parallelize_fn=parallelize_fn,
-            checkpointer=self.checkpointer,
             autopipeline=autopipeline,
         )
 
