@@ -140,7 +140,7 @@ model = NeMoAutoModelForCausalLM.from_pretrained(
 </table>
 :::
 
-### Text generation
+### Text Generation
 
 This snippet assumes you already have a `model` and `tokenizer` (see the loading snippet above).
 
