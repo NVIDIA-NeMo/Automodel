@@ -1,4 +1,4 @@
-# 🤗 Hugging Face Transformers compatibility
+# 🤗 Hugging Face Transformers API compatibility
 
 NeMo Automodel is built to work with the 🤗 Hugging Face ecosystem.
 In practice, compatibility comes in two layers:
