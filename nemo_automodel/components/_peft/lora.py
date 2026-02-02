@@ -45,6 +45,8 @@ class PeftConfig:
     match_all_linear: bool = False
     dim: int = 8
     alpha: int = 32
+    # Note: we currently support DoRA for nn.Linear only.
+    use_dora: bool = False
     dropout: float = 0.0
     dropout_position: Literal["pre", "post"] = "post"
     lora_A_init: str = "xavier"
@@ -62,6 +64,7 @@ class PeftConfig:
             match_all_linear=d.get("match_all_linear", False),
             dim=d.get("dim", 8),
             alpha=d.get("alpha", 32),
+            use_dora=d.get("use_dora", False),
             dropout=d.get("dropout", 0.0),
             dropout_position=d.get("dropout_position", "post"),
             lora_A_init=d.get("lora_A_init", "xavier"),
@@ -84,6 +87,7 @@ class LinearLoRA(nn.Linear):
         orig_linear,
         dim=8,
         alpha=32,
+        use_dora: bool = False,
         dropout=0.0,
         dropout_position="post",
         lora_A_init_method="xavier",
@@ -119,6 +123,7 @@ class LinearLoRA(nn.Linear):
             self,
             dim=dim,
             alpha=alpha,
+            use_dora=use_dora,
             dropout=dropout,
             dropout_position=dropout_position,
             lora_A_init_method=lora_A_init_method,
@@ -145,6 +150,7 @@ class LinearLoRA(nn.Linear):
         obj,
         dim=8,
         alpha=32,
+        use_dora: bool = False,
         dropout=0.0,
         dropout_position="post",
         lora_A_init_method="xavier",
@@ -165,6 +171,7 @@ class LinearLoRA(nn.Linear):
         """
         obj.dim = dim
         obj.scale = alpha / dim
+        obj.use_dora = bool(use_dora)
 
         # Freezer
         device = obj.weight.device
@@ -185,6 +192,22 @@ class LinearLoRA(nn.Linear):
         obj.dropout_p = dropout
         assert dropout_position in ["pre", "post"], ("dropout position can only be pre/post", dropout_position)
         obj.dropout_position = dropout_position
+
+        if obj.use_dora:
+            # initialize DoRA magnitude vector to ||W|| (row-wise L2 norm).
+            with torch.no_grad():
+                weight_norm = torch.linalg.norm(obj.weight.data, dim=1).to(dtype)
+            obj.lora_magnitude = nn.Parameter(weight_norm, requires_grad=True)
+
+    def _dora_weight_norm(self) -> torch.Tensor:
+        """
+        Compute the detached weight norm used by DoRA.
+        """
+        # ΔW = B @ A, shapes: [out, dim] @ [dim, in] => [out, in]
+        delta_w = (self.lora_B.weight @ self.lora_A.weight).detach().to(self.weight.dtype)
+        weight = self.weight.to(self.weight.dtype)
+        weight_norm = torch.linalg.norm(weight + self.scale * delta_w, dim=1).to(weight.dtype)
+        return weight_norm.detach()
 
     def forward(self, x):
         """
@@ -209,16 +232,57 @@ class LinearLoRA(nn.Linear):
         else:
             res = F.linear(x, self.weight, self.bias)
 
-        if self.dropout_position == "pre":
-            x = F.dropout(x, p=self.dropout_p, training=self.training)
+        if not self.use_dora:
+            if self.dropout_position == "pre":
+                x = F.dropout(x, p=self.dropout_p, training=self.training)
 
-        # Apply scale before lora_B to keep lora_res as a Partial tensor.
-        # This allows both res and lora_res to remain Partial, so only one reduce-scatter is needed after addition.
-        # Multiplying after lora_B would convert Partial to Replicate, causing an extra reduce-scatter operation.
-        lora_res = self.lora_B(self.lora_A(x) * self.scale)
+            # Apply scale before lora_B to keep lora_res as a Partial tensor.
+            # This allows both res and lora_res to remain Partial, so only one reduce-scatter is needed after addition.
+            # Multiplying after lora_B would convert Partial to Replicate, causing an extra reduce-scatter operation.
+            lora_res = self.lora_B(self.lora_A(x) * self.scale)
+            if self.dropout_position == "post":
+                lora_res = F.dropout(lora_res, p=self.dropout_p, training=self.training)
+            return res + lora_res
+
+        if getattr(self, "lora_magnitude", None) is None:
+            raise RuntimeError("use_dora=True but lora_magnitude was not initialized")
+
+        if self.dropout_position == "pre" and self.training and self.dropout_p > 0.0:
+            x_lora = F.dropout(x, p=self.dropout_p, training=True)
+            base_result = None
+        else:
+            x_lora = x
+            base_result = res
+
+        lora_result = self.lora_B(self.lora_A(x_lora))
         if self.dropout_position == "post":
-            lora_res = F.dropout(lora_res, p=self.dropout_p, training=self.training)
-        return res + lora_res
+            lora_result = F.dropout(lora_result, p=self.dropout_p, training=self.training)
+
+        # Compute DoRA scaling factor.
+        weight_norm = self._dora_weight_norm()
+        mag = self.lora_magnitude.to(x.dtype)
+        weight_norm = weight_norm.to(x.dtype)
+
+        # Broadcast magnitude scaling across batch/sequence dimensions.
+        mag_norm_scale = mag / weight_norm
+        if res.dim() == 3:
+            mag_norm_scale = mag_norm_scale.view(1, 1, -1)
+        else:
+            mag_norm_scale = mag_norm_scale.view(1, -1)
+
+        # HF PEFT subtracts bias from base_result before applying scaling terms.
+        if base_result is not None:
+            bias = self.bias
+            if bias is not None:
+                base_no_bias = base_result - bias
+            else:
+                base_no_bias = base_result
+        else:
+            # Recompute base linear output without bias on x_lora (see HF PEFT DoraLinearLayer.forward).
+            base_no_bias = F.linear(x_lora, self.weight, None)
+
+        dora_extra = (mag_norm_scale - 1) * base_no_bias + mag_norm_scale * lora_result * self.scale
+        return res + dora_extra
 
 
 class TritonLinearLoRA(LinearLoRA):
@@ -268,6 +332,7 @@ def patch_linear_module(
     orig_linear,
     dim=8,
     alpha=32,
+    use_dora: bool = False,
     dropout=0.0,
     dropout_position="post",
     lora_A_init_method="xavier",
@@ -310,8 +375,24 @@ def patch_linear_module(
         raise NotImplementedError("Expected isinstance(orig_linear, nn.Linear)")
     assert not hasattr(orig_linear, "super_fwd"), orig_linear.super_fwd
 
+    if use_dora:
+        if HAS_TE and isinstance(orig_linear, transformer_engine.pytorch.Linear):
+            raise ValueError("DoRA is not supported for transformer_engine.pytorch.Linear layers.")
+        if getattr(orig_linear, "quant_state", None) is not None:
+            raise ValueError("DoRA is not supported for quantized linear layers (e.g., BitsAndBytes).")
+        use_triton = False
+
     linear_lora_cls = TritonLinearLoRA if use_triton else LinearLoRA
-    linear_lora_cls._init_adapter(orig_linear, dim, alpha, dropout, dropout_position, lora_A_init_method, lora_dtype)
+    linear_lora_cls._init_adapter(
+        orig_linear,
+        dim=dim,
+        alpha=alpha,
+        use_dora=use_dora,
+        dropout=dropout,
+        dropout_position=dropout_position,
+        lora_A_init_method=lora_A_init_method,
+        lora_dtype=lora_dtype,
+    )
     cls = orig_linear.__class__
     new_cls = type("PatchedLinearLoRA", (linear_lora_cls, cls), {})
 
@@ -418,6 +499,8 @@ def apply_lora_to_linear_modules(
     for name, module in list(model.named_modules()):
         if isinstance(module, (GroupedExperts, GroupedExpertsDeepEP)):
             if matcher.match(module, name):
+                if peft_config.use_dora:
+                    raise NotImplementedError("DoRA is not supported for MoE expert modules in Automodel yet.")
                 num_modules_matched += 1
                 lora_dtype = peft_config.lora_dtype
                 if quantization_config is not None and lora_dtype is None:
@@ -452,6 +535,7 @@ def apply_lora_to_linear_modules(
                     module,
                     dim=peft_config.dim,
                     alpha=peft_config.alpha,
+                    use_dora=peft_config.use_dora,
                     dropout=peft_config.dropout,
                     dropout_position=peft_config.dropout_position,
                     lora_A_init_method=peft_config.lora_A_init,

@@ -1797,6 +1797,7 @@ def test_hf_peft_checkpoint(use_triton=False):
         "lora_alpha": 32,
         "peft_type": "LORA",
         "r": 8,
+        "use_dora": False,
         "target_modules": [
             "lm_head",
             "model.layers.0.block_sparse_moe.experts.0.w1",
@@ -1869,6 +1870,7 @@ def test_hf_peft_checkpoint(use_triton=False):
         "lora_dtype": None,
         "match_all_linear": True,
         "target_modules": [],
+        "use_dora": False,
         "use_triton": False,
     }
 
