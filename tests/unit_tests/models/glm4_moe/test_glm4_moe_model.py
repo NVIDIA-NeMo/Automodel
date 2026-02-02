@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from transformers.models.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.glm4_moe.model import Block, Glm4MoeForCausalLM, Glm4MoeModel
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.models.common import BackendConfig
@@ -537,3 +539,6 @@ def magic_moe_config(config: Glm4MoeConfig) -> MoEConfig:
         expert_activation="swiglu",
         softmax_before_topk=False,
     )
+
+
+# NOTE: HFCheckpointingMixin tests are now in tests/unit_tests/models/common/test_hf_checkpointing_mixin.py

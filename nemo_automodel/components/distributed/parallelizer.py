@@ -1113,7 +1113,7 @@ def megatron_fsdp_strategy_parallelize(
         preserve_fp32_weights=preserve_fp32_weights,
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
-        sync_grads_each_step=False,  # For better performance, avoid sync every step
+        sync_model_each_microbatch=False,  # For better performance, avoid sync every step
         check_for_nan_in_grad=check_for_nan_in_grad,
         average_in_collective=average_in_collective,
         disable_bucketing=disable_bucketing,

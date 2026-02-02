@@ -14,20 +14,20 @@
 
 import logging
 import types
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-import transformers
-from transformers import AutoConfig
 
 from nemo_automodel._transformers.auto_model import (
-    NeMoAutoModelForCausalLM,
-    NeMoAutoModelForImageTextToText,
     _get_next_fallback_attn,
     _patch_attention,
+    _get_mixin_wrapped_class,
+    _apply_peft_and_lower_precision,
+    _consume_config_overrides,
+    _filter_kwargs_for_init,
 )
-from nemo_automodel import __version__
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
 
 HAS_LIGER_KERNEL = False
@@ -818,48 +818,52 @@ class TestPatchAttention:
 
     def test__patch_attention_basic(self):
         """Test basic _patch_attention functionality."""
-        # Create a mock object with a forward method
-        mock_obj = Mock()
-        mock_forward = Mock()
-        mock_obj.forward = mock_forward
+        # Create a real object with a forward method to test the actual wrapping
+        class DummyModule:
+            def forward(self, x):
+                """Dummy forward method."""
+                return x * 2
 
-        # Mock the forward method to be a bound method
-        mock_forward.__func__ = Mock()
-        mock_forward.__self__ = mock_obj
+        obj = DummyModule()
+        original_forward = obj.forward
 
-        with (
-            patch("nemo_automodel._transformers.auto_model.sdpa_kernel") as mock_sdpa_kernel,  # noqa: F841
-            patch("nemo_automodel._transformers.auto_model._assert_same_signature"),
-        ):
-            result = _patch_attention(mock_obj)
+        with patch("nemo_automodel._transformers.auto_model.sdpa_kernel") as mock_sdpa_kernel:
+            result = _patch_attention(obj)
 
-            assert result is mock_obj
+            assert result is obj
             # Verify that the forward method was replaced
-            assert mock_obj.forward != mock_forward
+            assert obj.forward != original_forward
+            # Verify the wrapper has the expected docstring prefix
+            assert obj.forward.__doc__.startswith("SDPA kernel patch")
+
+            # Call forward and verify sdpa_kernel was used as context manager
+            output = obj.forward(5)
+            assert output == 10  # Original forward logic still works
+            mock_sdpa_kernel.assert_called_once()
 
     def test__patch_attention_with_custom_sdpa_method(self):
         """Test _patch_attention with custom SDPA method."""
         from torch.nn.attention import SDPBackend
 
-        mock_obj = Mock()
-        mock_forward = Mock()
-        mock_obj.forward = mock_forward
+        class DummyModule:
+            def forward(self, x):
+                """Dummy forward method."""
+                return x + 1
 
-        # Mock the forward method to be a bound method
-        mock_forward.__func__ = Mock()
-        mock_forward.__self__ = mock_obj
-
+        obj = DummyModule()
         custom_sdpa_method = [SDPBackend.FLASH_ATTENTION]
 
-        with (
-            patch("nemo_automodel._transformers.auto_model.sdpa_kernel") as mock_sdpa_kernel,  # noqa: F841
-            patch("nemo_automodel._transformers.auto_model._assert_same_signature"),
-        ):
-            result = _patch_attention(mock_obj, custom_sdpa_method)
+        with patch("nemo_automodel._transformers.auto_model.sdpa_kernel") as mock_sdpa_kernel:
+            result = _patch_attention(obj, custom_sdpa_method)
 
-            assert result is mock_obj
-            # Verify that the forward method was replaced
-            assert mock_obj.forward != mock_forward
+            assert result is obj
+            # Verify the wrapper has the expected docstring prefix
+            assert obj.forward.__doc__.startswith("SDPA kernel patch")
+
+            # Call forward and verify sdpa_kernel was called with the custom method
+            output = obj.forward(5)
+            assert output == 6  # Original forward logic still works
+            mock_sdpa_kernel.assert_called_once_with(custom_sdpa_method)
 
 
 class TestUtilityFunctions:
@@ -986,33 +990,23 @@ def prepare_env(monkeypatch, target_mod, *, has_liger=True, apply_ok=True):
     return apply_mock, patch_attn_mock
 
 
-@pytest.mark.parametrize("use_liger,has_liger", [(True, True), (False, True)])
-def test_success_paths(monkeypatch, use_liger, has_liger):
-    """
-    1. Liger available & requested  -> kernel applied, _patch_attention called.
-    2. Liger *not* requested        -> kernel *not* applied, _patch_attention called.
-    """
+def test_patch_liger_kernel_success(monkeypatch):
+    """Test _patch_liger_kernel successfully applies liger kernel when available."""
     import nemo_automodel._transformers.auto_model as tgt
 
-    apply_mock, attn_mock = prepare_env(monkeypatch, tgt, has_liger=has_liger, apply_ok=True)
+    apply_mock, attn_mock = prepare_env(monkeypatch, tgt, has_liger=True, apply_ok=True)
 
     model = DummyModel()
-    if use_liger:
-        patched = tgt._patch_liger_kernel(model)
-    else:
-        patched = model
+    patched = tgt._patch_liger_kernel(model)
 
-    # Always returns same instance (unless exception path)
+    # Returns same instance
     assert patched is model
 
-    if use_liger:
-        apply_mock.assert_called_once()
-        assert model.called is True
-    else:
-        apply_mock.assert_not_called()
-        assert model.called is False
+    # Liger kernel was applied
+    apply_mock.assert_called_once()
+    assert model.called is True
 
-    # SDPA not called inside _patch_liger_kernel
+    # SDPA not called inside _patch_liger_kernel (it's called separately)
     attn_mock.assert_not_called()
 
 
@@ -1059,3 +1053,211 @@ def test_liger_apply_failure_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Failed to patch model"):
         tgt._patch_liger_kernel(DummyModel())
+
+
+# =============================================================================
+# Tests for _get_mixin_wrapped_class
+# =============================================================================
+
+class TestGetMixinWrappedClass:
+    """Test cases for _get_mixin_wrapped_class function."""
+
+    def test_returns_original_if_already_has_mixin(self):
+        """When model class already inherits from HFCheckpointingMixin, return it unchanged."""
+        class ModelWithMixin(HFCheckpointingMixin, torch.nn.Module):
+            pass
+
+        result = _get_mixin_wrapped_class(ModelWithMixin)
+        assert result is ModelWithMixin
+
+    def test_creates_wrapper_for_hf_class_with_correct_attributes(self):
+        """For HF model classes, create a wrapper inheriting from both and preserving attributes."""
+        class PlainModel(torch.nn.Module):
+            pass
+
+        result = _get_mixin_wrapped_class(PlainModel)
+
+        # Should be a new class inheriting from both
+        assert result is not PlainModel
+        assert issubclass(result, HFCheckpointingMixin)
+        assert issubclass(result, PlainModel)
+        # Should preserve original class attributes
+        assert result.__module__ == PlainModel.__module__
+        assert result.__qualname__ == PlainModel.__qualname__
+        assert result.__name__ == PlainModel.__name__
+
+
+# NOTE: Tests for _init_model, apply_model_infrastructure, _shard_pp, _shard_ep_fsdp,
+# and from_pretrained/from_config with infrastructure kwargs have been moved to
+# integration tests since they require too many mocks and test complex orchestration.
+
+
+# =============================================================================
+# Tests for _apply_peft_and_lower_precision
+# =============================================================================
+
+class TestApplyPeftAndLowerPrecision:
+    """Test cases for _apply_peft_and_lower_precision function."""
+
+    def test_apply_peft_disables_triton_with_tp(self, caplog):
+        """When tp_size > 1, sets peft_config.use_triton = False."""
+        mock_model = MagicMock()
+        mock_peft_config = MagicMock()
+        mock_peft_config.use_triton = True
+
+        with (
+            patch("nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules") as mock_apply_lora,
+            caplog.at_level(logging.INFO),
+        ):
+            result = _apply_peft_and_lower_precision(
+                mock_model,
+                tp_size=2,  # TP > 1
+                autopipeline=None,
+                peft_config=mock_peft_config,
+                quantization_config=None,
+                fp8_config=None,
+                qat_quantizer=None,
+            )
+
+            assert mock_peft_config.use_triton is False
+            assert "Disabling Triton with TP" in caplog.text
+            mock_apply_lora.assert_called_once()
+
+    def test_apply_peft_disables_triton_with_autopipeline(self, caplog):
+        """When autopipeline is not None, disables Triton."""
+        mock_model = MagicMock()
+        mock_peft_config = MagicMock()
+        mock_peft_config.use_triton = True
+        mock_autopipeline = MagicMock()
+
+        with (
+            patch("nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules") as mock_apply_lora,
+            caplog.at_level(logging.INFO),
+        ):
+            result = _apply_peft_and_lower_precision(
+                mock_model,
+                tp_size=1,
+                autopipeline=mock_autopipeline,  # PP enabled
+                peft_config=mock_peft_config,
+                quantization_config=None,
+                fp8_config=None,
+                qat_quantizer=None,
+            )
+
+            assert mock_peft_config.use_triton is False
+            assert "Disabling Triton with Pipeline Parallelism" in caplog.text
+
+    def test_apply_fp8_when_configured(self):
+        """When fp8_config provided, calls apply_fp8_to_model."""
+        mock_model = MagicMock()
+        mock_fp8_config = MagicMock()
+
+        with patch("nemo_automodel._transformers.auto_model.apply_fp8_to_model") as mock_apply_fp8:
+            mock_apply_fp8.return_value = mock_model
+
+            result = _apply_peft_and_lower_precision(
+                mock_model,
+                tp_size=1,
+                autopipeline=None,
+                peft_config=None,
+                quantization_config=None,
+                fp8_config=mock_fp8_config,
+                qat_quantizer=None,
+            )
+
+            mock_apply_fp8.assert_called_once_with(mock_model, config=mock_fp8_config)
+
+    def test_apply_qat_when_configured(self):
+        """When qat_quantizer provided, calls prepare_qat_model."""
+        mock_model = MagicMock()
+        # Ensure model parameters return bfloat16
+        mock_param = MagicMock()
+        mock_param.dtype = torch.bfloat16
+        mock_model.parameters.return_value = [mock_param]
+
+        mock_qat_quantizer = MagicMock()
+
+        # prepare_qat_model is imported inside the function, so we need to patch it in its source module
+        with patch("nemo_automodel.components.quantization.qat.prepare_qat_model") as mock_prepare_qat:
+            mock_prepare_qat.return_value = (mock_model, "qat_mode")
+
+            result = _apply_peft_and_lower_precision(
+                mock_model,
+                tp_size=1,
+                autopipeline=None,
+                peft_config=None,
+                quantization_config=None,
+                fp8_config=None,
+                qat_quantizer=mock_qat_quantizer,
+            )
+
+            mock_prepare_qat.assert_called_once_with(mock_model, mock_qat_quantizer)
+            assert hasattr(result, "_qat_mode")
+
+
+
+
+# =============================================================================
+# Tests for _consume_config_overrides and _filter_kwargs_for_init
+# =============================================================================
+
+class TestConsumeConfigOverrides:
+    """Test cases for _consume_config_overrides function."""
+
+    def test_consume_config_overrides_moves_config_keys_to_config(self):
+        """Config-related kwargs are moved from kwargs dict to config object."""
+        mock_config = MagicMock()
+        mock_config.to_dict.return_value = {"output_hidden_states": True, "use_cache": True}
+
+        kwargs = {"output_hidden_states": True, "some_other_arg": 42}
+
+        _consume_config_overrides(mock_config, kwargs)
+
+        # output_hidden_states should be moved to config
+        assert "output_hidden_states" not in kwargs
+        assert "some_other_arg" in kwargs
+        mock_config.output_hidden_states = True  # Should be set on config
+
+    def test_consume_config_overrides_preserves_init_param_names(self):
+        """Keys that are in init_param_names are kept in kwargs."""
+        mock_config = MagicMock()
+        mock_config.to_dict.return_value = {"output_hidden_states": True}
+
+        kwargs = {"output_hidden_states": True, "explicit_param": 42}
+
+        _consume_config_overrides(mock_config, kwargs, init_param_names={"explicit_param", "output_hidden_states"})
+
+        # Both should be kept since they're in init_param_names
+        assert "output_hidden_states" in kwargs
+        assert "explicit_param" in kwargs
+
+
+class TestFilterKwargsForInit:
+    """Test cases for _filter_kwargs_for_init function."""
+
+    def test_filter_kwargs_for_init_removes_unknown_kwargs(self):
+        """Filters out kwargs not in model __init__ signature."""
+        class ModelWithSpecificInit:
+            def __init__(self, config, a, b):
+                pass
+
+        kwargs = {"a": 1, "b": 2, "c": 3, "d": 4}
+        result = _filter_kwargs_for_init(ModelWithSpecificInit, kwargs)
+
+        assert "a" in result
+        assert "b" in result
+        assert "c" not in result
+        assert "d" not in result
+
+    def test_filter_kwargs_for_init_keeps_all_with_var_keyword(self):
+        """If __init__ has **kwargs, returns all kwargs unchanged."""
+        class ModelWithVarKwargs:
+            def __init__(self, config, **kwargs):
+                pass
+
+        kwargs = {"a": 1, "b": 2, "c": 3}
+        result = _filter_kwargs_for_init(ModelWithVarKwargs, kwargs)
+
+        assert result == kwargs
+
+

@@ -28,7 +28,6 @@ model:
 
 from __future__ import annotations
 
-import os
 from typing import Callable, Optional, Union
 
 import torch
@@ -51,6 +50,7 @@ from nemo_automodel.components.models.common import (
     CombinedQKVAttentionMixin,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.llama.rope_utils import LlamaRotaryEmbedding, apply_rotary_pos_emb
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
@@ -382,7 +382,7 @@ class LlamaModel(LlamaPreTrainedModel):
         )
 
 
-class LlamaForCausalLM(LlamaPreTrainedModel):
+class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
     """Llama model with causal language modeling head."""
 
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
@@ -423,43 +423,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             print(f"[LlamaForCausalLM] Attention implementation: {self.config._attn_implementation}")
             print("[LlamaForCausalLM] Custom implementation with COMBINED QKV and gate_up projections")
             print(f"[LlamaForCausalLM] torch_dtype: {self.config.torch_dtype}")
-
-    def save_pretrained_hf_format(self, save_directory: str, **kwargs):
-        """Save model in HuggingFace-compatible format by converting combined projections.
-
-        This method converts the custom model's combined projections (qkv_proj, gate_up_proj)
-        back to HuggingFace's separate projections format before saving, making the checkpoint
-        loadable with AutoModelForCausalLM.from_pretrained().
-
-        Args:
-            save_directory: Directory where the model will be saved
-            **kwargs: Additional arguments passed to config.save_pretrained and save_file
-        """
-        from safetensors.torch import save_file
-
-        os.makedirs(save_directory, exist_ok=True)
-
-        # Save config
-        self.config.save_pretrained(save_directory)
-
-        # Convert state dict to HF format
-        if hasattr(self, "state_dict_adapter"):
-            custom_state_dict = self.state_dict()
-            hf_state_dict = self.state_dict_adapter.to_hf(custom_state_dict)
-        else:
-            hf_state_dict = self.state_dict()
-
-        # Handle tied weights: remove duplicate tied weights before saving
-        # In Llama, lm_head.weight is tied to model.embed_tokens.weight
-        # HuggingFace expects only model.embed_tokens.weight to be saved
-        if "lm_head.weight" in hf_state_dict and "model.embed_tokens.weight" in hf_state_dict:
-            # Check if they actually share memory
-            if hf_state_dict["lm_head.weight"].data_ptr() == hf_state_dict["model.embed_tokens.weight"].data_ptr():
-                # Remove lm_head.weight as it's tied to embed_tokens
-                hf_state_dict = {k: v for k, v in hf_state_dict.items() if k != "lm_head.weight"}
-
-        # Save weights
-        save_file(hf_state_dict, os.path.join(save_directory, "model.safetensors"))
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

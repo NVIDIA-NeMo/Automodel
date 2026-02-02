@@ -20,6 +20,7 @@ from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextCon
 from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextGatedDeltaNet
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention, Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.state_dict_adapter import Qwen3NextStateDictAdapter
@@ -218,7 +219,7 @@ class Qwen3NextModel(nn.Module):
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class Qwen3NextForCausalLM(nn.Module, MoEFSDPSyncMixin):
+class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     @classmethod
     def from_config(
         cls,
