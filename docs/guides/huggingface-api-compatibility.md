@@ -46,7 +46,7 @@ If you are running Transformers v5 in another environment, you can still use NeM
 
 - **Performance features**: NeMo Automodel can automatically apply optional kernel patches/optimizations (e.g., SDPA selection, Liger kernels, DeepEP, etc) while keeping the public model API the same.
 - **Distributed training stack**: NeMo Automodel’s recipes/CLI are designed for multi-GPU/multi-node fine-tuning with PyTorch-native distributed features (FSDP2, pipeline parallelism, etc.).
-- **CUDA expectation**: NeMo Automodel’s `NeMoAutoModel*` wrappers are primarily intended for NVIDIA GPU workflows.
+- **CUDA expectation**: NeMo Automodel’s `NeMoAutoModel*` wrappers are primarily optimized for NVIDIA GPU workflows, and offer support for CPU workflows as well.
 
 :::{important}
 `NeMoAutoModelForCausalLM.from_pretrained(...)` currently assumes CUDA is available (it uses `torch.cuda.current_device()` internally). If you need CPU-only inference, use Hugging Face `transformers` directly.
