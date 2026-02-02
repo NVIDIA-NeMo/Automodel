@@ -118,7 +118,6 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             autopipeline=None,
             loss_fn=self.loss_fn,
             parallelize_fn=None,
-            checkpointer=self.checkpointer,
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )
 

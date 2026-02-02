@@ -43,7 +43,6 @@ from typing import Any, Dict, Optional
 import torch
 import wandb
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-from transformers.utils import TRANSFORMERS_CACHE
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -77,10 +76,6 @@ def _build_teacher_model(
     cp_size=1,
     parallelize_fn=None,
     device=None,
-    dp_rank=0,
-    tp_rank=0,
-    pp_rank=0,
-    moe_mesh=None,
 ):
     """Build and initialize the teacher model for knowledge distillation.
 
@@ -104,28 +99,9 @@ def _build_teacher_model(
         The `offload_teacher_model` config option is not supported with this approach.
         Device placement is handled internally by NeMoAutoModelForCausalLM infrastructure.
     """
-    from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
     assert cfg_teacher is not None, "`teacher_model` section missing from YAML config"
     logger.info("Instantiating teacher model")
-
-    # Create a simple checkpointer for the teacher (just for weight loading)
-    teacher_checkpointer = Checkpointer(
-        CheckpointingConfig(
-            model_repo_id=cfg_teacher.get("pretrained_model_name_or_path"),
-            model_cache_dir=cfg_teacher.get("cache_dir", TRANSFORMERS_CACHE),
-            # Dummy values
-            is_peft=False,
-            enabled=False,
-            checkpoint_dir="",
-            model_save_format="safetensors",
-            save_consolidated=False,
-        ),
-        dp_rank=dp_rank,
-        tp_rank=tp_rank,
-        pp_rank=pp_rank,
-        moe_mesh=moe_mesh,
-    )
 
     # Build teacher model using the same infrastructure as student
     # but without PEFT/FP8/QAT (teacher should be frozen in full precision)
@@ -134,7 +110,6 @@ def _build_teacher_model(
             "tp_size": tp_size,
             "cp_size": cp_size,
             "has_packed_sequence": has_packed_sequence,
-            "checkpointer": teacher_checkpointer,
             "model_wrapper": model_wrapper,
             "parallelize_fn": parallelize_fn,
         }
@@ -196,10 +171,6 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             cp_size=self.cfg.get("distributed.cp_size", 1),
             parallelize_fn=getattr(self.cfg.get("parallelizer", None), "instantiate", None),
             device=teacher_device,
-            dp_rank=self._get_dp_rank(include_cp=True),
-            tp_rank=self._get_tp_rank(),
-            pp_rank=self._get_pp_rank(),
-            moe_mesh=self.moe_mesh,
         )
         logger.info("Teacher Model: " + str(self.teacher_model))
         # KD
