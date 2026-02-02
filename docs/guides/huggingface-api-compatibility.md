@@ -42,7 +42,7 @@ If you are running Transformers v5 in another environment, you can still use NeM
 - **Tokenizers**: standard `PreTrainedTokenizerBase` behavior, including `__call__` to create tensors and `decode`/`batch_decode`
 - **Generation**: `model.generate(...)` and the usual generation kwargs
 
-### Differences (where NeMo Automodel adds value or has constraints)
+### Differences (Where NeMo Automodel Adds Value or Has Constraints)
 
 - **Performance features**: NeMo Automodel can automatically apply optional kernel patches/optimizations (e.g., SDPA selection, Liger kernels, DeepEP, etc) while keeping the public model API the same.
 - **Distributed training stack**: NeMo Automodel’s recipes/CLI are designed for multi-GPU/multi-node fine-tuning with PyTorch-native distributed features (FSDP2, pipeline parallelism, etc.).
