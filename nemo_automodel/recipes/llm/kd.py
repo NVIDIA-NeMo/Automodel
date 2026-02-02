@@ -42,8 +42,8 @@ from typing import Any, Dict, Optional
 
 import torch
 import wandb
+from huggingface_hub import constants as hf_constants
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-from transformers.utils import TRANSFORMERS_CACHE
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -113,7 +113,7 @@ def _build_teacher_model(
     teacher_checkpointer = Checkpointer(
         CheckpointingConfig(
             model_repo_id=cfg_teacher.get("pretrained_model_name_or_path"),
-            model_cache_dir=cfg_teacher.get("cache_dir", TRANSFORMERS_CACHE),
+            model_cache_dir=cfg_teacher.get("cache_dir", hf_constants.HF_HUB_CACHE),
             # Dummy values
             is_peft=False,
             enabled=False,
