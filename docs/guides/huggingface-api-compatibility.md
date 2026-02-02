@@ -19,7 +19,7 @@ This means:
 - NeMo Automodel is primarily tested and released against **Transformers v4.x**
 - New model releases on the Hugging Face Hub that require a newer Transformers may require upgrading NeMo Automodel as well (similar to upgrading `transformers` directly)
 
-### Transformers v5 (forward-compatibility + checkpoint interoperability)
+### Transformers v5 (Forward-Compatibility and Checkpoint Interoperability)
 
 Transformers **v5** introduces breaking changes across some internal utilities (e.g., cache APIs) and adds/reshapes tokenizer backends for some model families.
 
