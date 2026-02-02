@@ -536,7 +536,6 @@ def apply_model_infrastructure(
     autopipeline=None,
     parallelize_fn=None,
     compile_config=None,
-    model_name_or_path=None,
     load_base_model=False,
     cache_dir=None,
     pretrained_model_name_or_path="",
@@ -570,7 +569,7 @@ def apply_model_infrastructure(
         autopipeline: AutoPipeline instance for pipeline parallelism. Default: None
         parallelize_fn: Function to apply parallelization (EP + FSDP2). Default: None
         compile_config: Compilation configuration. Default: None
-        model_name_or_path: Model name or path for checkpoint loading. Default: None
+        pretrained_model_name_or_path: Model name or path for checkpoint loading. Default: None
         load_base_model: Whether to load base model weights (True for from_pretrained). Default: False
         cache_dir: Cache directory for model weights. Default: None
         **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
@@ -659,7 +658,7 @@ def apply_model_infrastructure(
                 mp,
                 device,
                 cache_dir,
-                model_name_or_path,
+                pretrained_model_name_or_path,
                 lora_a_init,
                 load_base_model=load_base_model,
             )
@@ -976,7 +975,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             is_meta_device=is_meta_device,
             device=device,
             compile_config=compile_config,
-            model_name_or_path=pretrained_model_name_or_path,
             load_base_model=True,
             cache_dir=kwargs.get("cache_dir", TRANSFORMERS_CACHE),
         )
@@ -1180,7 +1178,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             is_meta_device=is_meta_device,
             device=device,
             compile_config=compile_config,
-            model_name_or_path=getattr(config, "name_or_path"),
+            pretrained_model_name_or_path=getattr(config, "name_or_path"),
             load_base_model=False,
             cache_dir=kwargs.get("cache_dir", TRANSFORMERS_CACHE),
         )

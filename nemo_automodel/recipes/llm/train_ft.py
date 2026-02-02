@@ -212,7 +212,7 @@ def build_model_and_optimizer(
                 is_hf_model=False,
                 is_meta_device=False,
                 device=torch.cuda.current_device(),
-                model_name_or_path=None,
+                pretrained_model_name_or_path=None,
                 load_base_model=False,
                 cache_dir=TRANSFORMERS_CACHE,
                 **kwargs,
