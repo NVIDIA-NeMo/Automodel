@@ -35,7 +35,7 @@ If you are running Transformers v5 in another environment, you can still use NeM
 
 ## What’s “drop-in” vs what’s different
 
-### Drop-in (same mental model as Transformers)
+### Drop-In (Same Mental Model as Transformers)
 
 - **Load by model ID or local path**: `from_pretrained(...)`
 - **Standard HF config objects**: `AutoConfig` / `config.json`
