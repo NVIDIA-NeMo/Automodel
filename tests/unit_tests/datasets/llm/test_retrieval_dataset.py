@@ -603,34 +603,24 @@ def test_inline_normalization_and_resolution_branches():
     with pytest.raises(ValueError, match="Inline doc dict must include 'text'"):
         rdi._normalize_inline_doc({"image": "x"})
 
-    # _resolve_doc_to_example: id lookup requires corpus present
-    with pytest.raises(KeyError, match="Corpus 'missing' not found"):
-        rdi._resolve_doc_to_example({"id": "123"}, corpus_id="missing", corpus_dict={})
+    # _resolve_doc_to_example: dict missing "text" should raise
+    with pytest.raises(ValueError, match="Inline doc dict must include 'text'"):
+        rdi._resolve_doc_to_example({"id": "123"})
 
-    corpus_dict = {
-        "c": DummyCorpus({"x": {"text": "T", "image": "", "nr_ocr": ""}}),
-    }
-
-    # String doc -> treat as id when corpus available
-    ex = rdi._resolve_doc_to_example("x", corpus_id="c", corpus_dict=corpus_dict)
-    assert ex["text"] == "T"
-
-    # String doc -> treat as inline text when corpus missing
-    ex2 = rdi._resolve_doc_to_example("hello", corpus_id=rdi.INLINE_CORPUS_ID, corpus_dict={})
-    assert ex2["text"] == "hello"
+    # String doc -> treated as inline text
+    ex = rdi._resolve_doc_to_example("hello")
+    assert ex["text"] == "hello"
 
     # Inline dict doc: id empty -> use inline fields
     inline = rdi._resolve_doc_to_example(
         {"id": "", "text": "txt", "image": None, "nr_ocr": 123},
-        corpus_id=rdi.INLINE_CORPUS_ID,
-        corpus_dict={},
     )
     assert inline["text"] == "txt"
     assert inline["image"] == ""  # None -> ""
     assert inline["nr_ocr"] == "123"
 
     # Fallback: non-str doc coerces to string
-    ex3 = rdi._resolve_doc_to_example(123, corpus_id=rdi.INLINE_CORPUS_ID, corpus_dict={})
+    ex3 = rdi._resolve_doc_to_example(123)
     assert ex3["text"] == "123"
 
 
@@ -681,20 +671,10 @@ def test_load_datasets_inline_dict_container_and_error_cases(tmp_path):
         rdi.load_datasets(str(f_bad_container))
 
 
-def test_load_datasets_corpus_id_format_in_inline_module(tmp_path, monkeypatch):
-    corpus_dir = tmp_path / "corpusA"
-    corpus_dir.mkdir()
-    (corpus_dir / "merlin_metadata.json").write_text(json.dumps({"class": "TextQADataset", "corpus_id": "corpusA"}))
-
-    # Provide minimal HF dataset for TextQADataset
-    monkeypatch.setattr(
-        rdi,
-        "load_dataset",
-        _mock_hf_load_dataset_returning([{"id": "p", "text": "P"}, {"id": "n1", "text": "N1"}]),
-    )
-
-    good = {
-        "corpus": [{"path": str(corpus_dir)}],
+def test_load_datasets_corpus_id_format_in_inline_module(tmp_path):
+    """The inline loader should reject corpus-id format (use retrieval_dataset.py instead)."""
+    data = {
+        "corpus": [{"path": str(tmp_path / "corpus")}],
         "data": [
             {
                 "question_id": "q1",
@@ -705,25 +685,10 @@ def test_load_datasets_corpus_id_format_in_inline_module(tmp_path, monkeypatch):
             }
         ],
     }
-    f_good = tmp_path / "train.json"
-    f_good.write_text(json.dumps(good))
-
-    ds, corpus_dict = rdi.load_datasets(str(f_good))
-    assert len(ds) == 1
-    assert "corpusA" in corpus_dict
-    row = ds[0]
-    assert row["question_id"] == "q1"
-    assert row["pos_doc"][0]["id"] == "p"
-    assert row["neg_doc"][0]["id"] == "n1"
-
-    bad = {
-        "corpus": [{"path": str(corpus_dir)}],
-        "data": [{"question": "Q1", "corpus_id": "corpusA", "pos_doc": [{"id": "p"}], "neg_doc": [{"id": "n1"}]}],
-    }
-    f_bad = tmp_path / "bad.json"
-    f_bad.write_text(json.dumps(bad))
-    with pytest.raises(ValueError, match="Missing required fields"):
-        rdi.load_datasets(str(f_bad))
+    f = tmp_path / "train.json"
+    f.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match=r"Corpus-id retrieval format.*not supported.*retrieval_dataset_inline"):
+        rdi.load_datasets(str(f))
 
 
 def test_transform_func_inline_error_and_num_neg_docs_zero():
@@ -770,7 +735,12 @@ def test_transform_func_inline_with_dataset_instruction_from_corpus():
             passage_instruction="PI",
         )
     }
-    examples = {"question": ["Q"], "corpus_id": ["c"], "pos_doc": [[{"id": "p"}]], "neg_doc": [[{"id": "n"}]]}
+    examples = {
+        "question": ["Q"],
+        "corpus_id": ["c"],
+        "pos_doc": [[{"id": "", "text": "P", "image": "", "nr_ocr": ""}]],
+        "neg_doc": [[{"id": "", "text": "N", "image": "", "nr_ocr": ""}]],
+    }
     out = rdi._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, use_dataset_instruction=True)
     assert out["query_instruction"][0] == "QI"
     assert out["passage_instruction"][0] == "PI"

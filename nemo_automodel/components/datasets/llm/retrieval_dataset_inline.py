@@ -15,142 +15,11 @@
 import json
 import logging
 import os
-from abc import ABC, abstractmethod
-from copy import deepcopy
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
-from datasets import Dataset, concatenate_datasets, load_dataset
+from datasets import Dataset, concatenate_datasets
 
-EXAMPLE_TEMPLATE = {"text": "", "image": "", "nr_ocr": ""}
 INLINE_CORPUS_ID = "__inline__"
-
-
-class AbstractDataset(ABC):
-    @abstractmethod
-    def get_document_by_id(self, id):
-        pass
-
-    @abstractmethod
-    def get_all_ids(self):
-        pass
-
-
-class TextQADataset(AbstractDataset):
-    def __init__(self, path):
-        self.path = path
-        self.data = load_dataset(path)["train"]
-        docid2idx = {}
-        for idx, docid in enumerate(self.data["id"]):
-            docid2idx[str(docid)] = idx
-        self.docid2idx = docid2idx
-
-    def get_document_by_id(self, id):
-        example = deepcopy(EXAMPLE_TEMPLATE)
-        example["text"] = self.data[self.docid2idx[id]]["text"]
-        return example
-
-    def get_all_ids(self):
-        return sorted(list(self.docid2idx.keys()))
-
-
-DATASETS = {
-    "TextQADataset": TextQADataset,
-}
-
-
-@dataclass
-class CorpusInfo:
-    """
-    Data structure to hold corpus metadata and dataset object together.
-    Provides easy access to both components with descriptive attribute names.
-    """
-
-    metadata: dict
-    corpus: AbstractDataset
-
-    @property
-    def corpus_id(self) -> str:
-        """Get corpus ID from metadata"""
-        return self.metadata["corpus_id"]
-
-    @property
-    def query_instruction(self) -> str:
-        """Get query instruction from metadata"""
-        if "query_instruction" in self.metadata:
-            return self.metadata["query_instruction"]
-        else:
-            return ""
-
-    @property
-    def passage_instruction(self) -> str:
-        """Get passage instruction from metadata"""
-        if "passage_instruction" in self.metadata:
-            return self.metadata["passage_instruction"]
-        else:
-            return ""
-
-    @property
-    def task_type(self) -> str:
-        """Get task type from metadata"""
-        if "task_type" in self.metadata:
-            return self.metadata["task_type"]
-        else:
-            return ""
-
-    @property
-    def path(self) -> str:
-        """Get corpus path from the corpus object"""
-        return self.corpus.path
-
-    def get_document_by_id(self, doc_id: str):
-        """Delegate to corpus for convenience"""
-        return self.corpus.get_document_by_id(doc_id)
-
-    def get_all_ids(self):
-        """Delegate to corpus for convenience"""
-        return self.corpus.get_all_ids()
-
-
-def load_corpus_metadata(path: str):
-    path_metadata = os.path.join(path, "merlin_metadata.json")
-    if not os.path.isfile(path_metadata):
-        raise ValueError("Metadata File for Corpus does not exist: " + path_metadata)
-
-    metadata = json.load(open(path_metadata, "r"))
-    return metadata
-
-
-def load_corpus(path, metadata: Optional[dict] = None):
-    if metadata is None:
-        metadata = load_corpus_metadata(path)
-    if metadata["class"] not in DATASETS:
-        raise ValueError("DatasetClass is not implemented: " + metadata["class"])
-    corpus = DATASETS[metadata["class"]](path)
-    corpus_id = metadata["corpus_id"]
-    return (corpus_id, corpus)
-
-
-def add_corpus(qa_corpus_paths: Union[dict, list], corpus_dict: dict):
-    if corpus_dict is None:
-        raise ValueError("Corpus dictionary is not provided")
-    if not isinstance(qa_corpus_paths, list):
-        qa_corpus_paths = [qa_corpus_paths]
-
-    for corpus_info in qa_corpus_paths:
-        corpus_metadata = load_corpus_metadata(corpus_info["path"])
-        if corpus_metadata["corpus_id"] in corpus_dict:
-            if corpus_dict[corpus_metadata["corpus_id"]].path != corpus_info["path"]:
-                raise ValueError(
-                    "Two Different Datasets have the same corpus id but different paths: "
-                    + "1. "
-                    + corpus_dict[corpus_metadata["corpus_id"]].path
-                    + "2. "
-                    + corpus_info["path"]
-                )
-        else:
-            corpus_id, corpus = load_corpus(corpus_info["path"], corpus_metadata)
-            corpus_dict[corpus_id] = CorpusInfo(corpus_metadata, corpus)
 
 
 def _load_json_or_jsonl(path: str) -> Union[dict, list]:
@@ -183,16 +52,6 @@ def _coerce_to_list(value: Any) -> list:
     return [value]
 
 
-def _normalize_id_doc(doc: Any) -> Dict[str, Any]:
-    """Normalize a corpus-id based doc reference into a canonical dict shape."""
-    if isinstance(doc, dict) and "id" in doc:
-        doc_id = doc["id"]
-    else:
-        doc_id = doc
-    doc_id = doc_id if isinstance(doc_id, str) else str(doc_id)
-    return {"id": doc_id, "text": "", "image": "", "nr_ocr": ""}
-
-
 def _normalize_inline_doc(doc: Any) -> Dict[str, Any]:
     """Normalize an inline doc (text/image provided) into a canonical dict shape."""
     if isinstance(doc, dict):
@@ -213,24 +72,19 @@ def _normalize_inline_doc(doc: Any) -> Dict[str, Any]:
     }
 
 
-def _resolve_doc_to_example(doc: Any, corpus_id: str, corpus_dict: Dict[str, Any]) -> dict:
+def _resolve_doc_to_example(doc: Any) -> dict:
     """
     Resolve a doc reference into an example dict with keys: text, image, nr_ocr.
 
-    Supports:
-    - corpus-id based docs: {"id": "..."} (looked up in corpus_dict[corpus_id])
-    - inline docs: {"text": "...", "image": "", "nr_ocr": ""} (used directly)
+    Supported doc forms:
+    - `str`: interpreted as inline document text
+    - `dict`: must include `text` (optionally `image`, `nr_ocr`)
     """
+    example = {"text": "", "image": "", "nr_ocr": ""}
     if isinstance(doc, dict):
-        doc_id = doc.get("id", "")
-        # Treat non-empty "id" as a corpus lookup.
-        if doc_id:
-            if corpus_id not in corpus_dict:
-                raise KeyError(f"Corpus '{corpus_id}' not found in corpus_dict (needed to resolve doc id '{doc_id}').")
-            return corpus_dict[corpus_id].get_document_by_id(str(doc_id))
+        if "text" not in doc:
+            raise ValueError(f"Inline doc dict must include 'text'. Got keys: {sorted(list(doc.keys()))}")
 
-        # Inline doc: copy supported fields over the template.
-        example = deepcopy(EXAMPLE_TEMPLATE)
         if "text" in doc and doc["text"] is not None:
             example["text"] = str(doc["text"])
         if "image" in doc and doc["image"] is not None:
@@ -239,16 +93,11 @@ def _resolve_doc_to_example(doc: Any, corpus_id: str, corpus_dict: Dict[str, Any
             example["nr_ocr"] = str(doc["nr_ocr"])
         return example
 
-    # String docs are interpreted as ids only when a corpus is available; otherwise as inline text.
     if isinstance(doc, str):
-        if corpus_id in corpus_dict:
-            return corpus_dict[corpus_id].get_document_by_id(doc)
-        example = deepcopy(EXAMPLE_TEMPLATE)
         example["text"] = doc
         return example
 
     # Fallback: coerce to string text
-    example = deepcopy(EXAMPLE_TEMPLATE)
     example["text"] = str(doc)
     return example
 
@@ -264,39 +113,19 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
     """
     if not isinstance(data_dir_list, list):
         data_dir_list = [data_dir_list]
-    corpus_dict = {}
     datasets = []
     for data_dir in data_dir_list:
         train_data = _load_json_or_jsonl(data_dir)
 
-        # Corpus-id based format:
-        # {
-        #   "corpus": [{"path": "..."}],
-        #   "data": [{"question_id": "...", "question": "...", "corpus_id": "...", "pos_doc": [{"id": "..."}], ...}]
-        # }
+        # Corpus-id based format is intentionally not supported in this "inline" loader.
+        # Use `nemo_automodel.components.datasets.llm.retrieval_dataset.load_datasets` instead.
         is_corpus_id_format = isinstance(train_data, dict) and "corpus" in train_data and "data" in train_data
         if is_corpus_id_format:
-            REQUIRED_FIELDS = ["question_id", "question", "corpus_id", "pos_doc", "neg_doc"]
-
-            qa_corpus_paths = train_data["corpus"]
-            add_corpus(qa_corpus_paths, corpus_dict)
-
-            normalized_data = []
-            for item in train_data["data"]:
-                missing = [f for f in REQUIRED_FIELDS if f not in item]
-                if missing:
-                    raise ValueError(f"Missing required fields: {missing} in train_data item: {item}")
-                normalized_item = {
-                    "question_id": item["question_id"],
-                    "question": item["question"],
-                    "corpus_id": item["corpus_id"],
-                    "pos_doc": [_normalize_id_doc(d) for d in _coerce_to_list(item["pos_doc"])],
-                    "neg_doc": [_normalize_id_doc(d) for d in _coerce_to_list(item["neg_doc"])],
-                }
-                normalized_data.append(normalized_item)
-
-            datasets.append(Dataset.from_list(normalized_data))
-            continue
+            raise ValueError(
+                "Corpus-id retrieval format (top-level 'corpus' + 'data') is not supported by "
+                "retrieval_dataset_inline. Use retrieval_dataset.py (corpus-id) or convert the dataset "
+                "to inline JSONL with inline `pos_doc`/`neg_doc` texts."
+            )
 
         # Inline-text format (JSONL or JSON list/dict). Example record:
         # {"query": "...", "pos_doc": "...", "neg_doc": ["...", "..."]}
@@ -347,7 +176,7 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
         dataset = concatenate_datasets(datasets)
     else:
         dataset = datasets
-    return (dataset, corpus_dict)
+    return (dataset, {})
 
 
 def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
@@ -415,7 +244,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         cur_corpus_id = corpus_ids[idx_doc]
 
         for doc in docs:
-            cur_doc = _resolve_doc_to_example(doc, cur_corpus_id, corpus_dict)
+            cur_doc = _resolve_doc_to_example(doc)
 
             # Extract text
             if cur_doc["text"] != "" and not cur_doc["image"]:
