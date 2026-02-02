@@ -33,7 +33,7 @@ NeMo Automodel addresses this in two complementary ways:
 If you are running Transformers v5 in another environment, you can still use NeMo Automodel–produced consolidated checkpoints with Transformers’ standard loading APIs. For details on the checkpoint layouts, see [checkpointing](checkpointing.md).
 :::
 
-## What’s “drop-in” vs what’s different
+## Drop-In Compatibility and Key Differences
 
 ### Drop-In (Same Mental Model as Transformers)
 
