@@ -10,7 +10,7 @@ This page summarizes what “HF compatibility” means in NeMo Automodel, calls 
 
 ## Transformers Version Compatibility: v4 and v5
 
-### Transformers v4 (current default)
+### Transformers v4 (Current Default)
 
 NeMo Automodel currently pins Hugging Face Transformers to the **v4** major line (see `pyproject.toml`, currently `transformers<=4.57.5`).
 
