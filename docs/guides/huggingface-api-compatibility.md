@@ -97,7 +97,9 @@ If you are running Transformers v5 in another environment, you can still use NeM
 </table>
 :::
 
-### Load a model and tokenizer
+## Side-by-side examples
+
+### Load a model and tokenizer (transformers v4)
 
 :::{raw} html
 <table>
@@ -179,7 +181,6 @@ print(tokenizer.decode(out[0], skip_special_tokens=True))</code></pre></div>
 </table>
 :::
 
-## Side-by-side examples
 
 ### Tokenizers (Transformers vs NeMo Automodel)
 
