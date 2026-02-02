@@ -99,7 +99,7 @@ If you are running Transformers v5 in another environment, you can still use NeM
 
 ## Side-by-side examples
 
-### Load a model and tokenizer (transformers v4)
+### Load a model and tokenizer (Transformers v4)
 
 :::{raw} html
 <table>
