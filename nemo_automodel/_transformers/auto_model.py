@@ -636,7 +636,10 @@ def apply_model_infrastructure(
         model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn)
         if compile_config is not None:
             model = compile_model(model, compile_config)
-        setattr(model, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
+        if isinstance(model_wrapper, DDPManager):
+            setattr(model.module, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
+        else:
+            setattr(model, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
 
     # Load the checkpoint if needed and return
     # Weights need to be loaded for meta device models that were parallelized:
