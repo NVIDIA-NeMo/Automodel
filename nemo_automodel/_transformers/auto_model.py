@@ -617,8 +617,8 @@ def apply_model_infrastructure(
             model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
         )
 
-    # hold a list copy of the model state dict keys before any parallelization
-    checkpointer.config.model_state_dict_keys = list(
+    # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
+    pre_shard_hf_state_dict_keys = list(
         _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=dequantize_base_checkpoint).keys()
     )
 
@@ -630,10 +630,13 @@ def apply_model_infrastructure(
     # Note: AutoPipeline takes care of applying PP + EP + FSDP. _shard_ep_fsdp will take care of applying EP + FSDP if no PP.
     if autopipeline is not None:
         model = _shard_pp(autopipeline, model, loss_fn, parallelize_fn)
+        for part in model.parts:
+            setattr(part, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
     else:
         model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn)
         if compile_config is not None:
             model = compile_model(model, compile_config)
+        setattr(model, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
 
     # Load the checkpoint if needed and return
     # Weights need to be loaded for meta device models that were parallelized:
