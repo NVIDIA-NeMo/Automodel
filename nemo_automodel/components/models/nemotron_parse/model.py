@@ -248,8 +248,6 @@ class NemotronParseDecoder(MBartPreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
         encoder_attention_mask: Optional[torch.LongTensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        cross_attn_head_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
@@ -282,7 +280,7 @@ class NemotronParseDecoder(MBartPreTrainedModel):
 
         if self.config._attn_implementation == "flash_attention_2":
             attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
-        elif self.config._attn_implementation == "sdpa" and not output_attentions and cross_attn_head_mask is None:
+        elif self.config._attn_implementation == "sdpa" and not output_attentions:
             attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
                 attention_mask, input_shape, inputs_embeds, past_key_values_length
             )
@@ -294,7 +292,7 @@ class NemotronParseDecoder(MBartPreTrainedModel):
         if encoder_hidden_states is not None and encoder_attention_mask is not None:
             if self.config._attn_implementation == "flash_attention_2":
                 encoder_attention_mask = encoder_attention_mask if 0 in encoder_attention_mask else None
-            elif self.config._attn_implementation == "sdpa" and cross_attn_head_mask is None and not output_attentions:
+            elif self.config._attn_implementation == "sdpa" and not output_attentions:
                 encoder_attention_mask = _prepare_4d_attention_mask_for_sdpa(
                     encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
                 )
@@ -309,12 +307,6 @@ class NemotronParseDecoder(MBartPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         all_cross_attentions = () if (output_attentions and encoder_hidden_states is not None) else None
-
-        for attn_mask, mask_name in zip([head_mask, cross_attn_head_mask], ["head_mask", "cross_attn_head_mask"]):
-            if attn_mask is not None and attn_mask.size()[0] != len(self.layers):
-                raise ValueError(
-                    f"The `{mask_name}` should be specified for {len(self.layers)} layers, but it is for {attn_mask.size()[0]}."
-                )
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -331,11 +323,9 @@ class NemotronParseDecoder(MBartPreTrainedModel):
                     attention_mask,
                     encoder_hidden_states,
                     encoder_attention_mask,
-                    head_mask[idx] if head_mask is not None else None,
-                    cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None,
-                    None,
+                    None,  # past_key_values
                     output_attentions,
-                    False,
+                    False,  # use_cache
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -343,11 +333,7 @@ class NemotronParseDecoder(MBartPreTrainedModel):
                     attention_mask=attention_mask,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
-                    layer_head_mask=(head_mask[idx] if head_mask is not None else None),
-                    cross_attn_layer_head_mask=(
-                        cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None
-                    ),
-                    past_key_value=None,
+                    past_key_values=None,
                     output_attentions=output_attentions,
                     use_cache=False,
                 )

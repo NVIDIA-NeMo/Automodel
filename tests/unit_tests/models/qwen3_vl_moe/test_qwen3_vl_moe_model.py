@@ -431,6 +431,8 @@ class TestQwen3VLMoeFromPretrainedAndModelClass:
             "mrope_section": [1, 1, 1],
             "partial_rotary_factor": 1.0,
         }
+        # Add pad_token_id required by transformers v5
+        cfg.text_config.pad_token_id = 0
 
         with (
             patch(
