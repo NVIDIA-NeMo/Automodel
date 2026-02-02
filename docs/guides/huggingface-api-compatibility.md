@@ -6,7 +6,7 @@ In practice, compatibility comes in two layers:
 - **API compatibility**: for many workflows you can keep your existing `transformers` code and swap in NeMo Automodel “drop-in” wrappers (`NeMoAutoModel*`, `NeMoAutoTokenizer`) with minimal changes.
 - **Artifact compatibility**: NeMo Automodel produces **Hugging Face–compatible checkpoints** (config + tokenizer + safetensors) that can be loaded by Hugging Face Transformers and downstream tools (vLLM, SGLang, etc.).
 
-This page summarizes what “HF compatibility” means in NeMo Automodel, calls out differences you should be aware of, and provides side-by-side examples.
+This page summarizes what "HF compatibility" means in NeMo Automodel, calls out differences you should be aware of, and provides side-by-side examples.
 
 ## Transformers Version Compatibility: v4 and v5
 
