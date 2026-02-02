@@ -52,7 +52,7 @@ If you are running Transformers v5 in another environment, you can still use NeM
 `NeMoAutoModelForCausalLM.from_pretrained(...)` currently assumes CUDA is available (it uses `torch.cuda.current_device()` internally). If you need CPU-only inference, use Hugging Face `transformers` directly.
 :::
 
-## API mapping (Transformers ⇔ NeMo Automodel)
+## API Mapping (Transformers and NeMo Automodel)
 
 ### API name mapping
 
