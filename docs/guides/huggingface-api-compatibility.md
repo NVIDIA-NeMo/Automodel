@@ -211,7 +211,7 @@ tok = NeMoAutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")</code></pre
 </table>
 :::
 
-## Checkpoints: save in Automodel, load everywhere
+## Checkpoints: Save in NeMo Automodel, Load Everywhere
 
 NeMo Automodel training recipes write checkpoints in Hugging Face–compatible layouts, including consolidated safetensors that you can load directly with Transformers:
 
