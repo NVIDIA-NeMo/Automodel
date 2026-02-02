@@ -54,7 +54,7 @@ If you are running Transformers v5 in another environment, you can still use NeM
 
 ## API Mapping (Transformers and NeMo Automodel)
 
-### API name mapping
+### API Name Mapping
 
 :::{raw} html
 <table>
