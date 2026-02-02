@@ -97,9 +97,20 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
         last_hidden_states: Hidden states from the model [batch_size, seq_len, hidden_size]
         attention_mask: Attention mask [batch_size, seq_len]
         pool_type: Type of pooling to apply
+            - "avg": Average pooling over all non-padded tokens
+            - "weighted_avg": Weighted average pooling
+            - "cls": Use the [CLS] token (first token)
+            - "last": Use the last non-padded token
+            - "eos": Use the EOS token (requires EOS token at end of sequence)
+            - "cls_last": Use the [CLS] token
+            - "colbert": Return all hidden states (for ColBERT-style models)
 
     Returns:
-        Pooled embeddings [batch_size, hidden_size]
+        Pooled embeddings [batch_size, hidden_size] or [batch_size, seq_len, hidden_size] for colbert
+        
+    Note:
+        For "eos" pooling, ensure your tokenizer adds EOS tokens to the end of sequences.
+        The tokenizer should be configured with add_eos_token=True or similar parameter.
     """
     last_hidden = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
 
@@ -119,6 +130,18 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
             emb = last_hidden[torch.arange(batch_size, device=last_hidden.device), sequence_lengths]
     elif pool_type == "cls_last":
         emb = last_hidden[:, 0]
+    elif pool_type == "eos":
+        # Extract hidden state at EOS token position (last non-padded position)
+        # Similar to "last" pooling, but explicitly for EOS token
+        left_padding = attention_mask[:, -1].sum() == attention_mask.shape[0]
+        if left_padding:
+            # If left padding, EOS is at the last position
+            emb = last_hidden[:, -1]
+        else:
+            # If right padding, EOS is at the last non-padded position
+            sequence_lengths = attention_mask.sum(dim=1) - 1
+            batch_size = last_hidden.shape[0]
+            emb = last_hidden[torch.arange(batch_size, device=last_hidden.device), sequence_lengths]
     elif pool_type == "colbert":
         emb = last_hidden
     else:
@@ -145,7 +168,7 @@ class NemotronBidirectionalConfig(NemotronHConfig):
         self.pooling = kwargs.get("pooling", "avg")
         self.temperature = kwargs.get("temperature", 1.0)
         self.use_cache = kwargs.get("use_cache", False)
-        self.mamba_bidirectional_strategy = kwargs.get("mamba_bidirectional_strategy", "average")  # Options: average, concat, weighted, gated
+        self.mamba_bidirectional_strategy = kwargs.get("mamba_bidirectional_strategy", "average")  # Options: unidirectional, average, concat, weighted, gated
         self.forward_weight = kwargs.get("forward_weight", 0.5)  # For weighted strategy
         self.bidirectional_attention = kwargs.get("bidirectional_attention", True)  # Use bidirectional attention for attention layers
         logger.info(f"NemotronBidirectionalConfig initialized with pooling: {self.pooling} and temperature: {self.temperature}")
@@ -169,7 +192,7 @@ class NemotronBidirectionalModel(NemotronHModel):
         self.config = config
         self.model = None
         self.tokenizer = None
-        
+
         # Initialize gating layer if using gated bidirectional strategy
         if hasattr(config, 'mamba_bidirectional_strategy') and config.mamba_bidirectional_strategy == "gated":
             self.gate_layer = nn.Linear(config.hidden_size * 2, 1)
@@ -270,7 +293,7 @@ class NemotronBidirectionalModel(NemotronHModel):
             )
 
         hidden_states = inputs_embeds
-        
+
         if cache_position is None:
             cache_position = torch.arange(hidden_states.shape[1], device=hidden_states.device)
         if position_ids is None:
@@ -282,7 +305,7 @@ class NemotronBidirectionalModel(NemotronHModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         # Until HERE
-        
+
         for mixer_block in self.layers:
             # Depending on the layer type we opt for 2D base attention mask (Mamba) or 4D causal mask (Attention)
             if mixer_block.block_type == "mamba":
@@ -291,40 +314,51 @@ class NemotronBidirectionalModel(NemotronHModel):
                 # Bidirectional processing for Mamba layers
                 strategy = getattr(self.config, 'mamba_bidirectional_strategy', 'average')
                 
-                # Forward pass
-                hidden_states_forward = mixer_block(
-                    hidden_states,
-                    cache_params=cache_params,
-                    cache_position=cache_position,
-                    attention_mask=layer_mask,
-                )
-                
-                # Backward pass (flip input and output)
-                hidden_states_reverse = hidden_states.flip(dims=[1])
-                hidden_states_reverse = mixer_block(
-                    hidden_states_reverse,
-                    cache_params=cache_params,
-                    cache_position=cache_position,
-                    attention_mask=layer_mask,
-                )
-                hidden_states_backward = hidden_states_reverse.flip(dims=[1])  # Flip back to align positions
-                
-                # Combine forward and backward based on strategy
-                if strategy == "average":
-                    hidden_states = (hidden_states_forward + hidden_states_backward) / 2
-                elif strategy == "concat":
-                    hidden_states = torch.cat([hidden_states_forward, hidden_states_backward], dim=-1)
-                elif strategy == "weighted":
-                    forward_weight = getattr(self.config, 'forward_weight', 0.5)
-                    backward_weight = 1.0 - forward_weight
-                    hidden_states = forward_weight * hidden_states_forward + backward_weight * hidden_states_backward
-                elif strategy == "gated":
-                    # Learned gating mechanism
-                    combined = torch.cat([hidden_states_forward, hidden_states_backward], dim=-1)
-                    gate = torch.sigmoid(self.gate_layer(combined))
-                    hidden_states = gate * hidden_states_forward + (1 - gate) * hidden_states_backward
+                # Check if unidirectional (no backward pass needed)
+                if strategy == "unidirectional":
+                    # Standard unidirectional forward pass only
+                    hidden_states = mixer_block(
+                        hidden_states,
+                        cache_params=cache_params,
+                        cache_position=cache_position,
+                        attention_mask=layer_mask,
+                    )
                 else:
-                    raise ValueError(f"Invalid mamba_bidirectional_strategy: {strategy}. Choose from: average, concat, weighted, gated")
+                    # Bidirectional processing: forward + backward passes
+                    # Forward pass
+                    hidden_states_forward = mixer_block(
+                        hidden_states,
+                        cache_params=cache_params,
+                        cache_position=cache_position,
+                        attention_mask=layer_mask,
+                    )
+                    
+                    # Backward pass (flip input and output)
+                    hidden_states_reverse = hidden_states.flip(dims=[1])
+                    hidden_states_reverse = mixer_block(
+                        hidden_states_reverse,
+                        cache_params=cache_params,
+                        cache_position=cache_position,
+                        attention_mask=layer_mask,
+                    )
+                    hidden_states_backward = hidden_states_reverse.flip(dims=[1])  # Flip back to align positions
+                    
+                    # Combine forward and backward based on strategy
+                    if strategy == "average":
+                        hidden_states = (hidden_states_forward + hidden_states_backward) / 2
+                    elif strategy == "concat":
+                        hidden_states = torch.cat([hidden_states_forward, hidden_states_backward], dim=-1)
+                    elif strategy == "weighted":
+                        forward_weight = getattr(self.config, 'forward_weight', 0.5)
+                        backward_weight = 1.0 - forward_weight
+                        hidden_states = forward_weight * hidden_states_forward + backward_weight * hidden_states_backward
+                    elif strategy == "gated":
+                        # Learned gating mechanism
+                        combined = torch.cat([hidden_states_forward, hidden_states_backward], dim=-1)
+                        gate = torch.sigmoid(self.gate_layer(combined))
+                        hidden_states = gate * hidden_states_forward + (1 - gate) * hidden_states_backward
+                    else:
+                        raise ValueError(f"Invalid mamba_bidirectional_strategy: {strategy}. Choose from: unidirectional, average, concat, weighted, gated")
                     
             elif mixer_block.block_type == "attention":
                 layer_mask = causal_mask
@@ -457,19 +491,19 @@ class BiencoderModel(nn.Module):
             return None
 
         import inspect
-      
+
         # Remove token_type_ids if encoder doesn't support it
         if (
             "token_type_ids" not in inspect.getfullargspec(encoder.forward).args
             and "token_type_ids" in input_dict.keys()
         ):
             input_dict = {k: v for k, v in input_dict.items() if k != "token_type_ids"}
-       
+
         # Get encoder outputs
       
         outputs = encoder(input_ids=input_dict["input_ids"],
                           attention_mask=input_dict["attention_mask"],
-                          output_hidden_states=True,
+            output_hidden_states=True,
                           return_dict=True,)
 
         # Extract hidden states
