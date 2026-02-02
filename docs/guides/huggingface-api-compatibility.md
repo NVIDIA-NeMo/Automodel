@@ -8,7 +8,7 @@ In practice, compatibility comes in two layers:
 
 This page summarizes what “HF compatibility” means in NeMo Automodel, calls out differences you should be aware of, and provides side-by-side examples.
 
-## Transformers version compatibility: v4 and v5
+## Transformers Version Compatibility: v4 and v5
 
 ### Transformers v4 (current default)
 
