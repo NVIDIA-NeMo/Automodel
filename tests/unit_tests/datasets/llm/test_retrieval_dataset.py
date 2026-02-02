@@ -808,24 +808,18 @@ def test_retrieval_dataset_cli_smoke(tmp_path, monkeypatch, capsys):
     assert "Dataset loading completed successfully" in capsys.readouterr().out
 
 
-def test_retrieval_dataset_inline_cli_smoke(tmp_path, monkeypatch, capsys):
+def test_retrieval_dataset_inline_smoke(tmp_path):
     f = tmp_path / "inline.jsonl"
     f.write_text(json.dumps({"query": "Q", "pos_doc": "P", "neg_doc": ["N"]}))
 
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "prog",
-            "--data_dir_list",
-            str(f),
-            "--data_type",
-            "train",
-            "--train_n_passages",
-            "2",
-            "--max_train_samples",
-            "1",
-        ],
+    ds = rdi.make_retrieval_dataset(
+        data_dir_list=str(f),
+        data_type="train",
+        train_n_passages=2,
+        do_shuffle=False,
+        max_train_samples=1,
     )
-    runpy.run_module("nemo_automodel.components.datasets.llm.retrieval_dataset_inline", run_name="__main__")
-    assert "Dataset loading completed successfully" in capsys.readouterr().out
+    ex = ds[0]
+    assert ex["question"] == "Q"
+    assert ex["doc_text"] == ["P", "N"]
+    assert ex["doc_image"] == ["", ""]
