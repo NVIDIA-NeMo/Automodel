@@ -1,4 +1,4 @@
-# Hugging Face compatibility (Transformers v4 & v5)
+# 🤗 Hugging Face Transformers compatibility
 
 NeMo Automodel is built to work with the 🤗 Hugging Face ecosystem.
 In practice, compatibility comes in two layers:
