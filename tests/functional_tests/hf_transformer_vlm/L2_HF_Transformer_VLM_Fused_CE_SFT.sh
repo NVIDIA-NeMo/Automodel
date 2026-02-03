@@ -19,7 +19,7 @@ TRANSFORMERS_OFFLINE=1 coverage run --data-file=/workspace/.coverage --source=/w
 examples/vlm_finetune/finetune.py \
   --config examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml \
   --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_gemma3_2l/ \
-  --model.output_hidden_states true \
+  --model.text_config.output_hidden_states true \
   --step_scheduler.max_steps 3 \
   --step_scheduler.global_batch_size 1 \
   --step_scheduler.local_batch_size 1 \

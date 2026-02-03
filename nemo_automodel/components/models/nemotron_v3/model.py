@@ -18,7 +18,12 @@ import torch
 import torch.nn as nn
 from transformers import AutoConfig
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common import (
+    BackendConfig,
+    HFCheckpointingMixin,
+    initialize_linear_module,
+    initialize_rms_norm_module,
+)
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -156,7 +161,7 @@ class NemotronV3Model(nn.Module):
             block.init_weights(buffer_device=buffer_device)
 
 
-class NemotronHForCausalLM(nn.Module, MoEFSDPSyncMixin):
+class NemotronHForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """NemotronV3 model with language modeling head."""
 
     @classmethod

@@ -127,9 +127,13 @@ class GptOssModel(nn.Module):
                 "beta_slow": 1.0,
                 "original_max_position_embeddings": 4096,
             }
+        if hasattr(config, "rope_parameters") and config.rope_parameters:
+            rope_theta = config.rope_parameters.get("rope_theta", 10000.0)
+        else:
+            rope_theta = getattr(config, "rope_theta", 10000.0)
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
-            base=getattr(config, "rope_theta", 10000.0),
+            base=rope_theta,
             dtype=torch.float32,
             initial_context_length=rope_scaling["original_max_position_embeddings"],
             scaling_factor=rope_scaling["factor"],

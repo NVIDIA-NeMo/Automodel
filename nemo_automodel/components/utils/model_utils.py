@@ -318,15 +318,20 @@ def init_empty_weights():
                 for k in module._parameters[name].__dict__:
                     if k in fp8_parameter_mapping:
                         kwargs[fp8_parameter_mapping[k]] = getattr(module._parameters[name], k)
+                is_hf_initialized = kwargs.pop("_is_hf_initialized", None)
             else:
                 # Standard nn.Parameter only accepts requires_grad, not arbitrary __dict__ attributes
                 # (e.g., TransformerEngine sets tensor_model_parallel on weights)
                 if param_cls is nn.Parameter:
                     kwargs = {"requires_grad": param.requires_grad}
+                    is_hf_initialized = None
                 else:
                     kwargs = module._parameters[name].__dict__.copy()
                     kwargs["requires_grad"] = param.requires_grad
+                    is_hf_initialized = kwargs.pop("_is_hf_initialized", None)
             module._parameters[name] = param_cls(module._parameters[name].to(device), **kwargs)
+            if is_hf_initialized is not None:
+                setattr(module._parameters[name], "_is_hf_initialized", is_hf_initialized)
 
     try:
         nn.Module.register_parameter = register_empty_parameter

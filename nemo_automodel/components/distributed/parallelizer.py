@@ -21,6 +21,7 @@ from types import FunctionType
 from typing import Any, Dict, Generator, List, Optional, Union
 
 import torch
+import transformers
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
@@ -43,6 +44,15 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
+
+
+def _is_transformers_v5_or_higher() -> bool:
+    """Check if transformers version is 5.x or higher."""
+    version = transformers.__version__
+    major_version = int(version.split(".")[0])
+    return major_version >= 5
+
+
 from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
 from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
 from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
@@ -487,8 +497,13 @@ def get_hf_tp_shard_plan(model):
         model_prefix = "model.language_model"
 
     elif model_cls == Gemma3ForConditionalGeneration:
-        inner_model = model.language_model
-        model_prefix = "language_model"
+        # In transformers v5, Gemma3 uses 'model' instead of 'language_model'
+        if _is_transformers_v5_or_higher():
+            inner_model = model.model
+            model_prefix = "model"
+        else:
+            inner_model = model.language_model
+            model_prefix = "language_model"
 
     elif model_cls == Llama4ForConditionalGeneration:
         inner_model = model.language_model.model
@@ -533,15 +548,35 @@ def get_hf_tp_shard_plan(model):
     if f"{model_prefix}.embed_tokens" not in hf_tp_plan:
         hf_tp_plan[f"{model_prefix}.embed_tokens"] = "rowwise_rep"
 
+    # Build translated plan, skipping HF's MoE-related styles.
+    #
+    # HuggingFace transformers v5 introduced these styles for MoE models, but they do NOT
+    # implement true expert parallelism (where each rank stores only a subset of experts).
+    # Instead, HF's approach:
+    # - local_colwise/local_rowwise: Store expert weights as local tensors (NOT sharded).
+    #   Despite the names, these do NOT perform tensor parallelism on the experts.
+    #   Each rank stores ALL expert weights (full shape), which is memory inefficient.
+    # - ep_router: Modifies routing so each rank only computes with a subset of experts.
+    #   This distributes compute but not memory.
+    # - gather: All-reduces expert outputs across ranks.
+    #
+    # Since these styles result in replicated expert weights (not sharded), and we don't
+    # support HF's routing modification approach, we skip them entirely. The experts will
+    # be replicated across all ranks and computed redundantly, which is correct but not
+    # memory/compute efficient for large MoE models.
+    _hf_moe_styles = {"ep_router", "local_colwise", "local_rowwise", "gather"}
+    translated_plan = {}
     for k, v in hf_tp_plan.items():
+        if isinstance(v, str) and (v.startswith("ep_") or v in _hf_moe_styles):
+            continue
         # speed up the tp plan for lm_head
         if (k == "lm_head" or k == "language_model.lm_head") and v == "colwise_rep":
-            hf_tp_plan[k] = ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)
+            translated_plan[k] = ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)
         else:
-            hf_tp_plan[k] = translate_to_torch_parallel_style(v)
+            translated_plan[k] = translate_to_torch_parallel_style(v)
 
-    logger.info(f"Hugging Face tp plan: {hf_tp_plan}")
-    return hf_tp_plan
+    logger.info(f"Hugging Face tp plan: {translated_plan}")
+    return translated_plan
 
 
 def import_class_from_path(name: str) -> Any:
@@ -766,8 +801,14 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
             ans.append(reduce(getattr, parts, model))
         return ans
 
+    # Gemma3 layer paths depend on transformers version
+    _gemma3_layers = (
+        ["model.layers", "model.vision_tower.vision_model.encoder.layers"]
+        if _is_transformers_v5_or_higher()
+        else ["language_model.layers", "vision_tower.vision_model.encoder.layers"]
+    )
     VLM_MODEL_CLS_TO_LAYERS = {
-        Gemma3ForConditionalGeneration: ["language_model.layers", "vision_tower.vision_model.encoder.layers"],
+        Gemma3ForConditionalGeneration: _gemma3_layers,
         Qwen2_5_VLForConditionalGeneration: ["language_model.layers", "visual.blocks"],
         Qwen2VLForConditionalGeneration: ["language_model.layers", "visual.blocks"],
         # Note: `model.` is not a mistake here, it's the full fqn
