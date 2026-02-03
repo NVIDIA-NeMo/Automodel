@@ -312,7 +312,7 @@ stage_ids = stage_ids_this_rank(pp_rank=0, pp_size=4, num_stages=8, style="v")
 # Returns: (0, 7) - rank 0 gets stages 0 and 7
 ```
 
-#### 2. **Module Name Generation**
+#### 2. Module Name Generation
 ```python
 from nemo_automodel.components.distributed.pipelining.functional import (
     generate_hf_model_fqn_per_model_part
