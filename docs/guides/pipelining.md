@@ -343,7 +343,7 @@ num_virtual_stages, stages_per_rank = calculate_virtual_stages(
 )
 ```
 
-#### 4. **Pipeline Schedule Building**
+#### 4. Pipeline Schedule Building
 ```python
 from nemo_automodel.components.distributed.pipelining.functional import build_pipeline_schedule
 
