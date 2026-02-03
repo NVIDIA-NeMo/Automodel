@@ -35,8 +35,11 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
             add_eos_token: Whether to add EOS token (default: True)
         """
         tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
-        tokenizer.add_bos_token = add_bos_token
-        tokenizer.add_eos_token = add_eos_token
+
+        if add_bos_token and getattr(tokenizer, "bos_token", None) is not None:
+            tokenizer.add_bos_token = add_bos_token
+        if add_eos_token and getattr(tokenizer, "eos_token", None) is not None:
+            tokenizer.add_eos_token = add_eos_token
         # Keep the wrapper class name at runtime, but remember the original HF tokenizer class
         # so we can save an HF-compatible `tokenizer_class` in `save_pretrained()`.
         base_tokenizer_cls = type(tokenizer)
