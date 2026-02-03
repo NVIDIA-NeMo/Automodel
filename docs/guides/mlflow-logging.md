@@ -1,8 +1,8 @@
-# MLflow Logging in NeMo Automodel
+# MLflow Logging in NeMo AutoModel
 
 ## Introduction
 
-MLflow is an open-source platform for managing the machine learning lifecycle, including experiment tracking, model versioning, and deployment. NeMo Automodel integrates with MLflow to automatically log training metrics, parameters, and artifacts during model training.
+MLflow is an open-source platform for managing the machine learning lifecycle, including experiment tracking, model versioning, and deployment. NeMo AutoModel integrates with MLflow to log training metrics, parameters, and artifacts during model training.
 
 With MLflow integration, you can:
 - Track and compare experiments across multiple runs
@@ -14,11 +14,13 @@ With MLflow integration, you can:
 
 ## Prerequisites
 
-Before using MLflow logging in NeMo Automodel, ensure you have:
+Before using MLflow logging in NeMo AutoModel, ensure you have:
 
-1. **MLflow installed**: MLflow is included as a dependency in NeMo Automodel. If needed, install it manually:
+1. **MLflow installed**: MLflow is installed with `nemo-automodel` by default. If you see an import error in your environment, install it manually:
    ```bash
-   uv add mlflow
+   pip install mlflow
+   # or:
+   uv pip install mlflow
    ```
 
 2. **MLflow tracking server** (optional): For production use, set up a tracking server to centralize experiment data. For local development, MLflow will use a local file-based store by default.
@@ -223,12 +225,14 @@ Supported storage backends include S3, Azure Blob Storage, Google Cloud Storage,
 
 If you see an import error:
 ```
-ImportError: MLflow is not installed. Please install it with: uv add mlflow
+ImportError: MLflow is not installed. Please install it (e.g. pip install mlflow).
 ```
 
 Install MLflow:
 ```bash
-uv add mlflow
+pip install mlflow
+# or:
+uv pip install mlflow
 ```
 
 ### Connection Issues
@@ -250,4 +254,4 @@ If metrics aren't appearing in MLflow:
 - [MLflow Documentation](https://mlflow.org/docs/latest/index.html)
 - [MLflow Tracking](https://mlflow.org/docs/latest/tracking.html)
 - [MLflow Python API](https://mlflow.org/docs/latest/python_api/index.html)
-- [NeMo Automodel Examples](https://github.com/NVIDIA/NeMo-Automodel/tree/main/examples)
+- [NeMo AutoModel Examples](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples)
