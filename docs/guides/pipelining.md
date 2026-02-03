@@ -292,7 +292,7 @@ Key observations:
 
 ## Using the Functional API for Custom Models
 
-While AutoPipeline is specifically designed as a high-level interface for HuggingFace models, the functional API in `nemo_automodel.components.distributed.pipelining.functional` provides more modular and accessible building blocks that can be used with any PyTorch model, including custom architectures. This separation allows for cleaner code organization where AutoPipeline handles HuggingFace-specific optimizations while the functional module remains model-agnostic.
+While AutoPipeline is specifically designed as a high-level interface for Hugging Face models, the functional API in `nemo_automodel.components.distributed.pipelining.functional` provides more modular and accessible building blocks that can be used with any PyTorch model, including custom architectures. This separation allows for cleaner code organization where AutoPipeline handles Hugging Face-specific optimizations while the functional module remains model-agnostic.
 
 ### Key Functional API Components
 
