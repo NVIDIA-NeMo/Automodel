@@ -533,7 +533,7 @@ The functional API is designed to be more accessible and modular than AutoPipeli
 4. **Flexibility**: The functional API gives you complete control over how models are split and parallelized
 5. **Testing**: Start with a small model and verify correct splitting before scaling up
 
-The functional module's modular design makes it easier to integrate pipeline parallelism into existing custom model training workflows without the HuggingFace-specific assumptions that AutoPipeline makes.
+The functional module's modular design makes it easier to integrate pipeline parallelism into existing custom model training workflows without the Hugging Face-specific assumptions that AutoPipeline makes.
 
 ## Mixed Parallelism
 
