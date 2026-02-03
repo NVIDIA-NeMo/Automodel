@@ -22,7 +22,13 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 import torch.distributed.checkpoint as dcp
 import yaml
-from huggingface_hub import constants as hf_constants
+
+# Safe import of HF_HUB_CACHE from huggingface_hub.constants
+try:
+    from huggingface_hub.constants import HF_HUB_CACHE
+except ImportError:
+    HF_HUB_CACHE = None
+
 from packaging.version import parse
 from safetensors.torch import load_file, save_file
 from torch import nn
@@ -695,18 +701,25 @@ class Checkpointer:
             getattr(model_state.model[0], "config", None), "name_or_path"
         ):
             return None
+
         pretrained_model_name_or_path = getattr(model_state.model[0], "name_or_path", None) or getattr(
             getattr(model_state.model[0], "config", None), "name_or_path", None
         )
+        # Randomly initialized HF models often have an empty `name_or_path`. In that case,
+        # there is no "original" HF snapshot to reference for metadata.
+        if not pretrained_model_name_or_path:
+            return None
+
         if os.path.isdir(pretrained_model_name_or_path):
             return pretrained_model_name_or_path
-        return get_safetensors_index_path(
-            getattr(self.config, "original_model_root_dir", hf_constants.HF_HUB_CACHE),
-            pretrained_model_name_or_path,
-        )
+
+        # `original_model_root_dir` exists on the config but may be None. In that case,
+        # fall back to the standard HF hub cache root.
+        cache_dir = getattr(self.config, "original_model_root_dir", None) or HF_HUB_CACHE
+        return get_safetensors_index_path(cache_dir, pretrained_model_name_or_path)
 
 
-def get_safetensors_index_path(cache_dir: str, repo_id: str | None) -> str | None:
+def get_safetensors_index_path(cache_dir: str | Path | None, repo_id: str | None) -> str | None:
     """
     Return the directory containing the first `model.safetensors.index.json` found for given model.
 
@@ -739,6 +752,10 @@ def get_safetensors_index_path(cache_dir: str, repo_id: str | None) -> str | Non
     if os.path.exists(repo_id):
         return repo_id
 
+    cache_dir = cache_dir or HF_HUB_CACHE
+    if cache_dir is None:
+        # Defensive guard: HF_HUB_CACHE is expected to always be a string/path.
+        raise ValueError("Hugging Face cache directory is not set (cache_dir=None).")
     repo_dir = f"models--{repo_id.replace('/', '--')}"
     snapshots_root = Path(cache_dir) / repo_dir / "snapshots"
 
