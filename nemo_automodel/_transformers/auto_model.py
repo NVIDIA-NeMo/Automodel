@@ -921,9 +921,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         )
         device = torch.cuda.current_device()
 
-        # Use meta device initialization for custom models only (HF models load weights via from_pretrained)
-        # MegatronFSDPManager and DDPManager handle their own initialization
-        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not is_hf_model
+        # Use meta device initialization when:
+        # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)
+        # - AND either multi-GPU (world_size > 1) or single-GPU custom model (not HF)
+        # HF models on single GPU load weights via from_pretrained, but multi-GPU needs meta device for sharding
+        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and (
+            get_world_size_safe() > 1 or not is_hf_model
+        )
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
         try:
@@ -1129,9 +1133,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         )
         device = torch.cuda.current_device()
 
-        # Use meta device initialization for custom models only (HF models load weights via from_config)
-        # MegatronFSDPManager and DDPManager handle their own initialization
-        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not is_hf_model
+        # Use meta device initialization when:
+        # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)
+        # - AND either multi-GPU (world_size > 1) or single-GPU custom model (not HF)
+        # HF models on single GPU load weights via from_config, but multi-GPU needs meta device for sharding
+        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and (
+            get_world_size_safe() > 1 or not is_hf_model
+        )
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
         try:
