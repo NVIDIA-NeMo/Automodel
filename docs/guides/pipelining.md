@@ -682,7 +682,7 @@ uv run torchrun --nproc_per_node=4 examples/llm/finetune.py \
     --dataloader.batch_size 8
 ```
 
-#### Full Hybrid: PP + DP + TP (8 GPUs total)
+#### Full Hybrid: PP + DP + TP (8 GPUs Total)
 ```bash
 uv run torchrun --nproc_per_node=8 examples/llm/finetune.py \
     --config your_config.yaml \
