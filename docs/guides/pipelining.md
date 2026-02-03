@@ -166,7 +166,7 @@ These two flags switch AutoPipeline to lightweight, pipeline-friendly `forward()
   
   Note: this is only used when the module you pipeline is a `...ForCausalLM`-style wrapper (i.e., it has a `.model` attribute). If you pass a base decoder module directly, `patch_causal_lm_model` typically has no effect.
 
-#### When should I change these?
+#### When Should I Change These?
 
 - **Leave both `True` (default)** for standard HuggingFace `AutoModelForCausalLM` / `...ForCausalLM` models. This is the common case and gives the expected behavior: token IDs -> hidden states -> logits across stages.
 - **Set both `False`** when your model already has a pipeline-friendly forward (returns tensors and can accept hidden states when embeddings are absent) or it needs custom kwargs/paths that the HF patch doesn't preserve (common for NeMo AutoModel-native model implementations, packed-sequence/`thd` paths, extra args like `padding_mask`, etc.). Many benchmark configs for NeMo-native models do this (for example `examples/benchmark/configs/qwen3_moe_30b_torch.yaml`).
