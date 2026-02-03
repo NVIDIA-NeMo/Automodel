@@ -36,7 +36,7 @@ For a complete guide and additional options please consult the AutoModel [Instal
 
 AutoPipeline provides enterprise-grade pipeline parallelism with the following features:
 
-- **Universal HuggingFace Support**: Works with any HuggingFace decoder-only causal language model including Llama, Qwen, Mistral, Gemma, and more
+- **Universal Hugging Face Support**: Works with any Hugging Face decoder-only causal language model including Llama, Qwen, Mistral, Gemma, and more
 - **PyTorch Native Integration**: Built on PyTorch's `torch.distributed.pipelining` for optimal performance
 - **Flexible Configuration**: Multiple scheduling strategies, configurable microbatch sizes, and automatic or manual layer splitting
 - **Mixed Parallelism Support**: Combine pipeline parallelism with data parallelism, tensor parallelism, and FSDP
