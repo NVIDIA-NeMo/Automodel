@@ -46,8 +46,8 @@ jobs:
     needs: [build-docs]
     env:
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run || false }}
-      NOTIFY_EMAILS: ${{ github.event_name == 'workflow_dispatch' && inputs.notify-emails || "akoumparouli@nvidia.com" }}
-      AWS_REGION: $${ github.event_name == 'workflow_dispatch' && inputs.aws-region || "us-east-1" }}
+      NOTIFY_EMAILS: ${{ github.event_name == 'workflow_dispatch' && inputs.notify-emails || 'akoumparouli@nvidia.com' }}
+      AWS_REGION: $${ github.event_name == 'workflow_dispatch' && inputs.aws-region || 'us-east-1' }}
     steps:
       - uses: actions/checkout@v6
         with:
