@@ -1,19 +1,19 @@
-# LLM Pre-Training with NeMo Automodel
+# LLM Pre-Training with NeMo AutoModel
 
-This guide covers **FineWeb** data preparation, **defining** a [NanoGPT‑style](https://github.com/KellerJordan/modded-nanogpt) model, and **launching and monitoring** a NeMo Automodel pre‑training run.
+This guide covers **FineWeb** data preparation, **defining** a [NanoGPT‑style](https://github.com/KellerJordan/modded-nanogpt) model, and **launching and monitoring** a NeMo AutoModel pre‑training run.
 
 ---
 
 ## Set Up Your Environment
 
-In this guide, we will use an interactive environment to install NeMo Automodel from Git. You can also install NeMo Automodel from PyPI or use our bi-monthly Docker container.
+In this guide, we will use an interactive environment to install NeMo AutoModel from Git. You can also install NeMo AutoModel from PyPI or use our bi-monthly Docker container.
 
 ```bash
-# clone / install Automodel (editable for local hacks)
+# clone / install AutoModel (editable for local hacks)
 cd /path/to/workspace/ # specify to your path as needed.
-git clone git@github.com:NVIDIA-NeMo/AutoModel.git
-cd AutoModel/
-pip install -e .[all]    # installs NeMo Automodel + optional extras
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel/
+pip install -e ".[all]"    # installs NeMo AutoModel + optional extras
 ```
 
 :::note
@@ -54,7 +54,7 @@ For the purposes of this guide, we provide a data preprocessing tool at [`nanogp
 
 ```bash
 # Step into repo root
-cd /path/to/workspace/AutoModel/
+cd /path/to/workspace/Automodel/
 
 # Generate 500 million tokens using the 10B raw split
 python tools/nanogpt_data_processor.py \
