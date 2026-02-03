@@ -329,7 +329,7 @@ module_names = generate_hf_model_fqn_per_model_part(
 )
 ```
 
-#### 3. **Virtual Stage Calculation**
+#### 3. Virtual Stage Calculation
 ```python
 from nemo_automodel.components.distributed.pipelining.functional import calculate_virtual_stages
 
