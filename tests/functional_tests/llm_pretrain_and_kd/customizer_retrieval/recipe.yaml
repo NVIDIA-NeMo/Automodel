@@ -1,0 +1,66 @@
+seed: 42
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 5
+
+model:
+  _target_: nemo_automodel.components.models.biencoder.NeMoAutoModelBiencoder.from_pretrained
+  pretrained_model_name_or_path: /app/model-cache/llama32_1b
+  share_encoder: true
+  add_linear_pooler: false
+  out_dimension: 768
+  do_gradient_checkpointing: false
+  train_n_passages: 2
+  eval_negative_size: 1
+  pooling: avg
+  l2_normalize: true
+  t: 0.02
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  torch_dtype: bfloat16
+
+tokenizer:
+  _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: /app/model-cache/llama32_1b
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset
+    data_dir_list: /home/TestData/automodel/embedding_testdata/
+    data_type: train
+    train_n_passages: 2
+    eval_negative_size: 1
+    seed: 42
+    do_shuffle: false
+    max_train_samples: 2
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.RetrievalBiencoderCollator
+    q_max_len: 64
+    p_max_len: 64
+    query_prefix: ""
+    passage_prefix: ""
+    padding: longest
+    pad_to_multiple_of: 8
+  shuffle: false
+  num_workers: 0
+
+step_scheduler:
+  global_batch_size: 1
+  local_batch_size: 1
+  ckpt_every_steps: 1
+  val_every_steps: 1000000
+  num_epochs: 1
+  max_steps: 1
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /workspace/output/biencoder_inline/checkpoints
+  model_save_format: safetensors
+  save_consolidated: false
