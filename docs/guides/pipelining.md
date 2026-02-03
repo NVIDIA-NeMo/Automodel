@@ -148,7 +148,7 @@ ap = AutoPipeline(
 
 ### Model Patching (`patch_inner_model`, `patch_causal_lm_model`)
 
-AutoPipeline splits a model by deep-copying it per stage and pruning away modules that don't belong to that stage. Many HuggingFace models assume the full module tree is present and return `ModelOutput` objects; after pruning, their original `forward()` often breaks (or returns objects that are awkward to pipeline).
+AutoPipeline splits a model by deep-copying it per stage and pruning away modules that don't belong to that stage. Many Hugging Face models assume the full module tree is present and return `ModelOutput` objects; after pruning, their original `forward()` often breaks (or returns objects that are awkward to pipeline).
 
 These two flags switch AutoPipeline to lightweight, pipeline-friendly `forward()` implementations that return tensors (see `nemo_automodel.components.distributed.pipelining.hf_utils.patch_hf_model_for_pp`):
 
