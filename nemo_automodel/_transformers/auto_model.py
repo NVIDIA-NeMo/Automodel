@@ -648,11 +648,13 @@ def apply_model_infrastructure(
             setattr(model, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
 
     # Load the checkpoint if needed and return
-    # Weights need to be loaded for meta device models that were parallelized:
-    # 1. When parallelize_fn was used (which will internally apply FSDP2/EP sharding)
-    # 2. When FSDP2Manager.parallelize was used (but not MegatronFSDP which handles weights internally)
+    # Weights need to be loaded for meta device models:
+    # 1. Single GPU custom models (no parallelization but still need weights)
+    # 2. When parallelize_fn was used (which will internally apply FSDP2/EP sharding)
+    # 3. When FSDP2Manager.parallelize was used (but not MegatronFSDP which handles weights internally)
     should_load_checkpoint = is_meta_device and any(
         [
+            get_world_size_safe() == 1,
             parallelize_fn is not None and get_world_size_safe() > 1,
             callable(getattr(model_wrapper, "parallelize", None)),
         ]
@@ -919,12 +921,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         )
         device = torch.cuda.current_device()
 
-        # Neither of these parallelization methods support meta device initialization
-        is_meta_device = (
-            not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager))
-            and not force_hf
-            and get_world_size_safe() > 1
-        )
+        # Use meta device initialization for custom models only (HF models load weights via from_pretrained)
+        # MegatronFSDPManager and DDPManager handle their own initialization
+        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not is_hf_model
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
         try:
@@ -1130,12 +1129,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         )
         device = torch.cuda.current_device()
 
-        # Neither of these parallelization methods support meta device initialization
-        is_meta_device = (
-            not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager))
-            and not force_hf
-            and get_world_size_safe() > 1
-        )
+        # Use meta device initialization for custom models only (HF models load weights via from_config)
+        # MegatronFSDPManager and DDPManager handle their own initialization
+        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not is_hf_model
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
         try:

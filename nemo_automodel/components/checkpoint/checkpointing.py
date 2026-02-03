@@ -701,7 +701,7 @@ class Checkpointer:
         if os.path.isdir(pretrained_model_name_or_path):
             return pretrained_model_name_or_path
         return get_safetensors_index_path(
-            getattr(self.config, "original_model_root_dir", hf_constants.HF_HOME),
+            getattr(self.config, "original_model_root_dir", hf_constants.HF_HUB_CACHE),
             pretrained_model_name_or_path,
         )
 
