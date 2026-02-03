@@ -146,7 +146,7 @@ ap = AutoPipeline(
 ).build(model, loss_fn=loss_fn)
 ```
 
-### Model patching (`patch_inner_model`, `patch_causal_lm_model`)
+### Model Patching (`patch_inner_model`, `patch_causal_lm_model`)
 
 AutoPipeline splits a model by deep-copying it per stage and pruning away modules that don't belong to that stage. Many HuggingFace models assume the full module tree is present and return `ModelOutput` objects; after pruning, their original `forward()` often breaks (or returns objects that are awkward to pipeline).
 
