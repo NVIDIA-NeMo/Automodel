@@ -60,38 +60,46 @@ If you are running Transformers v5 in another environment, you can still use NeM
 <table>
   <thead>
     <tr>
-      <th style="width: 50%;">🤗 Hugging Face (<code>transformers</code>)</th>
-      <th style="width: 50%;">NeMo Automodel (<code>nemo_automodel</code>)</th>
+      <th style="width: 45%;">🤗 Hugging Face (<code>transformers</code>)</th>
+      <th style="width: 45%;">NeMo Automodel (<code>nemo_automodel</code>)</th>
+      <th style="width: 10%;">Status</th>
     </tr>
   </thead>
   <tbody>
     <tr>
       <td><code>transformers.AutoModelForCausalLM</code></td>
       <td><code>nemo_automodel.NeMoAutoModelForCausalLM</code></td>
+      <td>✅</td>
     </tr>
     <tr>
       <td><code>transformers.AutoModelForImageTextToText</code></td>
       <td><code>nemo_automodel.NeMoAutoModelForImageTextToText</code></td>
+      <td>✅</td>
     </tr>
     <tr>
       <td><code>transformers.AutoModelForSequenceClassification</code></td>
       <td><code>nemo_automodel.NeMoAutoModelForSequenceClassification</code></td>
+      <td>✅</td>
     </tr>
     <tr>
       <td><code>transformers.AutoModelForTextToWaveform</code></td>
       <td><code>nemo_automodel.NeMoAutoModelForTextToWaveform</code></td>
+      <td>✅</td>
     </tr>
     <tr>
       <td><code>transformers.AutoTokenizer.from_pretrained(...)</code></td>
       <td><code>nemo_automodel.NeMoAutoTokenizer.from_pretrained(...)</code></td>
+      <td>✅</td>
     </tr>
     <tr>
       <td><code>model.generate(...)</code></td>
       <td><code>model.generate(...)</code></td>
+      <td>🚧</td>
     </tr>
     <tr>
       <td><code>model.save_pretrained(path)</code></td>
       <td><code>model.save_pretrained(path, checkpointer=...)</code></td>
+      <td>🚧</td>
     </tr>
   </tbody>
 </table>
