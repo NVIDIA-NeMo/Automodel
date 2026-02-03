@@ -10,7 +10,7 @@ AutoPipeline is NeMo Automodel's high-level pipeline parallelism interface speci
 
 For custom models and more granular control, the functional API in `nemo_automodel.components.distributed.pipelining.functional` provides modular, accessible building blocks that can be used with any PyTorch model architecture.
 
-This guide walks you through the complete process of using AutoPipeline for HuggingFace models and the functional API for custom models. You'll learn how to configure pipeline stages, integrate with existing training workflows, optimize performance, and combine pipeline parallelism with other parallelization strategies.
+This guide walks you through the complete process of using AutoPipeline for Hugging Face models and the functional API for custom models. You'll learn how to configure pipeline stages, integrate with existing training workflows, optimize performance, and combine pipeline parallelism with other parallelization strategies.
 
 :::{important}
 Before proceeding with this guide, please ensure that you have NeMo AutoModel installed on your machine.
