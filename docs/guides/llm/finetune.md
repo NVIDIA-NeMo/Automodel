@@ -303,14 +303,14 @@ the default recipes. -->
 automodel finetune llm -c sft_guide.yaml
 ```
 
-where `finetune` is name the name of the recipe file (excluding the `.py` extension) and `llm` the domain of the model.
+where `finetune` is the CLI command (it maps to the LLM training recipe under `nemo_automodel/recipes/llm/train_ft.py`) and `llm` is the model domain.
 
 ### Invoke the Recipe Script Directly
 
-Alternatively, you can run the recipe [script](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py) directly using [torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html), as shown below.
+Alternatively, you can run the recipe entrypoint [script](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/finetune.py) directly using [torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html), as shown below.
 
 ``` bash
-torchrun --nproc-per-node=8 examples/llm/finetune.py --config sft_guide.yaml
+torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config sft_guide.yaml
 ```
 
 ### Sample Output
