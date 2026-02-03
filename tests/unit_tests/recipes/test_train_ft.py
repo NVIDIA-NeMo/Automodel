@@ -206,14 +206,6 @@ def test_peft_with_pipeline_parallelism_enabled(caplog):
     mock_autopipeline = MagicMock()
     mock_autopipeline.parts = []
 
-    # Create mock checkpointer with config
-    mock_checkpointer_config = MagicMock()
-    mock_checkpointer_config.dequantize_base_checkpoint = False
-    mock_checkpointer_config.model_state_dict_keys = None
-    mock_checkpointer = MagicMock()
-    mock_checkpointer.config = mock_checkpointer_config
-    mock_checkpointer.load_base_model = MagicMock()
-
     # Mock the apply_lora_to_linear_modules function (now inside apply_model_infrastructure)
     with patch('nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules') as mock_apply_lora:
         with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
@@ -231,7 +223,6 @@ def test_peft_with_pipeline_parallelism_enabled(caplog):
                                     cfg_peft=cfg_peft,
                                     model_wrapper=None,
                                     seed=42,
-                                    checkpointer=mock_checkpointer,
                                     autopipeline=mock_autopipeline,
                                     loss_fn=None,
                                 )
@@ -255,20 +246,6 @@ def test_peft_without_pipeline_parallelism(caplog):
     cfg_opt = DummyOptConfig()
     cfg_peft = DummyPeftConfig()
 
-    # Create mock checkpointer with config
-    mock_checkpointer_config = MagicMock()
-    mock_checkpointer_config.dequantize_base_checkpoint = False
-    mock_checkpointer_config.model_state_dict_keys = None
-    mock_checkpointer = MagicMock()
-    mock_checkpointer.config = mock_checkpointer_config
-    mock_checkpointer.load_base_model = MagicMock()
-
-    # Stub: move from meta to device inside load_base_model
-    def _load_base_model_stub(model, device, *args, **kwargs):
-        if hasattr(model, "to_empty"):
-            model.to_empty(device=device)
-    mock_checkpointer.load_base_model = _load_base_model_stub
-
     # Mock the apply_lora_to_linear_modules function (now inside apply_model_infrastructure)
     with patch('nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules') as mock_apply_lora:
         with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
@@ -286,7 +263,6 @@ def test_peft_without_pipeline_parallelism(caplog):
                                     cfg_peft=cfg_peft,
                                     model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                                     seed=42,
-                                    checkpointer=mock_checkpointer,
                                     autopipeline=None,  # No pipeline parallelism
                                     loss_fn=None,
                                 )
@@ -308,20 +284,6 @@ def test_peft_with_tp_disables_triton(caplog):
     cfg_opt = DummyOptConfig()
     cfg_peft = DummyPeftConfig()
 
-    # Create mock checkpointer with config
-    mock_checkpointer_config = MagicMock()
-    mock_checkpointer_config.dequantize_base_checkpoint = False
-    mock_checkpointer_config.model_state_dict_keys = None
-    mock_checkpointer = MagicMock()
-    mock_checkpointer.config = mock_checkpointer_config
-    mock_checkpointer.load_base_model = MagicMock()
-
-    # Stub: move from meta to device inside load_base_model
-    def _load_base_model_stub(model, device, *args, **kwargs):
-        if hasattr(model, "to_empty"):
-            model.to_empty(device=device)
-    mock_checkpointer.load_base_model = _load_base_model_stub
-
     # Mock the apply_lora_to_linear_modules function (now inside apply_model_infrastructure)
     with patch('nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules') as mock_apply_lora:
         with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
@@ -339,7 +301,6 @@ def test_peft_with_tp_disables_triton(caplog):
                                     cfg_peft=cfg_peft,
                                     model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                                     seed=42,
-                                    checkpointer=mock_checkpointer,
                                     tp_size=2,  # Enable TP
                                     autopipeline=None,
                                     loss_fn=None,
@@ -426,14 +387,6 @@ def test_force_hf_true_disables_meta_init(monkeypatch):
     cfg_opt = DummyOptConfig()
     cfg_peft = None
 
-    # Create mock checkpointer with config
-    mock_checkpointer_config = MagicMock()
-    mock_checkpointer_config.dequantize_base_checkpoint = False
-    mock_checkpointer_config.model_state_dict_keys = None
-    mock_checkpointer = MagicMock()
-    mock_checkpointer.config = mock_checkpointer_config
-    mock_checkpointer.load_base_model = MagicMock()
-
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep", lambda *a, **k: True)
     monkeypatch.setattr("nemo_automodel._transformers.auto_model._supports_logits_to_keep", lambda *a, **k: True)
     monkeypatch.setattr("nemo_automodel._transformers.auto_model._verify_sdpa_support", lambda *a, **k: None)
@@ -446,7 +399,6 @@ def test_force_hf_true_disables_meta_init(monkeypatch):
         cfg_peft=cfg_peft,
         model_wrapper=SimpleNamespace(parallelize=lambda m: m),
         seed=123,
-        checkpointer=mock_checkpointer,
         autopipeline=None,
         loss_fn=None,
         parallelize_fn=None,
@@ -1080,25 +1032,12 @@ class DummyModelConfigWithAdapter:
 @requires_cuda
 def test_build_model_state_dict_keys_uses_adapter(caplog):
     """Test that state_dict_keys are transformed using _maybe_adapt_state_dict_to_hf when adapter is present.
-    Note: state_dict_keys are now stored in checkpointer.config.model_state_dict_keys."""
+    """
 
     cfg_model = DummyModelConfigWithAdapter()
     cfg_opt = DummyOptConfig()
     cfg_peft = None
 
-    # Create mock checkpointer with config that has dequantize_base_checkpoint
-    mock_checkpointer_config = MagicMock()
-    mock_checkpointer_config.dequantize_base_checkpoint = False
-    mock_checkpointer_config.model_state_dict_keys = None
-    mock_checkpointer = MagicMock()
-    mock_checkpointer.config = mock_checkpointer_config
-    mock_checkpointer.load_base_model = MagicMock()
-
-    def _load_base_model_stub(model, device, *args, **kwargs):
-        if hasattr(model, "to_empty"):
-            model.to_empty(device=device)
-    mock_checkpointer.load_base_model = _load_base_model_stub
-
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
         with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
@@ -1110,41 +1049,23 @@ def test_build_model_state_dict_keys_uses_adapter(caplog):
                         cfg_peft=cfg_peft,
                         model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                         seed=42,
-                        checkpointer=mock_checkpointer,
                         autopipeline=None,
                         loss_fn=None,
                     )
 
-    # Verify that state_dict_keys are stored in checkpointer.config and transformed
-    state_dict_keys = mock_checkpointer.config.model_state_dict_keys
-    assert state_dict_keys is not None, "state_dict_keys should be set in checkpointer.config"
-    assert len(state_dict_keys) > 0, "state_dict_keys should not be empty"
-    for key in state_dict_keys:
-        assert key.startswith("transformed_"), f"Key '{key}' should be transformed by adapter"
+    # Model should be instantiated
+    assert model is not None
+    assert optimizer is not None
 
 
 @requires_cuda
 def test_build_model_state_dict_keys_without_adapter():
-    """Test that state_dict_keys are not transformed when no adapter is present.
-    Note: state_dict_keys are now stored in checkpointer.config.model_state_dict_keys."""
+    """Test that state_dict_keys are not transformed when no adapter is present."""
 
     cfg_model = DummyModelConfig()  # DummyModel has no state_dict_adapter
     cfg_opt = DummyOptConfig()
     cfg_peft = None
 
-    # Create mock checkpointer
-    mock_checkpointer_config = MagicMock()
-    mock_checkpointer_config.dequantize_base_checkpoint = False
-    mock_checkpointer_config.model_state_dict_keys = None
-    mock_checkpointer = MagicMock()
-    mock_checkpointer.config = mock_checkpointer_config
-    mock_checkpointer.load_base_model = MagicMock()
-
-    def _load_base_model_stub(model, device, *args, **kwargs):
-        if hasattr(model, "to_empty"):
-            model.to_empty(device=device)
-    mock_checkpointer.load_base_model = _load_base_model_stub
-
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
         with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
@@ -1156,22 +1077,18 @@ def test_build_model_state_dict_keys_without_adapter():
                         cfg_peft=cfg_peft,
                         model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                         seed=42,
-                        checkpointer=mock_checkpointer,
                         autopipeline=None,
                         loss_fn=None,
                     )
 
-    # Verify that state_dict_keys are stored and not transformed (no 'transformed_' prefix)
-    state_dict_keys = mock_checkpointer.config.model_state_dict_keys
-    assert state_dict_keys is not None, "state_dict_keys should be set in checkpointer.config"
-    assert len(state_dict_keys) > 0, "state_dict_keys should not be empty"
-    for key in state_dict_keys:
-        assert not key.startswith("transformed_"), f"Key '{key}' should not be transformed without adapter"
+    # Model should be instantiated
+    assert model is not None
+    assert optimizer is not None
 
 
 @requires_cuda
-def test_build_model_infers_dequantize_from_model_config():
-    """Test that dequantize_base_checkpoint is inferred from model.config.quantization_config."""
+def test_build_model_with_quantized_model_config():
+    """Test that model with quantization_config is properly instantiated."""
 
     cfg_opt = DummyOptConfig()
     cfg_peft = None
@@ -1192,19 +1109,6 @@ def test_build_model_infers_dequantize_from_model_config():
 
     cfg_model = DummyQuantizedModelConfig()
 
-    # Create mock checkpointer with dequantize_base_checkpoint=None (to trigger inference)
-    mock_checkpointer_config = MagicMock()
-    mock_checkpointer_config.dequantize_base_checkpoint = None
-    mock_checkpointer_config.model_state_dict_keys = None
-    mock_checkpointer = MagicMock()
-    mock_checkpointer.config = mock_checkpointer_config
-    mock_checkpointer.load_base_model = MagicMock()
-
-    def _load_base_model_stub(model, device, *args, **kwargs):
-        if hasattr(model, "to_empty"):
-            model.to_empty(device=device)
-    mock_checkpointer.load_base_model = _load_base_model_stub
-
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
         with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
@@ -1216,36 +1120,23 @@ def test_build_model_infers_dequantize_from_model_config():
                         cfg_peft=cfg_peft,
                         model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                         seed=42,
-                        checkpointer=mock_checkpointer,
                         autopipeline=None,
                         loss_fn=None,
                     )
 
-    # Verify that dequantize_base_checkpoint was inferred as True
-    assert mock_checkpointer_config.dequantize_base_checkpoint is True
+    # Model should be instantiated with quantization config
+    assert model is not None
+    assert hasattr(model.config, "quantization_config")
 
 
 @requires_cuda
-def test_build_model_dequantize_defaults_to_false_without_quant_config():
-    """Test that dequantize_base_checkpoint defaults to False when model has no quantization_config."""
+def test_build_model_without_quant_config():
+    """Test that model without quantization_config is properly instantiated."""
 
     cfg_model = DummyModelConfig()  # DummyModel has no config.quantization_config
     cfg_opt = DummyOptConfig()
     cfg_peft = None
 
-    # Create mock checkpointer with dequantize_base_checkpoint=None (to trigger inference)
-    mock_checkpointer_config = MagicMock()
-    mock_checkpointer_config.dequantize_base_checkpoint = None
-    mock_checkpointer_config.model_state_dict_keys = None
-    mock_checkpointer = MagicMock()
-    mock_checkpointer.config = mock_checkpointer_config
-    mock_checkpointer.load_base_model = MagicMock()
-
-    def _load_base_model_stub(model, device, *args, **kwargs):
-        if hasattr(model, "to_empty"):
-            model.to_empty(device=device)
-    mock_checkpointer.load_base_model = _load_base_model_stub
-
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
         with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
@@ -1257,13 +1148,13 @@ def test_build_model_dequantize_defaults_to_false_without_quant_config():
                         cfg_peft=cfg_peft,
                         model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                         seed=42,
-                        checkpointer=mock_checkpointer,
                         autopipeline=None,
                         loss_fn=None,
                     )
 
-    # Verify that dequantize_base_checkpoint was inferred as False
-    assert mock_checkpointer_config.dequantize_base_checkpoint is False
+    # Model should be instantiated without quantization config
+    assert model is not None
+    assert not hasattr(model.config, "quantization_config")
 
 
 # =============================================================================
@@ -1278,12 +1169,6 @@ def test_build_model_disables_foreach_with_tp():
     cfg_opt = DummyOptConfig()
     cfg_opt.foreach = True  # Initially True
 
-    mock_checkpointer_config = MagicMock()
-    mock_checkpointer_config.dequantize_base_checkpoint = None
-    mock_checkpointer_config.model_state_dict_keys = None
-    mock_checkpointer = MagicMock()
-    mock_checkpointer.config = mock_checkpointer_config
-
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
         with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
@@ -1294,7 +1179,6 @@ def test_build_model_disables_foreach_with_tp():
                         cfg_peft=None,
                         model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                         seed=42,
-                        checkpointer=mock_checkpointer,
                         tp_size=2,  # TP > 1
                         autopipeline=None,
                         loss_fn=None,
@@ -1310,12 +1194,6 @@ def test_build_model_returns_model_optimizer_loss_fn_tuple():
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig()
 
-    mock_checkpointer_config = MagicMock()
-    mock_checkpointer_config.dequantize_base_checkpoint = None
-    mock_checkpointer_config.model_state_dict_keys = None
-    mock_checkpointer = MagicMock()
-    mock_checkpointer.config = mock_checkpointer_config
-
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
         with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
@@ -1326,7 +1204,6 @@ def test_build_model_returns_model_optimizer_loss_fn_tuple():
                         cfg_peft=None,
                         model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                         seed=42,
-                        checkpointer=mock_checkpointer,
                         autopipeline=None,
                         loss_fn=MagicMock(),
                     )

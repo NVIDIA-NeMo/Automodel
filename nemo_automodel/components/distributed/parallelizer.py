@@ -1119,6 +1119,26 @@ def megatron_fsdp_strategy_parallelize(
     # Import MegatronFSDP unit modules specified by the user.
     megatron_fsdp_unit_modules = import_classes_from_paths(megatron_fsdp_unit_modules)
 
+    # MegatronFSDP requires a sharded DP dimension to create its param/grad buffers.
+    # In practice, configurations like world_size=2,tp=2 -> dp=1 frequently hit
+    # DTensor metadata assertions inside megatron_fsdp. In that case, we still
+    # support training by applying TP-only and skipping the MegatronFSDP wrapper.
+    if dp_mesh.size() == 1:
+        logger.warning(
+            "MegatronFSDP DP shard group size is 1; skipping MegatronFSDP wrapping and returning the "
+            "TP-parallelized model. To enable MegatronFSDP sharding, use dp_size>1 (e.g., tp_size=1 "
+            "for world_size=2)."
+        )
+        # `parallelize_module` only moves/shards modules covered by the TP plan.
+        # Ensure the remaining (non-sharded) parameters/buffers are on the local device.
+        if getattr(device_mesh, "device_type", None) == "cuda" and torch.cuda.is_available():
+            try:
+                model = model.to(torch.device("cuda", torch.cuda.current_device()))
+            except Exception:
+                # Best-effort fallback (e.g., if current_device isn't set).
+                model = model.to("cuda")
+        return model, optimizer
+
     # Wrap model with MegatronFSDP.
     model, optimizer = megatron_fsdp_fully_shard(
         module=model,
@@ -1133,7 +1153,6 @@ def megatron_fsdp_strategy_parallelize(
         preserve_fp32_weights=preserve_fp32_weights,
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
-        sync_model_each_microbatch=False,  # For better performance, avoid sync every step
         check_for_nan_in_grad=check_for_nan_in_grad,
         average_in_collective=average_in_collective,
         disable_bucketing=disable_bucketing,

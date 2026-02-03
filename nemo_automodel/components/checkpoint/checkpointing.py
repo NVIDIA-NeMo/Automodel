@@ -91,7 +91,9 @@ class CheckpointingConfig:
     model_repo_id: str
     save_consolidated: bool
     is_peft: bool
-    model_state_dict_keys: list[str] = None  # copy of the model state dict keys before any parallelization
+    model_state_dict_keys: list[str] = (
+        None  # copy of the model state dict keys before any parallelization. Kept for BW compatibility.
+    )
     is_async: bool = False
     dequantize_base_checkpoint: bool | None = None
     original_model_root_dir: str | None = None
@@ -609,15 +611,19 @@ class Checkpointer:
             model_part = model_state.model[0]
             config = getattr(model_part, "config", None)
             model_type = getattr(config, "model_type", None)
+            pre_shard_hf_state_dict_keys = (
+                getattr(model, "_pre_shard_hf_state_dict_keys", None) or self.config.model_state_dict_keys
+            )
             if model_type and requires_tensor_merging(model_type) and not hasattr(model_part, "state_dict_adapter"):
                 # in this case, Transformers performed weight conversion so we will save the converted format in the checkpoint
                 num_shards = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
-                fqn_to_file_index_mapping = _equally_divide_layers(num_shards, self.config.model_state_dict_keys)
+                fqn_to_file_index_mapping = _equally_divide_layers(num_shards, pre_shard_hf_state_dict_keys)
             else:
                 # some HF models like Moonlight-16B have non-persistent buffers in the base checkpoint
                 # however, HF initializes buffers with persistent=False, so we need to make sure these
                 # buffer keys are not saved during checkpointing
-                keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - set(self.config.model_state_dict_keys))
+                # The `_pre_shard_hf_state_dict_keys` attribute is set in the `apply_model_infrastructure` in auto_model.py
+                keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - set(pre_shard_hf_state_dict_keys))
                 if model_state.is_tied_lm_head:
                     keys_to_remove.append(model_state.lm_head_param_name)
                 for key in keys_to_remove:
