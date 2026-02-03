@@ -763,7 +763,7 @@ AutoPipeline and the functional API together provide a complete pipeline paralle
 
 Key takeaways:
 - Pipeline parallelism enables training of models too large for a single GPU
-- AutoPipeline provides a simple API for HuggingFace models with powerful customization options
+- AutoPipeline provides a simple API for Hugging Face models with powerful customization options
 - The functional API offers modular components for implementing pipeline parallelism with any PyTorch model
 - Both can be combined with other parallelization strategies for optimal performance
 - Use built-in monitoring tools to understand and optimize your pipeline
