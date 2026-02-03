@@ -1,6 +1,6 @@
-# Install NeMo Automodel
+# Install NeMo AutoModel
 
-This guide explains how to install NeMo Automodel for LLM, VLM, and OMNI models on various platforms and environments. Depending on your use case, there are several ways to install it:
+This guide explains how to install NeMo AutoModel for LLM, VLM, and OMNI models on various platforms and environments. Depending on your use case, there are several ways to install it:
 
 | Method                  | Dev Mode | Use Case                                                          | Recommended For             |
 | ----------------------- | ---------|----------------------------------------------------------------- | ---------------------------- |
@@ -13,7 +13,7 @@ This guide explains how to install NeMo Automodel for LLM, VLM, and OMNI models 
 ## Prerequisites
 
 ### System Requirements
-- **Python**: 3.9 or higher
+- **Python**: 3.10 or higher
 - **CUDA**: 11.8 or higher (for GPU support)
 - **Memory**: Minimum 16GB RAM, 32GB+ recommended
 - **Storage**: At least 50GB free space for models and datasets
@@ -90,36 +90,48 @@ This installs Automodel in editable mode, so changes to the code are immediately
 :::
 
 ### Mount the Repo into a NeMo Docker Container
-To run `Automodel` inside a NeMo container while **mounting your local repo**, follow these steps:
+To run NeMo AutoModel inside a NeMo container while **mounting your local repo**, follow these steps:
 
 ```bash
-# Step 1: Clone the Automodel repository.
-git clone https://github.com/NVIDIA-NeMo/Automodel.git && cd Automodel && \
+# Step 1: Clone the AutoModel repository
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
 
-# Step 2: Pull the latest compatible NeMo container (replace `25.11.00` with [latest](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) if needed).
-docker pull nvcr.io/nvidia/nemo-automodel:25.11.00 && \
+# Step 2: Pull a compatible container image (replace the tag as needed)
+docker pull nvcr.io/nvidia/nemo-automodel:25.11.00
 
-# Step 3: Run the NeMo container with GPU support, shared memory, and mount the repo.
+# Step 3: Run the container, mount the repo, and run a quick sanity check
 docker run --gpus all -it --rm \
-  -v $(pwd):/workspace/Automodel \         # Mount repo into container workspace
-  -v $(pwd)/Automodel:/opt/Automodel \     # Optional: Mount Automodel under /opt for flexibility
-  --shm-size=8g \                           # Increase shared memory for PyTorch/data loading
-  nvcr.io/nvidia/nemo-automodel:25.11.00 /bin/bash -c "\
-    cd /workspace/Automodel && \           # Enter the mounted repo
-    pip install -e . && \                  # Install Automodel in editable mode
-    python3 examples/llm/finetune.py" # Run a usage example
+  --shm-size=8g \
+  -v "$PWD":/workspace/Automodel \
+  nvcr.io/nvidia/nemo-automodel:25.11.00 \
+  /bin/bash -lc "\
+    cd /workspace/Automodel && \
+    pip install -e . && \
+    python3 examples/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml"
 ```
 :::{note}
-The above `docker` command uses the volume `-v` option to mount the local `Automodel` directory
-under `/opt/Automodel`.
+The above `docker` command mounts your local `Automodel` directory into the container at `/workspace/Automodel`.
 :::
 
-## Bonus: Install Extras
-Some functionality may require optional extras. You can install them like this:
+## Optional dependencies (extras)
+Some functionality (notably VLM recipes and CUDA-accelerated libraries) is gated behind optional extras.
+
+Common extras:
+- `vlm`: required for `examples/vlm_*`
+- `cuda`: CUDA-adjacent dependencies (e.g., Transformer Engine, bitsandbytes, mamba)
+- `fa`: flash-attn
+- `moe`: MoE dependencies (e.g., DeepEP)
+- `all`: most optional dependencies (includes `vlm` and `cuda`)
+
+Install extras with pip:
+
 ```bash
-pip3 install nemo-automodel[cli]    # Installs only the Automodel CLI
-pip3 install nemo-automodel         # Installs the CLI and all LLM dependencies.
-pip3 install nemo-automodel[vlm]    # Install all VLM-related dependencies.
+pip3 install "nemo-automodel[vlm]"
+pip3 install "nemo-automodel[all]"
+
+# Add flash-attn (optional)
+pip3 install "nemo-automodel[all,fa]"
 ```
 
 ## Summary
