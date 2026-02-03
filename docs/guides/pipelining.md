@@ -746,7 +746,7 @@ uv run torchrun --nproc_per_node=2 examples/llm/finetune.py --config config.yaml
 
 ## Conclusion
 
-AutoPipeline and the functional API together provide a complete pipeline parallelism solution for both HuggingFace and custom models. AutoPipeline offers a high-level, optimized interface specifically for HuggingFace models, while the functional module provides modular, accessible building blocks for custom architectures.
+AutoPipeline and the functional API together provide a complete pipeline parallelism solution for both Hugging Face and custom models. AutoPipeline offers a high-level, optimized interface specifically for Hugging Face models, while the functional module provides modular, accessible building blocks for custom architectures.
 
 Key takeaways:
 - Pipeline parallelism enables training of models too large for a single GPU
