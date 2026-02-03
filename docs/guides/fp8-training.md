@@ -1,10 +1,10 @@
-# FP8 Training in NeMo Automodel
+# FP8 Training in NeMo AutoModel
 
-NeMo Automodel now supports FP8 quantization using [TorchAO](https://github.com/pytorch/ao) and `torch.compile` to accelerate training on compatible hardware.
+NeMo AutoModel supports FP8 quantization using [TorchAO](https://github.com/pytorch/ao) and `torch.compile` to accelerate training on compatible hardware.
 
 FP8 (8-bit floating point) quantization can provide substantial speedups for models where the majority of GEMMs are sufficiently large. The speedup from using FP8 tensor cores must outweigh the overhead of dynamic quantization.
 
-### Requirements for FP8 Training in NeMo-Automodel
+### Requirements for FP8 Training in NeMo AutoModel
 
 To enable FP8 training in NeMo Automodel, the following hardware and software requirements must be met:
 
@@ -105,12 +105,12 @@ FP8 quantization provides measurable performance improvements while maintaining 
 ## Ready-to-Use Recipes
 We provide FP8 training configs for popular models:
 
-- **Llama**: [Llama 3.1 8B](https://github.com/NVIDIA/NeMo-Automodel/blob/main/examples/llm_finetune/llama/llama3_1_8b_hellaswag_fp8.yaml)
-- **Mistral**: [Mistral 7B](https://github.com/NVIDIA/NeMo-Automodel/blob/main/examples/llm_finetune/mistral/mistral_7b_hellaswag_fp8.yaml), [Mistral Nemo 2407](https://github.com/NVIDIA/NeMo-Automodel/blob/main/examples/llm_finetune/mistral/mistral_nemo_2407_hellaswag_fp8.yaml) 
-- **Qwen**: [Qwen 2.5 7B](https://github.com/NVIDIA/NeMo-Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_7b_hellaswag_fp8.yaml)
-- **Phi**: [Phi 4](https://github.com/NVIDIA/NeMo-Automodel/blob/main/examples/llm_finetune/phi/phi_4_hellaswag_fp8.yaml)
+- **Llama**: [Llama 3.1 8B](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml)
+- **Mistral**: [Mistral 7B](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_7b_hellaswag_fp8.yaml), [Mistral Nemo 2407](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_nemo_2407_hellaswag_fp8.yaml)
+- **Qwen**: [Qwen 2.5 7B](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_7b_hellaswag_fp8.yaml)
+- **Phi**: [Phi 4](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_4_hellaswag_fp8.yaml)
 
-Check out our [examples directory](https://github.com/NVIDIA/NeMo-Automodel/tree/main/examples/llm_finetune/) for more recipes and configurations.
+Check out our [examples directory](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune) for more recipes and configurations.
 
 To run any of these FP8 training recipes, use the following command:
 
