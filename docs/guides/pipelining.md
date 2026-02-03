@@ -45,7 +45,7 @@ AutoPipeline provides enterprise-grade pipeline parallelism with the following f
 
 ## Quick Start with AutoPipeline (HuggingFace Models)
 
-Here's a minimal example to get started with AutoPipeline using 2 pipeline stages with a HuggingFace model:
+Here's a minimal example to get started with AutoPipeline using 2 pipeline stages with a Hugging Face model:
 
 ```python
 import torch
