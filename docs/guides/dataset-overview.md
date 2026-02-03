@@ -1,10 +1,11 @@
-# Dataset Overview: LLM and VLM Datasets in NeMo Automodel
+# Dataset Overview: LLM, VLM, and Retrieval Datasets in NeMo Automodel
 
-This page summarizes the datasets supported in NeMo Automodel for LLMs and VLMs and shows how to plug in your own datasets using Python functions or the YAML `_target_` mechanism.
+This page summarizes the datasets supported in NeMo Automodel for LLM, VLM, and retrieval/embedding (biencoder) training and shows how to plug in your own datasets using Python functions or the YAML `_target_` mechanism.
 
-- See also: [LLM datasets](llm/dataset.md) and [VLM datasets](vlm/dataset.md) for deeper, task-specific guides.
+- See also: [LLM datasets](llm/dataset.md), [VLM datasets](vlm/dataset.md), and [Biencoder retrieval dataset](llm/retrieval-dataset.md) for deeper, task-specific guides.
 
 - If a dataset you need is missing, please open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) with a short description and example schema so we can prioritize support.
+---
 
 ## LLM Datasets
 
@@ -12,9 +13,13 @@ NeMo Automodel supports several common patterns for language modeling and instru
 
 - **HellaSwag (completion SFT)**
   - Wrapper: `nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`
-  - Use case: single-turn, completion-style SFT where a prompt (context) is followed by a gold continuation 
+  - Use case: single-turn completion style SFT where a prompt (ctx) is followed by a gold continuation (ending)
   - Key args: `path_or_dataset`, `split`, `num_samples_limit`
-  - Example YAML:
+### HellaSwag (Completion SFT)
+- Wrapper: `nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`
+- Use case: single-turn completion-style SFT where a prompt (ctx) is followed by a gold continuation (ending)
+- Key args: `path_or_dataset`, `split`, `num_samples_limit`
+- Example YAML:
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
@@ -28,7 +33,14 @@ dataset:
   - Notes:
     - If the tokenizer has a chat template and you want answer-only loss, you must provide `start_of_turn_token`.
     - Optional `seq_length` can be used for padding/truncation.
-  - Example YAML:
+### SQuAD-Style Question Answering (QA) (Instruction SFT)
+- Factory: `nemo_automodel.components.datasets.llm.squad.make_squad_dataset`
+- Use case: instruction/QA tuning with either prompt-and-answer formatting or chat-template formatting
+:::{note}
+- If the tokenizer has a chat template and you want answer-only loss, you must provide `start_of_turn_token`.
+- Optional `seq_length` can be used for padding/truncation.
+:::
+- Example YAML:
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
@@ -37,7 +49,7 @@ dataset:
   start_of_turn_token: "<|assistant|>"
 ```
 
-- **ColumnMappedTextInstructionDataset (generic instruction SFT, map-style)**
+- **ColumnMappedTextInstructionDataset (generic instruction SFT)**
   - Class: `nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset`
   - Use case: quickly adapt instruction datasets by mapping your schema's columns to `context`, `question`, `answer`
   - Sources: local JSON/JSONL or Hugging Face Hub dataset ID
@@ -57,37 +69,17 @@ dataset:
     question: inputs
     answer: targets
   answer_only_loss_mask: true
+  start_of_turn_token: "<|assistant|>"
 ```
-
-- **ColumnMappedTextInstructionIterableDataset (generic instruction SFT, streaming)**
-  - Class: `nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset.ColumnMappedTextInstructionIterableDataset`
-  - Use case: stream instruction datasets (including Delta Lake / Databricks)
-  - Notes:
-    - Iterable/streaming dataset (iterate; no `len(ds)` / `ds[i]`)
-    - Always streaming by design (helps avoid accidental dataset materialization/data leakages)
-  - Example YAML:
-```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset.ColumnMappedTextInstructionIterableDataset
-  path_or_dataset_id: delta://catalog.schema.training_data
-  column_mapping:
-    question: user_message
-    answer: assistant_message
-  answer_only_loss_mask: true
-  delta_storage_options:
-    DATABRICKS_TOKEN: ${oc.env:DATABRICKS_TOKEN}
-    DATABRICKS_HOST: ${oc.env:DATABRICKS_HOST}
-```
-
-See the detailed guides, [Column-Mapped Text Instruction Dataset](llm/column-mapped-text-instruction-dataset.md) and [Column-Mapped Text Instruction Iterable Dataset](llm/column-mapped-text-instruction-iterable-dataset.md), for more information.
+See the detailed guide, [Column-Mapped Text Instruction Dataset](llm/column-mapped-text-instruction-dataset.md), for more information.
 
 - **ChatDataset (multi-turn conversations and tool calling)**
   - Class: `nemo_automodel.components.datasets.llm.ChatDataset`
   - Use case: multi-turn conversations and tool calling in OpenAI chat format
   - Sources: local JSON/JSONL or Hugging Face Hub dataset ID
   - Key args:
-    - `path_or_dataset_id`: path to local file(s) or Hugging Face dataset ID
-    - `tokenizer`: tokenizer instance (required; must have chat template support)
+    - `path_or_dataset_id`: path to local file(s) or HuggingFace dataset ID
+    - `tokenizer`: tokenizer instance (required. Must have chat template support)
     - `split`: dataset split (e.g., "train", "validation")
     - `name`: dataset configuration/subset name
     - `seq_length`: maximum sequence length for padding/truncation
@@ -101,7 +93,28 @@ See the detailed guides, [Column-Mapped Text Instruction Dataset](llm/column-map
     - Tool definitions are provided in a `tools` field at the conversation level
     - Tool calls appear in assistant messages via `tool_calls` field
     - Tool responses use the `tool` role
-  - Example YAML:
+### ChatDataset (Multi-Turn Conversations and Tool Calling)
+- Class: `nemo_automodel.components.datasets.llm.ChatDataset`
+- Use case: multi-turn conversations and tool calling in OpenAI chat format
+- Sources: local JSON/JSONL or Hugging Face Hub dataset ID
+- Key args:
+  - `path_or_dataset_id`: path to local file(s) or Hugging Face dataset ID
+  - `tokenizer`: tokenizer instance (required; must have chat template support)
+  - `split`: dataset split (e.g., "train", "validation")
+  - `name`: dataset configuration/subset name
+  - `seq_length`: maximum sequence length for padding/truncation
+  - `padding`: padding strategy ("do_not_pad", "max_length", etc.)
+  - `truncation`: truncation strategy ("do_not_truncate", "longest_first", etc.)
+  - `start_of_turn_token`: token marking assistant response start (for answer-only loss)
+  - `chat_template`: optional override for tokenizer's chat template
+:::{note}
+- Requires a tokenizer with chat template support
+- Supports both single-turn and multi-turn tool calling
+- Tool definitions are provided in a `tools` field at the conversation level
+- Tool calls appear in assistant messages through the `tool_calls` field
+- Tool responses use the `tool` role
+:::
+- Example YAML:
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.ChatDataset
@@ -207,20 +220,51 @@ dataset:
 ```
 See the [Function Calling guide](llm/toolcalling.md) for an end-to-end example with FunctionGemma.
 
+### Retrieval/Biencoder (Embedding Fine-Tuning)
+- Factory: `nemo_automodel.components.datasets.llm.make_retrieval_dataset`
+- Collator: `nemo_automodel.components.datasets.llm.RetrievalBiencoderCollator`
+- Use case: embedding model fine-tuning with (query, positive doc, negative docs) contrastive learning
+- Supported schemas:
+  - Corpus-ID JSON (Merlin/NeMo-retriever style)
+  - Inline-text JSONL (e.g., `{"query": "...", "pos_doc": "...", "neg_doc": ["...", "..."]}`)
+- Example YAML:
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
+  data_dir_list: /abs/path/to/train.jsonl
+  data_type: train
+  train_n_passages: 5
+collate_fn:
+  _target_: nemo_automodel.components.datasets.llm.RetrievalBiencoderCollator
+  q_max_len: 512
+  p_max_len: 512
+```
+See the detailed guide, [Biencoder retrieval dataset](llm/retrieval-dataset.md), for more information.
+
 - **NanoGPT Binary Shards (pretraining)**
   - Class: `nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset`
   - Use case: token-level LM pretraining over `.bin` shards produced by NanoGPT-style preprocessors (supports legacy and current formats)
   - Notes:
     - Streams contiguous `seq_len` slices, supports optional BOS alignment and `.bos.idx` sidecar files
-    - Related tool: `tools/nanogpt_data_processor.py`
+### NanoGPT Binary Shards (Pretraining)
+- Class: `nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset`
+- Use case: token-level LM pretraining over `.bin` shards produced by NanoGPT-style preprocessors (supports legacy and current formats)
+:::{note}
+- Streams contiguous `seq_len` slices, supports optional BOS alignment and `.bos.idx` sidecar files
+- Related tool: `tools/nanogpt_data_processor.py`
+:::
 
 - **Megatron (pretraining; interoperable with pre-tokenized Megatron data)**
   - Class: `nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining`
   - Use case: large-scale LM pretraining over Megatron-LM formatted tokenized corpora
   - Interoperability: If your corpus has already been tokenized/indexed for Megatron (i.e., `.bin`/`.idx` pairs), you can point Automodel to those assets directly. No re-tokenization required.
-  - Preprocessing tool: `tools/preprocess_megatron_dataset.py` supports both **JSONL** and **Parquet** input formats, enabling direct preprocessing of Hugging Face datasets stored in Parquet without conversion
   - Key args: `paths` (single path, glob, weighted list, or per-split dict), `seq_length`, `tokenizer`, `split`, `index_mapping_dir`, `splits_to_build`
-  - Example YAML:
+### Megatron (Pretraining; Interoperable With Pre-Tokenized Megatron Data)
+- Class: `nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining`
+- Use case: large-scale LM pretraining over Megatron-LM formatted tokenized corpora
+- Interoperability: If your corpus has already been tokenized/indexed for Megatron (i.e., `.bin`/`.idx` pairs), you can point Automodel to those assets directly. No re-tokenization required.
+- Key args: `paths` (single path, glob, weighted list, or per-split dict), `seq_length`, `tokenizer`, `split`, `index_mapping_dir`, `splits_to_build`
+- Example YAML:
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
@@ -382,7 +426,7 @@ packed_sequence:
   packed_sequence_size: 8192   # > 0 enables packing
   split_across_pack: false
 ```
-Use a collate function that pads to an FP8-friendly multiple when training with FP8:
+Use a collator that pads to an FP8-friendly multiple when training with FP8:
 ```yaml
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -391,6 +435,7 @@ dataloader:
     pad_seq_len_divisible: 16
 ```
 
+---
 
 ## VLM Datasets (Vision/Audio + Language)
 VLM datasets are represented as conversations (message lists) that combine text with images or audio and are processed with the model's `AutoProcessor.apply_chat_template` and a suitable collate function.
@@ -438,11 +483,12 @@ If you want answer-only loss masking, provide a model-appropriate `start_of_resp
 
 See [Gemma-3n](omni/gemma3-3n.md) and [VLM dataset](vlm/dataset.md) for end-to-end examples.
 
+---
 
 ## Bring Your Own Dataset
 You can integrate custom datasets with zero code changes to NeMo Automodel by using `_target_` in YAML. There are three approaches:
 
-### 1) Point to an existing class or function (dotted path)
+### Point to an Existing Class or Function (Dotted Path)
 - LLM example (class):
 ```yaml
 dataset:
@@ -464,7 +510,7 @@ dataset:
   split: train
 ```
 
-### 2) Point to a local Python file and function
+### Point to a Local Python File and Function
 ```yaml
 dataset:
   _target_: /abs/path/to/my_custom_dataset.py:build_my_dataset
@@ -473,7 +519,7 @@ dataset:
 ```
 Where `build_my_dataset` returns either a `datasets.Dataset` or a list/iterator of conversation dicts (for VLM).
 
-### 3) Use ColumnMappedTextInstructionDataset for most instruction datasets (LLM)
+### Use ColumnMappedTextInstructionDataset for Most Instruction Datasets (LLM)
 - Ideal when your data has columns like `instruction`, `input`, or `output` but with arbitrary names
 - Supports local JSON/JSONL and HF Hub
 ```yaml
@@ -488,7 +534,7 @@ dataset:
   start_of_turn_token: "<|assistant|>"
 ```
 
-### Minimal Custom Class Pattern (LLM Completion)
+### Implement a Minimal Custom Class Pattern (LLM Completion)
 If you prefer Python, implement `get_context` and `get_target` and reuse the built-in preprocessor:
 ```python
 from datasets import load_dataset

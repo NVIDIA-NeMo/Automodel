@@ -86,18 +86,26 @@ def _get_model_name(cfg_model):
         return None
 
 
-def _freeze_model(model: nn.Module, cfg_freeze: Optional[Dict[str, Any]] = None, freeze_embeddings: bool = True):
+def _freeze_model(
+    model: Union[nn.Module, AutoPipeline], cfg_freeze: Optional[Dict[str, Any]] = None, freeze_embeddings: bool = True
+):
     """
     Freeze the model.
 
     Args:
-        model: The model to freeze.
+        model: The model to freeze (can be nn.Module or AutoPipeline).
         cfg_freeze: The configuration for freezing the model.
         freeze_embeddings: Whether to freeze embeddings.
 
     Returns:
-        nn.Module: The frozen model.
+        nn.Module or AutoPipeline: The frozen model.
     """
+    # Handle AutoPipeline by applying freezing to each part
+    if isinstance(model, AutoPipeline):
+        for part in model.parts:
+            _freeze_model(part, cfg_freeze, freeze_embeddings)
+        return model
+
     if cfg_freeze is not None:
         apply_parameter_freezing(model, cfg_freeze)
     elif freeze_embeddings:
@@ -115,7 +123,6 @@ def build_model_and_optimizer(
     cfg_peft,
     model_wrapper,
     seed,
-    checkpointer: Checkpointer,
     tp_size=1,
     cp_size=1,
     freeze_embeddings=True,
@@ -136,7 +143,6 @@ def build_model_and_optimizer(
             "tp_size": tp_size,
             "cp_size": cp_size,
             "parallelize_fn": parallelize_fn,
-            "checkpointer": checkpointer,
             "peft_config": cfg_peft,
             "model_wrapper": model_wrapper,
             "loss_fn": loss_fn,
@@ -645,7 +651,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             cfg_compile=self.cfg.get("compile", None),
             loss_fn=self.loss_fn,
             parallelize_fn=parallelize_fn,
-            checkpointer=self.checkpointer,
             autopipeline=autopipeline,
         )
 
