@@ -14,7 +14,7 @@
 
 import logging
 import types
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
@@ -304,11 +304,6 @@ class TestGetMixinWrappedClass:
         assert result.__name__ == PlainModel.__name__
 
 
-# NOTE: Tests for _init_model, apply_model_infrastructure, _shard_pp, _shard_ep_fsdp,
-# and from_pretrained/from_config with infrastructure kwargs have been moved to
-# integration tests since they require too many mocks and test complex orchestration.
-
-
 # =============================================================================
 # Tests for _apply_peft_and_lower_precision
 # =============================================================================
@@ -476,5 +471,3 @@ class TestFilterKwargsForInit:
         result = _filter_kwargs_for_init(ModelWithVarKwargs, kwargs)
 
         assert result == kwargs
-
-

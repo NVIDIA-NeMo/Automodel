@@ -19,6 +19,14 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 import torch
 
+# Check if diffusers can be imported properly (may fail due to peft/transformers incompatibility)
+try:
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _choose_device
+    DIFFUSERS_AVAILABLE = True
+except Exception:
+    DIFFUSERS_AVAILABLE = False
+
+pytestmark = pytest.mark.skipif(not DIFFUSERS_AVAILABLE, reason="diffusers not available or incompatible with current transformers version")
 
 MODULE_PATH = "nemo_automodel._diffusers.auto_diffusion_pipeline"
 
@@ -128,8 +136,12 @@ def test_from_pretrained_basic_flow_moves_modules_and_returns_pipeline(caplog):
     m1, m2 = DummyModule(), DummyModule()
     dummy_pipe = DummyPipeline({"unet": m1, "text_encoder": m2})
 
+    mock_diffusion_pipeline = MagicMock()
+    mock_diffusion_pipeline.from_pretrained.return_value = dummy_pipe
+
     with (
-        patch("diffusers.DiffusionPipeline.from_pretrained", return_value=dummy_pipe) as mock_hf_from,
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
         patch.object(torch.nn.Module, "to") as mock_to,
         patch(f"{MODULE_PATH}.torch.cuda.is_available", return_value=False),
     ):
@@ -137,7 +149,7 @@ def test_from_pretrained_basic_flow_moves_modules_and_returns_pipeline(caplog):
         out = NeMoAutoDiffusionPipeline.from_pretrained("dummy")
 
     assert out is dummy_pipe
-    assert mock_hf_from.call_count == 1
+    assert mock_diffusion_pipeline.from_pretrained.call_count == 1
     # Both modules should be moved to device once
     assert mock_to.call_count == 2
 
@@ -146,8 +158,12 @@ def test_from_pretrained_skips_move_when_flag_false():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 
     dummy_pipe = DummyPipeline({"unet": DummyModule()})
+    mock_diffusion_pipeline = MagicMock()
+    mock_diffusion_pipeline.from_pretrained.return_value = dummy_pipe
+
     with (
-        patch("diffusers.DiffusionPipeline.from_pretrained", return_value=dummy_pipe),
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
         patch.object(torch.nn.Module, "to") as mock_to,
     ):
         out = NeMoAutoDiffusionPipeline.from_pretrained("dummy", move_to_device=False)
@@ -172,8 +188,12 @@ def test_from_pretrained_parallel_scheme_applies_managers_and_sets_attrs():
 
     parallel_scheme = {"unet": mgr_unet, "text_encoder": mgr_text}
 
+    mock_diffusion_pipeline = MagicMock()
+    mock_diffusion_pipeline.from_pretrained.return_value = dummy_pipe
+
     with (
-        patch("diffusers.DiffusionPipeline.from_pretrained", return_value=dummy_pipe),
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
         patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
     ):
         out = NeMoAutoDiffusionPipeline.from_pretrained("dummy", parallel_scheme=parallel_scheme, move_to_device=False)
@@ -196,8 +216,12 @@ def test_from_pretrained_parallel_scheme_logs_and_continues_on_errors(caplog):
     mgr = Mock()
     mgr.parallelize.side_effect = RuntimeError("boom")
 
+    mock_diffusion_pipeline = MagicMock()
+    mock_diffusion_pipeline.from_pretrained.return_value = dummy_pipe
+
     with (
-        patch("diffusers.DiffusionPipeline.from_pretrained", return_value=dummy_pipe),
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
         patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
         caplog.at_level(logging.WARNING),
     ):
