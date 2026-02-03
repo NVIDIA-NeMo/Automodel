@@ -174,7 +174,7 @@ These two flags switch AutoPipeline to lightweight, pipeline-friendly `forward()
 
 If you disable `patch_causal_lm_model`, your last stage will typically output hidden states instead of logits; in that case, make sure your `loss_fn` (or your last-stage module) applies the LM head explicitly.
 
-### Automatic vs Manual Layer Distribution
+### Automatic vs. Manual Layer Distribution
 
 AutoPipeline offers flexible control over how your model is split across pipeline stages:
 
