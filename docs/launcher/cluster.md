@@ -78,7 +78,7 @@ Then submit the job:
 automodel finetune llm -c your_config_with_slurm.yaml
 ```
 
-The Automodel CLI is the preferred method for most users. It provides a unified interface for running jobs, from local environments (e.g., [workstation](./local-workstation.md)) to large clusters (e.g., Slurm batch jobs). The CLI will automatically submit the job to Slurm and handle the distributed setup. The above example launches one node with eight workers per node using torchrun (`--nproc_per_node=8`). The Slurm script itself uses `#SBATCH --ntasks-per-node 1`, and when `gpus_per_node` is set, it adds `#SBATCH --gpus-per-node=8` as well.
+The Automodel CLI is the preferred method for most users. It provides a unified interface for running jobs, from local environments (e.g., [workstation](./local-workstation.md)) to large clusters (e.g., Slurm batch jobs). The CLI will automatically submit the job to Slurm and handle the distributed setup. The above example launches one node with eight workers per node using torchrun (`--nproc-per-node=8`). The Slurm script itself uses `#SBATCH --ntasks-per-node 1`, and when `gpus_per_node` is set, it adds `#SBATCH --gpus-per-node=8` as well.
 
 
 The CLI follows this format:
@@ -187,7 +187,7 @@ export NODE_RANK=0                  # node0 -> 0, node1 -> 1, ...
 
 torchrun \
   --nnodes=2 \
-  --nproc_per_node=8 \
+  --nproc-per-node=8 \
   --node_rank=${NODE_RANK} \
   --rdzv_backend=c10d \
   --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
@@ -196,12 +196,8 @@ torchrun \
 
 Notes:
 - Set `NODE_RANK=0` on the master node (where `MASTER_ADDR` resolves), `NODE_RANK=1` on the second node, and so on.
-- Ensure `--nproc_per_node` matches the number of GPUs per node.
-:::{note}
-- Set `NODE_RANK=0` on the master node (where `MASTER_ADDR` resolves), `NODE_RANK=1` on the second node, and so on.
-- Ensure `--nproc_per_node` matches the number of GPUs per node.
+- Ensure `--nproc-per-node` matches the number of GPUs per node.
 - When launching under Slurm, prefer the CLI `slurm` configuration above or ensure equivalent rendezvous/env settings are provided via the scheduler.
-:::
 
 ## Customize Configuration Settings
 
