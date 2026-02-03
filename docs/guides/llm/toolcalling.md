@@ -103,7 +103,7 @@ You should be able to see training loss curve similar to the below:
 </p>
 
 ## Run PEFT (LoRA)
-To apply LoRA (PEFT), uncomment the `peft` block in the recipe and tune rank/alpha/targets per the [SFT/PEFT guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/toolcalling.md). Example override:
+To apply LoRA (PEFT), uncomment the `peft` block in the config and tune rank/alpha/targets per the [SFT/PEFT guide](finetune.md). Example override:
 
 ```yaml
 peft:
