@@ -43,7 +43,7 @@ AutoPipeline provides enterprise-grade pipeline parallelism with the following f
 - **Modular Functional API**: For custom models, the functional module provides accessible, low-level building blocks
 - **Minimal Opinions**: Easy to extend and integrate with existing training workflows
 
-## Quick Start with AutoPipeline (HuggingFace Models)
+## Quick Start with AutoPipeline (Hugging Face Models)
 
 Here's a minimal example to get started with AutoPipeline using 2 pipeline stages with a Hugging Face model:
 
