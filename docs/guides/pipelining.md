@@ -6,7 +6,7 @@ As large language models continue to grow in size, training and fine-tuning them
 
 Pipeline parallelism addresses these challenges by splitting a model's layers across different devices and processing them in a pipelined fashion. Each device processes a different stage of the model, enabling training of models that wouldn't fit on a single device while maintaining high GPU utilization through overlapped computation.
 
-AutoPipeline is NeMo AutoModel's high-level pipeline parallelism interface specifically designed for HuggingFace models, making pipeline parallelism as simple as data parallelism. Built on PyTorch's native `torch.distributed.pipelining`, AutoPipeline provides seamless pipeline parallelism support for any HuggingFace decoder-only causal language model with minimal code changes.
+AutoPipeline is NeMo AutoModel's pipeline parallelism interface for HuggingFace decoder-only causal language models. Built on PyTorch's native `torch.distributed.pipelining`, it can split a model into stages and run common pipeline schedules with minimal changes to your training code.
 
 For custom models and more granular control, the functional API in `nemo_automodel.components.distributed.pipelining.functional` provides modular, accessible building blocks that can be used with any PyTorch model architecture.
 
@@ -29,12 +29,12 @@ uv pip install nemo-automodel
 uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
 ```
 
-For a complete guide and additional options please consult the AutoModel [Installation Guide](./installation.md).
+For a complete guide and additional options please consult the NeMo AutoModel [Installation Guide](./installation.md).
 :::
 
 ## Key Features
 
-AutoPipeline provides enterprise-grade pipeline parallelism with the following features:
+AutoPipeline provides the following capabilities:
 
 - **Universal HuggingFace Support**: Works with any HuggingFace decoder-only causal language model including Llama, Qwen, Mistral, Gemma, and more
 - **PyTorch Native Integration**: Built on PyTorch's `torch.distributed.pipelining` for optimal performance
@@ -95,14 +95,14 @@ Save the above code as `pipeline_example.py` and run with:
 
 ```bash
 # Run with 2 GPUs for 2 pipeline stages
-uv run torchrun --nproc_per_node=2 pipeline_example.py
+uv run torchrun --nproc-per-node=2 pipeline_example.py
 ```
 
 For a complete training example:
 
 ```bash
 # Run fine-tuning with 2-way pipeline parallelism using Llama 3.1 8B
-uv run torchrun --nproc_per_node=2 examples/llm/finetune.py \
+uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py \
     --config examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_pp.yaml
 ```
 
@@ -579,8 +579,8 @@ You can easily add pipeline parallelism to any existing training configuration t
 Add pipeline parallelism to an existing config using command-line arguments:
 
 ```bash
-uv run torchrun --nproc_per_node=2 examples/llm/finetune.py \
-    --config examples/llm/llama_3_2_1b_squad.yaml \
+uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py \
+    --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
     --distributed.pp_size 2 \
     --autopipeline._target_ nemo_automodel.components.distributed.pipelining.AutoPipeline \
@@ -591,7 +591,7 @@ uv run torchrun --nproc_per_node=2 examples/llm/finetune.py \
 ```
 
 Key parameters to override:
-- `--distributed.pp_size`: Number of pipeline stages (must match nproc_per_node)
+- `--distributed.pp_size`: Number of pipeline stages (must match `--nproc-per-node`)
 - `--autopipeline._target_`: Specify AutoPipeline class
 - `pp_batch_size` is automatically inferred from `--dataloader.batch_size`
 - `--autopipeline.pp_schedule`: Pipeline schedule (1f1b, interleaved_1f1b, etc.)
@@ -625,7 +625,7 @@ autopipeline:
 
 #### Pipeline + Data Parallelism (4 GPUs total)
 ```bash
-uv run torchrun --nproc_per_node=4 examples/llm/finetune.py \
+uv run torchrun --nproc-per-node=4 examples/llm_finetune/finetune.py \
     --config your_config.yaml \
     --distributed.pp_size 2 \
     --distributed.dp_size 2 \
@@ -634,7 +634,7 @@ uv run torchrun --nproc_per_node=4 examples/llm/finetune.py \
 
 #### Pipeline + Tensor Parallelism (4 GPUs total)
 ```bash
-uv run torchrun --nproc_per_node=4 examples/llm/finetune.py \
+uv run torchrun --nproc-per-node=4 examples/llm_finetune/finetune.py \
     --config your_config.yaml \
     --distributed.pp_size 2 \
     --distributed.tp_size 2 \
@@ -643,7 +643,7 @@ uv run torchrun --nproc_per_node=4 examples/llm/finetune.py \
 
 #### Full Hybrid: PP + DP + TP (8 GPUs total)
 ```bash
-uv run torchrun --nproc_per_node=8 examples/llm/finetune.py \
+uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py \
     --config your_config.yaml \
     --distributed.pp_size 2 \
     --distributed.dp_size 2 \
@@ -694,7 +694,7 @@ dataloader:
 Run training with:
 ```bash
 # Run with 2 GPUs for 2-way pipeline parallelism
-uv run torchrun --nproc_per_node=2 examples/llm/finetune.py --config config.yaml
+uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py --config config.yaml
 ```
 
 ## Troubleshooting
