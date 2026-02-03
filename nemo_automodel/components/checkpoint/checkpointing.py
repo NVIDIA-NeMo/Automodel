@@ -606,14 +606,22 @@ class Checkpointer:
             fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(
                 index_path, getattr(model, "_checkpoint_conversion_mapping", None)
             )
-            # some HF models like Moonlight-16B have non-persistent buffers in the base checkpoint
-            # however, HF initializes buffers with persistent=False, so we need to make sure these
-            # buffer keys are not saved during checkpointing
-            keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - set(self.config.model_state_dict_keys))
-            if model_state.is_tied_lm_head:
-                keys_to_remove.append(model_state.lm_head_param_name)
-            for key in keys_to_remove:
-                fqn_to_file_index_mapping.pop(key, None)
+            model_part = model_state.model[0]
+            config = getattr(model_part, "config", None)
+            model_type = getattr(config, "model_type", None)
+            if model_type and requires_tensor_merging(model_type) and not hasattr(model_part, "state_dict_adapter"):
+                # in this case, Transformers performed weight conversion so we will save the converted format in the checkpoint
+                num_shards = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
+                fqn_to_file_index_mapping = _equally_divide_layers(num_shards, self.config.model_state_dict_keys)
+            else:
+                # some HF models like Moonlight-16B have non-persistent buffers in the base checkpoint
+                # however, HF initializes buffers with persistent=False, so we need to make sure these
+                # buffer keys are not saved during checkpointing
+                keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - set(self.config.model_state_dict_keys))
+                if model_state.is_tied_lm_head:
+                    keys_to_remove.append(model_state.lm_head_param_name)
+                for key in keys_to_remove:
+                    fqn_to_file_index_mapping.pop(key, None)
         else:
             fqn_to_file_index_mapping = {k: 1 for k in state_dict.keys()}
 
@@ -1053,6 +1061,29 @@ def _maybe_adapt_state_dict_to_hf(
     if adapter:
         return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
     return state_dict
+
+
+def _equally_divide_layers(num_shards: int, keys: list[str]) -> dict[str, int]:
+    """
+    Equally divide the state dict keys into num_shards shards.
+    """
+    if num_shards <= 0:
+        raise ValueError(f"num_shards must be > 0, got {num_shards}")
+
+    num_layers = len(keys)
+    if num_layers == 0:
+        return {}
+
+    layers_per_shard, remainder = divmod(num_layers, num_shards)
+    fqn_to_index_mapping: dict[str, int] = {}
+    start = 0
+    for shard_index in range(1, num_shards + 1):
+        extra = 1 if shard_index <= remainder else 0
+        end = start + layers_per_shard + extra
+        for key in keys[start:end]:
+            fqn_to_index_mapping[key] = shard_index
+        start = end
+    return fqn_to_index_mapping
 
 
 def _maybe_adapt_state_dict_from_hf(

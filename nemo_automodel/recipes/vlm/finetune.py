@@ -880,7 +880,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     out = model(logits_to_keep=1, **batch)
                     if "hidden_states" not in out:
                         raise ValueError(
-                            "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
+                            "FusedLinearCrossEntropy requires the model to output hidden states. "
+                            "Set `model.text_config.output_hidden_states=True` in the config."
                         )
                 else:
                     out = model(**batch)

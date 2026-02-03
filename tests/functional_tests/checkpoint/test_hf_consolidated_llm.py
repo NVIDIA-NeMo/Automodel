@@ -1007,7 +1007,6 @@ def test_consolidated_llm_checkpoint():
         "model/consolidated/config.json",
         "model/consolidated/tokenizer_config.json",
         "model/consolidated/tokenizer.json",
-        # special_tokens_map.json is not produced by all tokenizers (e.g., Llama)
         "model/consolidated/model.safetensors.index.json",
         "model/consolidated/generation_config.json",
         "optim/__0_0.distcp",

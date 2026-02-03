@@ -548,15 +548,35 @@ def get_hf_tp_shard_plan(model):
     if f"{model_prefix}.embed_tokens" not in hf_tp_plan:
         hf_tp_plan[f"{model_prefix}.embed_tokens"] = "rowwise_rep"
 
+    # Build translated plan, skipping HF's MoE-related styles.
+    #
+    # HuggingFace transformers v5 introduced these styles for MoE models, but they do NOT
+    # implement true expert parallelism (where each rank stores only a subset of experts).
+    # Instead, HF's approach:
+    # - local_colwise/local_rowwise: Store expert weights as local tensors (NOT sharded).
+    #   Despite the names, these do NOT perform tensor parallelism on the experts.
+    #   Each rank stores ALL expert weights (full shape), which is memory inefficient.
+    # - ep_router: Modifies routing so each rank only computes with a subset of experts.
+    #   This distributes compute but not memory.
+    # - gather: All-reduces expert outputs across ranks.
+    #
+    # Since these styles result in replicated expert weights (not sharded), and we don't
+    # support HF's routing modification approach, we skip them entirely. The experts will
+    # be replicated across all ranks and computed redundantly, which is correct but not
+    # memory/compute efficient for large MoE models.
+    _hf_moe_styles = {"ep_router", "local_colwise", "local_rowwise", "gather"}
+    translated_plan = {}
     for k, v in hf_tp_plan.items():
+        if isinstance(v, str) and (v.startswith("ep_") or v in _hf_moe_styles):
+            continue
         # speed up the tp plan for lm_head
         if (k == "lm_head" or k == "language_model.lm_head") and v == "colwise_rep":
-            hf_tp_plan[k] = ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)
+            translated_plan[k] = ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)
         else:
-            hf_tp_plan[k] = translate_to_torch_parallel_style(v)
+            translated_plan[k] = translate_to_torch_parallel_style(v)
 
-    logger.info(f"Hugging Face tp plan: {hf_tp_plan}")
-    return hf_tp_plan
+    logger.info(f"Hugging Face tp plan: {translated_plan}")
+    return translated_plan
 
 
 def import_class_from_path(name: str) -> Any:

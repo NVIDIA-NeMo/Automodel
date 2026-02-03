@@ -213,7 +213,9 @@ class DeepseekV3Model(nn.Module):
             self.freqs_cis = precompute_freqs_cis(
                 self.config.qk_rope_head_dim,
                 self.max_seq_len,
-                self.config.rope_theta,
+                self.config.rope_parameters["rope_theta"]
+                if hasattr(self.config, "rope_parameters")
+                else self.config.rope_theta,
                 self.config.rope_scaling,
             )
             self.freqs_cis = self.freqs_cis.to(buffer_device)
@@ -321,7 +323,9 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             self.model.freqs_cis = precompute_freqs_cis(
                 self.config.qk_rope_head_dim,
                 self.model.max_seq_len,
-                self.config.rope_theta,
+                self.config.rope_parameters["rope_theta"]
+                if hasattr(self.config, "rope_parameters")
+                else self.config.rope_theta,
                 self.config.rope_scaling,
             )
 

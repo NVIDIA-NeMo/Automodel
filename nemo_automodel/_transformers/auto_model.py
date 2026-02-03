@@ -883,6 +883,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
+                force_hf=force_hf,
                 autopipeline=autopipeline,
                 parallelize_fn=parallelize_fn,
                 peft_config=peft_config,
