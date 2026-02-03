@@ -298,7 +298,7 @@ While AutoPipeline is specifically designed as a high-level interface for Huggin
 
 The functional API provides several utilities for building custom pipeline parallel systems:
 
-#### 1. **Stage ID Calculation**
+#### 1. Stage ID Calculation
 ```python
 from nemo_automodel.components.distributed.pipelining.functional import stage_ids_this_rank
 
