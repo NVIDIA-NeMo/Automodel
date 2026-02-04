@@ -766,7 +766,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 pixel_values = batch.pop("pixel_values", None)
                 image_grid_hws = batch.pop("image_grid_hws", None)
                 image_grid_thw = batch.pop("image_grid_thw", None)
-                
+
                 image_grid = image_grid_hws if image_grid_hws is not None else image_grid_thw
 
                 if self.pp.info.has_first_stage and pixel_values is not None and image_grid is not None:

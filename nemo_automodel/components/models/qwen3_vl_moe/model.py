@@ -401,11 +401,8 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
             and self._vlm_pixel_values_chunks is not None
         ):
             # Check if we have media tokens in input_ids (151655/151652)
-            has_media_tokens = (
-                input_ids is not None
-                and ((input_ids == 151655).any() or (input_ids == 151652).any())
-            )
-            
+            has_media_tokens = input_ids is not None and ((input_ids == 151655).any() or (input_ids == 151652).any())
+
             if has_media_tokens:
                 chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
                 if chunk_idx < len(self._vlm_pixel_values_chunks):
@@ -415,9 +412,7 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
                     if image_grid_hws is not None and image_grid_hws.numel() > 0:
                         if image_grid_hws.shape[-1] == 2:
                             ones = torch.ones(
-                                image_grid_hws.shape[0], 1,
-                                dtype=image_grid_hws.dtype,
-                                device=image_grid_hws.device
+                                image_grid_hws.shape[0], 1, dtype=image_grid_hws.dtype, device=image_grid_hws.device
                             )
                             image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
                         else:
@@ -448,7 +443,7 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         if self.lm_head is not None:
             logits = self.lm_head(hidden_states)
         else:
-            logits = hidden_states 
+            logits = hidden_states
 
         return logits
 
