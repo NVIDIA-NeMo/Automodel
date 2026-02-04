@@ -46,7 +46,6 @@ uv pip install nemo-automodel
 uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
 
 For a complete guide and additional options please consult the AutoModel [Installation Guide](./installation.md).
-For a complete guide and additional options please consult the AutoModel [Installation Guide](./installation.md).
 
 ## Key Features
 
