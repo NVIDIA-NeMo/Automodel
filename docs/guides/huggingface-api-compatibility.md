@@ -157,7 +157,7 @@ This snippet assumes you already have a `model` and `tokenizer` (see the loading
   <thead>
     <tr>
       <th style="width: 50%;">🤗 Hugging Face (<code>transformers</code>)</th>
-      <th style="width: 50%;">NeMo Automodel (<code>nemo_automodel</code>)</th>
+      <th style="width: 50%;">NeMo AutoModel (<code>nemo_automodel</code>)</th>
     </tr>
   </thead>
   <tbody>
