@@ -17,7 +17,7 @@ NeMo AutoModel currently pins Hugging Face Transformers to the **v4** major line
 This means:
 
 - NeMo AutoModel is primarily tested and released against **Transformers v4.x**
-- New model releases on the Hugging Face Hub that require a newer Transformers may require upgrading NeMo Automodel as well (similar to upgrading `transformers` directly)
+- New model releases on the Hugging Face Hub that require a newer Transformers may require upgrading NeMo AutoModel as well (similar to upgrading `transformers` directly)
 
 ### Transformers v5 (Forward-Compatibility and Checkpoint Interoperability)
 
