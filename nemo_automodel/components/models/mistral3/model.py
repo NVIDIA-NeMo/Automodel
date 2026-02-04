@@ -144,7 +144,7 @@ class Ministral3Config(PretrainedConfig):
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
-            ignore_keys_at_rope_validation=["llama_4_scaling_beta"],
+            ignore_keys_at_rope_validation={"llama_4_scaling_beta"},
             **kwargs,
         )
 
@@ -195,7 +195,10 @@ class Ministral3RotaryEmbedding(nn.Module):
 
         self.config = config
 
-        self.rope_type = self.config.rope_parameters["type"]
+        # Support both transformers v4 ("type") and v5 ("rope_type") key names
+        self.rope_type = self.config.rope_parameters.get("rope_type") or self.config.rope_parameters.get(
+            "type", "default"
+        )
         rope_init_fn = self.compute_default_rope_parameters
         if self.rope_type != "default":
             rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
