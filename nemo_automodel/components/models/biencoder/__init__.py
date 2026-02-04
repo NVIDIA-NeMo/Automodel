@@ -1,38 +1,12 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""
-Biencoder models for embedding and retrieval tasks.
-
-This module contains biencoder architectures and bidirectional models
-optimized for information retrieval and semantic search tasks.
-"""
-
-from .biencoder_model import NeMoAutoModelBiencoder  # noqa: F401
-from .llama_bidirectional_model import (  # noqa: F401
-    BiencoderModel,
-    BiencoderOutput,
-    LlamaBidirectionalConfig,
-    LlamaBidirectionalForSequenceClassification,
-    LlamaBidirectionalModel,
+# This directory has been deprecated. Please delete it.
+# All classes have been moved to their canonical locations:
+# - BiencoderModel, BiencoderOutput, pool, contrastive_scores_and_labels -> nemo_automodel._transformers.biencoder
+# - NeMoAutoModelForBiencoder -> nemo_automodel._transformers.auto_model
+# - LlamaBidirectionalModel, LlamaBidirectionalConfig -> nemo_automodel.components.models.llama_bidirectional.model
+# - BiencoderStateDictAdapter -> nemo_automodel.components.models.common.bidirectional
+raise ImportError(
+    "This module has been removed. Please import from the canonical locations:\n"
+    "  - from nemo_automodel._transformers.biencoder import BiencoderModel\n"
+    "  - from nemo_automodel._transformers.auto_model import NeMoAutoModelForBiencoder\n"
+    "  - from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel"
 )
-
-__all__ = [
-    "BiencoderModel",
-    "BiencoderOutput",
-    "NeMoAutoModelBiencoder",
-    "LlamaBidirectionalConfig",
-    "LlamaBidirectionalModel",
-    "LlamaBidirectionalForSequenceClassification",
-]

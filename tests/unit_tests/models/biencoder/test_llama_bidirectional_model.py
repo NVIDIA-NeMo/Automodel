@@ -19,13 +19,25 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 
-import nemo_automodel.components.models.biencoder.llama_bidirectional_model as lbm
+# Import from the new canonical locations
+from nemo_automodel._transformers.biencoder import (
+    BiencoderModel,
+    contrastive_scores_and_labels,
+    pool,
+)
+from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel.components.models.llama_bidirectional.model import (
+    LlamaBidirectionalConfig,
+    LlamaBidirectionalForSequenceClassification,
+    LlamaBidirectionalModel,
+)
+from transformers.modeling_outputs import BaseModelOutputWithPast
 
 
 def test_contrastive_scores_and_labels_shapes_and_labels():
     q = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
     k = torch.tensor([[1.0, 0.0], [0.5, 0.5], [0.0, 1.0], [0.2, 0.8]])
-    scores, labels = lbm.contrastive_scores_and_labels(q, k, current_train_n_passages=2)
+    scores, labels = contrastive_scores_and_labels(q, k, current_train_n_passages=2)
     assert scores.shape == (2, 2)
     assert torch.all(labels == 0) and labels.shape == (2,)
 
@@ -39,7 +51,7 @@ def test_pool_basic_modes(pool_type):
         ]
     )
     attn = torch.tensor([[1, 1, 0], [1, 1, 1]])
-    out = lbm.pool(last_hidden, attn, pool_type)
+    out = pool(last_hidden, attn, pool_type)
     if pool_type == "avg":
         # First seq avg over first 2 tokens
         assert torch.allclose(out[0], torch.tensor([(1.0 + 3.0) / 2, (2.0 + 4.0) / 2]))
@@ -56,11 +68,11 @@ def test_pool_last_with_left_padding_and_right_padding():
     last_hidden = torch.arange(2 * 3 * 2, dtype=torch.float32).reshape(2, 3, 2)
     # Case 1: left_padding -> attn[:, -1] sum equals batch_size
     attn_left = torch.tensor([[0, 0, 1], [0, 0, 1]])
-    out_left = lbm.pool(last_hidden, attn_left, "last")
+    out_left = pool(last_hidden, attn_left, "last")
     assert torch.allclose(out_left, last_hidden[:, -1])
     # Case 2: right padding -> pick last non-padded token per sample
     attn_right = torch.tensor([[1, 1, 0], [1, 1, 1]])
-    out_right = lbm.pool(last_hidden, attn_right, "last")
+    out_right = pool(last_hidden, attn_right, "last")
     # For first sample, last index 1; for second, 2
     assert torch.allclose(out_right[0], last_hidden[0, 1])
     assert torch.allclose(out_right[1], last_hidden[1, 2])
@@ -68,11 +80,11 @@ def test_pool_last_with_left_padding_and_right_padding():
 
 def test_pool_unsupported_raises():
     with pytest.raises(ValueError):
-        lbm.pool(torch.zeros(1, 1, 1), torch.ones(1, 1), "unsupported")
+        pool(torch.zeros(1, 1, 1), torch.ones(1, 1), "unsupported")
 
 
 def test_llama_bidirectional_config_fields():
-    cfg = lbm.LlamaBidirectionalConfig(pooling="cls", temperature=0.5, vocab_size=100)
+    cfg = LlamaBidirectionalConfig(pooling="cls", temperature=0.5, vocab_size=100)
     assert cfg.pooling == "cls"
     # Some downstream configs may overwrite; just ensure attribute exists and is float-like
     assert isinstance(cfg.temperature, float)
@@ -80,10 +92,10 @@ def test_llama_bidirectional_config_fields():
 
 def test_llama_bidirectional_model_init_and_mask():
     # Tiny config to instantiate actual model
-    cfg = lbm.LlamaBidirectionalConfig(
+    cfg = LlamaBidirectionalConfig(
         vocab_size=128, hidden_size=32, num_hidden_layers=1, num_attention_heads=1, intermediate_size=64, pad_token_id=0
     )
-    model = lbm.LlamaBidirectionalModel(cfg)
+    model = LlamaBidirectionalModel(cfg)
     # All layers should be non-causal
     assert all(getattr(layer.self_attn, "is_causal", True) is False for layer in model.layers)
     # Causal mask update behavior
@@ -138,7 +150,7 @@ class FakeLM(nn.Module):
 def test_sequence_classification_forward_variants(monkeypatch):
     # Build instance without running HF parent __init__
     hidden = 8
-    inst = object.__new__(lbm.LlamaBidirectionalForSequenceClassification)
+    inst = object.__new__(LlamaBidirectionalForSequenceClassification)
     # Initialize nn.Module base so we can attach submodules safely
     nn.Module.__init__(inst)
 
@@ -188,7 +200,7 @@ def test_biencoder_encode_and_compute_scores_and_forward(monkeypatch):
 
     lm_q = NoTTIDLm(hidden=8)
     lm_p = NoTTIDLm(hidden=8)
-    model = lbm.BiencoderModel(
+    model = BiencoderModel(
         lm_q=lm_q, lm_p=lm_p, train_n_passages=2, eval_negative_size=1, pooling="avg", l2_normalize=True, t=0.5
     )
     # _encode removes token_type_ids and normalizes
@@ -205,7 +217,7 @@ def test_biencoder_encode_and_compute_scores_and_forward(monkeypatch):
     q_reps = model._encode(lm_q, q)
     p_reps = model._encode(lm_p, p)
     assert q_reps.shape == (2, 8) and p_reps.shape == (4, 8)
-    scores, labels = lbm.contrastive_scores_and_labels(q_reps, p_reps, current_train_n_passages=2)
+    scores, labels = contrastive_scores_and_labels(q_reps, p_reps, current_train_n_passages=2)
     if model.l2_normalize:
         scores = scores / model.t
     assert scores.shape == (2, 2) and torch.all(labels == 0)
@@ -277,7 +289,10 @@ def test_biencoder_build_and_save(tmp_path, monkeypatch):
         def from_pretrained(cls, *args, **kwargs):
             return cls(hidden=16)
 
-    monkeypatch.setattr(lbm, "LlamaBidirectionalModel", FakeBidirectionalModel)
+    # Patch the registry to return our fake model
+    original_registry = ModelRegistry.model_arch_name_to_cls.copy()
+    ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
+    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
 
     # Directory path with config.json to hit config-reading branch
     model_dir = tmp_path / "model"
@@ -293,7 +308,7 @@ def test_biencoder_build_and_save(tmp_path, monkeypatch):
     }
     torch.save(state, pooler_path)
 
-    model = lbm.BiencoderModel.build(
+    model = BiencoderModel.build(
         model_name_or_path=str(model_dir),
         share_encoder=True,
         add_linear_pooler=True,
@@ -305,7 +320,7 @@ def test_biencoder_build_and_save(tmp_path, monkeypatch):
         l2_normalize=True,
         t=0.5,
     )
-    assert isinstance(model, lbm.BiencoderModel)
+    assert isinstance(model, BiencoderModel)
     # gradient checkpointing enabled on lm_q (and lm_p is same object)
     assert getattr(model.lm_q, "_ckpt", False) is True
     # save with share_encoder=True and add_linear_pooler=True
@@ -316,7 +331,7 @@ def test_biencoder_build_and_save(tmp_path, monkeypatch):
     assert os.path.exists(outdir / "pooler.pt")
 
     # build with share_encoder=False and without pooler file
-    model2 = lbm.BiencoderModel.build(
+    model2 = BiencoderModel.build(
         model_name_or_path=str(model_dir),
         share_encoder=False,
         add_linear_pooler=False,
@@ -331,10 +346,10 @@ def test_biencoder_build_and_save(tmp_path, monkeypatch):
 
 
 def test_llama_bidirectional_forward_paths(monkeypatch):
-    cfg = lbm.LlamaBidirectionalConfig(
+    cfg = LlamaBidirectionalConfig(
         vocab_size=64, hidden_size=16, num_hidden_layers=1, num_attention_heads=1, intermediate_size=32, pad_token_id=0
     )
-    model = lbm.LlamaBidirectionalModel(cfg)
+    model = LlamaBidirectionalModel(cfg)
     bsz, seqlen = 2, 3
     input_ids = torch.randint(0, cfg.vocab_size, (bsz, seqlen))
     attn = torch.ones(bsz, seqlen, dtype=torch.long)
@@ -353,14 +368,14 @@ def test_llama_bidirectional_forward_paths(monkeypatch):
         output_attentions=True,
         output_hidden_states=True,
     )
-    assert isinstance(out, lbm.BaseModelOutputWithPast.__mro__[0]) or hasattr(out, "last_hidden_state")
+    assert isinstance(out, BaseModelOutputWithPast.__mro__[0]) or hasattr(out, "last_hidden_state")
     assert out.past_key_values is not None
 
 
 def test_sequence_classification_regression_multi_output(monkeypatch):
     # Use manual instance with dummy config as before
     hidden = 8
-    inst = object.__new__(lbm.LlamaBidirectionalForSequenceClassification)
+    inst = object.__new__(LlamaBidirectionalForSequenceClassification)
     nn.Module.__init__(inst)
 
     class DummyCfg:
@@ -389,16 +404,34 @@ def test_biencoder_build_hub_and_errors(tmp_path, monkeypatch):
         def from_pretrained(cls, *args, **kwargs):
             return cls(hidden=16)
 
-    monkeypatch.setattr(lbm, "LlamaBidirectionalModel", FakeBidirectionalModel)
+    # Patch the registry to return our fake model
+    ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
+    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+
     # Unsupported model type from config
     bad_dir = tmp_path / "bad"
     bad_dir.mkdir()
     (bad_dir / "config.json").write_text(json.dumps({"model_type": "bert"}))
     with pytest.raises(ValueError):
-        lbm.BiencoderModel.build(model_name_or_path=str(bad_dir))
+        BiencoderModel.build(model_name_or_path=str(bad_dir))
+
+    # For hub path tests, we need to mock AutoConfig.from_pretrained since the new code
+    # calls it first to determine model type before using the registry
+    import nemo_automodel._transformers.biencoder as biencoder_module
+
+    class FakeConfig:
+        model_type = "llama"
+
+    original_auto_config = biencoder_module.AutoConfig
+
+    def fake_auto_config_from_pretrained(*args, **kwargs):
+        return FakeConfig()
+
+    monkeypatch.setattr(biencoder_module.AutoConfig, "from_pretrained", fake_auto_config_from_pretrained)
+
     # Hub path with share_encoder True
-    m1 = lbm.BiencoderModel.build(model_name_or_path="llama-tiny", share_encoder=True, do_gradient_checkpointing=True)
-    assert isinstance(m1, lbm.BiencoderModel) and getattr(m1.lm_q, "_ckpt", False) is True
+    m1 = BiencoderModel.build(model_name_or_path="llama-tiny", share_encoder=True, do_gradient_checkpointing=True)
+    assert isinstance(m1, BiencoderModel) and getattr(m1.lm_q, "_ckpt", False) is True
     # Hub path with share_encoder False and gradient ckpt enabled on both
-    m2 = lbm.BiencoderModel.build(model_name_or_path="llama-tiny", share_encoder=False, do_gradient_checkpointing=True)
-    assert isinstance(m2, lbm.BiencoderModel)
+    m2 = BiencoderModel.build(model_name_or_path="llama-tiny", share_encoder=False, do_gradient_checkpointing=True)
+    assert isinstance(m2, BiencoderModel)
