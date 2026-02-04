@@ -23,7 +23,7 @@ This means:
 
 Transformers **v5** introduces breaking changes across some internal utilities (e.g., cache APIs) and adds/reshapes tokenizer backends for some model families.
 
-NeMo Automodel addresses this in two complementary ways:
+NeMo AutoModel addresses this in two complementary ways:
 
 - **Forward-compatibility shims**: NeMo Automodel includes small compatibility patches to smooth over known API differences across Transformers releases (for example, cache utility method names). The built-in recipes apply these patches automatically.
 - **Backports where needed**: for some model families, NeMo Automodel may vendor/backport Hugging Face code that originated in the v5 development line so users can run those models while staying on a pinned v4 dependency.
