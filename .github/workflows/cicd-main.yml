@@ -36,6 +36,118 @@ jobs:
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.2
 
+  changed-tests-fast:
+    needs: [pre-flight]
+    runs-on: ubuntu-latest
+    name: Changed tests (fast)
+    if: |
+      github.event_name == 'pull_request'
+      && !(needs.pre-flight.outputs.docs_only == 'true'
+      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up UV
+        uses: astral-sh/setup-uv@v1
+        with:
+          version: 0.7.2
+
+      - name: Install dependencies with UV
+        env:
+          UV_PROJECT_ENVIRONMENT: ./venv
+          PAT: ${{ secrets.PAT }}
+        run: |
+          echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
+          chmod 600 ~/.netrc
+
+          uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+          source ./venv/bin/activate
+
+          uv sync --link-mode copy --locked --all-groups
+          uv pip install --no-deps -e .
+
+      - name: Get changed test files
+        id: changed
+        uses: tj-actions/changed-files@v45
+        with:
+          files: |
+            tests/unit_tests/**/*.py
+            tests/functional_tests/**/*.py
+            tests/**/*.sh
+            scripts/**/*.sh
+
+      - name: Build pytest target list
+        if: steps.changed.outputs.all_changed_files_count != '0'
+        id: targets
+        shell: bash -x -e -u -o pipefail {0}
+        run: |
+          printf "%s\n" ${{ steps.changed.outputs.all_changed_files }} > all_changed.txt
+          echo "All changed:"
+          cat all_changed.txt
+
+          # Files ending with .py under tests are direct pytest targets
+          grep -E '^tests/(unit_tests|functional_tests)/.*\.py$' all_changed.txt || true > py_targets.txt || true
+
+          # Map changed shell scripts to their nearest tests directory
+          # If a script is in tests/*, run that directory; if under scripts/* (or elsewhere), fall back to running all tests
+          FALLBACK_RUN_ALL=false
+          : > dir_targets.txt
+          while IFS= read -r file; do
+            case "$file" in
+              tests/unit_tests/*|tests/functional_tests/*)
+                dir="$(dirname "$file")"
+                echo "$dir" >> dir_targets.txt
+                ;;
+              *.sh)
+                FALLBACK_RUN_ALL=true
+                ;;
+            esac
+          done < <(grep -E '\.sh$' all_changed.txt || true)
+
+          # Deduplicate targets
+          sort -u py_targets.txt -o py_targets.txt || true
+          sort -u dir_targets.txt -o dir_targets.txt || true
+
+          cat py_targets.txt dir_targets.txt | sort -u > targets.txt || true
+          echo "Computed pytest targets:"
+          cat targets.txt || true
+
+          echo "fallback_run_all=$FALLBACK_RUN_ALL" >> "$GITHUB_OUTPUT"
+
+      - name: Run changed tests
+        if: steps.changed.outputs.all_changed_files_count != '0'
+        run: |
+          source ./venv/bin/activate
+          if [ "${{ steps.targets.outputs.fallback_run_all }}" = "true" ]; then
+            echo "A non-tests script changed; running full tests tree for safety."
+            ./venv/bin/python -m pytest tests/ \
+              -o log_cli=true -o log_cli_level=INFO \
+              -vs -m "not pleasefixme" --tb=short -rA
+            exit 0
+          fi
+          if [ -s targets.txt ]; then
+            echo "Running computed pytest targets:"
+            cat targets.txt
+            ./venv/bin/python -m pytest $(cat targets.txt) \
+              -o log_cli=true -o log_cli_level=INFO \
+              -vs -m "not pleasefixme" --tb=short -rA
+            exit 0
+          fi
+          echo "No direct pytest targets; skipping."
+          exit 0
+
+      - name: No changed tests
+        if: steps.changed.outputs.all_changed_files_count == '0'
+        run: echo "No changed tests detected; skipping fast run"
+
   linting:
     runs-on: ubuntu-latest
     steps:
