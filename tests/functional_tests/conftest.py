@@ -46,6 +46,7 @@ _OVERRIDES = [
     "peft.dim",
     "peft.alpha",
     "peft.use_triton",
+    "peft.use_dora",
     "peft._target_",
     "distributed",
     "distributed._target_",
