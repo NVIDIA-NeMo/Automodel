@@ -19,6 +19,7 @@ import os
 import sys
 import threading
 import time
+import tracemalloc
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -72,6 +73,7 @@ class _MemoryPeaks:
     rss_peak_bytes: int
     cuda_peak_allocated_bytes: Optional[int] = None
     cuda_peak_reserved_bytes: Optional[int] = None
+    python_peak_bytes: Optional[int] = None
 
 
 class _RssSampler:
@@ -194,6 +196,15 @@ def _measure_peaks_during_save(*, state_dict: dict[str, torch.Tensor], ckpt_dir:
         cuda_peak_alloc = torch.cuda.max_memory_allocated()
         cuda_peak_reserved = torch.cuda.max_memory_reserved()
 
+    # Track Python-level peak allocations to catch regressions where we materialize a full
+    # safetensors bytes blob (large `bytes` / `bytearray` allocations).
+    was_tracing = tracemalloc.is_tracing()
+    if not was_tracing:
+        tracemalloc.start(25)
+    tracemalloc.clear_traces()
+    tracemalloc.reset_peak()
+    baseline_py_current, _baseline_py_peak = tracemalloc.get_traced_memory()
+
     baseline_rss = _rss_bytes()
 
     sampler = _RssSampler(interval_s=0.001)
@@ -208,11 +219,17 @@ def _measure_peaks_during_save(*, state_dict: dict[str, torch.Tensor], ckpt_dir:
         cuda_peak_alloc = torch.cuda.max_memory_allocated()
         cuda_peak_reserved = torch.cuda.max_memory_reserved()
 
+    _py_current, py_peak = tracemalloc.get_traced_memory()
+    python_peak_delta = max(0, int(py_peak - baseline_py_current))
+    if not was_tracing:
+        tracemalloc.stop()
+
     # Convert to deltas to make assertions robust to unrelated baseline usage.
     return _MemoryPeaks(
         rss_peak_bytes=max(0, sampler.peak_rss_bytes - baseline_rss),
         cuda_peak_allocated_bytes=cuda_peak_alloc,
         cuda_peak_reserved_bytes=cuda_peak_reserved,
+        python_peak_bytes=python_peak_delta,
     )
 
 
@@ -228,7 +245,7 @@ def test_hf_safetensors_dcp_save_cpu_rss_peak_does_not_spike(tmp_path: Path):
     # while full-file bytes materialization spikes by ~total payload.
     state_dict = _make_many_small_tensors_state_dict(
         device=torch.device("cpu"),
-        total_payload_mb=1024,
+        total_payload_mb=128,
         per_tensor_mb=2,
         include_bf16=True,
     )
@@ -236,6 +253,18 @@ def test_hf_safetensors_dcp_save_cpu_rss_peak_does_not_spike(tmp_path: Path):
     max_tensor = _max_tensor_bytes(state_dict)
 
     peaks = _measure_peaks_during_save(state_dict=state_dict, ckpt_dir=ckpt_dir)
+
+    # Python allocations: streaming safetensors writer should avoid full-file bytes materialization.
+    allowed_python_peak_delta = 64 * 1024**2
+    assert peaks.python_peak_bytes is not None
+    assert peaks.python_peak_bytes <= allowed_python_peak_delta, (
+        "Unexpected Python allocation peak during safetensors checkpoint save.\n"
+        f"payload_bytes={payload}\n"
+        f"max_tensor_bytes={max_tensor}\n"
+        f"num_tensors={len(state_dict)}\n"
+        f"python_peak_delta_bytes={peaks.python_peak_bytes}\n"
+        f"allowed_python_peak_delta_bytes={allowed_python_peak_delta}\n"
+    )
 
     # Allow some allocator overhead and in-flight buffering, but keep it far below the total payload.
     # If the implementation regresses to materializing full safetensors bytes, this tends to approach ~payload.
@@ -249,6 +278,7 @@ def test_hf_safetensors_dcp_save_cpu_rss_peak_does_not_spike(tmp_path: Path):
         f"allowed_rss_delta_bytes={allowed_rss_delta}\n"
         f"cuda_peak_allocated_bytes={peaks.cuda_peak_allocated_bytes}\n"
         f"cuda_peak_reserved_bytes={peaks.cuda_peak_reserved_bytes}\n"
+        f"python_peak_delta_bytes={peaks.python_peak_bytes}\n"
     )
 
     # Sanity: something was written.
@@ -283,6 +313,15 @@ def test_hf_safetensors_dcp_save_tracks_cpu_and_gpu_peaks(tmp_path: Path):
     torch.cuda.reset_peak_memory_stats()
 
     peaks = _measure_peaks_during_save(state_dict=state_dict, ckpt_dir=ckpt_dir)
+
+    allowed_python_peak_delta = 64 * 1024**2
+    assert peaks.python_peak_bytes is not None
+    assert peaks.python_peak_bytes <= allowed_python_peak_delta, (
+        "Unexpected Python allocation peak during GPU safetensors checkpoint save.\n"
+        f"payload_bytes={payload}\n"
+        f"python_peak_delta_bytes={peaks.python_peak_bytes}\n"
+        f"allowed_python_peak_delta_bytes={allowed_python_peak_delta}\n"
+    )
 
     # CPU RSS: GPU checkpointing must stage tensors on CPU, so RSS can approach the payload size.
     # The regression we want to catch is an *additional* full-payload allocation from materializing a
