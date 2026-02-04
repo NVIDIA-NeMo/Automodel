@@ -103,8 +103,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         self.peft_config = self.cfg.instantiate_path("peft")
-        model, model_state_dict_keys, self.optimizer, _, _ = build_model_and_optimizer(
-            device=self.dist_env.device,
+        model, self.optimizer, self.loss_fn = build_model_and_optimizer(
             cfg_model=self.cfg.model,
             cfg_opt=self.cfg.optimizer,
             cfg_peft=self.peft_config,
@@ -119,12 +118,8 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             autopipeline=None,
             loss_fn=self.loss_fn,
             parallelize_fn=None,
-            load_base_model=self.cfg.get("checkpoint.load_base_model", True),
-            checkpointer=self.checkpointer,
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )
-
-        self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
 
         self.model_parts = [model]
 
@@ -407,10 +402,12 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        if wandb.run is not None:
-            wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+        # Log to remote services (WandB) according to step_scheduler frequency
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
+                wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
 
-        # JSONL training log
+        # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
         logging.info(
             "step {} | epoch {} | loss {:.4f} | accuracy {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu)".format(

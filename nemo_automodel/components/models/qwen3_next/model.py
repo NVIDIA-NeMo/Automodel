@@ -19,12 +19,13 @@ import torch.nn as nn
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
 from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextGatedDeltaNet
 
+from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention, Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.state_dict_adapter import Qwen3NextStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -147,10 +148,16 @@ class Qwen3NextModel(nn.Module):
         # Rotary embedding cache compatible with our rope_utils functions
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        if hasattr(config, "rope_parameters"):
+            partial_rotary_factor = config.rope_parameters.get("partial_rotary_factor", 1.0)
+            base = config.rope_parameters["rope_theta"]
+        else:
+            partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+            base = config.rope_theta
+
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
-            base=config.rope_theta,
+            base=base,
             dtype=torch.float32,
             scaling_factor=1.0,
             partial_rotary_factor=partial_rotary_factor,
@@ -212,7 +219,7 @@ class Qwen3NextModel(nn.Module):
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class Qwen3NextForCausalLM(nn.Module, MoEFSDPSyncMixin):
+class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     @classmethod
     def from_config(
         cls,

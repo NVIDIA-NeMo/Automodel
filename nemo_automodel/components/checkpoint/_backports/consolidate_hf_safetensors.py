@@ -21,7 +21,9 @@ import logging
 import math
 import mmap
 import os
+import shutil
 import struct
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -89,9 +91,6 @@ class _InputFileData:
 
     metadata_size: int = 0
     metadata: Any = None
-
-
-GLOBAL_OUTPUT_FILES_DATA: Optional[dict[str, _OutputFileData]] = None
 
 
 def _parse_input_metadata(
@@ -261,8 +260,14 @@ def _process_output_file(
 
     sorted_tensors = sorted(output_data.fqn_data.items(), key=lambda x: x[1].offset_in_file)
 
-    with open(output_file, "r+b") as output_stream:
-        output_stream.seek(0, os.SEEK_END)
+    # `_write_metadata()` already created/truncated the file and wrote the safetensors header.
+    # Here we only need to append the raw tensor bytes after that header.
+    if not os.path.exists(output_file):
+        raise FileNotFoundError(
+            f"Expected output file {output_file} to exist (header written in _write_metadata()), but it does not."
+        )
+
+    with open(output_file, "ab") as output_stream:
         # Process each tensor in sequential output order
         for tensor_fqn, tensor_fqn_data in sorted_tensors:
             full_tensor_mv = memoryview(
@@ -527,14 +532,101 @@ def _write_overall_metadata_file(
         json.dump(metadata_to_write, metadata_file, indent=2)
 
 
+def _write_overall_metadata_file_from_shards(
+    input_dir: str,
+    output_dir: str,
+    fqn_to_index_mapping: dict[str, int],
+) -> None:
+    """
+    Write the overall metadata file by reading metadata from input shard files.
+
+    This creates a model.safetensors.index.json file that HuggingFace models use
+    to locate tensors across multiple files. Unlike _write_overall_metadata_file,
+    this function reads the necessary shape/dtype information directly from the
+    input shard files, avoiding the need for distributed gather operations.
+
+    Args:
+        input_dir: Directory containing the input shard safetensors files
+        output_dir: Directory where the metadata file will be written
+        fqn_to_index_mapping: Mapping from tensor names to output file indices
+    """
+    from safetensors.torch import _getdtype  # type: ignore[import]
+
+    # Find all safetensors files in the input directory
+    safetensors_files = glob.glob(os.path.join(input_dir, f"*{SUFFIX}"))
+
+    # Read metadata from all input files
+    input_files_data: dict[str, _InputFileData] = {}
+    for input_file in safetensors_files:
+        with open(input_file, "rb") as f:
+            metadata, metadata_size = _get_safetensors_file_metadata(f)
+            input_files_data[input_file] = _InputFileData(
+                metadata_size=metadata_size,
+                metadata=metadata,
+            )
+
+    # Compute full tensor shapes from sharded metadata (same logic as _parse_input_metadata)
+    fqn_to_size_mapping: dict[str, tuple[list[int], str]] = {}
+    for file_data in input_files_data.values():
+        safetensors_metadata = file_data.metadata
+        dcp_sharding_info = _get_dcp_custom_metadata(safetensors_metadata)
+        if not dcp_sharding_info:
+            raise ValueError(
+                "No DCP custom metadata found in safetensors file. The file must be saved with DCP to be consolidated."
+            )
+
+        for key, val in safetensors_metadata.items():
+            if key == DEFAULT_EXTRA_METADATA_KEY:
+                continue
+
+            sizes = val[SHAPE_KEY]
+            offsets = dcp_sharding_info[key][SAVED_OFFSETS_KEY]
+
+            if key not in fqn_to_size_mapping:
+                cur_size = [size + offset for size, offset in zip(sizes, offsets)]
+                fqn_to_size_mapping[key] = (cur_size, val[DTYPE_KEY])
+            else:
+                cur_size = fqn_to_size_mapping[key][0]
+                for i in range(len(sizes)):
+                    cur_size[i] = max(cur_size[i], sizes[i] + offsets[i])
+
+    # Compute total_size and weight_map
+    max_index = max(fqn_to_index_mapping.values())
+    total_size = 0
+    weight_map = {}
+
+    for fqn, (tensor_shape, dtype_str) in fqn_to_size_mapping.items():
+        dtype = _getdtype(dtype_str)
+        try:
+            dtype_size = torch.finfo(dtype).bits // 8
+        except TypeError:
+            dtype_size = torch.tensor([], dtype=dtype).element_size()
+
+        total_size += math.prod(tensor_shape) * dtype_size
+
+        idx = fqn_to_index_mapping[fqn]
+        weight_map[fqn] = _gen_file_name(idx, max_index)
+
+    # Write the metadata file
+    metadata_to_write: dict[str, Any] = {}
+    metadata_to_write["metadata"] = {"total_size": total_size}
+    metadata_to_write["weight_map"] = weight_map
+
+    metadata_path = os.path.join(output_dir, _metadata_fn)
+    with open(metadata_path, "w") as metadata_file:
+        json.dump(metadata_to_write, metadata_file, indent=2)
+
+
 def _consolidate_safetensors_files(
     input_dir: str,
     output_dir: str,
     fqn_to_file_mapping: dict[str, str],
     num_threads: int,
+    use_staging: bool = False,
+    staging_dir: Optional[str] = None,
 ) -> dict[str, _OutputFileData]:
+    # Build output paths
     output_files_data: dict[str, _OutputFileData] = {}
-    # Create multiple output files based on the provided mapping
     for fqn, filename in fqn_to_file_mapping.items():
         output_path = os.path.join(output_dir, filename)
 
@@ -552,13 +644,54 @@ def _consolidate_safetensors_files(
         with open(safetensor_file, "rb") as f:
             metadata, size = _get_safetensors_file_metadata(f)
             input_files_data[safetensor_file] = _InputFileData(metadata_size=size, metadata=metadata)
-    # Step 1: Parse metadata to determine tensor shapes and types
-    _parse_input_metadata(input_files_data, output_files_data)
 
-    # Step 2: Write metadata headers to output files
-    _write_metadata(output_files_data)
-    # Step 3: Write actual tensor data from input files to output files
-    _write_data(input_files_data, output_files_data, num_threads)
+    if use_staging:
+        # Use staging directory for writing files first, then copy to final destination.
+        # This works around remote storage systems that don't support direct-append or non-sequential writes.
+        if staging_dir is not None:
+            os.makedirs(staging_dir, exist_ok=True)
+            temp_dir = tempfile.mkdtemp(prefix="safetensors_consolidate_", dir=staging_dir)
+        else:
+            temp_dir = tempfile.mkdtemp(prefix="safetensors_consolidate_")
+
+        try:
+            # Create temp output files data with temp paths
+            temp_output_files_data: dict[str, _OutputFileData] = {}
+            temp_to_final_mapping: dict[str, str] = {}
+
+            for final_path, file_data in output_files_data.items():
+                filename = os.path.basename(final_path)
+                temp_path = os.path.join(temp_dir, filename)
+                temp_output_files_data[temp_path] = file_data
+                temp_to_final_mapping[temp_path] = final_path
+
+            # Step 1: Parse metadata to determine tensor shapes and types
+            _parse_input_metadata(input_files_data, temp_output_files_data)
+
+            # Step 2: Write metadata headers to temp output files
+            _write_metadata(temp_output_files_data)
+
+            # Step 3: Write actual tensor data from input files to temp output files
+            _write_data(input_files_data, temp_output_files_data, num_threads)
+
+            # Step 4: Copy completed files from temp to final destination
+            for temp_path, final_path in temp_to_final_mapping.items():
+                shutil.copy2(temp_path, final_path)
+                logger.info("Copied %s to %s", temp_path, final_path)
+
+        finally:
+            # Clean up temp directory
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    else:
+        # Write directly to output directory
+        # Step 1: Parse metadata to determine tensor shapes and types
+        _parse_input_metadata(input_files_data, output_files_data)
+
+        # Step 2: Write metadata headers to output files
+        _write_metadata(output_files_data)
+
+        # Step 3: Write actual tensor data from input files to output files
+        _write_data(input_files_data, output_files_data, num_threads)
 
     return output_files_data
 
@@ -568,6 +701,8 @@ def consolidate_safetensors_files(
     output_dir: str,
     fqn_to_index_mapping: dict[str, int],
     num_threads: int = 1,
+    use_staging: bool = False,
+    staging_dir: Optional[str] = None,
 ) -> None:
     """
     Main function to consolidate sharded safetensors files into one or more output files.
@@ -586,6 +721,12 @@ def consolidate_safetensors_files(
         fqn_to_index_mapping: Optional mapping of tensor names to output file indices.
                              If None, all tensors will be consolidated into a single file.
         num_threads: Number of threads to use for parallel processing of saving data to output files.
+        use_staging: If True, write to a staging directory first then copy to output_dir.
+                    Required for remote storage systems that don't support
+                    direct-append or non-sequential writes. Default is False.
+        staging_dir: Optional directory for staging files during consolidation. If provided,
+                    temporary files will be created in this directory instead of the system temp.
+                    Only used when use_staging=True. Useful when system temp has limited space.
     """
     start_time = time.time()
     logger.info(
@@ -598,7 +739,9 @@ def consolidate_safetensors_files(
     max_index = max(fqn_to_index_mapping.values())
     fqn_to_file_mapping = {fqn: _gen_file_name(idx, max_index) for fqn, idx in fqn_to_index_mapping.items()}
 
-    output_files_data = _consolidate_safetensors_files(input_dir, output_dir, fqn_to_file_mapping, num_threads)
+    output_files_data = _consolidate_safetensors_files(
+        input_dir, output_dir, fqn_to_file_mapping, num_threads, use_staging, staging_dir
+    )
 
     # Step 4: Write overall model.index.safetensors.json file with weight map
     _write_overall_metadata_file(output_dir, output_files_data)
@@ -612,6 +755,8 @@ def consolidate_safetensors_files_on_every_rank(
     fqn_to_index_mapping: dict[str, int],
     num_threads: int = 1,
     process_group: Optional[dist.ProcessGroup] = None,
+    use_staging: bool = False,
+    staging_dir: Optional[str] = None,
 ) -> None:
     """
     Consolidate sharded safetensors files across multiple ranks, with each rank handling a subset of output files.
@@ -629,6 +774,12 @@ def consolidate_safetensors_files_on_every_rank(
         fqn_to_index_mapping: Mapping of tensor names to output file indices
         num_threads: Number of threads to use for parallel processing on each rank
         process_group: PyTorch distributed process group (default: None, will use default group)
+        use_staging: If True, write to a staging directory first then copy to output_dir.
+                    Required for remote storage systems that don't support
+                    direct-append or non-sequential writes. Default is False.
+        staging_dir: Optional directory for staging files during consolidation. If provided,
+                    temporary files will be created in this directory instead of the system temp.
+                    Only used when use_staging=True. Useful when system temp has limited space.
     """
 
     start_time = time.time()
@@ -678,31 +829,18 @@ def consolidate_safetensors_files_on_every_rank(
             filtered_filename_mapping[fqn] = filename
 
         # Call the existing consolidation function with the filtered mapping
-        output_files_data = _consolidate_safetensors_files(
+        _consolidate_safetensors_files(
             input_dir=input_dir,
             output_dir=output_dir,
             fqn_to_file_mapping=filtered_filename_mapping,
             num_threads=num_threads,
+            use_staging=use_staging,
+            staging_dir=staging_dir,
         )
-    else:
-        output_files_data = {}
 
-    global GLOBAL_OUTPUT_FILES_DATA
-    if GLOBAL_OUTPUT_FILES_DATA is None:
-        # cache after the first time we checkpoint
-        GLOBAL_OUTPUT_FILES_DATA = {}
-        global_output_files_data_list = [None] * world_size
-        dist.all_gather_object(global_output_files_data_list, output_files_data)
-        for item in global_output_files_data_list:
-            if item:
-                GLOBAL_OUTPUT_FILES_DATA.update(item)
-
-    # Write overall model.index.safetensors.json file with weight map
-    if GLOBAL_OUTPUT_FILES_DATA:
-        if rank == 0:
-            _write_overall_metadata_file(output_dir, GLOBAL_OUTPUT_FILES_DATA)
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier()
+    # Write overall model.index.safetensors.json file with weight map (rank 0 only)
+    if rank == 0:
+        _write_overall_metadata_file_from_shards(input_dir, output_dir, fqn_to_index_mapping)
 
     logger.info(
         "Rank %d: Done consolidating. Processed %d unique indices in %.2f secs.",

@@ -22,13 +22,24 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+
+from nemo_automodel.shared.torch_patches import apply_torch_patches
+
+apply_torch_patches()
 import torch.distributed as dist
 import torch.nn as nn
 import yaml
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.processing_utils import ProcessorMixin
-from transformers.tokenization_utils import PreTrainedTokenizerBase
+
+try:
+    # >= v5
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+except ImportError:
+    # < v5
+    from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 from nemo_automodel.components.checkpoint.checkpointing import save_config
 from nemo_automodel.components.config.loader import ConfigNode
@@ -359,7 +370,18 @@ class BaseRecipe:
                         os.path.join(path, f"{key}.pt"),
                     )
 
-        self.checkpointer.save_model(model, path, peft_config=self.peft_config, tokenizer=tokenizer)
+        # For multi-stage PP models, use checkpointer directly to handle all parts
+        # For single models, use save_pretrained for HF-compatible API
+        if isinstance(model, list) and len(model) > 1:
+            self.checkpointer.save_model(model, path, peft_config=self.peft_config, tokenizer=tokenizer)
+        else:
+            unwrapped_model = model[0] if isinstance(model, list) else model
+            # Unwrap DDP if present
+            if isinstance(unwrapped_model, DistributedDataParallel):
+                unwrapped_model = unwrapped_model.module
+            unwrapped_model.save_pretrained(
+                save_directory=path, checkpointer=self.checkpointer, tokenizer=tokenizer, peft_config=self.peft_config
+            )
         self.checkpointer.save_optimizer(optimizer, model, path, scheduler)
         save_config(config.raw_config, path)
         if is_dist_initialized:
@@ -395,7 +417,12 @@ class BaseRecipe:
         ckpt_root_abs = os.path.abspath(ckpt_root)
         target_abs = os.path.abspath(target_dir)
         relative_target = os.path.relpath(target_abs, start=ckpt_root_abs)
-        os.symlink(relative_target, link_path)
+        try:
+            os.symlink(relative_target, link_path)
+        except OSError:
+            # Fallback: write a text file containing the target path if symlinks aren't supported
+            with open(f"{link_path}.txt", "w") as f:
+                f.write(relative_target)
 
     def _update_latest_symlink(self, target_dir: str) -> None:
         """
@@ -552,7 +579,7 @@ class BaseRecipe:
         self.checkpointer.load_optimizer(optimizer, model, ckpt_dir, scheduler)
 
     def _log_experiment_details(self):
-        """Log metadata and resolved config on main rank using YAML markers."""
+        """Log metadata and config on main rank using YAML markers."""
         if not getattr(self, "dist_env", None) or not getattr(self.dist_env, "is_main", False):
             return
         details = {
@@ -571,16 +598,28 @@ class BaseRecipe:
                 logging.info(line)
         except Exception:
             logging.info(f"Experiment details: {details}")
-        # Resolved config
+        # Config (print original placeholders for reproducibility)
         try:
             cfg_obj = getattr(self, "cfg", None)
             # Prefer YAML-ready dict that converts callables/classes to dotted paths and preserves typed scalars
             if hasattr(cfg_obj, "to_yaml_dict"):
-                cfg_dict = cfg_obj.to_yaml_dict()
+                cfg_dict = cfg_obj.to_yaml_dict(use_orig_values=True)
             elif hasattr(cfg_obj, "to_dict"):
                 cfg_dict = cfg_obj.to_dict()
             else:
                 cfg_dict = dict(cfg_obj) if cfg_obj is not None else {}
+
+            # If any leaf values carry `_orig_value`, prefer it for printing.
+            def _prefer_orig_values(x):
+                if hasattr(x, "_orig_value"):
+                    return getattr(x, "_orig_value")
+                if isinstance(x, dict):
+                    return {k: _prefer_orig_values(v) for k, v in x.items()}
+                if isinstance(x, list):
+                    return [_prefer_orig_values(v) for v in x]
+                return x
+
+            cfg_dict = _prefer_orig_values(cfg_dict)
 
             # Print as clean YAML on stdout for easy copy/paste and readability
             cfg_yaml = yaml.safe_dump(cfg_dict, sort_keys=False, default_flow_style=False).strip()
@@ -722,7 +761,7 @@ def _find_latest_checkpoint(checkpoint_dir):
     Resolve the most recent checkpoint directory.
 
     Preference order:
-      1) Valid LATEST symlink under checkpoint_dir
+      1) Valid LATEST symlink or txt file under checkpoint_dir
       2) Highest step directory under checkpoint_dir matching *step_*
 
     Returns:
@@ -732,17 +771,26 @@ def _find_latest_checkpoint(checkpoint_dir):
     if not root.exists():
         return
 
-    # Try LATEST symlink first
+    # Try LATEST symlink or txt pointer first
     latest_link = os.path.join(os.fspath(root), "LATEST")
+    resolved = None
     if os.path.islink(latest_link):
         try:
             resolved = os.readlink(latest_link)
-            if not os.path.isabs(resolved):
-                resolved = os.path.abspath(os.path.join(os.fspath(root), resolved))
-            if os.path.isdir(resolved):
-                return resolved
         except OSError:
             pass
+    elif os.path.isfile(latest_link + ".txt"):
+        try:
+            with open(latest_link + ".txt", "r") as f:
+                resolved = f.read().strip()
+        except OSError:
+            pass
+
+    if resolved:
+        if not os.path.isabs(resolved):
+            resolved = os.path.abspath(os.path.join(os.fspath(root), resolved))
+        if os.path.isdir(resolved):
+            return resolved
 
     # Fallback to scanning
     checkpoint_files = list(root.glob("*step_*"))

@@ -45,11 +45,28 @@ def _supports_logits_to_keep(model: nn.Module) -> bool:
 
 def _supports_seq_lens(model: nn.Module) -> bool:
     """
-    Check if the model supports seq_lens.
+    Check if the model's forward() accepts seq_lens.
+
+    Returns True if:
+    - forward() has an explicit `seq_lens` parameter, OR
+    - forward() has **kwargs (so it won't crash if seq_lens is passed)
+
+    Returns False otherwise (passing seq_lens would cause "unexpected kwarg" error).
     """
-    if callable(getattr(model, "forward", None)):
-        return "seq_lens" in set(inspect.signature(model.forward).parameters.keys())
-    else:
+    if not callable(getattr(model, "forward", None)):
+        return False
+    try:
+        sig = inspect.signature(model.forward)
+        params = sig.parameters
+        # Check for explicit seq_lens parameter
+        if "seq_lens" in params:
+            return True
+        # Check for **kwargs (VAR_KEYWORD)
+        for param in params.values():
+            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                return True
+        return False
+    except (ValueError, TypeError):
         return False
 
 
@@ -301,10 +318,20 @@ def init_empty_weights():
                 for k in module._parameters[name].__dict__:
                     if k in fp8_parameter_mapping:
                         kwargs[fp8_parameter_mapping[k]] = getattr(module._parameters[name], k)
+                is_hf_initialized = kwargs.pop("_is_hf_initialized", None)
             else:
-                kwargs = module._parameters[name].__dict__
-                kwargs["requires_grad"] = param.requires_grad
+                # Standard nn.Parameter only accepts requires_grad, not arbitrary __dict__ attributes
+                # (e.g., TransformerEngine sets tensor_model_parallel on weights)
+                if param_cls is nn.Parameter:
+                    kwargs = {"requires_grad": param.requires_grad}
+                    is_hf_initialized = None
+                else:
+                    kwargs = module._parameters[name].__dict__.copy()
+                    kwargs["requires_grad"] = param.requires_grad
+                    is_hf_initialized = kwargs.pop("_is_hf_initialized", None)
             module._parameters[name] = param_cls(module._parameters[name].to(device), **kwargs)
+            if is_hf_initialized is not None:
+                setattr(module._parameters[name], "_is_hf_initialized", is_hf_initialized)
 
     try:
         nn.Module.register_parameter = register_empty_parameter

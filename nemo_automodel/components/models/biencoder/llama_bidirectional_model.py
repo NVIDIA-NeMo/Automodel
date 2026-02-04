@@ -50,10 +50,17 @@ try:
 except ImportError:
     BiencoderStateDictAdapter = object
 
-from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
+try:
+    from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
+
+    check_model_inputs = get_check_model_inputs_decorator()
+except ImportError:
+    # Fallback to no-op decorator if import fails
+    def check_model_inputs(func):
+        return func
+
 
 logger = logging.get_logger(__name__)
-check_model_inputs = get_check_model_inputs_decorator()
 
 
 def contrastive_scores_and_labels(
@@ -521,6 +528,7 @@ class BiencoderModel(nn.Module):
         pooling: str = "avg",
         l2_normalize: bool = True,
         t: float = 1.0,
+        trust_remote_code: bool = False,
         **hf_kwargs,
     ):
         """
@@ -537,6 +545,7 @@ class BiencoderModel(nn.Module):
             pooling: Pooling strategy ('avg', 'cls', 'last', etc.)
             l2_normalize: Whether to L2 normalize embeddings
             t: Temperature for scaling similarity scores
+            trust_remote_code: Whether to trust remote code
             **hf_kwargs: Additional arguments passed to model loading
         """
 
@@ -568,7 +577,7 @@ class BiencoderModel(nn.Module):
         # Load model locally or from hub using selected model class
         if os.path.isdir(model_name_or_path):
             if share_encoder:
-                lm_q = ModelClass.from_pretrained(model_name_or_path, trust_remote_code=True, **hf_kwargs)
+                lm_q = ModelClass.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
                 lm_p = lm_q
             else:
                 _qry_model_path = os.path.join(model_name_or_path, "query_model")
@@ -578,8 +587,8 @@ class BiencoderModel(nn.Module):
                     _qry_model_path = model_name_or_path
                     _psg_model_path = model_name_or_path
 
-                lm_q = ModelClass.from_pretrained(_qry_model_path, trust_remote_code=True, **hf_kwargs)
-                lm_p = ModelClass.from_pretrained(_psg_model_path, trust_remote_code=True, **hf_kwargs)
+                lm_q = ModelClass.from_pretrained(_qry_model_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+                lm_p = ModelClass.from_pretrained(_psg_model_path, trust_remote_code=trust_remote_code, **hf_kwargs)
         else:
             # Load from hub
             lm_q = ModelClass.from_pretrained(model_name_or_path, **hf_kwargs)

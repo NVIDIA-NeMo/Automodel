@@ -23,14 +23,14 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
-from nemo_automodel.components.models.deepseek_v3.rope_utils import (
-    apply_rotary_emb_qk,
-    yarn_get_mscale,
-)
-from nemo_automodel.components.moe.utils import (
+from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_linear_module,
     initialize_rms_norm_module,
+)
+from nemo_automodel.components.models.deepseek_v3.rope_utils import (
+    apply_rotary_emb_qk,
+    yarn_get_mscale,
 )
 
 
@@ -96,12 +96,13 @@ class MLA(nn.Module):
         )
         self.softmax_scale = self.qk_head_dim**-0.5
 
-        rope_scaling = config.rope_scaling
-
-        if rope_scaling:
-            factor = rope_scaling["factor"]
-            mscale = rope_scaling["mscale"]
-            original_seq_len = rope_scaling["original_max_position_embeddings"]
+        rope_parameters = config.rope_parameters if hasattr(config, "rope_parameters") else config.rope_scaling
+        if rope_parameters and all(
+            map(lambda x: x in rope_parameters, ["factor", "mscale", "original_max_position_embeddings"])
+        ):
+            factor = rope_parameters["factor"]
+            mscale = rope_parameters["mscale"]
+            original_seq_len = rope_parameters["original_max_position_embeddings"]
             if config.max_position_embeddings > original_seq_len:
                 mscale = yarn_get_mscale(factor, mscale)
             self.softmax_scale = self.softmax_scale * mscale * mscale
