@@ -629,7 +629,7 @@ def apply_model_infrastructure(
         _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=dequantize_base_checkpoint).keys()
     )
 
-    # Apply freezing before sharding 
+    # Apply freezing before sharding
     freeze_config = _kwargs.get("freeze_config")
     if freeze_config is not None:
         apply_parameter_freezing(model, freeze_config)
@@ -993,7 +993,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             device=device,
             compile_config=compile_config,
             load_base_model=True,
-            cache_dir=kwargs.pop("cache_dir", TRANSFORMERS_CACHE),
+            cache_dir=kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE),
             **kwargs,  # includes freeze_config
         )
 
@@ -1199,7 +1199,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             compile_config=compile_config,
             pretrained_model_name_or_path=getattr(config, "name_or_path"),
             load_base_model=False,
-            cache_dir=kwargs.pop("cache_dir", TRANSFORMERS_CACHE),
+            cache_dir=kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE),
             **kwargs,  # includes freeze_config
         )
 
