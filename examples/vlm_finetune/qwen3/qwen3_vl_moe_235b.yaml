@@ -115,11 +115,6 @@ optimizer:
   lr: 1.0e-4
   weight_decay: 0.0
 
-freeze_config:
-  freeze_vision_tower: true
-  freeze_audio_tower: true
-  freeze_language_model: false
-
 # Uncomment and configure for W&B logging
 # wandb:
 #   project: <your_wandb_project>
