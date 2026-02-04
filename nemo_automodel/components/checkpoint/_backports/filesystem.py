@@ -22,6 +22,7 @@ import operator
 import os
 import pickle
 import queue
+import struct
 import threading
 import uuid
 import warnings
@@ -68,6 +69,7 @@ from typing_extensions import Buffer
 from nemo_automodel.components.checkpoint._backports.hf_utils import (
     CUSTOM_METADATA_KEY,
     DCP_VERSION_KEY,
+    DTYPE_MAP,
     HF_DCP_VERSION,
 )
 
@@ -111,6 +113,21 @@ DEFAULT_SUFFIX = ".distcp"
 
 def _generate_uuid() -> str:
     return str(uuid.uuid4())
+
+
+_DTYPE_TO_SAFETENSORS_DTYPE: dict[torch.dtype, str] = {v: k for k, v in DTYPE_MAP.items()}
+
+
+def _to_safetensors_dtype_str(dtype: torch.dtype) -> str:
+    """Return the safetensors dtype string for a torch.dtype.
+
+    Raises:
+        ValueError: If dtype is not supported by our safetensors serializer.
+    """
+    try:
+        return _DTYPE_TO_SAFETENSORS_DTYPE[dtype]
+    except KeyError as e:
+        raise ValueError(f"Unsupported dtype for safetensors serialization: {dtype}") from e
 
 
 class _TensorLoader(ABC):
@@ -412,49 +429,134 @@ def _write_files_from_queue(
             write_results = []
 
             with create_stream(file_name, "wb") as stream:
-                for write_item in bytes_w:
-                    data = planner.resolve_data(write_item)
-                    write_results.append(
-                        _write_item(
-                            transforms,
-                            stream,
-                            data,
-                            write_item,
-                            storage_key,
-                            serialization_format,
-                        )
-                    )
-
-                tensor_dict = {}
-                metadata_dict = {}
-                for tensor, write_item in loader.values():
-                    assert tensor.is_cpu
-                    write_results.append(
-                        _write_item(
-                            transforms,
-                            stream,
-                            tensor,
-                            write_item,
-                            storage_key,
-                            serialization_format,
-                        )
-                    )
-                    tensor_dict[write_item.index.fqn] = tensor
-                    metadata_dict[write_item.index.fqn] = {"saved_offsets": write_item.tensor_data.chunk.offsets}
-
                 if serialization_format == SerializationFormat.SAFETENSORS:
-                    from safetensors.torch import save  # type: ignore[import-not-found]
-
-                    stream.write(
-                        save(
-                            tensor_dict,
-                            metadata={
-                                CUSTOM_METADATA_KEY: json.dumps(metadata_dict),
-                                DCP_VERSION_KEY: str(HF_DCP_VERSION),
-                                "format": "pt",
-                            },
+                    # SAFETENSORS expects the stream to start with the header.
+                    # DCP's BYTE_IO items would corrupt the file layout, so we explicitly disallow them.
+                    if bytes_w:
+                        raise RuntimeError(
+                            "Cannot serialize BYTE_IO items in safetensors format. "
+                            "This is a bug: safetensors files can only contain tensors."
                         )
-                    )
+
+                    # Determine the tensor write order. The overlapping loader sorts by size.
+                    ordered_tensor_w = tensor_w
+                    if isinstance(loader, _OverlappingCpuLoader):
+                        ordered_tensor_w = sorted(tensor_w, key=_item_size)
+
+                    # Build the custom DCP sharding metadata (per-key saved offsets).
+                    metadata_dict = {
+                        wi.index.fqn: {"saved_offsets": wi.tensor_data.chunk.offsets} for wi in ordered_tensor_w
+                    }
+
+                    # Build the safetensors header up-front so we can stream raw tensor bytes without
+                    # materializing the full file in memory (safetensors.torch.save returns a full bytes blob).
+                    header: dict[str, Any] = {}
+                    tensor_data_offsets: dict[str, tuple[int, int]] = {}
+                    data_offset = 0
+                    for wi in ordered_tensor_w:
+                        assert wi.tensor_data is not None
+                        nbytes = _item_size(wi)
+                        header[wi.index.fqn] = {
+                            "dtype": _to_safetensors_dtype_str(wi.tensor_data.properties.dtype),
+                            "shape": [int(s) for s in wi.tensor_data.size],
+                            "data_offsets": [data_offset, data_offset + nbytes],
+                        }
+                        tensor_data_offsets[wi.index.fqn] = (data_offset, nbytes)
+                        data_offset += nbytes
+
+                    header["__metadata__"] = {
+                        CUSTOM_METADATA_KEY: json.dumps(metadata_dict),
+                        DCP_VERSION_KEY: str(HF_DCP_VERSION),
+                        "format": "pt",
+                    }
+
+                    header_json = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                    # Pad to 8-byte alignment (matches safetensors writer behavior).
+                    pad_len = (8 - (len(header_json) % 8)) % 8
+                    if pad_len:
+                        header_json += b" " * pad_len
+
+                    stream.write(struct.pack("<Q", len(header_json)))
+                    stream.write(header_json)
+                    header_size = 8 + len(header_json)
+
+                    # Stream tensors in the same order as the header entries.
+                    expected_fqns = [wi.index.fqn for wi in ordered_tensor_w]
+                    expected_idx = 0
+                    for tensor, write_item in loader.values():
+                        assert tensor.is_cpu
+                        if expected_idx >= len(expected_fqns) or write_item.index.fqn != expected_fqns[expected_idx]:
+                            raise RuntimeError(
+                                "Internal error: safetensors write order mismatch. "
+                                f"Expected {expected_fqns[expected_idx] if expected_idx < len(expected_fqns) else '<end>'}, "
+                                f"got {write_item.index.fqn}."
+                            )
+                        expected_idx += 1
+
+                        # Ensure a compact, contiguous CPU buffer before writing.
+                        # Some tensor views can have larger backing storage than numel*element_size.
+                        if not tensor.is_contiguous():
+                            tensor = tensor.contiguous()
+                        expected_nbytes = tensor.numel() * tensor.element_size()
+                        if tensor.untyped_storage().size() != expected_nbytes:
+                            tensor = tensor.clone()
+
+                        # Write raw bytes without creating an intermediate bytes blob.
+                        byte_view = tensor.view(torch.uint8)
+                        np_view = byte_view.numpy()
+                        stream.write(memoryview(np_view))
+
+                        # Record storage offsets/lengths (absolute offset within the safetensors file).
+                        data_off, planned_nbytes = tensor_data_offsets[write_item.index.fqn]
+                        if expected_nbytes != planned_nbytes:
+                            raise RuntimeError(
+                                "Internal error: safetensors size mismatch for "
+                                f"{write_item.index.fqn}: planned {planned_nbytes} bytes, got {expected_nbytes}."
+                            )
+
+                        write_results.append(
+                            WriteResult(
+                                index=write_item.index,
+                                size_in_bytes=planned_nbytes,
+                                storage_data=_StorageInfo(
+                                    storage_key,
+                                    offset=header_size + data_off,
+                                    length=planned_nbytes,
+                                ),
+                            )
+                        )
+
+                    if expected_idx != len(expected_fqns):
+                        raise RuntimeError(
+                            "Internal error: did not write all tensors to safetensors file. "
+                            f"Wrote {expected_idx}/{len(expected_fqns)} tensors."
+                        )
+                else:
+                    for write_item in bytes_w:
+                        data = planner.resolve_data(write_item)
+                        write_results.append(
+                            _write_item(
+                                transforms,
+                                stream,
+                                data,
+                                write_item,
+                                storage_key,
+                                serialization_format,
+                            )
+                        )
+
+                    for tensor, write_item in loader.values():
+                        assert tensor.is_cpu
+                        write_results.append(
+                            _write_item(
+                                transforms,
+                                stream,
+                                tensor,
+                                write_item,
+                                storage_key,
+                                serialization_format,
+                            )
+                        )
 
                 if use_fsync:
                     try:
