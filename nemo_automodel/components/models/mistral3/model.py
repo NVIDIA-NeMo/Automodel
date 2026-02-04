@@ -37,6 +37,8 @@ from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditiona
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple, logging
 
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+
 logger = logging.get_logger(__name__)
 
 
@@ -142,7 +144,7 @@ class Ministral3Config(PretrainedConfig):
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
-            ignore_keys_at_rope_validation=["llama_4_scaling_beta"],
+            ignore_keys_at_rope_validation={"llama_4_scaling_beta"},
             **kwargs,
         )
 
@@ -193,7 +195,10 @@ class Ministral3RotaryEmbedding(nn.Module):
 
         self.config = config
 
-        self.rope_type = self.config.rope_parameters["type"]
+        # Support both transformers v4 ("type") and v5 ("rope_type") key names
+        self.rope_type = self.config.rope_parameters.get("rope_type") or self.config.rope_parameters.get(
+            "type", "default"
+        )
         rope_init_fn = self.compute_default_rope_parameters
         if self.rope_type != "default":
             rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
@@ -497,7 +502,7 @@ class Ministral3Model(Ministral3PreTrainedModel):
         )
 
 
-class Ministral3ForCausalLM(Ministral3PreTrainedModel, GenerationMixin):
+class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}

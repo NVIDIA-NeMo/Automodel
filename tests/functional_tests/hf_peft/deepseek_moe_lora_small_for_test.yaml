@@ -24,9 +24,10 @@ rng:
   ranked: true
 
 model:
-  _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: transformers.models.deepseek_v3.configuration_deepseek_v3.DeepseekV3Config
+    architectures: ["DeepseekV3ForCausalLM"]
     vocab_size: 32000
     hidden_size: 1024
     intermediate_size: 2816
@@ -87,7 +88,6 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/deepseek_small
   model_save_format: safetensors
-  load_base_model: false
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
