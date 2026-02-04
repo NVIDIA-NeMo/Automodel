@@ -74,6 +74,7 @@ if TYPE_CHECKING:
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 HAS_FA, _ = safe_import("flash_attn")
+DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if HAS_FA else "sdpa"
 
 logger = logging.getLogger(__name__)
 
@@ -799,7 +800,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         use_sdpa_patching: bool = True,
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype="auto",
-        attn_implementation: str = "flash_attention_2",
+        attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
         model_wrapper=None,
@@ -835,8 +836,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 SDPA back-ends to consider when `use_sdpa_patching=True`.
             torch_dtype (str | torch.dtype | Literal["auto"], default="auto"):
                 Data type passed to the underlying `from_pretrained` call.
-            attn_implementation (str, default="flash_attention_2"): Desired
-                attention implementation; forwarded to the HF config.
+            attn_implementation (str, optional):
+                Specifies which attention implementation to use (e.g.,
+                ``"flash_attention_2"``, ``"eager"``). Only applied when the
+                base model supports this kwarg. Defaults to ``"flash_attention_2"``,
+                if flash attention is not available, defaults to ``"sdpa"``.
             quantization_config (optional): BitsAndBytesConfig configuration object that
                 specifies all quantization settings. If provided, quantization
                 will be applied to the model.
@@ -1001,7 +1005,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         use_sdpa_patching: bool = True,
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype: Union[str, torch.dtype] = "auto",
-        attn_implementation: str = "flash_attention_2",
+        attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
         model_wrapper=None,
@@ -1045,7 +1049,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             attn_implementation (str, optional):
                 Specifies which attention implementation to use (e.g.,
                 ``"flash_attention_2"``, ``"eager"``). Only applied when the
-                base model supports this kwarg. Defaults to ``"flash_attention_2"``.
+                base model supports this kwarg. Defaults to ``"flash_attention_2"``,
+                if flash attention is not available, defaults to ``"sdpa"``.
             quantization_config (optional): BitsAndBytesConfig configuration object that
                 specifies all quantization settings. If provided, quantization
                 will be applied to the model.
