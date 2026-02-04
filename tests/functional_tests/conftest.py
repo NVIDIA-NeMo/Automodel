@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from pathlib import Path
+from typing import Tuple
+
 import pytest
 
 # List of CLI overrides forwarded by the functional-test shell scripts.
@@ -87,3 +90,32 @@ def pytest_addoption(parser: pytest.Parser):
         # ``dest`` must be a valid Python identifier, so replace dots.
         dest = opt.replace(".", "_")
         parser.addoption(f"--{opt}", dest=dest, action="store", help=f"(passthrough) {opt}")
+
+    # GT metrics test options
+    parser.addoption(
+        "--compare-jsonl",
+        dest="compare_jsonl",
+        action="store",
+        help="Path to JSONL file to compare against ground-truth logs.",
+    )
+    parser.addoption(
+        "--ground-truth-jsonl",
+        dest="ground_truth_jsonl",
+        action="store",
+        help="Path to the ground-truth JSONL file.",
+    )
+
+
+@pytest.fixture(scope="session")
+def jsonl_paths(pytestconfig: pytest.Config) -> Tuple[Path, Path]:
+    """Return (ground_truth_jsonl_path, compare_jsonl_path) from CLI args.
+
+    Raises pytest.UsageError if either is missing.
+    """
+    gt_path = pytestconfig.getoption("ground_truth_jsonl")
+    cmp_path = pytestconfig.getoption("compare_jsonl")
+    if not gt_path:
+        raise pytest.UsageError("Missing required option --ground-truth-jsonl=<path to jsonl>")
+    if not cmp_path:
+        raise pytest.UsageError("Missing required option --compare-jsonl=<path to jsonl>")
+    return Path(gt_path), Path(cmp_path)
