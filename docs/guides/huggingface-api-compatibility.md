@@ -190,7 +190,7 @@ print(tokenizer.decode(out[0], skip_special_tokens=True))</code></pre></div>
 :::
 
 
-### Tokenizers (Transformers vs NeMo Automodel)
+### Tokenizers (Transformers vs NeMo AutoModel)
 
 NeMo Automodel provides `NeMoAutoTokenizer` as a Transformers-like auto-tokenizer with a small registry for specialized backends (and a safe fallback when no specialization is needed).
 
