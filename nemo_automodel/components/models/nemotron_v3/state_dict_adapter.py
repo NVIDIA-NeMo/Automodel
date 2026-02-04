@@ -96,13 +96,30 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         Returns:
             HuggingFace format state dict
         """
+        inplace = bool(kwargs.get("inplace", False))
         hf_state_dict = {}
-        for fqn, tensor in state_dict.items():
-            converted_tensors = self.convert_single_tensor_to_hf(
-                fqn, tensor, exclude_key_regex=exclude_key_regex, **kwargs
-            )
-            for key, value in converted_tensors:
-                hf_state_dict[key] = value
+        if inplace:
+            for fqn in list(state_dict.keys()):
+                tensor = state_dict.get(fqn, None)
+                if tensor is None:
+                    continue
+                converted_tensors = self.convert_single_tensor_to_hf(
+                    fqn, tensor, exclude_key_regex=exclude_key_regex, **kwargs
+                )
+                for key, value in converted_tensors:
+                    hf_state_dict[key] = value
+                keep_original = (
+                    len(converted_tensors) == 1 and converted_tensors[0][0] == fqn and converted_tensors[0][1] is tensor
+                )
+                if not keep_original:
+                    state_dict.pop(fqn, None)
+        else:
+            for fqn, tensor in state_dict.items():
+                converted_tensors = self.convert_single_tensor_to_hf(
+                    fqn, tensor, exclude_key_regex=exclude_key_regex, **kwargs
+                )
+                for key, value in converted_tensors:
+                    hf_state_dict[key] = value
 
         return hf_state_dict
 
@@ -127,6 +144,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         Returns:
             Internal format state dict
         """
+        inplace = bool(kwargs.get("inplace", False))
         # Detect if HF checkpoint uses 'backbone' or 'model' prefix
         for key in hf_state_dict.keys():
             if ".mixer.experts." in key and key.endswith(".weight"):
@@ -134,21 +152,36 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
                 break
 
         # First, rename backbone → model and norm_f → norm
-        renamed_state_dict = {}
-        for key, value in hf_state_dict.items():
-            new_key = key
-            if new_key.startswith("backbone."):
-                new_key = "model." + new_key[len("backbone.") :]
-            if new_key == "model.norm_f.weight":
-                new_key = "model.norm.weight"
-            # HF uses 'embeddings' but internal uses 'embed_tokens'
-            if new_key == "model.embeddings.weight":
-                new_key = "model.embed_tokens.weight"
+        if inplace:
+            renamed_state_dict = hf_state_dict
+            for key in list(renamed_state_dict.keys()):
+                new_key = key
+                if new_key.startswith("backbone."):
+                    new_key = "model." + new_key[len("backbone.") :]
+                if new_key == "model.norm_f.weight":
+                    new_key = "model.norm.weight"
+                # HF uses 'embeddings' but internal uses 'embed_tokens'
+                if new_key == "model.embeddings.weight":
+                    new_key = "model.embed_tokens.weight"
 
-            renamed_state_dict[new_key] = value
+                if new_key != key:
+                    renamed_state_dict[new_key] = renamed_state_dict.pop(key)
+        else:
+            renamed_state_dict = {}
+            for key, value in hf_state_dict.items():
+                new_key = key
+                if new_key.startswith("backbone."):
+                    new_key = "model." + new_key[len("backbone.") :]
+                if new_key == "model.norm_f.weight":
+                    new_key = "model.norm.weight"
+                # HF uses 'embeddings' but internal uses 'embed_tokens'
+                if new_key == "model.embeddings.weight":
+                    new_key = "model.embed_tokens.weight"
+
+                renamed_state_dict[new_key] = value
 
         # Then merge experts using the mixin method
-        return self._from_hf_w_merged_experts(renamed_state_dict, device_mesh)
+        return self._from_hf_w_merged_experts(renamed_state_dict, device_mesh, inplace=inplace)
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         """Convert a single tensor from internal format to HuggingFace format.

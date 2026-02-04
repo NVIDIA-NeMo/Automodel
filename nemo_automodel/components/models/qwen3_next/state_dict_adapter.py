@@ -93,13 +93,31 @@ class Qwen3NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
     def to_hf(
         self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
+        inplace = bool(kwargs.get("inplace", False))
         hf_state_dict = {}
-        for fqn, tensor in state_dict.items():
-            converted_tensors = self.convert_single_tensor_to_hf(
-                fqn, tensor, exclude_key_regex=exclude_key_regex, quantization=quantization, **kwargs
-            )
-            for key, value in converted_tensors:
-                hf_state_dict[key] = value
+        if inplace:
+            # Iterate keys only so we don't keep references to all tensors in a list.
+            for fqn in list(state_dict.keys()):
+                tensor = state_dict.get(fqn, None)
+                if tensor is None:
+                    continue
+                converted_tensors = self.convert_single_tensor_to_hf(
+                    fqn, tensor, exclude_key_regex=exclude_key_regex, quantization=quantization, **kwargs
+                )
+                for key, value in converted_tensors:
+                    hf_state_dict[key] = value
+                keep_original = (
+                    len(converted_tensors) == 1 and converted_tensors[0][0] == fqn and converted_tensors[0][1] is tensor
+                )
+                if not keep_original:
+                    state_dict.pop(fqn, None)
+        else:
+            for fqn, tensor in state_dict.items():
+                converted_tensors = self.convert_single_tensor_to_hf(
+                    fqn, tensor, exclude_key_regex=exclude_key_regex, quantization=quantization, **kwargs
+                )
+                for key, value in converted_tensors:
+                    hf_state_dict[key] = value
 
         return hf_state_dict
 
@@ -109,6 +127,7 @@ class Qwen3NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         device_mesh: Optional["DeviceMesh"] = None,
         **kwargs,
     ) -> dict[str, Any]:
+        inplace = bool(kwargs.get("inplace", False))
         # Detect whether HF checkpoints use the "model." prefix
         for key in hf_state_dict.keys():
             if ".mlp.experts." in key and key.endswith(".weight"):
@@ -116,10 +135,20 @@ class Qwen3NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                 break
 
         # First apply key mappings for shared experts (shared_expert -> shared_experts)
-        hf_state_dict = self._apply_key_mapping(hf_state_dict, self.hf_to_internal_map)
+        if inplace:
+            for key in list(hf_state_dict.keys()):
+                new_key = key
+                for pattern, replacement in self.hf_to_internal_map.items():
+                    if pattern in key:
+                        new_key = key.replace(pattern, replacement)
+                        break
+                if new_key != key:
+                    hf_state_dict[new_key] = hf_state_dict.pop(key)
+        else:
+            hf_state_dict = self._apply_key_mapping(hf_state_dict, self.hf_to_internal_map)
 
         # Then convert routed experts from split to grouped format
-        return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
+        return self._from_hf_w_merged_experts(hf_state_dict, device_mesh, inplace=inplace)
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         """Convert a single tensor from native format to HuggingFace format.

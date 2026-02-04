@@ -195,19 +195,36 @@ class MoESplitExpertsStateDictMixin:
 
         return None
 
-    def _to_hf_w_split_experts(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+    def _to_hf_w_split_experts(self, state_dict: dict[str, Any], inplace: bool = False) -> dict[str, Any]:
         """Convert DeepEP format to HuggingFace format.
         Handles: gate_and_up_projs, down_projs -> individual expert weights
         """
         hf_state_dict: dict[str, Any] = {}
 
-        for fqn, tensor in state_dict.items():
-            converted = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor)
-            if converted is not None:
-                for key, value in converted:
-                    hf_state_dict[key] = value
-            else:
-                hf_state_dict[fqn] = tensor
+        if inplace:
+            # Iterate keys only (not items) so we don't keep references to all tensors in a list,
+            # which would defeat the purpose of inplace memory savings.
+            for fqn in list(state_dict.keys()):
+                tensor = state_dict.get(fqn, None)
+                if tensor is None:
+                    continue
+                converted = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor)
+                if converted is not None:
+                    for key, value in converted:
+                        hf_state_dict[key] = value
+                    # Drop the merged expert tensor key eagerly so large tensors can be freed
+                    # earlier during conversion when possible.
+                    state_dict.pop(fqn, None)
+                else:
+                    hf_state_dict[fqn] = tensor
+        else:
+            for fqn, tensor in state_dict.items():
+                converted = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor)
+                if converted is not None:
+                    for key, value in converted:
+                        hf_state_dict[key] = value
+                else:
+                    hf_state_dict[fqn] = tensor
 
         return hf_state_dict
 
@@ -215,6 +232,7 @@ class MoESplitExpertsStateDictMixin:
         self,
         hf_state_dict: dict[str, Any],
         device_mesh: Optional["DeviceMesh"] = None,
+        inplace: bool = False,
     ) -> dict[str, Any]:
         """Convert HF checkpoint to native format.
 
@@ -256,6 +274,124 @@ class MoESplitExpertsStateDictMixin:
             rf"(?P<prefix>(?:model\.)?(?:language_model\.)?)layers\.(\d+)\.{re.escape(expert_segment)}\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
         )
 
+        if inplace:
+            # Iterate keys only (not items) so we don't keep references to all tensors in a list.
+            keys = list(hf_state_dict.keys())
+            for key in keys:
+                if key not in hf_state_dict:
+                    continue
+                value = hf_state_dict.pop(key)
+                if f".{expert_segment}." in key and key.endswith(".weight"):
+                    m = expert_pattern.match(key)
+                    if m is None:
+                        state_dict[key] = value
+                        continue
+
+                    prefix = m.group("prefix") or ""
+                    layer_num, expert_num, which = m.group(2), m.group(3), m.group(4)
+                    expert_num = int(expert_num)
+
+                    if not should_load_expert_for_rank(expert_num, device_mesh, n_experts):
+                        del value
+                        continue
+
+                    if layer_num not in expert_weights_by_layer:
+                        expert_weights_by_layer[layer_num] = {}
+
+                    if which in ["gate_proj", "up_proj"]:
+                        native_key = f"{prefix}layers.{layer_num}.{expert_segment}.gate_and_up_projs"
+                    else:  # down_proj
+                        native_key = f"{prefix}layers.{layer_num}.{expert_segment}.down_projs"
+
+                    if native_key not in expert_weights_by_layer[layer_num]:
+                        expert_weights_by_layer[layer_num][native_key] = {}
+
+                    if which in ["gate_proj", "up_proj"]:
+                        # Non-gated models only use up_proj, skip gate_proj
+                        if not is_gated and which == "gate_proj":
+                            del value
+                            continue
+
+                        # Store weight: gated uses dict for gate+up, non-gated stores tensor directly
+                        if is_gated:
+                            if expert_num not in expert_weights_by_layer[layer_num][native_key]:
+                                expert_weights_by_layer[layer_num][native_key][expert_num] = {}
+                            expert_weights_by_layer[layer_num][native_key][expert_num][which] = value
+                        else:
+                            expert_weights_by_layer[layer_num][native_key][expert_num] = value
+
+                        # Check if all experts are complete
+                        all_complete = len(expert_weights_by_layer[layer_num][native_key]) == expected_experts_per_rank
+                        if is_gated:
+                            all_complete = all_complete and all(
+                                isinstance(d, dict) and "gate_proj" in d and "up_proj" in d
+                                for d in expert_weights_by_layer[layer_num][native_key].values()
+                            )
+
+                        if all_complete:
+                            expert_ids = sorted(expert_weights_by_layer[layer_num][native_key].keys())
+                            tensors = []
+                            for expert_id in expert_ids:
+                                expert_data = expert_weights_by_layer[layer_num][native_key][expert_id]
+
+                                if is_gated:
+                                    gate_weight = expert_data["gate_proj"]
+                                    up_weight = expert_data["up_proj"]
+                                    if is_dtensor(gate_weight):
+                                        gate_weight = gate_weight.to_local()
+                                    if is_dtensor(up_weight):
+                                        up_weight = up_weight.to_local()
+                                    gate_t = gate_weight.transpose(0, 1)
+                                    up_t = up_weight.transpose(0, 1)
+                                    tensors.append(torch.cat([gate_t, up_t], dim=-1))
+                                else:
+                                    up_weight = expert_data
+                                    if is_dtensor(up_weight):
+                                        up_weight = up_weight.to_local()
+                                    tensors.append(up_weight.transpose(0, 1))
+
+                            stacked = torch.stack(tensors, dim=0).to(self.dtype)
+                            state_dict[native_key] = create_dtensor_from_local(stacked, device_mesh, rank)
+                            # Drop references to per-expert tensors as soon as we've merged this group.
+                            expert_weights_by_layer[layer_num].pop(native_key, None)
+                            if not expert_weights_by_layer[layer_num]:
+                                expert_weights_by_layer.pop(layer_num, None)
+                            del tensors, stacked
+
+                    else:  # down_proj
+                        expert_weights_by_layer[layer_num][native_key][expert_num] = value
+
+                        if len(expert_weights_by_layer[layer_num][native_key]) == expected_experts_per_rank:
+                            expert_ids = sorted(expert_weights_by_layer[layer_num][native_key].keys())
+
+                            ordered = []
+                            for expert_id in expert_ids:
+                                down_weight = expert_weights_by_layer[layer_num][native_key][expert_id]  # [dim, inter_dim]
+
+                                # Extract local tensor if input is already a DTensor
+                                if is_dtensor(down_weight):
+                                    down_weight = down_weight.to_local()
+
+                                down_t = down_weight.transpose(0, 1)  # [inter_dim, dim]
+                                ordered.append(down_t)
+
+                            stacked = torch.stack(ordered, dim=0)
+                            stacked = stacked.to(self.dtype)
+
+                            dtensor = create_dtensor_from_local(stacked, device_mesh, rank)
+                            state_dict[native_key] = dtensor
+                            # Drop references to per-expert tensors as soon as we've merged this group.
+                            expert_weights_by_layer[layer_num].pop(native_key, None)
+                            if not expert_weights_by_layer[layer_num]:
+                                expert_weights_by_layer.pop(layer_num, None)
+                            del ordered, stacked, dtensor
+
+                else:
+                    if not key.endswith("_scale_inv"):
+                        state_dict[key] = value
+
+            return state_dict
+
         for key, value in hf_state_dict.items():
             if f".{expert_segment}." in key and key.endswith(".weight"):
                 m = expert_pattern.match(key)
@@ -268,6 +404,7 @@ class MoESplitExpertsStateDictMixin:
                 expert_num = int(expert_num)
 
                 if not should_load_expert_for_rank(expert_num, device_mesh, n_experts):
+                    del value
                     continue
 
                 if layer_num not in expert_weights_by_layer:
@@ -284,6 +421,7 @@ class MoESplitExpertsStateDictMixin:
                 if which in ["gate_proj", "up_proj"]:
                     # Non-gated models only use up_proj, skip gate_proj
                     if not is_gated and which == "gate_proj":
+                        del value
                         continue
 
                     # Store weight: gated uses dict for gate+up, non-gated stores tensor directly
@@ -293,7 +431,6 @@ class MoESplitExpertsStateDictMixin:
                         expert_weights_by_layer[layer_num][native_key][expert_num][which] = value
                     else:
                         expert_weights_by_layer[layer_num][native_key][expert_num] = value
-
                     # Check if all experts are complete
                     all_complete = len(expert_weights_by_layer[layer_num][native_key]) == expected_experts_per_rank
                     if is_gated:
@@ -326,6 +463,11 @@ class MoESplitExpertsStateDictMixin:
 
                         stacked = torch.stack(tensors, dim=0).to(self.dtype)
                         state_dict[native_key] = create_dtensor_from_local(stacked, device_mesh, rank)
+                        # Drop references to per-expert tensors as soon as we've merged this group.
+                        expert_weights_by_layer[layer_num].pop(native_key, None)
+                        if not expert_weights_by_layer[layer_num]:
+                            expert_weights_by_layer.pop(layer_num, None)
+                        del tensors, stacked
 
                 else:  # down_proj
                     expert_weights_by_layer[layer_num][native_key][expert_num] = value
@@ -349,6 +491,11 @@ class MoESplitExpertsStateDictMixin:
 
                         dtensor = create_dtensor_from_local(stacked, device_mesh, rank)
                         state_dict[native_key] = dtensor
+                        # Drop references to per-expert tensors as soon as we've merged this group.
+                        expert_weights_by_layer[layer_num].pop(native_key, None)
+                        if not expert_weights_by_layer[layer_num]:
+                            expert_weights_by_layer.pop(layer_num, None)
+                        del ordered, stacked, dtensor
 
             else:
                 if not key.endswith("_scale_inv"):

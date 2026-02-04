@@ -1082,7 +1082,11 @@ def _maybe_adapt_state_dict_to_hf(
     """
     adapter = getattr(model_part, "state_dict_adapter", None)
     if adapter:
-        return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
+        # Use inplace conversion where supported to reduce peak GPU memory during conversion
+        # (e.g., splitting grouped expert tensors can allocate large contiguous outputs).
+        return adapter.to_hf(
+            state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, inplace=True, **kwargs
+        )
     return state_dict
 
 
@@ -1119,5 +1123,7 @@ def _maybe_adapt_state_dict_from_hf(
     if adapter:
         ep_mesh_dims = [dim for dim in moe_mesh.mesh_dim_names if dim != "pp"] if moe_mesh is not None else []
         ep_mesh = moe_mesh[tuple(ep_mesh_dims)] if ep_mesh_dims else moe_mesh
-        return adapter.from_hf(state_dict, device_mesh=ep_mesh)
+        # Use inplace conversion where supported to reduce peak GPU memory during conversion
+        # (e.g., merging q/k/v -> qkv can otherwise keep both representations alive).
+        return adapter.from_hf(state_dict, device_mesh=ep_mesh, inplace=True)
     return state_dict
