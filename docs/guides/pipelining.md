@@ -30,21 +30,10 @@ uv pip install nemo-automodel
 
 # Or install from source for the latest features
 uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
-## Prerequisites
+```
+
 
 Before proceeding with this guide, please ensure that you have NeMo Automodel installed on your machine.
-
-```bash
-# Install uv from https://docs.astral.sh/uv/getting-started/installation/
-# Initialize the virtual environment using uv
-uv venv
-
-# Install the latest stable release from PyPI
-uv pip install nemo-automodel
-
-# Or install from source for the latest features
-uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
-
 For a complete guide and additional options please consult the AutoModel [Installation Guide](./installation.md).
 
 ## Key Features
