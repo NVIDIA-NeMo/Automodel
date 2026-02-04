@@ -61,7 +61,7 @@ If you are running Transformers v5 in another environment, you can still use NeM
   <thead>
     <tr>
       <th style="width: 45%;">🤗 Hugging Face (<code>transformers</code>)</th>
-      <th style="width: 45%;">NeMo Automodel (<code>nemo_automodel</code>)</th>
+      <th style="width: 45%;">NeMo AutoModel (<code>nemo_automodel</code>)</th>
       <th style="width: 10%;">Status</th>
     </tr>
   </thead>
