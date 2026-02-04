@@ -1,6 +1,6 @@
 # 🤗 Hugging Face Transformers API Compatibility
 
-NeMo Automodel is built to work with the 🤗 Hugging Face ecosystem.
+NeMo AutoModel is built to work with the 🤗 Hugging Face ecosystem.
 In practice, compatibility comes in two layers:
 
 - **API compatibility**: for many workflows, you can keep your existing `transformers` code and swap in NeMo AutoModel “drop-in” wrappers (`NeMoAutoModel*`, `NeMoAutoTokenizer`) with minimal changes.
