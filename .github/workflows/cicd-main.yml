@@ -140,7 +140,7 @@ jobs:
   #         echo "Running CI tests"
 
   cicd-container-build:
-    needs: [pre-flight, cicd-wait-in-queue]
+    needs: [pre-flight]
     if: |
       (
         success()
@@ -148,7 +148,7 @@ jobs:
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
       && !cancelled()
-    runs-on: self-hosted-nemo
+    runs-on: nemo-ci-aws-test
     environment: nemo-ci
     steps:
       - name: Checkout
@@ -177,7 +177,7 @@ jobs:
             runner: nemo-ci-aws-test
             cpu-only: false
             timeout: 30
-    needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
+    needs: [pre-flight, cicd-container-build]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
     environment: nemo-ci
@@ -243,7 +243,7 @@ jobs:
             test-folder: data
             runner: nemo-ci-aws-test
             timeout: 20
-    needs: [pre-flight]
+    needs: [pre-flight, cicd-container-build]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
     environment: nemo-ci
