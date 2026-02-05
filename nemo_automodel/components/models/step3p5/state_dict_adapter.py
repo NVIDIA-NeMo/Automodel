@@ -22,7 +22,7 @@ HF Format (Step3p5):
     model.layers.{L}.moe.up_proj.weight      # [n_exp, inter, dim]
     model.layers.{L}.moe.down_proj.weight    # [n_exp, dim, inter]
     model.layers.{L}.moe.gate.weight         # [n_exp, dim] (router)
-    model.layers.{L}.moe.gate.bias           # [n_exp] (router bias, optional)
+    model.layers.{L}.moe.router_bias         # [n_exp] (router bias, optional)
     model.layers.{L}.share_expert.*.weight   # Shared expert
 
 Native Format (Automodel):
@@ -54,6 +54,40 @@ from nemo_automodel.components.moe.state_dict_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _create_dtensor_from_local_or_reference(
+    local_tensor: torch.Tensor,
+    reference_dtensor: Optional["torch.Tensor"],
+    device_mesh: Optional["DeviceMesh"] = None,
+    rank: Optional[int] = None,
+) -> torch.Tensor:
+    """Create a DTensor from a local tensor.
+
+    Prefers using reference_dtensor's mesh/placements if available (for preserving
+    DTensor structure from DCP-loaded tensors). Falls back to creating a new DTensor
+    using device_mesh if reference is not a DTensor.
+
+    Args:
+        local_tensor: Local portion of the tensor after transformation
+        reference_dtensor: Optional DTensor to copy mesh/placements from
+        device_mesh: Device mesh for EP (used if reference is not DTensor)
+        rank: Current rank for device placement
+
+    Returns:
+        DTensor if mesh is available, otherwise local_tensor
+    """
+    from torch.distributed._tensor import DTensor
+
+    if reference_dtensor is not None and is_dtensor(reference_dtensor):
+        # Use the exact same mesh and placements from the reference
+        return DTensor.from_local(local_tensor, reference_dtensor.device_mesh, reference_dtensor.placements)
+    elif device_mesh is not None:
+        # Create DTensor using the provided mesh
+        return create_dtensor_from_local(local_tensor, device_mesh, rank)
+    else:
+        # No mesh available, return regular tensor
+        return local_tensor
 
 
 class Step3p5StateDictAdapter(StateDictAdapter):
@@ -162,8 +196,10 @@ class Step3p5StateDictAdapter(StateDictAdapter):
                 layer_num = m.group("layer")
                 proj = m.group("proj")
 
-                # For expert parallelism, slice the experts dimension
-                if device_mesh is not None:
+                # For expert parallelism with regular tensors, slice the experts dimension.
+                # If the value is already a DTensor (from DCP loading), it's already sharded
+                # and we should not slice it again.
+                if device_mesh is not None and not is_dtensor(value):
                     value = value[start_expert:end_expert]
 
                 if proj in ("gate_proj", "up_proj"):
@@ -179,35 +215,42 @@ class Step3p5StateDictAdapter(StateDictAdapter):
                         gate_weight = pending_gate_up[layer_key]["gate_proj"]  # [n_exp, inter, dim]
                         up_weight = pending_gate_up[layer_key]["up_proj"]  # [n_exp, inter, dim]
 
-                        # Extract local tensors if DTensor
-                        if is_dtensor(gate_weight):
-                            gate_weight = gate_weight.to_local()
-                        if is_dtensor(up_weight):
-                            up_weight = up_weight.to_local()
+                        # Keep reference to original DTensor for mesh/placements (if available)
+                        reference_dtensor = gate_weight if is_dtensor(gate_weight) else None
+
+                        # Extract local tensors if DTensor for transformation
+                        gate_local = gate_weight.to_local() if is_dtensor(gate_weight) else gate_weight
+                        up_local = up_weight.to_local() if is_dtensor(up_weight) else up_weight
 
                         # Transpose: [n_exp, inter, dim] -> [n_exp, dim, inter]
-                        gate_t = gate_weight.transpose(1, 2)
-                        up_t = up_weight.transpose(1, 2)
+                        gate_t = gate_local.transpose(1, 2)
+                        up_t = up_local.transpose(1, 2)
 
                         # Concatenate: [n_exp, dim, 2*inter]
                         merged = torch.cat([gate_t, up_t], dim=-1).to(self.dtype)
 
                         native_key = f"{prefix}layers.{layer_num}.moe.experts.gate_and_up_projs"
-                        state_dict[native_key] = create_dtensor_from_local(merged, device_mesh, rank)
+                        # Create DTensor using reference or device_mesh
+                        state_dict[native_key] = _create_dtensor_from_local_or_reference(
+                            merged, reference_dtensor, device_mesh, rank
+                        )
 
                         # Clean up
                         del pending_gate_up[layer_key]
 
                 elif proj == "down_proj":
                     # down_proj: [n_exp, dim, inter] -> [n_exp, inter, dim]
-                    down_weight = value
-                    if is_dtensor(down_weight):
-                        down_weight = down_weight.to_local()
+                    # Keep reference for DTensor recreation (if available)
+                    reference_dtensor = value if is_dtensor(value) else None
 
-                    down_t = down_weight.transpose(1, 2).to(self.dtype)
+                    down_local = value.to_local() if is_dtensor(value) else value
+                    down_t = down_local.transpose(1, 2).to(self.dtype)
 
                     native_key = f"{prefix}layers.{layer_num}.moe.experts.down_projs"
-                    state_dict[native_key] = create_dtensor_from_local(down_t, device_mesh, rank)
+                    # Create DTensor using reference or device_mesh
+                    state_dict[native_key] = _create_dtensor_from_local_or_reference(
+                        down_t, reference_dtensor, device_mesh, rank
+                    )
 
             elif router_m:
                 # Router gate weight/bias - handle key mapping
@@ -267,7 +310,11 @@ class Step3p5StateDictAdapter(StateDictAdapter):
 
         Native: gate_and_up_projs [n_exp, dim, 2*inter] -> HF: gate_proj, up_proj [n_exp, inter, dim]
         Native: down_projs [n_exp, inter, dim] -> HF: down_proj [n_exp, dim, inter]
+
+        Preserves DTensor structure when input is a DTensor.
         """
+        from torch.distributed._tensor import DTensor
+
         inter_dim = self.moe_config.moe_inter_dim
         prefix = self._hf_prefix
 
@@ -279,8 +326,14 @@ class Step3p5StateDictAdapter(StateDictAdapter):
 
             layer_num = layer_match.group(1)
 
-            # Extract local tensor if DTensor
-            local_tensor = tensor.to_local() if is_dtensor(tensor) else tensor
+            # Check if input is DTensor to preserve structure
+            tensor_is_dtensor = is_dtensor(tensor)
+            if tensor_is_dtensor:
+                device_mesh = tensor.device_mesh
+                placements = tensor.placements
+                local_tensor = tensor.to_local()
+            else:
+                local_tensor = tensor
 
             # Split gate and up: [n_exp, dim, 2*inter] -> [n_exp, dim, inter] each
             gate_t = local_tensor[:, :, :inter_dim]  # [n_exp, dim, inter]
@@ -289,6 +342,11 @@ class Step3p5StateDictAdapter(StateDictAdapter):
             # Transpose: [n_exp, dim, inter] -> [n_exp, inter, dim]
             gate_weight = gate_t.transpose(1, 2).contiguous()
             up_weight = up_t.transpose(1, 2).contiguous()
+
+            # Wrap in DTensor if original was DTensor
+            if tensor_is_dtensor:
+                gate_weight = DTensor.from_local(gate_weight, device_mesh, placements)
+                up_weight = DTensor.from_local(up_weight, device_mesh, placements)
 
             return [
                 (f"{prefix}layers.{layer_num}.moe.gate_proj.weight", gate_weight),
@@ -303,11 +361,21 @@ class Step3p5StateDictAdapter(StateDictAdapter):
 
             layer_num = layer_match.group(1)
 
-            # Extract local tensor if DTensor
-            local_tensor = tensor.to_local() if is_dtensor(tensor) else tensor
+            # Check if input is DTensor to preserve structure
+            tensor_is_dtensor = is_dtensor(tensor)
+            if tensor_is_dtensor:
+                device_mesh = tensor.device_mesh
+                placements = tensor.placements
+                local_tensor = tensor.to_local()
+            else:
+                local_tensor = tensor
 
             # Transpose: [n_exp, inter, dim] -> [n_exp, dim, inter]
             down_weight = local_tensor.transpose(1, 2).contiguous()
+
+            # Wrap in DTensor if original was DTensor
+            if tensor_is_dtensor:
+                down_weight = DTensor.from_local(down_weight, device_mesh, placements)
 
             return [
                 (f"{prefix}layers.{layer_num}.moe.down_proj.weight", down_weight),

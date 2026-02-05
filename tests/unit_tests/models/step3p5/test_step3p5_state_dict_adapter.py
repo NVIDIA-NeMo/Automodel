@@ -220,6 +220,34 @@ class TestStep3p5StateDictAdapterFromHF:
         # Should detect no model prefix and use that format
         assert "layers.0.moe.experts.gate_and_up_projs" in native_state_dict
 
+    def test_handles_multiple_layers(self, adapter, moe_config):
+        """Test from_hf correctly handles multiple MoE layers."""
+        n_experts = moe_config.n_routed_experts
+        dim = moe_config.dim
+        inter_dim = moe_config.moe_inter_dim
+
+        # Create HF state dict with two layers
+        hf_state_dict = {
+            "model.layers.0.moe.gate_proj.weight": torch.randn(n_experts, inter_dim, dim),
+            "model.layers.0.moe.up_proj.weight": torch.randn(n_experts, inter_dim, dim),
+            "model.layers.0.moe.down_proj.weight": torch.randn(n_experts, dim, inter_dim),
+            "model.layers.1.moe.gate_proj.weight": torch.randn(n_experts, inter_dim, dim),
+            "model.layers.1.moe.up_proj.weight": torch.randn(n_experts, inter_dim, dim),
+            "model.layers.1.moe.down_proj.weight": torch.randn(n_experts, dim, inter_dim),
+        }
+
+        native_state_dict = adapter.from_hf(hf_state_dict)
+
+        # Both layers should be converted
+        assert "model.layers.0.moe.experts.gate_and_up_projs" in native_state_dict
+        assert "model.layers.0.moe.experts.down_projs" in native_state_dict
+        assert "model.layers.1.moe.experts.gate_and_up_projs" in native_state_dict
+        assert "model.layers.1.moe.experts.down_projs" in native_state_dict
+
+        # Verify shapes
+        assert native_state_dict["model.layers.0.moe.experts.gate_and_up_projs"].shape == (n_experts, dim, 2 * inter_dim)
+        assert native_state_dict["model.layers.1.moe.experts.gate_and_up_projs"].shape == (n_experts, dim, 2 * inter_dim)
+
 
 class TestStep3p5StateDictAdapterToHF:
     def test_converts_gate_and_up_projs(self, adapter, moe_config):
@@ -262,6 +290,24 @@ class TestStep3p5StateDictAdapterToHF:
         assert "model.layers.0.moe.down_proj.weight" in hf_state_dict
         down_weight = hf_state_dict["model.layers.0.moe.down_proj.weight"]
         assert down_weight.shape == (n_experts, dim, inter_dim)
+
+    def test_maps_gate_bias_to_router_bias(self, adapter, moe_config):
+        """Test that native gate.bias is mapped to HF router_bias."""
+        n_experts = moe_config.n_routed_experts
+
+        gate_bias = torch.randn(n_experts)
+        native_state_dict = {
+            "model.layers.0.moe.gate.bias": gate_bias,
+        }
+
+        hf_state_dict = adapter.to_hf(native_state_dict)
+
+        # Native gate.bias should be mapped to HF router_bias
+        assert "model.layers.0.moe.router_bias" in hf_state_dict
+        torch.testing.assert_close(
+            hf_state_dict["model.layers.0.moe.router_bias"],
+            gate_bias,
+        )
 
 
 class TestStep3p5StateDictAdapterRoundtrip:
@@ -307,3 +353,132 @@ class TestStep3p5StateDictAdapterRoundtrip:
             rtol=1e-3,
             atol=1e-3,
         )
+
+    def test_roundtrip_preserves_router_bias(self, adapter, moe_config):
+        """Test that HF -> Native -> HF preserves router bias."""
+        n_experts = moe_config.n_routed_experts
+
+        original_bias = torch.randn(n_experts)
+
+        hf_state_dict = {
+            "model.layers.0.moe.router_bias": original_bias,
+        }
+
+        # HF -> Native
+        native_state_dict = adapter.from_hf(hf_state_dict)
+        assert "model.layers.0.moe.gate.bias" in native_state_dict
+
+        # Native -> HF
+        recovered_hf = adapter.to_hf(native_state_dict)
+
+        # Verify recovered matches original
+        torch.testing.assert_close(
+            recovered_hf["model.layers.0.moe.router_bias"],
+            original_bias,
+        )
+
+    def test_roundtrip_preserves_non_moe(self, adapter):
+        """Test that HF -> Native -> HF preserves non-MoE weights."""
+        embed_weight = torch.randn(128, 64)
+        norm_weight = torch.randn(64)
+        attn_weight = torch.randn(64, 64)
+
+        hf_state_dict = {
+            "model.embed_tokens.weight": embed_weight,
+            "model.layers.0.input_layernorm.weight": norm_weight,
+            "model.layers.0.self_attn.q_proj.weight": attn_weight,
+        }
+
+        # HF -> Native
+        native_state_dict = adapter.from_hf(hf_state_dict)
+
+        # Native -> HF
+        recovered_hf = adapter.to_hf(native_state_dict)
+
+        # Verify all keys preserved
+        torch.testing.assert_close(
+            recovered_hf["model.embed_tokens.weight"],
+            embed_weight,
+        )
+        torch.testing.assert_close(
+            recovered_hf["model.layers.0.input_layernorm.weight"],
+            norm_weight,
+        )
+        torch.testing.assert_close(
+            recovered_hf["model.layers.0.self_attn.q_proj.weight"],
+            attn_weight,
+        )
+
+
+class TestStep3p5StateDictAdapterDTensorAware:
+    """Tests for DTensor-aware behavior of the adapter."""
+
+    def test_to_hf_handles_regular_tensors(self, adapter, moe_config):
+        """Test that to_hf works correctly with regular (non-DTensor) tensors."""
+        n_experts = moe_config.n_routed_experts
+        dim = moe_config.dim
+        inter_dim = moe_config.moe_inter_dim
+
+        # Native format tensors
+        gate_and_up = torch.randn(n_experts, dim, 2 * inter_dim)
+        down = torch.randn(n_experts, inter_dim, dim)
+
+        native_state_dict = {
+            "model.layers.0.moe.experts.gate_and_up_projs": gate_and_up,
+            "model.layers.0.moe.experts.down_projs": down,
+        }
+
+        # Convert to HF
+        hf_state_dict = adapter.to_hf(native_state_dict)
+
+        # Verify shapes match HF format
+        assert hf_state_dict["model.layers.0.moe.gate_proj.weight"].shape == (n_experts, inter_dim, dim)
+        assert hf_state_dict["model.layers.0.moe.up_proj.weight"].shape == (n_experts, inter_dim, dim)
+        assert hf_state_dict["model.layers.0.moe.down_proj.weight"].shape == (n_experts, dim, inter_dim)
+
+    def test_from_hf_without_device_mesh(self, adapter, moe_config):
+        """Test from_hf without device_mesh loads all experts."""
+        n_experts = moe_config.n_routed_experts
+        dim = moe_config.dim
+        inter_dim = moe_config.moe_inter_dim
+
+        # HF format tensors (full experts)
+        hf_gate = torch.randn(n_experts, inter_dim, dim)
+        hf_up = torch.randn(n_experts, inter_dim, dim)
+        hf_down = torch.randn(n_experts, dim, inter_dim)
+
+        hf_state_dict = {
+            "model.layers.0.moe.gate_proj.weight": hf_gate,
+            "model.layers.0.moe.up_proj.weight": hf_up,
+            "model.layers.0.moe.down_proj.weight": hf_down,
+        }
+
+        # Convert without device_mesh (no EP)
+        native_state_dict = adapter.from_hf(hf_state_dict, device_mesh=None)
+
+        # Verify all experts are loaded
+        gate_and_up = native_state_dict["model.layers.0.moe.experts.gate_and_up_projs"]
+        down = native_state_dict["model.layers.0.moe.experts.down_projs"]
+
+        assert gate_and_up.shape == (n_experts, dim, 2 * inter_dim)
+        assert down.shape == (n_experts, inter_dim, dim)
+
+    def test_passthrough_keys_preserved(self, adapter):
+        """Test that non-MoE keys pass through unchanged."""
+        embed_weight = torch.randn(128, 64)
+        norm_weight = torch.randn(64)
+
+        native_state_dict = {
+            "model.embed_tokens.weight": embed_weight,
+            "model.layers.0.input_layernorm.weight": norm_weight,
+        }
+
+        hf_state_dict = adapter.to_hf(native_state_dict)
+
+        # Keys should be preserved
+        assert "model.embed_tokens.weight" in hf_state_dict
+        assert "model.layers.0.input_layernorm.weight" in hf_state_dict
+
+        # Values should match
+        torch.testing.assert_close(hf_state_dict["model.embed_tokens.weight"], embed_weight)
+        torch.testing.assert_close(hf_state_dict["model.layers.0.input_layernorm.weight"], norm_weight)
