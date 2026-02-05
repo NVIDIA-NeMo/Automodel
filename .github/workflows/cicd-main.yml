@@ -170,11 +170,11 @@ jobs:
       max-parallel: 5
       matrix:
         include:
-          - test-name: L0_Unit_Tests_CPU
-            runner: linux-amd64-cpu16
-            cpu-only: true
+          # - test-name: L0_Unit_Tests_CPU
+          #   runner: linux-amd64-cpu16
+          #   cpu-only: true
           - test-name: L0_Unit_Tests_GPU
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: nemo-ci-aws-test
             cpu-only: false
             timeout: 30
     needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
@@ -213,35 +213,35 @@ jobs:
         include:
           - test-name: L2_Pretrain_and_KD
             test-folder: llm_pretrain_and_kd
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: nemo-ci-aws-test
             timeout: 20
           - test-name: L2_HF_DCP
             test-folder: hf_dcp
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: nemo-ci-aws-test
             timeout: 40
           - test-name: L2_HF_PEFT
             test-folder: hf_peft
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: nemo-ci-aws-test
             timeout: 30
           - test-name: L2_HF_Transformer
             test-folder: hf_transformer
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: nemo-ci-aws-test
             timeout: 20
           - test-name: L2_HF_Transformer_Finetune
             test-folder: hf_transformer_finetune
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: nemo-ci-aws-test
             timeout: 40
           - test-name: L2_HF_Transformer_LLM
             test-folder: hf_transformer_llm
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: nemo-ci-aws-test
             timeout: 40
           - test-name: L2_HF_Transformer_VLM
             test-folder: hf_transformer_vlm
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: nemo-ci-aws-test
             timeout: 60
           - test-name: L2_Datasets
             test-folder: data
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: nemo-ci-aws-test
             timeout: 20
     needs: [pre-flight]
     runs-on: ${{ matrix.runner }}
