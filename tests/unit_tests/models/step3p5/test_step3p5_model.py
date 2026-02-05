@@ -290,3 +290,23 @@ class TestStep3p5ForCausalLM:
 
         # Check that backend.gate_precision was set
         assert sdpa_backend.gate_precision == torch.float32
+
+    def test_config_num_experts_set_from_moe_num_experts(self, config, sdpa_backend):
+        """Test that model.config.num_experts is set from config.moe_num_experts.
+
+        This is important for activation checkpointing (apply_ac) which looks for
+        config.num_experts to determine the router weight shape for selective AC.
+        """
+        config.moe_num_experts = 8  # Set explicitly
+        model = Step3p5ForCausalLM(config, backend=sdpa_backend)
+
+        # Verify config.num_experts is set to moe_num_experts value
+        assert hasattr(model.model.config, "num_experts")
+        assert model.model.config.num_experts == 8
+
+    def test_moe_config_uses_num_experts_from_config(self, config, sdpa_backend):
+        """Test that moe_config.n_routed_experts is set from config.num_experts."""
+        config.moe_num_experts = 16
+        model = Step3p5ForCausalLM(config, backend=sdpa_backend)
+
+        assert model.model.moe_config.n_routed_experts == 16

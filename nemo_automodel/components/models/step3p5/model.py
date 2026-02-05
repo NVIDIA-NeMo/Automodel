@@ -216,13 +216,14 @@ class Step3p5Model(nn.Module):
         super().__init__()
         self.backend = backend
         self.config = config
+        self.config.num_experts = config.moe_num_experts
 
         # Build MoE config from Step3p5 config
         self.moe_config = moe_config or MoEConfig(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
             moe_inter_dim=getattr(config, "moe_intermediate_size", config.intermediate_size),
-            n_routed_experts=getattr(config, "moe_num_experts", 8),
+            n_routed_experts=self.config.num_experts,
             n_shared_experts=0,  # Step3p5 handles shared experts separately
             n_activated_experts=getattr(config, "moe_top_k", 2),
             n_expert_groups=0,
