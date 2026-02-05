@@ -64,19 +64,19 @@ def initialize_rms_norm_module(
     rms_norm_impl: str,
     dim: int,
     eps: float = 1e-5,
-    device: torch.device | str = "meta",
+    device: torch.device | str | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> nn.Module:
     """Initialize RMSNorm module with the specified backend.
 
-    For TE backend, creates TE module directly on meta device (following GroupedExpertsTE pattern).
-    Call reset_parameters() to materialize weights.
+    For TE backend, creates TE module directly on specified device.
+    Call reset_parameters() to materialize weights if created on meta device.
 
     Args:
         rms_norm_impl: Backend implementation ("te" or "torch")
         dim: Normalized dimension
         eps: Epsilon for numerical stability
-        device: Device to create module on (meta for TE to support lazy init)
+        device: Device to create module on (None uses PyTorch default, typically CPU)
         dtype: Parameter dtype
 
     Returns:
@@ -97,20 +97,20 @@ def initialize_linear_module(
     in_features: int,
     out_features: int,
     bias: bool = False,
-    device: torch.device | str = "meta",
+    device: torch.device | str | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> nn.Module:
     """Initialize Linear module with the specified backend.
 
-    For TE backend, creates TE module directly on meta device (following GroupedExpertsTE pattern).
-    Call reset_parameters() to materialize weights.
+    For TE backend, creates TE module directly on specified device.
+    Call reset_parameters() to materialize weights if created on meta device.
 
     Args:
         linear_impl: Backend implementation ("te" or "torch")
         in_features: Input features
         out_features: Output features
         bias: Whether to use bias
-        device: Device to create module on (meta for TE to support lazy init)
+        device: Device to create module on (None uses PyTorch default, typically CPU)
         dtype: Parameter dtype
 
     Returns:
