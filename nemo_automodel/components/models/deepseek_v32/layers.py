@@ -41,13 +41,13 @@ except ImportError:
         Returns:
             product: Tensor of shape (..., n)
         """
-        import numpy as np
+        import math
 
-        batch_size, n = u.shape
-        m = int(np.log2(n))
+        n = u.shape[-1]
+        m = int(math.log2(n))
         assert n == 1 << m, "n must be a power of 2"
-        x = u[..., np.newaxis]
-        for d in range(m)[::-1]:
+        x = u.unsqueeze(-1)
+        for _ in range(m):
             x = torch.cat((x[..., ::2, :] + x[..., 1::2, :], x[..., ::2, :] - x[..., 1::2, :]), dim=-1)
         x = x.squeeze(-2) / 2 ** (m / 2) if normalize else x.squeeze(-2)
         return x * scale
