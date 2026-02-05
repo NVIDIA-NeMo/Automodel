@@ -8,6 +8,7 @@
 repository-structure.md
 guides/installation.md
 guides/configuration.md
+guides/huggingface-api-compatibility.md
 launcher/local-workstation.md
 launcher/cluster.md
 ```
