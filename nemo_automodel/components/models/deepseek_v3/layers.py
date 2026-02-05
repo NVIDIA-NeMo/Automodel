@@ -67,7 +67,9 @@ class MLA(nn.Module):
             self.q_a_proj = initialize_linear_module(
                 linear_impl=linear_impl, in_features=hidden_size, out_features=self.q_lora_rank, bias=False
             )
-            self.q_a_layernorm = initialize_rms_norm_module(rms_norm_impl=rms_norm_impl, dim=self.q_lora_rank)
+            self.q_a_layernorm = initialize_rms_norm_module(
+                rms_norm_impl=rms_norm_impl, dim=self.q_lora_rank, eps=config.rms_norm_eps
+            )
             self.q_b_proj = initialize_linear_module(
                 linear_impl=linear_impl,
                 in_features=self.q_lora_rank,
@@ -81,7 +83,9 @@ class MLA(nn.Module):
             out_features=self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
         )
-        self.kv_a_layernorm = initialize_rms_norm_module(rms_norm_impl=rms_norm_impl, dim=self.kv_lora_rank)
+        self.kv_a_layernorm = initialize_rms_norm_module(
+            rms_norm_impl=rms_norm_impl, dim=self.kv_lora_rank, eps=config.rms_norm_eps
+        )
         self.kv_b_proj = initialize_linear_module(
             linear_impl=linear_impl,
             in_features=self.kv_lora_rank,
