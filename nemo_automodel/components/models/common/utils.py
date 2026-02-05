@@ -25,20 +25,20 @@ HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_DEEP_EP = importlib.util.find_spec("deep_ep") is not None
 
 
-def is_tensor_unallocated(x: torch.Tensor) -> bool:
+def is_tensor_unallocated(tensor: torch.Tensor) -> bool:
     """Check if tensor is unallocated (meta tensor, fake tensor, etc.).
 
     TE kernels don't support meta tensors, fake tensors, or unallocated tensors.
     This helper detects such cases for fallback handling.
 
     Args:
-        x: Tensor to check
+        tensor: Tensor to check
 
     Returns:
         True if tensor is unallocated or cannot be accessed
     """
     try:
-        return x.data_ptr() == 0 or x.numel() == 0
+        return tensor.data_ptr() == 0 or tensor.numel() == 0
     except Exception:
         return True
 
@@ -60,96 +60,32 @@ class BackendConfig:
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
 
 
-class TENormWrapper(nn.Module):
-    """Wrapper for TransformerEngine RMSNorm to handle meta tensors."""
-
-    def __init__(self, normalized_shape, eps, device, params_dtype):
-        super().__init__()
-        from transformer_engine.pytorch.module.rmsnorm import RMSNorm as TransformerEngineRMSNorm
-
-        te_norm = TransformerEngineRMSNorm(
-            normalized_shape=normalized_shape, eps=eps, device=device, params_dtype=params_dtype
-        )
-        torch_norm = nn.RMSNorm(normalized_shape, eps=eps, device=device, dtype=params_dtype)
-
-        # Share parameters
-        self.weight = te_norm.weight
-        torch_norm.weight = self.weight
-
-        # Use object.__setattr__ to prevent submodules from being registered in self._modules.
-        # This ensures that the state_dict keys remain flat (e.g., 'weight' instead of 'te_norm.weight').
-        object.__setattr__(self, "te_norm", te_norm)
-        object.__setattr__(self, "torch_norm", torch_norm)
-
-    def reset_parameters(self) -> None:
-        """Reset parameters by delegating to the underlying torch norm."""
-        torch_norm = object.__getattribute__(self, "torch_norm")
-        torch_norm.reset_parameters()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if is_tensor_unallocated(x):
-            # Shape inference only - return empty tensor with same shape
-            return torch.empty_like(x)
-
-        # Re-sync shared weights in case they were replaced during materialization
-        # (e.g., by to_empty_parameters_only which replaces _parameters entries)
-        te_norm = object.__getattribute__(self, "te_norm")
-        if te_norm.weight is not self.weight:
-            te_norm.weight = self.weight
-
-        return te_norm(x)
-
-
-class TELinearWrapper(nn.Module):
-    """Wrapper for TransformerEngine Linear to handle meta tensors."""
-
-    def __init__(self, in_features, out_features, bias, device, params_dtype):
-        super().__init__()
-        from transformer_engine.pytorch.module.linear import Linear as TransformerEngineLinear
-
-        te_linear = TransformerEngineLinear(
-            in_features, out_features, bias=bias, device=device, params_dtype=params_dtype
-        )
-        torch_linear = nn.Linear(in_features, out_features, bias=bias, device=device, dtype=params_dtype)
-
-        # Share parameters
-        self.weight = te_linear.weight
-        torch_linear.weight = self.weight
-        if bias:
-            self.bias = te_linear.bias
-            torch_linear.bias = self.bias
-        else:
-            self.bias = None
-
-        # Use object.__setattr__ to prevent submodules from being registered in self._modules.
-        object.__setattr__(self, "te_linear", te_linear)
-        object.__setattr__(self, "torch_linear", torch_linear)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if is_tensor_unallocated(x):
-            # Shape inference only - return empty tensor with correct output shape
-            out_shape = x.shape[:-1] + (self.weight.shape[0],)
-            return torch.empty(out_shape, dtype=x.dtype, device=x.device)
-
-        # Re-sync shared weights in case they were replaced during materialization
-        te_linear = object.__getattribute__(self, "te_linear")
-        if te_linear.weight is not self.weight:
-            te_linear.weight = self.weight
-            if hasattr(self, "bias") and self.bias is not None:
-                te_linear.bias = self.bias
-
-        return te_linear(x)
-
-
 def initialize_rms_norm_module(
     rms_norm_impl: str,
     dim: int,
     eps: float = 1e-5,
-    device: torch.device | str | None = None,
+    device: torch.device | str = "meta",
     dtype: torch.dtype = torch.bfloat16,
 ) -> nn.Module:
+    """Initialize RMSNorm module with the specified backend.
+
+    For TE backend, creates TE module directly on meta device (following GroupedExpertsTE pattern).
+    Call reset_parameters() to materialize weights.
+
+    Args:
+        rms_norm_impl: Backend implementation ("te" or "torch")
+        dim: Normalized dimension
+        eps: Epsilon for numerical stability
+        device: Device to create module on (meta for TE to support lazy init)
+        dtype: Parameter dtype
+
+    Returns:
+        RMSNorm module
+    """
     if rms_norm_impl == "te":
-        return TENormWrapper(normalized_shape=dim, eps=eps, device=device, params_dtype=dtype)
+        from transformer_engine.pytorch.module.rmsnorm import RMSNorm as TransformerEngineRMSNorm
+
+        return TransformerEngineRMSNorm(normalized_shape=dim, eps=eps, device=device, params_dtype=dtype)
     elif rms_norm_impl == "torch":
         return nn.RMSNorm(dim, eps=eps, device=device, dtype=dtype)
     else:
@@ -161,12 +97,70 @@ def initialize_linear_module(
     in_features: int,
     out_features: int,
     bias: bool = False,
-    device: torch.device | str | None = None,
+    device: torch.device | str = "meta",
     dtype: torch.dtype = torch.bfloat16,
 ) -> nn.Module:
+    """Initialize Linear module with the specified backend.
+
+    For TE backend, creates TE module directly on meta device (following GroupedExpertsTE pattern).
+    Call reset_parameters() to materialize weights.
+
+    Args:
+        linear_impl: Backend implementation ("te" or "torch")
+        in_features: Input features
+        out_features: Output features
+        bias: Whether to use bias
+        device: Device to create module on (meta for TE to support lazy init)
+        dtype: Parameter dtype
+
+    Returns:
+        Linear module
+    """
     if linear_impl == "torch":
         return nn.Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
     elif linear_impl == "te":
-        return TELinearWrapper(in_features, out_features, bias=bias, device=device, params_dtype=dtype)
+        from transformer_engine.pytorch.module.linear import Linear as TransformerEngineLinear
+
+        # Create TE module directly on meta device (same as GroupedExpertsTE)
+        return TransformerEngineLinear(
+            in_features=in_features, out_features=out_features, bias=bias, device=device, params_dtype=dtype
+        )
     else:
         raise ValueError(f"Unsupported Linear implementation: {linear_impl}")
+
+
+def _patch_te_modules():
+    """Patch TE modules to handle unallocated tensors for PP shape inference."""
+    from transformer_engine.pytorch.module.linear import Linear as TELinear
+    from transformer_engine.pytorch.module.rmsnorm import RMSNorm as TERMSNorm
+
+    _original_rmsnorm_forward = TERMSNorm.forward
+    _original_linear_forward = TELinear.forward
+
+    def _patched_rmsnorm_forward(self, x):
+        is_unallocated = is_tensor_unallocated(x)
+        if is_unallocated:
+            return torch.empty_like(x)
+        return _original_rmsnorm_forward(self, x)
+
+    def _patched_linear_forward(self, x):
+        is_unallocated = is_tensor_unallocated(x)
+        if is_unallocated:
+            out_shape = x.shape[:-1] + (self.weight.shape[0],)
+            return torch.empty(out_shape, dtype=x.dtype, device=x.device)
+        return _original_linear_forward(self, x)
+
+    TERMSNorm.forward = _patched_rmsnorm_forward
+    TELinear.forward = _patched_linear_forward
+
+
+# Apply TE patches automatically if transformer_engine is available
+if HAVE_TE:
+    _patch_te_modules()
+
+
+__all__ = [
+    "BackendConfig",
+    "initialize_linear_module",
+    "initialize_rms_norm_module",
+]
