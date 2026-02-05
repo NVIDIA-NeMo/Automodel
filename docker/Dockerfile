@@ -89,6 +89,7 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
 RUN pip install "aiohttp>=3.13.3" \
         "jaraco-context>=6.1.0" \
         "protobuf>=6.3.5" \
+        "setuptools>=80.10.2" \
         "urllib3>=2.6.0" \
         "wheel>=0.46.2"
 
