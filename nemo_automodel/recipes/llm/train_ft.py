@@ -1132,10 +1132,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     targets = None
 
                 input_ids = batch.pop("input_ids")
-                
+
                 # Filter out None values and empty dicts from batch to avoid PP chunking errors
-                batch_filtered = {k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)}
-                
+                batch_filtered = {
+                    k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
+                }
+
                 if is_train:
                     # Use step for training (forward + backward)
                     if self.pp.info.has_first_stage:
