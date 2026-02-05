@@ -13,7 +13,7 @@
 # limitations under the License.
 
 [build-system]
-requires = ["setuptools >= 61.0"]
+requires = ["setuptools >= 80.10.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -173,7 +173,14 @@ no-build-isolation-package = [
     "transformer-engine-torch",
 ]
 constraint-dependencies = [
+    "aiohttp>=3.13.3", # Address CVE GHSA-6mq8-rvhq-8wgg
+    "jaraco-context>=6.1.0", #Address CVE GHSA-58pv-8j8x-9vj2
+    "protobuf>=6.33.5", # Address CVE GHSA-7gcm-g887-7qv7
+    "pyasn1>=0.6.2", # Address CVE GHSA-63vm-454h-vhhq
     "starlette>=0.49.1", # Address CVE GHSA-7f5h-v6xp-fcq8
+    "setuptools>=80.10.2",
+    "urllib3>=2.6.0", # Address CVE GHSA-gm62-xv2j-4w53
+    "wheel>=0.46.2", # Address CVE GHSA-8rrh-rw8j-w5fx
 ]
 prerelease = "allow"
 
