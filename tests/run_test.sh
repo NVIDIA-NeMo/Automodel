@@ -48,6 +48,7 @@ coverage run \
     --source=/workspace/ \
     --parallel-mode \
     -m pytest \
+    --durations 10 \
     $TEST_DIR \
     -o log_cli=true \
     -o log_cli_level=INFO \
