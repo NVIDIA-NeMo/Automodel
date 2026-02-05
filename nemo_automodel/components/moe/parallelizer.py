@@ -86,9 +86,10 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh):
     _model = get_text_module(_model)
 
     for _, block in _model.layers.named_children():
-        if isinstance(block.mlp, MoE):
+        moe_module = block.moe if hasattr(block, "moe") else block.mlp
+        if isinstance(moe_module, MoE):
             parallelize_module(
-                module=block.mlp.experts,
+                module=moe_module.experts,
                 device_mesh=ep_mesh,
                 parallelize_plan=ExpertParallel(),
             )
@@ -116,8 +117,10 @@ def apply_ac(
             raise ValueError("hidden_size must be provided or model must have config.hidden_size attribute")
 
     if num_experts is None:
-        if hasattr(model, "config") and hasattr(model.config, "num_experts"):
-            num_experts = model.config.num_experts
+        for attr in ["num_experts", "moe_num_experts"]:
+            if hasattr(model, "config") and hasattr(model.config, attr):
+                num_experts = getattr(model.config, attr)
+                break
         else:
             raise ValueError("num_experts must be provided or model must have config.num_experts attribute")
 
@@ -187,11 +190,12 @@ def apply_fsdp(
     _model = get_text_module(_model)
 
     for _, block in _model.layers.named_children():
-        if isinstance(block.mlp, MoE) and ep_shard_enabled:
+        moe_module = block.moe if hasattr(block, "moe") else block.mlp
+        if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
             # shards than experts (dim=0).
             fully_shard(
-                block.mlp.experts,
+                moe_module.experts,
                 mesh=ep_shard_mesh,
                 shard_placement_fn=lambda _: Shard(1),
                 reshard_after_forward=reshard_after_forward,
@@ -203,8 +207,8 @@ def apply_fsdp(
         # removed from the FSDP for the transformer block due to the rules of the
         # PyTorch FSDP implementation.
         ignored_params = None
-        if isinstance(block.mlp, MoE) and ep_enabled:
-            ignored_params = set(block.mlp.experts.parameters())
+        if isinstance(moe_module, MoE) and ep_enabled:
+            ignored_params = set(moe_module.experts.parameters())
 
         fully_shard_default(block, ignored_params=ignored_params)
 
