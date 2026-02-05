@@ -142,4 +142,4 @@ runs:
           ${{ env.container-registry }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
           ${{ env.container-registry }}/${{ env.REPO_LOWER }}:${{ github.sha }}
         secrets: |
-          GH_TOKEN=${{ input.PAT }}
+          GH_TOKEN=${{ inputs.PAT }}
