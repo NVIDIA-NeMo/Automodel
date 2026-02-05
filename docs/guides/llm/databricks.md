@@ -6,7 +6,7 @@ The specific example here fine-tunes a [Llama-3.2-1B](https://huggingface.co/met
 
 ## Compute
 
-Let’s start by [provisioning](https://docs.databricks.com/aws/en/compute/configure) a Databricks classic compute cluster with the following setup:
+Let's start by [provisioning](https://docs.databricks.com/aws/en/compute/configure) a Databricks classic compute cluster with the following setup:
 
 - Databricks runtime: [18.0 LTS (Machine Learning version)](https://docs.databricks.com/aws/en/release-notes/runtime/18.0ml)
 - Worker instance type: `g6e.12xlarge` on AWS (4x L40S GPUs per node)  
@@ -21,15 +21,15 @@ Let’s start by [provisioning](https://docs.databricks.com/aws/en/compute/confi
 /databricks/python3/bin/pip install git+https://github.com/NVIDIA-NeMo/Automodel
 ```
 
-This will provision three compute nodes – one driver node we’ll attach a notebook to, and two worker nodes we’ll use for multi-node training.
+This will provision three compute nodes – one driver node we'll attach a notebook to, and two worker nodes we'll use for multi-node training.
 
-Note that we’ve selected a small number of instances for demo purposes, but you can adjust the specific instance type and number of workers for your actual use case.
+Note that we've selected a small number of instances for demo purposes, but you can adjust the specific instance type and number of workers for your actual use case.
 
 ## Training
 
-With the above compute resources provisioned, we’re ready to fine-tune a model using Automodel.
+With the above compute resources provisioned, we're ready to fine-tune a model using Automodel.
 
-Automodel uses YAML file recipes to configure various settings for the training process (for example, model, dataset, loss function, optimizer, etc.). Here we’ll use this [preconfigured recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) for fine-tuning a Llama-3.2-1B model using the SQuAD dataset from Hugging Face. In a notebook connected to our compute resource, download the training script and configuration file with these `curl` commands:
+Automodel uses YAML file recipes to configure various settings for the training process (for example, model, dataset, loss function, optimizer, etc.). Here we'll use this [preconfigured recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) for fine-tuning a Llama-3.2-1B model using the SQuAD dataset from Hugging Face. In a notebook connected to our compute resource, download the training script and configuration file with these `curl` commands:
 
 ```bash
 # Download training script
@@ -38,7 +38,7 @@ Automodel uses YAML file recipes to configure various settings for the training 
 !curl -O https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/refs/heads/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
-Here’s what the model, dataset, and optimizer portions of the config file look like:
+Here's what the model, dataset, and optimizer portions of the config file look like:
 
 ```yaml
 model:
@@ -75,7 +75,7 @@ hf_token = getpass("HF token: ")
 
 ### Single-Node
 
-To run fine-tuning, we’ll use the `finetune.py` script from the Automodel repository and our config file.
+To run fine-tuning, we'll use the `finetune.py` script from the Automodel repository and our config file.
 
 To run training on a single GPU, use this command:
 
@@ -116,7 +116,7 @@ To utilize all four GPUs available on this `g6e.12xlarge` instance, use `torchru
     --checkpoint.is_async True
 ```
 
-This uses PyTorch’s [Elastic Launch](https://docs.pytorch.org/docs/stable/elastic/run.html) functionality to spawn and coordinate multiple training processes on the VM. Each training process runs on a separate GPU, and we can now see all four GPUs are being used (\~95% utilization for each GPU).
+This uses PyTorch's [Elastic Launch](https://docs.pytorch.org/docs/stable/elastic/run.html) functionality to spawn and coordinate multiple training processes on the VM. Each training process runs on a separate GPU, and we can now see all four GPUs are being used (\~95% utilization for each GPU).
 
 :::{figure} ./databricks-gpu-metrics-multi.png
 :name: databricks-gpu-metrics-multi
@@ -175,9 +175,126 @@ distributor.run(train_file, *args)
 
 We now see GPU utilization is \~95% for all GPUs on all worker nodes during training (8 GPUs in this particular case).
 
+## MLflow Tracking
+
+Databricks includes built-in MLflow integration for tracking experiments, logging metrics, and storing artifacts. To use MLflow with Automodel on Databricks, add the MLflow configuration to your YAML file.
+
+### Configuration
+
+Edit your configuration file (e.g., `llama3_2_1b_squad.yaml`) to include the `mlflow` section:
+
+```yaml
+mlflow:
+  experiment_name: "automodel-databricks-llama3-squad"
+  run_name: ""
+  tracking_uri: "databricks"
+  artifact_location: null
+  tags:
+    platform: "databricks"
+    task: "squad-finetune"
+    model_family: "llama3.2"
+```
+
+For Databricks, the key configuration parameters are:
+
+- `tracking_uri`: Set to `"databricks"` to use Databricks' managed MLflow tracking server
+- `experiment_name`: Name of your experiment (will appear in the Databricks workspace)
+- `artifact_location`: Leave as `null` to use default Databricks artifact storage, or specify a Unity Catalog volume path like `/Volumes/<catalog>/<schema>/<volume>/mlflow-artifacts`
+- `tags`: Add custom tags to organize and filter your runs
+
+:::{note}
+Databricks automatically handles authentication when `tracking_uri` is set to `"databricks"`. No additional credentials are needed.
+:::
+
+### Running with MLflow
+
+Run training with MLflow tracking enabled using the same commands as before. The MLflow configuration will be read from your YAML file:
+
+**Single-node:**
+```bash
+!python finetune.py \
+    --config llama3_2_1b_squad.yaml \
+    --step_scheduler.max_steps 20 \
+    --checkpoint.checkpoint_dir /Volumes/<catalog_name>/<schema_name>/<volume_name>/checkpoints/
+```
+
+**Multi-GPU:**
+```bash
+!torchrun --nproc-per-node=4 finetune.py \
+    --config llama3_2_1b_squad.yaml \
+    --step_scheduler.max_steps 20 \
+    --checkpoint.checkpoint_dir /Volumes/<catalog_name>/<schema_name>/<volume_name>/checkpoints/
+```
+
+**Multi-node with TorchDistributor:**
+```python
+distributor = TorchDistributor(
+    num_processes=num_executor * num_gpus_per_executor,
+    local_mode=False,
+    use_gpu=True,
+)
+
+args = [
+    "--config", "llama3_2_1b_squad.yaml",
+    "--step_scheduler.max_steps", "20",
+    "--checkpoint.checkpoint_dir", "/Volumes/<catalog_name>/<schema_name>/<volume_name>/checkpoints/",
+]
+distributor.run("finetune.py", *args)
+```
+
+### Viewing Results
+
+During training, you'll see MLflow logging messages in your output:
+
+```
+MLflow run started: abc123def456
+View run at: databricks/#/mlflow/experiments/123/runs/abc123def456
+```
+
+To view your experiments and metrics:
+
+1. Navigate to the **Experiments** page in your Databricks workspace
+2. Find your experiment by name (e.g., `automodel-databricks-llama3-squad`)
+3. Click on a run to view metrics, parameters, and artifacts
+
+The Databricks MLflow UI displays:
+- Training and validation metrics over time
+- Model parameters and hyperparameters
+- Custom tags for filtering and comparison
+- Artifacts and model checkpoints
+- System metrics (GPU utilization, memory usage)
+
+### Artifact Storage in Unity Catalog
+
+To store MLflow artifacts in Unity Catalog volumes, specify the `artifact_location`:
+
+```yaml
+mlflow:
+  experiment_name: "automodel-databricks-llama3-squad"
+  tracking_uri: "databricks"
+  artifact_location: "/Volumes/<catalog_name>/<schema_name>/<volume_name>/mlflow-artifacts"
+  tags:
+    platform: "databricks"
+```
+
+This ensures your artifacts are stored in a governed, versioned location within Unity Catalog.
+
+### Additional Configuration
+
+You can override MLflow settings from the command line:
+
+```bash
+!python finetune.py \
+    --config llama3_2_1b_squad.yaml \
+    --mlflow.experiment_name "custom-experiment-name" \
+    --mlflow.run_name "baseline-run-1" \
+    --mlflow.tags.learning_rate "1e-5"
+```
+
+For more details on MLflow configuration options and best practices, see the {doc}`MLflow logging guide </guides/mlflow-logging>`.
 
 ## Conclusion
 
-This guide showed how to use Automodel for model training on Databricks-managed compute. It’s relatively straightforward to scale from a single-GPU to multi-GPU to multi-node training to best suit your needs. 
+This guide showed how to use Automodel for model training on Databricks-managed compute. It's relatively straightforward to scale from a single-GPU to multi-GPU to multi-node training to best suit your needs. 
 
 While the example here fine-tunes a Llama-3.2-1B model using the SQuAD dataset, any supported Automodel functionality (like model pre-training, VLMs, etc.) can also run, and scale, on Databricks. Check out {doc}`additional recipes and end-to-end examples </guides/overview>` to learn more. 
