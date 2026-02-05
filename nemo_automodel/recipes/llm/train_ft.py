@@ -31,6 +31,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+from transformers import AutoConfig
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from wandb import Settings
 
@@ -494,6 +495,31 @@ def build_dataloader(
             else:
                 dl_kwargs["collate_fn"] = cfg_dl.collate_fn
             assert callable(dl_kwargs["collate_fn"]), "collate_fn must be callable"
+
+        # Chain with mask precomputation if PP is enabled
+        if pp_enabled:
+            from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
+
+            hf_model_config = AutoConfig.from_pretrained(
+                _get_model_name(cfg_model), trust_remote_code=compute_trust_remote_code_from_model(cfg_model)
+            )
+
+            if "collate_fn" in dl_kwargs:
+                # Case 1: PP enabled + collate_fn exists -> chain them
+                # base_collate_fn -> add_causal_masks_to_batch
+                base_collate_fn = dl_kwargs["collate_fn"]
+
+                def chained_collate_fn(batch, base_fn=base_collate_fn, config=hf_model_config):
+                    batch = base_fn(batch)  # Apply base collate (padding, batching, etc.)
+                    batch = add_causal_masks_to_batch(batch, model_config=config)  # Add masks
+                    return batch
+
+                dl_kwargs["collate_fn"] = chained_collate_fn
+            else:
+                # Case 2: PP enabled + no collate_fn -> only add masks
+                dl_kwargs["collate_fn"] = lambda batch, config=hf_model_config: add_causal_masks_to_batch(
+                    batch, model_config=config
+                )
 
         try:
             import torch.multiprocessing as mp
@@ -1081,7 +1107,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
         batch = {
             k: (
-                {dk: dv.to(self.dist_env.device, non_blocking=True) if dv is not None else None for dk, dv in v.items()}
+                {dk: dv.to(self.dist_env.device, non_blocking=True) for dk, dv in v.items() if dv is not None}
                 if isinstance(v, dict)
                 else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
             )
@@ -1106,18 +1132,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     targets = None
 
                 input_ids = batch.pop("input_ids")
+
+                # Filter out None values and empty dicts from batch to avoid PP chunking errors
+                batch_filtered = {
+                    k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
+                }
+
                 if is_train:
                     # Use step for training (forward + backward)
                     if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
+                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch_filtered)
                     else:
-                        self.pp.info.schedule.step(target=targets, losses=losses, **batch)
+                        self.pp.info.schedule.step(target=targets, losses=losses, **batch_filtered)
                 else:
                     # Use eval for validation (forward only, no backward)
                     if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch)
+                        self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch_filtered)
                     else:
-                        self.pp.info.schedule.eval(target=targets, losses=losses, **batch)
+                        self.pp.info.schedule.eval(target=targets, losses=losses, **batch_filtered)
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))
