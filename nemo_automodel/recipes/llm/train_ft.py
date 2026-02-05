@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 import torch
 import torch.nn as nn
 import wandb
+from huggingface_hub import constants as hf_constants
 from megatron_fsdp.fully_shard import fully_shard_optimizer
 from torch.distributed.device_mesh import DeviceMesh
 from torch.utils.data import DataLoader, IterableDataset
@@ -32,8 +33,6 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoConfig
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers.utils import TRANSFORMERS_CACHE
-from transformers.utils.hub import TRANSFORMERS_CACHE
 from wandb import Settings
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM, NeMoAutoModelForSequenceClassification
@@ -133,7 +132,6 @@ def build_model_and_optimizer(
     cfg_peft,
     model_wrapper,
     seed,
-    checkpointer: Checkpointer,
     has_packed_sequence=False,
     tp_size=1,
     cp_size=1,
@@ -174,7 +172,6 @@ def build_model_and_optimizer(
             "has_packed_sequence": has_packed_sequence,
             "autopipeline": autopipeline,
             "parallelize_fn": parallelize_fn,
-            "checkpointer": checkpointer,
             "peft_config": cfg_peft,
             "model_wrapper": model_wrapper,
             "loss_fn": loss_fn,
@@ -214,9 +211,9 @@ def build_model_and_optimizer(
                 is_hf_model=False,
                 is_meta_device=False,
                 device=torch.cuda.current_device(),
-                model_name_or_path=None,
+                pretrained_model_name_or_path=None,
                 load_base_model=False,
-                cache_dir=TRANSFORMERS_CACHE,
+                cache_dir=hf_constants.HF_HUB_CACHE,
                 **kwargs,
             )
 
@@ -271,7 +268,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         checkpoint_dir="checkpoints/",
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
-        model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
+        model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HUB_CACHE,
         save_consolidated=True,
         is_peft=is_peft,
     )
@@ -923,7 +920,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             autopipeline=autopipeline,
             loss_fn=self.loss_fn,
             parallelize_fn=parallelize_fn,
-            checkpointer=self.checkpointer,
         )
 
         if isinstance(model, AutoPipeline):
@@ -1111,7 +1107,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
         batch = {
             k: (
-                {dk: dv.to(self.dist_env.device, non_blocking=True) if dv is not None else None for dk, dv in v.items()}
+                {dk: dv.to(self.dist_env.device, non_blocking=True) for dk, dv in v.items() if dv is not None}
                 if isinstance(v, dict)
                 else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
             )
@@ -1136,18 +1132,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     targets = None
 
                 input_ids = batch.pop("input_ids")
+
+                # Filter out None values and empty dicts from batch to avoid PP chunking errors
+                batch_filtered = {
+                    k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
+                }
+
                 if is_train:
                     # Use step for training (forward + backward)
                     if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
+                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch_filtered)
                     else:
-                        self.pp.info.schedule.step(target=targets, losses=losses, **batch)
+                        self.pp.info.schedule.step(target=targets, losses=losses, **batch_filtered)
                 else:
                     # Use eval for validation (forward only, no backward)
                     if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch)
+                        self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch_filtered)
                     else:
-                        self.pp.info.schedule.eval(target=targets, losses=losses, **batch)
+                        self.pp.info.schedule.eval(target=targets, losses=losses, **batch_filtered)
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))
