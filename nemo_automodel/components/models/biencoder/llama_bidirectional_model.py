@@ -45,6 +45,8 @@ from transformers.models.llama.modeling_llama import (
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, logging
 
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+
 try:
     from nemo_automodel.components.models.biencoder.state_dict_adapter import BiencoderStateDictAdapter
 except ImportError:
@@ -372,7 +374,7 @@ class BiencoderOutput(ModelOutput):
     scores: Optional[Tensor] = None
 
 
-class BiencoderModel(nn.Module):
+class BiencoderModel(nn.Module, HFCheckpointingMixin):
     """
     Biencoder Model with essential functions for training.
 
