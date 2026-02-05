@@ -15,5 +15,7 @@ override-dependencies = [
     "torch; sys_platform == 'never'",
     "torchao; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
+    "transformer-engine; sys_platform == 'never'",
+    "transformer-engine-torch; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
 ]

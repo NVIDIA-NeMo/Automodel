@@ -25,6 +25,7 @@ examples/llm_finetune/finetune.py \
   --dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
   --validation_dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
   --dataset.dataset_name $HF_CACHE/squad/ \
+  --validation_dataset.dataset_name $HF_CACHE/squad/ \
   --dataset.limit_dataset_samples 10 \
   --peft._target_ nemo_automodel.components._peft.lora.PeftConfig \
   --peft.target_modules '*_proj' \

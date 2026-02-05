@@ -34,7 +34,6 @@ nemo_automodel/recipes/llm/train_ft.py \
     --step_scheduler.ckpt_every_steps 10 \
     --checkpoint.enabled true \
     --checkpoint.checkpoint_dir checkpoints/deepseek_moe_lora_test \
-    --checkpoint.load_base_model false \
     --peft.target_modules "[\"*.experts\"]" \
     --peft.dim 16 \
     --peft.alpha 32 \

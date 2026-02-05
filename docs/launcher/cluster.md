@@ -9,7 +9,7 @@ NeMo Automodel uses recipes to run end-to-end workflows. If you're new to recipe
 Kubernetes support is coming soon.
 :::
 
-## Quick start: Choose your job launch option
+## Quickstart: Choose Your Job Launch Option
 
 Slurm jobs support two modes of execution: `batch` and `interactive`. In `batch` mode, the job is submitted to the cluster queue and
 is executed without any other input from the user (e.g., no keyboard input), whereas the `interactive` mode, as the name implies, enables keyboard input.
@@ -59,14 +59,14 @@ slurm:
   time: 00:30:00
   account: your_account
   partition: gpu
-  container_image: nvcr.io/nvidia/nemo:25.07
+  container_image: nvcr.io/nvidia/nemo-automodel:25.11.00
   gpus_per_node: 8 # Adds an SBATCH line: "#SBATCH --gpus-per-node=8"
   # Optional: Add extra mount points if needed
   extra_mounts:
     - /lustre:/lustre
   # Optional: Specify custom HF_HOME location (will auto-create if not specified)
   hf_home: /path/to/your/HF_HOME
-  # Optional : Specify custom env vars
+  # Optional: Specify custom env vars
   # env_vars:
   #   ENV_VAR: value
   # Optional: Specify custom job directory (defaults to cwd/slurm_jobs)
@@ -197,7 +197,11 @@ torchrun \
 Notes:
 - Set `NODE_RANK=0` on the master node (where `MASTER_ADDR` resolves), `NODE_RANK=1` on the second node, and so on.
 - Ensure `--nproc_per_node` matches the number of GPUs per node.
+:::{note}
+- Set `NODE_RANK=0` on the master node (where `MASTER_ADDR` resolves), `NODE_RANK=1` on the second node, and so on.
+- Ensure `--nproc_per_node` matches the number of GPUs per node.
 - When launching under Slurm, prefer the CLI `slurm` configuration above or ensure equivalent rendezvous/env settings are provided via the scheduler.
+:::
 
 ## Customize Configuration Settings
 

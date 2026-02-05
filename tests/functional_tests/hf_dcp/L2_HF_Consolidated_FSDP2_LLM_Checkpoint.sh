@@ -35,6 +35,7 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --checkpoint.checkpoint_dir checkpoints/ \
     --checkpoint.model_save_format safetensors \
     --checkpoint.save_consolidated true \
+    --checkpoint.single_rank_consolidation true \
     --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
     --distributed.dp_size none \
     --distributed.tp_size 1 \

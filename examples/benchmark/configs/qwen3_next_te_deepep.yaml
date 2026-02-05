@@ -67,7 +67,7 @@ model:
     pretrained_model_name_or_path: Qwen/Qwen3-Next-80B-A3B-Instruct
   trust_remote_code: true
   backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
     rms_norm: te
@@ -79,7 +79,6 @@ model:
 
 checkpoint:
   enabled: false
-  load_base_model: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

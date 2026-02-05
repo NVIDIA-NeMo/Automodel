@@ -20,7 +20,7 @@ step_scheduler:
   local_batch_size: 1
   ckpt_every_steps: 2
   val_every_steps: null
-  max_steps: 2
+  max_steps: 3
 
 dist_env:
   backend: nccl
@@ -35,6 +35,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   # Overridden by the functional-test launcher to a tiny local HF model.
   pretrained_model_name_or_path: hf-internal-testing/tiny-random-gpt2
+  force_hf: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig

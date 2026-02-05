@@ -40,9 +40,10 @@ parallelizer:
   activation_checkpointing: false
 
 model:
-  _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: transformers.models.deepseek_v3.configuration_deepseek_v3.DeepseekV3Config
+    architectures: ["DeepseekV3ForCausalLM"]
     attention_bias: false
     attention_dropout: 0.0
     aux_loss_alpha: 0.001
@@ -92,7 +93,7 @@ model:
 
   trust_remote_code: true
   backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
     linear: torch
     rms_norm: torch
@@ -106,7 +107,6 @@ checkpoint:
   checkpoint_dir: checkpoints/
   model_save_format: torch_save # torch_save or safetensors
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
-  load_base_model: false
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager

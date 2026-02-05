@@ -31,12 +31,11 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_llm/users/huiyingl/bulb/Automodel-bulb/my/NVIDIA-Nemotron-Parse-v1.1
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-Parse-v1.1
   torch_dtype: torch.bfloat16
   use_liger_kernel: false
   attn_implementation: eager
   trust_remote_code: True
-  local_files_only: True
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained

@@ -53,9 +53,18 @@ inputs:
   test-data-path:
     description: "Test data path"
     required: true
+  container-image:
+    description: "Container image to use for test"
+    required: true
+
 runs:
   using: "composite"
   steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+      with:
+        path: NeMo-Automodel
+
     - name: Install Azure CLI
       if: ${{ inputs.has-azure-credentials == 'true' }}
       shell: bash
@@ -72,28 +81,18 @@ runs:
         tenant-id: ${{ inputs.azure-tenant-id }}
         subscription-id: ${{ inputs.azure-subscription-id }}
 
-    - name: Install uuidgen
-      shell: bash -x -e -u -o pipefail {0}
+    - name: Azure ACR Login
+      shell: bash
+      run: |
+        az acr login --name nemoci
+
+    - name: Azure Fileshare
+      if: ${{ inputs.has-azure-credentials == 'true' && inputs.is-unit-test == 'false' }}
+      shell: bash
+      id: azure-fileshare
       run: |
         apt-get update
         apt-get install -y uuid-runtime
-
-    - name: Checkout repository
-      uses: actions/checkout@v2
-      with:
-        path: NeMo-Automodel
-
-    - name: Build container
-      shell: bash
-      env:
-        GH_TOKEN: ${{ inputs.PAT }}
-      run: |
-        echo "::group::Build test container"
-        docker system prune -af
-        docker build -f docker/Dockerfile \
-          --build-arg BASE_IMAGE=pytorch \
-          --target automodel_final -t automodel .
-        echo "::endgroup::"
 
     - name: Start container
       shell: bash
@@ -122,7 +121,7 @@ runs:
           --volume $(pwd)/NeMo-Automodel:/workspace \
           --workdir /workspace \
           --volume ${{ inputs.test-data-path }}:/home/TestData \
-          automodel \
+          ${{ inputs.container-image }} \
           bash -c "sleep $(( ${{ inputs.timeout }} * 60 + 60 ))"
         RUN_TEST_EOF
         )

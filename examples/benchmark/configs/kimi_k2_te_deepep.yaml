@@ -66,7 +66,7 @@ model:
     pretrained_model_name_or_path: moonshotai/Kimi-K2-Base
   trust_remote_code: true
   backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
     rms_norm: te
@@ -77,7 +77,6 @@ model:
 
 checkpoint:
   enabled: false
-  load_base_model: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

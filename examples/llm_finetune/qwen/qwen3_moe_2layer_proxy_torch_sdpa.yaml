@@ -33,9 +33,10 @@ parallelizer:
   activation_checkpointing: false
 
 model:
-  _target_: nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM.from_config
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: transformers.models.qwen3_moe.configuration_qwen3_moe.Qwen3MoeConfig
+    architectures: [Qwen3MoeForCausalLM]
     vocab_size: 151936
     hidden_size: 2048
     intermediate_size: 1024
@@ -60,7 +61,7 @@ model:
     use_cache: false
   trust_remote_code: true
   backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
     linear: torch
     rms_norm: torch
@@ -73,7 +74,6 @@ checkpoint:
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors
   save_consolidated: false
-  load_base_model: false
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager

@@ -111,9 +111,17 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         self.tflops = flops / (10**12)
 
         if hasattr(self.cfg, "peft"):
-            # Calculate trainable vs non-trainable parameters without lora
-            lora_params = self.param_info["trainable_params"]
-            total_params = self.param_info["total_params"]
+            # Calculate trainable vs non-trainable parameters
+            # Need to get these before autopipeline splits the model across PP ranks
+            if self.pp is not None:
+                # PP enabled - use pre-sharding values stored on autopipeline
+                lora_params = self.pp.trainable_params_before_pp
+                total_params = self.pp.total_params_before_pp
+            else:
+                # No PP - model is not sharded, calculate directly
+                from nemo_automodel.components.utils.model_utils import print_trainable_parameters
+
+                lora_params, total_params = print_trainable_parameters(self.model_parts[0])
             frozen_params = total_params - lora_params
 
             # Adjust TFLOPS for PEFT: training has 3 computational phases:

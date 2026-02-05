@@ -29,6 +29,9 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  container-registry: nemoci.azurecr.io
+
 jobs:
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.69.1
@@ -136,6 +139,31 @@ jobs:
   #       run: |
   #         echo "Running CI tests"
 
+  cicd-container-build:
+    needs: [pre-flight, cicd-wait-in-queue]
+    if: |
+      (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && !cancelled()
+    runs-on: self-hosted-nemo
+    environment: nemo-ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: main
+        uses: ./.github/actions/build-container
+        with:
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          dockerfile-path: "./docker/Dockerfile"
+          has-azure-credentials: "true"
+          PAT: ${{ secrets.PAT }}
+          repo-name: "Automodel"
+
   cicd-unit-tests:
     strategy:
       fail-fast: false
@@ -149,7 +177,7 @@ jobs:
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
             cpu-only: false
             timeout: 30
-    needs: [pre-flight]
+    needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
     environment: nemo-ci
@@ -175,6 +203,7 @@ jobs:
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          container-image: ${{ env.container-registry }}/automodel:${{ github.sha }}
 
   cicd-e2e-tests:
     strategy:
@@ -240,6 +269,8 @@ jobs:
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          container-image: ${{ env.container-registry }}/automodel:${{ github.sha }}
+
 
   Nemo_CICD_Test:
     needs:

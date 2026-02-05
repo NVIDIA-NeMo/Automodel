@@ -35,9 +35,16 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
             add_eos_token: Whether to add EOS token (default: True)
         """
         tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
-        tokenizer.add_bos_token = add_bos_token
-        tokenizer.add_eos_token = add_eos_token
-        tokenizer.__class__ = type("NeMoAutoTokenizerWithBosEosEnforced", (cls, type(tokenizer)), {})
+
+        if add_bos_token and getattr(tokenizer, "bos_token", None) is not None:
+            tokenizer.add_bos_token = add_bos_token
+        if add_eos_token and getattr(tokenizer, "eos_token", None) is not None:
+            tokenizer.add_eos_token = add_eos_token
+        # Keep the wrapper class name at runtime, but remember the original HF tokenizer class
+        # so we can save an HF-compatible `tokenizer_class` in `save_pretrained()`.
+        base_tokenizer_cls = type(tokenizer)
+        tokenizer._base_class = base_tokenizer_cls
+        tokenizer.__class__ = type(cls.__name__, (cls, base_tokenizer_cls), {})
         return tokenizer
 
     def __call__(self, *args, **kwargs):
@@ -75,6 +82,21 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
             if encoded and (getattr(self, "eos_token_id", None) is not None) and encoded[-1] != self.eos_token_id:
                 encoded = encoded + [self.eos_token_id]
         return encoded
+
+    def save_pretrained(self, save_directory, push_to_hub: bool = False, **kwargs):
+        # HF writes `tokenizer_class` using `self.__class__.__name__`. Our runtime class name is
+        # the NeMo wrapper, but for portability we want to save the original HF tokenizer class.
+        # base_name = getattr(self, "_nemo_base_tokenizer_class_name", None)
+        base_class = getattr(self, "_base_class", None)
+        if not base_class:
+            return super().save_pretrained(save_directory, push_to_hub=push_to_hub, **kwargs)
+
+        original_cls = self.__class__
+        try:
+            self.__class__ = base_class
+            return base_class.save_pretrained(self, save_directory, push_to_hub=push_to_hub, **kwargs)
+        finally:
+            self.__class__ = original_cls
 
 
 def _add_token(tokenized, value, position, key):

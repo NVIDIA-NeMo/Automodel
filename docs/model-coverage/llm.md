@@ -5,7 +5,7 @@ Large Language Models (LLMs) power a variety of tasks such as dialogue systems, 
 NeMo Automodel provides a simple interface for loading and fine-tuning LLMs hosted on the Hugging Face Hub.
 
 ## Run LLMs with NeMo Automodel
-To run LLMs with NeMo Automodel, make sure you're using NeMo container version `25.07` or later. If the model you intend to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest version of NeMo Automodel by using:
+To run LLMs with NeMo Automodel, make sure you're using NeMo container version [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) or later. If the model you intend to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest version of NeMo Automodel by using:
 
 ```bash
 
@@ -15,7 +15,7 @@ To run LLMs with NeMo Automodel, make sure you're using NeMo container version `
 For other installation options (e.g., uv), please see our [Installation Guide](../guides/installation.md).
 
 ## Supported Models
-NeMo Automodel supports the <a href=https://huggingface.co/transformers/v3.5.1/model_doc/auto.html#automodelforcausallm>AutoModelForCausalLM<a> in the <a href="https://huggingface.co/models?pipeline_tag=text-generation&sort=trending">Text Generation<a> category. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, such as for reasoning tasks, you can override the default tokenizer during the data preparation stage.
+NeMo Automodel supports the [AutoModelForCausalLM](https://huggingface.co/transformers/v3.5.1/model_doc/auto.html#automodelforcausallm) in the [Text Generation](https://huggingface.co/models?pipeline_tag=text-generation&sort=trending) category. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, such as for reasoning tasks, you can override the default tokenizer during the data preparation stage.
 
 The table below lists the main architectures we test against (FSDP2 combined with SFT/PEFT) and includes a representative checkpoint for each.
 
@@ -39,10 +39,11 @@ The table below lists the main architectures we test against (FSDP2 combined wit
 | `GPTBigCodeForCausalLM`               | StarCoder, SantaCoder, WizardCoder    | `bigcode/starcoder`, `bigcode/gpt_bigcode-santacoder`, `WizardLM/WizardCoder-15B-V1.0` etc. |
 | `GPTJForCausalLM`                     | GPT‑J                                 | `EleutherAI/gpt-j-6b`, `nomic-ai/gpt4all-j` etc.                                  |
 | `GPTNeoXForCausalLM`                  | GPT‑NeoX, Pythia, OpenAssistant, Dolly V2, StableLM | `EleutherAI/gpt-neox-20b`, `EleutherAI/pythia-12b`, `OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5`, `databricks/dolly-v2-12b`, `stabilityai/stablelm-tuned-alpha-7b` etc. |
+| `GptOssForCausalLM`                   | GPT-OSS                               | `openai/gpt-oss-20b`, `openai/gpt-oss-120b`                                      |
 | `GraniteForCausalLM`                  | Granite 3.0, Granite 3.1, PowerLM     | `ibm-granite/granite-3.0-2b-base`, `ibm-granite/granite-3.1-8b-instruct`, `ibm/PowerLM-3b` etc. |
 | `GraniteMoeForCausalLM`               | Granite 3.0 MoE, PowerMoE             | `ibm-granite/granite-3.0-1b-a400m-base`, `ibm-granite/granite-3.0-3b-a800m-instruct`, `ibm/PowerMoE-3b` etc. |
 | `GraniteMoeSharedForCausalLM`         | Granite MoE Shared                    | `ibm-research/moe-7b-1b-active-shared-experts` (test model)                       |
-| `GritLM`                              | GritLM                                | `parasail-ai/GritLM-7B-vllm`.                                                     |
+| `GritLM`                              | GritLM                                | `parasail-ai/GritLM-7B-vllm`                                                    |
 | `InternLMForCausalLM`                 | InternLM                              | `internlm/internlm-7b`, `internlm/internlm-chat-7b` etc.                          |
 | `InternLM2ForCausalLM`                | InternLM2                             | `internlm/internlm2-7b`, `internlm/internlm2-chat-7b` etc.                        |
 | `InternLM3ForCausalLM`                | InternLM3                             | `internlm/internlm3-8b-instruct` etc.                                             |
@@ -81,10 +82,10 @@ The models listed above can be fine-tuned using NeMo Automodel to adapt them to 
 
 2. **Supervised Fine-Tuning (SFT)**: Updates all or most model parameters for deeper adaptation, suitable for high-precision applications.
 
-Please see our [Fine-Tuning Guide](../guides/llm/finetune.md) how you can apply both of these fine-tuning methods with your data.
+Please see our [Fine-Tuning Guide](../guides/llm/finetune.md) to learn how you can apply both of these fine-tuning methods to your data.
 
 :::{tip}
-In these guides, we use the `SQuAD v1.1` dataset for demonstation purposes, but you can specify your own data as needed.
+In these guides, we use the `SQuAD v1.1` dataset for demonstration purposes, but you can specify your own data as needed.
 :::
 
 ### Example: Fine-Tuning with SQuAD Dataset
@@ -113,14 +114,18 @@ This structure makes SQuAD ideal for training context-based question answering m
 ### Get Started with Fine-Tuning
 To fine-tune any of the supported models:
 
-1. Choose your approach (PEFT or SFT), see our [Fine-Tuning Guide](../guides/llm/finetune.md).
+1. Choose your approach (PEFT or SFT). See our [Fine-Tuning Guide](../guides/llm/finetune.md).
 
 2. Key steps in both guides:
    * Model and dataset configuration
    * Training recipe setup
    * Inference with fine-tuned models
    * Model sharing via Hugging Face Hub
-   * Deployment with vLLM
+   - Model and dataset configuration
+   - Training recipe setup
+   - Inference with fine-tuned models
+   - Model sharing via Hugging Face Hub
+   - Deployment with vLLM
 
 3. Example launch commands:
 
@@ -136,4 +141,7 @@ Both guides provide complete YAML configuration examples and explain how to:
   * Customize training parameters
   * Monitor progress
   * Save and share checkpoints
-  * Deploy the fine-tuned model with optimized inference
+  - Customize training parameters
+  - Monitor progress
+  - Save and share checkpoints
+  - Deploy the fine-tuned model with optimized inference

@@ -8,7 +8,7 @@ NeMo Automodel LLM APIs can be easily extended to support VLM tasks. While most 
 
 ## Run LLMs with NeMo Automodel
 
-To run LLMs with NeMo Automodel, use NeMo container version `25.07` or later. If the model you want to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest NeMo Automodel using:
+To run LLMs with NeMo Automodel, use NeMo container version [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) or later. If the model you want to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest NeMo Automodel using:
 
 ```bash
 
@@ -20,11 +20,12 @@ For other installation options (e.g., uv) please see our [Installation Guide](..
 ## Supported Models
 
 
-NeMo Automodel supports <a href=https://huggingface.co/docs/transformers/main/model_doc/auto#transformers.AutoModelForImageTextToText>AutoModelForImageTextToText<a> in the <a href="https://huggingface.co/models?pipeline_tag=image-text-to-text&sort=trending">Image-Text-to-Text<a> category. Specifically, the following VLM models from Hugging Face have been tested and support both Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT) with LoRA:
+NeMo Automodel supports [AutoModelForImageTextToText](https://huggingface.co/docs/transformers/main/model_doc/auto#transformers.AutoModelForImageTextToText) in the [Image-Text-to-Text](https://huggingface.co/models?pipeline_tag=image-text-to-text&sort=trending) category. Specifically, the following VLM models from Hugging Face have been tested and support both Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT) with LoRA:
 
 
 | Model                              | Dataset                     | FSDP2      | PEFT       | Example YAML |
 |------------------------------------|-----------------------------|------------|------------|--------------|
+| Kimi-VL-A3B-Instruct               | cord-v2                     | Supported  | Supported  | [kimi2vl_cordv2.yaml](../../examples/vlm_finetune/kimi/kimi2vl_cordv2.yaml) |
 | Gemma 3-4B & 27B                   | naver-clova-ix & rdr-items  | Supported  | Supported  | [gemma3_vl_4b_cord_v2.yaml](../../examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml) |
 | Gemma 3n                           | naver-clova-ix & rdr-items  | Supported  | Supported  | [gemma3n_vl_4b_medpix.yaml](../../examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml) |
 | Qwen2-VL-2B-Instruct & Qwen2.5-VL-3B-Instruct | cord-v2          | Supported  | Supported  | [qwen2_5_vl_3b_rdr.yaml](../../examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml) |
@@ -40,13 +41,13 @@ For detailed instructions on fine-tuning these models using both SFT and PEFT ap
 ## Dataset Examples
 
 :::{tip}
-In these guides, we use the `quintend/rdr-items` and `naver-clova-ix/cord-v2` datasets for demonstation purposes, but you can specify your own data as needed.
+In these guides, we use the `quintend/rdr-items` and `naver-clova-ix/cord-v2` datasets for demonstration purposes, but you can specify your own data as needed.
 :::
 
-### rdr items dataset
+### RDR Items Dataset
 The rdr items dataset [`quintend/rdr-items`](https://huggingface.co/datasets/quintend/rdr-items) is a small dataset containing 48 images with descriptions. This dataset serves as an example of how to prepare image-text data for VLM fine-tuning. For complete instructions on dataset preprocessing and the collate functions used, see the [Gemma Fine-Tuning Guide](../guides/omni/gemma3-3n.md).
 
-### cord-v2 dataset
+### CORD-v2 Dataset
 The cord-v2 dataset [`naver-clova-ix/cord-v2`](https://huggingface.co/datasets/naver-clova-ix/cord-v2) contains receipts with descriptions in JSON format. This demonstrates handling structured data in VLMs. The [Gemma Fine-Tuning Guide](../guides/omni/gemma3-3n.md) provides detailed examples of custom preprocessing and collate functions for similar datasets.
 
 ## Train VLM Models

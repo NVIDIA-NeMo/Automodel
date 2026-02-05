@@ -64,6 +64,40 @@ def test_load_yaml_bad_format(tmp_path):
         module.load_yaml(bad_yaml)
 
 
+def test_main_slurm_preserves_env_var_placeholders(monkeypatch, tmp_path: Path):
+    # The slurm section is passed through as-is (no env interpolation) so users can
+    # defer env expansion to the batch script runtime and avoid leaking secrets.
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(
+        f"""
+        slurm:
+          job_name: test_job
+          job_dir: {tmp_path / "slurm_jobs"}
+          hf_home: ${{HF_HOME}}
+          nodes: 1
+          ntasks_per_node: 2
+        """
+    )
+
+    captured = {}
+
+    def fake_launch_with_slurm(args, job_conf_path, job_dir, slurm_config, extra_args=None):
+        captured["job_dir"] = job_dir
+        captured["slurm_config"] = dict(slurm_config)
+        return 0
+
+    monkeypatch.setattr(module, "launch_with_slurm", fake_launch_with_slurm)
+    monkeypatch.setattr(module.time, "time", lambda: 1234567890)
+    monkeypatch.setattr("sys.argv", ["automodel", "finetune", "llm", "-c", str(cfg)])
+
+    result = module.main()
+    assert result == 0
+    assert os.path.basename(captured["job_dir"]) == "1234567890"
+    assert captured["slurm_config"]["hf_home"] == "${HF_HOME}"
+    # job_dir is used to construct the job directory and should not be forwarded.
+    assert "job_dir" not in captured["slurm_config"]
+
+
 def test_load_function_success(tmp_path):
     # Create a mock Python file with a function
     file_path = tmp_path / "mock_module.py"
