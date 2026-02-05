@@ -14,8 +14,6 @@ This guide walks you through the complete process of using AutoPipeline for Hugg
 
 :::{important}
 Before proceeding with this guide, please ensure that you have NeMo AutoModel installed on your machine.
-:::{important}
-Before proceeding with this guide, please ensure that you have NeMo AutoModel installed on your machine.
 :::
 
 **Prerequisites:**
