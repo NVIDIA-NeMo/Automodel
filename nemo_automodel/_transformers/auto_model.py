@@ -996,7 +996,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             load_base_model=True,
             cache_dir=kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE),
             freeze_config=freeze_config,
-            **kwargs,
         )
 
         return model
@@ -1204,7 +1203,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             load_base_model=False,
             cache_dir=kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE),
             freeze_config=freeze_config,
-            **kwargs,
         )
 
         return model
