@@ -298,12 +298,13 @@ class _StorageWriterTransforms:
 
 
 def _item_size(item: WriteItem) -> int:
-    size = 1
     assert item.tensor_data is not None
+    # NOTE: WriteItems can represent *chunks* of a global tensor (e.g., SHARD writes).
+    # The on-disk payload corresponds to the chunk sizes, not the global tensor size.
+    size = 1
     # can't use math.prod as PT needs to support older python
-    for s in item.tensor_data.size:
+    for s in item.tensor_data.chunk.sizes:
         size *= s
-
     dtype = item.tensor_data.properties.dtype
     return size * torch._utils._element_size(dtype)
 
@@ -458,7 +459,9 @@ def _write_files_from_queue(
                         nbytes = _item_size(wi)
                         header[wi.index.fqn] = {
                             "dtype": _to_safetensors_dtype_str(wi.tensor_data.properties.dtype),
-                            "shape": [int(s) for s in wi.tensor_data.size],
+                            # SAFETENSORS entries store the chunk payload; global shape is
+                            # reconstructed via CUSTOM_METADATA_KEY (saved_offsets) at load time.
+                            "shape": [int(s) for s in wi.tensor_data.chunk.sizes],
                             "data_offsets": [data_offset, data_offset + nbytes],
                         }
                         tensor_data_offsets[wi.index.fqn] = (data_offset, nbytes)
@@ -502,6 +505,10 @@ def _write_files_from_queue(
                             tensor = tensor.clone()
 
                         # Write raw bytes without creating an intermediate bytes blob.
+                        # NOTE: `Tensor.view(dtype)` does not allow 0-dim tensors when element sizes differ
+                        # (e.g. BF16 -> uint8). Safetensors stores raw bytes, so reshape scalars to 1D.
+                        if tensor.dim() == 0:
+                            tensor = tensor.reshape(1)
                         byte_view = tensor.view(torch.uint8)
                         np_view = byte_view.numpy()
                         stream.write(memoryview(np_view))
