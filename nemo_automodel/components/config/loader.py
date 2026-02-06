@@ -761,9 +761,9 @@ class ConfigNode:
         Returns:
             str: The string representation.
         """
-        # By default, show resolved values for readability/debugging.
-        # Use repr(cfg) (or cfg.__repr__(use_orig_values=True)) to get a safe view that preserves placeholders.
-        return self.__repr__(level=0, use_orig_values=False)
+        # Keep printing safe by default: preserve original placeholders (e.g. `${VAR}`) for any
+        # values that were resolved from environment variables.
+        return self.__repr__(level=0, use_orig_values=True)
 
     def __contains__(self, key):
         """

@@ -353,12 +353,8 @@ def test_load_yaml_config_resolves_braced_env(monkeypatch, tmp_path: Path):
     cfg = load_yaml_config(str(yml))
     assert cfg.x == "bar"
     s = str(cfg)
-    assert "bar" in s
-    assert "${FOO_ENV}" not in s
-    # repr() preserves placeholders for a safe/loggable view
-    r = repr(cfg)
-    assert "${FOO_ENV}" in r
-    assert "bar" not in r
+    assert "${FOO_ENV}" in s
+    assert "bar" not in s
 
 
 def test_load_yaml_config_resolves_dollar_env(monkeypatch, tmp_path: Path):
@@ -368,12 +364,8 @@ def test_load_yaml_config_resolves_dollar_env(monkeypatch, tmp_path: Path):
     cfg = load_yaml_config(str(yml))
     assert cfg.x == "bar"
     s = str(cfg)
-    assert "bar" in s
-    assert "$FOO_ENV" not in s
-    # repr() preserves placeholders for a safe/loggable view
-    r = repr(cfg)
-    assert "$FOO_ENV" in r
-    assert "bar" not in r
+    assert "$FOO_ENV" in s
+    assert "bar" not in s
 
 
 def test_load_yaml_config_resolves_dotted_env_var_name(monkeypatch, tmp_path: Path):
@@ -391,16 +383,11 @@ def test_load_yaml_config_resolves_dotted_env_var_name(monkeypatch, tmp_path: Pa
     assert cfg.a == "qux"
     assert cfg.b == "qux"
     assert cfg.path == "qux/qux"
-    # str() shows resolved values for readability/debugging.
+    # Printing should show original placeholders (avoid leaking resolved values).
     s = str(cfg)
-    assert "qux/qux" in s
-    assert "${foo.bar.baz}" not in s
-    assert "$foo.bar.baz" not in s
-    # repr() preserves placeholders for a safe/loggable view.
-    r = repr(cfg)
-    assert "${foo.bar.baz}" in r
-    assert "$foo.bar.baz" in r
-    assert "qux/qux" not in r
+    assert "${foo.bar.baz}" in s
+    assert "$foo.bar.baz" in s
+    assert "qux/qux" not in s
 
 
 def test_confignode_repr_uses_orig_value_for_oc_env(monkeypatch, tmp_path: Path):
@@ -411,14 +398,10 @@ def test_confignode_repr_uses_orig_value_for_oc_env(monkeypatch, tmp_path: Path)
 
     # Runtime value is resolved
     assert cfg.x == "super_secret_value"
-    # repr() preserves placeholders for a safe/loggable view (no resolved secret leakage)
-    r = repr(cfg)
-    assert "${oc.env:SECRET_ENV}" in r
-    assert "super_secret_value" not in r
-    # str() shows resolved values
+    # But printing the config should not leak the resolved secret
     s = str(cfg)
-    assert "super_secret_value" in s
-    assert "${oc.env:SECRET_ENV}" not in s
+    assert "${oc.env:SECRET_ENV}" in s
+    assert "super_secret_value" not in s
 
 
 def test_load_module_from_file(tmp_path):
