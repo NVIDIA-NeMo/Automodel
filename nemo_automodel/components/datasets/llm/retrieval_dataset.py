@@ -213,7 +213,7 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
     return (dataset, corpus_dict)
 
 
-def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
+def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False, epoch: int = 0):
     """
     Transform function to convert from raw format to training format.
     Same as _format_process_data in RetrievalMultiModalDatasetLoader.
@@ -223,6 +223,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         num_neg_docs: Number of negative documents to use
         corpus_dict: Dictionary mapping corpus_id to corpus objects
         use_dataset_instruction: Whether to use instruction from dataset's metadata
+        epoch: Current epoch for cycling through positive documents
     """
     # Handle both batched and single examples
     is_batched = isinstance(examples["question"], list)
@@ -241,10 +242,10 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
     for i_example in range(len(questions)):
         cur_pos_neg_doc = []
 
-        # Get one positive doc (take first one)
+        # Get one positive doc (cycle through positives based on epoch)
         positives = batch_positives[i_example]
         if isinstance(positives, list) and len(positives) > 0:
-            cur_pos_neg_doc.append(positives[0])
+            cur_pos_neg_doc.append(positives[epoch % len(positives)])
         else:
             cur_pos_neg_doc.append(positives)
 
@@ -312,18 +313,32 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
     return result
 
 
-def _create_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
-    """Create transform function with specified number of negative documents."""
+class RetrievalTransform:
+    """
+    Stateful transform for retrieval datasets with epoch-based positive cycling.
 
-    def transform(examples):
+    This class encapsulates the transform state (epoch, corpus_dict, etc.) and
+    provides a clean interface for updating the epoch without recreating the transform.
+    """
+
+    def __init__(self, num_neg_docs: int, corpus_dict: dict, use_dataset_instruction: bool = False):
+        self.num_neg_docs = num_neg_docs
+        self.corpus_dict = corpus_dict
+        self.use_dataset_instruction = use_dataset_instruction
+        self.epoch = 0
+
+    def __call__(self, examples):
         return _transform_func(
             examples,
-            num_neg_docs=num_neg_docs,
-            corpus_dict=corpus_dict,
-            use_dataset_instruction=use_dataset_instruction,
+            num_neg_docs=self.num_neg_docs,
+            corpus_dict=self.corpus_dict,
+            use_dataset_instruction=self.use_dataset_instruction,
+            epoch=self.epoch,
         )
 
-    return transform
+    def set_epoch(self, epoch: int):
+        """Update the epoch for positive document cycling."""
+        self.epoch = epoch
 
 
 def make_retrieval_dataset(
@@ -382,12 +397,16 @@ def make_retrieval_dataset(
             )
 
         # Set transform for training (train_n_passages - 1 negatives)
+        # Use stateful RetrievalTransform class for epoch-based positive cycling
         negative_size = train_n_passages - 1
-        dataset.set_transform(_create_transform_func(negative_size, corpus_dict, use_dataset_instruction))
+        transform = RetrievalTransform(negative_size, corpus_dict, use_dataset_instruction)
+        dataset.set_transform(transform)  # Called once at creation
+        dataset.set_epoch = transform.set_epoch  # Expose set_epoch on dataset for training loop
 
     elif data_type == "eval":
-        # Set transform for evaluation
-        dataset.set_transform(_create_transform_func(eval_negative_size, corpus_dict, use_dataset_instruction))
+        # Set transform for evaluation (no epoch cycling needed)
+        transform = RetrievalTransform(eval_negative_size, corpus_dict, use_dataset_instruction)
+        dataset.set_transform(transform)
 
     else:
         raise ValueError(f"Invalid data type: {data_type}")

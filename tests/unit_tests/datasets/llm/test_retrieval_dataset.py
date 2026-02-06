@@ -394,6 +394,87 @@ def test_make_retrieval_dataset_invalid_type(tmp_path, monkeypatch):
         rd.make_retrieval_dataset(str(train_file), data_type="invalid")
 
 
+def test_transform_func_epoch_cycling():
+    """Test epoch-based cycling through multiple positive documents."""
+    corpus_dict = {
+        "corpusA": DummyCorpus(
+            {
+                "p1": {"text": "pos1", "image": "", "nr_ocr": ""},
+                "p2": {"text": "pos2", "image": "", "nr_ocr": ""},
+                "p3": {"text": "pos3", "image": "", "nr_ocr": ""},
+                "n1": {"text": "neg1", "image": "", "nr_ocr": ""},
+            }
+        )
+    }
+
+    # Example with multiple positive docs
+    examples = {
+        "question": ["Q"],
+        "corpus_id": ["corpusA"],
+        "pos_doc": [[{"id": "p1"}, {"id": "p2"}, {"id": "p3"}]],
+        "neg_doc": [[{"id": "n1"}]],
+    }
+
+    # Epoch 0: Should select first positive (p1)
+    out_0 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, epoch=0)
+    assert out_0["doc_text"][0][0] == "pos1"
+
+    # Epoch 1: Should select second positive (p2)
+    out_1 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, epoch=1)
+    assert out_1["doc_text"][0][0] == "pos2"
+
+    # Epoch 2: Should select third positive (p3)
+    out_2 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, epoch=2)
+    assert out_2["doc_text"][0][0] == "pos3"
+
+    # Epoch 3: Should cycle back to first positive (p1)
+    out_3 = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, epoch=3)
+    assert out_3["doc_text"][0][0] == "pos1"
+
+
+def test_retrieval_transform_set_epoch():
+    """Test the RetrievalTransform stateful class and set_epoch method."""
+    corpus_dict = {
+        "corpusA": DummyCorpus(
+            {
+                "p1": {"text": "pos1", "image": "", "nr_ocr": ""},
+                "p2": {"text": "pos2", "image": "", "nr_ocr": ""},
+                "n1": {"text": "neg1", "image": "", "nr_ocr": ""},
+            }
+        )
+    }
+
+    # Create a dataset with multiple positive docs
+    dataset = Dataset.from_list([
+        {
+            "question_id": "q1",
+            "question": "Q",
+            "corpus_id": "corpusA",
+            "pos_doc": [{"id": "p1"}, {"id": "p2"}],
+            "neg_doc": [{"id": "n1"}]
+        }
+    ])
+
+    # Use the RetrievalTransform class
+    transform = rd.RetrievalTransform(num_neg_docs=1, corpus_dict=corpus_dict)
+    dataset.set_transform(transform)
+    dataset.set_epoch = transform.set_epoch
+
+    # Initial transform (epoch 0 default)
+    item_0 = dataset[0]
+    assert item_0["doc_text"][0] == "pos1"
+
+    # Update to epoch 1 using the exposed set_epoch method
+    dataset.set_epoch(1)
+    item_1 = dataset[0]
+    assert item_1["doc_text"][0] == "pos2"
+
+    # Cycle back to epoch 0
+    dataset.set_epoch(0)
+    item_back = dataset[0]
+    assert item_back["doc_text"][0] == "pos1"
+
+
 def test_use_dataset_instruction_from_metadata(tmp_path, monkeypatch):
     """Test that use_dataset_instruction correctly loads and applies instructions from metadata."""
     corpus_dir = tmp_path / "squad_corpus"
