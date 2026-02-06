@@ -745,7 +745,10 @@ class ConfigNode:
             return (
                 "[\n"
                 + "\n".join(
-                    [f"{'  ' * (level + 1)}{self._repr_value(i, level + 1, use_orig_values=use_orig_values)}" for i in value]
+                    [
+                        f"{'  ' * (level + 1)}{self._repr_value(i, level + 1, use_orig_values=use_orig_values)}"
+                        for i in value
+                    ]
                 )
                 + f"\n{'  ' * level}]"
             )
