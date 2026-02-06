@@ -13,7 +13,7 @@
 # limitations under the License.
 
 [build-system]
-requires = ["setuptools >= 61.0"]
+requires = ["setuptools >= 80.10.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -84,7 +84,7 @@ dependencies = [
     "pyyaml",
     "torch<=2.10.0",
     "torchdata",
-    "transformers<=4.57.5",
+    "transformers>=5.0.0",
     "wandb",
     "torchao",
     "mlflow",
@@ -124,7 +124,7 @@ vlm = [
     "numpy",
     "numba",
     "torchcodec; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
-    "mistral_common[opencv]",
+    "mistral_common[opencv]>=1.9.0",
     "albumentations"
 ]
 all = [
@@ -157,7 +157,7 @@ linting = [
     "ruff~=0.9.0",
     "import-linter~=2.4",
 ]
-test = ["coverage", "pytest", "peft"]
+test = ["coverage", "pytest", "peft>=0.18.1"]
 dev = ["cut-cross-entropy", "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
 
 [tool.uv]
@@ -173,8 +173,16 @@ no-build-isolation-package = [
     "transformer-engine-torch",
 ]
 constraint-dependencies = [
+    "aiohttp>=3.13.3", # Address CVE GHSA-6mq8-rvhq-8wgg
+    "jaraco-context>=6.1.0", #Address CVE GHSA-58pv-8j8x-9vj2
+    "protobuf>=6.33.5", # Address CVE GHSA-7gcm-g887-7qv7
+    "pyasn1>=0.6.2", # Address CVE GHSA-63vm-454h-vhhq
     "starlette>=0.49.1", # Address CVE GHSA-7f5h-v6xp-fcq8
+    "setuptools>=80.10.2",
+    "urllib3>=2.6.0", # Address CVE GHSA-gm62-xv2j-4w53
+    "wheel>=0.46.2", # Address CVE GHSA-8rrh-rw8j-w5fx
 ]
+prerelease = "allow"
 
 [tool.uv.sources]
 deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "e3908bf5bd0cc6265bcb225d15cd8c996d4759ef" }

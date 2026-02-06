@@ -8,6 +8,7 @@
 repository-structure.md
 guides/installation.md
 guides/configuration.md
+guides/huggingface-api-compatibility.md
 launcher/local-workstation.md
 launcher/cluster.md
 ```
@@ -54,6 +55,7 @@ model-coverage/vlm.md
 
 guides/dataset-overview.md
 guides/llm/dataset.md
+guides/llm/retrieval-dataset.md
 guides/llm/column-mapped-text-instruction-dataset.md
 guides/llm/column-mapped-text-instruction-iterable-dataset.md
 guides/vlm/dataset.md
