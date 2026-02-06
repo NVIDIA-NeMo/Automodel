@@ -43,7 +43,9 @@ For detailed instructions on fine-tuning these models using both SFT and PEFT ap
 ## Dataset Examples
 
 :::{tip}
-In these guides, we use the `quintend/rdr-items` and `naver-clova-ix/cord-v2` datasets for demonstration purposes, but you can specify your own data as needed.
+In these guides, we use the `quintend/rdr-items` and `naver-clova-ix/cord-v2` datasets for demonstration purposes, but you can use your own data.
+
+To do so, update the recipe YAML `dataset` section (for example `dataset._target_`, `path_or_dataset`, and `split`) and ensure your `dataloader.collate_fn` matches the model/dataset. See [VLM datasets](../guides/vlm/dataset.md) and [dataset overview](../guides/dataset-overview.md).
 :::
 
 ### RDR Items Dataset
