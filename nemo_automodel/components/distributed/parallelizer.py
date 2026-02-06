@@ -1010,6 +1010,7 @@ def fsdp2_strategy_parallelize(
     # Get the appropriate parallelization strategy for this model
     strategy = get_parallelization_strategy(model)
 
+    # Delegate to the strategy
     return strategy.parallelize(
         model=model,
         device_mesh=device_mesh,

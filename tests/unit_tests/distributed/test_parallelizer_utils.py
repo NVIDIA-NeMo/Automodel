@@ -21,14 +21,11 @@ import torch.nn as nn
 
 from nemo_automodel.components.distributed.parallelizer_utils import (
     iter_maximal_uniform_dtype_subtrees,
-    _build_fsdp_shard_placement_fn_from_tp_plan,
     _group_params_by_dtype,
     _get_module_from_path,
     _fully_shard,
     fully_shard_by_dtype,
 )
-from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
-from torch.distributed.tensor.placement_types import Shard
 
 
 class Block(nn.Module):
@@ -170,7 +167,7 @@ def test_get_module_from_path():
 def test__fully_shard_calls_for_single_module(monkeypatch):
     calls: list[tuple[nn.Module, object, object, object]] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, shard_placement_fn=None):
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
         calls.append((mod, mesh, mp_policy, offload_policy))
 
     # Monkeypatch the symbol inside the utils module
@@ -190,7 +187,7 @@ def test__fully_shard_calls_for_single_module(monkeypatch):
 def test__fully_shard_calls_for_modulelist(monkeypatch):
     calls: list[nn.Module] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, shard_placement_fn=None):
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
         calls.append(mod)
 
     monkeypatch.setattr(
@@ -267,10 +264,10 @@ def test_fully_shard_by_dtype_single_dtype(monkeypatch):
     fully_calls: list[nn.Module] = []
     sub_calls: list[nn.Module] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, shard_placement_fn=None):
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
         fully_calls.append(mod)
 
-    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, shard_placement_fn=None):
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy):
         sub_calls.append(mod)
 
     monkeypatch.setattr(
@@ -292,10 +289,10 @@ def test_fully_shard_by_dtype_two_dtypes(monkeypatch):
     fully_calls: list[nn.Module] = []
     sub_calls: list[nn.Module] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, shard_placement_fn=None):
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
         fully_calls.append(mod)
 
-    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, shard_placement_fn=None):
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy):
         sub_calls.append(mod)
 
     monkeypatch.setattr(
@@ -319,10 +316,10 @@ def test_fully_shard_by_dtype_three_dtypes(monkeypatch):
     fully_calls: list[nn.Module] = []
     sub_calls: list[nn.Module] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, shard_placement_fn=None):
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
         fully_calls.append(mod)
 
-    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, shard_placement_fn=None):
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy):
         sub_calls.append(mod)
 
     monkeypatch.setattr(
@@ -346,96 +343,5 @@ def test_fully_shard_by_dtype_three_dtypes(monkeypatch):
     # Expect all three subtrees to be individually sharded
     # Note: the 'b' subtree should be sharded as a whole since it is uniform float16
     assert set(sub_calls) == {model.a, model.b, model.c}
-
-
-class _TP_SelfAttn(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.q_proj = nn.Linear(4, 4, bias=True)
-        self.o_proj = nn.Linear(4, 4, bias=False)
-
-
-class _TP_MLP(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.gate_up_proj = nn.Linear(4, 8, bias=False)
-
-
-class _TP_Block(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.self_attn = _TP_SelfAttn()
-        self.mlp = _TP_MLP()
-
-
-class _TinyHFLikeModel(nn.Module):
-    """Constructs parameter names like model.layers.0.self_attn.q_proj.weight."""
-
-    def __init__(self):
-        super().__init__()
-        self.model = nn.Module()
-        self.model.embed_tokens = nn.Embedding(10, 4)
-        self.model.layers = nn.ModuleList([_TP_Block()])
-        self.lm_head = nn.Linear(4, 10, bias=False)
-        # Scalar param to cover ndim==0 path
-        self.scalar = nn.Parameter(torch.tensor(1.0))
-
-
-def _get_param_by_name(model: nn.Module, name: str) -> nn.Parameter:
-    for n, p in model.named_parameters():
-        if n == name:
-            return p
-    raise AssertionError(f"Parameter not found: {name}")
-
-
-def test_build_fsdp_shard_placement_fn_from_tp_plan_colwise_and_special_cases():
-    model = _TinyHFLikeModel()
-
-    tp_plan = {
-        # wildcard pattern (suffix should become ".self_attn.q_proj.weight")
-        "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-        # rowwise shouldn't be forced to dim=1
-        "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-        # concrete pattern (no '*')
-        "model.layers.0.mlp.gate_up_proj": ColwiseParallel(),
-        # lm_head special-case endswith("lm_head") => "lm_head.weight"
-        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
-    }
-
-    fn = _build_fsdp_shard_placement_fn_from_tp_plan(model, tp_plan)
-
-    # Wildcard colwise -> Shard(1) for 2D weight
-    q_w = _get_param_by_name(model, "model.layers.0.self_attn.q_proj.weight")
-    assert fn(q_w).dim == 1
-
-    # 1D params default to Shard(0)
-    q_b = _get_param_by_name(model, "model.layers.0.self_attn.q_proj.bias")
-    assert fn(q_b).dim == 0
-
-    # Rowwise should not be forced
-    o_w = _get_param_by_name(model, "model.layers.0.self_attn.o_proj.weight")
-    assert fn(o_w).dim == 0
-
-    # Concrete colwise -> Shard(1)
-    gate_up_w = _get_param_by_name(model, "model.layers.0.mlp.gate_up_proj.weight")
-    assert fn(gate_up_w).dim == 1
-
-    # embed tokens always included
-    embed_w = _get_param_by_name(model, "model.embed_tokens.weight")
-    assert fn(embed_w).dim == 1
-
-    # lm_head weight forced
-    lm_head_w = _get_param_by_name(model, "lm_head.weight")
-    assert fn(lm_head_w).dim == 1
-
-
-def test_build_fsdp_shard_placement_fn_from_tp_plan_returns_none_for_0d():
-    model = _TinyHFLikeModel()
-    tp_plan = {"model.layers.*.self_attn.q_proj": ColwiseParallel()}
-    fn = _build_fsdp_shard_placement_fn_from_tp_plan(model, tp_plan)
-
-    scalar = _get_param_by_name(model, "scalar")
-    assert scalar.ndim == 0
-    assert fn(scalar) is None
 
 
