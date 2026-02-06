@@ -104,6 +104,8 @@ runs:
           ARG=("--runtime=nvidia --gpus all")
         fi
 
+        ls -alh ${{ inputs.test-data-path }}
+
         cmd=$(cat <<RUN_TEST_EOF
         #!/bin/bash
         docker container rm -f nemo_container_${{ github.run_id }} || true
