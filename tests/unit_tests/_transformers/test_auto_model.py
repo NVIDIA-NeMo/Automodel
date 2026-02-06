@@ -272,6 +272,35 @@ def test_liger_apply_failure_raises(monkeypatch):
         tgt._patch_liger_kernel(DummyModel())
 
 
+def test_patch_liger_kernel_skips_non_nn_module(monkeypatch, caplog):
+    """
+    When model is not an nn.Module (e.g., a lightweight mock), _patch_liger_kernel
+    should skip patching and return the model unchanged with a warning.
+    """
+    import nemo_automodel._transformers.auto_model as tgt
+
+    apply_mock, attn_mock = prepare_env(
+        monkeypatch,
+        tgt,
+        has_liger=True,
+        apply_ok=True,
+    )
+
+    # Create a non-nn.Module mock object
+    mock_model = MagicMock(spec=[])  # Empty spec means no nn.Module methods
+    mock_model.config = {}
+
+    with caplog.at_level(logging.WARNING):
+        result = tgt._patch_liger_kernel(mock_model)
+
+    # Should return the same mock unchanged
+    assert result is mock_model
+    # Liger kernel should NOT be applied
+    apply_mock.assert_not_called()
+    # Warning should be logged
+    assert "Skipping Liger Kernel patch for non-nn.Module model" in caplog.text
+
+
 # =============================================================================
 # Tests for _get_mixin_wrapped_class
 # =============================================================================

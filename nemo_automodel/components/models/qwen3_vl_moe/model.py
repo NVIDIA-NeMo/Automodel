@@ -111,6 +111,61 @@ class Qwen3VLMoeModel(HFQwen3VLMoeModel):
     def norm(self):
         return self.language_model.norm
 
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        pixel_values=None,
+        pixel_values_videos=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        embed_tokens = self.get_input_embeddings()
+        if inputs_embeds is None:
+            if embed_tokens is not None:
+                inputs_embeds = embed_tokens(input_ids)
+            elif (
+                input_ids is not None
+                and isinstance(input_ids, torch.Tensor)
+                and input_ids.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            ):
+                inputs_embeds = input_ids
+                input_ids = None
+            else:
+                raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
+
+        if pixel_values is not None and self.visual is not None:
+            return super().forward(
+                input_ids=None,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+        outputs = self.language_model(
+            input_ids=None,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        return outputs
+
 
 class Qwen3VLMoeTextModelBackend(nn.Module):
     """Qwen3-VL text decoder rebuilt on top of the Qwen3-MoE block implementation."""
@@ -170,9 +225,6 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
         use_cache: bool | None = None,
         **attn_kwargs: Any,
     ) -> Qwen3VLMoeModelOutputWithPast:
-        if (input_ids is None) == (inputs_embeds is None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
         if past_key_values is not None or use_cache:
             raise NotImplementedError("KV cache is not supported for the Qwen3-VL backend implementation.")
 
@@ -216,7 +268,8 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
                     deepstack_visual_embeds[layer_idx],
                 )
 
-        hidden_states = self.norm(hidden_states)
+        if self.norm is not None:
+            hidden_states = self.norm(hidden_states)
 
         return Qwen3VLMoeModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -339,6 +392,35 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         cache_position: torch.Tensor | None = None,
         **kwargs: Any,
     ):
+        # PP VLM support: retrieve pixel_values from stored chunks if not passed directly
+        pixel_values = kwargs.get("pixel_values", None)
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        if (
+            pixel_values is None
+            and hasattr(self, "_vlm_pixel_values_chunks")
+            and self._vlm_pixel_values_chunks is not None
+        ):
+            # Check if we have media tokens in input_ids (151655/151652)
+            has_media_tokens = input_ids is not None and ((input_ids == 151655).any() or (input_ids == 151652).any())
+
+            if has_media_tokens:
+                chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
+                if chunk_idx < len(self._vlm_pixel_values_chunks):
+                    pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
+                    image_grid_hws = self._vlm_image_grid_hws_chunks[chunk_idx]
+                    # Convert image_grid_hws [N, 2] to image_grid_thw [N, 3] by prepending T=1
+                    if image_grid_hws is not None and image_grid_hws.numel() > 0:
+                        if image_grid_hws.shape[-1] == 2:
+                            ones = torch.ones(
+                                image_grid_hws.shape[0], 1, dtype=image_grid_hws.dtype, device=image_grid_hws.device
+                            )
+                            image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
+                        else:
+                            image_grid_thw = image_grid_hws
+                    kwargs["pixel_values"] = pixel_values
+                    kwargs["image_grid_thw"] = image_grid_thw
+                    self._vlm_chunk_idx = chunk_idx + 1
+
         if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
             input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, kwargs
@@ -347,7 +429,7 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
             if padding_mask is not None:
                 kwargs["padding_mask"] = padding_mask
 
-        return super().forward(
+        outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -355,6 +437,15 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
             cache_position=cache_position,
             **kwargs,
         )
+
+        hidden_states = outputs.last_hidden_state
+
+        if self.lm_head is not None:
+            logits = self.lm_head(hidden_states)
+        else:
+            logits = hidden_states
+
+        return logits
 
     @torch.no_grad()
     def initialize_weights(

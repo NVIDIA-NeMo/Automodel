@@ -172,20 +172,13 @@ def apply_parameter_freezing(model, freeze_config):
         freeze_config: Configuration dict specifying what to freeze.
 
     freeze_config can contain:
-        - freeze_embeddings: bool (default True)
-        - freeze_vision_tower: bool (default False)
+        - freeze_vision_tower: bool (default True)
+        - freeze_audio_tower: bool (default False)
         - freeze_language_model: bool (default False)
     """
-    freeze_embeddings = freeze_config.get("freeze_embeddings", True)
     freeze_vision_tower = freeze_config.get("freeze_vision_tower", True)
     freeze_audio_tower = freeze_config.get("freeze_audio_tower", False)
     freeze_language_model = freeze_config.get("freeze_language_model", False)
-
-    # Freeze embeddings
-    if freeze_embeddings:
-        for m in model.modules():
-            if isinstance(m, nn.Embedding):
-                m.weight.requires_grad = False
 
     # Freeze vision tower
     if freeze_vision_tower:
