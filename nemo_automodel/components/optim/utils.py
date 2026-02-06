@@ -168,6 +168,14 @@ def build_dion_optimizer(
     target = cfg_opt._target_
 
     cfg_dict = cfg_opt.to_dict()
+
+    no_compile = cfg_dict.pop("no_compile", False)
+    if no_compile:
+        import torch._dynamo
+
+        torch._dynamo.config.disable = True
+        logger.info("[Dion] no_compile=True: torch._dynamo fully disabled (optimizer runs in eager mode)")
+
     scalar_opt = cfg_dict.pop("scalar_opt", "adamw")
     scalar_betas = tuple(cfg_dict.pop("scalar_betas", [])) or None
     scalar_eps = cfg_dict.pop("scalar_eps", None)
@@ -196,23 +204,8 @@ def build_dion_optimizer(
 
     dion_mesh = _get_dion_mesh(distributed_mesh)
 
-    replicate_mesh = dion_mesh
-    outer_shard_mesh = None
-    inner_shard_mesh = None
-
-    if distributed_mesh is not None and hasattr(distributed_mesh, "__getitem__"):
-        replicate_mesh = distributed_mesh["dp_replicate"]
-        outer_shard_mesh = distributed_mesh["dp_shard_cp"]
-        inner_shard_mesh = distributed_mesh["tp"]
-
     if "distributed_mesh" in valid_keys:
         cleaned_kwargs["distributed_mesh"] = dion_mesh
-    if "replicate_mesh" in valid_keys:
-        cleaned_kwargs["replicate_mesh"] = replicate_mesh
-    if "outer_shard_mesh" in valid_keys:
-        cleaned_kwargs["outer_shard_mesh"] = outer_shard_mesh
-    if "inner_shard_mesh" in valid_keys:
-        cleaned_kwargs["inner_shard_mesh"] = inner_shard_mesh
     if "adjust_lr" in cfg_dict:
         cleaned_kwargs["adjust_lr"] = cfg_dict["adjust_lr"]
 

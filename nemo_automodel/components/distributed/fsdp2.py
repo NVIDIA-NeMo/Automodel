@@ -128,14 +128,6 @@ class FSDP2Manager:
         metadata={"help": "Enable activation checkpointing if True. Applies to linear layers."},
     )
 
-    use_dion_shard_placement: Optional[bool] = field(
-        default=False,
-        metadata={
-            "help": "If True, enable Dion-compatible FSDP shard_placement_fn when TP>1. "
-            "This should be enabled only when using the Dion optimizer."
-        },
-    )
-
     defer_fsdp_grad_sync: Optional[bool] = field(
         default=True,
         metadata={"help": "Defer FSDP gradient sync to only the final micro-batch before the optimizer step if True."},
@@ -321,6 +313,5 @@ class FSDP2Manager:
             tp_shard_plan=tp_shard_plan,
             offload_policy=self.offload_policy,
             activation_checkpointing=self.activation_checkpointing,
-            is_dion=self.use_dion_shard_placement,
         )
         return model

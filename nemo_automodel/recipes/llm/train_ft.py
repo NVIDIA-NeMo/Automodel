@@ -930,18 +930,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.moe_mesh = None
         self.model_wrapper = None
         if "distributed" in self.cfg:
-            # Instantiate distributed manager first (don't introspect `_target_`).
-            # Then, if it's FSDP2, enable Dion-compatible shard placement based on optimizer config.
             self.model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
-
-            opt_cfg = getattr(self.cfg, "optimizer", None)
-            if isinstance(opt_cfg, list):
-                use_dion_shard_placement = any(is_dion_optimizer(o) for o in opt_cfg)
-            else:
-                use_dion_shard_placement = is_dion_optimizer(opt_cfg) if opt_cfg is not None else False
-
-            if isinstance(self.model_wrapper, FSDP2Manager):
-                self.model_wrapper.use_dion_shard_placement = use_dion_shard_placement
             self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
             self.moe_mesh = getattr(self.model_wrapper, "moe_mesh", None)
 
