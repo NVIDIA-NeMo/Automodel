@@ -19,7 +19,7 @@ import logging
 import os
 import types
 from contextlib import contextmanager, nullcontext
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -50,13 +50,23 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
     _maybe_adapt_state_dict_to_hf,
 )
+from nemo_automodel.components.distributed.config import (
+    DDPConfig,
+    DistributedConfig,
+    FSDP2Config,
+    MegatronFSDPConfig,
+)
 from nemo_automodel.components.distributed.ddp import DDPManager
+from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
+from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.moe.config import MoEParallelizerConfig
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
+from nemo_automodel.components.quantization.qat import QATConfig
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     init_empty_weights,
@@ -67,6 +77,7 @@ from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
     from torchao.quantization.qat.linear import Int4WeightOnlyQATQuantizer, Int8DynActInt4WeightQATQuantizer
 
     from nemo_automodel.components.quantization.fp8 import FP8Config
@@ -298,16 +309,6 @@ def get_is_hf_model(config, force_hf):
     return is_hf_model
 
 
-def _pop_tp_cp_has_packed(kwargs):
-    """
-    Extract and remove TP/CP/packed flags from kwargs.
-    """
-    tp_size = kwargs.pop("tp_size", 1)
-    cp_size = kwargs.pop("cp_size", 1)
-    has_packed_sequence = kwargs.pop("has_packed_sequence", False)
-    return tp_size, cp_size, has_packed_sequence
-
-
 def _apply_preload_overrides(is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel):
     """
     Compute final attention implementation and liger-kernel flag based on TP/CP and packed sequence constraints.
@@ -525,6 +526,267 @@ def _shard_ep_fsdp(model, model_wrapper, parallelize_fn):
             model[0] if isinstance(model, tuple) else model
         )  # MegatronFSDP will return (model, None) since we don't pass optimizer here
     return model
+
+
+def _instantiate_distributed(
+    config: DistributedConfig,
+    device_mesh: Optional["DeviceMesh"],
+    moe_mesh: Optional["DeviceMesh"] = None,
+) -> Union[FSDP2Manager, MegatronFSDPManager, DDPManager, None]:
+    """Instantiate the appropriate distributed manager from config.
+
+    Args:
+        config: Distributed config (FSDP2Config, MegatronFSDPConfig, or DDPConfig).
+        device_mesh: Device mesh for distributed operations (required for FSDP2/MegatronFSDP).
+        moe_mesh: Optional MOE mesh for expert parallelism (FSDP2 only).
+
+    Returns:
+        The instantiated manager, or None if config is None.
+
+    Raises:
+        ValueError: If device_mesh is required but not provided.
+    """
+    if config is None:
+        return None
+
+    if isinstance(config, FSDP2Config):
+        if device_mesh is None:
+            raise ValueError("device_mesh is required for FSDP2Config")
+        return FSDP2Manager(config, device_mesh=device_mesh, moe_mesh=moe_mesh)
+    elif isinstance(config, MegatronFSDPConfig):
+        if device_mesh is None:
+            raise ValueError("device_mesh is required for MegatronFSDPConfig")
+        return MegatronFSDPManager(config, device_mesh=device_mesh)
+    elif isinstance(config, DDPConfig):
+        return DDPManager(config)
+    else:
+        raise ValueError(f"Unknown distributed config type: {type(config)}")
+
+
+def _extract_sizes_from_mesh(
+    device_mesh: "DeviceMesh",
+    moe_mesh: Optional["DeviceMesh"] = None,
+) -> dict:
+    """Extract parallelism sizes from device mesh structure.
+
+    Args:
+        device_mesh: Device mesh with named dimensions.
+        moe_mesh: Optional MOE mesh for expert parallelism.
+
+    Returns:
+        Dict with keys: tp_size, pp_size, cp_size, dp_size, dp_replicate_size, ep_size
+        (only includes keys for dimensions present in the mesh).
+    """
+    mesh_dim_names = device_mesh.mesh_dim_names
+    sizes = {}
+
+    if "tp" in mesh_dim_names:
+        sizes["tp_size"] = device_mesh["tp"].size()
+    if "pp" in mesh_dim_names:
+        sizes["pp_size"] = device_mesh["pp"].size()
+    if "cp" in mesh_dim_names:
+        sizes["cp_size"] = device_mesh["cp"].size()
+    if "dp" in mesh_dim_names:
+        sizes["dp_size"] = device_mesh["dp"].size()
+    if "dp_replicate" in mesh_dim_names:
+        sizes["dp_replicate_size"] = device_mesh["dp_replicate"].size()
+
+    # EP from moe_mesh
+    if moe_mesh is not None and "ep" in moe_mesh.mesh_dim_names:
+        sizes["ep_size"] = moe_mesh["ep"].size()
+
+    return sizes
+
+
+def _infer_pipeline_axis_names(
+    device_mesh: "DeviceMesh",
+    moe_mesh: Optional["DeviceMesh"] = None,
+) -> dict:
+    """Infer pipeline axis names from device mesh structure.
+
+    Args:
+        device_mesh: Device mesh containing parallelism axes.
+        moe_mesh: Optional MOE mesh for expert parallelism.
+
+    Returns:
+        Dictionary with axis name arguments for AutoPipeline.
+    """
+    mesh_dim_names = device_mesh.mesh_dim_names
+
+    # PP axis is always "pp"
+    pp_axis_name = "pp"
+
+    # DP axis names: use dp_replicate + dp_shard_cp if both exist, else just dp_shard_cp
+    if "dp_replicate" in mesh_dim_names and "dp_shard_cp" in mesh_dim_names:
+        dp_axis_names = ("dp_replicate", "dp_shard_cp")
+    else:
+        dp_axis_names = ("dp_shard_cp",)
+
+    cp_axis_name = "cp" if "cp" in mesh_dim_names else None
+    tp_axis_name = "tp" if "tp" in mesh_dim_names else None
+
+    # EP axes from moe_mesh
+    ep_axis_name = None
+    ep_shard_axis_names = None
+    if moe_mesh is not None:
+        moe_dim_names = moe_mesh.mesh_dim_names
+        ep_axis_name = "ep" if "ep" in moe_dim_names else None
+        ep_shard_axis_names = ("ep_shard",) if "ep_shard" in moe_dim_names else None
+
+    return {
+        "pp_axis_name": pp_axis_name,
+        "dp_axis_names": dp_axis_names,
+        "cp_axis_name": cp_axis_name,
+        "tp_axis_name": tp_axis_name,
+        "ep_axis_name": ep_axis_name,
+        "ep_shard_axis_names": ep_shard_axis_names,
+    }
+
+
+def _instantiate_pipeline(
+    config: Optional[PipelineConfig],
+    device_mesh: Optional["DeviceMesh"],
+    moe_mesh: Optional["DeviceMesh"] = None,
+    device: Optional[torch.device] = None,
+) -> Optional[AutoPipeline]:
+    """Instantiate AutoPipeline from config.
+
+    Args:
+        config: Pipeline config. If None or pp_size <= 1, returns None.
+        device_mesh: Device mesh containing the "pp" axis.
+        moe_mesh: Optional MOE mesh for expert parallelism.
+        device: Target device for pipeline computation.
+
+    Returns:
+        AutoPipeline instance, or None if pipeline parallelism is not enabled.
+    """
+    if any(
+        [
+            config is None,
+            device_mesh is None,
+            device_mesh is not None and "pp" not in device_mesh.mesh_dim_names,
+            device_mesh is not None and "pp" in device_mesh.mesh_dim_names and device_mesh["pp"].size() <= 1,
+        ]
+    ):
+        return None
+
+    # Infer axis names from mesh structure
+    axis_names = _infer_pipeline_axis_names(device_mesh, moe_mesh)
+
+    config_dict = config.to_dict()
+    config_dict.pop("loss_fn", None)
+
+    return AutoPipeline(
+        world_mesh=device_mesh,
+        moe_mesh=moe_mesh,
+        device=device,
+        **axis_names,
+        **config_dict,
+    )
+
+
+def _instantiate_qat(
+    config: Optional[QATConfig],
+) -> Optional[Union["Int4WeightOnlyQATQuantizer", "Int8DynActInt4WeightQATQuantizer"]]:
+    """Instantiate QAT quantizer from config.
+
+    Args:
+        config: QAT config. If None, returns None.
+
+    Returns:
+        QAT quantizer instance, or None if QAT is not enabled.
+    """
+    if config is None:
+        return None
+
+    return config.create_quantizer()
+
+
+def parallelize_for_pp(
+    model: torch.nn.Module,
+    *,
+    model_wrapper: Optional[Union[FSDP2Manager, MegatronFSDPManager, DDPManager]] = None,
+    **kwargs,
+) -> torch.nn.Module:
+    """Parallelize model for pipeline parallelism (non-MoE case).
+
+    This function adapts the pipeline parallelism interface to use model_wrapper.parallelize().
+    For MoE models, use parallelize_model from nemo_automodel.components.moe.parallelizer directly.
+
+    Args:
+        model: The model to parallelize.
+        model_wrapper: Distributed manager instance.
+        **kwargs: Additional arguments (world_mesh, moe_mesh, axis names) passed by
+            AutoPipeline but unused for non-MoE parallelization.
+
+    Returns:
+        The parallelized model.
+    """
+    if model_wrapper is not None:
+        if callable(getattr(model_wrapper, "parallelize", None)):
+            model = model_wrapper.parallelize(model)
+    return model
+
+
+def instantiate_infrastructure(
+    *,
+    device_mesh: Optional["DeviceMesh"] = None,
+    moe_mesh: Optional["DeviceMesh"] = None,
+    distributed_config: Optional[DistributedConfig] = None,
+    pipeline_config: Optional[PipelineConfig] = None,
+    qat_config: Optional[QATConfig] = None,
+    moe_config: Optional[MoEParallelizerConfig] = None,
+    ep_size: int = 1,
+    device: Optional[torch.device] = None,
+) -> tuple:
+    """Instantiate infrastructure objects from config classes.
+
+    This function converts config objects into the runtime objects needed by
+    apply_model_infrastructure. It provides a cleaner, more HuggingFace-like API
+    where users pass config objects instead of constructing runtime objects directly.
+
+    Args:
+        device_mesh: Device mesh for distributed operations.
+        moe_mesh: Optional MOE mesh for expert parallelism (FSDP2 only).
+        distributed_config: Distributed training config (FSDP2Config, MegatronFSDPConfig,
+            or DDPConfig).
+        pipeline_config: Pipeline parallelism config.
+        qat_config: Quantization-aware training config.
+        moe_config: MoE parallelizer config (for expert parallel models).
+        ep_size: Expert parallelism size. If > 1, uses MoE-specific parallelizer.
+        device: Target device for model.
+
+    Returns:
+        tuple: (model_wrapper, autopipeline, parallelize_fn, qat_quantizer)
+            - model_wrapper: Distributed manager instance (or None)
+            - autopipeline: AutoPipeline instance (or None)
+            - parallelize_fn: Parallelization function (or None) - built internally for PP
+            - qat_quantizer: QAT quantizer instance (or None)
+    """
+    # Instantiate distributed manager
+    model_wrapper = _instantiate_distributed(distributed_config, device_mesh, moe_mesh)
+
+    # Instantiate pipeline
+    autopipeline = _instantiate_pipeline(pipeline_config, device_mesh, moe_mesh, device)
+
+    # Build parallelize_fn if pipeline parallelism is enabled
+    parallelize_fn = None
+    if autopipeline is not None and model_wrapper is not None:
+        from functools import partial
+
+        if ep_size > 1:
+            # Use MoE-specific parallelizer with config values baked in
+            from nemo_automodel.components.moe.parallelizer import parallelize_model
+
+            parallelize_fn = partial(parallelize_model, **moe_config.to_dict())
+        else:
+            # Use standard parallelization via model_wrapper
+            parallelize_fn = partial(parallelize_for_pp, model_wrapper=model_wrapper)
+
+    # Instantiate QAT quantizer
+    qat_quantizer = _instantiate_qat(qat_config)
+
+    return model_wrapper, autopipeline, parallelize_fn, qat_quantizer
 
 
 def apply_model_infrastructure(
@@ -796,6 +1058,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         cls,
         pretrained_model_name_or_path,
         *model_args,
+        # HF model related kwargs
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
         sdpa_method: Optional[List[SDPBackend]] = None,
@@ -803,13 +1066,23 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
-        model_wrapper=None,
-        autopipeline: AutoPipeline | None = None,
-        parallelize_fn: Callable | None = None,
+        # Parallelism sizes (None = infer from device_mesh if provided)
+        dp_size: Optional[int] = None,
+        dp_replicate_size: Optional[int] = None,
+        tp_size: Optional[int] = None,
+        pp_size: Optional[int] = None,
+        cp_size: Optional[int] = None,
+        ep_size: Optional[int] = None,
+        # Device mesh
+        device_mesh: Optional["DeviceMesh"] = None,
+        moe_mesh: Optional["DeviceMesh"] = None,
+        # Strategy-specific configs
+        distributed_config: Optional[DistributedConfig] = None,
+        pipeline_config: Optional[PipelineConfig] = None,
+        qat_config: Optional[QATConfig] = None,
+        moe_config: Optional[MoEParallelizerConfig] = None,
         peft_config: Optional[dict] = None,
         fp8_config: Optional["FP8Config"] = None,
-        qat_quantizer: Optional[Union["Int4WeightOnlyQATQuantizer", "Int8DynActInt4WeightQATQuantizer"]] = None,
-        loss_fn: Optional[Callable] = None,
         compile_config: Optional["CompileConfig"] = None,
         **kwargs,
     ) -> PreTrainedModel:
@@ -846,29 +1119,33 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 will be applied to the model.
             force_hf (bool, default=False): If `True`, force the use of HF model implementation.
                 If `False`, the model will be loaded using the custom model implementation if available.
-            model_wrapper (optional): Parallelism wrapper instance (e.g., FSDP2Manager,
-                MegatronFSDPManager, DDPManager). Used for distributed training setup
-                and determines meta device initialization behavior.
-            autopipeline (AutoPipeline | None, optional): AutoPipeline instance for
-                pipeline parallelism. When provided, the model will be split across
-                pipeline stages. Default: None.
-            parallelize_fn (Callable | None, optional): Custom function to apply
-                parallelization (EP + FSDP2). Default: None.
+            dp_size (int | None, optional): Data parallel size. If None, inferred from
+                world_size and other parallelism sizes. Default: None.
+            dp_replicate_size (int | None, optional): FSDP2-only. Size of the replication
+                group for HSDP. Raises ValueError if used with non-FSDP2 config. Default: None.
+            tp_size (int, optional): Tensor parallel size. Default: 1.
+            pp_size (int, optional): Pipeline parallel size. Default: 1.
+            cp_size (int, optional): Context parallel size. Default: 1.
+            ep_size (int, optional): Expert parallel size for MoE models. Default: 1.
+            device_mesh (DeviceMesh | None, optional): Pre-created device mesh for
+                distributed training. Default: None.
+            moe_mesh (DeviceMesh | None, optional): FSDP2-only. Device mesh for expert
+                parallelism. Default: None.
+            distributed_config (FSDP2Config | MegatronFSDPConfig | DDPConfig | None, optional):
+                Strategy-specific distributed training configuration. Default: None.
+            pipeline_config (PipelineConfig | None, optional): Pipeline parallelism
+                configuration including loss_fn. Default: None.
+            qat_config (QATConfig | None, optional): Quantization-Aware Training
+                configuration. Default: None.
+            moe_config (MoEParallelizerConfig | None, optional): MoE parallelizer
+                configuration. Default: None.
             peft_config (dict | None, optional): PEFT/LoRA configuration dictionary.
                 If provided, LoRA adapters will be applied to the model. Default: None.
             fp8_config (FP8Config | None, optional): FP8 quantization configuration.
                 If provided, FP8 quantization will be applied to the model. Default: None.
-            qat_quantizer (Int4WeightOnlyQATQuantizer | Int8DynActInt4WeightQATQuantizer | None, optional):
-                Quantization-Aware Training quantizer instance. If provided, QAT will be
-                applied to the model. Default: None.
-            loss_fn (Callable | None, optional): Loss function to use. If the model
-                doesn't support `logits_to_keep` and loss_fn is not MaskedCrossEntropy,
-                it will be replaced with MaskedCrossEntropy. This is passed to AutoPipeline. Default: None.
             compile_config (CompileConfig | None, optional): Configuration for torch.compile.
                 If provided, the model will be compiled for improved performance. Default: None.
             **kwargs: Additional keyword arguments. Notable ones include:
-                - tp_size (int): Tensor parallelism size. Default: 1.
-                - cp_size (int): Context parallelism size. Default: 1.
                 - has_packed_sequence (bool): Whether using packed sequences. Default: False.
                 - cache_dir (str): Cache directory for model weights.
 
@@ -904,22 +1181,74 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
                 force_hf=force_hf,
-                autopipeline=autopipeline,
-                parallelize_fn=parallelize_fn,
+                # Config-based API
+                dp_size=dp_size,
+                dp_replicate_size=dp_replicate_size,
+                tp_size=tp_size,
+                pp_size=pp_size,
+                cp_size=cp_size,
+                ep_size=ep_size,
+                device_mesh=device_mesh,
+                moe_mesh=moe_mesh,
+                distributed_config=distributed_config,
+                pipeline_config=pipeline_config,
+                qat_config=qat_config,
+                moe_config=moe_config,
+                # Other configs
                 peft_config=peft_config,
                 fp8_config=fp8_config,
-                qat_quantizer=qat_quantizer,
-                loss_fn=loss_fn,
                 compile_config=compile_config,
-                model_wrapper=model_wrapper,
                 **kwargs,
             )
+
+        # Validate FSDP2-only params
+        if dp_replicate_size is not None and dp_replicate_size > 1:
+            if distributed_config is not None and not isinstance(distributed_config, FSDP2Config):
+                raise ValueError("dp_replicate_size is only supported with FSDP2Config")
+
+        # Extract sizes from device_mesh if not explicitly provided
+        if device_mesh is not None:
+            mesh_sizes = _extract_sizes_from_mesh(device_mesh, moe_mesh)
+            if tp_size is None:
+                tp_size = mesh_sizes.get("tp_size", 1)
+            if pp_size is None:
+                pp_size = mesh_sizes.get("pp_size", 1)
+            if cp_size is None:
+                cp_size = mesh_sizes.get("cp_size", 1)
+            if ep_size is None:
+                ep_size = mesh_sizes.get("ep_size", 1)
+            if dp_size is None:
+                dp_size = mesh_sizes.get("dp_size")
+            if dp_replicate_size is None:
+                dp_replicate_size = mesh_sizes.get("dp_replicate_size")
+        else:
+            # No mesh provided, use defaults
+            tp_size = tp_size if tp_size is not None else 1
+            pp_size = pp_size if pp_size is not None else 1
+            cp_size = cp_size if cp_size is not None else 1
+            ep_size = ep_size if ep_size is not None else 1
+
+        # Instantiate from configs
+        model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
+            device_mesh=device_mesh,
+            moe_mesh=moe_mesh,
+            distributed_config=distributed_config,
+            pipeline_config=pipeline_config,
+            qat_config=qat_config,
+            moe_config=moe_config,
+            ep_size=ep_size,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+        # Extract loss_fn from pipeline_config
+        loss_fn = pipeline_config.loss_fn if pipeline_config is not None else None
 
         is_hf_model = get_is_hf_model(
             get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs),
             force_hf,
         )
-        tp_size, cp_size, has_packed_sequence = _pop_tp_cp_has_packed(kwargs)
+
+        has_packed_sequence = kwargs.get("has_packed_sequence", False)
+
         attn_implementation, use_liger_kernel = _apply_preload_overrides(
             is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
         )
@@ -1008,13 +1337,23 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
-        model_wrapper=None,
-        autopipeline: AutoPipeline | None = None,
-        parallelize_fn: Callable | None = None,
+        # Parallelism sizes (None = infer from device_mesh if provided)
+        dp_size: Optional[int] = None,
+        dp_replicate_size: Optional[int] = None,
+        tp_size: Optional[int] = None,
+        pp_size: Optional[int] = None,
+        cp_size: Optional[int] = None,
+        ep_size: Optional[int] = None,
+        # Device mesh
+        device_mesh: Optional["DeviceMesh"] = None,
+        moe_mesh: Optional["DeviceMesh"] = None,
+        # Strategy-specific configs
+        distributed_config: Optional[DistributedConfig] = None,
+        pipeline_config: Optional[PipelineConfig] = None,
+        qat_config: Optional[QATConfig] = None,
+        moe_config: Optional[MoEParallelizerConfig] = None,
         peft_config: Optional[dict] = None,
         fp8_config: Optional["FP8Config"] = None,
-        qat_quantizer: Optional[Union["Int4WeightOnlyQATQuantizer", "Int8DynActInt4WeightQATQuantizer"]] = None,
-        loss_fn: Optional[Callable] = None,
         compile_config: Optional["CompileConfig"] = None,
         **kwargs,
     ) -> PreTrainedModel:
@@ -1056,31 +1395,34 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 will be applied to the model.
             force_hf (bool, default=False): If ``True``, force the use of HF model implementation.
                 If ``False``, the model will be loaded using the custom model implementation if available.
-            model_wrapper (optional): Parallelism wrapper instance (e.g., FSDP2Manager,
-                MegatronFSDPManager, DDPManager). Used for distributed training setup
-                and determines meta device initialization behavior.
-            autopipeline (AutoPipeline | None, optional): AutoPipeline instance for
-                pipeline parallelism. When provided, the model will be split across
-                pipeline stages. Default: None.
-            parallelize_fn (Callable | None, optional): Custom function to apply
-                parallelization (EP + FSDP2).
-                Called after model initialization. Default: None.
+            dp_size (int | None, optional): Data parallel size. If None, inferred from
+                world_size and other parallelism sizes. Default: None.
+            dp_replicate_size (int | None, optional): FSDP2-only. Size of the replication
+                group for HSDP. Raises ValueError if used with non-FSDP2 config. Default: None.
+            tp_size (int, optional): Tensor parallel size. Default: 1.
+            pp_size (int, optional): Pipeline parallel size. Default: 1.
+            cp_size (int, optional): Context parallel size. Default: 1.
+            ep_size (int, optional): Expert parallel size for MoE models. Default: 1.
+            device_mesh (DeviceMesh | None, optional): Pre-created device mesh for
+                distributed training. Default: None.
+            moe_mesh (DeviceMesh | None, optional): FSDP2-only. Device mesh for expert
+                parallelism. Default: None.
+            distributed_config (FSDP2Config | MegatronFSDPConfig | DDPConfig | None, optional):
+                Strategy-specific distributed training configuration. Default: None.
+            pipeline_config (PipelineConfig | None, optional): Pipeline parallelism
+                configuration including loss_fn. Default: None.
+            qat_config (QATConfig | None, optional): Quantization-Aware Training
+                configuration. Default: None.
+            moe_config (MoEParallelizerConfig | None, optional): MoE parallelizer
+                configuration. Default: None.
             peft_config (dict | None, optional): PEFT/LoRA configuration dictionary.
                 If provided, LoRA adapters will be applied to the model. Default: None.
             fp8_config (FP8Config | None, optional): FP8 quantization configuration.
                 If provided, FP8 quantization will be applied to the model. Default: None.
-            qat_quantizer (Int4WeightOnlyQATQuantizer | Int8DynActInt4WeightQATQuantizer | None, optional):
-                Quantization-Aware Training quantizer instance. If provided, QAT will be
-                applied to the model. Default: None.
-            loss_fn (Callable | None, optional): Loss function to use. If the model
-                doesn't support `logits_to_keep` and loss_fn is not MaskedCrossEntropy,
-                it will be replaced with MaskedCrossEntropy. This is passed to AutoPipeline. Default: None.
             compile_config (CompileConfig | None, optional): Configuration for torch.compile.
                 If provided, the model will be compiled for improved performance. Default: None.
             **kwargs:
                 Additional keyword arguments. Notable ones include:
-                - tp_size (int): Tensor parallelism size. Default: 1.
-                - cp_size (int): Context parallelism size. Default: 1.
                 - has_packed_sequence (bool): Whether using packed sequences. Default: False.
                 - cache_dir (str): Cache directory for model weights.
 
@@ -1111,16 +1453,75 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 quantization_config=quantization_config,
                 torch_dtype=torch_dtype,
                 force_hf=force_hf,
-                model_wrapper=model_wrapper,
-                autopipeline=autopipeline,
-                parallelize_fn=parallelize_fn,
+                # Config-based API
+                dp_size=dp_size,
+                dp_replicate_size=dp_replicate_size,
+                tp_size=tp_size,
+                pp_size=pp_size,
+                cp_size=cp_size,
+                ep_size=ep_size,
+                device_mesh=device_mesh,
+                moe_mesh=moe_mesh,
+                distributed_config=distributed_config,
+                pipeline_config=pipeline_config,
+                qat_config=qat_config,
+                moe_config=moe_config,
+                # Other configs
                 peft_config=peft_config,
                 fp8_config=fp8_config,
-                qat_quantizer=qat_quantizer,
-                loss_fn=loss_fn,
                 compile_config=compile_config,
                 **kwargs,
             )
+
+        # Validate FSDP2-only params
+        if dp_replicate_size is not None and dp_replicate_size > 1:
+            if distributed_config is not None and not isinstance(distributed_config, FSDP2Config):
+                raise ValueError("dp_replicate_size is only supported with FSDP2Config")
+
+        # Extract sizes from device_mesh if not explicitly provided
+        if device_mesh is not None:
+            mesh_sizes = _extract_sizes_from_mesh(device_mesh, moe_mesh)
+            if tp_size is None:
+                tp_size = mesh_sizes.get("tp_size", 1)
+            if pp_size is None:
+                pp_size = mesh_sizes.get("pp_size", 1)
+            if cp_size is None:
+                cp_size = mesh_sizes.get("cp_size", 1)
+            if ep_size is None:
+                ep_size = mesh_sizes.get("ep_size", 1)
+            if dp_size is None:
+                dp_size = mesh_sizes.get("dp_size")
+            if dp_replicate_size is None:
+                dp_replicate_size = mesh_sizes.get("dp_replicate_size")
+        else:
+            # No mesh provided, use defaults
+            tp_size = tp_size if tp_size is not None else 1
+            pp_size = pp_size if pp_size is not None else 1
+            cp_size = cp_size if cp_size is not None else 1
+            ep_size = ep_size if ep_size is not None else 1
+
+        # Initialize infrastructure objects (will be populated from configs if provided)
+        model_wrapper = None
+        autopipeline = None
+        parallelize_fn = None
+        qat_quantizer = None
+        loss_fn = None
+
+        # Instantiate from configs if provided
+        if distributed_config is not None:
+            model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
+                device_mesh=device_mesh,
+                moe_mesh=moe_mesh,
+                distributed_config=distributed_config,
+                pipeline_config=pipeline_config,
+                qat_config=qat_config,
+                moe_config=moe_config,
+                ep_size=ep_size,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
+            # Extract loss_fn from pipeline_config if provided
+            if pipeline_config is not None:
+                loss_fn = pipeline_config.loss_fn
 
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch.bfloat16
         name_or_path = config if isinstance(config, str) else getattr(config, "name_or_path", None)
@@ -1132,7 +1533,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # config object, not as model __init__ kwargs.
         _consume_config_overrides(config, kwargs)
         is_hf_model = get_is_hf_model(config, force_hf)
-        tp_size, cp_size, has_packed_sequence = _pop_tp_cp_has_packed(kwargs)
+
+        has_packed_sequence = kwargs.get("has_packed_sequence", False)
+
         attn_implementation, use_liger_kernel = _apply_preload_overrides(
             is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
         )

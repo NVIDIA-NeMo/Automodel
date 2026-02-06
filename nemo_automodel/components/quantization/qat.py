@@ -14,15 +14,19 @@
 
 """TorchAO Quantization-Aware Training (QAT) helpers for NeMo-AutoModel.
 
-This module provides thin wrappers to:
-- Instantiate and apply torchao QAT quantizers to models (prepare)
+This module provides:
+- QATConfig: Configuration class for QAT settings
+- Thin wrappers to instantiate and apply torchao QAT quantizers to models (prepare)
 - Toggle fake-quant on/off during training (for delayed fake-quant)
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Callable, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Literal, Optional
+
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +40,90 @@ from torchao.quantization.qat.linear import (
     enable_4w_fake_quant,
     enable_8da4w_fake_quant,
 )
+
+
+@dataclass
+class QATConfig:
+    """
+    Configuration for Quantization-Aware Training (QAT).
+
+    This config controls how QAT quantizers are instantiated and applied to models.
+    QAT is enabled when this config is provided to from_pretrained/from_config.
+
+    Attributes:
+        quantizer_type (Literal["int8_dynact_int4weight", "int4_weight_only"]):
+            Type of QAT quantizer to use.
+            - "int8_dynact_int4weight": Int8 dynamic activation with Int4 weight
+              quantization. Uses Int8DynActInt4WeightQATQuantizer from torchao.
+              Good balance of accuracy and inference speed.
+            - "int4_weight_only": Int4 weight-only quantization. Uses
+              Int4WeightOnlyQATQuantizer from torchao. More aggressive compression,
+              may have slightly lower accuracy.
+        precision (torch.dtype): Data type for model weights during QAT training.
+            Typically torch.bfloat16 for mixed-precision training.
+        scales_precision (torch.dtype): Data type for quantization scale factors.
+            Using higher precision (e.g., torch.bfloat16) for scales can improve
+            accuracy.
+    """
+
+    quantizer_type: Literal["int8_dynact_int4weight", "int4_weight_only"] = "int8_dynact_int4weight"
+    precision: torch.dtype = torch.bfloat16
+    scales_precision: torch.dtype = torch.bfloat16
+
+    def __init__(
+        self,
+        quantizer_type: Literal["int8_dynact_int4weight", "int4_weight_only"] = "int8_dynact_int4weight",
+        precision: torch.dtype = torch.bfloat16,
+        scales_precision: torch.dtype = torch.bfloat16,
+    ):
+        self.quantizer_type = quantizer_type
+        self.precision = precision
+        self.scales_precision = scales_precision
+
+    @classmethod
+    def from_config_node(cls, config_node) -> "QATConfig":
+        """Create QATConfig from a configuration node (e.g., Hydra config)."""
+        if config_node is None:
+            return cls()
+
+        kwargs = {}
+        for field_name in cls.__dataclass_fields__:
+            if hasattr(config_node, field_name):
+                kwargs[field_name] = getattr(config_node, field_name)
+
+        return cls(**kwargs)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert config to dictionary."""
+        return {
+            "quantizer_type": self.quantizer_type,
+            "precision": self.precision,
+            "scales_precision": self.scales_precision,
+        }
+
+    def create_quantizer(self):
+        """Create and return the appropriate QAT quantizer based on config.
+
+        Returns:
+            A torchao QAT quantizer instance (Int8DynActInt4WeightQATQuantizer
+            or Int4WeightOnlyQATQuantizer).
+
+        Raises:
+            ValueError: If quantizer_type is not recognized.
+        """
+        if self.quantizer_type == "int8_dynact_int4weight":
+            return Int8DynActInt4WeightQATQuantizer(
+                precision=self.precision,
+                scales_precision=self.scales_precision,
+            )
+        elif self.quantizer_type == "int4_weight_only":
+            return Int4WeightOnlyQATQuantizer(
+                precision=self.precision,
+                scales_precision=self.scales_precision,
+            )
+        else:
+            raise ValueError(f"Unknown quantizer_type: {self.quantizer_type}")
+
 
 _QUANTIZER_TO_MODE = {
     Int8DynActInt4WeightQATQuantizer: "8da4w-qat",
@@ -94,6 +182,7 @@ def prepare_qat_model(model, quantizer) -> tuple[object, Optional[str]]:
 
 
 __all__ = [
+    "QATConfig",
     "get_quantizer_mode",
     "get_disable_fake_quant_fn",
     "get_enable_fake_quant_fn",
