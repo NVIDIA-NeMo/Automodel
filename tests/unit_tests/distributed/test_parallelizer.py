@@ -38,6 +38,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     megatron_fsdp_strategy_parallelize,
     import_class_from_path,
     get_hf_tp_shard_plan,
+    build_tp_shard_plan_from_config,
     apply_fsdp2_sharding_recursively,
     unshard_fsdp2_model,
 )
@@ -881,3 +882,98 @@ class TestUnshardFsdp2Model:
 
             # Verify reshard was still called despite the exception
             assert test_fsdp_module.reshard_called is True
+
+
+class TestBuildTpShardPlanFromConfig:
+    def test_dict_of_styles_expands_globs(self):
+        class TinyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleList([])
+                for _ in range(2):
+                    layer = nn.Module()
+                    layer.self_attn = nn.Module()
+                    layer.self_attn.q_proj = nn.Linear(4, 4)
+                    layer.self_attn.k_proj = nn.Linear(4, 4)
+                    layer.self_attn.v_proj = nn.Linear(4, 4)
+                    layer.self_attn.o_proj = nn.Linear(4, 4)
+                    self.model.layers.append(layer)
+                self.lm_head = nn.Linear(4, 4)
+
+        model = TinyModel()
+        cfg = {
+            "model.layers.*.self_attn.q_proj": "colwise",
+            "model.layers.*.self_attn.o_proj": "rowwise",
+            "lm_head": "colwise_rep",
+        }
+        plan = build_tp_shard_plan_from_config(model, cfg)
+
+        # Globs should be expanded to concrete module names.
+        assert "model.layers.*.self_attn.q_proj" not in plan
+        assert isinstance(plan["model.layers.0.self_attn.q_proj"], ColwiseParallel)
+        assert isinstance(plan["model.layers.1.self_attn.q_proj"], ColwiseParallel)
+        assert isinstance(plan["model.layers.0.self_attn.o_proj"], RowwiseParallel)
+        assert isinstance(plan["model.layers.1.self_attn.o_proj"], RowwiseParallel)
+        assert isinstance(plan["lm_head"], ColwiseParallel)
+
+    def test_list_rules_with_regexp_and_override(self):
+        class TinyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleList([])
+                for _ in range(2):
+                    layer = nn.Module()
+                    layer.self_attn = nn.Module()
+                    layer.self_attn.q_proj = nn.Linear(4, 4)
+                    layer.self_attn.k_proj = nn.Linear(4, 4)
+                    layer.self_attn.v_proj = nn.Linear(4, 4)
+                    layer.self_attn.o_proj = nn.Linear(4, 4)
+                    self.model.layers.append(layer)
+
+        model = TinyModel()
+        cfg = [
+            # First rule shards all *_proj as colwise...
+            {"fqn": "model.layers.*.self_attn", "regexp": ".*_proj$", "style": "colwise"},
+            # ...then override o_proj to rowwise.
+            {"fqn": "model.layers.*.self_attn.o_proj", "style": "rowwise"},
+        ]
+        plan = build_tp_shard_plan_from_config(model, cfg)
+
+        assert isinstance(plan["model.layers.0.self_attn.q_proj"], ColwiseParallel)
+        assert isinstance(plan["model.layers.0.self_attn.k_proj"], ColwiseParallel)
+        assert isinstance(plan["model.layers.0.self_attn.v_proj"], ColwiseParallel)
+        assert isinstance(plan["model.layers.0.self_attn.o_proj"], RowwiseParallel)
+
+    def test_invalid_style_raises(self):
+        class TinyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(4, 4)
+
+        model = TinyModel()
+        with pytest.raises(ValueError, match="Unknown parallel style"):
+            build_tp_shard_plan_from_config(model, {"lm_head": "not_a_style"})
+
+    def test_invalid_regexp_raises(self):
+        class TinyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+
+        model = TinyModel()
+        cfg = [{"fqn": "model", "regexp": "[", "style": "colwise"}]
+        with pytest.raises(ValueError, match="Invalid tp_shard_plan regexp"):
+            build_tp_shard_plan_from_config(model, cfg)
+
+    def test_already_materialized_plan_passthrough(self):
+        class TinyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(4, 4)
+
+        model = TinyModel()
+        materialized = {"lm_head": ColwiseParallel()}
+        out = build_tp_shard_plan_from_config(model, materialized)
+        assert out is materialized

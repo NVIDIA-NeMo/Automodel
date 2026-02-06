@@ -54,6 +54,23 @@ distributed:
   dp_replicate_size: 1
   ep_size: 8
   sequence_parallel: false
+  # Optional: override the tensor-parallel sharding plan from YAML (no Python needed).
+  # Supports either a dict of {fqn_or_pattern: style} or a list of rules with fqn + optional regexp.
+  #
+  # Example (rules + regexp):
+  # tp_shard_plan:
+  #   - fqn: "model.layers.*.self_attn"
+  #     regexp: ".*_proj$"
+  #     style: "colwise"
+  #   - fqn: "model.layers.*.self_attn.o_proj"
+  #     style: "rowwise"
+  #
+  # Example (dict form):
+  # tp_shard_plan:
+  #   "model.layers.*.self_attn.q_proj": "colwise"
+  #   "model.layers.*.self_attn.k_proj": "colwise"
+  #   "model.layers.*.self_attn.v_proj": "colwise"
+  #   "model.layers.*.self_attn.o_proj": "rowwise"
 
 autopipeline:
   _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline

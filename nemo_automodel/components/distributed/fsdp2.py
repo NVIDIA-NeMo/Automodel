@@ -24,6 +24,7 @@ from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.distributed.parallelizer import (
     _get_parallel_plan,
+    build_tp_shard_plan_from_config,
     fsdp2_strategy_parallelize,
 )
 
@@ -99,6 +100,18 @@ class FSDP2Manager:
     use_hf_tp_plan: Optional[bool] = field(
         default=False,
         metadata={"help": "Use Hugging Face TP plan if True."},
+    )
+    tp_shard_plan: Optional[object] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Custom tensor-parallel sharding plan. Supports YAML-friendly forms:\n"
+                "  - dict[str, str]: {<fqn-or-pattern>: <style>} with styles like 'rowwise'/'colwise'\n"
+                "  - list[dict]: rules with keys {fqn, (optional) regexp/regex, style}\n"
+                "  - str: import path to a dict/function returning a dict[str, ParallelStyle]\n"
+                "If provided, this takes precedence over optimized plans and `use_hf_tp_plan`."
+            )
+        },
     )
     mp_policy: Optional[MixedPrecisionPolicy] = field(
         default=MixedPrecisionPolicy(
@@ -288,10 +301,11 @@ class FSDP2Manager:
 
         if self.device_mesh["tp"].size() > 1:
             # Delegate plan selection to central helper
+            cfg_tp_shard_plan = build_tp_shard_plan_from_config(model, self.tp_shard_plan)
             tp_shard_plan = _get_parallel_plan(
                 model,
                 sequence_parallel=bool(self.sequence_parallel),
-                tp_shard_plan=None,
+                tp_shard_plan=cfg_tp_shard_plan,
                 use_hf_tp_plan=self.use_hf_tp_plan,
             )
         else:

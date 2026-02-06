@@ -22,6 +22,7 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from nemo_automodel.components.distributed.parallelizer import (
     _get_parallel_plan,
+    build_tp_shard_plan_from_config,
     megatron_fsdp_strategy_parallelize,
 )
 
@@ -77,6 +78,18 @@ class MegatronFSDPManager:
     use_hf_tp_plan: Optional[bool] = field(
         default=False,
         metadata={"help": "Use Hugging Face TP plan if True."},
+    )
+    tp_shard_plan: Optional[object] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Custom tensor-parallel sharding plan. Supports YAML-friendly forms:\n"
+                "  - dict[str, str]: {<fqn-or-pattern>: <style>} with styles like 'rowwise'/'colwise'\n"
+                "  - list[dict]: rules with keys {fqn, (optional) regexp/regex, style}\n"
+                "  - str: import path to a dict/function returning a dict[str, ParallelStyle]\n"
+                "If provided, this takes precedence over optimized plans and `use_hf_tp_plan`."
+            )
+        },
     )
     backend: Optional[str] = field(default="nccl", metadata={"help": "Distributed backend, e.g. 'nccl' or 'gloo'."})
     world_size: Optional[int] = field(
@@ -224,10 +237,11 @@ class MegatronFSDPManager:
 
         if self.device_mesh["tp"].size() > 1:
             # Delegate plan selection to central helper. MegatronFSDP currently does not support SP.
+            cfg_tp_shard_plan = build_tp_shard_plan_from_config(model, self.tp_shard_plan)
             tp_shard_plan = _get_parallel_plan(
                 model,
                 sequence_parallel=False,  # explicit: SP not supported here
-                tp_shard_plan=None,
+                tp_shard_plan=cfg_tp_shard_plan,
                 use_hf_tp_plan=self.use_hf_tp_plan,
             )
         else:

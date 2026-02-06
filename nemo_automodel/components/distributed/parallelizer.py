@@ -567,6 +567,133 @@ def translate_to_torch_parallel_style(style: str):
         raise ValueError(f"Unknown parallel style: {style}")
 
 
+def build_tp_shard_plan_from_config(model: nn.Module, tp_shard_plan: Any) -> Any:
+    """
+    Convert a YAML-friendly TP sharding plan into a torch ``parallelize_module`` plan.
+
+    This helper is intended for configs (YAML/CLI overrides) where the user cannot
+    easily construct torch ``ParallelStyle`` objects.
+
+    Supported inputs:
+    - ``None``: returns ``None``
+    - ``str``: returned as-is (handled by ``_get_parallel_plan`` as an import path)
+    - ``dict[str, str]``: mapping of module FQNs/patterns to style strings (e.g. "rowwise", "colwise")
+    - ``list[dict]``: list of rules. Each rule supports:
+        - ``fqn`` (str): module FQN or glob-pattern (``*`` matches a single path segment)
+        - ``regexp``/``regex`` (str, optional): regex matched *after* the fqn prefix (fqn + "." + regexp)
+        - ``style`` (str): one of the styles accepted by ``translate_to_torch_parallel_style``
+
+    Output:
+    - ``dict[str, ParallelStyle]`` mapping *concrete* module names to ParallelStyle objects.
+      We expand globs/regexps against ``model.named_modules()`` so the result works even if
+      the underlying torch version does not support wildcard keys.
+    """
+
+    import re
+
+    if tp_shard_plan is None:
+        return None
+    if isinstance(tp_shard_plan, str):
+        return tp_shard_plan
+
+    module_names = [name for name, _ in model.named_modules() if name]
+    module_name_set = set(module_names)
+
+    def _fqn_glob_to_regex_str(fqn: str) -> str:
+        # Treat '*' as "one module path segment" (e.g. layers.*.mlp matches layers.0.mlp).
+        return re.escape(fqn).replace(r"\*", r"[^.]+")
+
+    def _match_fqn_glob(fqn: str) -> list[str]:
+        if fqn in module_name_set:
+            return [fqn]
+        pattern = re.compile(rf"^{_fqn_glob_to_regex_str(fqn)}$")
+        return [name for name in module_names if pattern.match(name)]
+
+    def _add_matches(matches: list[str], style_obj: ParallelStyle, rule_desc: str):
+        if not matches:
+            logger.warning(f"TP plan rule '{rule_desc}' did not match any modules in the model.")
+            return
+        for name in matches:
+            plan[name] = style_obj  # last rule wins
+
+    plan: dict[str, ParallelStyle] = {}
+
+    # Case 1: dict mapping fqn/pattern -> style string
+    if isinstance(tp_shard_plan, dict):
+        # If the user passed an already-materialized plan (python), keep it as-is.
+        if all(isinstance(v, ParallelStyle) for v in tp_shard_plan.values()):
+            return tp_shard_plan
+
+        for fqn, style in tp_shard_plan.items():
+            if not isinstance(fqn, str):
+                raise TypeError(f"tp_shard_plan keys must be strings (module FQNs), got {type(fqn)}")
+            if not isinstance(style, str):
+                raise TypeError(
+                    "tp_shard_plan values must be parallel style strings when provided via config "
+                    f"(e.g. 'rowwise'/'colwise'), got {type(style)} for key '{fqn}'"
+                )
+            style_obj = translate_to_torch_parallel_style(style)
+            _add_matches(_match_fqn_glob(fqn), style_obj, rule_desc=f"{fqn} -> {style}")
+        return plan
+
+    # Case 2: list of rules (fqn and optional regexp)
+    if isinstance(tp_shard_plan, list):
+        for rule in tp_shard_plan:
+            if not isinstance(rule, dict):
+                raise TypeError(f"tp_shard_plan list entries must be dicts, got {type(rule)}")
+
+            style = rule.get("style", rule.get("parallel_style", None))
+            if style is None:
+                raise ValueError(f"tp_shard_plan rule is missing required key 'style': {rule}")
+            if not isinstance(style, str):
+                raise TypeError(f"tp_shard_plan rule 'style' must be a string, got {type(style)}: {rule}")
+            style_obj = translate_to_torch_parallel_style(style)
+
+            fqn = rule.get("fqn", rule.get("module", rule.get("name", None)))
+            regexp = rule.get("regexp", rule.get("regex", None))
+
+            if fqn is None and regexp is None:
+                raise ValueError(
+                    "tp_shard_plan rules must specify 'fqn' (with optional 'regexp') or a standalone 'regexp'/'regex'. "
+                    f"Got: {rule}"
+                )
+            if fqn is not None and not isinstance(fqn, str):
+                raise TypeError(f"tp_shard_plan rule 'fqn' must be a string, got {type(fqn)}: {rule}")
+            if regexp is not None and not isinstance(regexp, str):
+                raise TypeError(f"tp_shard_plan rule 'regexp'/'regex' must be a string, got {type(regexp)}: {rule}")
+
+            if regexp is None:
+                assert fqn is not None
+                matches = _match_fqn_glob(fqn)
+                _add_matches(matches, style_obj, rule_desc=f"{fqn} -> {style}")
+                continue
+
+            # regexp provided: apply it after the fqn prefix (fqn + "." + regexp), or treat as full regex if fqn missing.
+            if fqn is None:
+                full_re = regexp
+                if not full_re.startswith("^"):
+                    full_re = "^" + full_re
+                if not full_re.endswith("$"):
+                    full_re = full_re + "$"
+            else:
+                full_re = rf"^{_fqn_glob_to_regex_str(fqn)}\.{regexp}$"
+
+            try:
+                compiled = re.compile(full_re)
+            except re.error as e:
+                raise ValueError(f"Invalid tp_shard_plan regexp '{full_re}' (from rule {rule}): {e}") from e
+
+            matches = [name for name in module_names if compiled.match(name)]
+            _add_matches(matches, style_obj, rule_desc=f"{fqn}+{regexp} -> {style}")
+
+        return plan
+
+    raise TypeError(
+        "tp_shard_plan must be one of: None, str, dict, or list. "
+        f"Got {type(tp_shard_plan)}: {tp_shard_plan}"
+    )
+
+
 def validate_tp_mesh_for_nemotron_nas(model, tp_size):
     num_attention_heads = model.config.num_attention_heads
     assert num_attention_heads % tp_size == 0, "num_attention_heads in config does not match the TP size"
