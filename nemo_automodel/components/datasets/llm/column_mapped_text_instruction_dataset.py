@@ -236,15 +236,15 @@ class ColumnMappedTextInstructionDataset(Dataset):
         self.truncation = truncation
         self.use_hf_chat_template = use_hf_chat_template
 
+    def __iter__(self) -> Iterator[Dict[str, List[int]]]:
+        raise ValueError("__iter__ is not supported in map mode.")
+
     def __len__(self) -> int:  # noqa: D401
         """
         Returns the length of the dataset.
 
         Returns:
             The length of the dataset.
-
-        Raises:
-            RuntimeError: If streaming is enabled.
         """
         return len(self.dataset)
 
@@ -257,9 +257,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
 
         Returns:
             A dictionary with the mapped columns.
-
-        Raises:
-            RuntimeError: If streaming is enabled.
         """
         row = self.dataset[idx]
         mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}

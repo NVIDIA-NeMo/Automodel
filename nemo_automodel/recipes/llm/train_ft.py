@@ -25,32 +25,30 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 import torch
 import torch.nn as nn
 import wandb
+from huggingface_hub import constants as hf_constants
+from megatron_fsdp.fully_shard import fully_shard_optimizer
 from torch.distributed.device_mesh import DeviceMesh
 from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoConfig
-from transformers.modeling_utils import no_init_weights
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
-from transformers.utils.hub import TRANSFORMERS_CACHE
 from wandb import Settings
 
-from nemo_automodel._transformers import NeMoAutoModelForCausalLM
+from nemo_automodel._transformers import NeMoAutoModelForCausalLM, NeMoAutoModelForSequenceClassification
+from nemo_automodel._transformers.auto_model import apply_model_infrastructure
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.checkpoint.checkpointing import (
+    Checkpointer,
+    CheckpointingConfig,
+)
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
-from nemo_automodel.components.distributed.ddp import DDPManager
-from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 from nemo_automodel.components.distributed.init_utils import (
-    get_rank_safe,
-    get_world_size_safe,
     initialize_distributed,
 )
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
@@ -64,7 +62,7 @@ from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
-from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
+from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
@@ -75,12 +73,10 @@ from nemo_automodel.components.training.utils import (
 )
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
-    compile_model,
 )
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
-    init_empty_weights,
-    print_trainable_parameters,
+    _supports_seq_lens,
     resolve_trust_remote_code,
 )
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -100,6 +96,8 @@ def _get_model_name(cfg_model):
     if cfg_model.get("pretrained_model_name_or_path", None) is not None:
         return cfg_model.pretrained_model_name_or_path
     elif cfg_model.get("config", None) is not None:
+        if isinstance(cfg_model.config, str):
+            return cfg_model.config
         return cfg_model.config.get("pretrained_model_name_or_path", None)
     else:
         return None
@@ -130,13 +128,11 @@ def _get_num_thd_chunks(pp_enabled, cfg):
 
 
 def build_model_and_optimizer(
-    device,
     cfg_model,
     cfg_opt,
     cfg_peft,
     model_wrapper,
     seed,
-    checkpointer: Checkpointer,
     has_packed_sequence=False,
     tp_size=1,
     cp_size=1,
@@ -147,9 +143,8 @@ def build_model_and_optimizer(
     autopipeline: AutoPipeline | None = None,
     loss_fn=None,
     parallelize_fn=None,
-    load_base_model=True,
     unfreeze_modules: list[str] | None = None,
-) -> tuple[nn.Module | AutoPipeline, list[str], list["Optimizer"], nn.Module, dict]:  # noqa: F821
+) -> tuple[nn.Module | AutoPipeline, list["Optimizer"], nn.Module]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
 
@@ -171,174 +166,68 @@ def build_model_and_optimizer(
     Returns:
         The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, the loss function, and param_info dict.
     """
-    is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and not cfg_model.get(
-        "force_hf", False
-    )
-
-    init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
     with ScopedRNG(seed=seed, ranked=True):
-        kwargs = {"tp_size": tp_size, "cp_size": cp_size, "has_packed_sequence": has_packed_sequence}
-        if not cfg_model.get("_target_", None) in (
-            NeMoAutoModelForCausalLM.from_config,
-            NeMoAutoModelForCausalLM.from_pretrained,
-        ):
-            kwargs = {}
+        kwargs = {
+            "tp_size": tp_size,
+            "cp_size": cp_size,
+            "has_packed_sequence": has_packed_sequence,
+            "autopipeline": autopipeline,
+            "parallelize_fn": parallelize_fn,
+            "peft_config": cfg_peft,
+            "model_wrapper": model_wrapper,
+            "loss_fn": loss_fn,
+        }
+        if cfg_fp8 is not None:
+            fp8_config = build_fp8_config(cfg_fp8)
+            kwargs["fp8_config"] = fp8_config
+        if cfg_qat is not None and cfg_qat.get("enabled", False):
+            if cfg_peft is not None:
+                raise ValueError("QAT with PEFT is not currently supported")
+            quantizer = cfg_qat.quantizer.instantiate(precision=torch.bfloat16, scales_precision=torch.bfloat16)
+            kwargs["qat_quantizer"] = quantizer
+        if cfg_compile is not None:
+            kwargs["compile_config"] = build_compile_config(cfg_compile)
         if cfg_quantization is not None:
             logger.info("Model weight quantization enabled with BitsAndBytes")
             from nemo_automodel.components.quantization.qlora import create_bnb_config
 
             kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
 
-        # Instantiate the model in meta device to avoid OOM
-        with init_ctx:
+        is_nemo_auto_model = cfg_model.get("_target_", None) in (
+            NeMoAutoModelForCausalLM.from_config,
+            NeMoAutoModelForCausalLM.from_pretrained,
+            NeMoAutoModelForSequenceClassification.from_config,
+            NeMoAutoModelForSequenceClassification.from_pretrained,
+        )
+
+        if is_nemo_auto_model:
+            # NeMoAutoModel handles infrastructure internally
             model = cfg_model.instantiate(**kwargs)
-
-            if checkpointer.config.dequantize_base_checkpoint is None:
-                # try to infer whether the base weights are quantized
-                try:
-                    checkpointer.config.dequantize_base_checkpoint = hasattr(model.config, "quantization_config")
-                except:
-                    checkpointer.config.dequantize_base_checkpoint = False
-
-            # Optionally apply PEFT (e.g., LoRA/DoRA, etc)
-            if cfg_peft is not None:
-                if tp_size > 1:
-                    logger.info("Disabling Triton with TP ({})".format(tp_size))
-                    cfg_peft.use_triton = False
-                if autopipeline is not None:
-                    logger.info("Enabling PEFT with Pipeline Parallelism")
-                    logger.info("Disabling Triton with Pipeline Parallelism Enabled.")
-                    cfg_peft.use_triton = False
-                apply_lora_to_linear_modules(
-                    model, cfg_peft, quantization_config=kwargs.get("quantization_config", None)
-                )
-
-        if cfg_fp8 is not None:
-            fp8_config = build_fp8_config(cfg_fp8)
-            model = apply_fp8_to_model(model, config=fp8_config)
-
-        # Apply QAT if configured (torchao QAT)
-        if cfg_qat is not None and cfg_qat.get("enabled", False):
-            if cfg_peft is not None:
-                raise ValueError("QAT with PEFT is not supported in 25.11")
-            from nemo_automodel.components.quantization.qat import prepare_qat_model
-
-            if any(map(lambda x: x.dtype != torch.bfloat16, model.parameters())):
-                logger.warning("QAT is only supported for bfloat16 models. Support will be added in future release.")
-                quit(code=0)
-            quantizer = cfg_qat.quantizer.instantiate(precision=torch.bfloat16, scales_precision=torch.bfloat16)
-            model, qat_mode = prepare_qat_model(model, quantizer)
-            # Attach helpers for delayed fake-quant toggling if desired
-            model._qat_mode = qat_mode  # type: ignore[attr-defined]
-
-        # Explicitly unfreeze specified modules (e.g. task heads) that need full fine-tuning
-        if unfreeze_modules:
-            for name, param in model.named_parameters():
-                if any(module_name in name for module_name in unfreeze_modules):
-                    param.requires_grad_(True)
-            logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
-
-    param_info = {
-        "trainable_params": 0,
-        "total_params": 0,
-    }
-
-    # hold a list copy of the model state dict keys before any parallelization
-    state_dict_keys = list(model.state_dict().keys())
+        else:
+            # For non-NemoAutoModel entry points (e.g., build_gpt2_model),
+            # instantiate the model first, then apply infrastructure separately
+            model = cfg_model.instantiate()
+            model = apply_model_infrastructure(
+                model,
+                is_hf_model=False,
+                is_meta_device=False,
+                device=torch.cuda.current_device(),
+                pretrained_model_name_or_path=None,
+                load_base_model=False,
+                cache_dir=hf_constants.HF_HUB_CACHE,
+                **kwargs,
+            )
 
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
         loss_fn = MaskedCrossEntropy()
 
-    if autopipeline is not None:
-        trainable_params, total_params = print_trainable_parameters(model)
-        param_info["trainable_params"] = trainable_params
-        param_info["total_params"] = total_params
-        if get_world_size_safe() == 1:
-            logger.info("World size is 1, skipping autopipeline.")
-        else:
-            autopipeline.build(model, loss_fn=loss_fn, parallelize_fn=parallelize_fn)
-            for mp in autopipeline.parts:
-                checkpointer.load_base_model(
-                    mp,
-                    device,
-                    cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
-                    _get_model_name(cfg_model),
-                    getattr(cfg_peft, "lora_A_init", None),
-                    load_base_model=load_base_model,
-                )
-
-            # Create optimizer for all model parts
-            trainable_params = []
-            for i, model_part in enumerate(autopipeline.parts):
-                trainable_params.append(
-                    {
-                        "params": list(filter(lambda x: x.requires_grad, model_part.parameters())),
-                        "name": f"rank_{get_rank_safe()}_model_part_{i}",
-                    }
-                )
-            model = autopipeline
-    else:
-        load_weights = False
-        if parallelize_fn is not None and get_world_size_safe() > 1:
-            parallelize_fn(
-                model,
-                world_mesh=model_wrapper.device_mesh,
-                moe_mesh=getattr(model_wrapper, "moe_mesh", None),
-                pp_enabled=False,
-                dp_axis_names=(
-                    ("dp_replicate", "dp_shard_cp")
-                    if "dp_replicate" in model_wrapper.device_mesh.mesh_dim_names
-                    and "dp_shard_cp" in model_wrapper.device_mesh.mesh_dim_names
-                    else ("dp_shard_cp",)
-                ),
-                cp_axis_name="cp",
-                tp_axis_name="tp",
-                ep_axis_name="ep",
-                ep_shard_axis_names=("ep_shard",),
-            )
-            load_weights = True
-        elif callable(getattr(model_wrapper, "parallelize", None)):
-            # FSDP2 and MegatronFSDP should already be on the correct device
-            if isinstance(model_wrapper, MegatronFSDPManager):
-                # MegatronFSDP instantiate optimizer inside parallelize_function
-                trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
-                assert len(trainable_params) > 0, "trainable_params cannot be empty"
-                if tp_size > 1:
-                    # TP does not support foreach
-                    cfg_opt.foreach = False
-                optimizer = cfg_opt.instantiate(params=trainable_params)
-
-                model, optimizer = model_wrapper.parallelize(model, optimizer)
-
-                trainable_params, total_params = print_trainable_parameters(model)
-                param_info["trainable_params"] = trainable_params
-                param_info["total_params"] = total_params
-
-                return model, state_dict_keys, [optimizer], loss_fn, param_info
-
-            else:
-                load_weights = True
-                model = model_wrapper.parallelize(model)
-
-        # Load the weights into the model in parallel.
-        if is_meta_device and load_weights:
-            checkpointer.load_base_model(
-                model,
-                device,
-                cfg_model.get("cache_dir", TRANSFORMERS_CACHE),
-                _get_model_name(cfg_model),
-                getattr(cfg_peft, "lora_A_init", None),
-                load_base_model=load_base_model,
-            )
-
-        # ensure the model is on device
-        model = model.to(device)
-
-        # Apply torch.compile if configured
-        if cfg_compile is not None:
-            compile_config = build_compile_config(cfg_compile)
-            model = compile_model(model, compile_config)
+    # Explicitly unfreeze specified modules (e.g. task heads) that need full fine-tuning
+    if unfreeze_modules:
+        for name, param in model.named_parameters():
+            if any(module_name in name for module_name in unfreeze_modules):
+                param.requires_grad_(True)
+        logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
 
     if tp_size > 1:
         # TP does not support foreach
@@ -375,14 +264,11 @@ def build_model_and_optimizer(
             trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
             assert len(trainable_params) > 0, "trainable_params cannot be empty"
             optimizer = [cfg_opt.instantiate(params=trainable_params)]
+            if isinstance(model_wrapper, MegatronFSDPManager) and torch.distributed.get_world_size() > 1:
+                fully_shard_optimizer(model, optimizer)
+            optimizer = [optimizer]
 
-        # Print trainable parameters after model has been moved to device
-        if autopipeline is None:
-            trainable_params, total_params = print_trainable_parameters(model)
-            param_info["trainable_params"] = trainable_params
-            param_info["total_params"] = total_params
-
-    return model, state_dict_keys, optimizer, loss_fn, param_info
+    return model, optimizer, loss_fn
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
@@ -404,14 +290,13 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         checkpoint_dir="checkpoints/",
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
-        model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
+        model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HUB_CACHE,
         save_consolidated=True,
         is_peft=is_peft,
     )
     if cfg_ckpt is not None:
         cfg_ckpt = cfg_ckpt.to_dict()
         cfg_ckpt.pop("restore_from", None)
-        cfg_ckpt.pop("load_base_model", None)
         ckpt_kwargs |= cfg_ckpt
     if ckpt_kwargs.get("is_peft", False) and ckpt_kwargs.get("model_save_format") == "torch_save":
         raise ValueError(
@@ -491,8 +376,8 @@ def build_dataloader(
     dp_rank,
     dp_world_size,
     pp_enabled,
-    supports_seq_lens=True,
     cp_size=1,
+    model: Optional[nn.Module] = None,
 ) -> tuple[DataLoader, PreTrainedTokenizerBase]:
     """Build a DataLoader for the dataset.
 
@@ -509,7 +394,9 @@ def build_dataloader(
         dp_rank: Data parallel rank.
         dp_world_size: Data parallel world size.
         pp_enabled: Whether pipeline parallelism is enabled.
-        supports_seq_lens: Whether the model supports seq_lens (Default: True).
+        cp_size: Context parallel size.
+        model: Optional model instance. If provided and packed sequences are enabled,
+            seq_lens will only be included if the model's forward() accepts it.
     Returns:
         The instantiated DataLoader and tokenizer.
     """
@@ -528,31 +415,35 @@ def build_dataloader(
 
         # If using an IterableDataset, per-rank sharding for unique samples
         if isinstance(ds, IterableDataset):
-            try:
-                if ds.num_shards >= dp_world_size:
-                    ds = ds.shard(dp_world_size, dp_rank)
-                    logging.info(
-                        f"Sharded IterableDataset via dataset.shard: world_size={dp_world_size}, rank={dp_rank}"
-                    )
-                else:
-                    from datasets.distributed import split_dataset_by_node
+            if callable(getattr(ds, "shard", None)):
+                ds = ds.shard(dp_world_size, dp_rank)
+                logging.info(f"Sharded IterableDataset via dataset.shard: world_size={dp_world_size}, rank={dp_rank}")
+            elif hasattr(ds, "dataset"):
+                # HuggingFace streaming datasets: split by file shards when possible.
+                from datasets.distributed import split_dataset_by_node
 
-                    ds.dataset = split_dataset_by_node(ds.dataset, world_size=dp_world_size, rank=dp_rank)
-                    logging.info(f"Sharded dataset via split_dataset_by_node: world_size={dp_world_size}")
-            except Exception as e:
-                logging.warning(f"IterableDataset sharding skipped due to error: {e}")
+                assert hasattr(ds, "dataset"), "dataset must have a dataset attribute"
+                ds.dataset = split_dataset_by_node(ds.dataset, world_size=dp_world_size, rank=dp_rank)
+                logging.info(f"Sharded dataset via split_dataset_by_node: world_size={dp_world_size}")
+            else:
+                logging.warning("IterableDataset does not support sharding; Data may be duplicated across ranks.")
 
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
+
         # check if packed sequence is supported
+        supports_seq_lens = _supports_seq_lens(model)
         if packed_sequence_size > 0 and not supports_seq_lens:
             logging.warning("Packed sequence is not supported without seq_lens; disabling packed sequence")
             packed_sequence_size = 0
 
         # Apply packing if configured
+        # Apply packing if configured
         if packed_sequence_size > 0:
             logger.info(f"Packing dataset with size: {packed_sequence_size}")
             if hasattr(ds, "shuffle"):
                 ds = ds.shuffle(seed)
+            # Determine whether to include seq_lens/seq_lens_padded in packed samples.
+            # Priority: explicit config > model.forward signature detection > default False
             ds = pack_dataset(
                 ds,
                 split=cfg_ds.split,  # Assumes split is defined in dataset config
@@ -832,7 +723,7 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     return loss_fn(**loss_fn_kwargs)
 
 
-def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled):
+def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: Optional[nn.Module] = None):
     def _prepare_val_ds_name(val_ds_name):
         val_ds_name = val_ds_name.replace("validation_dataset", "")
         if len(val_ds_name) > 1 and val_ds_name[0] in ("_", "-", "."):
@@ -861,8 +752,8 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled):
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             pp_enabled=False,
-            supports_seq_lens=True,
             cp_size=cfg.get("distributed.cp_size", 1),
+            model=model,
         )[0]
 
     return val_dataloaders
@@ -873,7 +764,6 @@ def parallelize_for_pp(
     *,
     world_mesh: DeviceMesh,
     moe_mesh: Optional[DeviceMesh] = None,
-    pp_enabled: bool = False,
     dp_axis_names: Union[tuple[str, ...], str] = ("data_parallel",),
     cp_axis_name: Optional[str] = None,
     tp_axis_name: Optional[str] = None,
@@ -1036,8 +926,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
-        model, model_state_dict_keys, self.optimizer, self.loss_fn, self.param_info = build_model_and_optimizer(
-            self.dist_env.device,
+        model, self.optimizer, self.loss_fn = build_model_and_optimizer(
             self.cfg.model,
             self.cfg.optimizer,
             self.peft_config,
@@ -1053,10 +942,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             autopipeline=autopipeline,
             loss_fn=self.loss_fn,
             parallelize_fn=parallelize_fn,
-            load_base_model=self.cfg.get("checkpoint.load_base_model", True),
-            checkpointer=self.checkpointer,
         )
-        self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
 
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
@@ -1089,14 +975,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
             pp_enabled=self.pp_enabled,
-            supports_seq_lens=True,
             cp_size=self.cfg.get("distributed.cp_size", 1),
+            model=self.model_parts[0],
         )
         self.val_dataloaders = build_validation_dataloader(
             self.cfg,
             self._get_dp_group_size(),
             self._get_dp_rank(),
             self.pp_enabled,
+            model=self.model_parts[0],
         )
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler
@@ -1205,13 +1092,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # Run validation every val_every_steps
                 val_losses = {}
                 if self.step_scheduler.is_val_step:
-                    if self.pp_enabled:
-                        logger.warning("Validation is not supported for pipeline parallelism")
-                    else:
-                        for val_name, val_dataloader in self.val_dataloaders.items():
-                            val_log_data = self._run_validation_epoch(val_dataloader)
-                            val_losses[val_name] = val_log_data.metrics["val_loss"]
-                            self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
+                    for val_name, val_dataloader in self.val_dataloaders.items():
+                        val_log_data = self._run_validation_epoch(val_dataloader)
+                        val_losses[val_name] = val_log_data.metrics["val_loss"]
+                        self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
                     for mp in self.model_parts:
                         mp.train()
 
@@ -1245,7 +1129,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
         batch = {
             k: (
-                {dk: dv.to(self.dist_env.device, non_blocking=True) if dv is not None else None for dk, dv in v.items()}
+                {dk: dv.to(self.dist_env.device, non_blocking=True) for dk, dv in v.items() if dv is not None}
                 if isinstance(v, dict)
                 else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
             )
@@ -1261,10 +1145,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         labels = batch.pop("labels")
 
         if self.pp_enabled:
-            if not is_train:
-                logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")
-                return
-
             with train_ctx():
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
@@ -1274,10 +1154,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     targets = None
 
                 input_ids = batch.pop("input_ids")
-                if self.pp.info.has_first_stage:
-                    self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
+
+                # Filter out None values and empty dicts from batch to avoid PP chunking errors
+                batch_filtered = {
+                    k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
+                }
+
+                if is_train:
+                    # Use step for training (forward + backward)
+                    if self.pp.info.has_first_stage:
+                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch_filtered)
+                    else:
+                        self.pp.info.schedule.step(target=targets, losses=losses, **batch_filtered)
                 else:
-                    self.pp.info.schedule.step(target=targets, losses=losses, **batch)
+                    # Use eval for validation (forward only, no backward)
+                    if self.pp.info.has_first_stage:
+                        self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch_filtered)
+                    else:
+                        self.pp.info.schedule.eval(target=targets, losses=losses, **batch_filtered)
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))
@@ -1461,9 +1355,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 total_loss += torch.sum(torch.stack(loss_buffer)).item()
                 total_num_label_tokens += num_label_tokens
 
-        total_loss = self._dp_allreduce(total_loss, include_cp=True).item()
+        total_loss = self._dp_allreduce(total_loss, include_cp=True)
         total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
+
+        # For PP, send val_loss from last stage to main rank for logging
+        if self.pp_enabled:
+            val_loss = val_loss.to(self.dist_env.device)
+            # Send loss to first rank from the last stage
+            src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
+            if self.dist_env.rank == src_rank:
+                torch.distributed.send(val_loss, dst=0)
+            elif self.dist_env.is_main:
+                torch.distributed.recv(val_loss, src=src_rank)
+
+        val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
 
         return MetricsSample(
             step=self.step_scheduler.step,
@@ -1489,7 +1395,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     "mem": Memory allocated.
         """
 
-        # Pipeline parallelism does not support validation -> log_data is None
         if not self.dist_env.is_main or log_data is None:
             return
 

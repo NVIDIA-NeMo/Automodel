@@ -7,6 +7,8 @@
 :hidden:
 repository-structure.md
 guides/installation.md
+guides/configuration.md
+guides/huggingface-api-compatibility.md
 launcher/local-workstation.md
 launcher/cluster.md
 ```
@@ -35,6 +37,7 @@ guides/llm/pretraining.md
 guides/llm/nanogpt-pretraining.md
 guides/llm/sequence-classification.md
 guides/omni/gemma3-3n.md
+guides/quantization-aware-training.md
 guides/llm/databricks.md
 ```
 
@@ -52,7 +55,9 @@ model-coverage/vlm.md
 
 guides/dataset-overview.md
 guides/llm/dataset.md
+guides/llm/retrieval-dataset.md
 guides/llm/column-mapped-text-instruction-dataset.md
+guides/llm/column-mapped-text-instruction-iterable-dataset.md
 guides/vlm/dataset.md
 ```
 
@@ -64,6 +69,7 @@ guides/gradient-checkpointing.md
 guides/pipelining.md
 guides/llm/knowledge-distillation.md
 guides/fp8-training.md
+guides/mlflow-logging.md
 
 apidocs/index.rst
 ```

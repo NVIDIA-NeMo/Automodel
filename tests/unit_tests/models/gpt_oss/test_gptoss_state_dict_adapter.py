@@ -17,7 +17,7 @@ from unittest.mock import Mock, patch
 from transformers import GptOssConfig
 
 from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig
 
 from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
 

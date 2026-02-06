@@ -22,7 +22,7 @@ from nemo_automodel.components.models.deepseek_v3.layers import (
     postprocess_output_for_attn,
     MLA,
 )
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig
 
 # Skip Transformer Engine tests by default unless explicitly enabled
 TE_AVAILABLE = False
@@ -201,6 +201,7 @@ class TestMLAInitialization:
         config.hidden_size = 4096
         config.rope_scaling = None
         config.max_position_embeddings = 4096
+        config.rms_norm_eps = 1e-6
 
         # Apply overrides
         for key, value in overrides.items():
@@ -358,6 +359,7 @@ class TestMLAForward:
         config.hidden_size = 1024
         config.rope_scaling = None
         config.max_position_embeddings = 4096
+        config.rms_norm_eps = 1e-6
 
         for key, value in overrides.items():
             setattr(config, key, value)
@@ -480,6 +482,7 @@ class TestMLAInitWeights:
         config.hidden_size = 1024
         config.rope_scaling = None
         config.max_position_embeddings = 4096
+        config.rms_norm_eps = 1e-6
 
         for key, value in overrides.items():
             setattr(config, key, value)

@@ -646,12 +646,12 @@ def test_hf_peft_checkpoint():
     # checkpoint is saved at this point
     # first extract the in-memory checkpoint
     model_state_dict = ModelState(
-        trainer.model,
+        trainer.model_parts[0],
         trainer.checkpointer.config.is_peft,
     ).state_dict()
     optimizer_state_dict = to_cpu(
         OptimizerState(
-            trainer.model,
+            trainer.model_parts[0],
             trainer.optimizer,
             trainer.lr_scheduler,
         ).state_dict()["optim"]
@@ -690,11 +690,9 @@ def test_hf_peft_checkpoint():
         "model/adapter_config.json",
         "model/automodel_peft_config.json",
         "model/chat_template.jinja",
-        "model/preprocessor_config.json",
         "model/processor_config.json",
         "model/tokenizer_config.json",
         "model/tokenizer.json",
-        "model/special_tokens_map.json",
         "optim/__0_0.distcp",
         "optim/__1_0.distcp",
         "optim/.metadata",
@@ -759,10 +757,10 @@ def test_hf_peft_checkpoint():
 
     # check if new model and current model give the same CE loss
     val_batch = next(iter(trainer.val_dataloader))
-    restored_model = FinetuneRecipeForVLM(cfg)
-    restored_model.setup()
-    restored_model = restored_model.model
-    source_model_loss = get_validation_loss(trainer.model, val_batch, trainer.loss_fn, trainer.dist_env.device)
+    restored_trainer = FinetuneRecipeForVLM(cfg)
+    restored_trainer.setup()
+    restored_model = restored_trainer.model_parts[0]
+    source_model_loss = get_validation_loss(trainer.model_parts[0], val_batch, trainer.loss_fn, trainer.dist_env.device)
     restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
     assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
 
@@ -851,7 +849,7 @@ def test_hf_peft_checkpoint():
         base = AutoModelForImageTextToText.from_pretrained(cfg.model.pretrained_model_name_or_path)
         peft_model = PeftModel.from_pretrained(
             base, Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model"
-        ).to(trainer.model.dtype)
+        ).to(trainer.model_parts[0].dtype)
 
         for source_key, source_param in model_state_dict.items():
             # source key example: 'base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight'
