@@ -98,6 +98,14 @@ dataloader:
 #   shuffle: false
 #   num_workers: 0
 
+# Quantization configuration
+# Uncomment and configure for Quantization
+# quantization:
+#   load_in_4bit: true
+#   bnb_4bit_compute_dtype: bfloat16
+#   bnb_4bit_use_double_quant: true
+#   bnb_4bit_quant_type: "nf4"
+
 # LoRA/PEFT configuration
 # Uncomment and configure for LoRA/PEFT
 # peft:
