@@ -1379,6 +1379,17 @@ wheels = [
 ]
 
 [[package]]
+name = "dion"
+version = "0.1.0"
+source = { git = "https://github.com/microsoft/dion.git#7452a5823cf9655b93c3f1d8020b4ebb2535239b" }
+dependencies = [
+    { name = "numpy", version = "1.26.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "numpy", version = "2.4.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' and platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "torch", marker = "platform_machine == 'x86_64' and sys_platform == 'never'" },
+    { name = "triton", marker = "platform_machine == 'x86_64' and sys_platform == 'never'" },
+]
+
+[[package]]
 name = "distlib"
 version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3246,6 +3257,7 @@ build = [
 ]
 dev = [
     { name = "cut-cross-entropy" },
+    { name = "dion", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
 ]
 docs = [
@@ -3329,6 +3341,7 @@ build = [
 ]
 dev = [
     { name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" },
+    { name = "dion", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", git = "https://github.com/microsoft/dion.git" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", git = "https://github.com/linkedin/Liger-Kernel.git?rev=49e63538e64b00780e424e34bc4f193dcfeba75c" },
 ]
 docs = [
