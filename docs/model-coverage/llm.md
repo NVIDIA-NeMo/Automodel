@@ -15,7 +15,7 @@ To run LLMs with NeMo AutoModel, make sure you're using NeMo container version [
 For other installation options (e.g., uv), please see our [Installation Guide](../guides/installation.md).
 
 ## Supported Models
-NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transformers/v3.5.1/model_doc/auto.html#automodelforcausallm) in the [Text Generation](https://huggingface.co/models?pipeline_tag=text-generation&sort=trending) category. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, such as for reasoning tasks, you can override the default tokenizer during the data preparation stage.
+NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transformers/v3.5.1/model_doc/auto.html#automodelforcausallm) in the [Text Generation](https://huggingface.co/models?pipeline_tag=text-generation&sort=trending) category. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling (for example, a custom chat template), override the tokenizer in your recipe YAML (for example, set `dataset.tokenizer` / `validation_dataset.tokenizer`) or provide a custom dataset `_target_`. See [LLM datasets](../guides/llm/dataset.md) and [dataset overview](../guides/dataset-overview.md).
 
 The table below lists the main architectures we test against (FSDP2 combined with SFT/PEFT) and includes a representative checkpoint for each.
 
