@@ -101,34 +101,22 @@ def _get_module_from_path(layer, path):
     return layer
 
 
-def _fully_shard(module, mesh, mp_policy, offload_policy, shard_placement_fn=None):
+def _fully_shard(module, mesh, mp_policy, offload_policy):
     if isinstance(module, nn.ModuleList):
         for layer in module:
-            _fully_shard(layer, mesh, mp_policy, offload_policy, shard_placement_fn=shard_placement_fn)
+            _fully_shard(layer, mesh, mp_policy, offload_policy)
     else:
-        fully_shard(
-            module,
-            mesh=mesh,
-            shard_placement_fn=shard_placement_fn,
-            mp_policy=mp_policy,
-            offload_policy=offload_policy,
-        )
+        fully_shard(module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
 
 
-def fully_shard_by_dtype(module, mesh, mp_policy, offload_policy, shard_placement_fn=None):
+def fully_shard_by_dtype(module, mesh, mp_policy, offload_policy):
     # calling _group_params_by_dtype is not optimal here, because we may
     # end up with two traversals over the module, but this code is not in the hot path.
     grouped_params = _group_params_by_dtype(module)
     if len(grouped_params) == 0:
         return
     elif len(grouped_params) == 1:
-        fully_shard(
-            module,
-            mesh=mesh,
-            shard_placement_fn=shard_placement_fn,
-            mp_policy=mp_policy,
-            offload_policy=offload_policy,
-        )
+        fully_shard(module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
     else:
         least_items_dtype = min(grouped_params.items(), key=lambda x: len(x[1]))[0]
         for path, mod, dtype in iter_maximal_uniform_dtype_subtrees(
@@ -142,13 +130,6 @@ def fully_shard_by_dtype(module, mesh, mp_policy, offload_policy, shard_placemen
                     mesh=mesh,
                     mp_policy=mp_policy,
                     offload_policy=offload_policy,
-                    shard_placement_fn=shard_placement_fn,
                 )
         if len(grouped_params) == 2:
-            fully_shard(
-                module,
-                mesh=mesh,
-                shard_placement_fn=shard_placement_fn,
-                mp_policy=mp_policy,
-                offload_policy=offload_policy,
-            )
+            fully_shard(module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)

@@ -199,7 +199,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             )
 
         # Find transformer layers and apply parallelisms
-        apply_fsdp2_sharding_recursively(model, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
 
         # Apply FSDP to the root model
         # Do not reshard after forward for root model because its parameters
@@ -266,10 +266,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
 
         for layer in layers:
             parallelizer_utils.fully_shard_by_dtype(
-                layer,
-                mesh=dp_mesh,
-                mp_policy=mp_policy,
-                offload_policy=offload_policy,
+                layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy
             )
 
         # do not reshard after forward for root model
@@ -452,12 +449,7 @@ def apply_fsdp2_sharding_recursively(
             # If child is also a ModuleList (nested structure), recurse instead of wrapping
             # since ModuleList doesn't have a forward() method required by fully_shard
             if isinstance(child_module, nn.ModuleList):
-                apply_fsdp2_sharding_recursively(
-                    child_module,
-                    mesh,
-                    mp_policy,
-                    offload_policy,
-                )
+                apply_fsdp2_sharding_recursively(child_module, mesh, mp_policy, offload_policy)
             else:
                 # As an optimization, do not reshard after forward for the last
                 # transformer block since FSDP would prefetch it immediately
@@ -472,12 +464,7 @@ def apply_fsdp2_sharding_recursively(
                 module[layer_id] = child_module
     else:
         for name, sub_module in module.named_children():
-            apply_fsdp2_sharding_recursively(
-                sub_module,
-                mesh,
-                mp_policy,
-                offload_policy,
-            )
+            apply_fsdp2_sharding_recursively(sub_module, mesh, mp_policy, offload_policy)
 
 
 def get_hf_tp_shard_plan(model):
