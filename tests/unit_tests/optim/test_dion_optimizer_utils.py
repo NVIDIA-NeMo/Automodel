@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from contextlib import nullcontext
 
 import pytest
 import torch
@@ -475,20 +476,43 @@ class TestSynchronizeForCheckpoint:
 # Tests for train_ft.py: Dion optimizer branch in build_model_and_optimizer()
 # ---------------------------------------------------------------------------
 
+def _patch_train_ft_for_cpu(monkeypatch, train_ft_mod, model):
+    """Patch train_ft module so build_model_and_optimizer can run on CPU.
+
+    Makes cfg_model.get("_target_") match NeMoAutoModelForCausalLM.from_pretrained
+    so the code takes the simple cfg_model.instantiate(**kwargs) path and never
+    calls torch.cuda.current_device().
+
+    Returns the sentinel value that FakeCfgModel.get("_target_") should return.
+    """
+    _sentinel = object()
+    monkeypatch.setattr(
+        train_ft_mod, "NeMoAutoModelForCausalLM",
+        type("_FakeAutoModel", (), {"from_pretrained": _sentinel, "from_config": object()})(),
+    )
+    # Also stub out the sequence-classification targets so they don't interfere
+    monkeypatch.setattr(
+        train_ft_mod, "NeMoAutoModelForSequenceClassification",
+        type("_FakeAutoModel2", (), {"from_pretrained": object(), "from_config": object()})(),
+    )
+    monkeypatch.setattr(train_ft_mod, "_supports_logits_to_keep", lambda m: True)
+    monkeypatch.setattr(train_ft_mod, "ScopedRNG", lambda seed, ranked: nullcontext())
+    return _sentinel
+
+
 class TestBuildModelAndOptimizerDionBranch:
     """Test the optimizer creation branch in build_model_and_optimizer().
 
     The logic under test (train_ft.py lines 236-270):
-    - is_dion_optimizer(cfg_opt) → True → build_dion_optimizer()
-    - is_dion_optimizer(cfg_opt) → False → normal cfg_opt.instantiate()
+    - is_dion_optimizer(cfg_opt) -> True -> build_dion_optimizer()
+    - is_dion_optimizer(cfg_opt) -> False -> normal cfg_opt.instantiate()
     - Model with/without `parts` attribute
     """
 
     @staticmethod
     def _make_simple_model():
         """A tiny model with requires_grad params."""
-        m = nn.Linear(4, 4)
-        return m
+        return nn.Linear(4, 4)
 
     @staticmethod
     def _make_parts_model():
@@ -508,31 +532,32 @@ class TestBuildModelAndOptimizerDionBranch:
         import nemo_automodel.recipes.llm.train_ft as train_ft_mod
 
         model = self._make_simple_model()
-        sentinel = object()
+        sentinel_mesh = object()
         build_calls = []
 
-        # Mock the heavy model creation: make cfg_model.instantiate return our model
+        _target_sentinel = _patch_train_ft_for_cpu(monkeypatch, train_ft_mod, model)
+
         class FakeCfgModel:
             def get(self, key, default=None):
+                if key == "_target_":
+                    return _target_sentinel
                 return default
             def instantiate(self, **kwargs):
                 return model
 
         class FakeCfgOpt:
             foreach = True
-            def get(self, key, default=None):
-                return default
 
         class FakeModelWrapper:
-            device_mesh = sentinel
+            device_mesh = sentinel_mesh
 
         monkeypatch.setattr(train_ft_mod, "is_dion_optimizer", lambda cfg: True)
         monkeypatch.setattr(
             train_ft_mod, "build_dion_optimizer",
-            lambda cfg_opt, model, distributed_mesh: (build_calls.append((model, distributed_mesh)) or "fake_dion_opt"),
+            lambda cfg_opt, model, distributed_mesh: (
+                build_calls.append((model, distributed_mesh)) or "fake_dion_opt"
+            ),
         )
-        monkeypatch.setattr(train_ft_mod, "_supports_logits_to_keep", lambda m: True)
-        monkeypatch.setattr(train_ft_mod, "ScopedRNG", lambda seed, ranked: __import__('contextlib').nullcontext())
 
         result_model, optimizers, loss_fn = train_ft_mod.build_model_and_optimizer(
             cfg_model=FakeCfgModel(),
@@ -547,7 +572,7 @@ class TestBuildModelAndOptimizerDionBranch:
         assert optimizers == ["fake_dion_opt"]
         assert len(build_calls) == 1
         assert build_calls[0][0] is model
-        assert build_calls[0][1] is sentinel  # distributed_mesh from model_wrapper
+        assert build_calls[0][1] is sentinel_mesh
 
     def test_dion_optimizer_with_parts(self, monkeypatch):
         """When model has `parts`, build_dion_optimizer is called per part."""
@@ -556,8 +581,12 @@ class TestBuildModelAndOptimizerDionBranch:
         model = self._make_parts_model()
         build_calls = []
 
+        _target_sentinel = _patch_train_ft_for_cpu(monkeypatch, train_ft_mod, model)
+
         class FakeCfgModel:
             def get(self, key, default=None):
+                if key == "_target_":
+                    return _target_sentinel
                 return default
             def instantiate(self, **kwargs):
                 return model
@@ -571,10 +600,10 @@ class TestBuildModelAndOptimizerDionBranch:
         monkeypatch.setattr(train_ft_mod, "is_dion_optimizer", lambda cfg: True)
         monkeypatch.setattr(
             train_ft_mod, "build_dion_optimizer",
-            lambda cfg_opt, model, distributed_mesh: (build_calls.append(model) or f"opt_for_{id(model)}"),
+            lambda cfg_opt, model, distributed_mesh: (
+                build_calls.append(model) or f"opt_for_{id(model)}"
+            ),
         )
-        monkeypatch.setattr(train_ft_mod, "_supports_logits_to_keep", lambda m: True)
-        monkeypatch.setattr(train_ft_mod, "ScopedRNG", lambda seed, ranked: __import__('contextlib').nullcontext())
 
         _, optimizers, _ = train_ft_mod.build_model_and_optimizer(
             cfg_model=FakeCfgModel(),
@@ -585,7 +614,6 @@ class TestBuildModelAndOptimizerDionBranch:
             loss_fn=None,
         )
 
-        # Should have called build_dion_optimizer once per part
         assert len(build_calls) == 2
         assert build_calls[0] is model.parts[0]
         assert build_calls[1] is model.parts[1]
@@ -598,8 +626,12 @@ class TestBuildModelAndOptimizerDionBranch:
         model = self._make_simple_model()
         instantiate_calls = []
 
+        _target_sentinel = _patch_train_ft_for_cpu(monkeypatch, train_ft_mod, model)
+
         class FakeCfgModel:
             def get(self, key, default=None):
+                if key == "_target_":
+                    return _target_sentinel
                 return default
             def instantiate(self, **kwargs):
                 return model
@@ -614,8 +646,6 @@ class TestBuildModelAndOptimizerDionBranch:
             pass
 
         monkeypatch.setattr(train_ft_mod, "is_dion_optimizer", lambda cfg: False)
-        monkeypatch.setattr(train_ft_mod, "_supports_logits_to_keep", lambda m: True)
-        monkeypatch.setattr(train_ft_mod, "ScopedRNG", lambda seed, ranked: __import__('contextlib').nullcontext())
 
         _, optimizers, _ = train_ft_mod.build_model_and_optimizer(
             cfg_model=FakeCfgModel(),
@@ -631,14 +661,18 @@ class TestBuildModelAndOptimizerDionBranch:
         assert optimizers == ["regular_opt"]
 
     def test_non_dion_optimizer_with_parts(self, monkeypatch):
-        """Non-dion optimizer with model.parts → instantiate per part."""
+        """Non-dion optimizer with model.parts -> instantiate per part."""
         import nemo_automodel.recipes.llm.train_ft as train_ft_mod
 
         model = self._make_parts_model()
         instantiate_calls = []
 
+        _target_sentinel = _patch_train_ft_for_cpu(monkeypatch, train_ft_mod, model)
+
         class FakeCfgModel:
             def get(self, key, default=None):
+                if key == "_target_":
+                    return _target_sentinel
                 return default
             def instantiate(self, **kwargs):
                 return model
@@ -653,8 +687,6 @@ class TestBuildModelAndOptimizerDionBranch:
             pass
 
         monkeypatch.setattr(train_ft_mod, "is_dion_optimizer", lambda cfg: False)
-        monkeypatch.setattr(train_ft_mod, "_supports_logits_to_keep", lambda m: True)
-        monkeypatch.setattr(train_ft_mod, "ScopedRNG", lambda seed, ranked: __import__('contextlib').nullcontext())
 
         _, optimizers, _ = train_ft_mod.build_model_and_optimizer(
             cfg_model=FakeCfgModel(),
