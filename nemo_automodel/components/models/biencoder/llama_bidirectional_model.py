@@ -553,14 +553,13 @@ class BiencoderModel(nn.Module):
 
         # Infer model class from model_name_or_path
         # Check config.json if it exists
-        config_path = os.path.join(model_name_or_path, "config.json") if os.path.isdir(model_name_or_path) else None
+        config_path = os.path.join(model_name_or_path, "config.json")
 
         if config_path and os.path.exists(config_path):
             import json
 
             with open(config_path, "r") as f:
-                config = json.load(f)
-                model_type = config.get("model_type", "")
+                model_type = json.load(f).get("model_type", "")
         else:
             # If no config, infer from model name
             model_type = ""
@@ -630,22 +629,22 @@ class BiencoderModel(nn.Module):
         )
         return model
 
-    def save(self, output_dir: str):
+    def save_pretrained(self, save_directory: str, **kwargs):
         """Save model to output directory."""
 
-        logger.info(f"Saving BiencoderModel to {output_dir}")
+        logger.info(f"Saving BiencoderModel to {save_directory}")
 
         # Save the model
         if self.share_encoder:
-            self.lm_q.save_pretrained(output_dir)
+            self.lm_q.save_pretrained(save_directory)
         else:
-            os.makedirs(os.path.join(output_dir, "query_model"), exist_ok=True)
-            os.makedirs(os.path.join(output_dir, "passage_model"), exist_ok=True)
-            self.lm_q.save_pretrained(os.path.join(output_dir, "query_model"))
-            self.lm_p.save_pretrained(os.path.join(output_dir, "passage_model"))
+            os.makedirs(os.path.join(save_directory, "query_model"), exist_ok=True)
+            os.makedirs(os.path.join(save_directory, "passage_model"), exist_ok=True)
+            self.lm_q.save_pretrained(os.path.join(save_directory, "query_model"))
+            self.lm_p.save_pretrained(os.path.join(save_directory, "passage_model"))
 
         # Save linear pooler if exists
         if self.add_linear_pooler:
-            pooler_path = os.path.join(output_dir, "pooler.pt")
+            pooler_path = os.path.join(save_directory, "pooler.pt")
             logger.info(f"Saving linear pooler to {pooler_path}")
             torch.save(self.linear_pooler.state_dict(), pooler_path)
