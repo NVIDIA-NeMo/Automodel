@@ -104,7 +104,7 @@ runs:
           ARG=("--runtime=nvidia --gpus all")
         fi
 
-        ls -alh ${{ inputs.test-data-path }}
+        ls -alh ${{ inputs.test-data-path }}/automodel
 
         cmd=$(cat <<RUN_TEST_EOF
         #!/bin/bash
