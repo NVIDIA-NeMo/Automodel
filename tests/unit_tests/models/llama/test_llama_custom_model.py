@@ -22,7 +22,6 @@ import torch
 from transformers import AutoModelForCausalLM, LlamaConfig
 
 from nemo_automodel import NeMoAutoModelForCausalLM
-from nemo_automodel.components.models.llama.model import LlamaForCausalLM
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -94,7 +93,8 @@ class TestLlamaModel:
         hf_state_dict = llama_model_hf.state_dict()
         custom_state_dict_from_hf = adapter.from_hf(hf_state_dict)
         # Use nn.Module.load_state_dict directly to bypass mixin (testing adapter, not mixin)
-        torch.nn.Module.load_state_dict(llama_model_custom, custom_state_dict_from_hf, strict=True)
+        # Note: strict=False because HF checkpoints don't have TE's _extra_state keys
+        torch.nn.Module.load_state_dict(llama_model_custom, custom_state_dict_from_hf, strict=False)
 
         # Use nn.Module.state_dict directly to get native format (testing adapter, not mixin)
         s = adapter.to_hf(torch.nn.Module.state_dict(llama_model_custom))
@@ -140,7 +140,8 @@ class TestLlamaModel:
             .to(torch.bfloat16)
         )  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
         llama_model_hf_converted.eval()
-        llama_model_hf_converted.load_state_dict(hf_state_dict_from_custom, strict=True)
+        # Note: strict=False because HF checkpoints don't have TE's _extra_state keys
+        llama_model_hf_converted.load_state_dict(hf_state_dict_from_custom, strict=False)
 
         # Compare Custom → HF outputs
         with torch.no_grad():
