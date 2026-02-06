@@ -108,7 +108,9 @@ Here’s a glimpse of what the data looks like:
 This structure is ideal for training models in context-based question answering, where the model learns to answer questions based on the input context.
 
 :::{tip}
-In this guide, we use the `SQuAD v1.1` dataset, but you can specify your own data as needed.
+In this guide, we use the `SQuAD v1.1` dataset, but you can use your own data.
+
+To do so, edit the YAML `dataset` / `validation_dataset` sections (for example `dataset._target_`, `dataset_name`/`path_or_dataset`, and `split`). See [Integrate Your Own Text Dataset](dataset.md) and [Dataset Overview](../dataset-overview.md).
 :::
 
 ## Use a Recipe to Fine-Tune the Model
