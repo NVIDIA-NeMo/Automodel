@@ -59,6 +59,7 @@ from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFChe
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
+    apply_parameter_freezing,
     init_empty_weights,
     print_trainable_parameters,
     resolve_trust_remote_code,
@@ -629,6 +630,11 @@ def apply_model_infrastructure(
         _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=dequantize_base_checkpoint).keys()
     )
 
+    # Apply freezing before sharding
+    freeze_config = _kwargs.get("freeze_config")
+    if freeze_config is not None:
+        apply_parameter_freezing(model, freeze_config)
+
     # Loss function check
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         loss_fn = MaskedCrossEntropy()
@@ -920,6 +926,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             force_hf,
         )
         tp_size, cp_size, has_packed_sequence = _pop_tp_cp_has_packed(kwargs)
+        freeze_config = kwargs.pop("freeze_config", None)
         attn_implementation, use_liger_kernel = _apply_preload_overrides(
             is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
         )
@@ -991,7 +998,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             device=device,
             compile_config=compile_config,
             load_base_model=True,
-            cache_dir=kwargs.get("cache_dir", hf_constants.HF_HUB_CACHE),
+            cache_dir=kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE),
+            freeze_config=freeze_config,
         )
 
         return model
@@ -1133,6 +1141,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         _consume_config_overrides(config, kwargs)
         is_hf_model = get_is_hf_model(config, force_hf)
         tp_size, cp_size, has_packed_sequence = _pop_tp_cp_has_packed(kwargs)
+        freeze_config = kwargs.pop("freeze_config", None)
         attn_implementation, use_liger_kernel = _apply_preload_overrides(
             is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
         )
@@ -1197,7 +1206,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             compile_config=compile_config,
             pretrained_model_name_or_path=getattr(config, "name_or_path"),
             load_base_model=False,
-            cache_dir=kwargs.get("cache_dir", hf_constants.HF_HUB_CACHE),
+            cache_dir=kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE),
+            freeze_config=freeze_config,
         )
 
         return model

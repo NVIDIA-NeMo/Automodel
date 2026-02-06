@@ -89,20 +89,24 @@ def test_print_trainable_parameters_non_zero_rank(dummy_model, capsys, monkeypat
     "freeze_cfg, expect",
     [
         (
-            {"freeze_embeddings": True, "freeze_vision_tower": False, "freeze_language_model": False},
-            {"emb": False, "vision": True, "lang": True, "other": True},
+            # freeze_vision_tower=False means vision stays trainable
+            {"freeze_vision_tower": False, "freeze_language_model": False},
+            {"vision": True, "lang": True, "other": True},
         ),
         (
-            {"freeze_embeddings": False, "freeze_vision_tower": True, "freeze_language_model": False},
-            {"emb": True, "vision": False, "lang": True, "other": True},
+            # freeze_vision_tower=True means vision is frozen
+            {"freeze_vision_tower": True, "freeze_language_model": False},
+            {"vision": False, "lang": True, "other": True},
         ),
         (
-            {"freeze_embeddings": False, "freeze_vision_tower": False, "freeze_language_model": True},
-            {"emb": True, "vision": True, "lang": False, "other": True},
+            # freeze_language_model=True means language_model is frozen
+            {"freeze_vision_tower": False, "freeze_language_model": True},
+            {"vision": True, "lang": False, "other": True},
         ),
         (
-            {},  # rely on in-code defaults: embeddings=True, vision=True, language=False
-            {"emb": False, "vision": False, "lang": True, "other": True},
+            # defaults: freeze_vision_tower=True, freeze_language_model=False
+            {},
+            {"vision": False, "lang": True, "other": True},
         ),
     ],
 )
@@ -111,20 +115,19 @@ def test_apply_parameter_freezing(dummy_model, freeze_cfg: Dict, expect: Dict):
     Parametrized test to verify that each freeze flag affects the right sub-modules.
 
     `expect` dict uses:
-        emb   -> require_grad status for Embedding
         vision-> require_grad status for *all* vision-related parameters
         lang  -> require_grad status for language_model
         other -> require_grad status for the unrelated `other` layer
     A value of True means gradients SHOULD be enabled; False means frozen.
+
+    Note: freeze_embeddings was removed from apply_parameter_freezing.
+    Embeddings are no longer frozen by this function.
     """
     # Reset all grads before every run (pytest reuses the same fixture instance)
     for p in dummy_model.parameters():
         p.requires_grad = True
 
     model_utils.apply_parameter_freezing(dummy_model, freeze_cfg)
-
-    # embeddings
-    assert dummy_model.token_embed.weight.requires_grad is expect["emb"]
 
     # vision tower(s)
     assert _all_requires_grad(dummy_model.vision_tower) is expect["vision"]
@@ -133,9 +136,11 @@ def test_apply_parameter_freezing(dummy_model, freeze_cfg: Dict, expect: Dict):
     # language model
     assert _all_requires_grad(dummy_model.language_model) is expect["lang"]
 
-    # unrelated layer
+    # unrelated layer (including embeddings - not frozen by this function)
     assert dummy_model.other.weight.requires_grad is expect["other"]
     assert dummy_model.other.bias.requires_grad is expect["other"]
+    # embeddings are always trainable now (freeze_embeddings was removed)
+    assert dummy_model.token_embed.weight.requires_grad is True
 
 
 def test_init_empty_weights_moves_params_to_meta_and_preserves_requires_grad():
@@ -241,3 +246,48 @@ def test_init_empty_weights_torchao_branch_with_fake_weight(monkeypatch):
     assert getattr(m.p, "_linear_mm_config") == "cfg"
     assert getattr(m.p, "_dtype") == torch.float32
     assert isinstance(getattr(m.p, "_precomputed_scale"), torch.Tensor)
+
+
+def test_init_empty_weights_preserves_is_hf_initialized_attribute():
+    """
+    Test that _is_hf_initialized attribute is preserved when moving parameters
+    to meta device. This attribute is used by HuggingFace transformers to track
+    which parameters have been initialized.
+    """
+
+    class ModuleWithHFInitializedParam(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.w = nn.Parameter(torch.empty(2, 3))
+            # Simulate HF setting _is_hf_initialized on the parameter
+            self.w._is_hf_initialized = True
+
+    with model_utils.init_empty_weights():
+        m = ModuleWithHFInitializedParam()
+
+    # Device moved to meta
+    assert m.w.device.type == "meta"
+    # _is_hf_initialized should be preserved
+    assert hasattr(m.w, "_is_hf_initialized")
+    assert m.w._is_hf_initialized is True
+
+
+def test_init_empty_weights_handles_missing_is_hf_initialized():
+    """
+    Test that parameters without _is_hf_initialized attribute work correctly
+    and don't have the attribute added spuriously.
+    """
+
+    class ModuleWithoutHFInitialized(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.w = nn.Parameter(torch.empty(2, 3))
+            # No _is_hf_initialized attribute set
+
+    with model_utils.init_empty_weights():
+        m = ModuleWithoutHFInitialized()
+
+    # Device moved to meta
+    assert m.w.device.type == "meta"
+    # _is_hf_initialized should NOT be present since it wasn't set originally
+    assert not hasattr(m.w, "_is_hf_initialized")
