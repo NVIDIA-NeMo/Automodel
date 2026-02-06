@@ -6,7 +6,7 @@ This guide covers **FineWeb** data preparation, **defining** a [NanoGPT‑style]
 
 ## Set Up Your Environment
 
-In this guide, we will use an interactive environment to install NeMo AutoModel from Git. You can also install NeMo AutoModel from PyPI or use our bi-monthly Docker container.
+In this guide, we will use an interactive environment to install NeMo Automodel from Git. You can also install NeMo Automodel from PyPI or use our bi-monthly Docker container (see the [Installation Guide](../installation.md)).
 
 ```bash
 # clone / install AutoModel (editable for local hacks)
@@ -21,7 +21,7 @@ For this guide we will use a single machine equipped with 8xH100 NVIDIA GPUs.
 :::
 
 :::tip
-You can run this guide with a single GPU by changing the config.
+To run this guide on a single GPU, use the single-GPU command in the **Launch Training** section below and scale down the YAML (for example, reduce `step_scheduler.global_batch_size` / `local_batch_size`, and shrink the model via `model.n_layer` / `model.n_embd` / `model.n_head`). For more launch patterns, see [Run on Your Local Workstation](../../launcher/local-workstation.md).
 :::
 
 ---

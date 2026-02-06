@@ -33,7 +33,13 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.processing_utils import ProcessorMixin
-from transformers.tokenization_utils import PreTrainedTokenizerBase
+
+try:
+    # >= v5
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+except ImportError:
+    # < v5
+    from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 from nemo_automodel.components.checkpoint.checkpointing import save_config
 from nemo_automodel.components.config.loader import ConfigNode
@@ -276,6 +282,12 @@ class BaseRecipe:
             unwrapped_model.save_pretrained(
                 save_directory=path, checkpointer=self.checkpointer, tokenizer=tokenizer, peft_config=self.peft_config
             )
+
+        # Sync before checkpointing for Dion
+        optimizers = optimizer if isinstance(optimizer, list) else [optimizer]
+        for opt in optimizers:
+            if hasattr(opt, "synchronize_for_checkpoint"):
+                opt.synchronize_for_checkpoint()
         self.checkpointer.save_optimizer(optimizer, model, path, scheduler)
         save_config(config.raw_config, path)
         if is_dist_initialized:
