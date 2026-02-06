@@ -22,7 +22,6 @@ import torch
 from transformers import AutoModelForCausalLM, Qwen2Config
 
 from nemo_automodel import NeMoAutoModelForCausalLM
-from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM
 from nemo_automodel.components.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -94,7 +93,8 @@ class TestQwen2Model:
         hf_state_dict = qwen2_model_hf.state_dict()
         custom_state_dict_from_hf = adapter.from_hf(hf_state_dict)
         # Use nn.Module.load_state_dict directly to bypass mixin (testing adapter, not mixin)
-        torch.nn.Module.load_state_dict(qwen2_model_custom, custom_state_dict_from_hf, strict=True)
+        # Note: strict=False because HF checkpoints don't have TE's _extra_state keys
+        torch.nn.Module.load_state_dict(qwen2_model_custom, custom_state_dict_from_hf, strict=False)
 
         # Generate test inputs
         input_ids = torch.randint(0, config.vocab_size, (1, 10)).to("cuda")
@@ -126,7 +126,8 @@ class TestQwen2Model:
             .to("cuda")
             .to(torch.bfloat16)  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
         )
-        qwen2_model_hf_converted.load_state_dict(hf_state_dict_from_custom, strict=True)
+        # Note: strict=False because HF checkpoints don't have TE's _extra_state keys
+        qwen2_model_hf_converted.load_state_dict(hf_state_dict_from_custom, strict=False)
 
         # Compare Custom → HF outputs
         with torch.no_grad():
