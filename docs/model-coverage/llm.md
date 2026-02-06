@@ -2,20 +2,20 @@
 
 ## Introduction
 Large Language Models (LLMs) power a variety of tasks such as dialogue systems, text classification, summarization, and more.
-NeMo Automodel provides a simple interface for loading and fine-tuning LLMs hosted on the Hugging Face Hub.
+NeMo AutoModel provides a simple interface for loading and fine-tuning LLMs hosted on the Hugging Face Hub.
 
-## Run LLMs with NeMo Automodel
-To run LLMs with NeMo Automodel, make sure you're using NeMo container version [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) or later. If the model you intend to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest version of NeMo Automodel by using:
+## Run LLMs with NeMo AutoModel
+To run LLMs with NeMo AutoModel, make sure you're using NeMo container version [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) or later. If the model you intend to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest version of NeMo AutoModel by using:
 
 ```bash
 
-   pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/Automodel.git
+   pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/AutoModel.git
 ```
 
 For other installation options (e.g., uv), please see our [Installation Guide](../guides/installation.md).
 
 ## Supported Models
-NeMo Automodel supports the [AutoModelForCausalLM](https://huggingface.co/transformers/v3.5.1/model_doc/auto.html#automodelforcausallm) in the [Text Generation](https://huggingface.co/models?pipeline_tag=text-generation&sort=trending) category. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, such as for reasoning tasks, you can override the default tokenizer during the data preparation stage.
+NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transformers/v3.5.1/model_doc/auto.html#automodelforcausallm) in the [Text Generation](https://huggingface.co/models?pipeline_tag=text-generation&sort=trending) category. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, such as for reasoning tasks, you can override the default tokenizer during the data preparation stage.
 
 The table below lists the main architectures we test against (FSDP2 combined with SFT/PEFT) and includes a representative checkpoint for each.
 
@@ -78,9 +78,9 @@ The table below lists the main architectures we test against (FSDP2 combined wit
 | `Mistral3ForConditionalGeneration`    | Devstral-Small-2-24B                | `mistralai/Devstral-Small-2-24B-Instruct-2512` — example recipes: [devstral2_small_2512_squad.yaml](../../examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml), [devstral2_small_2512_squad_peft.yaml](../../examples/llm_finetune/devstral/devstral2_small_2512_squad_peft.yaml) |
 
 
-## Fine-Tuning LLMs with NeMo Automodel
+## Fine-Tuning LLMs with NeMo AutoModel
 
-The models listed above can be fine-tuned using NeMo Automodel to adapt them to specific tasks or domains. We support two primary fine-tuning approaches:
+The models listed above can be fine-tuned using NeMo AutoModel to adapt them to specific tasks or domains. We support two primary fine-tuning approaches:
 
 1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically <1%) using techniques like Low-Rank Adaptation (LoRA). This is ideal for resource-constrained environments.
 

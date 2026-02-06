@@ -4,15 +4,15 @@
 
 Vision Language Models (VLMs) are advanced models that integrate vision and language processing capabilities. They are trained on extensive datasets containing both interleaved images and text data, allowing them to generate text descriptions of images and answer questions related to images.
 
-NeMo Automodel LLM APIs can be easily extended to support VLM tasks. While most of the training setup is the same, some additional steps are required to prepare the data and model for VLM training.
+NeMo AutoModel LLM APIs can be easily extended to support VLM tasks. While most of the training setup is the same, some additional steps are required to prepare the data and model for VLM training.
 
-## Run VLMs with NeMo Automodel
+## Run VLMs with NeMo AutoModel
 
-To run VLMs with NeMo Automodel, use NeMo container version [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) or later. If the model you want to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest NeMo Automodel using:
+To run VLMs with NeMo AutoModel, use NeMo container version [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) or later. If the model you want to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest NeMo AutoModel using:
 
 ```bash
 
-   pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/Automodel.git
+   pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/AutoModel.git
 ```
 
 For other installation options (e.g., uv) please see our [Installation Guide](../guides/installation.md).
@@ -20,7 +20,7 @@ For other installation options (e.g., uv) please see our [Installation Guide](..
 ## Supported Models
 
 
-NeMo Automodel supports [AutoModelForImageTextToText](https://huggingface.co/docs/transformers/main/model_doc/auto#transformers.AutoModelForImageTextToText) in the [Image-Text-to-Text](https://huggingface.co/models?pipeline_tag=image-text-to-text&sort=trending) category. Specifically, the following VLM models from Hugging Face have been tested and support both Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT) with LoRA:
+NeMo AutoModel supports [AutoModelForImageTextToText](https://huggingface.co/docs/transformers/main/model_doc/auto#transformers.AutoModelForImageTextToText) in the [Image-Text-to-Text](https://huggingface.co/models?pipeline_tag=image-text-to-text&sort=trending) category. Specifically, the following VLM models from Hugging Face have been tested and support both Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT) with LoRA:
 
 
 | Model                              | Dataset                     | FSDP2      | PEFT       | Example YAML |
