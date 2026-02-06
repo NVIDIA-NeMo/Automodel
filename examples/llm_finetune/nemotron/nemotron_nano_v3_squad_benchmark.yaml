@@ -14,11 +14,18 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/llama3_3_nemotron_super_49B_squad_peft.yaml
+# torchrun --nproc-per-node=8 nemo_automodel/recipes/llm/benchmark.py --config examples/llm_finetune/nemotron/nemotron_nano_v3_squad_benchmark.yaml
 
+benchmark:
+  warmup_steps: 5   
+  peak_tflops: 989  # H100: 989, A100: 312
+  nsys_start: -1    # Set to step number to profile (e.g., 10)
+  nsys_end: -1      # Set to end step (e.g., 15)
+  nsys_ranks: []    # e.g., [0] to profile rank 0
+  num_nodes: 1
 
 step_scheduler:
-  global_batch_size: 16
+  global_batch_size: 8
   local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 1000  # will run every x number of gradient steps
@@ -57,28 +64,20 @@ distributed:
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
-  split: train
-
 packed_sequence:
   packed_sequence_size: 0
 
+# Use MockIterableDataset for benchmarking (faster, no I/O)
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  vocab_size: 100
+  seq_len: 512
+  num_samples: 1000000
+
 dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: True
-
-validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
-  split: validation
-  limit_dataset_samples: 64
-
-validation_dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  _target_: torch.utils.data.DataLoader
+  batch_size: null  # Dataset already yields batches
+  # Note: model_config will be auto-injected by train_ft.py for PP models
 
 optimizer:
   _target_: torch.optim.Adam
