@@ -46,7 +46,8 @@ class Qwen3OmniMoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
     def to_hf(
         self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
-        hf_state_dict = self._to_hf_w_split_experts(state_dict)
+        inplace = bool(kwargs.get("inplace", False))
+        hf_state_dict = self._to_hf_w_split_experts(state_dict, inplace=inplace)
 
         if self._uses_thinker_prefix:
             hf_state_dict_with_prefix = {}
@@ -67,6 +68,7 @@ class Qwen3OmniMoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         device_mesh: Optional["DeviceMesh"] = None,
         **kwargs,
     ) -> dict[str, Any]:
+        inplace = bool(kwargs.get("inplace", False))
         for key in hf_state_dict.keys():
             if ".mlp.experts." in key and key.endswith(".weight"):
                 self._uses_thinker_prefix = key.startswith("thinker.")
@@ -75,16 +77,22 @@ class Qwen3OmniMoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
 
         # Remove thinker prefix if present to match our internal format
         if self._uses_thinker_prefix:
-            hf_state_dict_no_prefix = {}
-            for key, value in hf_state_dict.items():
-                if key.startswith("thinker."):
-                    new_key = key[len("thinker.") :]
-                    hf_state_dict_no_prefix[new_key] = value
-                else:
-                    hf_state_dict_no_prefix[key] = value
-            hf_state_dict = hf_state_dict_no_prefix
+            if inplace:
+                for key in list(hf_state_dict.keys()):
+                    if key.startswith("thinker."):
+                        new_key = key[len("thinker.") :]
+                        hf_state_dict[new_key] = hf_state_dict.pop(key)
+            else:
+                hf_state_dict_no_prefix = {}
+                for key, value in hf_state_dict.items():
+                    if key.startswith("thinker."):
+                        new_key = key[len("thinker.") :]
+                        hf_state_dict_no_prefix[new_key] = value
+                    else:
+                        hf_state_dict_no_prefix[key] = value
+                hf_state_dict = hf_state_dict_no_prefix
 
-        return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
+        return self._from_hf_w_merged_experts(hf_state_dict, device_mesh, inplace=inplace)
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         exclude_key_regex = kwargs.get("exclude_key_regex", None)

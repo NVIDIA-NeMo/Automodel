@@ -12,10 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import sys
 from pathlib import Path
 from shutil import rmtree
 
 import pytest
+
+# Ensure tests run against the local source tree even if a pip-installed
+# `nemo_automodel` exists in the environment.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 def pytest_addoption(parser):
