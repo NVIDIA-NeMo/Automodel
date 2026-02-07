@@ -150,6 +150,18 @@ def _build_minified_model(kind: ModelKind):
             max_position_embeddings=128,
             use_cache=False,
             tie_word_embeddings=True,
+            rope_parameters={
+                "type": "yarn",
+                "rope_theta": 1000000.0,
+                "factor": 16.0,
+                "original_max_position_embeddings": 8,
+                "max_position_embeddings": 128,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "mscale_all_dim": 1.0,
+                "mscale": 1.0,
+                "llama_4_scaling_beta": 0.1,
+            },
         )
         return cfg, Ministral3ForCausalLM(cfg)
 
