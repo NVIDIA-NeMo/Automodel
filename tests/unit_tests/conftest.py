@@ -11,11 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import sys
 import os
 from pathlib import Path
 from shutil import rmtree
 
 import pytest
+
+# Ensure tests import the in-repo sources (not an installed site-packages copy).
+# This is important when `nemo_automodel` is also installed in the environment.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 
 def pytest_addoption(parser):
