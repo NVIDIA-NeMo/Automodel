@@ -54,23 +54,17 @@ class FSDP2Config:
     are passed separately on the from_pretrained/from_config method signature.
 
     Attributes:
-        sequence_parallel (bool): Enable sequence parallelism in TP plan if True.
-        use_hf_tp_plan (bool): Use Hugging Face TP plan if True.
-        custom_tp_plan (Optional[dict]): Custom TP plan for FSDP2.
-        mp_policy (Optional[MixedPrecisionPolicy]): MixedPrecisionPolicy for FSDP2
-            (param/reduce/output dtypes).
-        offload_policy (Optional[CPUOffloadPolicy]): CPUOffloadPolicy to offload
-            parameters/optim states to CPU.
-        activation_checkpointing (bool): Enable activation checkpointing if True.
-            Applies to linear layers.
-        defer_fsdp_grad_sync (bool): Defer FSDP gradient sync to only the final
-            micro-batch before the optimizer step if True.
-        backend (str): Distributed backend, e.g. 'nccl' or 'gloo'.
+        sequence_parallel (bool): Enable sequence parallelism in TP plan.
+        tp_plan (Optional[dict]): Custom TP plan. If None, auto-selected based on model type.
+        mp_policy (Optional[MixedPrecisionPolicy]): MixedPrecisionPolicy for FSDP2.
+        offload_policy (Optional[CPUOffloadPolicy]): CPUOffloadPolicy for CPU offloading.
+        activation_checkpointing (bool): Enable activation checkpointing.
+        defer_fsdp_grad_sync (bool): Defer FSDP gradient sync to final micro-batch.
+        backend (str): Distributed backend.
     """
 
     sequence_parallel: bool = False
-    use_hf_tp_plan: bool = False
-    custom_tp_plan: Optional[dict] = None
+    tp_plan: Optional[dict] = None
     mp_policy: Optional[MixedPrecisionPolicy] = field(
         default_factory=lambda: MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
@@ -87,8 +81,7 @@ class FSDP2Config:
     def __init__(
         self,
         sequence_parallel: bool = False,
-        use_hf_tp_plan: bool = False,
-        custom_tp_plan: Optional[dict] = None,
+        tp_plan: Optional[dict] = None,
         mp_policy: Optional[MixedPrecisionPolicy] = None,
         offload_policy: Optional[CPUOffloadPolicy] = None,
         activation_checkpointing: bool = False,
@@ -96,8 +89,7 @@ class FSDP2Config:
         backend: str = "nccl",
     ):
         self.sequence_parallel = sequence_parallel
-        self.use_hf_tp_plan = use_hf_tp_plan
-        self.custom_tp_plan = custom_tp_plan
+        self.tp_plan = tp_plan
         self.mp_policy = mp_policy or MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.bfloat16,
@@ -126,8 +118,7 @@ class FSDP2Config:
         """Convert config to dictionary."""
         return {
             "sequence_parallel": self.sequence_parallel,
-            "use_hf_tp_plan": self.use_hf_tp_plan,
-            "custom_tp_plan": self.custom_tp_plan,
+            "tp_plan": self.tp_plan,
             "mp_policy": self.mp_policy,
             "offload_policy": self.offload_policy,
             "activation_checkpointing": self.activation_checkpointing,
@@ -146,9 +137,8 @@ class MegatronFSDPConfig:
     support pp_size, dp_replicate_size, or ep_size.
 
     Attributes:
-        sequence_parallel (bool): Enable sequence parallelism in TP plan if True.
+        sequence_parallel (bool): Enable sequence parallelism in TP plan.
             Note: Not supported with MegatronFSDP right now.
-        use_hf_tp_plan (bool): Use Hugging Face TP plan if True.
         megatron_fsdp_unit_modules (Optional[List[str]]): List of unit modules to be
             wrapped with MegatronFSDP.
         zero_dp_strategy (int): Data parallel sharding strategy.
@@ -170,7 +160,6 @@ class MegatronFSDPConfig:
     """
 
     sequence_parallel: bool = False
-    use_hf_tp_plan: bool = False
     megatron_fsdp_unit_modules: Optional[List[str]] = field(
         default_factory=lambda: ["transformers.models.llama.modeling_llama.LlamaDecoderLayer"]
     )
@@ -193,7 +182,7 @@ class MegatronFSDPConfig:
     def __init__(
         self,
         sequence_parallel: bool = False,
-        use_hf_tp_plan: bool = False,
+        tp_plan: Optional[dict] = None,
         megatron_fsdp_unit_modules: Optional[List[str]] = None,
         zero_dp_strategy: int = 3,
         init_fsdp_with_meta_device: bool = False,
@@ -211,8 +200,9 @@ class MegatronFSDPConfig:
         activation_checkpointing: bool = False,
         backend: str = "nccl",
     ):
+        if tp_plan is not None:
+            raise ValueError("MegatronFSDPConfig does not support custom TP plans. Use FSDP2Config instead.")
         self.sequence_parallel = sequence_parallel
-        self.use_hf_tp_plan = use_hf_tp_plan
         self.megatron_fsdp_unit_modules = megatron_fsdp_unit_modules or [
             "transformers.models.llama.modeling_llama.LlamaDecoderLayer"
         ]
@@ -249,7 +239,6 @@ class MegatronFSDPConfig:
         """Convert config to dictionary."""
         return {
             "sequence_parallel": self.sequence_parallel,
-            "use_hf_tp_plan": self.use_hf_tp_plan,
             "megatron_fsdp_unit_modules": self.megatron_fsdp_unit_modules,
             "zero_dp_strategy": self.zero_dp_strategy,
             "init_fsdp_with_meta_device": self.init_fsdp_with_meta_device,

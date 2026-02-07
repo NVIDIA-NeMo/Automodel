@@ -1067,6 +1067,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         force_hf: bool = False,
         device_mesh: Optional["DeviceMesh"] = None,
         moe_mesh: Optional["DeviceMesh"] = None,
+        tp_plan: Optional[dict] = None,
         distributed_config: Optional[DistributedConfig] = None,
         pipeline_config: Optional[PipelineConfig] = None,
         qat_config: Optional[QATConfig] = None,
@@ -1114,6 +1115,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 from this. Default: None.
             moe_mesh (DeviceMesh | None, optional): FSDP2-only. Device mesh for expert
                 parallelism. ep_size is inferred from this. Default: None.
+            tp_plan (dict | None, optional): Custom tensor parallel plan. If provided,
+                overrides the tp_plan on distributed_config (which use nemo_automodel/components/distributed/optimized_tp_plans.py). Default: None.
             distributed_config (FSDP2Config | MegatronFSDPConfig | DDPConfig | None, optional):
                 Strategy-specific distributed training configuration. Default: None.
             pipeline_config (PipelineConfig | None, optional): Pipeline parallelism
@@ -1166,6 +1169,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 force_hf=force_hf,
                 device_mesh=device_mesh,
                 moe_mesh=moe_mesh,
+                tp_plan=tp_plan,
                 distributed_config=distributed_config,
                 pipeline_config=pipeline_config,
                 qat_config=qat_config,
@@ -1175,6 +1179,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 compile_config=compile_config,
                 **kwargs,
             )
+
+        # Override tp_plan on distributed_config if provided
+        if tp_plan is not None and distributed_config is not None:
+            distributed_config.tp_plan = tp_plan
 
         # Infer parallelism sizes from device_mesh
         if device_mesh is not None:
@@ -1188,6 +1196,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             ep_size = 1
 
         # Instantiate from configs
+        # Temporary change; this only pulls in sharding logic from the recipe into this class. Logic itself is unchanged.
         model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
             device_mesh=device_mesh,
             moe_mesh=moe_mesh,
@@ -1298,6 +1307,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         force_hf: bool = False,
         device_mesh: Optional["DeviceMesh"] = None,
         moe_mesh: Optional["DeviceMesh"] = None,
+        tp_plan: Optional[dict] = None,
         distributed_config: Optional[DistributedConfig] = None,
         pipeline_config: Optional[PipelineConfig] = None,
         qat_config: Optional[QATConfig] = None,
@@ -1350,6 +1360,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 from this. Default: None.
             moe_mesh (DeviceMesh | None, optional): FSDP2-only. Device mesh for expert
                 parallelism. ep_size is inferred from this. Default: None.
+            tp_plan (dict | None, optional): Custom tensor parallel plan. If provided,
+                overrides the tp_plan on distributed_config (which use nemo_automodel/components/distributed/optimized_tp_plans.py). Default: None.
             distributed_config (FSDP2Config | MegatronFSDPConfig | DDPConfig | None, optional):
                 Strategy-specific distributed training configuration. Default: None.
             pipeline_config (PipelineConfig | None, optional): Pipeline parallelism
@@ -1398,6 +1410,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 force_hf=force_hf,
                 device_mesh=device_mesh,
                 moe_mesh=moe_mesh,
+                tp_plan=tp_plan,
                 distributed_config=distributed_config,
                 pipeline_config=pipeline_config,
                 qat_config=qat_config,
@@ -1407,6 +1420,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 compile_config=compile_config,
                 **kwargs,
             )
+
+        if tp_plan is not None and distributed_config is not None:
+            distributed_config.tp_plan = tp_plan
 
         # Infer parallelism sizes from device_mesh
         if device_mesh is not None:
@@ -1427,6 +1443,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         loss_fn = None
 
         # Instantiate from configs if provided
+        # Temporary change; this only pulls in sharding logic from the recipe into this class. Logic itself is unchanged.
         if distributed_config is not None:
             model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
                 device_mesh=device_mesh,

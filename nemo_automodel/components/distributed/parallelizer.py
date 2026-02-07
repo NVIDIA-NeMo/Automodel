@@ -107,7 +107,6 @@ class ParallelizationStrategy(ABC):
         sequence_parallel: bool = False,
         activation_checkpointing: bool = False,
         tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
-        use_hf_tp_plan: bool = False,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
@@ -128,7 +127,6 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         sequence_parallel: bool = False,
         activation_checkpointing: bool = False,
         tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
-        use_hf_tp_plan: bool = False,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
@@ -156,7 +154,6 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     model,
                     sequence_parallel,
                     tp_shard_plan,
-                    use_hf_tp_plan=use_hf_tp_plan,
                 ).items()
             }
 
@@ -867,23 +864,18 @@ def _get_parallel_plan(
     model: nn.Module,
     sequence_parallel: bool = False,
     tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
-    use_hf_tp_plan: bool = False,
 ) -> Dict[str, ParallelStyle]:
     """
     Select the tensor-parallel plan for the given model.
 
     Priority order:
-    1) If ``tp_shard_plan`` is provided as a dict or import path (to a dict/function), use it.
-    2) If ``use_hf_tp_plan`` is True, use the HF plan directly (asserts when sequence_parallel=True).
-    3) If the model type exists in ``PARALLELIZE_FUNCTIONS``, use its optimised plan; on failure, try HF plan
-    4) Otherwise, use the default base plan.
+    1) If ``tp_shard_plan`` is provided as a dict or import path, use it.
+    2) If the model type exists in ``PARALLELIZE_FUNCTIONS``, use its optimised plan; on failure, fall back to HF plan.
+    3) Otherwise, use the default base plan.
     """
-
-    # Generate or use tensor parallel plan
     model_parallel_plan = None
     model_cls = type(model)
 
-    # 1. Use custom parallel plan if provided
     if isinstance(tp_shard_plan, dict):
         model_parallel_plan = tp_shard_plan
         logger.info(f"Using parallel plan (dictionary). {tp_shard_plan}")
@@ -908,12 +900,6 @@ def _get_parallel_plan(
                 f"Error: {e}"
             )
 
-    # 2. Prefer HF TP plan explicitly if requested
-    elif use_hf_tp_plan:
-        assert not sequence_parallel, "sequence_parallel is not supported in HF tp plan."
-        model_parallel_plan = get_hf_tp_shard_plan(model)
-
-    # 3. Use optimized parallel plan based on model type
     elif model_cls in PARALLELIZE_FUNCTIONS:
         try:
             func = PARALLELIZE_FUNCTIONS[model_cls]
@@ -921,10 +907,8 @@ def _get_parallel_plan(
             logger.info("Using optimized parallel plan.")
         except Exception as e:
             logger.info(f"Optimized parallel plan is not available: {e}. Falling back to the HF tp plan.")
-            assert not sequence_parallel, "sequence_parallel is not supported in HF tp plan."
             model_parallel_plan = get_hf_tp_shard_plan(model)
 
-    # 4. Otherwise, use the default base plan.
     else:
         base_model_tp_plan = {
             "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),

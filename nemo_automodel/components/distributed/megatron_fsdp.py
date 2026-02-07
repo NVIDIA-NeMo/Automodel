@@ -59,7 +59,6 @@ class MegatronFSDPManager:
 
         # Extract config fields for easy access
         self.sequence_parallel = config.sequence_parallel
-        self.use_hf_tp_plan = config.use_hf_tp_plan
         self.megatron_fsdp_unit_modules = config.megatron_fsdp_unit_modules
         self.zero_dp_strategy = config.zero_dp_strategy
         self.init_fsdp_with_meta_device = config.init_fsdp_with_meta_device
@@ -112,9 +111,8 @@ class MegatronFSDPManager:
             # Delegate plan selection to central helper. MegatronFSDP currently does not support SP.
             tp_shard_plan = _get_parallel_plan(
                 model,
-                sequence_parallel=False,  # explicit: SP not supported here
+                sequence_parallel=False, # explicit: SP not supported here
                 tp_shard_plan=None,
-                use_hf_tp_plan=self.use_hf_tp_plan,
             )
         else:
             tp_shard_plan = None

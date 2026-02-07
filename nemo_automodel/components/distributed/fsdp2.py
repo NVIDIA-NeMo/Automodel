@@ -62,8 +62,7 @@ class FSDP2Manager:
 
         # Extract config fields for easy access
         self.sequence_parallel = config.sequence_parallel
-        self.use_hf_tp_plan = config.use_hf_tp_plan
-        self.custom_tp_plan = config.custom_tp_plan
+        self.tp_plan = config.tp_plan
         self.mp_policy = config.mp_policy
         self.offload_policy = config.offload_policy
         self.activation_checkpointing = config.activation_checkpointing
@@ -94,8 +93,7 @@ class FSDP2Manager:
             tp_shard_plan = _get_parallel_plan(
                 model,
                 sequence_parallel=bool(self.sequence_parallel),
-                tp_shard_plan=self.custom_tp_plan,
-                use_hf_tp_plan=self.use_hf_tp_plan,
+                tp_shard_plan=self.tp_plan,
             )
         else:
             tp_shard_plan = None
