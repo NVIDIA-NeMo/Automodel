@@ -941,12 +941,14 @@ def _get_parallel_plan(
         }
         if sequence_parallel:
             base_model_sp_plan = {
-                "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate(), output_layouts=Shard(1)),
+                "model.embed_tokens": VocabParallelEmbedding(
+                    input_layouts=Replicate(), output_layouts=Shard(1), use_local_output=False,
+                ),
                 "model.norm": SequenceParallel(),
                 "model.layers.*.input_layernorm": SequenceParallel(),
-                "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+                "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
                 "model.layers.*.post_attention_layernorm": SequenceParallel(),
-                "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+                "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
                 "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
             }
             base_model_tp_plan.update(base_model_sp_plan)

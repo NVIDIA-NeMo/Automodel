@@ -187,14 +187,16 @@ def _parallelize_gemma3(
     }
 
     base_model_sp_plan = {
-        f"{model_prefix}.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate(), output_layouts=Shard(1)),
+        f"{model_prefix}.embed_tokens": VocabParallelEmbedding(
+            input_layouts=Replicate(), output_layouts=Shard(1), use_local_output=False,
+        ),
         f"{model_prefix}.rotary_emb": RotaryEmbedParallel(use_local_output=True),
         f"{model_prefix}.rotary_emb_local": RotaryEmbedParallel(use_local_output=True),
         f"{model_prefix}.layers.*.input_layernorm": SequenceParallel(),
-        f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+        f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
         f"{model_prefix}.layers.*.post_attention_layernorm": SequenceParallel(),
         f"{model_prefix}.layers.*.pre_feedforward_layernorm": SequenceParallel(),
-        f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+        f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
         f"{model_prefix}.layers.*.post_feedforward_layernorm": SequenceParallel(),
         f"{model_prefix}.norm": SequenceParallel(),
         "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False),
@@ -227,12 +229,14 @@ def _parallelize_llama(
     }
 
     base_model_sp_plan = {
-        "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate(), output_layouts=Shard(1)),
+        "model.embed_tokens": VocabParallelEmbedding(
+            input_layouts=Replicate(), output_layouts=Shard(1), use_local_output=False,
+        ),
         "model.norm": SequenceParallel(),
         "model.layers.*.input_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
-        "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+        "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
         "model.layers.*.post_attention_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
-        "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+        "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
         "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False),
     }
 
@@ -261,12 +265,14 @@ def _parallelize_ministral3(
     }
 
     base_model_sp_plan = {
-        "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate(), output_layouts=Shard(1)),
+        "model.embed_tokens": VocabParallelEmbedding(
+            input_layouts=Replicate(), output_layouts=Shard(1), use_local_output=False,
+        ),
         "model.norm": SequenceParallel(),
         "model.layers.*.input_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
-        "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+        "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
         "model.layers.*.post_attention_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
-        "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+        "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
         "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False),
     }
 
