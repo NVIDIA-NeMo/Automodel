@@ -76,7 +76,7 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 )
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
-from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS
+from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS, VocabParallelEmbedding
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
 
 # TODO(boxiangw): Change to MegatronFSDP once it got published
@@ -927,7 +927,7 @@ def _get_parallel_plan(
     # 4. Otherwise, use the default base plan.
     else:
         base_model_tp_plan = {
-            "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
+            "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
             "model.layers.*.self_attn.q_proj": ColwiseParallel(),
             "model.layers.*.self_attn.k_proj": ColwiseParallel(),
             "model.layers.*.self_attn.v_proj": ColwiseParallel(),
@@ -941,7 +941,7 @@ def _get_parallel_plan(
         }
         if sequence_parallel:
             base_model_sp_plan = {
-                "model.embed_tokens": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1)),
+                "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate(), output_layouts=Shard(1)),
                 "model.norm": SequenceParallel(),
                 "model.layers.*.input_layernorm": SequenceParallel(),
                 "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
