@@ -124,7 +124,7 @@ class TestDeepseekV32Config:
 class TestDeepseekV32Block:
     def create_moe_config(self):
         """Create a valid MoEConfig for tests."""
-        from nemo_automodel.components.moe.layers import MoEConfig
+        from nemo_automodel.components.moe.config import MoEConfig
         return MoEConfig(
             dim=64,
             inter_dim=128,
@@ -266,7 +266,7 @@ class TestDeepseekV32Model:
         """Test DeepseekV32Model initialization with explicit MoE config."""
         from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32Model
         from nemo_automodel.components.models.common import BackendConfig
-        from nemo_automodel.components.moe.layers import MoEConfig
+        from nemo_automodel.components.moe.config import MoEConfig
 
         cfg = DeepseekV32Config(
             vocab_size=100,
@@ -349,7 +349,7 @@ class TestDeepseekV32ForCausalLM:
     def test_from_config_with_moe_config(self):
         """Test from_config with explicit MoE config."""
         from nemo_automodel.components.models.common import BackendConfig
-        from nemo_automodel.components.moe.layers import MoEConfig
+        from nemo_automodel.components.moe.config import MoEConfig
 
         cfg = DeepseekV32Config(
             vocab_size=100,

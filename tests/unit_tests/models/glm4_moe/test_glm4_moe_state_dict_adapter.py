@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.glm4_moe.state_dict_adapter import Glm4MoeStateDictAdapter
-from nemo_automodel.components.moe.layers import MoEConfig
+from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.models.common import BackendConfig
 
 
@@ -68,7 +68,8 @@ def backend_config():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
-        enable_deepep=False,
+        experts="torch",
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )

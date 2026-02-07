@@ -309,7 +309,7 @@ class _DeepepManager(_DispatchManager):
 
 
 @dataclass
-class MoEConfig:
+class TokenDispatcherConfig:
     moe_enable_deepep: bool = True
     """Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
@@ -347,7 +347,7 @@ class MoEFlexTokenDispatcher:
         self,
         num_local_experts: int,
         local_expert_indices: List[int],
-        config: MoEConfig,
+        config: TokenDispatcherConfig,
         ep_group: torch.distributed.ProcessGroup,
     ):
         """
