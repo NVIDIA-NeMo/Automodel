@@ -92,9 +92,7 @@ class VocabParallelEmbedding(RowwiseParallel):
         else:
             mod._vocab_parallel_saved_ids = input_tensor.clone()
 
-        return RowwiseParallel._prepare_input_fn(
-            input_layouts, desired_input_layouts, mod, inputs, device_mesh
-        )
+        return RowwiseParallel._prepare_input_fn(input_layouts, desired_input_layouts, mod, inputs, device_mesh)
 
     @staticmethod
     def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):
@@ -125,9 +123,7 @@ class VocabParallelEmbedding(RowwiseParallel):
                 mask = (saved_ids < local_off) | (saved_ids >= local_off + local_size)
                 mb.materialize_mask(mask)
 
-        return RowwiseParallel._prepare_output_fn(
-            output_layouts, use_local_output, mod, outputs, device_mesh
-        )
+        return RowwiseParallel._prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh)
 
 
 class RotaryEmbedParallel(SequenceParallel):
