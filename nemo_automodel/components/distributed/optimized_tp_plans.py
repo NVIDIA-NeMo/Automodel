@@ -280,7 +280,9 @@ def _parallelize_qwen_classification(
     assert not hasattr(model, "lm_head"), "Expected model not to have lm_head"
     del plan["lm_head"]
     assert hasattr(model, "score"), "Expected model to have score"
-    plan["score"] = ColwiseParallel()
+    # `Qwen3ForSequenceClassification` pools over the *sequence* dimension in Python.
+    # Ensure the classifier logits are replicated (full num_labels) for correct pooling/loss.
+    plan["score"] = ColwiseParallel(output_layouts=Replicate())
     return plan
 
 

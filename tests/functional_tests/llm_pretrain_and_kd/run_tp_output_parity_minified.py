@@ -18,6 +18,7 @@
 Validates that TP=2 produces the same logits as TP=1 for tiny ("2-layer thin")
 variants of:
 - Qwen3ForCausalLM (HF)
+- Qwen3ForSequenceClassification (HF)
 - Ministral3ForCausalLM (NeMo Automodel custom)
 
 It also validates both tensor-parallel plans:
@@ -29,7 +30,7 @@ Usage:
 
     # Optional: select models / SP mode
     torchrun --nproc_per_node=2 tests/functional_tests/llm_pretrain_and_kd/run_tp_output_parity_minified.py \\
-        --models qwen3 ministral3 \\
+        --models qwen3 qwen3_seq_cls ministral3 \\
         --sequence_parallel both \\
         --kl_threshold 1e-6
 """
@@ -53,9 +54,9 @@ from torch.distributed.tensor.placement_types import Replicate
 from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan
 from nemo_automodel.components.models.mistral3.model import Ministral3Config, Ministral3ForCausalLM
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
-from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
-ModelKind = Literal["qwen3", "ministral3"]
+ModelKind = Literal["qwen3", "qwen3_seq_cls", "ministral3"]
 SPMode = Literal["true", "false", "both"]
 
 
@@ -124,8 +125,7 @@ def _kl_divergence_from_logits(*, reference_logits: torch.Tensor, candidate_logi
     ref_log_probs = F.log_softmax(reference_logits.float(), dim=-1).reshape(-1, vocab_size)
     cand_log_probs = F.log_softmax(candidate_logits.float(), dim=-1).reshape(-1, vocab_size)
     # F.kl_div expects input=log(q), target=log(p) when log_target=True → KL(p || q)
-    return F.kl_div(cand_log_probs, ref_log_probs, reduction="batchmean", log_target=True)
-
+    return F.kl_div(cand_log_probs, ref_log_probs, reduction="none", log_target=True)
 
 @dataclass(frozen=True)
 class _Case:
@@ -171,6 +171,27 @@ def _build_minified_model(kind: ModelKind):
         )
         return cfg, Qwen3ForCausalLM(cfg)
 
+    if kind == "qwen3_seq_cls":
+        num_layers = 2
+        cfg = Qwen3Config(
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=256,
+            num_hidden_layers=num_layers,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=128,
+            use_cache=False,
+            tie_word_embeddings=True,
+            attention_bias=False,
+            use_sliding_window=False,
+            layer_types=["full_attention"] * num_layers,
+            num_labels=2,  # must be divisible by TP size (2) if sharded
+            pad_token_id=0,  # required for batch_size>1 pooling
+        )
+        return cfg, Qwen3ForSequenceClassification(cfg)
+
     raise ValueError(f"Unknown model kind: {kind}")
 
 
@@ -193,12 +214,15 @@ def _run_case(
     cfg, baseline = _build_minified_model(case.kind)
     baseline = baseline.to(device=device, dtype=torch.float32)
     baseline.eval()
+    print(baseline)
 
     # Deterministic inputs across ranks.
     torch.manual_seed(999)
     if device_type == "cuda":
         torch.cuda.manual_seed_all(999)
-    input_ids = torch.randint(0, int(cfg.vocab_size), (2, 8), dtype=torch.long, device=device)
+    # Keep this small for a fast functional test. Also avoid 0 to keep seq-cls pad-token
+    # pooling deterministic.
+    input_ids = torch.randint(1, int(cfg.vocab_size), (2, 1024), dtype=torch.long, device=device)
     attention_mask = torch.ones_like(input_ids)
 
     with torch.inference_mode():
@@ -224,10 +248,9 @@ def _run_case(
     tp_logits_full = _maybe_gather_dtensor_to_replicated_local(tp_logits, tp_mesh=tp_mesh)
 
     kl = _kl_divergence_from_logits(reference_logits=baseline_logits, candidate_logits=tp_logits_full)
-    kl_value = float(kl.item())
     # NOTE: keep this threshold loose; different TP reduction orders can introduce tiny numeric drift.
-    ok = kl_value <= kl_threshold
-    return ok, kl_value
+    ok = torch.all(kl <= kl_threshold)
+    return ok, kl.view(-1).max().item()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -235,8 +258,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--models",
         nargs="+",
-        default=["qwen3", "ministral3"],
-        choices=["qwen3", "ministral3"],
+        default=["qwen3", "qwen3_seq_cls", "ministral3"],
+        choices=["qwen3", "qwen3_seq_cls", "ministral3"],
         help="Which models to test.",
     )
     parser.add_argument(
