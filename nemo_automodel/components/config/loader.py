@@ -706,45 +706,54 @@ class ConfigNode:
         # wrap the final leaf value
         node.__dict__[parts[-1]] = node._wrap(parts[-1], value)
 
-    def __repr__(self, level=0):
+    def __repr__(self, level: int = 0, *, use_orig_values: bool = True):
         """
         Return a string representation of the configuration node with indentation.
 
         Args:
             level (int): The current indentation level.
+            use_orig_values (bool): If True, prefer original placeholder strings (e.g. `${VAR}`)
+                stored on `_OrigValueStr` values for safe logging. If False, show resolved values.
 
         Returns:
             str: An indented string representation of the configuration.
         """
         indent = "  " * level
         lines = [
-            f"{indent}{key}: {self._repr_value(value, level)}"
+            f"{indent}{key}: {self._repr_value(value, level, use_orig_values=use_orig_values)}"
             for key, value in self.__dict__.items()
             if key not in ("raise_on_missing_attr", "_raw_config", "_original_strings")
         ]
         return "\n".join(lines) + f"\n{indent}"
 
-    def _repr_value(self, value, level):
+    def _repr_value(self, value, level, *, use_orig_values: bool = True):
         """
         Format a configuration value for the string representation.
 
         Args:
             value: The configuration value.
             level (int): The indentation level.
+            use_orig_values (bool): If True, prefer original placeholder strings stored on
+                `_OrigValueStr` values for safe logging. If False, show resolved values.
 
         Returns:
             str: A formatted string representation of the value.
         """
         if isinstance(value, ConfigNode):
-            return value.__repr__(level + 1)
+            return value.__repr__(level + 1, use_orig_values=use_orig_values)
         elif isinstance(value, list):
             return (
                 "[\n"
-                + "\n".join([f"{'  ' * (level + 1)}{self._repr_value(i, level + 1)}" for i in value])
+                + "\n".join(
+                    [
+                        f"{'  ' * (level + 1)}{self._repr_value(i, level + 1, use_orig_values=use_orig_values)}"
+                        for i in value
+                    ]
+                )
                 + f"\n{'  ' * level}]"
             )
         else:
-            if hasattr(value, "_orig_value"):
+            if use_orig_values and hasattr(value, "_orig_value"):
                 return repr(getattr(value, "_orig_value"))
             return repr(value)
 
@@ -755,7 +764,9 @@ class ConfigNode:
         Returns:
             str: The string representation.
         """
-        return self.__repr__(level=0)
+        # Keep printing safe by default: preserve original placeholders (e.g. `${VAR}`) for any
+        # values that were resolved from environment variables.
+        return self.__repr__(level=0, use_orig_values=True)
 
     def __contains__(self, key):
         """
