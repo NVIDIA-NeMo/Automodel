@@ -79,4 +79,3 @@ def get_final_hidden_states(model_output: Any) -> Optional[Any]:
     raise TypeError(
         f"Unexpected hidden_states type {type(hidden_states)}; expected a tensor-like object or a tuple/list of them."
     )
-
