@@ -1058,7 +1058,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         cls,
         pretrained_model_name_or_path,
         *model_args,
-        # HF model related kwargs
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
         sdpa_method: Optional[List[SDPBackend]] = None,
@@ -1066,17 +1065,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
-        # Parallelism sizes (None = infer from device_mesh if provided)
-        dp_size: Optional[int] = None,
-        dp_replicate_size: Optional[int] = None,
-        tp_size: Optional[int] = None,
-        pp_size: Optional[int] = None,
-        cp_size: Optional[int] = None,
-        ep_size: Optional[int] = None,
-        # Device mesh
         device_mesh: Optional["DeviceMesh"] = None,
         moe_mesh: Optional["DeviceMesh"] = None,
-        # Strategy-specific configs
         distributed_config: Optional[DistributedConfig] = None,
         pipeline_config: Optional[PipelineConfig] = None,
         qat_config: Optional[QATConfig] = None,
@@ -1119,18 +1109,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 will be applied to the model.
             force_hf (bool, default=False): If `True`, force the use of HF model implementation.
                 If `False`, the model will be loaded using the custom model implementation if available.
-            dp_size (int | None, optional): Data parallel size. If None, inferred from
-                world_size and other parallelism sizes. Default: None.
-            dp_replicate_size (int | None, optional): FSDP2-only. Size of the replication
-                group for HSDP. Raises ValueError if used with non-FSDP2 config. Default: None.
-            tp_size (int, optional): Tensor parallel size. Default: 1.
-            pp_size (int, optional): Pipeline parallel size. Default: 1.
-            cp_size (int, optional): Context parallel size. Default: 1.
-            ep_size (int, optional): Expert parallel size for MoE models. Default: 1.
             device_mesh (DeviceMesh | None, optional): Pre-created device mesh for
-                distributed training. Default: None.
+                distributed training. Parallelism sizes (tp, pp, cp, ep) are inferred
+                from this. Default: None.
             moe_mesh (DeviceMesh | None, optional): FSDP2-only. Device mesh for expert
-                parallelism. Default: None.
+                parallelism. ep_size is inferred from this. Default: None.
             distributed_config (FSDP2Config | MegatronFSDPConfig | DDPConfig | None, optional):
                 Strategy-specific distributed training configuration. Default: None.
             pipeline_config (PipelineConfig | None, optional): Pipeline parallelism
@@ -1181,52 +1164,28 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
                 force_hf=force_hf,
-                # Config-based API
-                dp_size=dp_size,
-                dp_replicate_size=dp_replicate_size,
-                tp_size=tp_size,
-                pp_size=pp_size,
-                cp_size=cp_size,
-                ep_size=ep_size,
                 device_mesh=device_mesh,
                 moe_mesh=moe_mesh,
                 distributed_config=distributed_config,
                 pipeline_config=pipeline_config,
                 qat_config=qat_config,
                 moe_config=moe_config,
-                # Other configs
                 peft_config=peft_config,
                 fp8_config=fp8_config,
                 compile_config=compile_config,
                 **kwargs,
             )
 
-        # Validate FSDP2-only params
-        if dp_replicate_size is not None and dp_replicate_size > 1:
-            if distributed_config is not None and not isinstance(distributed_config, FSDP2Config):
-                raise ValueError("dp_replicate_size is only supported with FSDP2Config")
-
-        # Extract sizes from device_mesh if not explicitly provided
+        # Infer parallelism sizes from device_mesh
         if device_mesh is not None:
             mesh_sizes = _extract_sizes_from_mesh(device_mesh, moe_mesh)
-            if tp_size is None:
-                tp_size = mesh_sizes.get("tp_size", 1)
-            if pp_size is None:
-                pp_size = mesh_sizes.get("pp_size", 1)
-            if cp_size is None:
-                cp_size = mesh_sizes.get("cp_size", 1)
-            if ep_size is None:
-                ep_size = mesh_sizes.get("ep_size", 1)
-            if dp_size is None:
-                dp_size = mesh_sizes.get("dp_size")
-            if dp_replicate_size is None:
-                dp_replicate_size = mesh_sizes.get("dp_replicate_size")
+            tp_size = mesh_sizes.get("tp_size", 1)
+            cp_size = mesh_sizes.get("cp_size", 1)
+            ep_size = mesh_sizes.get("ep_size", 1)
         else:
-            # No mesh provided, use defaults
-            tp_size = tp_size if tp_size is not None else 1
-            pp_size = pp_size if pp_size is not None else 1
-            cp_size = cp_size if cp_size is not None else 1
-            ep_size = ep_size if ep_size is not None else 1
+            tp_size = 1
+            cp_size = 1
+            ep_size = 1
 
         # Instantiate from configs
         model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
@@ -1337,17 +1296,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
-        # Parallelism sizes (None = infer from device_mesh if provided)
-        dp_size: Optional[int] = None,
-        dp_replicate_size: Optional[int] = None,
-        tp_size: Optional[int] = None,
-        pp_size: Optional[int] = None,
-        cp_size: Optional[int] = None,
-        ep_size: Optional[int] = None,
-        # Device mesh
         device_mesh: Optional["DeviceMesh"] = None,
         moe_mesh: Optional["DeviceMesh"] = None,
-        # Strategy-specific configs
         distributed_config: Optional[DistributedConfig] = None,
         pipeline_config: Optional[PipelineConfig] = None,
         qat_config: Optional[QATConfig] = None,
@@ -1395,18 +1345,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 will be applied to the model.
             force_hf (bool, default=False): If ``True``, force the use of HF model implementation.
                 If ``False``, the model will be loaded using the custom model implementation if available.
-            dp_size (int | None, optional): Data parallel size. If None, inferred from
-                world_size and other parallelism sizes. Default: None.
-            dp_replicate_size (int | None, optional): FSDP2-only. Size of the replication
-                group for HSDP. Raises ValueError if used with non-FSDP2 config. Default: None.
-            tp_size (int, optional): Tensor parallel size. Default: 1.
-            pp_size (int, optional): Pipeline parallel size. Default: 1.
-            cp_size (int, optional): Context parallel size. Default: 1.
-            ep_size (int, optional): Expert parallel size for MoE models. Default: 1.
             device_mesh (DeviceMesh | None, optional): Pre-created device mesh for
-                distributed training. Default: None.
+                distributed training. Parallelism sizes (tp, pp, cp, ep) are inferred
+                from this. Default: None.
             moe_mesh (DeviceMesh | None, optional): FSDP2-only. Device mesh for expert
-                parallelism. Default: None.
+                parallelism. ep_size is inferred from this. Default: None.
             distributed_config (FSDP2Config | MegatronFSDPConfig | DDPConfig | None, optional):
                 Strategy-specific distributed training configuration. Default: None.
             pipeline_config (PipelineConfig | None, optional): Pipeline parallelism
@@ -1453,52 +1396,28 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 quantization_config=quantization_config,
                 torch_dtype=torch_dtype,
                 force_hf=force_hf,
-                # Config-based API
-                dp_size=dp_size,
-                dp_replicate_size=dp_replicate_size,
-                tp_size=tp_size,
-                pp_size=pp_size,
-                cp_size=cp_size,
-                ep_size=ep_size,
                 device_mesh=device_mesh,
                 moe_mesh=moe_mesh,
                 distributed_config=distributed_config,
                 pipeline_config=pipeline_config,
                 qat_config=qat_config,
                 moe_config=moe_config,
-                # Other configs
                 peft_config=peft_config,
                 fp8_config=fp8_config,
                 compile_config=compile_config,
                 **kwargs,
             )
 
-        # Validate FSDP2-only params
-        if dp_replicate_size is not None and dp_replicate_size > 1:
-            if distributed_config is not None and not isinstance(distributed_config, FSDP2Config):
-                raise ValueError("dp_replicate_size is only supported with FSDP2Config")
-
-        # Extract sizes from device_mesh if not explicitly provided
+        # Infer parallelism sizes from device_mesh
         if device_mesh is not None:
             mesh_sizes = _extract_sizes_from_mesh(device_mesh, moe_mesh)
-            if tp_size is None:
-                tp_size = mesh_sizes.get("tp_size", 1)
-            if pp_size is None:
-                pp_size = mesh_sizes.get("pp_size", 1)
-            if cp_size is None:
-                cp_size = mesh_sizes.get("cp_size", 1)
-            if ep_size is None:
-                ep_size = mesh_sizes.get("ep_size", 1)
-            if dp_size is None:
-                dp_size = mesh_sizes.get("dp_size")
-            if dp_replicate_size is None:
-                dp_replicate_size = mesh_sizes.get("dp_replicate_size")
+            tp_size = mesh_sizes.get("tp_size", 1)
+            cp_size = mesh_sizes.get("cp_size", 1)
+            ep_size = mesh_sizes.get("ep_size", 1)
         else:
-            # No mesh provided, use defaults
-            tp_size = tp_size if tp_size is not None else 1
-            pp_size = pp_size if pp_size is not None else 1
-            cp_size = cp_size if cp_size is not None else 1
-            ep_size = ep_size if ep_size is not None else 1
+            tp_size = 1
+            cp_size = 1
+            ep_size = 1
 
         # Initialize infrastructure objects (will be populated from configs if provided)
         model_wrapper = None

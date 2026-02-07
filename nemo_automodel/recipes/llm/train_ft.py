@@ -131,12 +131,6 @@ def build_model_and_optimizer(
     cfg_peft,
     seed,
     has_packed_sequence=False,
-    dp_size=None,
-    dp_replicate_size=None,
-    tp_size=1,
-    pp_size=1,
-    cp_size=1,
-    ep_size=1,
     cfg_fp8=None,
     cfg_compile=None,
     cfg_quantization=None,
@@ -157,16 +151,10 @@ def build_model_and_optimizer(
         cfg_peft: Configuration for PEFT.
         seed: Random seed.
         has_packed_sequence: Whether using packed sequences.
-        dp_size: Data parallel size. If None, inferred from world_size.
-        dp_replicate_size: FSDP2-only. Size of the replication group for HSDP.
-        tp_size: Tensor parallel size.
-        pp_size: Pipeline parallel size.
-        cp_size: Context parallel size.
-        ep_size: Expert parallel size.
         cfg_fp8: Configuration for FP8.
         cfg_compile: Configuration for torch.compile.
         cfg_quantization: Configuration for BitsAndBytes quantization.
-        device_mesh: Device mesh for distributed training.
+        device_mesh: Device mesh for distributed training. Parallelism sizes are inferred from this.
         moe_mesh: MOE mesh for expert parallelism.
         distributed_config: Strategy-specific distributed config (FSDP2Config, etc.).
         pipeline_config: Pipeline parallelism config.
@@ -182,12 +170,6 @@ def build_model_and_optimizer(
 
     with ScopedRNG(seed=seed, ranked=True):
         kwargs = {
-            "dp_size": dp_size,
-            "dp_replicate_size": dp_replicate_size,
-            "tp_size": tp_size,
-            "pp_size": pp_size,
-            "cp_size": cp_size,
-            "ep_size": ep_size,
             "has_packed_sequence": has_packed_sequence,
             "peft_config": cfg_peft,
             "device_mesh": device_mesh,
@@ -253,7 +235,7 @@ def build_model_and_optimizer(
                 param.requires_grad_(True)
         logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
 
-    if tp_size > 1:
+    if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
         # TP does not support foreach
         cfg_opt.foreach = False
 
@@ -915,12 +897,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.peft_config,
             has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
             seed=self.cfg.get("seed", 42),
-            dp_size=self.cfg.get("distributed.dp_size", None),
-            dp_replicate_size=self.cfg.get("distributed.dp_replicate_size", None),
-            tp_size=self.cfg.get("distributed.tp_size", 1),
-            pp_size=self.cfg.get("distributed.pp_size", 1),
-            cp_size=self.cfg.get("distributed.cp_size", 1),
-            ep_size=self.cfg.get("distributed.ep_size", 1),
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
             cfg_quantization=self.cfg.get("quantization", None),
