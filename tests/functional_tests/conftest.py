@@ -59,6 +59,8 @@ _OVERRIDES = [
     "dataset._target_",
     "dataset.path_or_dataset",
     "validation_dataset.path_or_dataset",
+    "validation_dataset.split",
+    "validation_dataset.num_samples_limit",
     "validation_dataset.limit_dataset_samples",
     "autopipeline._target_",
     "autopipeline.pp_schedule",
