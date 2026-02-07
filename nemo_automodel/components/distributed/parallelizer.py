@@ -942,7 +942,9 @@ def _get_parallel_plan(
         if sequence_parallel:
             base_model_sp_plan = {
                 "model.embed_tokens": VocabParallelEmbedding(
-                    input_layouts=Replicate(), output_layouts=Shard(1), use_local_output=False,
+                    input_layouts=Replicate(),
+                    output_layouts=Shard(1),
+                    use_local_output=False,
                 ),
                 "model.norm": SequenceParallel(),
                 "model.layers.*.input_layernorm": SequenceParallel(),

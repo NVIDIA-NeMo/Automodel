@@ -188,7 +188,9 @@ def _parallelize_gemma3(
 
     base_model_sp_plan = {
         f"{model_prefix}.embed_tokens": VocabParallelEmbedding(
-            input_layouts=Replicate(), output_layouts=Shard(1), use_local_output=False,
+            input_layouts=Replicate(),
+            output_layouts=Shard(1),
+            use_local_output=False,
         ),
         f"{model_prefix}.rotary_emb": RotaryEmbedParallel(use_local_output=True),
         f"{model_prefix}.rotary_emb_local": RotaryEmbedParallel(use_local_output=True),
@@ -230,7 +232,9 @@ def _parallelize_llama(
 
     base_model_sp_plan = {
         "model.embed_tokens": VocabParallelEmbedding(
-            input_layouts=Replicate(), output_layouts=Shard(1), use_local_output=False,
+            input_layouts=Replicate(),
+            output_layouts=Shard(1),
+            use_local_output=False,
         ),
         "model.norm": SequenceParallel(),
         "model.layers.*.input_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
@@ -266,7 +270,9 @@ def _parallelize_ministral3(
 
     base_model_sp_plan = {
         "model.embed_tokens": VocabParallelEmbedding(
-            input_layouts=Replicate(), output_layouts=Shard(1), use_local_output=False,
+            input_layouts=Replicate(),
+            output_layouts=Shard(1),
+            use_local_output=False,
         ),
         "model.norm": SequenceParallel(),
         "model.layers.*.input_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
