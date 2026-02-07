@@ -14,10 +14,10 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config examples/llm_finetune/gemma/functiongemma_xlam.yaml
+# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/gemma/functiongemma_xlam.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 #
-# For details, please refer to tutorial:https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/toolcalling.md
+# For details, please refer to tutorial: https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/toolcalling.md
 
 
 step_scheduler:

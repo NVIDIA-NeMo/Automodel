@@ -1,7 +1,7 @@
-# Knowledge Distillation with NeMo-AutoModel
+# Knowledge Distillation with NeMo AutoModel
 
 This guide walks through fine-tuning a **student** LLM with the help of a
-larger **teacher** model using the new `knowledge_distillation` recipe.
+larger **teacher** model using the `kd` (knowledge distillation) recipe.
 
 In particular, we will show how to distill a 3B (`meta-llama/Llama-3.2-3B`) model into a 1B (`meta-llama/Llama-3.2-1B`) model.
 
@@ -44,7 +44,7 @@ Feel free to tweak these values as required.
 ```yaml
 # Example config for knowledge distillation fine-tuning
 # Run with:
-#   automodel knowledge_distillation llm -c examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml
+#   automodel kd llm -c examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml
 
 step_scheduler:
   global_batch_size: 32

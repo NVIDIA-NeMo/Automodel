@@ -1,4 +1,4 @@
-# 🚀 Gradient (Activation) Checkpointing in NeMo-AutoModel
+# Gradient (Activation) Checkpointing in NeMo AutoModel
 
 Gradient checkpointing - also called _activation checkpointing_ - trades a little extra compute for a **large reduction in GPU memory** by recomputing intermediate activations during the backwards pass instead of storing them.  
 It is especially powerful when combined with memory-efficient loss functions (e.g. Linear-Cut Cross-Entropy) and parameter sharding via FSDP.
@@ -89,7 +89,3 @@ If we run with the above settings (activation ckpt = on, lc-ce = on, fsdp = on),
 ```
 ... | mem 7.30 GiB | ...
 ```
-
----
-
-Happy fine-tuning! 🌟 
