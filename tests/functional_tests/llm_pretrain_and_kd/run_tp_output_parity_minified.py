@@ -51,6 +51,7 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import parallelize_module
 from torch.distributed.tensor.placement_types import Replicate
 
+from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan
 from nemo_automodel.components.models.mistral3.model import Ministral3Config, Ministral3ForCausalLM
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -254,6 +255,9 @@ def _run_case(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # Ensure any required transformers compatibility patches are applied before we build models.
+    apply_cache_compatibility_patches()
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--models",
