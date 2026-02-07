@@ -218,21 +218,7 @@ def _parallelize_qwen(
     model: Union[Qwen2ForCausalLM, Qwen3ForCausalLM],
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
-    """Parallelizes a Qwen2ForCausalLM model across data and tensor parallel dimensions."""
-
-    class Qwen3QKNorm(SequenceParallel):
-        @staticmethod
-        def _prepare_input_fn(sequence_sharding, mod, inputs, device_mesh):
-            input_tensor = inputs[0]
-
-            if isinstance(input_tensor, DTensor):
-                assert input_tensor.placements == (Shard(dim=2),)
-                return input_tensor
-            elif isinstance(input_tensor, torch.Tensor):
-                # assume the input passed in already sharded on the sequence dim and create the DTensor
-                return DTensor.from_local(input_tensor, device_mesh, sequence_sharding, run_check=False)
-            else:
-                raise ValueError(f"expecting input of {mod} to be a torch.Tensor or DTensor, but got {input_tensor}")
+    """Parallelizes a Qwen2/Qwen3 causal LM across data and tensor parallel dimensions."""
 
     if sequence_parallel:
         base_model_tp_plan = {
@@ -244,6 +230,9 @@ def _parallelize_qwen(
             "model.embed_tokens": RowwiseParallel(
                 input_layouts=Replicate(),
                 output_layouts=Shard(1),
+                # Keep DTensor outputs so HF modeling code (e.g. cache_position) can
+                # observe the *global* sequence length via DTensor.shape.
+                use_local_output=False,
             ),
             "model.norm": SequenceParallel(),
             "model.layers.*.input_layernorm": SequenceParallelAllGatherActivation(),
@@ -251,14 +240,16 @@ def _parallelize_qwen(
             "model.layers.*.self_attn.k_proj": ColwiseParallel(),
             "model.layers.*.self_attn.v_proj": ColwiseParallel(),
             "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
-            "model.layers.*.self_attn.q_norm": Qwen3QKNorm(),
-            "model.layers.*.self_attn.k_norm": Qwen3QKNorm(),
+            # Rowwise projections reduce-scatter back to sequence-sharded activations.
+            "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+            # NOTE: Qwen3 has `q_norm`/`k_norm` inside attention. These operate on the
+            # head-sharded outputs of q_proj/k_proj. Do NOT wrap them with SequenceParallel,
+            # which would incorrectly tag head-sharded activations as sequence-sharded.
             "model.layers.*.post_attention_layernorm": SequenceParallelAllGatherActivation(),
             "model.layers.*.mlp.up_proj": ColwiseParallel(),
             "model.layers.*.mlp.gate_proj": ColwiseParallel(),
             "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),
-            "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+            "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
         }
 
     else:
