@@ -61,6 +61,7 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
@@ -232,19 +233,40 @@ def build_model_and_optimizer(
         # TP does not support foreach
         cfg_opt.foreach = False
 
-    if hasattr(model, "parts"):
+    if is_dion_optimizer(cfg_opt):
+        distributed_mesh = getattr(model_wrapper, "device_mesh", None)
         optimizer = []
-        for part in model.parts:
-            trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
-            assert len(trainable_params) > 0, "trainable_params cannot be empty"
-            optimizer.append(cfg_opt.instantiate(params=trainable_params))
+        if hasattr(model, "parts"):
+            for part in model.parts:
+                optimizer.append(
+                    build_dion_optimizer(
+                        cfg_opt=cfg_opt,
+                        model=part,
+                        distributed_mesh=distributed_mesh,
+                    )
+                )
+        else:
+            optimizer = [
+                build_dion_optimizer(
+                    cfg_opt=cfg_opt,
+                    model=model,
+                    distributed_mesh=distributed_mesh,
+                )
+            ]
     else:
-        trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
-        assert len(trainable_params) > 0, "trainable_params cannot be empty"
-        optimizer = cfg_opt.instantiate(params=trainable_params)
-        if isinstance(model_wrapper, MegatronFSDPManager) and torch.distributed.get_world_size() > 1:
-            fully_shard_optimizer(model, optimizer)
-        optimizer = [optimizer]
+        if hasattr(model, "parts"):
+            optimizer = []
+            for part in model.parts:
+                trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
+                assert len(trainable_params) > 0, "trainable_params cannot be empty"
+                optimizer.append(cfg_opt.instantiate(params=trainable_params))
+        else:
+            trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
+            assert len(trainable_params) > 0, "trainable_params cannot be empty"
+            optimizer = cfg_opt.instantiate(params=trainable_params)
+            if isinstance(model_wrapper, MegatronFSDPManager) and torch.distributed.get_world_size() > 1:
+                fully_shard_optimizer(model, optimizer)
+            optimizer = [optimizer]
 
     return model, optimizer, loss_fn
 
