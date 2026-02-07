@@ -150,6 +150,35 @@ def test_lora_layers_are_trainable():
         assert lora.bias.requires_grad is False
 
 
+def test_dora_layers_are_trainable_and_forward_works(dummy_input):
+    """Ensures DoRA adds a learnable magnitude vector and forward/backward succeed."""
+    base = nn.Linear(16, 16)
+    dora = LinearLoRA(base, dim=4, alpha=8, use_dora=True, dropout=0.0)
+
+    assert dora.weight.requires_grad is False
+    assert dora.lora_A.weight.requires_grad
+    assert dora.lora_B.weight.requires_grad
+    assert hasattr(dora, "lora_magnitude")
+    assert dora.lora_magnitude.requires_grad
+
+    out = dora(dummy_input)
+    loss = out.sum()
+    loss.backward()
+
+    assert dora.lora_A.weight.grad is not None
+    assert dora.lora_B.weight.grad is not None
+    assert dora.lora_magnitude.grad is not None
+    assert torch.isfinite(dora.lora_magnitude.grad).all()
+
+
+def test_apply_lora_with_dora_patches_selected_module(model):
+    """apply_lora_to_linear_modules should be able to patch a module with DoRA enabled."""
+    apply_lora_to_linear_modules(model, PeftConfig(target_modules=["linear1"], dim=4, alpha=8, use_dora=True))
+    assert isinstance(model.linear1, LinearLoRA)
+    assert getattr(model.linear1, "use_dora", False) is True
+    assert hasattr(model.linear1, "lora_magnitude")
+
+
 def test_dropout_pre_post_effects(dummy_input):
     """Tests that different dropout positions ('pre' vs 'post') lead to different outputs."""
     base = nn.Linear(16, 16)

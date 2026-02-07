@@ -83,6 +83,8 @@ class RowwiseParallelLora(RowwiseParallel):
         if hasattr(module, "lora_A"):
             _distribute_param(module.lora_A, "weight", device_mesh, self.src_data_rank, [Shard(1)])
             _distribute_param(module.lora_B, "weight", device_mesh, self.src_data_rank, [Shard(1)])
+        if hasattr(module, "lora_magnitude"):
+            _distribute_param(module, "lora_magnitude", device_mesh, self.src_data_rank, [Replicate()])
 
     def _partition_embedding_fn(self, name, module, device_mesh):
         # rowwise shard embedding.weight is Shard(0)

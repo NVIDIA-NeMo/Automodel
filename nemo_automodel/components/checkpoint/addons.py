@@ -201,6 +201,7 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState) -> d
         "peft_type": "LORA",
         "r": peft_config.dim,
         "lora_alpha": peft_config.alpha,
+        "use_dora": peft_config.use_dora,
         "target_modules": target_modules,
         "bias": "none",
         "base_model_name_or_path": name_or_path,
