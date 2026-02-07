@@ -20,6 +20,7 @@ import torch.nn as nn
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
@@ -126,9 +127,13 @@ class GptOssModel(nn.Module):
                 "beta_slow": 1.0,
                 "original_max_position_embeddings": 4096,
             }
+        if hasattr(config, "rope_parameters") and config.rope_parameters:
+            rope_theta = config.rope_parameters.get("rope_theta", 10000.0)
+        else:
+            rope_theta = getattr(config, "rope_theta", 10000.0)
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
-            base=getattr(config, "rope_theta", 10000.0),
+            base=rope_theta,
             dtype=torch.float32,
             initial_context_length=rope_scaling["original_max_position_embeddings"],
             scaling_factor=rope_scaling["factor"],
@@ -191,7 +196,7 @@ class GptOssModel(nn.Module):
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class GptOssForCausalLM(nn.Module, MoEFSDPSyncMixin):
+class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     @classmethod
     def from_config(
         cls,

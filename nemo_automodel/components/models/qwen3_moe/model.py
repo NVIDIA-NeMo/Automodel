@@ -19,6 +19,7 @@ import torch.nn as nn
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention
 from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3MoeStateDictAdapter
@@ -129,9 +130,15 @@ class Qwen3MoeModel(nn.Module):
         # Rotary embedding cache compatible with our rope_utils functions
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+
+        if hasattr(config, "rope_parameters"):
+            base = config.rope_parameters["rope_theta"]
+        else:
+            base = config.rope_theta
+
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
-            base=config.rope_theta,
+            base=base,
             dtype=torch.float32,
             initial_context_length=4096,
             scaling_factor=1.0,
@@ -194,7 +201,7 @@ class Qwen3MoeModel(nn.Module):
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class Qwen3MoeForCausalLM(nn.Module, MoEFSDPSyncMixin):
+class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     @classmethod
     def from_config(
         cls,

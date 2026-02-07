@@ -3,10 +3,10 @@ codecov.yml @nvidia-nemo/automation
 docker/ @nvidia-nemo/automation
 pyproject.toml @nvidia-nemo/automation
 
-docs @akoumpa @jgerh
+docs @akoumpa @jgerh @adil-a @HuiyingLi @hemildesai
 nemo_automodel @akoumpa @HuiyingLi @adil-a @hemildesai
 examples @akoumpa @HuiyingLi @adil-a @hemildesai
 README.md @akoumpa @HuiyingLi @snowmanwwg
 
-nemo_automodel/components/datasets/llm/ @akoumpa @adil-a @NVIDIA-NeMo/automodel_retriever_maintainers
-biencoder/ @akoumpa @adil-a @NVIDIA-NeMo/automodel_retriever_maintainers
+nemo_automodel/components/datasets/llm/ @akoumpa @adil-a @HuiyingLi @hemildesai @NVIDIA-NeMo/automodel_retriever_maintainers
+biencoder/ @akoumpa @adil-a @HuiyingLi @hemildesai @NVIDIA-NeMo/automodel_retriever_maintainers

@@ -228,6 +228,18 @@ def get_test_hf_sharded_vlm_checkpoint_expected_keys():
             torch.bfloat16,
             "cpu",
         ),
+        # Embedding layer optimizer states (no longer frozen after PR change)
+        "optim.state.model.language_model.embed_tokens.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.language_model.embed_tokens.weight.exp_avg": (
+            [131104, 128],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.state.model.language_model.embed_tokens.weight.exp_avg_sq": (
+            [131104, 128],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.state.model.language_model.layers.0.self_attn.q_proj.weight.step": ([], torch.float32, "cpu"),
         "optim.state.model.language_model.layers.0.self_attn.q_proj.weight.exp_avg": (
             [64, 128],
@@ -553,12 +565,12 @@ def test_hf_vlm_sharded_checkpoint():
     # first extract the in-memory checkpoint
     model_state_dict = to_cpu(
         ModelState(
-            trainer.model,
+            trainer.model_parts[0],
         ).state_dict()
     )
     optimizer_state_dict = to_cpu(
         OptimizerState(
-            trainer.model,
+            trainer.model_parts[0],
             trainer.optimizer,
             trainer.lr_scheduler,
         ).state_dict()["optim"]
@@ -629,10 +641,10 @@ def test_hf_vlm_sharded_checkpoint():
 
     # check if new model and current model give the same CE loss
     val_batch = next(iter(trainer.val_dataloader))
-    restored_model = FinetuneRecipeForVLM(cfg)
-    restored_model.setup()
-    restored_model = restored_model.model
-    source_model_loss = get_validation_loss(trainer.model, val_batch, trainer.loss_fn, trainer.dist_env.device)
+    restored_trainer = FinetuneRecipeForVLM(cfg)
+    restored_trainer.setup()
+    restored_model = restored_trainer.model_parts[0]
+    source_model_loss = get_validation_loss(trainer.model_parts[0], val_batch, trainer.loss_fn, trainer.dist_env.device)
     restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
     assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
 

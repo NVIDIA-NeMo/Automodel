@@ -61,7 +61,6 @@ model:
 
 checkpoint:
   enabled: false
-  load_base_model: false
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
