@@ -175,7 +175,9 @@ def build_model_and_optimizer(
 
     # override when the loss function requires logits_to_keep (FusedLinearCrossEntropy).
     if not _supports_logits_to_keep(model) and isinstance(loss_fn, FusedLinearCrossEntropy):
-        logger.warning("logits_to_keep not found in model.forward but required by FusedLinearCrossEntropy. Using MaskedCrossEntropy instead.")
+        logger.warning(
+            "logits_to_keep not found in model.forward but required by FusedLinearCrossEntropy. Using MaskedCrossEntropy instead."
+        )
         loss_fn = MaskedCrossEntropy()
 
     if tp_size > 1:

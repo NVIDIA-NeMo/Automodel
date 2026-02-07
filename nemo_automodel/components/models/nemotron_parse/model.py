@@ -18,7 +18,6 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from einops import rearrange
-from torch.nn import CrossEntropyLoss
 from transformers import AutoConfig, AutoModel, GenerationMixin, PreTrainedModel
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_attn_mask_utils import (
