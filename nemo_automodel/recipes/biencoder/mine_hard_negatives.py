@@ -27,7 +27,7 @@ from tqdm import tqdm
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.datasets.llm.retrieval_dataset import load_datasets
 from nemo_automodel.components.distributed.init_utils import DistInfo, initialize_distributed
-from nemo_automodel.components.models.biencoder import NeMoAutoModelBiencoder
+from nemo_automodel._transformers.auto_model import NeMoAutoModelForBiencoder
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +234,7 @@ class MineHardNegativesRecipe:
         # Load model directly from checkpoint path
         # This loads the saved model without requiring architecture config
         logger.info(f"Loading biencoder model from {self.model_name_or_path}...")
-        self.model = NeMoAutoModelBiencoder.from_pretrained(
+        self.model = NeMoAutoModelForBiencoder.from_pretrained(
             self.model_name_or_path,
             # Use inference-appropriate settings
             use_liger_kernel=False,  # Not needed for inference
