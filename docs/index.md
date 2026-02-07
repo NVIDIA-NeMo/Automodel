@@ -28,6 +28,13 @@ Fine-tune Hugging Face Models Instantly with Day-0 Support with NVIDIA NeMo Auto
 ```
 
 ```{toctree}
+:caption: Performance
+:hidden:
+
+performance-summary.md
+```
+
+```{toctree}
 :caption: Recipes & E2E Examples
 :hidden:
 guides/overview.md
@@ -72,11 +79,4 @@ guides/fp8-training.md
 guides/mlflow-logging.md
 
 apidocs/index.rst
-```
-
-```{toctree}
-:caption: Performance
-:hidden:
-
-performance-summary.md
 ```
