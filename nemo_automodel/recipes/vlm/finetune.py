@@ -136,7 +136,6 @@ def build_model_and_optimizer(
                 f"Got model target: {cfg_model.get('_target_', None)}"
             )
 
-
     # override when the loss function requires logits_to_keep (FusedLinearCrossEntropy).
     if not _supports_logits_to_keep(model) and isinstance(loss_fn, FusedLinearCrossEntropy):
         logger.warning(
