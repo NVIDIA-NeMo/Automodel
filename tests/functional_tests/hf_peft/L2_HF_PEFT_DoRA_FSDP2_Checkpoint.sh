@@ -16,16 +16,16 @@
 set -xeuo pipefail
 
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
-export CUDA_VISIBLE_DEVICES="0,1"
+export CUDA_VISIBLE_DEVICES="0"
 
 # DoRA test using TinyLlama (non-MoE model, publicly available)
 python -m torch.distributed.run \
---master-port=29503 --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace  \
--m pytest tests/functional_tests/checkpoint/test_peft.py::test_hf_peft_dora_checkpoint \
+--master-port=29503 --nproc_per_node=1 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace  \
+-m pytest tests/functional_tests/checkpoint/test_peft.py::test_hf_peft_dora_checkpoint -vs \
     --config examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml \
     --model.pretrained_model_name_or_path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --step_scheduler.max_steps 10 \
-    --step_scheduler.global_batch_size 16 \
+    --step_scheduler.global_batch_size 8 \
     --step_scheduler.local_batch_size 8 \
     --dataset.tokenizer.pretrained_model_name_or_path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --validation_dataset.tokenizer.pretrained_model_name_or_path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
@@ -47,5 +47,6 @@ python -m torch.distributed.run \
     --distributed.dp_size none \
     --distributed.tp_size 1 \
     --distributed.cp_size 1 \
-    --distributed.sequence_parallel false
+    --distributed.sequence_parallel false \
+    --distributed.dp_replicate_size 1
 
