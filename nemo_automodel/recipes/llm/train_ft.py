@@ -63,9 +63,9 @@ from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
+from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
-from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
     prepare_for_final_backward,
