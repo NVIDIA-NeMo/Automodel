@@ -432,8 +432,9 @@ class NemotronParsePreTrainedModel(PreTrainedModel):
 class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParsePreTrainedModel, GenerationMixin):
     """NemotronParse model for conditional generation tasks."""
 
-    def __init__(self, config: NemotronParseConfig, **kwargs):
+    def __init__(self, config: NemotronParseConfig, loss_fn=None, **kwargs):
         super().__init__(config)
+        self.loss_fn = loss_fn
 
         self.encoder = RadioWithNeck(config.encoder)
         self.encoder.main_input_name = "pixel_values"
@@ -530,50 +531,14 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
             **kwargs_decoder,
         )
 
-        loss = None
-        if labels is not None:
-            main_logits = self.lm_head(decoder_outputs.last_hidden_state)
-            logits = [main_logits]
-            decoder_inputs_embeds = decoder_outputs.inputs_embeds
-            for iii, head in enumerate(self.decoder.extra_heads):
-                decoder_input_embeds_shift = self.decoder.extra_proj[iii](
-                    torch.cat(
-                        (
-                            decoder_inputs_embeds[:, 1:, :],
-                            torch.zeros_like(decoder_inputs_embeds[:, 0, :].unsqueeze(1)),
-                        ),
-                        axis=1,
-                    )
-                )
-                hidden = head(decoder_outputs["hidden_states"][-1] + decoder_input_embeds_shift)
-                logits.append(self.lm_head(hidden))
-
-            logits = torch.stack(logits, dim=-2)
-            loss_fct = CrossEntropyLoss(reduction="none")
-
-            losses_per_head = []
-            tokens_per_head = []
-            for head_num in range(len(self.decoder.extra_heads) + 1):
-                logits_head = logits[:, :, head_num, :]
-                labels_head = torch.cat((labels[:, head_num:], torch.full_like(labels[:, :head_num], -100)), 1)
-                loss_full = loss_fct(logits_head.permute(0, 2, 1), labels_head)
-                loss_full[labels_head >= self.class_token_indx_start] *= 10
-                losses_per_head.append(loss_full.sum(1))
-                tokens_per_head.append((labels_head != -100).sum(1))
-
-            losses_per_sample = torch.stack(losses_per_head, dim=1).sum(1)
-            tokens_per_sample = torch.stack(tokens_per_head, dim=1).sum(1)
-            loss = losses_per_sample.sum() / (tokens_per_sample.sum() + 1e-6)
+        logits = self.lm_head(decoder_outputs.last_hidden_state)
 
         if not return_dict:
-            return (
-                (loss,) + decoder_outputs + encoder_outputs if loss is not None else decoder_outputs + encoder_outputs
-            )
+            return decoder_outputs + encoder_outputs
 
-        output_logits = self.lm_head(decoder_outputs.last_hidden_state)
         return Seq2SeqLMOutput(
-            loss=loss,
-            logits=output_logits,
+            loss=None,
+            logits=logits,
             past_key_values=decoder_outputs.past_key_values,
             decoder_hidden_states=decoder_outputs.hidden_states,
             decoder_attentions=decoder_outputs.attentions,
