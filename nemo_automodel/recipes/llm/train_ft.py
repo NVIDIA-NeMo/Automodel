@@ -233,39 +233,24 @@ def build_model_and_optimizer(
         # TP does not support foreach
         cfg_opt.foreach = False
 
-    if is_dion_optimizer(cfg_opt):
-        optimizer = []
-        if hasattr(model, "parts"):
-            for part in model.parts:
-                optimizer.append(
-                    build_dion_optimizer(
-                        cfg_opt=cfg_opt,
-                        model=part,
-                        distributed_mesh=device_mesh,
-                    )
-                )
+    optimizer = []
+    has_dion_optimizer = is_dion_optimizer(cfg_opt)
+    for part in getattr(model, "parts", [model]):
+        trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
+        assert len(trainable_params) > 0, "trainable_params cannot be empty"
+        # TODO(@akoumparouli): no branching for building the optimizer, refactor.
+        if has_dion_optimizer:
+            tmp_optimizer = build_dion_optimizer(
+                cfg_opt=cfg_opt,
+                model=part,
+                distributed_mesh=device_mesh,
+            )
         else:
-            optimizer = [
-                build_dion_optimizer(
-                    cfg_opt=cfg_opt,
-                    model=model,
-                    distributed_mesh=device_mesh,
-                )
-            ]
-    else:
-        if hasattr(model, "parts"):
-            optimizer = []
-            for part in model.parts:
-                trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
-                assert len(trainable_params) > 0, "trainable_params cannot be empty"
-                optimizer.append(cfg_opt.instantiate(params=trainable_params))
-        else:
-            trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
-            assert len(trainable_params) > 0, "trainable_params cannot be empty"
-            optimizer = cfg_opt.instantiate(params=trainable_params)
-            if isinstance(distributed_config, MegatronFSDPConfig) and torch.distributed.get_world_size() > 1:
-                fully_shard_optimizer(model, optimizer)
-            optimizer = [optimizer]
+            tmp_optimizer = cfg_opt.instantiate(params=trainable_params)
+        if isinstance(distributed_config, MegatronFSDPConfig) and torch.distributed.get_world_size() > 1:
+            assert not has_dion_optimizer, "Dion optimizer does not support fully_shard_optimizer"
+            fully_shard_optimizer(part, tmp_optimizer)
+        optimizer.append(tmp_optimizer)
 
     return model, optimizer
 
