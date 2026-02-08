@@ -19,6 +19,7 @@ import logging
 import os
 import types
 from contextlib import contextmanager, nullcontext
+from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
@@ -761,7 +762,8 @@ def instantiate_infrastructure(
         tuple: (model_wrapper, autopipeline, parallelize_fn, qat_quantizer)
             - model_wrapper: Distributed manager instance (or None)
             - autopipeline: AutoPipeline instance (or None)
-            - parallelize_fn: Parallelization function (or None) - built internally for PP
+            - parallelize_fn: Parallelization function (or None) - built for EP
+                (MoE-specific parallelizer when ep_size > 1) or PP (via model_wrapper)
             - qat_quantizer: QAT quantizer instance (or None)
     """
     # Instantiate distributed manager
@@ -770,19 +772,14 @@ def instantiate_infrastructure(
     # Instantiate pipeline
     autopipeline = _instantiate_pipeline(pipeline_config, device_mesh, moe_mesh, device)
 
-    # Build parallelize_fn if pipeline parallelism is enabled
+    # Build parallelize_fn for EP or PP
     parallelize_fn = None
-    if autopipeline is not None and model_wrapper is not None:
-        from functools import partial
+    if ep_size > 1:
+        from nemo_automodel.components.moe.parallelizer import parallelize_model
 
-        if ep_size > 1:
-            # Use MoE-specific parallelizer with config values baked in
-            from nemo_automodel.components.moe.parallelizer import parallelize_model
-
-            parallelize_fn = partial(parallelize_model, **moe_config.to_dict())
-        else:
-            # Use standard parallelization via model_wrapper
-            parallelize_fn = partial(parallelize_for_pp, model_wrapper=model_wrapper)
+        parallelize_fn = partial(parallelize_model, **moe_config.to_dict())
+    elif autopipeline is not None and model_wrapper is not None:
+        parallelize_fn = partial(parallelize_for_pp, model_wrapper=model_wrapper)
 
     # Instantiate QAT quantizer
     qat_quantizer = _instantiate_qat(qat_config)
@@ -1221,7 +1218,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             force_hf,
         )
 
-        has_packed_sequence = kwargs.get("has_packed_sequence", False)
+        has_packed_sequence = kwargs.pop("has_packed_sequence", False)
         freeze_config = kwargs.pop("freeze_config", None)
         attn_implementation, use_liger_kernel = _apply_preload_overrides(
             is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
@@ -1477,7 +1474,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         _consume_config_overrides(config, kwargs)
         is_hf_model = get_is_hf_model(config, force_hf)
 
-        has_packed_sequence = kwargs.get("has_packed_sequence", False)
+        has_packed_sequence = kwargs.pop("has_packed_sequence", False)
         freeze_config = kwargs.pop("freeze_config", None)
         attn_implementation, use_liger_kernel = _apply_preload_overrides(
             is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel

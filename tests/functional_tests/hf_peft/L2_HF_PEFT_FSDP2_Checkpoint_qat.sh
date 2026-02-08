@@ -40,7 +40,7 @@ nemo_automodel/recipes/llm/train_ft.py \
     --distributed.tp_size 1 \
     --distributed.cp_size 1 \
     --distributed_config.sequence_parallel false \
+    --qat.enabled true \
     --qat.fake_quant_after_n_steps 1 \
-    --qat.enabled True \
-    --qat.quantizer._target_ torchao.quantization.qat.Int8DynActInt4WeightQATQuantizer \
-    --qat.quantizer.groupsize 32
+    --qat.qat_config._target_ nemo_automodel.components.quantization.qat.QATConfig \
+    --qat.qat_config.groupsize 32

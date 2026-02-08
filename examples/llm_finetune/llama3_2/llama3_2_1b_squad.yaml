@@ -56,7 +56,6 @@ distributed:
 
 distributed_config:
   _target_: nemo_automodel.components.distributed.config.FSDP2Config
-  sequence_parallel: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

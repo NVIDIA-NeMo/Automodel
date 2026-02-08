@@ -59,26 +59,20 @@ class QATConfig:
             - "int4_weight_only": Int4 weight-only quantization. Uses
               Int4WeightOnlyQATQuantizer from torchao. More aggressive compression,
               may have slightly lower accuracy.
-        precision (torch.dtype): Data type for model weights during QAT training.
-            Typically torch.bfloat16 for mixed-precision training.
-        scales_precision (torch.dtype): Data type for quantization scale factors.
-            Using higher precision (e.g., torch.bfloat16) for scales can improve
-            accuracy.
+        **quantizer_kwargs: Additional keyword arguments forwarded directly to
+            the torchao quantizer constructor (e.g. groupsize, padding_allowed,
+            inner_k_tiles).
     """
 
     quantizer_type: Literal["int8_dynact_int4weight", "int4_weight_only"] = "int8_dynact_int4weight"
-    precision: torch.dtype = torch.bfloat16
-    scales_precision: torch.dtype = torch.bfloat16
 
     def __init__(
         self,
         quantizer_type: Literal["int8_dynact_int4weight", "int4_weight_only"] = "int8_dynact_int4weight",
-        precision: torch.dtype = torch.bfloat16,
-        scales_precision: torch.dtype = torch.bfloat16,
+        **quantizer_kwargs,
     ):
         self.quantizer_type = quantizer_type
-        self.precision = precision
-        self.scales_precision = scales_precision
+        self.quantizer_kwargs = quantizer_kwargs
 
     @classmethod
     def from_config_node(cls, config_node) -> "QATConfig":
@@ -87,18 +81,23 @@ class QATConfig:
             return cls()
 
         kwargs = {}
-        for field_name in cls.__dataclass_fields__:
-            if hasattr(config_node, field_name):
-                kwargs[field_name] = getattr(config_node, field_name)
+        if hasattr(config_node, "__iter__"):
+            for key in config_node:
+                kwargs[key] = getattr(config_node, key)
+        else:
+            for field_name in cls.__dataclass_fields__:
+                if hasattr(config_node, field_name):
+                    kwargs[field_name] = getattr(config_node, field_name)
 
+        # Remove _target_ if present (used by config loader, not by QATConfig)
+        kwargs.pop("_target_", None)
         return cls(**kwargs)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
         return {
             "quantizer_type": self.quantizer_type,
-            "precision": self.precision,
-            "scales_precision": self.scales_precision,
+            **self.quantizer_kwargs,
         }
 
     def create_quantizer(self):
@@ -111,16 +110,17 @@ class QATConfig:
         Raises:
             ValueError: If quantizer_type is not recognized.
         """
+        # Default precision to bfloat16 so fake-quant params match the model dtype,
+        # preventing FSDP mixed-dtype errors. User kwargs can override.
+        kwargs = {
+            "precision": torch.bfloat16,
+            "scales_precision": torch.bfloat16,
+            **self.quantizer_kwargs,
+        }
         if self.quantizer_type == "int8_dynact_int4weight":
-            return Int8DynActInt4WeightQATQuantizer(
-                precision=self.precision,
-                scales_precision=self.scales_precision,
-            )
+            return Int8DynActInt4WeightQATQuantizer(**kwargs)
         elif self.quantizer_type == "int4_weight_only":
-            return Int4WeightOnlyQATQuantizer(
-                precision=self.precision,
-                scales_precision=self.scales_precision,
-            )
+            return Int4WeightOnlyQATQuantizer(**kwargs)
         else:
             raise ValueError(f"Unknown quantizer_type: {self.quantizer_type}")
 
@@ -171,13 +171,11 @@ def prepare_qat_model(model, quantizer) -> tuple[object, Optional[str]]:
     if not hasattr(quantizer, "prepare"):
         raise ValueError("Provided quantizer does not implement a prepare(model) method")
 
-    logger.info("Preparing model for QAT using %s".format(type(quantizer).__name__))
+    logger.info("Preparing model for QAT using %s", type(quantizer).__name__)
     model = quantizer.prepare(model)
     mode = get_quantizer_mode(quantizer)
     if mode is None:
-        logger.warning(
-            "Unknown QAT quantizer %s; fake-quant toggling will be unavailable.".format(type(quantizer).__name__)
-        )
+        logger.warning("Unknown QAT quantizer %s; fake-quant toggling will be unavailable.", type(quantizer).__name__)
     return model, mode
 
 
