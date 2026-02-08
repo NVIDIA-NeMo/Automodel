@@ -75,6 +75,25 @@ def _add_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX, skip_keys: list
             sd[prefix + k] = sd.pop(k)
 
 
+def _rename_dora_keys_to_hf(sd: dict[str, Any]) -> None:
+    """
+    Rename DoRA magnitude keys to match HF PEFT's expected format in-place.
+    """
+    for k in list(sd.keys()):
+        if k.endswith(".lora_magnitude"):
+            sd[k[: -len(".lora_magnitude")] + ".lora_magnitude_vector.default.weight"] = sd.pop(k)
+
+
+def _rename_dora_keys_from_hf(sd: dict[str, Any]) -> None:
+    """
+    Reverse of _rename_dora_keys_to_hf: convert HF PEFT key format back to internal names.
+    """
+    suffix = ".lora_magnitude_vector.default.weight"
+    for k in list(sd.keys()):
+        if k.endswith(suffix):
+            sd[k[: -len(suffix)] + ".lora_magnitude"] = sd.pop(k)
+
+
 def _get_lm_head_weight_and_name(model: torch.nn.Module) -> Optional[tuple[torch.Tensor, str]]:
     for name, param in model.named_parameters(remove_duplicate=False):
         if "lm_head" in name and name.endswith(".weight"):
@@ -163,6 +182,8 @@ class ModelState:
             # HF PEFT models are saved with a "base.model." prefix. This is so they can be loaded
             # correctly with the HF PEFT API.
             _add_outer_prefix(model_state_dict, "base_model.model.")
+            # DoRA: rename lora_magnitude to match HF PEFT's expected key format
+            _rename_dora_keys_to_hf(model_state_dict)
 
         return model_state_dict
 
@@ -181,6 +202,8 @@ class ModelState:
         options = StateDictOptions(strict=strict)
         if self.is_peft:
             _drop_outer_prefix(state_dict, "base_model.model.")
+            # DoRA: reverse the HF PEFT key rename so DCP can match model params
+            _rename_dora_keys_from_hf(state_dict)
             options = StateDictOptions(strict=False, broadcast_from_rank0=True, full_state_dict=True)
 
         # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
