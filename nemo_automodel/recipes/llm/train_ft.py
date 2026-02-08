@@ -234,7 +234,6 @@ def build_model_and_optimizer(
         cfg_opt.foreach = False
 
     if is_dion_optimizer(cfg_opt):
-        distributed_mesh = getattr(model_wrapper, "device_mesh", None)
         optimizer = []
         if hasattr(model, "parts"):
             for part in model.parts:
@@ -242,7 +241,7 @@ def build_model_and_optimizer(
                     build_dion_optimizer(
                         cfg_opt=cfg_opt,
                         model=part,
-                        distributed_mesh=distributed_mesh,
+                        distributed_mesh=device_mesh,
                     )
                 )
         else:
@@ -250,7 +249,7 @@ def build_model_and_optimizer(
                 build_dion_optimizer(
                     cfg_opt=cfg_opt,
                     model=model,
-                    distributed_mesh=distributed_mesh,
+                    distributed_mesh=device_mesh,
                 )
             ]
     else:

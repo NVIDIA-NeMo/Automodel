@@ -193,46 +193,24 @@ class DummyModelConfig:
         return str(getattr(self, key, default))
 
 
-@requires_cuda
 def test_peft_with_pipeline_parallelism_enabled(caplog):
-    """Test that PEFT can be applied with pipeline parallelism enabled"""
+    """Test that _apply_peft_and_lower_precision disables triton with PP."""
+    from nemo_automodel._transformers.auto_model import _apply_peft_and_lower_precision
 
-    # Create mock configs
-    cfg_model = DummyModelConfig()
-    cfg_opt = DummyOptConfig()
     cfg_peft = DummyPeftConfig()
-
-    # Create mock autopipeline
+    model = DummyModel()
     mock_autopipeline = MagicMock()
-    mock_autopipeline.parts = []
 
-    # Mock the apply_lora_to_linear_modules function (now inside apply_model_infrastructure)
     with patch('nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules') as mock_apply_lora:
-        with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
-            with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-                with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
-                    with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                        with patch('nemo_automodel._transformers.auto_model._shard_pp') as mock_shard_pp:
-                            mock_shard_pp.return_value = mock_autopipeline
-                            with caplog.at_level(logging.INFO):
-                                # This should NOT raise an assertion error
-                                # New API: no device param, returns 2-tuple
-                                model, optimizer = build_model_and_optimizer(
-                                    cfg_model=cfg_model,
-                                    cfg_opt=cfg_opt,
-                                    cfg_peft=cfg_peft,
-                                    seed=42,
-                                    autopipeline=mock_autopipeline,
-                                )
+        with caplog.at_level(logging.INFO):
+            _apply_peft_and_lower_precision(
+                model, tp_size=1, autopipeline=mock_autopipeline,
+                peft_config=cfg_peft, quantization_config=None, fp8_config=None, qat_quantizer=None,
+            )
 
-                                # Verify that apply_lora was called
-                                assert mock_apply_lora.called, "apply_lora_to_linear_modules should be called"
-
-                                # Verify that use_triton was disabled
-                                assert cfg_peft.use_triton == False, "use_triton should be disabled for PP"
-
-                                # Verify the log message was generated
-                                assert "Enabling PEFT with Pipeline Parallelism" in caplog.text
+    assert mock_apply_lora.called, "apply_lora_to_linear_modules should be called"
+    assert cfg_peft.use_triton == False, "use_triton should be disabled for PP"
+    assert "Enabling PEFT with Pipeline Parallelism" in caplog.text
 
 
 @requires_cuda
@@ -260,7 +238,6 @@ def test_peft_without_pipeline_parallelism(caplog):
                                     cfg_opt=cfg_opt,
                                     cfg_peft=cfg_peft,
                                     seed=42,
-                                    autopipeline=None,  # No pipeline parallelism
                                 )
 
                             # Verify that apply_lora was called
@@ -271,40 +248,22 @@ def test_peft_without_pipeline_parallelism(caplog):
                             assert "Enabling PEFT with Pipeline Parallelism" not in caplog.text
 
 
-@requires_cuda
 def test_peft_with_tp_disables_triton(caplog):
-    """Test that PEFT with tensor parallelism disables triton"""
+    """Test that _apply_peft_and_lower_precision disables triton with TP."""
+    from nemo_automodel._transformers.auto_model import _apply_peft_and_lower_precision
 
-    # Create mock configs
-    cfg_model = DummyModelConfig()
-    cfg_opt = DummyOptConfig()
     cfg_peft = DummyPeftConfig()
+    model = DummyModel()
 
-    # Mock the apply_lora_to_linear_modules function (now inside apply_model_infrastructure)
-    with patch('nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules') as mock_apply_lora:
-        with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
-            with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-                with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
-                    with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                        with patch('nemo_automodel._transformers.auto_model._shard_ep_fsdp') as mock_shard:
-                            mock_shard.return_value = DummyModel()
-                            with caplog.at_level(logging.INFO):
-                                # Test with TP > 1
-                                # New API: no device param, returns 2-tuple
-                                model, optimizer = build_model_and_optimizer(
-                                    cfg_model=cfg_model,
-                                    cfg_opt=cfg_opt,
-                                    cfg_peft=cfg_peft,
-                                    seed=42,
-                                    tp_size=2,  # Enable TP
-                                    autopipeline=None,
-                                )
+    with patch('nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules'):
+        with caplog.at_level(logging.INFO):
+            _apply_peft_and_lower_precision(
+                model, tp_size=2, autopipeline=None,
+                peft_config=cfg_peft, quantization_config=None, fp8_config=None, qat_quantizer=None,
+            )
 
-                            # Verify that use_triton was disabled
-                            assert cfg_peft.use_triton == False, "use_triton should be disabled for TP"
-
-                            # Verify the TP log message was generated
-                            assert "Disabling Triton with TP" in caplog.text
+    assert cfg_peft.use_triton == False, "use_triton should be disabled for TP"
+    assert "Disabling Triton with TP" in caplog.text
 
 
 def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatch):
@@ -392,8 +351,6 @@ def test_force_hf_true_disables_meta_init(monkeypatch):
         cfg_opt=cfg_opt,
         cfg_peft=cfg_peft,
         seed=123,
-        autopipeline=None,
-        parallelize_fn=None,
     )
 
     # Model should be instantiated
@@ -1040,7 +997,6 @@ def test_build_model_state_dict_keys_uses_adapter(caplog):
                         cfg_opt=cfg_opt,
                         cfg_peft=cfg_peft,
                         seed=42,
-                        autopipeline=None,
                     )
 
     # Model should be instantiated
@@ -1066,7 +1022,6 @@ def test_build_model_state_dict_keys_without_adapter():
                         cfg_opt=cfg_opt,
                         cfg_peft=cfg_peft,
                         seed=42,
-                        autopipeline=None,
                     )
 
     # Model should be instantiated
@@ -1107,7 +1062,6 @@ def test_build_model_with_quantized_model_config():
                         cfg_opt=cfg_opt,
                         cfg_peft=cfg_peft,
                         seed=42,
-                        autopipeline=None,
                     )
 
     # Model should be instantiated with quantization config
@@ -1133,7 +1087,6 @@ def test_build_model_without_quant_config():
                         cfg_opt=cfg_opt,
                         cfg_peft=cfg_peft,
                         seed=42,
-                        autopipeline=None,
                     )
 
     # Model should be instantiated without quantization config
@@ -1148,10 +1101,17 @@ def test_build_model_without_quant_config():
 
 @requires_cuda
 def test_build_model_disables_foreach_with_tp():
-    """Test that when tp_size > 1, cfg_opt.foreach is set to False."""
+    """Test that when device_mesh has tp > 1, cfg_opt.foreach is set to False."""
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig()
     cfg_opt.foreach = True  # Initially True
+
+    # Create mock device_mesh with TP > 1
+    mock_tp = MagicMock()
+    mock_tp.size.return_value = 2
+    mock_mesh = MagicMock()
+    mock_mesh.mesh_dim_names = ("dp", "tp")
+    mock_mesh.__getitem__ = lambda self, key: mock_tp if key == "tp" else MagicMock()
 
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
         with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
@@ -1162,8 +1122,7 @@ def test_build_model_disables_foreach_with_tp():
                         cfg_opt=cfg_opt,
                         cfg_peft=None,
                         seed=42,
-                        tp_size=2,  # TP > 1
-                        autopipeline=None,
+                        device_mesh=mock_mesh,
                     )
 
     # Verify foreach was disabled
@@ -1185,7 +1144,6 @@ def test_build_model_returns_model_optimizer_tuple():
                         cfg_opt=cfg_opt,
                         cfg_peft=None,
                         seed=42,
-                        autopipeline=None,
                     )
 
     # Should return 2-tuple

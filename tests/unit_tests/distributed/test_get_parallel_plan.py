@@ -197,7 +197,7 @@ def test_optimised_plan_and_hf_both_fail_assert_sp_true(monkeypatch):
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf2, raising=True)
     _set_global_model_cls(monkeypatch, _DummyModel)
 
-    with pytest.raises(AssertionError):
+    with pytest.raises(RuntimeError, match="hf fail"):
         _get_parallel_plan(_DummyModel(), sequence_parallel=True)
 
 

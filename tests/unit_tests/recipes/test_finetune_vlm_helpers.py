@@ -1664,9 +1664,16 @@ class TestForwardBackwardStepNonPP:
 
 
 def test_build_model_and_optimizer_returns_optimizer_list():
-    """Test that build_model_and_optimizer returns list of optimizers."""
+    """Test that build_model_and_optimizer returns list of optimizers and disables foreach with TP."""
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig(lr=0.01)
+
+    # Create a mock device_mesh with tp size > 1
+    mock_tp_submesh = MagicMock()
+    mock_tp_submesh.size.return_value = 2
+    mock_device_mesh = MagicMock()
+    mock_device_mesh.mesh_dim_names = ("dp", "tp")
+    mock_device_mesh.__getitem__ = lambda self, key: mock_tp_submesh if key == "tp" else MagicMock()
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
         model, optimizer = build_model_and_optimizer(
@@ -1675,10 +1682,14 @@ def test_build_model_and_optimizer_returns_optimizer_list():
             cfg_freeze=None,
             cfg_peft=None,
             seed=42,
+            device_mesh=mock_device_mesh,
         )
 
-    # Verify foreach was disabled
+    # Verify foreach was disabled due to TP > 1
     assert cfg_opt.foreach is False
+    # Verify optimizer is returned as a list
+    assert isinstance(optimizer, list)
+    assert len(optimizer) == 1
 
 
 def test_vlm_build_model_returns_model_optimizer_tuple():

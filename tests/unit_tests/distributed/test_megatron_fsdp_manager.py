@@ -14,13 +14,13 @@
 # limitations under the License.
 
 import logging
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 
 from nemo_automodel.components.distributed import megatron_fsdp as mfsdp
+from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 
 
 class _FakeModel:
@@ -40,95 +40,17 @@ class _FakeModel:
         return self
 
 
-def test_setup_distributed_raises_when_dist_not_available(monkeypatch):
-    fake_dist = SimpleNamespace(is_available=lambda: False)
-    monkeypatch.setattr(mfsdp, "dist", fake_dist, raising=True)
-
-    with pytest.raises(RuntimeError, match="torch.distributed not available"):
-        mfsdp.MegatronFSDPManager(world_size=1, backend="gloo")
-
-
-def test_setup_distributed_raises_when_dist_not_initialized(monkeypatch):
-    fake_dist = SimpleNamespace(is_available=lambda: True, is_initialized=lambda: False)
-    monkeypatch.setattr(mfsdp, "dist", fake_dist, raising=True)
-
-    with pytest.raises(RuntimeError, match="expected torch.distributed to be initialized"):
-        mfsdp.MegatronFSDPManager(world_size=1, backend="gloo")
-
-
-def test_setup_distributed_defaults_tp_cp_to_one_and_uses_cpu_mesh_when_backend_not_nccl(monkeypatch):
-    fake_dist = SimpleNamespace(is_available=lambda: True, is_initialized=lambda: True)
-    monkeypatch.setattr(mfsdp, "dist", fake_dist, raising=True)
-
-    mesh = MagicMock()
-    init_device_mesh_mock = MagicMock(return_value=mesh)
-    monkeypatch.setattr(mfsdp, "init_device_mesh", init_device_mesh_mock, raising=True)
-
-    mgr = mfsdp.MegatronFSDPManager(tp_size=0, cp_size=0, dp_size=None, world_size=4, backend="gloo")
-
-    assert mgr.tp_size == 1
-    assert mgr.cp_size == 1
-    assert mgr.dp_size == 4
-    assert mgr.device_mesh is mesh
-
-    init_device_mesh_mock.assert_called_once()
-    call_kwargs = init_device_mesh_mock.call_args.kwargs
-    assert call_kwargs["device_type"] == "cpu"
-    assert call_kwargs["mesh_shape"] == (4, 1, 1)
-    assert call_kwargs["mesh_dim_names"] == ("dp", "cp", "tp")
-
-
-def test_setup_distributed_infers_dp_size_and_flattens_dp_cp_when_cp_gt_one(monkeypatch):
-    fake_dist = SimpleNamespace(is_available=lambda: True, is_initialized=lambda: True)
-    monkeypatch.setattr(mfsdp, "dist", fake_dist, raising=True)
-
-    mesh = MagicMock()
-    tp_mesh = MagicMock()
-    tp_mesh.size.return_value = 2
-    dp_cp_mesh = MagicMock()
-
-    mesh.__getitem__.side_effect = lambda key: {
-        "tp": tp_mesh,
-        ("dp", "cp"): dp_cp_mesh,
-    }[key]
-
-    init_device_mesh_mock = MagicMock(return_value=mesh)
-    monkeypatch.setattr(mfsdp, "init_device_mesh", init_device_mesh_mock, raising=True)
-
-    mgr = mfsdp.MegatronFSDPManager(dp_size=None, tp_size=2, cp_size=2, world_size=8, backend="nccl")
-
-    # inferred dp_size so that dp * cp * tp == world_size
-    assert mgr.dp_size == 2
-    assert mgr.device_mesh is mesh
-
-    # backend="nccl" selects cuda mesh
-    init_device_mesh_mock.assert_called_once()
-    call_kwargs = init_device_mesh_mock.call_args.kwargs
-    assert call_kwargs["device_type"] == "cuda"
-    assert call_kwargs["mesh_shape"] == (2, 2, 2)
-
-    # cp_size > 1 triggers dp+cp flattening
-    dp_cp_mesh._flatten.assert_called_once_with(mesh_dim_name="dp_cp")
-
-
-def test_setup_distributed_raises_when_world_size_not_divisible_by_tp_times_cp(monkeypatch):
-    fake_dist = SimpleNamespace(is_available=lambda: True, is_initialized=lambda: True)
-    monkeypatch.setattr(mfsdp, "dist", fake_dist, raising=True)
-
-    with pytest.raises(ValueError, match="must be divisible by \\(tp_size \\* cp_size\\)"):
-        mfsdp.MegatronFSDPManager(dp_size=None, tp_size=3, cp_size=2, world_size=8, backend="gloo")
+def _make_manager(mesh, **config_kwargs):
+    """Helper to create a MegatronFSDPManager with a mock mesh and config overrides."""
+    config = MegatronFSDPConfig(**config_kwargs)
+    return mfsdp.MegatronFSDPManager(config=config, device_mesh=mesh)
 
 
 def test_parallelize_world_size_one_moves_to_cuda_bf16_and_enables_checkpointing_when_supported(monkeypatch):
-    fake_dist = SimpleNamespace(
-        is_available=lambda: True,
-        is_initialized=lambda: True,
-        get_world_size=lambda: 1,
-    )
-    monkeypatch.setattr(mfsdp, "dist", fake_dist, raising=True)
-    monkeypatch.setattr(mfsdp, "init_device_mesh", MagicMock(return_value=MagicMock()), raising=True)
+    monkeypatch.setattr(mfsdp, "dist", MagicMock(get_world_size=lambda: 1), raising=True)
 
-    mgr = mfsdp.MegatronFSDPManager(world_size=1, backend="gloo", activation_checkpointing=True)
+    mesh = MagicMock()
+    mgr = _make_manager(mesh, activation_checkpointing=True)
     model = _FakeModel(supports_gradient_checkpointing=True)
     optimizer = MagicMock()
 
@@ -136,22 +58,17 @@ def test_parallelize_world_size_one_moves_to_cuda_bf16_and_enables_checkpointing
     assert out_model is model
     assert out_opt is optimizer
 
-    # `.to("cuda").to(torch.bfloat16)` chain should be attempted even in CPU-only tests
+    # `.to("cuda").to(torch.bfloat16)` chain
     assert [args for (args, _kwargs) in model.to_calls] == [("cuda",), (torch.bfloat16,)]
     model.gradient_checkpointing_enable.assert_called_once_with()
     assert model.gradient_checkpointing_enabled is True
 
 
 def test_parallelize_world_size_one_logs_error_when_checkpointing_not_supported(monkeypatch, caplog):
-    fake_dist = SimpleNamespace(
-        is_available=lambda: True,
-        is_initialized=lambda: True,
-        get_world_size=lambda: 1,
-    )
-    monkeypatch.setattr(mfsdp, "dist", fake_dist, raising=True)
-    monkeypatch.setattr(mfsdp, "init_device_mesh", MagicMock(return_value=MagicMock()), raising=True)
+    monkeypatch.setattr(mfsdp, "dist", MagicMock(get_world_size=lambda: 1), raising=True)
 
-    mgr = mfsdp.MegatronFSDPManager(world_size=1, backend="gloo", activation_checkpointing=True)
+    mesh = MagicMock()
+    mgr = _make_manager(mesh, activation_checkpointing=True)
     model = _FakeModel(supports_gradient_checkpointing=False)
 
     caplog.set_level(logging.ERROR)
@@ -160,24 +77,15 @@ def test_parallelize_world_size_one_logs_error_when_checkpointing_not_supported(
 
 
 def test_parallelize_world_size_gt_one_selects_tp_plan_passes_dims_and_warns_on_nonzero3(monkeypatch, capsys, caplog):
-    fake_dist = SimpleNamespace(
-        is_available=lambda: True,
-        is_initialized=lambda: True,
-        get_world_size=lambda: 8,
-    )
-    monkeypatch.setattr(mfsdp, "dist", fake_dist, raising=True)
+    monkeypatch.setattr(mfsdp, "dist", MagicMock(get_world_size=lambda: 8), raising=True)
 
-    # Device mesh used by manager.parallelize
+    # Device mesh with tp > 1 and dp_cp flattened dim
     mesh = MagicMock()
     mesh.get_rank.return_value = 0
+    mesh.mesh_dim_names = ("dp_cp", "tp")
     tp_mesh = MagicMock()
     tp_mesh.size.return_value = 2
-    dp_cp_mesh = MagicMock()
-    mesh.__getitem__.side_effect = lambda key: {
-        "tp": tp_mesh,
-        ("dp", "cp"): dp_cp_mesh,
-    }[key]
-    monkeypatch.setattr(mfsdp, "init_device_mesh", MagicMock(return_value=mesh), raising=True)
+    mesh.__getitem__ = lambda self, key: tp_mesh if key == "tp" else MagicMock()
 
     # Plan selection and strategy call should be delegated
     tp_plan = {"some.layer": object()}
@@ -186,15 +94,7 @@ def test_parallelize_world_size_gt_one_selects_tp_plan_passes_dims_and_warns_on_
     monkeypatch.setattr(mfsdp, "_get_parallel_plan", get_plan_mock, raising=True)
     monkeypatch.setattr(mfsdp, "megatron_fsdp_strategy_parallelize", strat_mock, raising=True)
 
-    mgr = mfsdp.MegatronFSDPManager(
-        dp_size=None,
-        tp_size=2,
-        cp_size=2,
-        world_size=8,
-        backend="gloo",
-        activation_checkpointing=True,  # should log error but continue
-        zero_dp_strategy=2,  # triggers warning print on rank 0
-    )
+    mgr = _make_manager(mesh, activation_checkpointing=True, zero_dp_strategy=2)
 
     caplog.set_level(logging.ERROR)
     out_model, out_opt = mgr.parallelize(model=object(), optimizer="opt")
@@ -223,37 +123,31 @@ def test_parallelize_world_size_gt_one_selects_tp_plan_passes_dims_and_warns_on_
 
 
 def test_parallelize_world_size_gt_one_skips_tp_plan_when_tp_size_is_one(monkeypatch, capsys):
-    fake_dist = SimpleNamespace(
-        is_available=lambda: True,
-        is_initialized=lambda: True,
-        get_world_size=lambda: 2,
-    )
-    monkeypatch.setattr(mfsdp, "dist", fake_dist, raising=True)
+    monkeypatch.setattr(mfsdp, "dist", MagicMock(get_world_size=lambda: 2), raising=True)
 
     mesh = MagicMock()
     mesh.get_rank.return_value = 0
+    mesh.mesh_dim_names = ("dp", "cp", "tp")
     tp_mesh = MagicMock()
     tp_mesh.size.return_value = 1
-    mesh.__getitem__.side_effect = lambda key: {"tp": tp_mesh}[key]
-    monkeypatch.setattr(mfsdp, "init_device_mesh", MagicMock(return_value=mesh), raising=True)
+    mesh.__getitem__ = lambda self, key: tp_mesh if key == "tp" else MagicMock()
 
     get_plan_mock = MagicMock()
     strat_mock = MagicMock(return_value=("m", "o"))
     monkeypatch.setattr(mfsdp, "_get_parallel_plan", get_plan_mock, raising=True)
     monkeypatch.setattr(mfsdp, "megatron_fsdp_strategy_parallelize", strat_mock, raising=True)
 
-    mgr = mfsdp.MegatronFSDPManager(dp_size=2, tp_size=1, cp_size=1, world_size=2, backend="gloo")
+    mgr = _make_manager(mesh)
     out_model, out_opt = mgr.parallelize(model=object(), optimizer=object())
     assert (out_model, out_opt) == ("m", "o")
 
     # No TP -> do not ask for a TP plan
     get_plan_mock.assert_not_called()
 
-    # dp_shard_dim should be "dp" when cp_size == 1
+    # dp_shard_dim should be "dp" when dp_cp is not in mesh_dim_names
     strat_kwargs = strat_mock.call_args.kwargs
     assert strat_kwargs["tp_shard_plan"] is None
     assert strat_kwargs["dp_shard_dim"] == "dp"
 
     # zero_dp_strategy default is 3 -> no warning print
     assert capsys.readouterr().out == ""
-
