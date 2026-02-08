@@ -54,9 +54,6 @@ distributed:
 
 distributed_config:
   _target_: nemo_automodel.components.distributed.config.FSDP2Config
-  sequence_parallel: false
-  activation_checkpointing: false
-  defer_fsdp_grad_sync: true
 
 autopipeline:
   _target_: nemo_automodel.components.distributed.pipelining.config.PipelineConfig
