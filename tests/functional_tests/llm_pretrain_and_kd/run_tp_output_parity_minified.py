@@ -126,7 +126,7 @@ def _kl_divergence_from_logits(*, reference_logits: torch.Tensor, candidate_logi
     ref_log_probs = F.log_softmax(reference_logits.float(), dim=-1).reshape(-1, vocab_size)
     cand_log_probs = F.log_softmax(candidate_logits.float(), dim=-1).reshape(-1, vocab_size)
     # F.kl_div expects input=log(q), target=log(p) when log_target=True → KL(p || q)
-    return F.kl_div(cand_log_probs, ref_log_probs, reduction="none", log_target=True)
+    return F.kl_div(cand_log_probs, ref_log_probs, reduction="none", log_target=True).sum(-1)
 
 @dataclass(frozen=True)
 class _Case:
@@ -227,7 +227,6 @@ def _run_case(
     cfg, baseline = _build_minified_model(case.kind)
     baseline = baseline.to(device=device, dtype=torch.float32)
     baseline.eval()
-    print(baseline)
 
     # Deterministic inputs across ranks.
     torch.manual_seed(999)
