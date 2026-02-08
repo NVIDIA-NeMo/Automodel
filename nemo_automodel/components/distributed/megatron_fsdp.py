@@ -111,7 +111,7 @@ class MegatronFSDPManager:
             # Delegate plan selection to central helper. MegatronFSDP currently does not support SP.
             tp_shard_plan = _get_parallel_plan(
                 model,
-                sequence_parallel=False, # explicit: SP not supported here
+                sequence_parallel=False,  # explicit: SP not supported here
                 tp_shard_plan=None,
             )
         else:

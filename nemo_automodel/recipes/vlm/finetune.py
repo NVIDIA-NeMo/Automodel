@@ -18,7 +18,7 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -36,10 +36,10 @@ from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
-from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
+from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.device_mesh import create_device_mesh
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
