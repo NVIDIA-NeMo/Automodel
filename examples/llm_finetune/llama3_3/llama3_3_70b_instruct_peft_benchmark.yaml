@@ -32,6 +32,7 @@ model:
   pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
   torch_dtype: bf16
   trust_remote_code: true
+  force_hf: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
