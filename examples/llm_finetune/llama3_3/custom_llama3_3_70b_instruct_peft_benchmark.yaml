@@ -50,7 +50,7 @@ distributed:
   tp_size: 2
   cp_size: 1
   pp_size: 4
-  sequence_parallel: false
+  sequence_parallel: true
   activation_checkpointing: true
 
 autopipeline:

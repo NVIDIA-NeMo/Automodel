@@ -192,8 +192,11 @@ def create_pipeline_forward_causal_lm() -> Callable:
             outputs = None
 
         if hasattr(self, "lm_head") and self.lm_head is not None:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            logits = self.lm_head(hidden_states[:, slice_indices, :])
+            if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+                return self.lm_head(hidden_states)
+            else:
+                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+                logits = self.lm_head(hidden_states[:, slice_indices, :])
             return logits
         else:
             return hidden_states
