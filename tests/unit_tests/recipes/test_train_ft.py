@@ -216,15 +216,13 @@ def test_peft_with_pipeline_parallelism_enabled(caplog):
                             mock_shard_pp.return_value = mock_autopipeline
                             with caplog.at_level(logging.INFO):
                                 # This should NOT raise an assertion error
-                                # New API: no device param, returns 3-tuple
-                                model, optimizer, loss_fn = build_model_and_optimizer(
+                                # New API: no device param, returns 2-tuple
+                                model, optimizer = build_model_and_optimizer(
                                     cfg_model=cfg_model,
                                     cfg_opt=cfg_opt,
                                     cfg_peft=cfg_peft,
-                                    model_wrapper=None,
                                     seed=42,
                                     autopipeline=mock_autopipeline,
-                                    loss_fn=None,
                                 )
 
                                 # Verify that apply_lora was called
@@ -256,15 +254,13 @@ def test_peft_without_pipeline_parallelism(caplog):
                             mock_shard.return_value = DummyModel()
                             with caplog.at_level(logging.INFO):
                                 # This should work fine without PP
-                                # New API: no device param, returns 3-tuple
-                                model, optimizer, loss_fn = build_model_and_optimizer(
+                                # New API: no device param, returns 2-tuple
+                                model, optimizer = build_model_and_optimizer(
                                     cfg_model=cfg_model,
                                     cfg_opt=cfg_opt,
                                     cfg_peft=cfg_peft,
-                                    model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                                     seed=42,
                                     autopipeline=None,  # No pipeline parallelism
-                                    loss_fn=None,
                                 )
 
                             # Verify that apply_lora was called
@@ -294,16 +290,14 @@ def test_peft_with_tp_disables_triton(caplog):
                             mock_shard.return_value = DummyModel()
                             with caplog.at_level(logging.INFO):
                                 # Test with TP > 1
-                                # New API: no device param, returns 3-tuple
-                                model, optimizer, loss_fn = build_model_and_optimizer(
+                                # New API: no device param, returns 2-tuple
+                                model, optimizer = build_model_and_optimizer(
                                     cfg_model=cfg_model,
                                     cfg_opt=cfg_opt,
                                     cfg_peft=cfg_peft,
-                                    model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                                     seed=42,
                                     tp_size=2,  # Enable TP
                                     autopipeline=None,
-                                    loss_fn=None,
                                 )
 
                             # Verify that use_triton was disabled
@@ -392,15 +386,13 @@ def test_force_hf_true_disables_meta_init(monkeypatch):
     monkeypatch.setattr("nemo_automodel._transformers.auto_model._verify_sdpa_support", lambda *a, **k: None)
     monkeypatch.setattr("nemo_automodel._transformers.auto_model.print_trainable_parameters", lambda *a, **k: None)
 
-    # Call under test - new API: no device param, returns 3-tuple
-    model, optimizer, loss_fn = build_model_and_optimizer(
+    # Call under test - new API: no device param, returns 2-tuple
+    model, optimizer = build_model_and_optimizer(
         cfg_model=cfg_model,
         cfg_opt=cfg_opt,
         cfg_peft=cfg_peft,
-        model_wrapper=SimpleNamespace(parallelize=lambda m: m),
         seed=123,
         autopipeline=None,
-        loss_fn=None,
         parallelize_fn=None,
     )
 
@@ -462,12 +454,12 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         ),
     )
 
-    # Stub model/optimizer creation - new API returns 3-tuple (model, optimizer, loss_fn)
+    # Stub model/optimizer creation - new API returns 2-tuple (model, optimizer)
     dummy_model = DummyModel()
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
     monkeypatch.setattr(
         "nemo_automodel.recipes.llm.train_ft.build_model_and_optimizer",
-        lambda *a, **k: (dummy_model, [dummy_opt], "loss_fn"),
+        lambda *a, **k: (dummy_model, [dummy_opt]),
     )
 
     # Data-related stubs
@@ -583,10 +575,10 @@ def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
     parts = [DummyModel(), DummyModel()]
 
     def _build_model_and_optimizer_stub(*args, **kwargs):
-        # New API returns 3-tuple (model, optimizer, loss_fn)
+        # New API returns 2-tuple (model, optimizer)
         ap = DummyAutoPipeline(parts=parts, info=SimpleNamespace(has_last_stage=False, has_first_stage=False, schedule=None))
         dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
-        return ap, [dummy_opt], "loss_fn"
+        return ap, [dummy_opt]
 
     # Override the default stub to return a pipeline-wrapped model
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model_and_optimizer", _build_model_and_optimizer_stub)
@@ -1042,15 +1034,13 @@ def test_build_model_state_dict_keys_uses_adapter(caplog):
         with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
                 with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
-                    # New API: no device param, returns 3-tuple
-                    model, optimizer, loss_fn = build_model_and_optimizer(
+                    # New API: no device param, returns 2-tuple
+                    model, optimizer = build_model_and_optimizer(
                         cfg_model=cfg_model,
                         cfg_opt=cfg_opt,
                         cfg_peft=cfg_peft,
-                        model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                         seed=42,
                         autopipeline=None,
-                        loss_fn=None,
                     )
 
     # Model should be instantiated
@@ -1070,15 +1060,13 @@ def test_build_model_state_dict_keys_without_adapter():
         with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
                 with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
-                    # New API: no device param, returns 3-tuple
-                    model, optimizer, loss_fn = build_model_and_optimizer(
+                    # New API: no device param, returns 2-tuple
+                    model, optimizer = build_model_and_optimizer(
                         cfg_model=cfg_model,
                         cfg_opt=cfg_opt,
                         cfg_peft=cfg_peft,
-                        model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                         seed=42,
                         autopipeline=None,
-                        loss_fn=None,
                     )
 
     # Model should be instantiated
@@ -1113,15 +1101,13 @@ def test_build_model_with_quantized_model_config():
         with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
                 with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
-                    # New API: no device param, returns 3-tuple
-                    model, optimizer, loss_fn = build_model_and_optimizer(
+                    # New API: no device param, returns 2-tuple
+                    model, optimizer = build_model_and_optimizer(
                         cfg_model=cfg_model,
                         cfg_opt=cfg_opt,
                         cfg_peft=cfg_peft,
-                        model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                         seed=42,
                         autopipeline=None,
-                        loss_fn=None,
                     )
 
     # Model should be instantiated with quantization config
@@ -1141,15 +1127,13 @@ def test_build_model_without_quant_config():
         with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
                 with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
-                    # New API: no device param, returns 3-tuple
-                    model, optimizer, loss_fn = build_model_and_optimizer(
+                    # New API: no device param, returns 2-tuple
+                    model, optimizer = build_model_and_optimizer(
                         cfg_model=cfg_model,
                         cfg_opt=cfg_opt,
                         cfg_peft=cfg_peft,
-                        model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                         seed=42,
                         autopipeline=None,
-                        loss_fn=None,
                     )
 
     # Model should be instantiated without quantization config
@@ -1173,15 +1157,13 @@ def test_build_model_disables_foreach_with_tp():
         with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
                 with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
-                    model, optimizer, loss_fn = build_model_and_optimizer(
+                    model, optimizer = build_model_and_optimizer(
                         cfg_model=cfg_model,
                         cfg_opt=cfg_opt,
                         cfg_peft=None,
-                        model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                         seed=42,
                         tp_size=2,  # TP > 1
                         autopipeline=None,
-                        loss_fn=None,
                     )
 
     # Verify foreach was disabled
@@ -1189,8 +1171,8 @@ def test_build_model_disables_foreach_with_tp():
 
 
 @requires_cuda
-def test_build_model_returns_model_optimizer_loss_fn_tuple():
-    """Test that build_model_and_optimizer returns (model, optimizer, loss_fn) 3-tuple."""
+def test_build_model_returns_model_optimizer_tuple():
+    """Test that build_model_and_optimizer returns (model, optimizer) 2-tuple."""
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig()
 
@@ -1202,16 +1184,14 @@ def test_build_model_returns_model_optimizer_loss_fn_tuple():
                         cfg_model=cfg_model,
                         cfg_opt=cfg_opt,
                         cfg_peft=None,
-                        model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                         seed=42,
                         autopipeline=None,
-                        loss_fn=MagicMock(),
                     )
 
-    # Should return 3-tuple
+    # Should return 2-tuple
     assert isinstance(result, tuple)
-    assert len(result) == 3
-    model, optimizer, loss_fn = result
+    assert len(result) == 2
+    model, optimizer = result
     assert model is not None
     assert optimizer is not None
 

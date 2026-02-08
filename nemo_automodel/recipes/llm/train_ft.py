@@ -141,7 +141,7 @@ def build_model_and_optimizer(
     cfg_qat=None,
     cfg_moe=None,
     unfreeze_modules: list[str] | None = None,
-) -> tuple[nn.Module | AutoPipeline, list["Optimizer"], nn.Module]:  # noqa: F821
+) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
 
@@ -163,11 +163,8 @@ def build_model_and_optimizer(
         unfreeze_modules: List of module names/substrings to unfreeze.
 
     Returns:
-        Tuple of (model, optimizer_list, loss_fn).
+        Tuple of (model, optimizer_list).
     """
-    # Extract loss_fn from pipeline_config if provided
-    loss_fn = pipeline_config.loss_fn if pipeline_config is not None else None
-
     with ScopedRNG(seed=seed, ranked=True):
         kwargs = {
             "has_packed_sequence": has_packed_sequence,
@@ -224,10 +221,6 @@ def build_model_and_optimizer(
                 **kwargs,
             )
 
-    if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
-        logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
-        loss_fn = MaskedCrossEntropy()
-
     # Explicitly unfreeze specified modules (e.g. task heads) that need full fine-tuning
     if unfreeze_modules:
         for name, param in model.named_parameters():
@@ -253,7 +246,7 @@ def build_model_and_optimizer(
             fully_shard_optimizer(model, optimizer)
         optimizer = [optimizer]
 
-    return model, optimizer, loss_fn
+    return model, optimizer
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
@@ -891,7 +884,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
-        model, self.optimizer, self.loss_fn = build_model_and_optimizer(
+        model, self.optimizer = build_model_and_optimizer(
             self.cfg.model,
             self.cfg.optimizer,
             self.peft_config,
@@ -907,6 +900,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_qat=self.cfg.get("qat", None),
             cfg_moe=self.cfg.get("moe_config", None),
         )
+
+        if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
+            logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
+            self.loss_fn = MaskedCrossEntropy()
 
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts

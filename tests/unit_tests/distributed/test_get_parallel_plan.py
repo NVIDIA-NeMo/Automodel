@@ -171,25 +171,6 @@ def test_hf_fallback_sequence_parallel_assert(monkeypatch):
     assert "model.norm" in result
 
 
-def test_use_hf_tp_plan_sp_false(monkeypatch):
-    """Explicit HF plan when requested and SP=False returns HF plan."""
-    sentinel = {"hf": "plan"}
-    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda m: sentinel, raising=True)
-    _set_global_model_cls(monkeypatch, _DummyModel)
-
-    result = _get_parallel_plan(_DummyModel(), sequence_parallel=False, use_hf_tp_plan=True)
-    assert result is sentinel
-
-
-def test_use_hf_tp_plan_sp_true_assert(monkeypatch):
-    """Explicit HF plan with SP=True should assert."""
-    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda m: {"hf": "plan"}, raising=True)
-    _set_global_model_cls(monkeypatch, _DummyModel)
-
-    with pytest.raises(AssertionError):
-        _get_parallel_plan(_DummyModel(), sequence_parallel=True, use_hf_tp_plan=True)
-
-
 def test_optimised_plan_and_hf_both_fail_raises_sp_false(monkeypatch):
     """Optimised plan raises and HF raises → runtime error (SP=False)."""
     def _broken_fn(model, seq):

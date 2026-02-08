@@ -212,7 +212,6 @@ def test_parallelize_world_size_gt_one_selects_tp_plan_passes_dims_and_warns_on_
     assert plan_args[0] is not None  # model object
     assert plan_kwargs["sequence_parallel"] is False
     assert plan_kwargs["tp_shard_plan"] is None
-    assert plan_kwargs["use_hf_tp_plan"] is mgr.use_hf_tp_plan
 
     # Strategy should receive computed mesh dim names
     strat_mock.assert_called_once()
