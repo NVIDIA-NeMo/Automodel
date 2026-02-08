@@ -11,3 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from nemo_automodel.components.distributed.config import FSDP2Config, MegatronFSDPConfig, DDPConfig
+
+__all__ = ["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]
