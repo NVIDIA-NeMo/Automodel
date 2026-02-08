@@ -127,19 +127,6 @@ class PipelineConfig:
         self.scale_grads_in_schedule = scale_grads_in_schedule
         self.loss_fn = loss_fn
 
-    @classmethod
-    def from_config_node(cls, config_node) -> "PipelineConfig":
-        """Create PipelineConfig from a configuration node (e.g., Hydra config)."""
-        if config_node is None:
-            return cls()
-
-        kwargs = {}
-        for field_name in cls.__dataclass_fields__:
-            if hasattr(config_node, field_name):
-                kwargs[field_name] = getattr(config_node, field_name)
-
-        return cls(**kwargs)
-
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
         return {

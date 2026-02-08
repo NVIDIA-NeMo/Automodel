@@ -74,25 +74,6 @@ class QATConfig:
         self.quantizer_type = quantizer_type
         self.quantizer_kwargs = quantizer_kwargs
 
-    @classmethod
-    def from_config_node(cls, config_node) -> "QATConfig":
-        """Create QATConfig from a configuration node (e.g., Hydra config)."""
-        if config_node is None:
-            return cls()
-
-        kwargs = {}
-        if hasattr(config_node, "__iter__"):
-            for key in config_node:
-                kwargs[key] = getattr(config_node, key)
-        else:
-            for field_name in cls.__dataclass_fields__:
-                if hasattr(config_node, field_name):
-                    kwargs[field_name] = getattr(config_node, field_name)
-
-        # Remove _target_ if present (used by config loader, not by QATConfig)
-        kwargs.pop("_target_", None)
-        return cls(**kwargs)
-
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
         return {

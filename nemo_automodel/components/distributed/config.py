@@ -101,19 +101,6 @@ class FSDP2Config:
         self.defer_fsdp_grad_sync = defer_fsdp_grad_sync
         self.backend = backend
 
-    @classmethod
-    def from_config_node(cls, config_node) -> "FSDP2Config":
-        """Create FSDP2Config from a configuration node (e.g., Hydra config)."""
-        if config_node is None:
-            return cls()
-
-        kwargs = {}
-        for field_name in cls.__dataclass_fields__:
-            if hasattr(config_node, field_name):
-                kwargs[field_name] = getattr(config_node, field_name)
-
-        return cls(**kwargs)
-
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
         return {
@@ -222,19 +209,6 @@ class MegatronFSDPConfig:
         self.activation_checkpointing = activation_checkpointing
         self.backend = backend
 
-    @classmethod
-    def from_config_node(cls, config_node) -> "MegatronFSDPConfig":
-        """Create MegatronFSDPConfig from a configuration node (e.g., Hydra config)."""
-        if config_node is None:
-            return cls()
-
-        kwargs = {}
-        for field_name in cls.__dataclass_fields__:
-            if hasattr(config_node, field_name):
-                kwargs[field_name] = getattr(config_node, field_name)
-
-        return cls(**kwargs)
-
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
         return {
@@ -281,19 +255,6 @@ class DDPConfig:
     ):
         self.activation_checkpointing = activation_checkpointing
         self.backend = backend
-
-    @classmethod
-    def from_config_node(cls, config_node) -> "DDPConfig":
-        """Create DDPConfig from a configuration node (e.g., Hydra config)."""
-        if config_node is None:
-            return cls()
-
-        kwargs = {}
-        for field_name in cls.__dataclass_fields__:
-            if hasattr(config_node, field_name):
-                kwargs[field_name] = getattr(config_node, field_name)
-
-        return cls(**kwargs)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""

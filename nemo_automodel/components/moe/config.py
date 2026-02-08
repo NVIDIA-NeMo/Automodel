@@ -66,19 +66,6 @@ class MoEParallelizerConfig:
         self.lm_head_precision = lm_head_precision
         self.wrap_outer_model = wrap_outer_model
 
-    @classmethod
-    def from_config_node(cls, config_node) -> "MoEParallelizerConfig":
-        """Create MoEParallelizerConfig from a configuration node (e.g., Hydra config)."""
-        if config_node is None:
-            return cls()
-
-        kwargs = {}
-        for field_name in cls.__dataclass_fields__:
-            if hasattr(config_node, field_name):
-                kwargs[field_name] = getattr(config_node, field_name)
-
-        return cls(**kwargs)
-
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
         return {
