@@ -69,6 +69,15 @@ if TYPE_CHECKING:
     from nemo_automodel.components.utils.compile_utils import CompileConfig
 
 #  Re-exports from sibling modules (backward compatibility)
+from nemo_automodel._transformers.infrastructure import (  # noqa: E402, F401
+    MeshContext,
+    _apply_peft_and_lower_precision,
+    _shard_ep_fsdp,
+    _shard_pp,
+    apply_model_infrastructure,
+    instantiate_infrastructure,
+    parallelize_for_pp,
+)
 from nemo_automodel._transformers.kernel_patches import (  # noqa: E402, F401
     DEFAULT_ATTN_IMPLEMENTATION,
     HAS_FA,
@@ -92,15 +101,6 @@ from nemo_automodel._transformers.model_init import (  # noqa: E402, F401
     get_hf_config,
     get_is_hf_model,
     local_torch_dtype,
-)
-from nemo_automodel._transformers.infrastructure import (  # noqa: E402, F401
-    MeshContext,
-    _apply_peft_and_lower_precision,
-    _shard_ep_fsdp,
-    _shard_pp,
-    apply_model_infrastructure,
-    instantiate_infrastructure,
-    parallelize_for_pp,
 )
 
 logger = logging.getLogger(__name__)
@@ -267,7 +267,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         try:
             if use_sdpa_patching and not is_custom_model:
-                model = _patch_attention(model, sdpa_method)
+                model = _patch_attention(model, sdpa_method)  # noqa: F821
         except Exception:
             logger.warning("Retrying without SDPA patching.")
             return _retry(use_sdpa_patching=False)

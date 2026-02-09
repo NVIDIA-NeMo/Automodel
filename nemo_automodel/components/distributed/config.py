@@ -35,7 +35,7 @@ Usage:
     config = DDPConfig(activation_checkpointing=True)
 """
 
-from dataclasses import InitVar, dataclass, field, fields
+from dataclasses import InitVar, dataclass, fields
 from typing import Any, Dict, List, Optional, Union
 
 import torch

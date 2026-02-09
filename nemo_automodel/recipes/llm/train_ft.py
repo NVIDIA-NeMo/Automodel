@@ -34,12 +34,12 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from wandb import Settings
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM, NeMoAutoModelForSequenceClassification
+from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.infrastructure import (
     MeshContext,
     apply_model_infrastructure,
     instantiate_infrastructure,
 )
-from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,

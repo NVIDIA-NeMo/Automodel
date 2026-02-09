@@ -15,16 +15,11 @@
 """MoE parallelizer configuration."""
 
 from dataclasses import dataclass, fields
-from typing import Any, Dict, Optional, Union
-
-import torch
-from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Dict, Literal, Optional, Union
 
 import torch
 
 from nemo_automodel.shared.utils import dtype_from_str
-
 
 
 @dataclass
