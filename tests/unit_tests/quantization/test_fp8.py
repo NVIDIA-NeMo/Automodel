@@ -15,7 +15,7 @@
 import pytest
 import torch
 import torch.nn as nn
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from nemo_automodel.components.quantization.fp8 import (
     FP8Config,
@@ -67,38 +67,6 @@ class TestFP8Config:
         config = FP8Config()
         # enabled should still be False from the dataclass field default
         assert config.enabled is False
-    
-    def test_from_config_node_with_none(self):
-        """Test from_config_node with None returns default config."""
-        config = FP8Config.from_config_node(None)
-        assert isinstance(config, FP8Config)
-        assert config.enabled is False
-        assert config.recipe_name is None
-        assert config.enable_fsdp_float8_all_gather is False
-        assert config.filter_fqns == []
-    
-    def test_from_config_node_with_mock_node(self):
-        """Test from_config_node with mock config node."""
-        # Create a mock config node
-        mock_node = MagicMock()
-        mock_node.enabled = True
-        mock_node.recipe_name = "rowwise"
-        mock_node.enable_fsdp_float8_all_gather = True
-        mock_node.filter_fqns = ["lm_head"]
-        mock_node.emulate = True
-        
-        # Mock hasattr to return True for these fields
-        def mock_hasattr(obj, attr):
-            return attr in ['enabled', 'recipe_name', 'enable_fsdp_float8_all_gather', 'filter_fqns', 'emulate']
-        
-        with patch('builtins.hasattr', side_effect=mock_hasattr):
-            config = FP8Config.from_config_node(mock_node)
-        
-        assert config.enabled is True
-        assert config.recipe_name == "rowwise"
-        assert config.enable_fsdp_float8_all_gather is True
-        assert config.filter_fqns == ["lm_head"]
-        assert config.emulate is True
     
     def test_to_dict_conversion(self):
         """Test to_dict method converts config to legacy format."""

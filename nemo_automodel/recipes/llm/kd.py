@@ -71,10 +71,9 @@ def _build_teacher_model(
     cfg_teacher,
     seed,
     has_packed_sequence,
-    model_wrapper,
-    tp_size=1,
-    cp_size=1,
-    parallelize_fn=None,
+    device_mesh=None,
+    moe_mesh=None,
+    distributed_config=None,
     device=None,
 ):
     """Build and initialize the teacher model for knowledge distillation.
@@ -86,10 +85,9 @@ def _build_teacher_model(
         cfg_teacher: Configuration for teacher model instantiation.
         seed: Random seed for reproducibility.
         has_packed_sequence: Whether using packed sequences.
-        model_wrapper: Parallelism wrapper (FSDP2Manager, etc.).
-        tp_size: Tensor parallelism size.
-        cp_size: Context parallelism size.
-        parallelize_fn: Custom parallelization function.
+        device_mesh: Device mesh for distributed training.
+        moe_mesh: MOE mesh for expert parallelism.
+        distributed_config: Strategy-specific distributed config.
         device: Device to place the teacher model on.
 
     Returns:
@@ -107,11 +105,10 @@ def _build_teacher_model(
     # but without PEFT/FP8/QAT (teacher should be frozen in full precision)
     with ScopedRNG(seed=seed, ranked=True):
         kwargs: Dict[str, Any] = {
-            "tp_size": tp_size,
-            "cp_size": cp_size,
             "has_packed_sequence": has_packed_sequence,
-            "model_wrapper": model_wrapper,
-            "parallelize_fn": parallelize_fn,
+            "device_mesh": device_mesh,
+            "moe_mesh": moe_mesh,
+            "distributed_config": distributed_config,
         }
 
         teacher_model = cfg_teacher.instantiate(**kwargs)
@@ -166,10 +163,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             cfg_teacher=self.cfg.get("teacher_model", None),
             seed=self.cfg.get("seed", 42),
             has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
-            model_wrapper=self.model_wrapper,
-            tp_size=self.cfg.get("distributed.tp_size", 1),
-            cp_size=self.cfg.get("distributed.cp_size", 1),
-            parallelize_fn=getattr(self.cfg.get("parallelizer", None), "instantiate", None),
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            distributed_config=self.distributed_config,
             device=teacher_device,
         )
         logger.info("Teacher Model: " + str(self.teacher_model))
@@ -204,7 +200,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             get_sync_ctx(
                 model,
                 idx == num_batches - 1,
-                defer_fsdp_grad_sync=getattr(self.model_wrapper, "defer_fsdp_grad_sync", True),
+                defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
             )
             if is_train
             else nullcontext()
