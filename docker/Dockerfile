@@ -34,7 +34,9 @@ FROM ${PYTORCH_IMAGE} AS pytorch
 
 FROM ${BASE_IMAGE} AS update_base_container
 
+ENV PIP_NO_CACHE_DIR=1
 WORKDIR /opt
+
 # Install uv
 ENV UV_VERSION="0.8.22"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
@@ -50,6 +52,8 @@ RUN if [ -f /usr/local/bin/torchrun ]; then \
         sed -i '1c\#!/opt/venv/bin/python3' /usr/local/bin/torchrun; \
     fi
 
+FROM update_base_container AS automodel_dep
+
 # Install TE
 ARG INSTALL_TE=False
 ARG TE_COMMIT=release_v2.11
@@ -62,46 +66,6 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     pip install nvidia-mathdx==25.1.1 && \
     env NVTE_CUDA_ARCHS="80;90;100;120" NVTE_BUILD_THREADS_PER_JOB=8 pip install --no-cache-dir --no-build-isolation -v . && \
     cd ../ && rm -rf TransformerEngine; \
-    fi
-
-FROM update_base_container AS automodel_dep
-
-# Install Grouped Gemm
-RUN pip install --no-build-isolation git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
-
-# Install Mamba
-ARG INSTALL_MAMBA=False
-ARG MAMBA_COMMIT=6b32be06d026e170b3fdaf3ae6282c5a6ff57b06
-RUN if [ "$INSTALL_MAMBA" = "True" ]; then \
-    git clone https://github.com/Dao-AILab/causal-conv1d.git && \
-    cd causal-conv1d && \
-    git checkout v1.5.3 && \
-    CAUSAL_CONV1D_FORCE_BUILD=TRUE pip install --no-build-isolation -v . && \
-    cd ../ && rm -rf causal-conv1d && \
-    git clone https://github.com/state-spaces/mamba.git && \
-    cd mamba && \
-    git checkout $MAMBA_COMMIT && \
-    sed -i "/triton/d" setup.py && \
-    sed -i "/triton/d" pyproject.toml && \
-    pip install --no-build-isolation -v . && \
-    cd ../ && rm -rf mamba; \
-    fi
-
-# Install Bitsandbytes
-ARG INSTALL_BITSANDBYTES=False
-ARG BITSANDBYTES_COMMIT=0.48.2
-RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
-    git clone https://github.com/bitsandbytes-foundation/bitsandbytes.git && \
-    cd bitsandbytes && \
-    git pull && \
-    git fetch origin $DEEPEP_COMMIT && \
-    git checkout FETCH_HEAD && \
-    cmake -DCOMPUTE_BACKEND=cuda -DCOMPUTE_CAPABILITY="80;86;90;100;110" -S . && \
-    make && \
-    cmake -DCOMPUTE_BACKEND=cpu -S . && \
-    make && \
-    pip install . && \
-    cd ../ && rm -rf bitsandbytes; \
     fi
 
 # Install Deepep
@@ -121,6 +85,14 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     rm -rf DeepEP; \
     fi
 
+# Address base image CVE
+RUN pip install "aiohttp>=3.13.3" \
+        "jaraco-context>=6.1.0" \
+        "protobuf>=6.3.5" \
+        "setuptools>=80.10.2" \
+        "urllib3>=2.6.0" \
+        "wheel>=0.46.2"
+
 FROM automodel_dep as automodel_final
 
 WORKDIR /opt/Automodel
@@ -128,6 +100,7 @@ WORKDIR /opt/Automodel
 COPY pyproject.toml uv.lock /opt/Automodel/
 COPY nemo_automodel/__init__.py nemo_automodel/package_info.py /opt/Automodel/nemo_automodel/
 COPY docker/common/uv-pytorch.toml docker/common/uv-pytorch.lock /opt/Automodel/docker/common/
+COPY docker/common/update_pyproject_pytorch.sh /opt/Automodel/docker/common/
 
 # Install Automodel
 ARG BASE_IMAGE=cuda
@@ -136,11 +109,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     --mount=type=cache,target=/root/.cache/uv \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \
-        sed -i '/\[tool\.uv\]/r /opt/Automodel/docker/common/uv-pytorch.toml' pyproject.toml && \
-        mv /opt/Automodel/docker/common/uv-pytorch.lock /opt/Automodel/uv.lock; \
+        bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi && \
     uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups && \
-    uv cache prune
+    uv cache prune --ci
 
 COPY . /opt/Automodel
 

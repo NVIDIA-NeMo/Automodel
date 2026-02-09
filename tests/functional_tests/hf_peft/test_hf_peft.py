@@ -22,6 +22,7 @@ HF_PEFT_Triton_FSDP2_CHECKPOINT_FILENAME = "L2_HF_PEFT_Triton_FSDP2_Checkpoint.s
 HF_PEFT_VLM_FSDP2_CHECKPOINT_FILENAME = "L2_HF_PEFT_VLM_FSDP2_Checkpoint.sh"
 HF_QLORA_TINY_FILENAME = "L2_HF_QLORA_Tiny.sh"
 HF_PEFT_DEEPSEEK_MOE_LORA_FILENAME = "L2_HF_PEFT_DeepSeek_MoE_LoRA.sh"
+HF_PEFT_DORA_FSDP2_CHECKPOINT_FILENAME = "L2_HF_PEFT_DoRA_FSDP2_Checkpoint.sh"
 
 class TestHFPEFT:
     def test_hf_peft_fsdp2_checkpoint(self):
@@ -61,6 +62,13 @@ class TestHFPEFT:
     def test_hf_peft_deepseek_moe_lora(self):
         try:
             run_test_script(TEST_FOLDER, HF_PEFT_DEEPSEEK_MOE_LORA_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_hf_peft_dora_fsdp2_checkpoint(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_PEFT_DORA_FSDP2_CHECKPOINT_FILENAME)
         finally:
             # remove the checkpoint directory
             shutil.rmtree("checkpoints/", ignore_errors=True)

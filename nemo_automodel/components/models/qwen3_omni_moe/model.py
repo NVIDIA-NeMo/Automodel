@@ -28,10 +28,11 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.qwen3_moe.model import Block
 from nemo_automodel.components.models.qwen3_omni_moe.state_dict_adapter import Qwen3OmniMoeStateDictAdapter
+from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -173,7 +174,9 @@ class Qwen3OmniMoeThinkerTextModel(
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class Qwen3OmniMoeThinkerForConditionalGeneration(HFQwen3OmniMoeThinkerForConditionalGeneration, MoEFSDPSyncMixin):
+class Qwen3OmniMoeThinkerForConditionalGeneration(
+    HFCheckpointingMixin, HFQwen3OmniMoeThinkerForConditionalGeneration, MoEFSDPSyncMixin
+):
     """Qwen3OmniMoe Thinker for Conditional Generation with multimodal support."""
 
     @classmethod

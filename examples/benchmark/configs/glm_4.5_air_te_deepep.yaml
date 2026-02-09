@@ -72,14 +72,14 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    enable_deepep: true
+    experts: gmm
+    dispatcher: deepep
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
 checkpoint:
   enabled: false
-  load_base_model: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

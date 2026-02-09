@@ -18,6 +18,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.recipes.base_recipe import BaseRecipe, _find_latest_checkpoint
 from nemo_automodel.components.config.loader import ConfigNode
 
@@ -57,11 +58,11 @@ def _patch_checkpoint_ops(monkeypatch):
             self.pp_rank = pp_rank
             self.moe_mesh = moe_mesh
 
-        def save_model(self, model, path, peft_config=None, tokenizer=None):
+        def save_model(self, model=None, weights_path=None, peft_config=None, tokenizer=None):
             """Save model state dict."""
             if model is None:
                 return
-            model_dir = os.path.join(path, "model")
+            model_dir = os.path.join(weights_path, "model")
             os.makedirs(model_dir, exist_ok=True)
             torch.save(model.state_dict(), os.path.join(model_dir, "model.pt"))
 
@@ -131,6 +132,15 @@ class _DummyStateful:
         self.foo = state["foo"].clone()
 
 
+class _ToyModel(HFCheckpointingMixin, nn.Linear):
+    """
+    Toy model that inherits from HFCheckpointingMixin for testing save_pretrained.
+    """
+
+    def __init__(self, in_features, out_features, bias=False):
+        nn.Linear.__init__(self, in_features, out_features, bias=bias)
+
+
 class _ToyRecipe(BaseRecipe):
     """
     Minimal concrete implementation of BaseRecipe for testing.
@@ -160,7 +170,7 @@ class _ToyRecipe(BaseRecipe):
             moe_mesh=None,
         )
 
-        self.model = nn.Linear(2, 2, bias=False)
+        self.model = _ToyModel(2, 2, bias=False)
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.1)
         self.custom_state = _DummyStateful()
         self.peft_config = None

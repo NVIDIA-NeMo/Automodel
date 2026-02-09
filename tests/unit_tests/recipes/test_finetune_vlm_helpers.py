@@ -22,7 +22,6 @@ from contextlib import nullcontext
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
-    _freeze_model,
     _get_model_name,
     build_model_and_optimizer,
 )
@@ -73,6 +72,8 @@ class DummyModel(nn.Module):
         self.embedding = nn.Embedding(10, 4)
         # expose as attribute so apply_parameter_freezing can find it
         self.language_model = nn.Linear(4, 4)
+        # Add config attribute like HF models have
+        self.config = SimpleNamespace()
 
     def forward(self, x):  # pragma: no cover – not needed for these unit tests
         return self.language_model(self.embedding(x))
@@ -94,6 +95,11 @@ class DummyOptConfig:
 class DummyModelConfig:
     """Mimics the Hydra/OmegaConf model config with an *instantiate* method."""
 
+    def __init__(self):
+        from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+        # Add _target_ to make the config valid for VLM finetuning
+        self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
     def instantiate(self, **kwargs):
         return DummyModel()
 
@@ -102,73 +108,25 @@ class DummyModelConfig:
 
 
 # -----------------------------------------------------------------------------
-# _freeze_model
-# -----------------------------------------------------------------------------
-
-def test_freeze_model_embedding_only():
-    """When cfg_freeze is *None*, embeddings should be frozen by default."""
-    model = DummyModel()
-    assert model.embedding.weight.requires_grad  # sanity check – initially True
-
-    _freeze_model(model, cfg_freeze=None, freeze_embeddings=True)
-
-    # embedding weights must be frozen; linear layer should still train
-    assert not model.embedding.weight.requires_grad
-    assert model.language_model.weight.requires_grad
-
-
-def test_freeze_model_with_config(monkeypatch):
-    """Custom freeze config should be respected (freeze_language_model only)."""
-    model = DummyModel()
-
-    freeze_cfg = {
-        "freeze_embeddings": False,  # keep embeddings trainable
-        "freeze_language_model": True,
-    }
-
-    _freeze_model(model, cfg_freeze=freeze_cfg, freeze_embeddings=False)
-
-    # embedding remains trainable, language_model is frozen
-    assert model.embedding.weight.requires_grad
-    assert not model.language_model.weight.requires_grad
-
-
-# -----------------------------------------------------------------------------
 # build_model_and_optimizer
 # -----------------------------------------------------------------------------
 
 def test_build_model_and_optimizer_basic():
+    """Test basic build_model_and_optimizer for VLM.
+    Note: New API passes freeze_config to model instantiation instead of calling _freeze_model."""
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig(lr=0.01)
 
-    device = torch.device("cpu")
-    # Minimal checkpointer to satisfy build_model_and_optimizer signature
-    ckpt_cfg = CheckpointingConfig(
-        enabled=False,
-        checkpoint_dir="checkpoints/",
-        model_save_format="safetensors",
-        model_cache_dir=".",
-        model_repo_id="dummy/model",
-        save_consolidated=False,
-        is_peft=False,
-    )
-    checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
-    # Ensure meta init path is exercised and weights are materialized via checkpointer
-    def _load_base_model_stub(model, device, *args, **kwargs):
-        if hasattr(model, "to_empty"):
-            model.to_empty(device=device)
-    with patch.object(checkpointer, 'load_base_model', new=_load_base_model_stub):
-        model, _, optim = build_model_and_optimizer(
-            device=device,
+    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+        # New API: freeze_config is passed to model instantiation
+        model, optim, loss_fn = build_model_and_optimizer(
             cfg_model=cfg_model,
             cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
             model_wrapper=SimpleNamespace(parallelize=lambda m: m),
             seed=123,
-            checkpointer=checkpointer,
             tp_size=1,
-            freeze_embeddings=True,
         )
 
     # Check returned objects and their properties
@@ -177,16 +135,44 @@ def test_build_model_and_optimizer_basic():
     assert len(optim) == 1
     assert isinstance(optim[0], torch.optim.Optimizer)
 
-    # Model parameters should reside on the requested device
-    assert next(model.parameters()).device == device
 
-    # Embedding weights should be frozen by default
-    assert not model.embedding.weight.requires_grad
+def test_build_model_and_optimizer_passes_freeze_config():
+    """Test that freeze_config is passed to model instantiation."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 
-    # Optimizer should hold only trainable parameters
-    trainable_param_count = _count_trainable(model.parameters())
-    optim_param_count = sum(p.numel() for group in optim[0].param_groups for p in group["params"])
-    assert trainable_param_count == optim_param_count
+    captured_kwargs = {}
+
+    class CapturingModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
+        def instantiate(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = CapturingModelConfig()
+    cfg_opt = DummyOptConfig(lr=0.01)
+
+    class FreezeConfig:
+        def to_dict(self):
+            return {"freeze_embeddings": True, "freeze_language_model": False}
+
+    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+        model, optim, loss_fn = build_model_and_optimizer(
+            cfg_model=cfg_model,
+            cfg_opt=cfg_opt,
+            cfg_freeze=FreezeConfig(),
+            cfg_peft=None,
+            model_wrapper=None,
+            seed=123,
+        )
+
+    # Verify freeze_config was passed to model instantiation
+    assert "freeze_config" in captured_kwargs
+    assert captured_kwargs["freeze_config"] == {"freeze_embeddings": True, "freeze_language_model": False}
 
 
 # -----------------------------------------------------------------------------
@@ -407,6 +393,11 @@ class DummyModelWithAdapter(torch.nn.Module):
 class DummyModelConfigWithAdapter:
     """Mock model config that returns a model with state_dict_adapter."""
 
+    def __init__(self):
+        from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+        # Add _target_ to make the config valid for VLM finetuning
+        self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
     def instantiate(self, **kwargs):
         return DummyModelWithAdapter()
 
@@ -414,100 +405,89 @@ class DummyModelConfigWithAdapter:
         return getattr(self, key, default)
 
 
-def test_vlm_build_model_state_dict_keys_uses_adapter():
-    """Test that state_dict_keys are transformed using _maybe_adapt_state_dict_to_hf when adapter is present in VLM."""
+def test_vlm_build_model_with_adapter():
+    """Test that model with state_dict_adapter is properly instantiated in VLM."""
 
-    cfg_model = DummyModelConfigWithAdapter()
     cfg_opt = DummyOptConfig(lr=0.01)
 
-    device = torch.device("cpu")
-    ckpt_cfg = CheckpointingConfig(
-        enabled=False,
-        checkpoint_dir="checkpoints/",
-        model_save_format="safetensors",
-        model_cache_dir=".",
-        model_repo_id="dummy/model",
-        save_consolidated=False,
-        is_peft=False,
-        dequantize_base_checkpoint=False,
-    )
-    checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+    # Create a config that simulates NeMoAutoModel's internal infrastructure handling
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 
-    def _load_base_model_stub(model, device, *args, **kwargs):
-        if hasattr(model, "to_empty"):
-            model.to_empty(device=device)
+    class NeMoModelConfigWithAdapter:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
 
-    with patch.object(checkpointer, 'load_base_model', new=_load_base_model_stub):
-        model, state_dict_keys, optim = build_model_and_optimizer(
-            device=device,
+        def instantiate(self, **kwargs):
+            return DummyModelWithAdapter()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = NeMoModelConfigWithAdapter()
+
+    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+        model, optim, loss_fn = build_model_and_optimizer(
             cfg_model=cfg_model,
             cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
             model_wrapper=SimpleNamespace(parallelize=lambda m: m),
             seed=123,
-            checkpointer=checkpointer,
             tp_size=1,
-            freeze_embeddings=True,
         )
 
-    # Verify that state_dict_keys are transformed (should have 'vlm_transformed_' prefix)
-    assert len(state_dict_keys) > 0, "state_dict_keys should not be empty"
-    for key in state_dict_keys:
-        assert key.startswith("vlm_transformed_"), f"Key '{key}' should be transformed by adapter"
+    # Model should be instantiated with adapter
+    assert model is not None
+    assert hasattr(model, "state_dict_adapter")
 
 
-def test_vlm_build_model_state_dict_keys_without_adapter():
-    """Test that state_dict_keys are not transformed when no adapter is present in VLM."""
+def test_vlm_build_model_without_adapter():
+    """Test that model without state_dict_adapter is properly instantiated in VLM."""
 
-    cfg_model = DummyModelConfig()  # DummyModel has no state_dict_adapter
     cfg_opt = DummyOptConfig(lr=0.01)
 
-    device = torch.device("cpu")
-    ckpt_cfg = CheckpointingConfig(
-        enabled=False,
-        checkpoint_dir="checkpoints/",
-        model_save_format="safetensors",
-        model_cache_dir=".",
-        model_repo_id="dummy/model",
-        save_consolidated=False,
-        is_peft=False,
-        dequantize_base_checkpoint=False,
-    )
-    checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+    # Create a config that simulates NeMoAutoModel's internal infrastructure handling (no adapter)
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 
-    def _load_base_model_stub(model, device, *args, **kwargs):
-        if hasattr(model, "to_empty"):
-            model.to_empty(device=device)
+    class NeMoModelConfigNoAdapter:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
 
-    with patch.object(checkpointer, 'load_base_model', new=_load_base_model_stub):
-        model, state_dict_keys, optim = build_model_and_optimizer(
-            device=device,
+        def instantiate(self, **kwargs):
+            return DummyModel()  # No adapter
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = NeMoModelConfigNoAdapter()
+
+    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+        model, optim, loss_fn = build_model_and_optimizer(
             cfg_model=cfg_model,
             cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
             model_wrapper=SimpleNamespace(parallelize=lambda m: m),
             seed=123,
-            checkpointer=checkpointer,
             tp_size=1,
-            freeze_embeddings=True,
         )
 
-    # Verify that state_dict_keys are not transformed (no 'vlm_transformed_' prefix)
-    assert len(state_dict_keys) > 0, "state_dict_keys should not be empty"
-    for key in state_dict_keys:
-        assert not key.startswith("vlm_transformed_"), f"Key '{key}' should not be transformed without adapter"
+    # Model should be instantiated without adapter
+    assert model is not None
+    assert not hasattr(model, "state_dict_adapter")
 
 
-def test_vlm_build_model_infers_dequantize_from_model_config():
-    """Test that dequantize_base_checkpoint is inferred from model.config.quantization_config in VLM."""
+def test_vlm_build_model_with_quantization_config():
+    """Test that model with quantization_config is properly instantiated in VLM."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 
-    device = torch.device("cpu")
     cfg_opt = DummyOptConfig(lr=0.01)
 
-    # Create a model config that returns a model with quantization_config
+    # Create a model config that simulates NeMoAutoModel's internal infrastructure handling
     class DummyQuantizedVLMModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
         def instantiate(self, **kwargs):
             model = DummyModel()
             # Add a config attribute with quantization_config
@@ -519,79 +499,121 @@ def test_vlm_build_model_infers_dequantize_from_model_config():
 
     cfg_model = DummyQuantizedVLMModelConfig()
 
-    ckpt_cfg = CheckpointingConfig(
-        enabled=False,
-        checkpoint_dir="checkpoints/",
-        model_save_format="safetensors",
-        model_cache_dir=".",
-        model_repo_id="dummy/model",
-        save_consolidated=False,
-        is_peft=False,
-        dequantize_base_checkpoint=None,  # Should be inferred
-    )
-    checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
-
-    def _load_base_model_stub(model, device, *args, **kwargs):
-        if hasattr(model, "to_empty"):
-            model.to_empty(device=device)
-
-    with patch.object(checkpointer, 'load_base_model', new=_load_base_model_stub):
-        model, state_dict_keys, optim = build_model_and_optimizer(
-            device=device,
+    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+        model, optim, loss_fn = build_model_and_optimizer(
             cfg_model=cfg_model,
             cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
             model_wrapper=SimpleNamespace(parallelize=lambda m: m),
             seed=123,
-            checkpointer=checkpointer,
             tp_size=1,
-            freeze_embeddings=True,
         )
 
-    # Verify that dequantize_base_checkpoint was inferred as True
-    assert checkpointer.config.dequantize_base_checkpoint is True
+    # Model should be instantiated with quantization config
+    assert model is not None
+    assert hasattr(model.config, "quantization_config")
 
 
-def test_vlm_build_model_dequantize_defaults_to_false_without_quant_config():
-    """Test that dequantize_base_checkpoint defaults to False when VLM model has no quantization_config."""
+def test_vlm_build_model_without_quantization_config():
+    """Test that model without quantization_config is properly instantiated in VLM."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 
-    device = torch.device("cpu")
-    cfg_model = DummyModelConfig()  # DummyModel has no config.quantization_config
     cfg_opt = DummyOptConfig(lr=0.01)
 
-    ckpt_cfg = CheckpointingConfig(
-        enabled=False,
-        checkpoint_dir="checkpoints/",
-        model_save_format="safetensors",
-        model_cache_dir=".",
-        model_repo_id="dummy/model",
-        save_consolidated=False,
-        is_peft=False,
-        dequantize_base_checkpoint=None,  # Should be inferred as False
-    )
-    checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+    # Create a config that simulates NeMoAutoModel's internal infrastructure handling (no quant config)
+    class DummyNoQuantVLMModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
 
-    def _load_base_model_stub(model, device, *args, **kwargs):
-        if hasattr(model, "to_empty"):
-            model.to_empty(device=device)
+        def instantiate(self, **kwargs):
+            return DummyModel()  # DummyModel has no config.quantization_config
 
-    with patch.object(checkpointer, 'load_base_model', new=_load_base_model_stub):
-        model, state_dict_keys, optim = build_model_and_optimizer(
-            device=device,
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = DummyNoQuantVLMModelConfig()
+
+    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+        model, optim, loss_fn = build_model_and_optimizer(
             cfg_model=cfg_model,
             cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
             model_wrapper=SimpleNamespace(parallelize=lambda m: m),
             seed=123,
-            checkpointer=checkpointer,
             tp_size=1,
-            freeze_embeddings=True,
         )
 
-    # Verify that dequantize_base_checkpoint was inferred as False
-    assert checkpointer.config.dequantize_base_checkpoint is False
+    # Model should be instantiated without quantization config
+    assert model is not None
+    assert not hasattr(model.config, "quantization_config")
+
+
+# =============================================================================
+# New tests for VLM-specific build_model_and_optimizer functionality
+# =============================================================================
+
+
+def test_vlm_build_model_raises_value_error_for_non_nemo_auto_model():
+    """Test that VLM build_model_and_optimizer raises ValueError when target is not NeMoAutoModelForImageTextToText."""
+
+    # Create a cfg_model that targets something other than NeMoAutoModelForImageTextToText
+    class InvalidModelConfig:
+        def __init__(self):
+            self._target_ = "some.invalid.Target"
+
+        def instantiate(self, **kwargs):
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = InvalidModelConfig()
+    cfg_opt = DummyOptConfig(lr=0.01)
+
+    with pytest.raises(ValueError, match="VLM finetuning requires NeMoAutoModelForImageTextToText"):
+        build_model_and_optimizer(
+            cfg_model=cfg_model,
+            cfg_opt=cfg_opt,
+            cfg_freeze=None,
+            cfg_peft=None,
+            model_wrapper=None,
+            seed=42,
+        )
+
+
+def test_vlm_build_model_disables_foreach_with_tp():
+    """Test that when tp_size > 1, cfg_opt.foreach is set to False in VLM."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
+    class NeMoVLMModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
+        def instantiate(self, **kwargs):
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = NeMoVLMModelConfig()
+    cfg_opt = DummyOptConfig(lr=0.01)
+    cfg_opt.foreach = True  # Initially True
+
+    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+        model, optimizer, loss_fn = build_model_and_optimizer(
+            cfg_model=cfg_model,
+            cfg_opt=cfg_opt,
+            cfg_freeze=None,
+            cfg_peft=None,
+            model_wrapper=None,
+            seed=42,
+            tp_size=2,  # TP > 1
+        )
+
+    # Verify foreach was disabled
+    assert cfg_opt.foreach is False
 
 
 from nemo_automodel.recipes.vlm.finetune import (
@@ -795,7 +817,6 @@ class TestBuildCheckpointConfig:
             "checkpoint_dir": "/custom/ckpt/",
             "save_consolidated": False,
             "restore_from": "/some/path",  # Should be removed
-            "load_base_model": True,  # Should be removed
         }
 
         config = build_checkpoint_config(
@@ -823,6 +844,19 @@ class TestBuildCheckpointConfig:
                 model_repo_id="org/model",
                 is_peft=True,
             )
+
+    def test_build_checkpoint_config_uses_hf_hub_cache_when_cache_dir_none(self):
+        """Test that HF_HUB_CACHE is used when cache_dir is None."""
+        from huggingface_hub import constants as hf_constants
+
+        config = build_checkpoint_config(
+            cfg_ckpt=None,
+            cache_dir=None,
+            model_repo_id="org/model",
+            is_peft=False,
+        )
+
+        assert config.model_cache_dir == hf_constants.HF_HUB_CACHE
 
 
 # -----------------------------------------------------------------------------
@@ -1051,6 +1085,51 @@ class TestForwardBackwardStepPP:
             "input_ids": torch.randint(0, 100, (batch_size, 10)),
             "pixel_values": pixel_values,
             "image_grid_hws": image_grid_hws,
+        }
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=40,
+            num_batches=1,
+            is_train=True,
+        )
+
+        # Verify chunking happened correctly
+        model = pp_recipe.model_parts[0]
+        assert model._vlm_pixel_values_chunks is None  # Cleared after step
+        assert model._vlm_image_grid_hws_chunks is None
+        assert model._vlm_chunk_idx is None
+
+        # Verify schedule.step was called
+        pp_recipe.pp.info.schedule.step.assert_called_once()
+
+        # Verify loss was computed
+        assert len(loss_buffer) == 1
+
+    def test_pp_vlm_chunking_with_image_grid_thw(self, pp_recipe, monkeypatch):
+        """Test VLM pixel_values chunking with image_grid_thw (3D grid) instead of image_grid_hws."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+        )
+
+        batch_size = 4
+        n_images = 4
+        # image_grid_thw: 4 images with T, H, W dimensions (uses .prod(dim=1) for patch counts)
+        image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 3], [1, 4, 4]])  # patch counts: 4, 9, 6, 16
+        total_patches = 4 + 9 + 6 + 16  # = 35
+        pixel_values = torch.randn(total_patches, 3, 14, 14)
+
+        batch = {
+            "labels": torch.randint(0, 100, (batch_size, 10)),
+            "input_ids": torch.randint(0, 100, (batch_size, 10)),
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,  # Using thw instead of hws
         }
         loss_buffer = []
 
@@ -1641,40 +1720,86 @@ def test_build_model_and_optimizer_returns_optimizer_list():
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig(lr=0.01)
 
-    device = torch.device("cpu")
-    ckpt_cfg = CheckpointingConfig(
-        enabled=False,
-        checkpoint_dir="checkpoints/",
-        model_save_format="safetensors",
-        model_cache_dir=".",
-        model_repo_id="dummy/model",
-        save_consolidated=False,
-        is_peft=False,
-    )
-    checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
-
-    def _load_base_model_stub(model, device, *args, **kwargs):
-        if hasattr(model, "to_empty"):
-            model.to_empty(device=device)
-
-    with patch.object(checkpointer, 'load_base_model', new=_load_base_model_stub):
-        model, state_dict_keys, optim = build_model_and_optimizer(
-            device=device,
+    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+        model, optimizer, loss_fn = build_model_and_optimizer(
             cfg_model=cfg_model,
             cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
-            model_wrapper=SimpleNamespace(parallelize=lambda m: m),
-            seed=123,
-            checkpointer=checkpointer,
-            tp_size=1,
-            freeze_embeddings=True,
+            model_wrapper=None,
+            seed=42,
+            tp_size=2,  # TP > 1
         )
 
-    # Now returns list of optimizers
-    assert isinstance(optim, list)
-    assert len(optim) == 1
-    assert isinstance(optim[0], torch.optim.Optimizer)
+    # Verify foreach was disabled
+    assert cfg_opt.foreach is False
 
-    # state_dict_keys should be a list
-    assert isinstance(state_dict_keys, list)
+
+def test_vlm_build_model_returns_model_optimizer_loss_fn_tuple():
+    """Test that VLM build_model_and_optimizer returns (model, optimizer, loss_fn) 3-tuple."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
+    class NeMoVLMModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
+        def instantiate(self, **kwargs):
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = NeMoVLMModelConfig()
+    cfg_opt = DummyOptConfig(lr=0.01)
+
+    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+        result = build_model_and_optimizer(
+            cfg_model=cfg_model,
+            cfg_opt=cfg_opt,
+            cfg_freeze=None,
+            cfg_peft=None,
+            model_wrapper=None,
+            seed=42,
+            loss_fn=MagicMock(),
+        )
+
+    # Should return 3-tuple
+    assert isinstance(result, tuple)
+    assert len(result) == 3
+    model, optimizer, loss_fn = result
+    assert model is not None
+    assert optimizer is not None
+
+
+@pytest.mark.parametrize("entry_point", ["from_config", "from_pretrained"])
+def test_vlm_build_model_validates_nemo_auto_model_entry_points(entry_point):
+    """Test that VLM recognizes both NeMoAutoModelForImageTextToText entry points."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
+    target = getattr(NeMoAutoModelForImageTextToText, entry_point)
+
+    class NeMoVLMModelConfig:
+        def __init__(self):
+            self._target_ = target
+
+        def instantiate(self, **kwargs):
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = NeMoVLMModelConfig()
+    cfg_opt = DummyOptConfig(lr=0.01)
+
+    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+        # Should not raise - entry point should be recognized
+        model, optimizer, loss_fn = build_model_and_optimizer(
+            cfg_model=cfg_model,
+            cfg_opt=cfg_opt,
+            cfg_freeze=None,
+            cfg_peft=None,
+            model_wrapper=None,
+            seed=42,
+        )
+
+    assert model is not None

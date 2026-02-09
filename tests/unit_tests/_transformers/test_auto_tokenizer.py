@@ -25,6 +25,8 @@ class _StubHFTokenizer:
     def __init__(self, bos_id=101, eos_id=102):
         self.bos_token_id = bos_id
         self.eos_token_id = eos_id
+        self.add_bos_token = True
+        self.add_eos_token = True
 
     def __call__(self, *args, **kwargs):
         return BatchEncoding(
@@ -39,10 +41,15 @@ class _StubHFTokenizer:
         return [5, 6]
 
 
+class _StubConfig:
+    model_type = "stub"
+
+
 class TestNeMoAutoTokenizerFromPretrained:
     def test_patched_adds_bos_eos(self):
         stub = _StubHFTokenizer()
-        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub):
+        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub), \
+             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()):
             tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
             out = tok(["x"])
             assert isinstance(out, BatchEncoding)

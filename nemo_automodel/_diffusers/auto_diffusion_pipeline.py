@@ -18,10 +18,18 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from diffusers import DiffusionPipeline
 
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 from nemo_automodel.shared.utils import dtype_from_str
+
+# diffusers is an optional dependency
+try:
+    from diffusers import DiffusionPipeline
+
+    DIFFUSERS_AVAILABLE = True
+except Exception:
+    DIFFUSERS_AVAILABLE = False
+    DiffusionPipeline = object
 
 logger = logging.getLogger(__name__)
 
@@ -91,8 +99,13 @@ class NeMoAutoDiffusionPipeline(DiffusionPipeline):
         torch_dtype: Any = "auto",
         move_to_device: bool = True,
         **kwargs,
-    ) -> DiffusionPipeline:
-        pipe: DiffusionPipeline = DiffusionPipeline.from_pretrained(
+    ) -> "DiffusionPipeline":
+        if not DIFFUSERS_AVAILABLE:
+            raise RuntimeError(
+                "diffusers is required for NeMoAutoDiffusionPipeline.from_pretrained. "
+                "Install diffusers with a compatible version."
+            )
+        pipe = DiffusionPipeline.from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
             torch_dtype=torch_dtype,
