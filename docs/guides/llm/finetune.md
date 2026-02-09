@@ -4,12 +4,12 @@
 
 As large language models (LLMs) become more powerful, adapting them to
 specific tasks through fine-tuning has become essential for achieving
-high accuracy and relevance. There are two ways to do so 
+high accuracy and relevance. There are two ways to do so
   (1)Supervised Fine-Tuning (SFT) that applies full-parameter update to the pretrained model. It is useful for tasks that requires high precision although it requires more computational resources.
   (2) PEFT, specifically [Low-Rank Adapters (LoRA)](https://arxiv.org/abs/2106.09685) that updates only a small subset of parameters
 while keeping the base model weights frozen. It is lightweight and reduces the
 number of trainable parameters, often to less than 1%, while
-achieving decent accuracy. 
+achieving decent accuracy.
 
 NeMo Automodel simplifies the fine-tuning process by offering seamless
 integration with Hugging Face Transformers. It allows you to fine-tune
@@ -21,7 +21,7 @@ models from the Hugging Face Hub using NeMo Automodel. You'll learn how
 to prepare datasets, train models, generate text with fine-tuned
 checkpoints, evaluate performance using the LM Eval Harness, share your
 models on the Hugging Face Model Hub, and deploy them efficiently with
-vLLM.
+vLLM or NVIDIA NIM.
 
 <!-- In addition to this user guide, you can also explore our Quickstart,
 which features a [standalone python3
@@ -271,7 +271,7 @@ peft:
   alpha: 32               # LoRA alpha scaling factor
   dropout: 0.1            # LoRA dropout rate
 
-# Quantization configuration 
+# Quantization configuration
 quantization:
   load_in_4bit: True                        # Enable 4-bit quantization
   load_in_8bit: False                       # Disable 8-bit (use 4-bit instead)
@@ -337,7 +337,7 @@ INFO:root:[val] step 20 | epoch 0 | loss 0.2469
 ```
 For each training batch, the fine-tuning recipe logs the current loss, along with current peak memory usage and tokens per second (TPS).
 
-In addition, the model checkpoint is saved under the `checkpoints/` directory. 
+In addition, the model checkpoint is saved under the `checkpoints/` directory.
 For SFT, it will have the following contents:
 ``` bash
 $ tree checkpoints/epoch_0_step_10/
@@ -465,7 +465,7 @@ from transformers import AutoModelForCausalLM
 
 model = AutoModelForCausalLM.from_pretrained("your-username/llama3.2_1b-finetuned-name")
 ```
-Similarly, the PEFT adapter can be loaded directly using: 
+Similarly, the PEFT adapter can be loaded directly using:
 ``` python
 from peft import PeftModel, AutoModelForCausalLM
 
@@ -476,7 +476,7 @@ peft_model = PeftModel.from_pretrained(model, "your-username/peft-adapter-name")
 By publishing the fine-tuned checkpoint or PEFT adapter to the Hugging Face Hub, we
 enable easy sharing, reproducibility, and integration with downstream
 applications.
-<!-- 
+<!--
 ## Evaluate with the LM Evaluation Harness
 
 After fine-tuning the pretrained model on a domain-specific dataset
@@ -567,3 +567,94 @@ if __name__ == '__main__':
 
     print("vLLM Output: ", exporter.forward(input_texts=["How are you doing?"], lora_model_name=lora_model_name))
 ```
+
+## Deploy with NVIDIA NIM
+
+[NVIDIA NIM (NVIDIA Inference Microservices)](https://docs.nvidia.com/nim/large-language-models/latest/index.html) is a containerized inference service that automatically builds optimized TRT-LLM, vLLM, or other engines from your fine-tuned models. NIM provides production-ready deployment with optimized performance, making it ideal for serving fine-tuned models at scale.
+
+The following demonstrates how to deploy a fine-tuned checkpoint with NIM:
+
+**Note:** Make sure you have Docker with GPU support installed and access to the NVIDIA Container Registry (see the [NIM documentation](https://docs.nvidia.com/nim/large-language-models/latest/deployment-guide.html) for authentication instructions).
+
+
+```bash
+# Set the path to your fine-tuned checkpoint
+finetuned_ckpt_path="checkpoints/epoch_0_step_10/model/consolidated"
+
+# Pull the NIM container (replace with appropriate model base image)
+# For Llama-3.2-1B models, use the corresponding Llama NIM container
+nim_image="nvcr.io/nim/meta/llama-3.2-1b-instruct:latest"
+
+# Launch the NIM container
+docker run -it --rm --name=llama3-finetuned \
+  --gpus all \
+  -e NIM_FT_MODEL=$finetuned_ckpt_path \
+  -e NIM_SERVED_MODEL_NAME="llama3.2-1b-finetuned-squad" \
+  -e NIM_CUSTOM_MODEL_NAME=custom_1 \
+  -v $finetuned_ckpt_path:$finetuned_ckpt_path \
+  -p 8000:8000 \
+  $nim_image
+```
+
+Once the container is running, you can test the deployment using the NIM API:
+
+```python
+import requests
+import json
+
+url = "http://localhost:8000/v1/chat/completions"
+headers = {"Content-Type": "application/json"}
+data = {
+    "model": "custom_1",  # Use the NIM_CUSTOM_MODEL_NAME you specified
+    "messages": [
+        {"role": "user", "content": "What is the capital of France?"}
+    ],
+    "temperature": 0.7,
+    "max_tokens": 100
+}
+
+response = requests.post(url, headers=headers, json=data)
+print(json.dumps(response.json(), indent=2))
+```
+
+Similarly, the following demonstrates how to deploy a PEFT adapter with NIM.
+For PEFT (LoRA) adapters, you need to merge the adapter with the base model before deploying:
+
+```python
+from transformers import AutoModelForCausalLM
+from peft import PeftModel
+
+# Merge the PEFT adapter with the base model
+base_model_name = "meta-llama/Llama-3.2-1B"
+adapter_path = "checkpoints/epoch_0_step_10/model/"
+base_model = AutoModelForCausalLM.from_pretrained(base_model_name)
+model = PeftModel.from_pretrained(base_model, adapter_path)
+merged_model = model.merge_and_unload()
+merged_model.save_pretrained("merged_model/")
+```
+
+Then deploy the merged model:
+
+```bash
+finetuned_ckpt_path="merged_model"
+nim_image="nvcr.io/nim/meta/llama-3.2-1b-instruct:latest"
+
+docker run -it --rm --name=llama3-peft-merged \
+  --gpus all \
+  -e NIM_FT_MODEL=$finetuned_ckpt_path \
+  -e NIM_SERVED_MODEL_NAME="llama3.2-1b-peft-squad" \
+  -e NIM_CUSTOM_MODEL_NAME=custom_1 \
+  -v $finetuned_ckpt_path:$finetuned_ckpt_path \
+  -p 8000:8000 \
+  $nim_image
+```
+
+**Note:** Make sure the NIM container image matches the base architecture of your fine-tuned model. For example, if you fine-tuned `meta-llama/Llama-3.2-1B`, use the corresponding [LLM-specifc NIM container](https://docs.nvidia.com/nim/large-language-models/latest/supported-models.html). If an LLM-specific NIM container doesn't exist for your base model, you can use the [Multi-LLM NIM container](https://docs.nvidia.com/nim/large-language-models/latest/ft-support.html) to deploy your fine-tuned model. In this configuration, replace `NIM_FT_MODEL` with `NIM_MODEL_NAME` (to your local model path) and set `NIM_MANIFEST_ALLOW_UNSAFE=1`. For more information on how to do this, refer to the [example](https://docs.nvidia.com/nim/large-language-models/latest/supported-architectures.html#example-deployment) from NIM Documentation.
+
+<!-- :::{tip}
+For production deployments, consider using Kubernetes or cloud platforms. NIM supports deployment on AWS, Azure, GCP, and on-premise infrastructure. See the [NIM deployment guide](https://docs.nvidia.com/nim/large-language-models/latest/deployment-guide.html) for more details.
+:::
+
+:::{important}
+NIM automatically builds optimized TensorRT-LLM engines from your model weights. The first startup may take longer as it compiles the model. Subsequent restarts will be faster if the compiled engine is cached.
+::: -->
