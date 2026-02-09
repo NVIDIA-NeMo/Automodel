@@ -147,24 +147,19 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
         # TP does not support foreach
         cfg_opt.foreach = False
 
-    if hasattr(model, "parts"):
-        optimizer = []
-        for part in model.parts:
-            trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
-            assert len(trainable_params) > 0, "trainable_params cannot be empty"
-            optimizer.append(cfg_opt.instantiate(params=trainable_params))
-    else:
-        trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
+    optimizer = []
+    for part in getattr(model, "parts", [model]):
+        trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
-        optimizer = cfg_opt.instantiate(params=trainable_params)
+        tmp_optimizer = cfg_opt.instantiate(params=trainable_params)
         if isinstance(distributed_config, MegatronFSDPConfig) and torch.distributed.get_world_size() > 1:
             # Only call fully_shard_optimizer when the model was actually wrapped
             # with MegatronFSDP. When dp_mesh.size()==1 the parallelizer skips
             # MegatronFSDP wrapping and the parameters won't carry the required
             # _megatron_fsdp_model attribute.
-            if isinstance(model, MegatronFSDP):
-                fully_shard_optimizer(optimizer)
-        optimizer = [optimizer]
+            if isinstance(part, MegatronFSDP):
+                fully_shard_optimizer(tmp_optimizer)
+        optimizer.append(tmp_optimizer)
 
     return optimizer
 
@@ -273,19 +268,6 @@ def build_dataloader(
                 processor_type = "default"
                 logging.warning(f"You are using {processor_type} with default collate function.")
             collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
-
-        return cfg_dl.instantiate(
-            dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=local_batch_size
-        ), processor
-
-        # Ensure spawn start method to avoid fork-safety issues with CUDA/JIT
-        try:
-            import torch.multiprocessing as mp
-
-            if mp.get_start_method(allow_none=True) is None:
-                mp.set_start_method("spawn", force=True)
-        except RuntimeError:
-            pass
 
         return cfg_dl.instantiate(
             dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=local_batch_size
