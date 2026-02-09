@@ -57,7 +57,6 @@ optimizer:
   lr: 1.0e-5
   weight_decay: 0
 
-...
 ```
 
 See the full file for complete details (`!cat llama3_2_1b_squad.yaml`). 
