@@ -234,6 +234,9 @@ name = "nv_grouped_gemm"
 version = "1.1.4.post8"
 requires-dist = ["torch", "packaging", "ninja", "setuptools"]
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
 [tool.coverage.paths]
 source = [".", "/workspace", "/home/runner/work/Automodel/Automodel"]
 

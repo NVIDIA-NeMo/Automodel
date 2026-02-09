@@ -449,13 +449,12 @@ class BaseRecipe:
         for key in sorted(self.__dict__["__state_tracked"]):
             obj = getattr(self, key)
             if is_model(obj):
-                assert model is None, "Multiple models found in checkpoint"
+                if key == "teacher_model":
+                    continue
                 model = obj
             elif is_optimizer(obj):
-                assert optimizer is None, "Multiple optimizers found in checkpoint"
                 optimizer = obj
             elif is_lr_scheduler(obj):
-                assert scheduler is None, "Multiple schedulers found in checkpoint"
                 scheduler = obj
             elif is_dataloader(obj) or isinstance(obj, StatefulRNG):
                 self.checkpointer.load_on_dp_ranks(obj, key, ckpt_dir)
@@ -476,7 +475,7 @@ class BaseRecipe:
         - If restore_from is set to a path or "LATEST": resolve and load that checkpoint
         - If restore_from is None: auto-detect the latest checkpoint in checkpoint_dir
         - Before loading, check if the checkpoint is compatible with the current model config
-        - If incompatible: print a warning and continue without restoring
+        - If incompatible: print a warning and proceed with the restore anyway
 
         Args:
             restore_from: Path to checkpoint directory to restore from. Options:
@@ -511,15 +510,27 @@ class BaseRecipe:
             ckpt_dir = str(ckpt_dir)
 
         # Check if the checkpoint is compatible with the current model configuration.
-        # If incompatible, warn and skip the restore instead of crashing.
-        ok, reason = _is_checkpoint_model_config_compatible(self.cfg, ckpt_dir)
-        if not ok:
-            if is_rank_0:
-                logging.warning(
-                    f"Checkpoint at {ckpt_dir} appears incompatible with current model configuration: "
-                    f"{reason}. Skipping checkpoint restore and continuing with fresh weights."
-                )
-            return
+        #  - Auto-detected checkpoints (restore_from=None) are SKIPPED when
+        #    incompatible, because they likely belong to a different training run
+        #    that happened to share the same checkpoint_dir.
+        #  - Explicitly requested checkpoints still proceed (user's intent).
+        cfg = getattr(self, "cfg", None)
+        if cfg is not None:
+            ok, reason = _is_checkpoint_model_config_compatible(cfg, ckpt_dir)
+            if not ok and is_rank_0:
+                if not restore_from:
+                    # Auto-detected: skip restore to avoid loading stale/incompatible checkpoints
+                    logging.warning(
+                        f"Auto-detected checkpoint at {ckpt_dir} is incompatible with current "
+                        f"model configuration: {reason}. Skipping restore."
+                    )
+                    return
+                else:
+                    # Explicit restore_from: warn but honour the user's request
+                    logging.warning(
+                        f"Checkpoint at {ckpt_dir} may be incompatible with current model "
+                        f"configuration: {reason}. Proceeding with restore anyway."
+                    )
 
         if is_rank_0:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)
@@ -762,10 +773,15 @@ def _find_latest_checkpoint(checkpoint_dir):
 def _extract_model_signature(cfg: dict) -> dict:
     """
     Extract a stable subset of the model config used to decide checkpoint compatibility.
+
+    This includes model architecture fields AND training-mode indicators (e.g. PEFT)
+    that affect the checkpoint format.
     """
-    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
-    if not isinstance(model_cfg, dict):
+    if not isinstance(cfg, dict):
         return {}
+    model_cfg = cfg.get("model", {})
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
     keys = (
         # the most common identifier in this repo's configs
         "pretrained_model_name_or_path",
@@ -783,12 +799,24 @@ def _extract_model_signature(cfg: dict) -> dict:
         "rope_scaling",
     )
     sig = {k: model_cfg.get(k, None) for k in keys}
+
+    # PEFT presence affects checkpoint format (adapter-only vs full model).
+    # A PEFT checkpoint is NOT loadable into a non-PEFT model and vice-versa.
+    peft_cfg = cfg.get("peft", None)
+    sig["_has_peft"] = peft_cfg is not None and isinstance(peft_cfg, dict)
+
     return sig
 
 
-def _is_checkpoint_model_config_compatible(current_cfg: ConfigNode, ckpt_dir: str) -> tuple[bool, str]:
+def _is_checkpoint_model_config_compatible(current_cfg, ckpt_dir: str) -> tuple[bool, str]:
     """
-    Compare the checkpoint's saved `config.yaml` model signature to the current run's model signature.
+    Compare the checkpoint's saved ``config.yaml`` model signature to the
+    current run's model signature.
+
+    Uses ``raw_config`` (when available) for comparison because
+    ``save_config`` serialises ``raw_config`` to YAML.  Round-tripping
+    through YAML preserves types, avoiding false mismatches that would
+    arise from using ``to_dict()`` (which may apply type conversions).
     """
     config_path = os.path.join(os.fspath(ckpt_dir), "config.yaml")
     if not os.path.exists(config_path):
@@ -799,11 +827,13 @@ def _is_checkpoint_model_config_compatible(current_cfg: ConfigNode, ckpt_dir: st
     except Exception as e:
         return True, f"failed to read checkpoint config.yaml (cannot validate): {e}"
 
+    # Prefer raw_config (same representation that was saved) to avoid
+    # type-coercion mismatches between to_dict() and yaml.safe_load().
     try:
-        if hasattr(current_cfg, "to_dict"):
-            cur_cfg = current_cfg.to_dict()
-        elif hasattr(current_cfg, "raw_config"):
+        if hasattr(current_cfg, "raw_config"):
             cur_cfg = current_cfg.raw_config
+        elif hasattr(current_cfg, "to_dict"):
+            cur_cfg = current_cfg.to_dict()
         else:
             cur_cfg = dict(current_cfg)
     except Exception:

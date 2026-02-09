@@ -352,10 +352,11 @@ def test_load_checkpoint_with_latest_keyword_case_insensitive(tmp_path):
 
 
 @pytest.mark.parametrize("model,compatible", [("toy/model-a", True), ("toy/model-a2", False)])
-def test_load_checkpoint_incompatible_model_warns_and_skips(tmp_path, model, compatible):
+def test_load_checkpoint_explicit_restore_incompatible_warns_and_continues(tmp_path, model, compatible):
     """
-    If a checkpoint doesn't match the current model config, warn and skip the restore
-    (don't crash). This applies to both explicit 'LATEST' and auto-detect.
+    When an explicit restore_from is given (e.g. "LATEST"), an incompatible
+    checkpoint still proceeds with the restore -- the user explicitly asked
+    for that checkpoint, so we honour the request and just warn.
     """
     # Create a checkpoint with a specific model signature
     recipe_a = _ToyRecipe(tmp_path, cfg_dict={"model": {"pretrained_model_name_or_path": "toy/model-a"}})
@@ -369,17 +370,72 @@ def test_load_checkpoint_incompatible_model_warns_and_skips(tmp_path, model, com
 
     # Attempt to restore with a (possibly different) model signature using the 'LATEST' keyword
     recipe_b = _ToyRecipe(tmp_path, cfg_dict={"model": {"pretrained_model_name_or_path": model}})
-    weight_before_load = recipe_b.model.weight.clone()
 
-    # Should NOT raise - incompatible checkpoints are warned and skipped
+    # Should NOT raise - always restores with explicit restore_from; warns if incompatible
     recipe_b.load_checkpoint(restore_from="LATEST")
 
-    if compatible:
-        # Should have restored from checkpoint
-        assert torch.allclose(recipe_b.model.weight, weight_after_step)
-    else:
-        # Should have skipped restore (incompatible), weights unchanged
-        assert torch.allclose(recipe_b.model.weight, weight_before_load)
+    # Both compatible and incompatible cases restore the checkpoint weights
+    # because restore_from was explicitly set.
+    assert torch.allclose(recipe_b.model.weight, weight_after_step)
+
+
+def test_load_checkpoint_autodetect_skips_incompatible(tmp_path):
+    """
+    When restore_from is None (auto-detect), an incompatible checkpoint is
+    SKIPPED -- this prevents stale/leftover checkpoints from a different
+    training run (e.g. PEFT vs full fine-tune) from breaking training.
+    """
+    # Create a checkpoint with model-a
+    recipe_a = _ToyRecipe(tmp_path, cfg_dict={"model": {"pretrained_model_name_or_path": "toy/model-a"}})
+
+    x = torch.randn(4, 2)
+    loss = recipe_a.model(x).sum()
+    loss.backward()
+    recipe_a.optimizer.step()
+    weight_after_step = recipe_a.model.weight.clone()
+    recipe_a.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
+
+    # Create a new recipe with a DIFFERENT model signature and auto-detect (restore_from=None)
+    recipe_b = _ToyRecipe(tmp_path, cfg_dict={"model": {"pretrained_model_name_or_path": "toy/model-b"}})
+    weight_before_load = recipe_b.model.weight.clone()
+
+    # Auto-detect should skip the incompatible checkpoint
+    recipe_b.load_checkpoint(restore_from=None)
+
+    # Weights should NOT have been restored (incompatible → skipped)
+    assert torch.allclose(recipe_b.model.weight, weight_before_load)
+    assert not torch.allclose(recipe_b.model.weight, weight_after_step)
+
+
+def test_load_checkpoint_autodetect_skips_peft_mismatch(tmp_path):
+    """
+    A checkpoint saved with PEFT config is incompatible with a non-PEFT run
+    (and vice-versa) because the checkpoint format differs (adapter-only vs
+    full model). Auto-detect should skip such checkpoints.
+    """
+    # Save a checkpoint WITH a peft section in config
+    recipe_peft = _ToyRecipe(tmp_path, cfg_dict={
+        "model": {"pretrained_model_name_or_path": "toy/model-a"},
+        "peft": {"dim": 8, "alpha": 32},
+    })
+    x = torch.randn(4, 2)
+    loss = recipe_peft.model(x).sum()
+    loss.backward()
+    recipe_peft.optimizer.step()
+    recipe_peft.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
+
+    # Create a new recipe WITHOUT peft (same model architecture)
+    recipe_no_peft = _ToyRecipe(tmp_path, cfg_dict={
+        "model": {"pretrained_model_name_or_path": "toy/model-a"},
+    })
+    weight_before_load = recipe_no_peft.model.weight.clone()
+
+    # Auto-detect should skip because PEFT mismatch
+    recipe_no_peft.load_checkpoint(restore_from=None)
+
+    # Weights should NOT have been restored
+    assert torch.allclose(recipe_no_peft.model.weight, weight_before_load)
+
 
 def test_load_checkpoint_with_latest_no_checkpoints_warns(tmp_path):
     """
