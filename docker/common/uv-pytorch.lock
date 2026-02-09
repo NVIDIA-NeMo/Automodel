@@ -2752,16 +2752,16 @@ wheels = [
 
 [[package]]
 name = "megatron-fsdp"
-version = "0.1.0"
+version = "0.2.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "einops" },
     { name = "packaging" },
     { name = "torch", marker = "sys_platform == 'never'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/95/8d/07223a667484e03311c8a0db6f2a19f69d0845c1661195ebb7ed86bf39ec/megatron_fsdp-0.1.0.tar.gz", hash = "sha256:3c0714e6f9fa484af72d2693f1633711094473ce42967cfa81c74a630c841556", size = 82754, upload-time = "2025-10-08T15:04:31.998Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/10/58/1dc5f0a79634cb6dd11715b62c994e6e1d43de952a2ea914c07b78bc3c48/megatron_fsdp-0.2.3.tar.gz", hash = "sha256:d12d93b20e3e5d214ae44d115976b209ef7352221f5ec07767bcbcb978ec5098", size = 86472, upload-time = "2026-02-06T16:30:27.88Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6f/44/213003e3e9cd4d2014d59ffcb699ceb2b1b0ae6db6015d024718c63bc89e/megatron_fsdp-0.1.0-py3-none-any.whl", hash = "sha256:c4a4190f8fdbd0e89f7f47a6a9b218f709498ef0a676729449dad7e55688a10c", size = 83287, upload-time = "2025-10-08T15:04:30.676Z" },
+    { url = "https://files.pythonhosted.org/packages/ba/90/11e0eec3676832d12843350d2ab3aba803c91c99f9957e8f02c1ad1eb3c5/megatron_fsdp-0.2.3-py3-none-any.whl", hash = "sha256:d88083fac9cc26bc138532bb23fada22d5fd5774e570cabd92125bc42991d5f3", size = 85888, upload-time = "2026-02-06T16:30:26.442Z" },
 ]
 
 [[package]]
@@ -3297,7 +3297,7 @@ requires-dist = [
     { name = "ftfy" },
     { name = "imageio-ffmpeg" },
     { name = "mamba-ssm", marker = "extra == 'cuda'" },
-    { name = "megatron-fsdp" },
+    { name = "megatron-fsdp", specifier = ">=0.2.3" },
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'", specifier = ">=1.9.0" },
     { name = "mlflow" },
     { name = "nemo-automodel", extras = ["cuda"], marker = "extra == 'all'" },
