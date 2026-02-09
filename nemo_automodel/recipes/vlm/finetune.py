@@ -136,9 +136,11 @@ def build_model_and_optimizer(
                 f"Got model target: {cfg_model.get('_target_', None)}"
             )
 
-    # Check loss function compatibility
-    if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
-        logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
+    # override when the loss function requires logits_to_keep (FusedLinearCrossEntropy).
+    if not _supports_logits_to_keep(model) and isinstance(loss_fn, FusedLinearCrossEntropy):
+        logger.warning(
+            "logits_to_keep not found in model.forward but required by FusedLinearCrossEntropy. Using MaskedCrossEntropy instead."
+        )
         loss_fn = MaskedCrossEntropy()
 
     if tp_size > 1:

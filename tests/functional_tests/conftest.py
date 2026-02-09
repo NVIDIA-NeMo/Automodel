@@ -13,6 +13,19 @@
 # limitations under the License.
 import pytest
 
+# Ensure the repository root is importable so functional tests can do
+# `from tests.utils.test_utils import run_test_script` reliably across
+# different pytest import modes / runners.
+#
+# (Without this, some environments do not include the repo root on sys.path,
+# causing `ModuleNotFoundError: No module named 'tests.utils'` during collection.)
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 # List of CLI overrides forwarded by the functional-test shell scripts.
 # Registering them with pytest prevents the test discovery phase from
 # aborting with "file or directory not found: --<option>" errors.
@@ -46,6 +59,7 @@ _OVERRIDES = [
     "peft.dim",
     "peft.alpha",
     "peft.use_triton",
+    "peft.use_dora",
     "peft._target_",
     "distributed",
     "distributed._target_",
@@ -54,10 +68,13 @@ _OVERRIDES = [
     "distributed.cp_size",
     "distributed.pp_size",
     "distributed.sequence_parallel",
+    "distributed.dp_replicate_size",
     "distributed.activation_checkpointing",
     "dataset._target_",
     "dataset.path_or_dataset",
     "validation_dataset.path_or_dataset",
+    "validation_dataset.split",
+    "validation_dataset.num_samples_limit",
     "validation_dataset.limit_dataset_samples",
     "autopipeline._target_",
     "autopipeline.pp_schedule",

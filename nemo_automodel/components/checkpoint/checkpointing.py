@@ -344,7 +344,12 @@ class Checkpointer:
 
         # Standard loading path
         state_dict = model_state.state_dict()
-        storage_reader = self._get_storage_reader(model_path, key_mapping, is_init_step=is_init_step)
+        # When the model has a state_dict_adapter, it handles all key transformations
+        # (to_hf/from_hf). Passing key_mapping to the storage reader would double-transform
+        # keys: the storage reader renames checkpoint keys in metadata, and then to_hf also
+        # renames model keys, producing a mismatch in the DCP planner.
+        reader_key_mapping = None if has_state_dict_adapter else key_mapping
+        storage_reader = self._get_storage_reader(model_path, reader_key_mapping, is_init_step=is_init_step)
 
         state_dict = _maybe_adapt_state_dict_to_hf(
             model_state.model[0],
