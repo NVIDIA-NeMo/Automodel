@@ -527,11 +527,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         )
 
 
-# ---------------------------------------------------------------------------
 #  Concrete Auto-Model classes
-# ---------------------------------------------------------------------------
-
-
 class NeMoAutoModelForCausalLM(_BaseNeMoAutoModelClass, AutoModelForCausalLM):
     """
     Drop-in replacement for ``transformers.AutoModelForCausalLM`` that includes custom-kernels.
