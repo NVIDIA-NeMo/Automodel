@@ -83,6 +83,7 @@ from nemo_automodel.components.distributed.parallel_styles import translate_to_l
 HAVE_MEGATRON_FSDP = False
 try:
     from megatron_fsdp import fully_shard as megatron_fsdp_fully_shard
+    from megatron_fsdp import fully_shard_model as megatron_fsdp_fully_shard_model
 
     HAVE_MEGATRON_FSDP = True
 except:
@@ -1144,9 +1145,13 @@ def megatron_fsdp_strategy_parallelize(
         return model, optimizer
 
     # Wrap model with MegatronFSDP.
-    model, optimizer = megatron_fsdp_fully_shard(
-        module=model,
-        optimizer=optimizer,
+    # When an optimizer is provided, use the combined fully_shard which handles
+    # both model wrapping and optimizer sharding in one step.
+    # When optimizer is None (e.g., during model creation before optimizer
+    # instantiation), use fully_shard_model to wrap only the model and prepare
+    # distributed parameters so the optimizer can be sharded later via
+    # fully_shard_optimizer.
+    fsdp_kwargs = dict(
         fsdp_unit_modules=megatron_fsdp_unit_modules,
         device_mesh=device_mesh,
         dp_shard_dim=dp_shard_dim,
@@ -1165,6 +1170,13 @@ def megatron_fsdp_strategy_parallelize(
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer,
     )
+    if optimizer is not None:
+        model, optimizer = megatron_fsdp_fully_shard(
+            module=model, optimizer=optimizer, **fsdp_kwargs
+        )
+    else:
+        model = megatron_fsdp_fully_shard_model(module=model, **fsdp_kwargs)
+        model._replace_param_with_distributed_if_needed()
 
     return model, optimizer
 
