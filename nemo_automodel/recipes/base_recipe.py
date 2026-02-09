@@ -150,35 +150,6 @@ def _resolve_restore_from_to_ckpt_dir(checkpoint_dir: str, restore_from: str) ->
     return restore_from
 
 
-def _format_existing_ckpt_collision_error(ckpt_root: Path, existing_ckpts: list[Path]) -> str:
-    """Format an error message for 'starting fresh with existing checkpoints'."""
-    return "\n".join(
-        [
-            f"\n{'=' * 80}",
-            "ERROR: Checkpoint directory contains existing checkpoints",
-            f"{'=' * 80}",
-            f"Directory: {ckpt_root}",
-            f"Found {len(existing_ckpts)} existing checkpoint(s):",
-            f"  {', '.join([p.name for p in existing_ckpts[:5]])}",
-            f"  {'...' if len(existing_ckpts) > 5 else ''}",
-            "",
-            "Starting fresh training with existing checkpoints will cause checkpoint",
-            "name collisions when saving (e.g., epoch_0_step_100 already exists).",
-            "",
-            "To FIX, choose ONE of:",
-            "  1. Resume training:",
-            "       Set checkpoint.restore_from: 'LATEST' (for latest checkpoint)",
-            "       Or checkpoint.restore_from: 'epoch_0_step_100' (subdirectory name)",
-            "       Or checkpoint.restore_from: './path/to/checkpoint' (full path)",
-            "  2. Start fresh with unique directory:",
-            "       Set checkpoint.checkpoint_dir: './checkpoints/my_exp_name'",
-            "  3. Start fresh by removing existing checkpoints:",
-            f"       Run: rm -rf {ckpt_root}/*step_*",
-            f"{'=' * 80}",
-        ]
-    )
-
-
 def _format_missing_checkpoint_dir_error(checkpoint_dir: str, restore_from: str, resolved_ckpt_dir: str) -> str:
     """Format a helpful error message for a missing checkpoint directory."""
     error_msg = [
@@ -446,22 +417,6 @@ class BaseRecipe:
                 f"Updated LOWEST_VAL checkpoint symlink to {os.path.basename(target_dir)} (val_loss={val_loss:.4f})"
             )
 
-    def _assert_safe_fresh_start(self, ckpt_root: Path, is_rank_0: bool) -> None:
-        """
-        Starting fresh training is only allowed if checkpoint_dir is empty (of '*step_*'),
-        to prevent checkpoint name collisions during saving.
-        """
-        existing_ckpts = _list_existing_checkpoints(ckpt_root)
-        if not existing_ckpts:
-            return
-
-        if is_rank_0:
-            logging.error(_format_existing_ckpt_collision_error(ckpt_root, existing_ckpts))
-
-        # Ensure all ranks fail together
-        _dist_barrier()
-        raise RuntimeError("Checkpoint directory contains existing checkpoints but restore_from not set")
-
     def _validate_checkpoint_dir_exists(self, ckpt_dir: str, restore_from: str, is_rank_0: bool) -> None:
         """Validate resolved checkpoint directory exists; raise FileNotFoundError with a helpful message."""
         if os.path.exists(ckpt_dir):
@@ -509,18 +464,18 @@ class BaseRecipe:
 
     def load_checkpoint(self, restore_from: str | None = None):
         """
-        Loads checkpoint only when explicitly requested via restore_from.
+        Loads checkpoint with automatic compatibility checking.
 
         This method will:
-        - Load checkpoint if restore_from is explicitly set to a path or "LATEST"
-        - Start fresh training if restore_from is None
-        - Fail early if checkpoint_dir contains checkpoints but restore_from is not set
-          (prevents checkpoint name collisions during saving)
+        - If restore_from is set to a path or "LATEST": resolve and load that checkpoint
+        - If restore_from is None: auto-detect the latest checkpoint in checkpoint_dir
+        - Before loading, check if the checkpoint is compatible with the current model config
+        - If incompatible: print a warning and continue without restoring
 
         Args:
             restore_from: Path to checkpoint directory to restore from. Options:
-                         - None: Start fresh (fails if checkpoint_dir not empty)
-                         - "LATEST": Auto-detect latest checkpoint in checkpoint_dir
+                         - None: Auto-detect latest checkpoint in checkpoint_dir
+                         - "LATEST": Explicitly auto-detect latest checkpoint
                          - "epoch_0_step_100": Subdirectory name (relative to checkpoint_dir)
                          - "./path/to/checkpoint": Absolute or relative path
         """
@@ -531,44 +486,34 @@ class BaseRecipe:
 
         is_rank_0 = _is_rank_0()
 
-        if not restore_from:
-            # Starting fresh - ensure checkpoint dir is safe to avoid name collisions
-            ckpt_root = Path(self.checkpointer.config.checkpoint_dir)
-            self._assert_safe_fresh_start(ckpt_root, is_rank_0=is_rank_0)
-            return
+        if restore_from:
+            ckpt_dir = _resolve_restore_from_to_ckpt_dir(self.checkpointer.config.checkpoint_dir, restore_from)
+            if ckpt_dir is None:
+                # LATEST keyword with no checkpoints found
+                if is_rank_0:
+                    logging.warning(
+                        "restore_from='LATEST' specified but no checkpoint found in "
+                        f"{self.checkpointer.config.checkpoint_dir}. Starting fresh."
+                    )
+                return
+            self._validate_checkpoint_dir_exists(ckpt_dir, restore_from=restore_from, is_rank_0=is_rank_0)
+        else:
+            # Auto-detect latest checkpoint
+            ckpt_dir = _find_latest_checkpoint(self.checkpointer.config.checkpoint_dir)
+            if ckpt_dir is None:
+                return
+            ckpt_dir = str(ckpt_dir)
 
-        ckpt_dir = _resolve_restore_from_to_ckpt_dir(self.checkpointer.config.checkpoint_dir, restore_from)
-        if ckpt_dir is None:
+        # Check if the checkpoint is compatible with the current model configuration.
+        # If incompatible, warn and skip the restore instead of crashing.
+        ok, reason = _is_checkpoint_model_config_compatible(self.cfg, ckpt_dir)
+        if not ok:
             if is_rank_0:
                 logging.warning(
-                    "restore_from='LATEST' specified but no checkpoint found in "
-                    f"{self.checkpointer.config.checkpoint_dir}. Starting fresh."
+                    f"Checkpoint at {ckpt_dir} appears incompatible with current model configuration: "
+                    f"{reason}. Skipping checkpoint restore and continuing with fresh weights."
                 )
             return
-
-        self._validate_checkpoint_dir_exists(ckpt_dir, restore_from=restore_from, is_rank_0=is_rank_0)
-
-        # If the user asked for restore_from="LATEST", we auto-select a checkpoint. In that case,
-        # validate that the checkpoint's saved config.yaml matches this run's model config to avoid
-        # accidentally restoring from an unrelated experiment.
-        if restore_from.upper() == "LATEST":
-            ok, reason = _is_checkpoint_model_config_compatible(self.cfg, ckpt_dir)
-            if not ok:
-                msg = (
-                    "Checkpoint appears to be from a different model configuration; refusing to restore from "
-                    "`checkpoint.restore_from: LATEST`.\n"
-                    f"- checkpoint: {ckpt_dir}\n"
-                    f"- reason: {reason}\n"
-                    "If you want to force restore anyway, set `checkpoint.restore_from` to this checkpoint path "
-                    "(instead of 'LATEST')."
-                )
-                if is_rank_0:
-                    logging.error(msg)
-                    print(msg, flush=True)
-
-                # Ensure all ranks fail together.
-                _dist_barrier()
-                raise RuntimeError(msg)
 
         if is_rank_0:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)

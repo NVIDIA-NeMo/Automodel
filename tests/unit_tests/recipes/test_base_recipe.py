@@ -273,20 +273,31 @@ def test_load_checkpoint_fresh_start_empty_dir(tmp_path):
     recipe_inst.load_checkpoint(restore_from=None)
 
 
-def test_load_checkpoint_fresh_start_with_existing_checkpoints_fails(tmp_path):
+def test_load_checkpoint_auto_detect_restores_latest(tmp_path):
     """
-    Test that load_checkpoint() with restore_from=None fails if checkpoint directory
-    contains existing checkpoints (prevents name collisions).
+    Test that load_checkpoint() with restore_from=None auto-detects and restores the
+    latest checkpoint when one exists (the old default behavior).
     """
     recipe_inst = _ToyRecipe(tmp_path)
 
-    # Create existing checkpoint
-    existing_ckpt = tmp_path / "epoch_0_step_100"
-    existing_ckpt.mkdir()
+    # Perform training and save checkpoint
+    x = torch.randn(4, 2)
+    loss = recipe_inst.model(x).sum()
+    loss.backward()
+    recipe_inst.optimizer.step()
 
-    # Should fail with clear error message
-    with pytest.raises(RuntimeError, match="existing checkpoints"):
-        recipe_inst.load_checkpoint(restore_from=None)
+    weight_after_step = recipe_inst.model.weight.clone()
+    recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
+
+    # Modify model
+    recipe_inst.model.weight.data.add_(42.0)
+    assert not torch.allclose(recipe_inst.model.weight, weight_after_step)
+
+    # Load with restore_from=None should auto-detect and restore
+    recipe_inst.load_checkpoint(restore_from=None)
+
+    # Should restore to saved state
+    assert torch.allclose(recipe_inst.model.weight, weight_after_step)
 
 
 def test_load_checkpoint_with_latest_keyword(tmp_path):
@@ -340,11 +351,11 @@ def test_load_checkpoint_with_latest_keyword_case_insensitive(tmp_path):
     assert torch.allclose(recipe_inst.model.weight, weight_after_step)
 
 
-@pytest.mark.parametrize("model,raises", [("toy/model-a", False), ("toy/model-a2", True)])
-def test_load_checkpoint_with_latest_mismatched_model_signature_fails(tmp_path, model, raises):
+@pytest.mark.parametrize("model,compatible", [("toy/model-a", True), ("toy/model-a2", False)])
+def test_load_checkpoint_incompatible_model_warns_and_skips(tmp_path, model, compatible):
     """
-    If restore_from='LATEST' auto-selects a checkpoint that doesn't match the current model config,
-    fail early with a clear error (user can force by setting restore_from to an explicit path).
+    If a checkpoint doesn't match the current model config, warn and skip the restore
+    (don't crash). This applies to both explicit 'LATEST' and auto-detect.
     """
     # Create a checkpoint with a specific model signature
     recipe_a = _ToyRecipe(tmp_path, cfg_dict={"model": {"pretrained_model_name_or_path": "toy/model-a"}})
@@ -353,16 +364,22 @@ def test_load_checkpoint_with_latest_mismatched_model_signature_fails(tmp_path, 
     loss = recipe_a.model(x).sum()
     loss.backward()
     recipe_a.optimizer.step()
+    weight_after_step = recipe_a.model.weight.clone()
     recipe_a.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
 
-    # Attempt to restore with a different model signature using the 'LATEST' keyword
+    # Attempt to restore with a (possibly different) model signature using the 'LATEST' keyword
     recipe_b = _ToyRecipe(tmp_path, cfg_dict={"model": {"pretrained_model_name_or_path": model}})
+    weight_before_load = recipe_b.model.weight.clone()
 
-    if raises:
-        with pytest.raises(RuntimeError, match="model signature mismatch"):
-            recipe_b.load_checkpoint(restore_from="LATEST")
+    # Should NOT raise - incompatible checkpoints are warned and skipped
+    recipe_b.load_checkpoint(restore_from="LATEST")
+
+    if compatible:
+        # Should have restored from checkpoint
+        assert torch.allclose(recipe_b.model.weight, weight_after_step)
     else:
-        recipe_b.load_checkpoint(restore_from="LATEST")
+        # Should have skipped restore (incompatible), weights unchanged
+        assert torch.allclose(recipe_b.model.weight, weight_before_load)
 
 def test_load_checkpoint_with_latest_no_checkpoints_warns(tmp_path):
     """
