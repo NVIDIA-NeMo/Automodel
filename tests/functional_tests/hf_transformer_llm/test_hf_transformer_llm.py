@@ -32,27 +32,32 @@ class TestHFTransformerLLM:
             run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_DDP_FILENAME)
         except:
             shutil.rmtree("checkpoints/", ignore_errors=True)
+            raise
 
     def test_hf_transformer_llm_fsdp2_tp2(self):
         try:
             run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_FSDP2_TP2_FILENAME)
         except:
             shutil.rmtree("checkpoints/", ignore_errors=True)
+            raise
 
     def test_hf_transformer_llm_fsdp2_tp2_hf_tpplan(self):
         try:
             run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_FSDP2_TP2_HF_TPPLAN_FILENAME)
         except:
             shutil.rmtree("checkpoints/", ignore_errors=True)
+            raise
 
     def test_hf_transformer_llm_megatron_fsdp_tp2(self):
         try:
             run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_MegatronFSDP_TP2_FILENAME)
         except:
             shutil.rmtree("checkpoints/", ignore_errors=True)
+            raise
 
     def test_hf_transformer_llm_megatron_fsdp_tp2_hf_tpplan(self):
         try:
             run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_MegatronFSDP_TP2_HF_TPPLAN_FILENAME)
         except:
             shutil.rmtree("checkpoints/", ignore_errors=True)
+            raise
