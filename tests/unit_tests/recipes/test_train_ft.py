@@ -201,7 +201,7 @@ def test_peft_with_pipeline_parallelism_enabled(caplog):
     model = DummyModel()
     mock_autopipeline = MagicMock()
 
-    with patch('nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules') as mock_apply_lora:
+    with patch('nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules') as mock_apply_lora:
         with caplog.at_level(logging.INFO):
             _apply_peft_and_lower_precision(
                 model, tp_size=1, autopipeline=mock_autopipeline,
@@ -223,12 +223,12 @@ def test_peft_without_pipeline_parallelism(caplog):
     cfg_peft = DummyPeftConfig()
 
     # Mock the apply_lora_to_linear_modules function (now inside apply_model_infrastructure)
-    with patch('nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules') as mock_apply_lora:
-        with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
+    with patch('nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules') as mock_apply_lora:
+        with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
             with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-                with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
+                with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
                     with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                        with patch('nemo_automodel._transformers.auto_model._shard_ep_fsdp') as mock_shard:
+                        with patch('nemo_automodel._transformers.infrastructure._shard_ep_fsdp') as mock_shard:
                             mock_shard.return_value = DummyModel()
                             with caplog.at_level(logging.INFO):
                                 # This should work fine without PP
@@ -255,7 +255,7 @@ def test_peft_with_tp_disables_triton(caplog):
     cfg_peft = DummyPeftConfig()
     model = DummyModel()
 
-    with patch('nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules'):
+    with patch('nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules'):
         with caplog.at_level(logging.INFO):
             _apply_peft_and_lower_precision(
                 model, tp_size=2, autopipeline=None,
@@ -341,9 +341,9 @@ def test_force_hf_true_disables_meta_init(monkeypatch):
     cfg_peft = None
 
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep", lambda *a, **k: True)
-    monkeypatch.setattr("nemo_automodel._transformers.auto_model._supports_logits_to_keep", lambda *a, **k: True)
+    monkeypatch.setattr("nemo_automodel._transformers.infrastructure._supports_logits_to_keep", lambda *a, **k: True)
     monkeypatch.setattr("nemo_automodel._transformers.auto_model._verify_sdpa_support", lambda *a, **k: None)
-    monkeypatch.setattr("nemo_automodel._transformers.auto_model.print_trainable_parameters", lambda *a, **k: None)
+    monkeypatch.setattr("nemo_automodel._transformers.infrastructure.print_trainable_parameters", lambda *a, **k: None)
 
     # Call under test - new API: no device param, returns 2-tuple
     model, optimizer = build_model_and_optimizer(
@@ -988,9 +988,9 @@ def test_build_model_state_dict_keys_uses_adapter(caplog):
     cfg_peft = None
 
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
+        with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
+                with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
                     # New API: no device param, returns 2-tuple
                     model, optimizer = build_model_and_optimizer(
                         cfg_model=cfg_model,
@@ -1013,9 +1013,9 @@ def test_build_model_state_dict_keys_without_adapter():
     cfg_peft = None
 
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
+        with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
+                with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
                     # New API: no device param, returns 2-tuple
                     model, optimizer = build_model_and_optimizer(
                         cfg_model=cfg_model,
@@ -1053,9 +1053,9 @@ def test_build_model_with_quantized_model_config():
     cfg_model = DummyQuantizedModelConfig()
 
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
+        with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
+                with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
                     # New API: no device param, returns 2-tuple
                     model, optimizer = build_model_and_optimizer(
                         cfg_model=cfg_model,
@@ -1078,9 +1078,9 @@ def test_build_model_without_quant_config():
     cfg_peft = None
 
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
+        with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
+                with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
                     # New API: no device param, returns 2-tuple
                     model, optimizer = build_model_and_optimizer(
                         cfg_model=cfg_model,
@@ -1114,9 +1114,9 @@ def test_build_model_disables_foreach_with_tp():
     mock_mesh.__getitem__ = lambda self, key: mock_tp if key == "tp" else MagicMock()
 
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
+        with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
+                with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
                     model, optimizer = build_model_and_optimizer(
                         cfg_model=cfg_model,
                         cfg_opt=cfg_opt,
@@ -1136,9 +1136,9 @@ def test_build_model_returns_model_optimizer_tuple():
     cfg_opt = DummyOptConfig()
 
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
+        with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
+                with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
                     result = build_model_and_optimizer(
                         cfg_model=cfg_model,
                         cfg_opt=cfg_opt,

@@ -14,7 +14,7 @@
 
 """MoE parallelizer configuration."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any, Dict, Optional, Union
 
 import torch
@@ -52,26 +52,6 @@ class MoEParallelizerConfig:
     lm_head_precision: Optional[Union[str, torch.dtype]] = None
     wrap_outer_model: bool = True
 
-    def __init__(
-        self,
-        activation_checkpointing: bool = False,
-        ignore_router_for_ac: bool = False,
-        reshard_after_forward: bool = False,
-        lm_head_precision: Optional[Union[str, torch.dtype]] = None,
-        wrap_outer_model: bool = True,
-    ):
-        self.activation_checkpointing = activation_checkpointing
-        self.ignore_router_for_ac = ignore_router_for_ac
-        self.reshard_after_forward = reshard_after_forward
-        self.lm_head_precision = lm_head_precision
-        self.wrap_outer_model = wrap_outer_model
-
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
-        return {
-            "activation_checkpointing": self.activation_checkpointing,
-            "ignore_router_for_ac": self.ignore_router_for_ac,
-            "reshard_after_forward": self.reshard_after_forward,
-            "lm_head_precision": self.lm_head_precision,
-            "wrap_outer_model": self.wrap_outer_model,
-        }
+        return {f.name: getattr(self, f.name) for f in fields(self)}

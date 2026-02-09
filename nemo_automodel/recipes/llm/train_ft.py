@@ -34,7 +34,11 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from wandb import Settings
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM, NeMoAutoModelForSequenceClassification
-from nemo_automodel._transformers.auto_model import apply_model_infrastructure
+from nemo_automodel._transformers.infrastructure import (
+    MeshContext,
+    apply_model_infrastructure,
+    instantiate_infrastructure,
+)
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import (
@@ -209,17 +213,40 @@ def build_model_and_optimizer(
             model = cfg_model.instantiate(**kwargs)
         else:
             # For non-NemoAutoModel entry points (e.g., build_gpt2_model),
-            # instantiate the model first, then apply infrastructure separately
+            # instantiate the model first, then apply infrastructure separately.
+            # We must convert config objects into runtime objects (model_wrapper,
+            # autopipeline, parallelize_fn, etc.) via instantiate_infrastructure,
+            # exactly as from_pretrained/from_config do internally.
             model = cfg_model.instantiate()
+
+            mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+            model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
+                distributed_config=distributed_config,
+                pipeline_config=pipeline_config,
+                qat_config=kwargs.get("qat_config"),
+                moe_config=kwargs.get("moe_config"),
+                device=torch.device("cuda", torch.cuda.current_device()),
+                mesh=mesh,
+            )
+            loss_fn = pipeline_config.loss_fn if pipeline_config is not None else None
+
             model = apply_model_infrastructure(
                 model,
-                is_hf_model=False,
                 is_meta_device=False,
                 device=torch.cuda.current_device(),
+                mesh=mesh,
+                model_wrapper=model_wrapper,
+                autopipeline=autopipeline,
+                parallelize_fn=parallelize_fn,
+                qat_quantizer=qat_quantizer,
+                loss_fn=loss_fn,
+                peft_config=kwargs.get("peft_config"),
+                fp8_config=kwargs.get("fp8_config"),
+                compile_config=kwargs.get("compile_config"),
+                quantization_config=kwargs.get("quantization_config"),
                 pretrained_model_name_or_path=None,
                 load_base_model=False,
                 cache_dir=hf_constants.HF_HUB_CACHE,
-                **kwargs,
             )
 
     # Explicitly unfreeze specified modules (e.g. task heads) that need full fine-tuning
@@ -1000,9 +1027,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         qat_cfg = cfg.qat
         _qat_enable_after = qat_cfg.get("fake_quant_after_n_steps", 0)
         # Collect mode from any model part that has it
-        qat_mode = None
-        if hasattr(model_parts[0], "_qat_mode"):
-            qat_mode = getattr(model_parts[0], "_qat_mode")
+        qat_mode = getattr(model_parts[0], "_qat_mode", None)
 
         if qat_mode is None:
             return None, None, None
