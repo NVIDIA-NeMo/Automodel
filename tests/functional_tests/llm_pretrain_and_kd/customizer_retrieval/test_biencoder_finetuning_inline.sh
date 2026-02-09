@@ -18,13 +18,16 @@ set -exo pipefail
 # Run the biencoder recipe (uses nemo_automodel/recipes/biencoder/train_biencoder.py via module entrypoint).
 python3 -m nemo_automodel.recipes.biencoder.train_biencoder \
     --config \
-    tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/recipe.yaml
-
-# exit 0;
+    tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/recipe.yaml \
+    --model.pretrained_model_name_or_path $TEST_DATA_DIR/llama-nemotron-embed-1b-v2/ \
+    --tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/llama-nemotron-embed-1b-v2/ \
+    --dataloader.dataset.data_dir_list [$TEST_DATA_DIR/embedding_testdata/training.jsonl] \
 
 # Compare baseline vs finetuned biencoder checkpoint (pos-neg separation should not degrade).
 python3 \
     tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/compare_biencoder_models.py \
-    /mnt/4tb/auto/Automodel6/ckpts/nvidia/llama-nemotron-embed-1b-v2 \
+    $TEST_DATA_DIR/llama-nemotron-embed-1b-v2 \
     /workspace/output/biencoder_inline/checkpoints/epoch_0_step_31/ \
-    /home/TestData/automodel/embedding_testdata/testing.jsonl
+    $TEST_DATA_DIR/embedding_testdata/testing.jsonl
+
+

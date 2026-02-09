@@ -45,7 +45,7 @@ _REPO_ROOT = _THIS_DIR.parents[3]  # Automodel6/
 
 BASE_MODEL_PATH = os.environ.get(
     "BASE_MODEL_PATH",
-    "/mnt/4tb/auto/Automodel6/ckpts/nvidia/llama-nemotron-embed-1b-v2",
+    "/home/TestData/automodel/llama-nemotron-embed-1b-v2",
 )
 CHECKPOINT_DIR = os.environ.get(
     "CHECKPOINT_DIR",
