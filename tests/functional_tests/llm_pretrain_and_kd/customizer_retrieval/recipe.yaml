@@ -42,7 +42,6 @@ dataloader:
     _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset
     data_dir_list:
     - /home/TestData/automodel/embedding_testdata/training.jsonl
-    # /home/TestData/automodel/embedding_testdata/
     data_type: train
     train_n_passages: 2
     seed: 42
