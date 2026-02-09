@@ -1171,9 +1171,7 @@ def megatron_fsdp_strategy_parallelize(
         fsdp_double_buffer=fsdp_double_buffer,
     )
     if optimizer is not None:
-        model, optimizer = megatron_fsdp_fully_shard(
-            module=model, optimizer=optimizer, **fsdp_kwargs
-        )
+        model, optimizer = megatron_fsdp_fully_shard(module=model, optimizer=optimizer, **fsdp_kwargs)
     else:
         model = megatron_fsdp_fully_shard_model(module=model, **fsdp_kwargs)
         model._replace_param_with_distributed_if_needed()
