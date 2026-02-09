@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 import wandb
 from huggingface_hub import constants as hf_constants
+from megatron_fsdp import MegatronFSDP
 from megatron_fsdp.fully_shard import fully_shard_optimizer
 from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
@@ -131,9 +132,8 @@ def _get_num_thd_chunks(pp_enabled, cfg):
     return 1
 
 
-def build_model_and_optimizer(
+def build_model(
     cfg_model,
-    cfg_opt,
     cfg_peft,
     seed,
     has_packed_sequence=False,
@@ -153,7 +153,6 @@ def build_model_and_optimizer(
 
     Args:
         cfg_model: Configuration for model instantiation.
-        cfg_opt: Configuration for optimizer instantiation.
         cfg_peft: Configuration for PEFT.
         seed: Random seed.
         has_packed_sequence: Whether using packed sequences.
@@ -257,6 +256,18 @@ def build_model_and_optimizer(
                 param.requires_grad_(True)
         logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
 
+    return model
+
+
+def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
+    """Build an optimizer for the model.
+
+    Args:
+        model: The model to build an optimizer for.
+        cfg_opt: The configuration for the optimizer.
+        distributed_config: The distributed configuration.
+        device_mesh: The device mesh.
+    """
     if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
         # TP does not support foreach
         cfg_opt.foreach = False
@@ -277,10 +288,15 @@ def build_model_and_optimizer(
             tmp_optimizer = cfg_opt.instantiate(params=trainable_params)
         if isinstance(distributed_config, MegatronFSDPConfig) and torch.distributed.get_world_size() > 1:
             assert not has_dion_optimizer, "Dion optimizer does not support fully_shard_optimizer"
-            fully_shard_optimizer(tmp_optimizer)
+            # Only call fully_shard_optimizer when the model was actually wrapped
+            # with MegatronFSDP. When dp_mesh.size()==1 the parallelizer skips
+            # MegatronFSDP wrapping and the parameters won't carry the required
+            # _megatron_fsdp_model attribute.
+            if isinstance(part, MegatronFSDP):
+                fully_shard_optimizer(tmp_optimizer)
         optimizer.append(tmp_optimizer)
 
-    return model, optimizer
+    return optimizer
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
@@ -918,9 +934,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
-        model, self.optimizer = build_model_and_optimizer(
+        model = build_model(
             self.cfg.model,
-            self.cfg.optimizer,
             self.peft_config,
             has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
             seed=self.cfg.get("seed", 42),
@@ -934,6 +949,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_qat=self.cfg.get("qat", None),
             cfg_moe=self.cfg.get("moe_config", None),
         )
+        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")

@@ -474,11 +474,11 @@ class TestSynchronizeForCheckpoint:
 
 
 # ---------------------------------------------------------------------------
-# Tests for train_ft.py: Dion optimizer branch in build_model_and_optimizer()
+# Tests for train_ft.py: Dion optimizer branch in build_optimizer()
 # ---------------------------------------------------------------------------
 
 def _patch_train_ft_for_cpu(monkeypatch, train_ft_mod, model):
-    """Patch train_ft module so build_model_and_optimizer can run on CPU.
+    """Patch train_ft module so build_model / build_optimizer can run on CPU.
 
     Makes cfg_model.get("_target_") match NeMoAutoModelForCausalLM.from_pretrained
     so the code takes the simple cfg_model.instantiate(**kwargs) path and never
@@ -501,10 +501,10 @@ def _patch_train_ft_for_cpu(monkeypatch, train_ft_mod, model):
     return _sentinel
 
 
-class TestBuildModelAndOptimizerDionBranch:
-    """Test the optimizer creation branch in build_model_and_optimizer().
+class TestBuildOptimizerDionBranch:
+    """Test the optimizer creation branch in build_optimizer().
 
-    The logic under test (train_ft.py lines 236-270):
+    The logic under test:
     - is_dion_optimizer(cfg_opt) -> True -> build_dion_optimizer()
     - is_dion_optimizer(cfg_opt) -> False -> normal cfg_opt.instantiate()
     - Model with/without `parts` attribute
@@ -558,13 +558,13 @@ class TestBuildModelAndOptimizerDionBranch:
             ),
         )
 
-        result_model, optimizers = train_ft_mod.build_model_and_optimizer(
+        result_model = train_ft_mod.build_model(
             cfg_model=FakeCfgModel(),
-            cfg_opt=FakeCfgOpt(),
             cfg_peft=None,
             seed=42,
             device_mesh=sentinel_mesh,
         )
+        optimizers = train_ft_mod.build_optimizer(result_model, FakeCfgOpt(), None, sentinel_mesh)
 
         assert result_model is model
         assert optimizers == ["fake_dion_opt"]
@@ -600,12 +600,12 @@ class TestBuildModelAndOptimizerDionBranch:
             ),
         )
 
-        _, optimizers = train_ft_mod.build_model_and_optimizer(
+        result_model = train_ft_mod.build_model(
             cfg_model=FakeCfgModel(),
-            cfg_opt=FakeCfgOpt(),
             cfg_peft=None,
             seed=42,
         )
+        optimizers = train_ft_mod.build_optimizer(result_model, FakeCfgOpt(), None, None)
 
         assert len(build_calls) == 2
         assert build_calls[0] is model.parts[0]
@@ -637,12 +637,12 @@ class TestBuildModelAndOptimizerDionBranch:
 
         monkeypatch.setattr(train_ft_mod, "is_dion_optimizer", lambda cfg: False)
 
-        _, optimizers = train_ft_mod.build_model_and_optimizer(
+        result_model = train_ft_mod.build_model(
             cfg_model=FakeCfgModel(),
-            cfg_opt=FakeCfgOpt(),
             cfg_peft=None,
             seed=42,
         )
+        optimizers = train_ft_mod.build_optimizer(result_model, FakeCfgOpt(), None, None)
 
         assert len(instantiate_calls) == 1
         assert len(instantiate_calls[0]) > 0  # trainable params passed
@@ -673,12 +673,12 @@ class TestBuildModelAndOptimizerDionBranch:
 
         monkeypatch.setattr(train_ft_mod, "is_dion_optimizer", lambda cfg: False)
 
-        _, optimizers = train_ft_mod.build_model_and_optimizer(
+        result_model = train_ft_mod.build_model(
             cfg_model=FakeCfgModel(),
-            cfg_opt=FakeCfgOpt(),
             cfg_peft=None,
             seed=42,
         )
+        optimizers = train_ft_mod.build_optimizer(result_model, FakeCfgOpt(), None, None)
 
         assert len(instantiate_calls) == 2
         assert len(optimizers) == 2

@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 import wandb
 from huggingface_hub import constants as hf_constants
+from megatron_fsdp import MegatronFSDP
 from megatron_fsdp.fully_shard import fully_shard_optimizer
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
@@ -82,9 +83,8 @@ def _get_model_name(cfg_model):
         return None
 
 
-def build_model_and_optimizer(
+def build_model(
     cfg_model,
-    cfg_opt,
     cfg_freeze,
     cfg_peft,
     seed,
@@ -131,7 +131,18 @@ def build_model_and_optimizer(
                 f"VLM finetuning requires NeMoAutoModelForImageTextToText. "
                 f"Got model target: {cfg_model.get('_target_', None)}"
             )
+    return model
 
+
+def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
+    """Build an optimizer for the model.
+
+    Args:
+        model: The model to build an optimizer for.
+        cfg_opt: The configuration for the optimizer.
+        distributed_config: The distributed configuration.
+        device_mesh: The device mesh.
+    """
     if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
         # TP does not support foreach
         cfg_opt.foreach = False
@@ -147,10 +158,15 @@ def build_model_and_optimizer(
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         optimizer = cfg_opt.instantiate(params=trainable_params)
         if isinstance(distributed_config, MegatronFSDPConfig) and torch.distributed.get_world_size() > 1:
-            fully_shard_optimizer(optimizer)
+            # Only call fully_shard_optimizer when the model was actually wrapped
+            # with MegatronFSDP. When dp_mesh.size()==1 the parallelizer skips
+            # MegatronFSDP wrapping and the parameters won't carry the required
+            # _megatron_fsdp_model attribute.
+            if isinstance(model, MegatronFSDP):
+                fully_shard_optimizer(optimizer)
         optimizer = [optimizer]
 
-    return model, optimizer
+    return optimizer
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
@@ -567,9 +583,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
-        model, self.optimizer = build_model_and_optimizer(
+        model = build_model(
             self.cfg.model,
-            self.cfg.optimizer,
             self.cfg.get("freeze_config", None),
             self.peft_config,
             seed=self.cfg.get("seed", 42),
@@ -580,6 +595,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             distributed_config=self.distributed_config,
             pipeline_config=self.pipeline_config,
         )
+        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
