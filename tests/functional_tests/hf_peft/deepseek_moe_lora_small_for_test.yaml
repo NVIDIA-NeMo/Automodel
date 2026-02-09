@@ -102,8 +102,8 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: train
   tokenizer:
     pretrained_model_name_or_path: TinyLlama/TinyLlama-1.1B-Chat-v1.0
@@ -115,10 +115,10 @@ dataloader:
   num_workers: 2
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: validation
-  num_samples_limit: 128
+  limit_dataset_samples: 128
   tokenizer:
     pretrained_model_name_or_path: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 
