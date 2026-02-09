@@ -104,6 +104,7 @@ class FSDP2Manager:
             mp_policy=self.mp_policy,
             tp_shard_plan=tp_shard_plan,
             offload_policy=self.offload_policy,
+            sequence_parallel=bool(self.sequence_parallel),
             activation_checkpointing=self.activation_checkpointing,
         )
         return model
