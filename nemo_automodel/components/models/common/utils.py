@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.util
+import warnings
 from dataclasses import dataclass
 from typing import Literal
 
@@ -49,7 +50,9 @@ class BackendConfig:
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
-    enable_deepep: bool = HAVE_DEEP_EP
+    experts: Literal["torch", "te", "gmm"] = "torch"
+    dispatcher: Literal["torch", "deepep"] = "torch"
+    enable_deepep: bool | None = None  # Deprecated: use dispatcher="deepep" instead
     fake_balanced_gate: bool = False
     enable_hf_state_dict_adapter: bool = True
     enable_fsdp_optimizations: bool = False
@@ -58,6 +61,29 @@ class BackendConfig:
     def __post_init__(self):
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
+
+        # Handle deprecated enable_deepep parameter
+        if self.enable_deepep is not None:
+            warnings.warn(
+                "enable_deepep is deprecated and will be removed in a future release. "
+                "Use experts='gmm' and dispatcher='deepep' instead of enable_deepep=True, "
+                "or dispatcher='torch' instead of enable_deepep=False.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.enable_deepep:
+                self.experts = "gmm"
+                self.dispatcher = "deepep"
+            else:
+                self.dispatcher = "torch"
+            # Clear the deprecated field after conversion
+            self.enable_deepep = None
+
+        # TE and GMM experts require DeepEP dispatcher
+        if self.experts in ("te", "gmm") and self.dispatcher != "deepep":
+            raise ValueError(
+                f"experts='{self.experts}' requires dispatcher='deepep', but got dispatcher='{self.dispatcher}'"
+            )
 
 
 def initialize_rms_norm_module(

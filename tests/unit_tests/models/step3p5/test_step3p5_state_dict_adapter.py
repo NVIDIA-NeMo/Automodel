@@ -19,7 +19,7 @@ import torch
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.step3p5.state_dict_adapter import Step3p5StateDictAdapter
-from nemo_automodel.components.moe.layers import MoEConfig
+from nemo_automodel.components.moe.config import MoEConfig
 
 
 @dataclass

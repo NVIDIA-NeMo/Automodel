@@ -17,7 +17,8 @@ import sys
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.moe.layers import GroupedExperts, MoEConfig
+from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.layers import GroupedExperts
 
 # Track whether expert_activation was called
 activation_called = [False]

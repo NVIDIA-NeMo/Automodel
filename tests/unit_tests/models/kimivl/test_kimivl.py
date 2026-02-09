@@ -33,7 +33,7 @@ class TestMoonViTConfig:
     def test_default_initialization(self):
         """Test MoonViTConfig initializes with correct defaults."""
         config = MoonViTConfig()
-        
+
         assert config.patch_size == 14
         assert config.init_pos_emb_height == 64
         assert config.init_pos_emb_width == 64
@@ -52,7 +52,7 @@ class TestMoonViTConfig:
             num_hidden_layers=12,
             merge_kernel_size=(4, 4),
         )
-        
+
         assert config.patch_size == 16
         assert config.hidden_size == 768
         assert config.num_hidden_layers == 12
@@ -71,7 +71,7 @@ class TestKimiVLConfig:
     def test_default_initialization(self):
         """Test KimiVLConfig initializes with defaults."""
         config = KimiVLConfig()
-        
+
         assert isinstance(config.vision_config, MoonViTConfig)
         assert isinstance(config.text_config, DeepseekV3Config)
         assert config.ignore_index == -100
@@ -84,16 +84,16 @@ class TestKimiVLConfig:
         """Test KimiVLConfig initializes correctly from dict configs."""
         vision_dict = {"hidden_size": 768, "patch_size": 16}
         text_dict = {"hidden_size": 1024, "vocab_size": 50000}
-        
+
         config = KimiVLConfig(
             vision_config=vision_dict,
             text_config=text_dict,
         )
-        
+
         assert isinstance(config.vision_config, MoonViTConfig)
         assert config.vision_config.hidden_size == 768
         assert config.vision_config.patch_size == 16
-        
+
         assert isinstance(config.text_config, DeepseekV3Config)
         assert config.text_config.hidden_size == 1024
         assert config.text_config.vocab_size == 50000
@@ -102,12 +102,12 @@ class TestKimiVLConfig:
         """Test KimiVLConfig initializes correctly from config objects."""
         vision_config = MoonViTConfig(hidden_size=512)
         text_config = DeepseekV3Config(hidden_size=2048)
-        
+
         config = KimiVLConfig(
             vision_config=vision_config,
             text_config=text_config,
         )
-        
+
         assert config.vision_config is vision_config
         assert config.text_config is text_config
 
@@ -115,7 +115,7 @@ class TestKimiVLConfig:
         """Test KimiVLConfig.to_dict() includes nested configs."""
         config = KimiVLConfig()
         config_dict = config.to_dict()
-        
+
         assert "vision_config" in config_dict
         assert "text_config" in config_dict
         assert isinstance(config_dict["vision_config"], dict)
@@ -146,15 +146,15 @@ class TestKimiVLForConditionalGeneration:
             qk_nope_head_dim=16,
         )
         mock_config.media_placeholder_token_id = 163605
-        
+
         with patch.object(KimiVLConfig, "from_pretrained", return_value=mock_config):
             with patch.object(
                 KimiVLForConditionalGeneration, "from_config"
             ) as mock_from_config:
                 mock_from_config.return_value = MagicMock()
-                
+
                 KimiVLForConditionalGeneration.from_pretrained("dummy/path")
-                
+
                 KimiVLConfig.from_pretrained.assert_called_once_with("dummy/path")
                 mock_from_config.assert_called_once()
                 assert mock_from_config.call_args[0][0] is mock_config
@@ -162,7 +162,7 @@ class TestKimiVLForConditionalGeneration:
     def test_modelclass_export_exists(self):
         """Test ModelClass is exported and points to correct class."""
         from nemo_automodel.components.models.kimivl import model as kimivl_mod
-        
+
         assert hasattr(kimivl_mod, "ModelClass")
         assert kimivl_mod.ModelClass is KimiVLForConditionalGeneration
 
@@ -173,7 +173,7 @@ class TestKimiVLUsesDeepseekV3Config:
     def test_text_config_is_hf_deepseek_v3_config(self):
         """Verify text_config uses HF's DeepseekV3Config, not a custom class."""
         config = KimiVLConfig()
-        
+
         # Should be the actual HuggingFace DeepseekV3Config class
         assert type(config.text_config).__name__ == "DeepseekV3Config"
         assert type(config.text_config).__module__ == "transformers.models.deepseek_v3.configuration_deepseek_v3"
@@ -181,7 +181,7 @@ class TestKimiVLUsesDeepseekV3Config:
     def test_text_config_from_dict_creates_hf_config(self):
         """Verify creating from dict still uses HF's DeepseekV3Config."""
         config = KimiVLConfig(text_config={"hidden_size": 512})
-        
+
         assert type(config.text_config).__name__ == "DeepseekV3Config"
         assert config.text_config.hidden_size == 512
 
@@ -369,7 +369,7 @@ class TestKimiVLMultiModalProjector:
 
 class TestKimiVLModel:
     """Tests for KimiVLModel.
-    
+
     These tests verify validation logic without instantiating full model
     to avoid CUDA code in MoE layers.
     """
@@ -490,7 +490,7 @@ class TestKimiVLStateDictAdapter:
         """Create adapter setup for testing."""
         from nemo_automodel.components.models.common import BackendConfig
         from nemo_automodel.components.models.kimivl.model import KimiVLStateDictAdapter
-        from nemo_automodel.components.moe.layers import MoEConfig
+        from nemo_automodel.components.moe.config import MoEConfig
 
         config = KimiVLConfig(
             vision_config=MoonViTConfig(hidden_size=64),
@@ -578,7 +578,7 @@ class TestKimiVLStateDictAdapter:
 
 class TestKimiVLPipelineParallelismChunking:
     """Tests for VLM chunking logic used in pipeline parallelism.
-    
+
     These tests verify the chunking logic directly without instantiating
     the full model to avoid CUDA code in MoE layers.
     """
@@ -593,11 +593,11 @@ class TestKimiVLPipelineParallelismChunking:
         vlm_chunk_idx,
     ):
         """Simulate the PP chunking logic from KimiVLForConditionalGeneration.forward.
-        
+
         Returns (pixel_values, image_grid_hws, new_chunk_idx).
         """
         image_grid_hws = None
-        
+
         if (
             pixel_values is None
             and vlm_pixel_values_chunks is not None
@@ -612,7 +612,7 @@ class TestKimiVLPipelineParallelismChunking:
                     pixel_values = vlm_pixel_values_chunks[vlm_chunk_idx]
                     image_grid_hws = vlm_image_grid_hws_chunks[vlm_chunk_idx]
                     vlm_chunk_idx = vlm_chunk_idx + 1
-        
+
         return pixel_values, image_grid_hws, vlm_chunk_idx
 
     def test_pp_chunking_retrieves_when_media_tokens_present(self):
@@ -976,7 +976,7 @@ class TestMoonVitEncoder:
 
 class TestMoonVisionPatchEmbed:
     """Tests for MoonVisionPatchEmbed.
-    
+
     Note: MoonVisionPatchEmbed expects input as (num_patches, channels, patch_h, patch_w)
     where each patch is a separate item. The Conv2d processes each patch individually.
     """
@@ -1004,13 +1004,13 @@ class TestMoonVisionPatchEmbed:
 
     def test_patch_embed_forward(self, patch_embed):
         """Test patch embed forward pass.
-        
+
         Input format: (num_patches_total, 3, patch_size, patch_size)
         Each patch is 14x14 pixels.
         """
         h, w = 4, 4
         num_patches = h * w  # 16 patches for 4x4 grid
-        
+
         # Input: individual patches stacked as batch
         # Each patch is (3, 14, 14)
         x = torch.randn(num_patches, 3, 14, 14)
@@ -1026,27 +1026,27 @@ class TestMoonVisionPatchEmbed:
         h1, w1 = 4, 4
         h2, w2 = 2, 2
         total_patches = h1 * w1 + h2 * w2  # 16 + 4 = 20
-        
+
         # All patches from both images concatenated
         x = torch.randn(total_patches, 3, 14, 14)
         grid_hws = torch.tensor([[h1, w1], [h2, w2]])
-        
+
         output = patch_embed(x, grid_hws)
-        
+
         assert output.shape == (total_patches, 64)
 
     def test_patch_embed_pos_emb_applied(self, patch_embed):
         """Test that position embedding is applied to output."""
         h, w = 4, 4
         num_patches = h * w
-        
+
         x = torch.randn(num_patches, 3, 14, 14)
         grid_hws = torch.tensor([[h, w]])
 
         # Run twice with same input - output should be same (deterministic)
         out1 = patch_embed(x, grid_hws)
         out2 = patch_embed(x, grid_hws)
-        
+
         assert torch.allclose(out1, out2)
 
 

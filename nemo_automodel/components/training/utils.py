@@ -14,6 +14,7 @@
 
 import gc
 import math
+import re
 from typing import Iterable
 
 import torch
@@ -21,6 +22,14 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.moe.fsdp_mixin import set_is_optim_step
+
+# Regex pattern to match expert parameters in GroupedExpertsTE.
+# Matches FQNs like:
+# - model.layers.X.mlp.experts.gate_up_linear.weight0
+# - model.layers.X.mlp.experts.gate_up_linear.bias0
+# - model.layers.X.mlp.experts.down_linear.weight0
+# - model.layers.X.mlp.experts.down_linear.bias0
+_TE_EXPERT_PARAM_PATTERN = re.compile(r"(^|\.)mlp\.experts\.(gate_up_linear|down_linear)\.(weight|bias)\d+")
 
 
 @torch.no_grad()
@@ -291,16 +300,28 @@ def scale_grads_and_clip_grad_norm(
     # Single pass over parameters to apply both scalings where applicable
     if pp_divisor is not None or ep_ratio is not None:
         for mp in model_parts:
-            for p in mp.parameters():
+            for name, p in mp.named_parameters():
                 if p.grad is None:
                     continue
                 if pp_divisor is not None:
                     p.grad.div_(pp_divisor)
                 if ep_ratio is not None:
-                    # Grad and param must be DTensors for EP-aware scaling
-                    if isinstance(p, DTensor) and isinstance(p.grad, DTensor):
-                        if ep_axis_name and ep_axis_name in p.device_mesh.mesh_dim_names:
-                            p.grad.div_(ep_ratio)
+                    # Scale expert gradients by EP ratio.
+                    # DTensor experts: check device mesh for EP sharding axis
+                    # Non-DTensor experts (e.g., DeepEP): check param name
+                    is_ep_sharded_dtensor = (
+                        isinstance(p, DTensor)
+                        and isinstance(p.grad, DTensor)
+                        and ep_axis_name
+                        and ep_axis_name in p.device_mesh.mesh_dim_names
+                    )
+                    is_expert_param = (
+                        isinstance(p, torch.Tensor)
+                        and isinstance(p.grad, torch.Tensor)
+                        and _TE_EXPERT_PARAM_PATTERN.search(name) is not None
+                    )
+                    if is_ep_sharded_dtensor or is_expert_param:
+                        p.grad.div_(ep_ratio)
 
     # Clip with the existing PP/EP-aware helper
     return clip_grad_norm(
