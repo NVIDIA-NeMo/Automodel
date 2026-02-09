@@ -27,8 +27,8 @@ examples/vlm_finetune/finetune.py \
   --dataset.limit_dataset_samples 10 \
   --validation_dataset.path_or_dataset $HF_CACHE/mini_cord_v2/ \
   --validation_dataset.limit_dataset_samples 10 \
-  --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
+  --distributed_config._target_ nemo_automodel.components.distributed.config.FSDP2Config \
   --distributed.dp_size none \
   --distributed.tp_size 2 \
   --distributed.cp_size 1 \
-  --distributed.activation_checkpointing true
+  --distributed_config.activation_checkpointing true

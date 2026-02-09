@@ -28,8 +28,8 @@ rng:
   seed: 1234
   ranked: true
 
-parallelizer:
-  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
+moe_config:
+  _target_: nemo_automodel.components.moe.config.MoEParallelizerConfig
   activation_checkpointing: false
 
 model:
@@ -77,16 +77,17 @@ checkpoint:
   save_consolidated: false
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  dp_replicate_size: 1
   ep_size: 2
+
+distributed_config:
+  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false
 
 autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
+  _target_: nemo_automodel.components.distributed.pipelining.config.PipelineConfig
   pp_schedule: interleaved1f1b
   pp_microbatch_size: 1
   round_virtual_stages_to_pp_multiple: up

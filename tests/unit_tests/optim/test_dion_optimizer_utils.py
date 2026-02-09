@@ -14,6 +14,7 @@
 
 import math
 from contextlib import nullcontext
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -532,7 +533,8 @@ class TestBuildModelAndOptimizerDionBranch:
         import nemo_automodel.recipes.llm.train_ft as train_ft_mod
 
         model = self._make_simple_model()
-        sentinel_mesh = object()
+        sentinel_mesh = MagicMock()
+        sentinel_mesh.mesh_dim_names = ("dp",)
         build_calls = []
 
         _target_sentinel = _patch_train_ft_for_cpu(monkeypatch, train_ft_mod, model)
@@ -548,9 +550,6 @@ class TestBuildModelAndOptimizerDionBranch:
         class FakeCfgOpt:
             foreach = True
 
-        class FakeModelWrapper:
-            device_mesh = sentinel_mesh
-
         monkeypatch.setattr(train_ft_mod, "is_dion_optimizer", lambda cfg: True)
         monkeypatch.setattr(
             train_ft_mod, "build_dion_optimizer",
@@ -559,13 +558,12 @@ class TestBuildModelAndOptimizerDionBranch:
             ),
         )
 
-        result_model, optimizers, loss_fn = train_ft_mod.build_model_and_optimizer(
+        result_model, optimizers = train_ft_mod.build_model_and_optimizer(
             cfg_model=FakeCfgModel(),
             cfg_opt=FakeCfgOpt(),
             cfg_peft=None,
-            model_wrapper=FakeModelWrapper(),
             seed=42,
-            loss_fn=None,
+            device_mesh=sentinel_mesh,
         )
 
         assert result_model is model
@@ -594,9 +592,6 @@ class TestBuildModelAndOptimizerDionBranch:
         class FakeCfgOpt:
             foreach = True
 
-        class FakeModelWrapper:
-            device_mesh = None
-
         monkeypatch.setattr(train_ft_mod, "is_dion_optimizer", lambda cfg: True)
         monkeypatch.setattr(
             train_ft_mod, "build_dion_optimizer",
@@ -605,13 +600,11 @@ class TestBuildModelAndOptimizerDionBranch:
             ),
         )
 
-        _, optimizers, _ = train_ft_mod.build_model_and_optimizer(
+        _, optimizers = train_ft_mod.build_model_and_optimizer(
             cfg_model=FakeCfgModel(),
             cfg_opt=FakeCfgOpt(),
             cfg_peft=None,
-            model_wrapper=FakeModelWrapper(),
             seed=42,
-            loss_fn=None,
         )
 
         assert len(build_calls) == 2
@@ -642,18 +635,13 @@ class TestBuildModelAndOptimizerDionBranch:
                 instantiate_calls.append(params)
                 return "regular_opt"
 
-        class FakeModelWrapper:
-            pass
-
         monkeypatch.setattr(train_ft_mod, "is_dion_optimizer", lambda cfg: False)
 
-        _, optimizers, _ = train_ft_mod.build_model_and_optimizer(
+        _, optimizers = train_ft_mod.build_model_and_optimizer(
             cfg_model=FakeCfgModel(),
             cfg_opt=FakeCfgOpt(),
             cfg_peft=None,
-            model_wrapper=FakeModelWrapper(),
             seed=42,
-            loss_fn=None,
         )
 
         assert len(instantiate_calls) == 1
@@ -683,18 +671,13 @@ class TestBuildModelAndOptimizerDionBranch:
                 instantiate_calls.append(params)
                 return f"opt_{len(instantiate_calls)}"
 
-        class FakeModelWrapper:
-            pass
-
         monkeypatch.setattr(train_ft_mod, "is_dion_optimizer", lambda cfg: False)
 
-        _, optimizers, _ = train_ft_mod.build_model_and_optimizer(
+        _, optimizers = train_ft_mod.build_model_and_optimizer(
             cfg_model=FakeCfgModel(),
             cfg_opt=FakeCfgOpt(),
             cfg_peft=None,
-            model_wrapper=FakeModelWrapper(),
             seed=42,
-            loss_fn=None,
         )
 
         assert len(instantiate_calls) == 2
