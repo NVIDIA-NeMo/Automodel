@@ -862,7 +862,7 @@ def apply_model_infrastructure(
         0,
         0,
         0,
-        getattr(model_wrapper, "moe_mesh", None) if model_wrapper else None,
+        getattr(model_wrapper, "moe_mesh", None),
     )
 
     # Handle checkpointer config updates if checkpointer is provided

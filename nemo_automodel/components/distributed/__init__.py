@@ -13,5 +13,6 @@
 # limitations under the License.
 
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
+from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 
-__all__ = ["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]
+__all__ = ["FSDP2Config", "MegatronFSDPConfig", "DDPConfig", "PipelineConfig"]
