@@ -147,7 +147,7 @@ def build_model_and_optimizer(
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         optimizer = cfg_opt.instantiate(params=trainable_params)
         if isinstance(distributed_config, MegatronFSDPConfig) and torch.distributed.get_world_size() > 1:
-            fully_shard_optimizer(model, optimizer)
+            fully_shard_optimizer(optimizer)
         optimizer = [optimizer]
 
     return model, optimizer

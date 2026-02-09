@@ -277,7 +277,7 @@ def build_model_and_optimizer(
             tmp_optimizer = cfg_opt.instantiate(params=trainable_params)
         if isinstance(distributed_config, MegatronFSDPConfig) and torch.distributed.get_world_size() > 1:
             assert not has_dion_optimizer, "Dion optimizer does not support fully_shard_optimizer"
-            fully_shard_optimizer(part, tmp_optimizer)
+            fully_shard_optimizer(tmp_optimizer)
         optimizer.append(tmp_optimizer)
 
     return model, optimizer
