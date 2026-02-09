@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.components.distributed.config import FSDP2Config, MegatronFSDPConfig, DDPConfig
+from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
 
 __all__ = ["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]
