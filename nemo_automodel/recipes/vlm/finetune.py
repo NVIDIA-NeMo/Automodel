@@ -59,10 +59,7 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import (
-    _supports_logits_to_keep,
-    apply_parameter_freezing,
-)
+from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -86,36 +83,6 @@ def _get_model_name(cfg_model):
         return None
 
 
-def _freeze_model(
-    model: Union[nn.Module, AutoPipeline], cfg_freeze: Optional[Dict[str, Any]] = None, freeze_embeddings: bool = True
-):
-    """
-    Freeze the model.
-
-    Args:
-        model: The model to freeze (can be nn.Module or AutoPipeline).
-        cfg_freeze: The configuration for freezing the model.
-        freeze_embeddings: Whether to freeze embeddings.
-
-    Returns:
-        nn.Module or AutoPipeline: The frozen model.
-    """
-    # Handle AutoPipeline by applying freezing to each part
-    if isinstance(model, AutoPipeline):
-        for part in model.parts:
-            _freeze_model(part, cfg_freeze, freeze_embeddings)
-        return model
-
-    if cfg_freeze is not None:
-        apply_parameter_freezing(model, cfg_freeze)
-    elif freeze_embeddings:
-        logging.info("Freezing embeddings")
-        for m in model.modules():
-            if isinstance(m, nn.Embedding):
-                m.weight.requires_grad = False
-    return model
-
-
 def build_model_and_optimizer(
     cfg_model,
     cfg_opt,
@@ -125,7 +92,6 @@ def build_model_and_optimizer(
     seed,
     tp_size=1,
     cp_size=1,
-    freeze_embeddings=True,
     cfg_fp8=None,
     cfg_compile=None,
     loss_fn=None,
@@ -147,6 +113,7 @@ def build_model_and_optimizer(
             "model_wrapper": model_wrapper,
             "loss_fn": loss_fn,
             "autopipeline": autopipeline,
+            "freeze_config": cfg_freeze.to_dict() if cfg_freeze is not None else None,
         }
         if cfg_fp8 is not None:
             fp8_config = build_fp8_config(cfg_fp8)
@@ -169,13 +136,11 @@ def build_model_and_optimizer(
                 f"Got model target: {cfg_model.get('_target_', None)}"
             )
 
-    # VLM-specific: Apply freezing after model is built
-    # For PEFT, base model params are already frozen; this handles additional freezing (e.g., embeddings)
-    model = _freeze_model(model, cfg_freeze, freeze_embeddings)
-
-    # Check loss function compatibility
-    if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
-        logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
+    # override when the loss function requires logits_to_keep (FusedLinearCrossEntropy).
+    if not _supports_logits_to_keep(model) and isinstance(loss_fn, FusedLinearCrossEntropy):
+        logger.warning(
+            "logits_to_keep not found in model.forward but required by FusedLinearCrossEntropy. Using MaskedCrossEntropy instead."
+        )
         loss_fn = MaskedCrossEntropy()
 
     if tp_size > 1:
@@ -797,23 +762,26 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 input_ids = batch.pop("input_ids")
 
-                # VLM: Custom chunking for pixel_values and image_grid_hws
+                # VLM: Custom chunking for pixel_values and image_grid
                 # These tensors have non-standard structure that can't be naively chunked by dim 0
                 # TODO: @HuiyingLi properly handle pixel_values split
                 pixel_values = batch.pop("pixel_values", None)
                 image_grid_hws = batch.pop("image_grid_hws", None)
+                image_grid_thw = batch.pop("image_grid_thw", None)
 
-                if self.pp.info.has_first_stage and pixel_values is not None and image_grid_hws is not None:
+                image_grid = image_grid_hws if image_grid_hws is not None else image_grid_thw
+
+                if self.pp.info.has_first_stage and pixel_values is not None and image_grid is not None:
                     stage0_model = self.model_parts[0]
                     n_microbatches = self.pp._info.schedule._n_microbatches
                     batch_size = input_ids.shape[0]
-                    n_images = image_grid_hws.shape[0]
+                    n_images = image_grid.shape[0]
 
-                    patch_counts = image_grid_hws[:, 0] * image_grid_hws[:, 1]
+                    patch_counts = image_grid.prod(dim=1)
                     cumsum = torch.cumsum(patch_counts, dim=0)
 
                     pixel_values_chunks = []
-                    image_grid_hws_chunks = []
+                    image_grid_chunks = []
 
                     if n_images == batch_size:
                         # 1 image per sample
@@ -822,24 +790,24 @@ class FinetuneRecipeForVLM(BaseRecipe):
                             img_start = mb_idx * images_per_mb
                             img_end = min(img_start + images_per_mb, n_images)
 
-                            image_grid_hws_chunks.append(image_grid_hws[img_start:img_end])
+                            image_grid_chunks.append(image_grid[img_start:img_end])
 
                             patch_start = 0 if img_start == 0 else cumsum[img_start - 1].item()
                             patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
                             pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
                     else:
                         pixel_values_chunks.append(pixel_values)
-                        image_grid_hws_chunks.append(image_grid_hws)
+                        image_grid_chunks.append(image_grid)
                         for _ in range(n_microbatches - 1):
                             pixel_values_chunks.append(pixel_values[:0])
-                            image_grid_hws_chunks.append(image_grid_hws[:0])
+                            image_grid_chunks.append(image_grid[:0])
                         logging.warning(
                             f"VLM chunking: n_images={n_images} != batch_size={batch_size}, giving all images to first microbatch"
                         )
 
                     # Store pre-chunked tensors on model for forward to use
                     stage0_model._vlm_pixel_values_chunks = pixel_values_chunks
-                    stage0_model._vlm_image_grid_hws_chunks = image_grid_hws_chunks
+                    stage0_model._vlm_image_grid_hws_chunks = image_grid_chunks
                     stage0_model._vlm_chunk_idx = 0
 
                 if self.pp.info.has_first_stage:
@@ -848,7 +816,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     self.pp.info.schedule.step(target=targets, losses=losses, **batch)
 
                 # Clear stored VLM chunks after PP step
-                if self.pp.info.has_first_stage and pixel_values is not None:
+                if self.pp.info.has_first_stage and pixel_values is not None and image_grid is not None:
                     stage0_model = self.model_parts[0]
                     stage0_model._vlm_pixel_values_chunks = None
                     stage0_model._vlm_image_grid_hws_chunks = None
