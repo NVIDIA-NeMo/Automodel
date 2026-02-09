@@ -13,12 +13,15 @@
 # limitations under the License.
 
 import json
+import runpy
+import sys
 from typing import Any, Dict
 
 import pytest
 from datasets import Dataset
 
 import nemo_automodel.components.datasets.llm.retrieval_dataset as rd
+import nemo_automodel.components.datasets.llm.retrieval_dataset_inline as rdi
 
 
 class DummyImage:
@@ -565,3 +568,309 @@ def test_transform_func_with_use_dataset_instruction():
     # Both should have same question and doc_text content
     assert out_with_instruction["question"] == out_without_instruction["question"]
     assert out_with_instruction["doc_text"] == out_without_instruction["doc_text"]
+
+
+def test_load_datasets_inline_jsonl(tmp_path):
+    """Inline retrieval format: query + inline pos/neg doc texts (JSONL)."""
+    f = tmp_path / "inline.jsonl"
+    records = [
+        {
+            "query": "Explain transformers",
+            "pos_doc": "Transformers are a type of neural network...",
+            "neg_doc": ["RNNs are...", "CNNs are..."],
+            "extra_field": 123,  # should be ignored
+        },
+        {
+            # Support "question" as alias for "query", plus list/singleton coercions
+            "question": "What is Python?",
+            "pos_doc": ["A programming language."],
+            "neg_doc": "A snake.",
+        },
+    ]
+    f.write_text("\n".join(json.dumps(r) for r in records))
+
+    dataset, corpus_dict = rdi.load_datasets(str(f))
+    assert len(dataset) == 2
+    assert corpus_dict == {}
+
+    row0 = dataset[0]
+    assert row0["question"] == "Explain transformers"
+    assert row0["corpus_id"] == rdi.INLINE_CORPUS_ID
+    assert row0["pos_doc"][0]["id"] == ""
+    assert row0["pos_doc"][0]["text"].startswith("Transformers are")
+    assert [d["text"] for d in row0["neg_doc"]] == ["RNNs are...", "CNNs are..."]
+
+    row1 = dataset[1]
+    assert row1["question"] == "What is Python?"
+    assert [d["text"] for d in row1["pos_doc"]] == ["A programming language."]
+    assert [d["text"] for d in row1["neg_doc"]] == ["A snake."]
+
+
+def test_transform_func_inline_text_docs_no_corpus():
+    """_transform_func should work without a corpus_dict when docs are inline text."""
+    examples = {
+        "question": ["Q"],
+        "corpus_id": [rdi.INLINE_CORPUS_ID],
+        "pos_doc": [[{"id": "", "text": "P", "image": "", "nr_ocr": ""}]],
+        "neg_doc": [
+            [
+                {"id": "", "text": "N1", "image": "", "nr_ocr": ""},
+                {"id": "", "text": "N2", "image": "", "nr_ocr": ""},
+            ]
+        ],
+    }
+
+    out = rdi._transform_func(examples, num_neg_docs=2, corpus_dict={}, use_dataset_instruction=True)
+    assert out["question"] == ["Q"]
+    assert out["doc_text"][0] == ["P", "N1", "N2"]
+    assert len(out["doc_image"][0]) == 3
+    # No corpus metadata -> instructions should be empty even if enabled
+    assert out["query_instruction"][0] == ""
+    assert out["passage_instruction"][0] == ""
+
+
+def test_make_retrieval_dataset_inline_end_to_end(tmp_path):
+    """End-to-end: make_retrieval_dataset should accept inline JSONL input."""
+    f = tmp_path / "inline.jsonl"
+    f.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "query": "Explain transformers",
+                        "pos_doc": "Transformers are a type of neural network...",
+                        "neg_doc": ["RNNs are...", "CNNs are..."],
+                    }
+                )
+            ]
+        )
+    )
+
+    ds = rdi.make_retrieval_dataset(data_dir_list=str(f), data_type="train", train_n_passages=3, do_shuffle=False)
+    ex = ds[0]
+    assert ex["question"] == "Explain transformers"
+    assert ex["doc_text"] == ["Transformers are a type of neural network...", "RNNs are...", "CNNs are..."]
+    assert ex["doc_image"] == ["", "", ""]
+
+
+def test__load_json_or_jsonl_json_and_jsonl_error_paths(tmp_path):
+    # JSON (list)
+    f_json = tmp_path / "data.json"
+    f_json.write_text(json.dumps([{"a": 1}, {"a": 2}]))
+    out = rdi._load_json_or_jsonl(str(f_json))
+    assert isinstance(out, list) and out[0]["a"] == 1
+
+    # JSON (single object)
+    f_json_obj = tmp_path / "obj.json"
+    f_json_obj.write_text(json.dumps({"a": 3}))
+    out_obj = rdi._load_json_or_jsonl(str(f_json_obj))
+    assert isinstance(out_obj, dict) and out_obj["a"] == 3
+
+    # Empty file -> JSONL fallback -> "No records found"
+    f_empty = tmp_path / "empty.jsonl"
+    f_empty.write_text("")
+    with pytest.raises(ValueError, match="No records found in JSONL file"):
+        rdi._load_json_or_jsonl(str(f_empty))
+
+    # Invalid JSONL line -> parse error includes line number
+    f_bad = tmp_path / "bad.jsonl"
+    f_bad.write_text('{"ok": 1}\n{bad json}\n')
+    with pytest.raises(ValueError, match=r"Failed to parse JSONL .*:2"):
+        rdi._load_json_or_jsonl(str(f_bad))
+
+
+def test_inline_normalization_and_resolution_branches():
+    # _normalize_inline_doc: dict missing "text" should raise
+    with pytest.raises(ValueError, match="Inline doc dict must include 'text'"):
+        rdi._normalize_inline_doc({"image": "x"})
+
+    # _resolve_doc_to_example: dict missing "text" should raise
+    with pytest.raises(ValueError, match="Inline doc dict must include 'text'"):
+        rdi._resolve_doc_to_example({"id": "123"})
+
+    # String doc -> treated as inline text
+    ex = rdi._resolve_doc_to_example("hello")
+    assert ex["text"] == "hello"
+
+    # Inline dict doc: id empty -> use inline fields
+    inline = rdi._resolve_doc_to_example(
+        {"id": "", "text": "txt", "image": None, "nr_ocr": 123},
+    )
+    assert inline["text"] == "txt"
+    assert inline["image"] == ""  # None -> ""
+    assert inline["nr_ocr"] == "123"
+
+    # Fallback: non-str doc coerces to string
+    ex3 = rdi._resolve_doc_to_example(123)
+    assert ex3["text"] == "123"
+
+
+def test_load_datasets_inline_dict_container_and_error_cases(tmp_path):
+    # Dict container with "data" key (no corpus)
+    f = tmp_path / "inline.json"
+    f.write_text(
+        json.dumps(
+            {
+                "data": {
+                    "query": "Q",
+                    "pos_doc": "P",
+                    "neg_doc": "N",
+                }
+            }
+        )
+    )
+    ds, corpus_dict = rdi.load_datasets(str(f))
+    assert len(ds) == 1
+    assert corpus_dict == {}
+    row = ds[0]
+    assert row["question"] == "Q"
+    assert [d["text"] for d in row["pos_doc"]] == ["P"]
+    assert [d["text"] for d in row["neg_doc"]] == ["N"]
+
+    # Missing query/question should raise
+    f_missing_query = tmp_path / "missing_query.json"
+    f_missing_query.write_text(json.dumps({"pos_doc": "P", "neg_doc": "N"}))
+    with pytest.raises(ValueError, match="must include 'query' or 'question'"):
+        rdi.load_datasets(str(f_missing_query))
+
+    # pos_doc empty list should raise
+    f_empty_pos = tmp_path / "empty_pos.json"
+    f_empty_pos.write_text(json.dumps({"query": "Q", "pos_doc": [], "neg_doc": ["N"]}))
+    with pytest.raises(ValueError, match="pos_doc cannot be empty"):
+        rdi.load_datasets(str(f_empty_pos))
+
+    # Inline record must be dict
+    f_bad_record = tmp_path / "bad_record.json"
+    f_bad_record.write_text(json.dumps([1, 2, 3]))
+    with pytest.raises(ValueError, match="Inline retrieval record must be a dict"):
+        rdi.load_datasets(str(f_bad_record))
+
+    # Unsupported container type
+    f_bad_container = tmp_path / "bad_container.json"
+    f_bad_container.write_text(json.dumps(123))
+    with pytest.raises(ValueError, match="Unsupported inline retrieval dataset container type"):
+        rdi.load_datasets(str(f_bad_container))
+
+
+def test_load_datasets_corpus_id_format_in_inline_module(tmp_path):
+    """The inline loader should reject corpus-id format (use retrieval_dataset.py instead)."""
+    data = {
+        "corpus": [{"path": str(tmp_path / "corpus")}],
+        "data": [
+            {
+                "question_id": "q1",
+                "question": "Q1",
+                "corpus_id": "corpusA",
+                "pos_doc": [{"id": "p"}],
+                "neg_doc": [{"id": "n1"}],
+            }
+        ],
+    }
+    f = tmp_path / "train.json"
+    f.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match=r"Corpus-id retrieval format.*not supported.*retrieval_dataset_inline"):
+        rdi.load_datasets(str(f))
+
+
+def test_transform_func_inline_error_and_num_neg_docs_zero():
+    # pos_doc empty should raise (batched)
+    with pytest.raises(ValueError, match="pos_doc cannot be empty"):
+        rdi._transform_func(
+            {"question": ["Q"], "corpus_id": [rdi.INLINE_CORPUS_ID], "pos_doc": [[]], "neg_doc": [[{"text": "n"}]]},
+            num_neg_docs=1,
+            corpus_dict={},
+        )
+
+    # neg_doc empty with num_neg_docs>0 should raise
+    with pytest.raises(ValueError, match="neg_doc must contain at least 1 document"):
+        rdi._transform_func(
+            {
+                "question": ["Q"],
+                "corpus_id": [rdi.INLINE_CORPUS_ID],
+                "pos_doc": [[{"text": "p"}]],
+                "neg_doc": [[]],
+            },
+            num_neg_docs=1,
+            corpus_dict={},
+        )
+
+    # num_neg_docs=0 should succeed with only positive
+    out = rdi._transform_func(
+        {
+            "question": ["Q"],
+            "corpus_id": [rdi.INLINE_CORPUS_ID],
+            "pos_doc": [[{"text": "p"}]],
+            "neg_doc": [[]],
+        },
+        num_neg_docs=0,
+        corpus_dict={},
+    )
+    assert out["doc_text"][0] == ["p"]
+
+
+def test_transform_func_inline_with_dataset_instruction_from_corpus():
+    corpus_dict = {
+        "c": DummyCorpus(
+            {"p": {"text": "P", "image": "", "nr_ocr": ""}, "n": {"text": "N", "image": "", "nr_ocr": ""}},
+            query_instruction="QI",
+            passage_instruction="PI",
+        )
+    }
+    examples = {
+        "question": ["Q"],
+        "corpus_id": ["c"],
+        "pos_doc": [[{"id": "", "text": "P", "image": "", "nr_ocr": ""}]],
+        "neg_doc": [[{"id": "", "text": "N", "image": "", "nr_ocr": ""}]],
+    }
+    out = rdi._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, use_dataset_instruction=True)
+    assert out["query_instruction"][0] == "QI"
+    assert out["passage_instruction"][0] == "PI"
+
+
+def test_retrieval_dataset_cli_smoke(tmp_path, monkeypatch, capsys):
+    corpus_dir = tmp_path / "corpusA"
+    corpus_dir.mkdir()
+    (corpus_dir / "merlin_metadata.json").write_text(json.dumps({"class": "TextQADataset", "corpus_id": "corpusA"}))
+
+    train_file = _make_train_file(tmp_path, corpus_dir, data_len=1, corpus_id="corpusA")
+
+    # Patch datasets.load_dataset before running module as __main__ so the import binds the stub.
+    monkeypatch.setattr(
+        "datasets.load_dataset",
+        _mock_hf_load_dataset_returning([{"id": "p", "text": "P"}, {"id": "n1", "text": "N1"}]),
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prog",
+            "--data_dir_list",
+            str(train_file),
+            "--data_type",
+            "train",
+            "--train_n_passages",
+            "2",
+            "--max_train_samples",
+            "1",
+        ],
+    )
+    runpy.run_module("nemo_automodel.components.datasets.llm.retrieval_dataset", run_name="__main__")
+    assert "Dataset loading completed successfully" in capsys.readouterr().out
+
+
+def test_retrieval_dataset_inline_smoke(tmp_path):
+    f = tmp_path / "inline.jsonl"
+    f.write_text(json.dumps({"query": "Q", "pos_doc": "P", "neg_doc": ["N"]}))
+
+    ds = rdi.make_retrieval_dataset(
+        data_dir_list=str(f),
+        data_type="train",
+        train_n_passages=2,
+        do_shuffle=False,
+        max_train_samples=1,
+    )
+    ex = ds[0]
+    assert ex["question"] == "Q"
+    assert ex["doc_text"] == ["P", "N"]
+    assert ex["doc_image"] == ["", ""]

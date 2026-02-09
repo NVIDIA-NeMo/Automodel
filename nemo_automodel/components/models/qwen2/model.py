@@ -30,7 +30,6 @@ model:
 
 from __future__ import annotations
 
-import os
 from typing import Callable, Optional, Union
 
 import torch
@@ -51,6 +50,7 @@ from nemo_automodel.components.models.common import (
     CombinedQKVAttentionMixin,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
 # Use shared rope_utils (same implementation as Llama, supports both config formats)
 from nemo_automodel.components.models.llama.rope_utils import Qwen2RotaryEmbedding, apply_rotary_pos_emb
@@ -358,13 +358,13 @@ class Qwen2Model(Qwen2PreTrainedModel):
         )
 
 
-class Qwen2ForCausalLM(Qwen2PreTrainedModel):
+class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
     """Qwen2 model with causal language modeling head.
 
     ALWAYS uses combined projections - this is the whole point of the custom implementation.
     """
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
@@ -465,43 +465,6 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         if return_dict:
             return out
         return out.to_tuple()
-
-    def save_pretrained_hf_format(self, save_directory: str, **kwargs):
-        """Save model in HuggingFace-compatible format by converting combined projections.
-
-        This method converts the custom model's combined projections (qkv_proj, gate_up_proj)
-        back to HuggingFace's separate projections format before saving, making the checkpoint
-        loadable with AutoModelForCausalLM.from_pretrained().
-
-        Args:
-            save_directory: Directory where the model will be saved
-            **kwargs: Additional arguments passed to config.save_pretrained and save_file
-        """
-        from safetensors.torch import save_file
-
-        os.makedirs(save_directory, exist_ok=True)
-
-        # Save config
-        self.config.save_pretrained(save_directory)
-
-        # Convert state dict to HF format
-        if hasattr(self, "state_dict_adapter"):
-            custom_state_dict = self.state_dict()
-            hf_state_dict = self.state_dict_adapter.to_hf(custom_state_dict)
-        else:
-            hf_state_dict = self.state_dict()
-
-        # Handle tied weights: remove duplicate tied weights before saving
-        # In Qwen2, lm_head.weight is tied to model.embed_tokens.weight
-        # HuggingFace expects only model.embed_tokens.weight to be saved
-        if "lm_head.weight" in hf_state_dict and "model.embed_tokens.weight" in hf_state_dict:
-            # Check if they actually share memory
-            if hf_state_dict["lm_head.weight"].data_ptr() == hf_state_dict["model.embed_tokens.weight"].data_ptr():
-                # Remove lm_head.weight as it's tied to embed_tokens
-                hf_state_dict = {k: v for k, v in hf_state_dict.items() if k != "lm_head.weight"}
-
-        # Save weights in safetensors format
-        save_file(hf_state_dict, os.path.join(save_directory, "model.safetensors"), metadata={"format": "pt"})
 
 
 ModelClass = Qwen2ForCausalLM
