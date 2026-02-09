@@ -181,7 +181,9 @@ def _apply_peft_and_lower_precision(
         from nemo_automodel.components.quantization.qat import prepare_qat_model
 
         if any(map(lambda x: x.dtype != torch.bfloat16, model.parameters())):
-            raise NotImplementedError("QAT is only supported for bfloat16 models. Support will be added in future release.")
+            raise NotImplementedError(
+                "QAT is only supported for bfloat16 models. Support will be added in future release."
+            )
         model, qat_mode = prepare_qat_model(model, qat_quantizer)
         # Attach helpers for delayed fake-quant toggling if desired
         model._qat_mode = qat_mode  # type: ignore[attr-defined]

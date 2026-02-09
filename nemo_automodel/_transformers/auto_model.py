@@ -221,8 +221,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         if is_hf_model:
             attn_implementation, use_liger_kernel = _apply_preload_overrides(
-                mesh.tp_size, mesh.cp_size, has_packed_sequence,
-                attn_implementation, use_liger_kernel,
+                mesh.tp_size,
+                mesh.cp_size,
+                has_packed_sequence,
+                attn_implementation,
+                use_liger_kernel,
             )
         device = torch.cuda.current_device()
 

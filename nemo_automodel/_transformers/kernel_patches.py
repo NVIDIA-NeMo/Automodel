@@ -153,7 +153,7 @@ def _apply_preload_overrides(tp_size, cp_size, has_packed_sequence, attn_impleme
     """
     Compute final attention implementation and liger-kernel flag based on TP/CP and packed sequence constraints.
     """
-    if (tp_size > 1 or cp_size > 1):
+    if tp_size > 1 or cp_size > 1:
         logger.info("Disabling Liger kernel with TP ({}) or CP ({})".format(tp_size, cp_size))
         use_liger_kernel = False
 
