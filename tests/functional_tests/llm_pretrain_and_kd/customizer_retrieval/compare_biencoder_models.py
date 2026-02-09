@@ -13,14 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
 import glob
 import os
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
 import torch
-
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.datasets.llm import retrieval_dataset_inline as rdi
 from nemo_automodel.components.datasets.llm import RetrievalBiencoderCollator
@@ -60,7 +61,7 @@ def _iter_batches(ds, batch_size: int, max_samples: int):
     if batch:
         yield batch
 
-
+@torch.no_grad()
 def _compute_pos_neg_diffs(
     *,
     model,
@@ -75,30 +76,25 @@ def _compute_pos_neg_diffs(
     diffs: list[np.ndarray] = []
 
     autocast_ctx = (
-        torch.amp.autocast("cuda", dtype=torch.bfloat16) if (use_bf16_autocast and device.type == "cuda") else None
+        torch.amp.autocast("cuda", dtype=torch.bfloat16) if (use_bf16_autocast and device.type == "cuda") else nullcontext()
     )
 
-    with torch.no_grad():
-        for batch_examples in _iter_batches(ds, batch_size=batch_size, max_samples=max_samples):
-            batch = collator(batch_examples)
-            batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+    for batch_examples in _iter_batches(ds, batch_size=batch_size, max_samples=max_samples):
+        batch = collator(batch_examples)
+        batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
 
-            q_prefix, d_prefix = "q_", "d_"
-            query = {k[len(q_prefix) :]: v for k, v in batch.items() if k.startswith(q_prefix)}
-            passage = {k[len(d_prefix) :]: v for k, v in batch.items() if k.startswith(d_prefix)}
+        q_prefix, d_prefix = "q_", "d_"
+        query = {k[len(q_prefix) :]: v for k, v in batch.items() if k.startswith(q_prefix)}
+        passage = {k[len(d_prefix) :]: v for k, v in batch.items() if k.startswith(d_prefix)}
 
-            if autocast_ctx is None:
-                out = model(query=query, passage=passage)
-            else:
-                with autocast_ctx:
-                    out = model(query=query, passage=passage)
+        with autocast_ctx:
+            out = model(query=query, passage=passage)
 
-            scores = out.scores  # [batch, n_passages]
-            if scores is None or scores.shape[-1] < 2:
-                raise RuntimeError(f"Unexpected scores shape: {None if scores is None else tuple(scores.shape)}")
-
-            diff = (scores[:, 0] - scores[:, 1]).float().detach().cpu().numpy()
-            diffs.append(diff)
+        scores = out.scores  # [batch, n_passages]
+        if scores is None or scores.shape[-1] < 2:
+            raise RuntimeError(f"Unexpected scores shape: {None if scores is None else tuple(scores.shape)}")
+        diff = (scores[:, 0] - scores[:, 1]).float().detach().cpu().numpy()
+        diffs.append(diff)
 
     out = np.concatenate(diffs, axis=0) if diffs else np.array([], dtype=np.float32)
     if out.size == 0:
@@ -108,24 +104,7 @@ def _compute_pos_neg_diffs(
     return out
 
 
-def main() -> int:
-    if len(sys.argv) < 3:
-        print("Usage: compare_biencoder_models.py <base_model_path> <checkpoint_root> [dataset_jsonl]", file=sys.stderr)
-        return 2
-
-    base_model_path = sys.argv[1]
-    ckpt_root = Path(sys.argv[2])
-    dataset_path = sys.argv[3] if len(sys.argv) > 3 else os.environ.get("TEST_DATASET", "/app/data/cust-1234/training.jsonl")
-
-    max_samples = int(os.environ.get("MAX_COMPARE_SAMPLES", "32"))
-    batch_size = int(os.environ.get("COMPARE_BATCH_SIZE", "8"))
-
-    # Initialize torch.distributed (DCP load requires a process group even in single-process mode).
-    dist = initialize_distributed(backend="nccl", timeout_minutes=5)
-    device = dist.device if dist.device is not None else torch.device("cpu")
-
-    ckpt_dir = _resolve_latest_checkpoint_dir(ckpt_root)
-    ft_model_dir = ckpt_dir / "model"
+def load_finetuned_model(model, ft_model_dir: Path) -> NeMoAutoModelBiencoder:
     if not ft_model_dir.exists():
         raise FileNotFoundError(f"Expected finetuned model dir at {ft_model_dir}")
 
@@ -133,6 +112,71 @@ def main() -> int:
     st = glob.glob(str(ft_model_dir / "**" / "*.safetensors"), recursive=True)
     if not st:
         raise FileNotFoundError(f"No .safetensors found under {ft_model_dir}")
+
+    ckpt_cfg = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(ft_model_dir),
+        model_save_format="safetensors",
+        model_cache_dir="/tmp",
+        model_repo_id="__local__",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+    # The biencoder recipe saves `LlamaBidirectionalModel` via HF `save_pretrained()`,
+    # which produces keys like "embed_tokens.weight" (no leading "model."). Our
+    # `BiencoderStateDictAdapter` converts biencoder keys to HF keys with a "model."
+    # prefix, so we remap checkpoint keys at read time to match.
+    key_mapping = {
+        r"^(?!(model\.|linear_pooler\.))": "model.",
+    }
+    checkpointer.load_model(model, model_path=str(ft_model_dir), key_mapping=key_mapping)
+    checkpointer.close()
+    return model
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Compare baseline vs fine-tuned biencoder models (pos-neg separation)."
+    )
+    parser.add_argument("base_model_path", type=str, help="Path to base/pretrained HF model")
+    parser.add_argument("checkpoint_root", type=str, help="Path to fine-tuned model directory")
+    parser.add_argument("dataset_jsonl", type=str, help="Path to evaluation JSONL dataset")
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=128,
+        help="Max token length for query/passage truncation (default: 128, aligned with customizer)",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Cap on number of evaluation samples (default: use all data)",
+    )
+    parser.add_argument("--batch-size", type=int, default=8, help="Batch size (default: 8)")
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        default=False,
+        help="Enable bf16 autocast during inference (default: off for consistency with customizer)",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = _parse_args()
+
+    base_model_path = args.base_model_path
+    ckpt_root = Path(args.checkpoint_root)
+    dataset_path = args.dataset_jsonl
+    max_length = args.max_length
+    batch_size = args.batch_size
+    use_bf16 = args.bf16
+
+    # Initialize torch.distributed (DCP load requires a process group even in single-process mode).
+    dist = initialize_distributed(backend="nccl", timeout_minutes=5)
+    device = dist.device if dist.device is not None else torch.device("cpu")
 
     # Build tokenizer/collator/dataset.
     from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -142,23 +186,31 @@ def main() -> int:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
 
+    # Load all data first (max_train_samples=None -> no cap inside the dataset loader).
     ds = rdi.make_retrieval_dataset(
         data_dir_list=str(dataset_path),
-        data_type="train",
+        data_type="eval",
         train_n_passages=2,
+        eval_negative_size=1,
         do_shuffle=False,
-        max_train_samples=max_samples,
+        max_train_samples=args.max_samples,
     )
+
+    # max_samples for the batching iterator: use all rows unless capped via CLI.
+    max_samples = args.max_samples if args.max_samples is not None else len(ds)
 
     collator = RetrievalBiencoderCollator(
         tokenizer=tokenizer,
-        q_max_len=64,
-        p_max_len=64,
+        q_max_len=max_length,
+        p_max_len=max_length,
         query_prefix="",
         passage_prefix="",
         padding="longest",
-        pad_to_multiple_of=8,
+        pad_to_multiple_of=1,
     )
+
+    # Use bf16 to match the model's native weight format and training dtype.
+    model_dtype = torch.bfloat16
 
     # Build a single model instance, compute baseline diffs, then load finetuned weights and recompute.
     model = NeMoAutoModelBiencoder.from_pretrained(
@@ -174,8 +226,11 @@ def main() -> int:
         t=0.02,
         use_liger_kernel=False,
         use_sdpa_patching=False,
-        torch_dtype=torch.bfloat16,
-    ).to(device)
+        torch_dtype=model_dtype,
+    ).to(device).eval()
+
+    print(f"Config: max_length={max_length}, max_samples={max_samples}, batch_size={batch_size}, "
+          f"dtype={model_dtype}, bf16_autocast={use_bf16}")
 
     base_diffs = _compute_pos_neg_diffs(
         model=model,
@@ -184,23 +239,11 @@ def main() -> int:
         device=device,
         batch_size=batch_size,
         max_samples=max_samples,
-        use_bf16_autocast=True,
+        use_bf16_autocast=use_bf16,
     )
 
     # Load finetuned weights into the same model.
-    ckpt_cfg = CheckpointingConfig(
-        enabled=True,
-        checkpoint_dir=str(ckpt_root),
-        model_save_format="safetensors",
-        model_cache_dir="/tmp",
-        model_repo_id="__local__",
-        save_consolidated=False,
-        is_peft=False,
-    )
-    checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
-    checkpointer.load_model(model, model_path=str(ft_model_dir))
-    checkpointer.close()
-
+    model = load_finetuned_model(model, ckpt_root)
     ft_diffs = _compute_pos_neg_diffs(
         model=model,
         collator=collator,
@@ -208,7 +251,7 @@ def main() -> int:
         device=device,
         batch_size=batch_size,
         max_samples=max_samples,
-        use_bf16_autocast=True,
+        use_bf16_autocast=use_bf16,
     )
 
     # Compare baseline vs finetuned diffs (pos - neg); finetuned should not be degraded.
@@ -233,4 +276,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
