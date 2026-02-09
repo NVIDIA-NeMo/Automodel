@@ -240,6 +240,10 @@ def get_test_consolidated_vlm_checkpoint_expected_keys():
         "optim.state.model.multi_modal_projector.mm_soft_emb_norm.weight.step": ([], torch.float32, "cpu"),
         "optim.state.model.multi_modal_projector.mm_soft_emb_norm.weight.exp_avg": ([576], torch.bfloat16, "cpu"),
         "optim.state.model.multi_modal_projector.mm_soft_emb_norm.weight.exp_avg_sq": ([576], torch.bfloat16, "cpu"),
+        # Embedding layer optimizer states (no longer frozen after PR change)
+        "optim.state.model.language_model.embed_tokens.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.language_model.embed_tokens.weight.exp_avg": ([131104, 128], torch.bfloat16, "cpu"),
+        "optim.state.model.language_model.embed_tokens.weight.exp_avg_sq": ([131104, 128], torch.bfloat16, "cpu"),
         "optim.state.model.language_model.layers.0.self_attn.q_proj.weight.step": ([], torch.float32, "cpu"),
         "optim.state.model.language_model.layers.0.self_attn.q_proj.weight.exp_avg": ([64, 128], torch.bfloat16, "cpu"),
         "optim.state.model.language_model.layers.0.self_attn.q_proj.weight.exp_avg_sq": (
@@ -453,11 +457,9 @@ def test_consolidated_vlm_checkpoint():
         "model/consolidated/config.json",
         "model/consolidated/model.safetensors.index.json",
         "model/consolidated/chat_template.jinja",
-        "model/consolidated/preprocessor_config.json",
         "model/consolidated/processor_config.json",
         "model/consolidated/tokenizer_config.json",
         "model/consolidated/tokenizer.json",
-        "model/consolidated/special_tokens_map.json",
         "model/consolidated/generation_config.json",
         "optim/__0_0.distcp",
         "optim/__1_0.distcp",

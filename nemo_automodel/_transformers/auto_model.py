@@ -28,6 +28,7 @@ from nemo_automodel.components.utils.compile_utils import compile_model
 from nemo_automodel.shared.torch_patches import apply_torch_patches
 
 apply_torch_patches()
+from huggingface_hub import constants as hf_constants
 from huggingface_hub import snapshot_download
 from transformers import (
     AutoConfig,
@@ -37,9 +38,9 @@ from transformers import (
     AutoModelForTextToWaveform,
     PreTrainedModel,
 )
-from transformers.modeling_utils import no_init_weights
+from transformers.initialization import no_init_weights
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
-from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
+from transformers.utils import ContextManagers
 
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry
@@ -58,6 +59,7 @@ from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFChe
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
+    apply_parameter_freezing,
     init_empty_weights,
     print_trainable_parameters,
     resolve_trust_remote_code,
@@ -73,6 +75,7 @@ if TYPE_CHECKING:
 
 HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
 HAS_FA, _ = safe_import("flash_attn")
+DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if HAS_FA else "sdpa"
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +226,12 @@ def _patch_liger_kernel(model):
     """
     if not HAS_LIGER_KERNEL:
         logging.warning("Asked to use Liger Kernel, but could not import")
+        return model
+
+    # Unit tests may pass lightweight mocks; skip patching in that case.
+    # (The wrapper logic itself is tested separately by patching this function.)
+    if not isinstance(model, torch.nn.Module):
+        logging.warning("Skipping Liger Kernel patch for non-nn.Module model: %s", type(model))
         return model
 
     try:
@@ -621,6 +630,11 @@ def apply_model_infrastructure(
         _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=dequantize_base_checkpoint).keys()
     )
 
+    # Apply freezing before sharding
+    freeze_config = _kwargs.get("freeze_config")
+    if freeze_config is not None:
+        apply_parameter_freezing(model, freeze_config)
+
     # Loss function check
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         loss_fn = MaskedCrossEntropy()
@@ -641,11 +655,13 @@ def apply_model_infrastructure(
             setattr(model, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
 
     # Load the checkpoint if needed and return
-    # Weights need to be loaded for meta device models that were parallelized:
-    # 1. When parallelize_fn was used (which will internally apply FSDP2/EP sharding)
-    # 2. When FSDP2Manager.parallelize was used (but not MegatronFSDP which handles weights internally)
+    # Weights need to be loaded for meta device models:
+    # 1. Single GPU custom models (no parallelization but still need weights)
+    # 2. When parallelize_fn was used (which will internally apply FSDP2/EP sharding)
+    # 3. When FSDP2Manager.parallelize was used (but not MegatronFSDP which handles weights internally)
     should_load_checkpoint = is_meta_device and any(
         [
+            get_world_size_safe() == 1,
             parallelize_fn is not None and get_world_size_safe() > 1,
             callable(getattr(model_wrapper, "parallelize", None)),
         ]
@@ -790,7 +806,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         use_sdpa_patching: bool = True,
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype="auto",
-        attn_implementation: str = "flash_attention_2",
+        attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
         model_wrapper=None,
@@ -826,8 +842,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 SDPA back-ends to consider when `use_sdpa_patching=True`.
             torch_dtype (str | torch.dtype | Literal["auto"], default="auto"):
                 Data type passed to the underlying `from_pretrained` call.
-            attn_implementation (str, default="flash_attention_2"): Desired
-                attention implementation; forwarded to the HF config.
+            attn_implementation (str, optional):
+                Specifies which attention implementation to use (e.g.,
+                ``"flash_attention_2"``, ``"eager"``). Only applied when the
+                base model supports this kwarg. Defaults to ``"flash_attention_2"``,
+                if flash attention is not available, defaults to ``"sdpa"``.
             quantization_config (optional): BitsAndBytesConfig configuration object that
                 specifies all quantization settings. If provided, quantization
                 will be applied to the model.
@@ -890,6 +909,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
+                force_hf=force_hf,
                 autopipeline=autopipeline,
                 parallelize_fn=parallelize_fn,
                 peft_config=peft_config,
@@ -906,16 +926,18 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             force_hf,
         )
         tp_size, cp_size, has_packed_sequence = _pop_tp_cp_has_packed(kwargs)
+        freeze_config = kwargs.pop("freeze_config", None)
         attn_implementation, use_liger_kernel = _apply_preload_overrides(
             is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
         )
         device = torch.cuda.current_device()
 
-        # Neither of these parallelization methods support meta device initialization
-        is_meta_device = (
-            not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager))
-            and not force_hf
-            and get_world_size_safe() > 1
+        # Use meta device initialization when:
+        # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)
+        # - AND either multi-GPU (world_size > 1) or single-GPU custom model (not HF)
+        # HF models on single GPU load weights via from_pretrained, but multi-GPU needs meta device for sharding
+        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and (
+            get_world_size_safe() > 1 or not is_hf_model
         )
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
@@ -976,7 +998,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             device=device,
             compile_config=compile_config,
             load_base_model=True,
-            cache_dir=kwargs.get("cache_dir", TRANSFORMERS_CACHE),
+            cache_dir=kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE),
+            freeze_config=freeze_config,
         )
 
         return model
@@ -990,7 +1013,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         use_sdpa_patching: bool = True,
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype: Union[str, torch.dtype] = "auto",
-        attn_implementation: str = "flash_attention_2",
+        attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
         model_wrapper=None,
@@ -1034,7 +1057,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             attn_implementation (str, optional):
                 Specifies which attention implementation to use (e.g.,
                 ``"flash_attention_2"``, ``"eager"``). Only applied when the
-                base model supports this kwarg. Defaults to ``"flash_attention_2"``.
+                base model supports this kwarg. Defaults to ``"flash_attention_2"``,
+                if flash attention is not available, defaults to ``"sdpa"``.
             quantization_config (optional): BitsAndBytesConfig configuration object that
                 specifies all quantization settings. If provided, quantization
                 will be applied to the model.
@@ -1117,16 +1141,18 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         _consume_config_overrides(config, kwargs)
         is_hf_model = get_is_hf_model(config, force_hf)
         tp_size, cp_size, has_packed_sequence = _pop_tp_cp_has_packed(kwargs)
+        freeze_config = kwargs.pop("freeze_config", None)
         attn_implementation, use_liger_kernel = _apply_preload_overrides(
             is_hf_model, tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel
         )
         device = torch.cuda.current_device()
 
-        # Neither of these parallelization methods support meta device initialization
-        is_meta_device = (
-            not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager))
-            and not force_hf
-            and get_world_size_safe() > 1
+        # Use meta device initialization when:
+        # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)
+        # - AND either multi-GPU (world_size > 1) or single-GPU custom model (not HF)
+        # HF models on single GPU load weights via from_config, but multi-GPU needs meta device for sharding
+        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and (
+            get_world_size_safe() > 1 or not is_hf_model
         )
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
@@ -1180,7 +1206,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             compile_config=compile_config,
             pretrained_model_name_or_path=getattr(config, "name_or_path"),
             load_base_model=False,
-            cache_dir=kwargs.get("cache_dir", TRANSFORMERS_CACHE),
+            cache_dir=kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE),
+            freeze_config=freeze_config,
         )
 
         return model

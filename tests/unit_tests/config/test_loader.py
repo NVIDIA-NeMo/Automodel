@@ -285,6 +285,20 @@ def test_repr_contains_paths():
     assert "x:" in s and "y:" in s
 
 
+def test_str_does_not_include_internal_original_strings_mapping():
+    """
+    ConfigNode keeps a private `_original_strings` mapping for `_target_` and `*_fn` keys.
+    This internal bookkeeping must never show up in `str(cfg)` / `repr(cfg)`.
+    """
+    cfg = ConfigNode({"_target_": "builtins.len", "my_fn": "builtins.len", "x": "1"})
+    # Ensure the mapping is actually populated so the test is meaningful.
+    assert cfg.get_as_string("_target_") == "builtins.len"
+    assert cfg.get_as_string("my_fn") == "builtins.len"
+
+    assert "_original_strings" not in str(cfg)
+    assert "_original_strings" not in repr(cfg)
+
+
 def test_load_yaml_config(tmp_path):
     """YAML helper must produce a ConfigNode with translated values."""
     yml = tmp_path / "cfg.yaml"
@@ -338,8 +352,9 @@ def test_load_yaml_config_resolves_braced_env(monkeypatch, tmp_path: Path):
     yml.write_text("x: ${FOO_ENV}\n")
     cfg = load_yaml_config(str(yml))
     assert cfg.x == "bar"
-    assert "${FOO_ENV}" in str(cfg)
-    assert "bar" not in str(cfg)
+    s = str(cfg)
+    assert "${FOO_ENV}" in s
+    assert "bar" not in s
 
 
 def test_load_yaml_config_resolves_dollar_env(monkeypatch, tmp_path: Path):
@@ -348,7 +363,9 @@ def test_load_yaml_config_resolves_dollar_env(monkeypatch, tmp_path: Path):
     yml.write_text("x: $FOO_ENV\n")
     cfg = load_yaml_config(str(yml))
     assert cfg.x == "bar"
-    assert "$FOO_ENV" in str(cfg)
+    s = str(cfg)
+    assert "$FOO_ENV" in s
+    assert "bar" not in s
 
 
 def test_load_yaml_config_resolves_dotted_env_var_name(monkeypatch, tmp_path: Path):
@@ -366,7 +383,7 @@ def test_load_yaml_config_resolves_dotted_env_var_name(monkeypatch, tmp_path: Pa
     assert cfg.a == "qux"
     assert cfg.b == "qux"
     assert cfg.path == "qux/qux"
-    # Printing should show original placeholders.
+    # Printing should show original placeholders (avoid leaking resolved values).
     s = str(cfg)
     assert "${foo.bar.baz}" in s
     assert "$foo.bar.baz" in s

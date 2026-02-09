@@ -23,8 +23,9 @@ from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFChe
 from nemo_automodel.components.models.glm4_moe.layers import Glm4MoeAttention
 from nemo_automodel.components.models.glm4_moe.state_dict_adapter import Glm4MoeStateDictAdapter
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
+from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
+from nemo_automodel.components.moe.layers import MLP, MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -130,13 +131,20 @@ class Glm4MoeModel(nn.Module):
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
 
+        if hasattr(config, "rope_parameters"):
+            partial_rotary_factor = config.rope_parameters.get("partial_rotary_factor", 1.0)
+            base = config.rope_parameters["rope_theta"]
+        else:
+            partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+            base = config.rope_theta
+
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
-            base=config.rope_theta,
+            base=base,
             dtype=torch.float32,
             scaling_factor=1.0,
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
-            partial_rotary_factor=config.partial_rotary_factor,
+            partial_rotary_factor=partial_rotary_factor,
         )
 
     def forward(
