@@ -49,19 +49,19 @@ The table below shows finetuning (LoRA) performance for full sequences with no p
 
 ## Configuration Files
 
-All benchmark configurations are available in [`examples/benchmark/configs/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples):
+Pre-training benchmark configurations are available in [`examples/benchmark/configs/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs) and fine-tuning (LoRA) configurations are in [`examples/llm_finetune/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune):
 
 - [`deepseek_v3_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/deepseek_v3_te_deepep.yaml) - DeepSeek V3 with TE + DeepEP
 - [`kimi_k2_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/kimi_k2_te_deepep.yaml) - Kimi K2 optimized configuration
 - [`qwen3_moe_30b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/qwen3_moe_30b_te_deepep.yaml) - Qwen3 MoE with TE + DeepEP
 - [`gptoss_20b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/gptoss_20b_te_deepep.yaml) - GPT-OSS 20B with optimizations
 - [`gptoss_120b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/gptoss_120b_te_deepep.yaml) - GPT-OSS 120B optimized
-- [`Llama_8b_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/llama3_1/llama3_1_8b_peft_benchmark.yaml) - Llama-8B Finetuning (LoRA) optimized
-- [`Qwen2_5_7b_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/qwen/qwen2_5_7b_peft_benchmark.yaml) - Qwen2.5-7B Finetuning (LoRA) optimized
-- [`Llama_70b_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark.yaml) - Llama-70B Finetuning (LoRA) optimized
-- [`Qwen2_5_32b_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark.yaml) - Qwen2.5-32B Finetuning (LoRA) optimized
-- [`Llama_70b_lora_2nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml) - Llama-70B Finetuning (LoRA) optimized on 2 nodes
-- [`Qwen2_5_32b_lora_2nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark_2nodes.yaml) - Qwen2.5-32B Finetuning (LoRA) optimized on 2 nodes
+- [`llama3_1_8b_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/llama3_1/llama3_1_8b_peft_benchmark.yaml) - Llama-8B Finetuning (LoRA) optimized
+- [`qwen2_5_7b_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/qwen/qwen2_5_7b_peft_benchmark.yaml) - Qwen2.5-7B Finetuning (LoRA) optimized
+- [`custom_llama3_3_70b_instruct_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark.yaml) - Llama-70B Finetuning (LoRA) optimized
+- [`qwen2_5_32b_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark.yaml) - Qwen2.5-32B Finetuning (LoRA) optimized
+- [`custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml) - Llama-70B Finetuning (LoRA) optimized on 2 nodes
+- [`qwen2_5_32b_peft_benchmark_2nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark_2nodes.yaml) - Qwen2.5-32B Finetuning (LoRA) optimized on 2 nodes
 
 :::{note}
 - All benchmarks use mock data for consistent performance measurement.
