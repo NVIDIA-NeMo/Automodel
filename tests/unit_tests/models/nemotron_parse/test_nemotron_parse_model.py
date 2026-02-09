@@ -195,4 +195,3 @@ def test_nemotron_parse_external_loss(monkeypatch):
     l10 = loss_10x(logits=out_coords.logits, labels=labels_with_coords)
     l20 = loss_20x(logits=out_coords.logits, labels=labels_with_coords)
     assert l10 != l20, "Different coordinate weights should produce different losses"
-

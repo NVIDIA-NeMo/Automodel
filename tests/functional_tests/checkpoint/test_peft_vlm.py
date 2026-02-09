@@ -666,7 +666,7 @@ def test_hf_peft_checkpoint():
         # PEFT model state is consolidated - use FULL tensor shape (no splitting)
         curr_shard = v
         model_keys_fixture[k] = (list(curr_shard.shape), curr_shard.dtype, str(curr_shard.device))
-    
+
     # the saved optimizer state has an "optim." prefix that DCP adds.
     # For the on-disk view to match, it needs to be prepended with the "optim." prefix
     flattened_optim_dict = _rename_keys(optimizer_state_dict, "optim.")

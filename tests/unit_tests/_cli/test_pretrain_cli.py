@@ -23,4 +23,4 @@ def test_cli_accepts_pretrain(tmp_path, monkeypatch):
     args = parser.parse_args(["pretrain", "llm", "-c", str(cfg)])
     assert args.command == "pretrain"
     assert args.domain == "llm"
-    assert args.config == cfg 
+    assert args.config == cfg

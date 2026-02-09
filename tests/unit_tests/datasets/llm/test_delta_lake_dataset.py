@@ -504,4 +504,3 @@ class TestDeletionVectorsFallback:
                     it = mod.DeltaLakeIterator(table_path="delta:///tmp/table")
                     with pytest.raises(ImportError, match=r"Spark|pyspark|Databricks"):
                         _ = list(it)
-

@@ -229,5 +229,3 @@ def test_from_pretrained_parallel_scheme_logs_and_continues_on_errors(caplog):
 
     assert out is dummy_pipe
     assert "parallelize failed" in caplog.text
-
-

@@ -140,6 +140,28 @@ ruff check --fix .
 ruff format .
 ```
 
+## Pre-commit
+
+We recommand to use [perk](https://github.com/j178/prek) to ensure code quality. It is a faster and more modern alternative to [pre-commit](https://github.com/pre-commit/pre-commit).
+
+Installation:
+
+```bash
+uv tool install perk
+```
+
+Usage:
+
+```bash
+# Install git hooks
+perk install
+
+# Run manually on all files
+perk run --all-files
+```
+
+After installing the git hooks, `git commit` will automatically run incremental checks.
+
 ## Adding Documentation
 
 If your contribution involves documentation changes, please refer to the [Documentation Development](docs/documentation.md) guide for detailed instructions on building and serving the documentation.

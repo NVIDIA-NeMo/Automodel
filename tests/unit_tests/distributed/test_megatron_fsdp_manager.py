@@ -257,4 +257,3 @@ def test_parallelize_world_size_gt_one_skips_tp_plan_when_tp_size_is_one(monkeyp
 
     # zero_dp_strategy default is 3 -> no warning print
     assert capsys.readouterr().out == ""
-

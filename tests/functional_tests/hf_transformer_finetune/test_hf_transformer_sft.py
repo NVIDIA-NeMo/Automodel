@@ -92,7 +92,7 @@ class TestHFTransformerFinetune:
         finally:
             # remove the checkpoint directory
             shutil.rmtree("checkpoints/", ignore_errors=True)
-    
+
     def test_hf_transformer_nemotron_nano_v3_4layer_custom(self):
         try:
             run_test_script(TEST_FOLDER, HF_TRANSFORMER_NEMOTRON_NANO_V3_4LAYER_CUSTOM_FILENAME)

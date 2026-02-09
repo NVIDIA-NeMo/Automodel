@@ -134,5 +134,3 @@ def test_from_pretrained_retries_without_sdpa(monkeypatch):
     # Liger called only on the first attempt of each build; second attempt still calls liger
     # but since use_liger_kernel remains True for this path, ensure it was called twice.
     assert calls["liger"] == 2
-
-

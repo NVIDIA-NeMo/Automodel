@@ -188,7 +188,7 @@ class DummyModelConfig:
 
     def get(self, key, default=None):
         return getattr(self, key, default)
-    
+
     def get_as_string(self, key, default=None):
         return str(getattr(self, key, default))
 

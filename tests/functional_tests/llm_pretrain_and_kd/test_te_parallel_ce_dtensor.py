@@ -21,4 +21,3 @@ TE_PARALLEL_CE_DTENSOR_TP2_FILENAME = "L2_TEParallelCrossEntropy_DTENSOR_TP2.sh"
 class TestTEParallelCrossEntropyDTensor:
     def test_te_parallel_cross_entropy_dtensor_tp2(self):
         run_test_script(TEST_FOLDER, TE_PARALLEL_CE_DTENSOR_TP2_FILENAME)
-

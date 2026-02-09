@@ -87,17 +87,17 @@ class _StubTokenizerChat(_StubTokenizerPlain):  # noqa: D401
         # Separate prompt messages (system, user) from assistant messages
         prompt_messages = [m for m in messages if m["role"] != "assistant"]
         assistant_messages = [m for m in messages if m["role"] == "assistant"]
-        
+
         # Build ids: [SOT] + prompt tokens + [SOT] + assistant tokens + [EOS]
         ids: List[int] = [self._start_of_turn_token_id]
-        
+
         # Add all prompt tokens (system + user)
         prompt_token_count = 0
         for msg in prompt_messages:
             tokens = msg["content"].split()
             ids.extend(self._id_for_token(tok) for tok in tokens)
             prompt_token_count += len(tokens)
-        
+
         # Add second SOT and assistant tokens
         ids.append(self._start_of_turn_token_id)
         assistant_token_count = 0
@@ -105,15 +105,15 @@ class _StubTokenizerChat(_StubTokenizerPlain):  # noqa: D401
             tokens = msg["content"].split()
             ids.extend(self._id_for_token(tok) for tok in tokens)
             assistant_token_count += len(tokens)
-        
+
         ids.append(self.eos_token_id)
-        
+
         # Handle return_dict parameter
         if kwargs.get("return_dict", False):
             result = {"input_ids": ids}
             # Handle return_assistant_tokens_mask parameter
             if kwargs.get("return_assistant_tokens_mask", False):
-                # Create mask: first SOT and prompt tokens are 0 (masked), 
+                # Create mask: first SOT and prompt tokens are 0 (masked),
                 # second SOT and assistant tokens are 1 (not masked)
                 mask = [0] * (1 + prompt_token_count)  # first SOT + prompt tokens
                 mask += [1] * (1 + assistant_token_count + 1)  # second SOT + assistant tokens + EOS

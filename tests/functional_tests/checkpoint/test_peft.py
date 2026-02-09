@@ -487,7 +487,7 @@ def test_hf_peft_checkpoint(use_triton=False):
 
 def test_hf_peft_dora_checkpoint():
     """
-    Tests DoRA finetune 
+    Tests DoRA finetune
     """
     default_cfg_path = Path(__file__).parents[3] / "examples" / "llm_finetune" / "llama3_2" / "llama3_2_1b_hellaswag_peft.yaml"
     cfg = parse_args_and_load_config(default_cfg_path)

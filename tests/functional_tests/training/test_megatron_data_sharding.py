@@ -53,7 +53,7 @@ def test_megatron_data_sharding():
         dp_world_size=dp_world_size,
         pp_enabled=False,
     )[0]
-    
+
     # fast-forward. not necessary, but we want to make sure the dataset is not at the beginning.
     for i, batch in enumerate(dataset):
         if i == 2:

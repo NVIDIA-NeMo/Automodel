@@ -355,4 +355,3 @@ def test_hf_safetensors_dcp_save_tracks_cpu_and_gpu_peaks(tmp_path: Path):
     )
 
     assert any(p.name.endswith(".safetensors") for p in ckpt_dir.glob("*.safetensors"))
-

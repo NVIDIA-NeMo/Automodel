@@ -161,5 +161,3 @@ def test_tool_calling_chat_dataset_errors(monkeypatch):
     monkeypatch.setattr(tcd, "_has_chat_template", lambda _tok: False)
     with pytest.raises(ValueError):
         tcd.ChatDataset("ignored", Tok())
-
-

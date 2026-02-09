@@ -58,4 +58,3 @@ def test_retrieval_dataset_inline_embedding_testdata_smoke():
     assert ex['doc_text'][0] == payload[0]['pos_doc']
     assert ex['doc_text'][1] == payload[0]['neg_doc'][0]
     assert ex['question'] == payload[0]['query']
-

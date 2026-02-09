@@ -96,5 +96,3 @@ def test_model_state_disables_tied_embeddings_for_non_tied_models():
 
     state_dict = state.state_dict()
     assert "lm_head.weight" in state_dict
-
-

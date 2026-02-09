@@ -75,7 +75,7 @@ class DummyTokenizer:
             masks.extend([1 if is_assistant else 0] * len(content_ids))
         ids.append(self.eos_token_id)
         masks.append(1)  # EOS is part of assistant
-        
+
         if return_dict:
             result = {"input_ids": ids}
             if return_assistant_tokens_mask:

@@ -367,5 +367,3 @@ def test_repo_structure():
     assert (repo_root / "nemo_automodel" / "shared").exists()
     assert (repo_root / "docs").exists()
     assert (repo_root / "examples").exists()
-
-

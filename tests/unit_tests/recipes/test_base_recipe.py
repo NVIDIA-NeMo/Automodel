@@ -50,14 +50,14 @@ def _patch_checkpoint_ops(monkeypatch):
 
     class MockCheckpointer:
         """Mock Checkpointer for testing."""
-        
+
         def __init__(self, config, dp_rank, tp_rank, pp_rank, moe_mesh=None):
             self.config = config
             self.dp_rank = dp_rank
             self.tp_rank = tp_rank
             self.pp_rank = pp_rank
             self.moe_mesh = moe_mesh
-        
+
         def save_model(self, model=None, weights_path=None, peft_config=None, tokenizer=None):
             """Save model state dict."""
             if model is None:
@@ -65,14 +65,14 @@ def _patch_checkpoint_ops(monkeypatch):
             model_dir = os.path.join(weights_path, "model")
             os.makedirs(model_dir, exist_ok=True)
             torch.save(model.state_dict(), os.path.join(model_dir, "model.pt"))
-        
-        def load_model(self, model, model_path, is_init_step=False, use_checkpoint_id=True, 
+
+        def load_model(self, model, model_path, is_init_step=False, use_checkpoint_id=True,
                       key_mapping=None, quantization=False):
             """Load model state dict."""
             if model is None:
                 return
             model.load_state_dict(torch.load(os.path.join(model_path, "model.pt"), weights_only=False))
-        
+
         def save_optimizer(self, optimizer, model, weights_path, scheduler=None):
             """Save optimizer state dict."""
             if optimizer is None:
@@ -80,30 +80,30 @@ def _patch_checkpoint_ops(monkeypatch):
             optim_dir = os.path.join(weights_path, "optim")
             os.makedirs(optim_dir, exist_ok=True)
             torch.save(optimizer.state_dict(), os.path.join(optim_dir, "optimizer.pt"))
-        
+
         def load_optimizer(self, optimizer, model, weights_path, scheduler=None):
             """Load optimizer state dict."""
             if optimizer is None:
                 return
             optim_path = os.path.join(weights_path, "optim")
             optimizer.load_state_dict(torch.load(os.path.join(optim_path, "optimizer.pt"), weights_only=False))
-        
+
         def async_wait(self):
             """No-op for tests to satisfy BaseRecipe interface."""
             return
-        
+
         def save_on_dp_ranks(self, state, state_name, path):
             """Save stateful object (e.g., dataloader, rng)."""
             state_dir = os.path.join(path, state_name)
             os.makedirs(state_dir, exist_ok=True)
             if self.tp_rank == 0 and self.pp_rank == 0:
                 torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}.pt"))
-        
+
         def load_on_dp_ranks(self, state, state_name, path):
             """Load stateful object (e.g., dataloader, rng)."""
             state_dir = os.path.join(path, state_name)
             state.load_state_dict(torch.load(os.path.join(state_dir, f"{state_name}.pt"), weights_only=False))
-    
+
     monkeypatch.setattr(checkpointing, "Checkpointer", MockCheckpointer)
     yield
 
@@ -148,7 +148,7 @@ class _ToyRecipe(BaseRecipe):
 
     def __init__(self, checkpoint_dir):
         super().__init__()
-        
+
         from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
         checkpoint_config = CheckpointingConfig(
