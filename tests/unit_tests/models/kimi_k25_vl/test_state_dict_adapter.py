@@ -24,7 +24,7 @@ from nemo_automodel.components.models.kimi_k25_vl.state_dict_adapter import (
     dequantize_int4,
     quantize_to_int4,
 )
-from nemo_automodel.components.moe.layers import MoEConfig
+from nemo_automodel.components.moe.config import MoEConfig
 
 
 class TestDequantizeInt4:
