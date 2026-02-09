@@ -1,10 +1,10 @@
 # Model Training on Databricks
 
-Databricks is a widely used platform for managing data, models, applications, and compute on the cloud. This guide shows how to use Automodel for scalable, performant model training on Databricks.
+Databricks is a widely used platform for managing data, models, applications, and compute on the cloud. This guide shows how to use AutoModel for scalable, performant model training on Databricks.
 
-The specific example here fine-tunes a [Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B) model using the [SQuAD dataset](https://huggingface.co/datasets/rajpurkar/squad) from Hugging Face, but any Automodel functionality (for example, {doc}`model pre-training <pretraining>`, {doc}`VLMs </model-coverage/vlm>`, {doc}`other supported models </model-coverage/overview>`) can also be run on Databricks.
+The specific example here fine-tunes a [Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B) model using the [SQuAD dataset](https://huggingface.co/datasets/rajpurkar/squad) from Hugging Face, but any AutoModel functionality (for example, {doc}`model pre-training <pretraining>`, {doc}`VLMs </model-coverage/vlm>`, {doc}`other supported models </model-coverage/overview>`) can also be run on Databricks.
 
-## Compute
+## Provision Compute
 
 Let's start by [provisioning](https://docs.databricks.com/aws/en/compute/configure) a Databricks classic compute cluster with the following setup:
 
@@ -17,7 +17,7 @@ Let's start by [provisioning](https://docs.databricks.com/aws/en/compute/configu
 ```bash
 #!/bin/bash
 
-# Install Automodel on all nodes
+# Install AutoModel on all nodes
 /databricks/python3/bin/pip install git+https://github.com/NVIDIA-NeMo/Automodel
 ```
 
@@ -25,11 +25,11 @@ This will provision three compute nodes – one driver node we'll attach a noteb
 
 Note that we've selected a small number of instances for demo purposes, but you can adjust the specific instance type and number of workers for your actual use case.
 
-## Training
+## Train the Model
 
-With the above compute resources provisioned, we're ready to fine-tune a model using Automodel.
+With the above compute resources provisioned, we're ready to fine-tune a model using AutoModel.
 
-Automodel uses YAML file recipes to configure various settings for the training process (for example, model, dataset, loss function, optimizer, etc.). Here we'll use this [preconfigured recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) for fine-tuning a Llama-3.2-1B model using the SQuAD dataset from Hugging Face. In a notebook connected to our compute resource, download the training script and configuration file with these `curl` commands:
+AutoModel uses YAML file recipes to configure various settings for the training process (for example, model, dataset, loss function, optimizer, etc.). Here we'll use this [preconfigured recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) for fine-tuning a Llama-3.2-1B model using the SQuAD dataset from Hugging Face. In a notebook connected to our compute resource, download the training script and configuration file with these `curl` commands:
 
 ```bash
 # Download training script
@@ -75,7 +75,7 @@ hf_token = getpass("HF token: ")
 
 ### Single-Node
 
-To run fine-tuning, we'll use the `finetune.py` script from the Automodel repository and our config file.
+To run fine-tuning, we'll use the `finetune.py` script from the AutoModel repository and our config file.
 
 To run training on a single GPU, use this command:
 
@@ -91,7 +91,7 @@ To run training on a single GPU, use this command:
 In addition to specifying the configuration file, we also use these options:
 
 - `--step_scheduler.max_steps`: Limits the number of training steps taken. Again, this is for example purposes – adapt for your actual use case as needed.
-- `--checkpoint.checkpoint_dir`: Tells Automodel where to {doc}`save model checkpoints </guides/checkpointing>` from training. We recommend saving model checkpoints in a Databricks Unity Catalog [volume](https://docs.databricks.com/aws/en/volumes/).
+- `--checkpoint.checkpoint_dir`: Tells AutoModel where to {doc}`save model checkpoints </guides/checkpointing>` from training. We recommend saving model checkpoints in a Databricks Unity Catalog [volume](https://docs.databricks.com/aws/en/volumes/).
 - `--checkpoint.staging_dir`: Specifies a temporary staging location for model checkpoints. Files will be temporarily saved to this location before being moved to the final `checkpoint_dir` location. This is needed when saving checkpoints in Unity Catalog. 
 - `--checkpoint.is_async`: Uses asynchronous checkpointing. 
 
@@ -116,7 +116,7 @@ To utilize all four GPUs available on this `g6e.12xlarge` instance, use `torchru
     --checkpoint.is_async True
 ```
 
-This uses PyTorch's [Elastic Launch](https://docs.pytorch.org/docs/stable/elastic/run.html) functionality to spawn and coordinate multiple training processes on the VM. Each training process runs on a separate GPU, and we can now see all four GPUs are being used (\~95% utilization for each GPU).
+This uses PyTorch's [Elastic Launch](https://docs.pytorch.org/docs/stable/elastic/run.html) functionality to spawn and coordinate multiple training processes on the VM. Each training process runs on a separate GPU, and we can now see all four GPUs are being used (~95% utilization for each GPU).
 
 :::{figure} ./databricks-gpu-metrics-multi.png
 :name: databricks-gpu-metrics-multi
@@ -175,11 +175,11 @@ distributor.run(train_file, *args)
 
 We now see GPU utilization is \~95% for all GPUs on all worker nodes during training (8 GPUs in this particular case).
 
-## MLflow Tracking
+## Track Experiments with MLflow
 
-Databricks includes built-in MLflow integration for tracking experiments, logging metrics, and storing artifacts. To use MLflow with Automodel on Databricks, add the MLflow configuration to your YAML file.
+Databricks includes built-in MLflow integration for tracking experiments, logging metrics, and storing artifacts. To use MLflow with AutoModel on Databricks, add the MLflow configuration to your YAML file.
 
-### Configuration
+### Configure MLflow
 
 Edit your configuration file (e.g., `llama3_2_1b_squad.yaml`) to include the `mlflow` section:
 
@@ -206,7 +206,7 @@ For Databricks, the key configuration parameters are:
 Databricks automatically handles authentication when `tracking_uri` is set to `"databricks"`. No additional credentials are needed.
 :::
 
-### Running with MLflow
+### Run Training with MLflow
 
 Run training with MLflow tracking enabled using the same commands as before. The MLflow configuration will be read from your YAML file:
 
@@ -242,7 +242,7 @@ args = [
 distributor.run("finetune.py", *args)
 ```
 
-### Viewing Results
+### View Results
 
 During training, you'll see MLflow logging messages in your output:
 
@@ -264,7 +264,7 @@ The Databricks MLflow UI displays:
 - Artifacts and model checkpoints
 - System metrics (GPU utilization, memory usage)
 
-### Artifact Storage in Unity Catalog
+### Store Artifacts in Unity Catalog
 
 To store MLflow artifacts in Unity Catalog volumes, specify the `artifact_location`:
 
@@ -295,6 +295,6 @@ For more details on MLflow configuration options and best practices, see the {do
 
 ## Conclusion
 
-This guide showed how to use Automodel for model training on Databricks-managed compute. It's relatively straightforward to scale from a single-GPU to multi-GPU to multi-node training to best suit your needs. 
+This guide showed how to use AutoModel for model training on Databricks-managed compute. It's relatively straightforward to scale from a single-GPU to multi-GPU to multi-node training to best suit your needs. 
 
-While the example here fine-tunes a Llama-3.2-1B model using the SQuAD dataset, any supported Automodel functionality (like model pre-training, VLMs, etc.) can also run, and scale, on Databricks. Check out {doc}`additional recipes and end-to-end examples </guides/overview>` to learn more. 
+While the example here fine-tunes a Llama-3.2-1B model using the SQuAD dataset, any supported AutoModel functionality (like model pre-training, VLMs, etc.) can also run, and scale, on Databricks. Check out {doc}`additional recipes and end-to-end examples </guides/overview>` to learn more. 
