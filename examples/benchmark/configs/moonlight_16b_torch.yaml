@@ -51,6 +51,7 @@ autopipeline:
   patch_inner_model: false
   patch_causal_lm_model: false
   layers_per_stage: 2
+  pp_seq_len: 2048
 
 dist_env:
   backend: nccl

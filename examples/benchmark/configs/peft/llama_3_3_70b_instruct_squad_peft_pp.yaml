@@ -37,6 +37,7 @@ autopipeline:
   pp_schedule: interleaved1f1b
   pp_microbatch_size: 1
   layers_per_stage: 4
+  pp_seq_len: 4096
   scale_grads_in_schedule: false
   round_virtual_stages_to_pp_multiple: up
   dtype: bf16
