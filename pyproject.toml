@@ -78,7 +78,7 @@ dependencies = [
     "diffusers",
     "ftfy",
     "imageio-ffmpeg",
-    "megatron-fsdp",
+    "megatron-fsdp>=0.2.3",
     "opencv-python-headless==4.10.0.84",
     "pybind11",
     "pyyaml",
