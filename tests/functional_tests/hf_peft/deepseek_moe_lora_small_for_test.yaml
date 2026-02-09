@@ -72,7 +72,8 @@ model:
     attn: sdpa
     linear: torch
     rms_norm: torch
-    enable_deepep: false
+    experts: torch
+    dispatcher: torch
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 

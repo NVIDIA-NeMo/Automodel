@@ -47,7 +47,8 @@ model:
     attn: te
     linear: te
     rms_norm: te
-    enable_deepep: true
+    experts: te
+    dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -55,8 +56,8 @@ model:
 checkpoint:
   enabled: false
   checkpoint_dir: checkpoints/
-  model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  model_save_format: safetensors # torch_save or safetensors
+  save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
   tp_size: 1
@@ -121,10 +122,13 @@ optimizer:
   lr: 1.0e-4
   weight_decay: 0
   # min_lr: 1.0e-5
+  # foreach=false is required when using TE GroupedLinear with FSDP
+  # because TE weights are regular tensors while FSDP wraps other params as DTensor
+  foreach: false
 
 # Uncomment and configure for W&B logging
-wandb:
-  project: automodel-fsdp-moe-opt
-  entity: Nemo-automodel
-  name: moonlight-16b-te-fsdp-moe-opt
-  dir: /tmp/wandb
+# wandb:
+#   project: automodel-fsdp-moe-opt
+#   entity: Nemo-automodel
+#   name: moonlight-16b-te-grouped-linear
+#   dir: /tmp/wandb

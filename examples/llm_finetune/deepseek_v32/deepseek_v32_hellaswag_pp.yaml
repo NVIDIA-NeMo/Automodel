@@ -63,7 +63,7 @@ model:
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3.2
   trust_remote_code: true
   backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa # TE requires the latest cudnn version so disabling by default
     linear: te
     rms_norm: te
