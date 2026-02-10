@@ -1,22 +1,24 @@
-# Domain-Specific Fine-Tuning Guide
+# Fine-Tuning Hyperparameter Guide
 
 ## Introduction
 
-The standard NeMo AutoModel [fine-tuning guide](finetune.md) walks through an end-to-end example using the SQuAD benchmark dataset. While that example demonstrates the mechanics of fine-tuning, adapting a model to a **domain-specific** task (e.g., legal documents, medical records, code generation, customer support) requires careful parameter tuning and data preparation.
+The standard NeMo AutoModel [fine-tuning guide](finetune.md) walks through an end-to-end example using the SQuAD benchmark dataset. While that example demonstrates the mechanics of fine-tuning, getting good results on your own data requires careful hyperparameter tuning. Learning rate, LoRA rank, batch size, number of epochs -- the right values depend on your dataset size, task complexity, and available compute.
 
-This guide provides practical recommendations for taking a pretrained model and fine-tuning it on your own domain data. It covers parameter ranges, common failure modes, and step-by-step strategies to go from an initial run to a production-quality fine-tuned model.
+There is no formula that gives you the perfect hyperparameters up front. Fine-tuning is inherently iterative -- you run an experiment, read the loss curves, adjust, and repeat. The goal of this guide is to make that loop faster by giving you good starting points, clear signals to watch for, and concrete knobs to turn when something is off.
+
+This guide covers recommended parameter ranges by dataset scale, how to interpret training signals and decide what to change, common failure modes and how to fix them, and step-by-step strategies to go from an initial run to a production-quality fine-tuned model.
 
 ## Before You Start
 
 Before diving into parameter tuning, ensure the following:
 
-1. **Data quality**: Your dataset is clean, consistently formatted, and representative of the target domain. Garbage in, garbage out applies strongly to fine-tuning.
-2. **Evaluation set**: You have a held-out validation set (ideally 5-10% of your data) from the same domain. Never tune parameters without a validation signal.
+1. **Data quality**: Your dataset is clean, consistently formatted, and representative of your target task. Garbage in, garbage out applies strongly to fine-tuning.
+2. **Evaluation set**: You have a held-out validation set (ideally 5-10% of your data) from the same distribution. Never tune parameters without a validation signal.
 3. **Baseline**: Run the pretrained model (without fine-tuning) on your evaluation set to establish a baseline. This tells you how much improvement to expect.
 
 ## Quick-Start: Recommended Parameter Ranges
 
-The table below summarizes recommended starting points for domain-specific fine-tuning. These are intended as starting ranges -- the optimal values depend on your dataset size, domain complexity, and model architecture.
+The tables below summarize recommended starting points for fine-tuning. These are intended as starting ranges -- the optimal values depend on your dataset size, task complexity, and model architecture.
 
 ### SFT (Full Fine-Tuning)
 
@@ -56,13 +58,109 @@ The table below summarizes recommended starting points for domain-specific fine-
 | `quantization.bnb_4bit_compute_dtype` | `bfloat16` |
 | `quantization.bnb_4bit_use_double_quant` | `True` |
 
+## Reading the Loss Curves: When to Adjust What
+
+The tables above are starting points. In practice, you will need to adjust based on what you observe during training. This section tells you what to watch for and which knob to turn.
+
+### Learning Rate
+
+The learning rate is the single most impactful hyperparameter. Get this wrong and nothing else matters.
+
+| What you see | What it means | What to do |
+|---|---|---|
+| Loss barely decreases over the first 50-100 steps | LR is too low -- the model is barely updating | Increase `optimizer.lr` by 5-10x |
+| Loss decreases very slowly but steadily | LR is on the low side -- safe but inefficient | Try 2-3x higher; you can converge in fewer steps |
+| Loss decreases quickly in early steps, then plateaus at a good value | LR is in the right range | Keep it; fine-tune the schedule (`min_lr`, warmup) |
+| Loss decreases quickly but then **spikes** or oscillates | LR is too high -- the optimizer is overshooting | Reduce by 2-5x, or add/increase `lr_warmup_steps` |
+| Loss goes to NaN or inf within the first few steps | LR is far too high, or there's a data issue | Reduce by 10x; also check data and gradient clipping |
+| Training loss keeps falling but validation loss starts climbing | Overfitting, not an LR issue per se | See the overfitting section below; reduce epochs first |
+
+:::{tip}
+**Rule of thumb for PEFT vs SFT:** LoRA fine-tuning tolerates ~10x higher learning rates than full SFT because only a small fraction of parameters are being updated. If you switch from SFT to PEFT (or vice versa), adjust the LR accordingly.
+:::
+
+### Batch Size
+
+Batch size affects both training stability and convergence speed. In NeMo AutoModel, `global_batch_size` is the effective batch size per optimizer step, while `local_batch_size` is the per-GPU micro-batch size. The ratio determines how many gradient accumulation steps occur.
+
+| What you see | What it means | What to do |
+|---|---|---|
+| Loss curve is very noisy (jumps around a lot) | Effective batch size may be too small -- gradients are noisy | Increase `global_batch_size` (e.g., 16 -> 32 -> 64) |
+| Loss is smooth but converges very slowly | Batch size may be too large -- fewer updates per epoch | Decrease `global_batch_size` and/or increase LR proportionally |
+| OOM error | `local_batch_size` is too large for your GPU memory | Reduce `local_batch_size`; keep `global_batch_size` the same (this increases gradient accumulation steps automatically) |
+| Training is very slow (high step time) with low GPU utilization | `local_batch_size` might be too small to saturate the GPU | Increase `local_batch_size` if memory allows |
+
+:::{tip}
+**Scaling rule:** If you double `global_batch_size`, you can often increase `optimizer.lr` by ~1.4x (square-root scaling) to maintain similar convergence behavior. This is a rough guideline, not a strict rule.
+:::
+
+### Number of Epochs
+
+More epochs means the model sees the data more times. This is useful when you have little data, but risky because of overfitting.
+
+| What you see | What it means | What to do |
+|---|---|---|
+| Validation loss is still decreasing at the end of training | Model hasn't finished learning -- you can train longer | Increase `num_epochs` by 1-2 |
+| Validation loss flattens while training loss keeps dropping | Classic overfitting onset | Stop here; use the checkpoint from the flat point |
+| Validation loss **increases** while training loss drops | Overfitting is already happening | Reduce `num_epochs`, increase regularization (`weight_decay`, `peft.dropout`), or add more data |
+| Both losses plateau very early (within the first epoch) | LR is likely too low, or the model has already learned what it can from this data | Increase LR first; if that doesn't help, the data may be too small or too easy |
+
+:::{tip}
+**Small datasets (<5K samples):** 1-3 epochs is usually enough. Going beyond 3 epochs almost always leads to overfitting. If results aren't good after 3 epochs, the problem is likely elsewhere (data quality, LR, or model choice).
+
+**Large datasets (>50K samples):** 1 epoch may be all you need, especially for full SFT. The model sees enough variety in a single pass.
+:::
+
+### Weight Decay
+
+Weight decay is a regularizer that penalizes large weights. It helps prevent overfitting but can hurt performance if set too high.
+
+| What you see | What it means | What to do |
+|---|---|---|
+| Overfitting (val loss rises) and you've already reduced epochs | Model needs more regularization | Add or increase `optimizer.weight_decay` (try 0.01 -> 0.05 -> 0.1) |
+| Training loss converges to a higher value than expected | Weight decay may be too aggressive | Reduce `optimizer.weight_decay` (try 0.01 or 0) |
+| Model is underfitting (both train and val loss are high) | Weight decay is not the issue, but don't make it worse | Set `weight_decay: 0` and focus on LR and data |
+
+### LoRA Rank (`peft.dim`)
+
+LoRA rank controls the capacity of the adapters. Higher rank = more trainable parameters = more capacity to learn, but also more risk of overfitting.
+
+| What you see | What it means | What to do |
+|---|---|---|
+| Training loss plateaus well above what you'd expect | Adapter capacity is too low -- the model can't represent the task | Increase `peft.dim` (e.g., 8 -> 16 -> 32) |
+| Overfitting on a small dataset even with low LR and few epochs | Rank may be too high for the data size | Decrease `peft.dim` (e.g., 16 -> 8 -> 4) |
+| Good results but you want to reduce checkpoint size / inference cost | Rank is higher than needed | Try halving `peft.dim` and see if quality holds |
+
+### Gradient Clipping
+
+Gradient clipping prevents exploding gradients. In most cases, `max_norm: 1.0` is a safe default and you don't need to change it.
+
+| What you see | What it means | What to do |
+|---|---|---|
+| Loss spikes or NaN, especially with high LR | Gradients are exploding | Ensure `clip_grad_norm.max_norm: 1.0` is set; if already set, reduce LR |
+| Training is stable | Clipping is working as intended | Leave it at 1.0 |
+
+### Summary: The Tuning Loop
+
+In practice, a typical tuning session looks like this:
+
+1. **Start with a conservative config** from the recommended ranges above.
+2. **Run for a few hundred steps** and watch the training + validation loss.
+3. **Adjust the learning rate first** -- it has the biggest impact.
+4. **Then adjust batch size** if the loss curve is too noisy or training is too slow.
+5. **Then adjust epochs** based on where validation loss starts to rise.
+6. **Then fine-tune regularization** (weight decay, LoRA dropout, LoRA rank) if overfitting persists.
+7. **Repeat** until validation loss is good and generated outputs look right.
+
+This is not a one-shot process. Expect 3-5 iterations to find a good configuration for a new dataset.
+
 ## Example Datasets by Scale
 
-To help you get started, here are practical, widely-used Hugging Face datasets that represent real fine-tuning scenarios across different scales and domains. All instruction-style datasets can be loaded via `ColumnMappedTextInstructionDataset`, which maps arbitrary column names to the standard `context`, `question`, and `answer` fields expected by NeMo AutoModel.
+To help you get started, here are practical, widely-used Hugging Face datasets that represent real fine-tuning scenarios at different scales. All instruction-style datasets can be loaded via `ColumnMappedTextInstructionDataset`, which maps arbitrary column names to the standard `context`, `question`, and `answer` fields expected by NeMo AutoModel.
 
 ### Dataset Overview
 
-| Scale | Dataset | Domain | Size | HF ID |
+| Scale | Dataset | Task | Size | HF ID |
 |-------|---------|--------|------|-------|
 | **Small** | Medical Meadow MedQA | Medical QA | ~10K | `medalpaca/medical_meadow_medqa` |
 | **Small** | Databricks Dolly | General instruction | ~15K | `databricks/databricks-dolly-15k` |
@@ -74,10 +172,10 @@ To help you get started, here are practical, widely-used Hugging Face datasets t
 
 ### Small: Medical Meadow MedQA (~10K samples)
 
-[Medical Meadow MedQA](https://huggingface.co/datasets/medalpaca/medical_meadow_medqa) contains medical exam-style question-answer pairs. This is a realistic example of a small, domain-specific dataset for healthcare applications -- the kind of data you would encounter when fine-tuning for a clinical or biomedical use case.
+[Medical Meadow MedQA](https://huggingface.co/datasets/medalpaca/medical_meadow_medqa) contains medical exam-style question-answer pairs. This is a realistic example of a small, specialized dataset for healthcare applications -- the kind of data you would encounter when fine-tuning for a clinical or biomedical use case.
 
 ```yaml
-# Small domain: Medical QA (~10K)
+# Small: Medical QA (~10K)
 dataset:
   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
   path_or_dataset_id: medalpaca/medical_meadow_medqa
@@ -98,10 +196,10 @@ validation_dataset:
 
 ### Small: Databricks Dolly (~15K samples)
 
-[Databricks Dolly](https://huggingface.co/datasets/databricks/databricks-dolly-15k) is a human-generated instruction-following dataset covering QA, summarization, brainstorming, and classification. Its small size, human authorship, and diverse task coverage make it a practical starting point for general-purpose domain adaptation.
+[Databricks Dolly](https://huggingface.co/datasets/databricks/databricks-dolly-15k) is a human-generated instruction-following dataset covering QA, summarization, brainstorming, and classification. Its small size, human authorship, and diverse task coverage make it a practical starting point for general-purpose fine-tuning.
 
 ```yaml
-# Small domain: Dolly instruction-following (~15K)
+# Small: Dolly instruction-following (~15K)
 dataset:
   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
   path_or_dataset_id: databricks/databricks-dolly-15k
@@ -124,10 +222,10 @@ validation_dataset:
 
 ### Medium: CodeAlpaca (~20K samples)
 
-[CodeAlpaca](https://huggingface.co/datasets/sahil2801/CodeAlpaca-20k) contains 20K instruction-following examples for code generation. This is representative of medium-scale, domain-specific fine-tuning for developer tools and code assistants.
+[CodeAlpaca](https://huggingface.co/datasets/sahil2801/CodeAlpaca-20k) contains 20K instruction-following examples for code generation. This is representative of medium-scale fine-tuning for developer tools and code assistants.
 
 ```yaml
-# Medium domain: Code generation (~20K)
+# Medium: Code generation (~20K)
 dataset:
   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
   path_or_dataset_id: sahil2801/CodeAlpaca-20k
@@ -153,7 +251,7 @@ validation_dataset:
 [Stanford Alpaca](https://huggingface.co/datasets/tatsu-lab/alpaca) is one of the most widely-used instruction-tuning datasets. Its 52K instruction-input-output triples make it a solid baseline for general-purpose fine-tuning at medium scale.
 
 ```yaml
-# Medium domain: Alpaca instruction-following (~52K)
+# Medium: Alpaca instruction-following (~52K)
 dataset:
   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
   path_or_dataset_id: tatsu-lab/alpaca
@@ -179,7 +277,7 @@ validation_dataset:
 [xLAM](https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k) from Salesforce is a specialized dataset for training models to generate structured function/tool calls -- a high-demand production use case for AI agents. NeMo AutoModel includes a dedicated loader for this dataset.
 
 ```yaml
-# Large domain: Tool/function calling (~60K)
+# Large: Tool/function calling (~60K)
 dataset:
   _target_: nemo_automodel.components.datasets.llm.xlam.make_xlam_dataset
   dataset_name: Salesforce/xlam-function-calling-60k
@@ -197,7 +295,7 @@ validation_dataset:
 [SlimOrca](https://huggingface.co/datasets/Open-Orca/SlimOrca) is a large-scale, curated instruction-following dataset with ~518K conversations in OpenAI chat format. Commonly used for building general-purpose assistants, this represents the scale where full SFT becomes most effective.
 
 ```yaml
-# Large domain: SlimOrca instruction-following (~518K)
+# Large: SlimOrca instruction-following (~518K)
 # SlimOrca uses OpenAI chat format (messages list).
 # Use the ChatDataset loader for this format.
 dataset:
@@ -214,7 +312,7 @@ validation_dataset:
 
 ### Custom Dataset: Your Own JSONL Files
 
-If you have your own data in JSONL format, `ColumnMappedTextInstructionDataset` is the most common path for proprietary domain data. Just map your column names:
+If you have your own data in JSONL format, `ColumnMappedTextInstructionDataset` is the most common path for proprietary data. Just map your column names:
 
 ```yaml
 # Custom JSONL file with columns: "instruction", "input", "response"
@@ -424,18 +522,18 @@ For easier comparison, enable experiment tracking. Each run will appear as a sep
 ```yaml
 # Add to your config to track experiments in Weights & Biases
 wandb:
-  project: domain-finetune-lr-sweep
+  project: finetune-lr-sweep
   entity: your-wandb-entity
   name: lr_1e-5_dolly_sft   # Change per experiment
   save_dir: ./wandb_logs
 
 # Or use MLflow
 mlflow:
-  experiment_name: domain-finetune-lr-sweep
+  experiment_name: finetune-lr-sweep
   run_name: lr_1e-5_dolly_sft   # Change per experiment
   tracking_uri: null              # Uses default local tracking
   tags:
-    task: domain-finetune
+    task: finetune
     learning_rate: "1e-5"
 ```
 
@@ -462,7 +560,7 @@ model = AutoModelForCausalLM.from_pretrained(ckpt_path)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model.to(device)
 
-# Evaluate on domain-specific prompts
+# Evaluate on task-specific prompts
 test_prompts = [
     "Context: The patient presented with elevated troponin levels. Question: What condition does this suggest? Answer: ",
     "Context: Section 12(b) of the Securities Exchange Act requires... Question: What must be filed? Answer: ",
@@ -591,7 +689,7 @@ When comparing hyperparameter experiments, keep the same seed across runs so dif
 Begin with a low learning rate and few epochs. The goal of the first run is to confirm the pipeline works and to see a decreasing loss curve.
 
 ```yaml
-# domain_finetune_conservative.yaml
+# conservative_finetune.yaml
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
@@ -659,7 +757,7 @@ dist_env:
 
 Run it:
 ```bash
-torchrun --nproc-per-node=1 examples/llm_finetune/finetune.py --config domain_finetune_conservative.yaml
+torchrun --nproc-per-node=1 examples/llm_finetune/finetune.py --config conservative_finetune.yaml
 ```
 
 **What to look for:**
@@ -678,13 +776,13 @@ Once you confirm the pipeline works, increase the learning rate. A common approa
 Override the learning rate from the CLI without editing the YAML:
 ```bash
 torchrun --nproc-per-node=1 examples/llm_finetune/finetune.py \
-  --config domain_finetune_conservative.yaml \
+  --config conservative_finetune.yaml \
   --optimizer.lr 1.0e-5
 ```
 
 ### Step 3: Monitor for Overfitting
 
-Overfitting is the most common failure mode with domain-specific fine-tuning, especially on small datasets.
+Overfitting is the most common failure mode when fine-tuning, especially on small datasets.
 
 **Symptoms:**
 - Training loss keeps decreasing, but validation loss starts increasing after a certain number of steps.
@@ -700,11 +798,11 @@ Overfitting is the most common failure mode with domain-specific fine-tuning, es
 | LoRA dropout | `peft.dropout` | 0.05-0.1 |
 | Smaller LoRA rank | `peft.dim` | 4-8 for small datasets |
 | Lower learning rate | `optimizer.lr` | Reduce by 2-5x |
-| More data | `dataset` | Augment or collect more domain data |
+| More data | `dataset` | Augment or collect more training data |
 
 ### Step 4: Switch to PEFT if Resources Are Limited
 
-If full fine-tuning is too expensive or you have limited data, switch to LoRA. PEFT is particularly effective for domain adaptation because:
+If full fine-tuning is too expensive or you have limited data, switch to LoRA. PEFT is particularly effective because:
 
 - It updates <1% of parameters, reducing overfitting risk.
 - It requires significantly less GPU memory.
@@ -754,14 +852,14 @@ step_scheduler:
 
 After training, evaluate each saved checkpoint on your validation set and select the best one.
 
-## Domain-Specific Scenarios
+## Scenarios by Dataset Scale
 
-### Scenario 1: Small Domain Dataset (<1K Samples)
+### Scenario 1: Small Dataset (<1K Samples)
 
 Use PEFT with aggressive regularization. Example: Medical Meadow MedQA, a real-world medical QA dataset.
 
 ```yaml
-# small_domain_peft.yaml -- PEFT on a small medical dataset
+# small_dataset_peft.yaml -- PEFT on a small medical dataset
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
@@ -808,7 +906,7 @@ validation_dataset:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: checkpoints/small_domain/
+  checkpoint_dir: checkpoints/small_dataset/
   model_save_format: safetensors
   save_consolidated: false
 
@@ -844,15 +942,15 @@ dist_env:
 
 Run it:
 ```bash
-torchrun --nproc-per-node=1 examples/llm_finetune/finetune.py --config small_domain_peft.yaml
+torchrun --nproc-per-node=1 examples/llm_finetune/finetune.py --config small_dataset_peft.yaml
 ```
 
-### Scenario 2: Medium Domain Dataset (5K-50K Samples)
+### Scenario 2: Medium Dataset (5K-50K Samples)
 
 Standard PEFT with moderate parameters. Example: Stanford Alpaca (~52K instruction-following samples).
 
 ```yaml
-# medium_domain_peft.yaml -- PEFT on Alpaca
+# medium_dataset_peft.yaml -- PEFT on Alpaca
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
@@ -901,7 +999,7 @@ validation_dataset:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: checkpoints/medium_domain/
+  checkpoint_dir: checkpoints/medium_dataset/
   model_save_format: safetensors
   save_consolidated: false
 
@@ -937,15 +1035,15 @@ dist_env:
 
 Run it (multi-GPU):
 ```bash
-torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config medium_domain_peft.yaml
+torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config medium_dataset_peft.yaml
 ```
 
-### Scenario 3: Large Domain Dataset (>50K Samples)
+### Scenario 3: Large Dataset (>50K Samples)
 
 Full SFT is viable with large datasets. Example: xLAM function calling (~60K) or Natural Instructions (~800K+).
 
 ```yaml
-# large_domain_sft.yaml -- Full SFT on xLAM function calling
+# large_dataset_sft.yaml -- Full SFT on xLAM function calling
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
@@ -984,7 +1082,7 @@ validation_dataset:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: checkpoints/large_domain/
+  checkpoint_dir: checkpoints/large_dataset/
   model_save_format: safetensors
   save_consolidated: True
 
@@ -1020,7 +1118,7 @@ dist_env:
 
 Run it (multi-GPU):
 ```bash
-torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config large_domain_sft.yaml
+torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config large_dataset_sft.yaml
 ```
 
 :::{tip}
