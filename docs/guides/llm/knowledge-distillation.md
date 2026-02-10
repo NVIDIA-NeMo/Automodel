@@ -7,7 +7,7 @@ In particular, we will show how to distill a 3B (`meta-llama/Llama-3.2-3B`) mode
 
 ---
 
-## 1. What is Knowledge Distillation?
+## What is Knowledge Distillation?
 
 Knowledge distillation (KD) transfers the *dark knowledge* of a high-capacity
 teacher model to a smaller student by minimizing the divergence between their
