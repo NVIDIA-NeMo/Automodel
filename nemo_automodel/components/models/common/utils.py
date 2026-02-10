@@ -86,26 +86,24 @@ class BackendConfig:
             )
 
 
-class _Float32RMSNorm(nn.Module):
-    """RMSNorm with explicit float32 upcast, matching HuggingFace's LlamaRMSNorm precision.
-
-    PyTorch's nn.RMSNorm computes in the input dtype (e.g. bfloat16),
-    but HF's LlamaRMSNorm upcasts to float32 for variance/rsqrt to avoid
-    precision loss. This class matches HF's behavior so that custom model
-    outputs are numerically identical to HF.
-    """
-
-    def __init__(self, dim: int, eps: float = 1e-6, device=None, dtype=None):
+class Float32RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6, device=None, dtype=None):
+        """
+        Float32RMSNorm equivalent to HuggingFace's LlamaRMSNorm
+        """
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim, device=device, dtype=dtype))
+        self.weight = nn.Parameter(torch.ones(hidden_size, device=device, dtype=dtype))
         self.variance_epsilon = eps
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
 def initialize_rms_norm_module(
@@ -140,7 +138,7 @@ def initialize_rms_norm_module(
     elif rms_norm_impl == "torch":
         return nn.RMSNorm(dim, eps=eps, device=device, dtype=dtype)
     elif rms_norm_impl == "torch_fp32":
-        return _Float32RMSNorm(dim, eps=eps, device=device, dtype=dtype)
+        return Float32RMSNorm(dim, eps=eps, device=device, dtype=dtype)
     else:
         raise ValueError(f"Unsupported RMSNorm implementation: {rms_norm_impl}")
 
