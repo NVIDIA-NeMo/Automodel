@@ -23,7 +23,8 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
     _get_model_name,
-    build_model_and_optimizer,
+    build_model,
+    build_optimizer,
 )
 
 
@@ -108,23 +109,22 @@ class DummyModelConfig:
 
 
 # -----------------------------------------------------------------------------
-# build_model_and_optimizer
+# build_model / build_optimizer
 # -----------------------------------------------------------------------------
 
 def test_build_model_and_optimizer_basic():
-    """Test basic build_model_and_optimizer for VLM.
-    Note: New API returns 2-tuple (model, optimizer) and passes freeze_config to model instantiation."""
+    """Test basic build_model and build_optimizer for VLM."""
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig(lr=0.01)
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
-        model, optim = build_model_and_optimizer(
+        model = build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
             seed=123,
         )
+        optim = build_optimizer(model, cfg_opt, None, None)
 
     # Check returned objects and their properties
     assert isinstance(model, DummyModel)
@@ -133,7 +133,7 @@ def test_build_model_and_optimizer_basic():
     assert isinstance(optim[0], torch.optim.Optimizer)
 
 
-def test_build_model_and_optimizer_passes_freeze_config():
+def test_build_model_passes_freeze_config():
     """Test that freeze_config is passed to model instantiation."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 
@@ -151,16 +151,14 @@ def test_build_model_and_optimizer_passes_freeze_config():
             return getattr(self, key, default)
 
     cfg_model = CapturingModelConfig()
-    cfg_opt = DummyOptConfig(lr=0.01)
 
     class FreezeConfig:
         def to_dict(self):
             return {"freeze_embeddings": True, "freeze_language_model": False}
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
-        model, optim = build_model_and_optimizer(
+        model = build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=FreezeConfig(),
             cfg_peft=None,
             seed=123,
@@ -422,9 +420,8 @@ def test_vlm_build_model_with_adapter():
     cfg_model = NeMoModelConfigWithAdapter()
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
-        model, optim = build_model_and_optimizer(
+        model = build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
             seed=123,
@@ -437,8 +434,6 @@ def test_vlm_build_model_with_adapter():
 
 def test_vlm_build_model_without_adapter():
     """Test that model without state_dict_adapter is properly instantiated in VLM."""
-
-    cfg_opt = DummyOptConfig(lr=0.01)
 
     # Create a config that simulates NeMoAutoModel's internal infrastructure handling (no adapter)
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
@@ -456,9 +451,8 @@ def test_vlm_build_model_without_adapter():
     cfg_model = NeMoModelConfigNoAdapter()
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
-        model, optim = build_model_and_optimizer(
+        model = build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
             seed=123,
@@ -472,8 +466,6 @@ def test_vlm_build_model_without_adapter():
 def test_vlm_build_model_with_quantization_config():
     """Test that model with quantization_config is properly instantiated in VLM."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-
-    cfg_opt = DummyOptConfig(lr=0.01)
 
     # Create a model config that simulates NeMoAutoModel's internal infrastructure handling
     class DummyQuantizedVLMModelConfig:
@@ -492,9 +484,8 @@ def test_vlm_build_model_with_quantization_config():
     cfg_model = DummyQuantizedVLMModelConfig()
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
-        model, optim = build_model_and_optimizer(
+        model = build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
             seed=123,
@@ -508,8 +499,6 @@ def test_vlm_build_model_with_quantization_config():
 def test_vlm_build_model_without_quantization_config():
     """Test that model without quantization_config is properly instantiated in VLM."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-
-    cfg_opt = DummyOptConfig(lr=0.01)
 
     # Create a config that simulates NeMoAutoModel's internal infrastructure handling (no quant config)
     class DummyNoQuantVLMModelConfig:
@@ -525,9 +514,8 @@ def test_vlm_build_model_without_quantization_config():
     cfg_model = DummyNoQuantVLMModelConfig()
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
-        model, optim = build_model_and_optimizer(
+        model = build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
             seed=123,
@@ -539,12 +527,12 @@ def test_vlm_build_model_without_quantization_config():
 
 
 # =============================================================================
-# New tests for VLM-specific build_model_and_optimizer functionality
+# New tests for VLM-specific build_model / build_optimizer functionality
 # =============================================================================
 
 
 def test_vlm_build_model_raises_value_error_for_non_nemo_auto_model():
-    """Test that VLM build_model_and_optimizer raises ValueError when target is not NeMoAutoModelForImageTextToText."""
+    """Test that VLM build_model raises ValueError when target is not NeMoAutoModelForImageTextToText."""
 
     # Create a cfg_model that targets something other than NeMoAutoModelForImageTextToText
     class InvalidModelConfig:
@@ -558,12 +546,10 @@ def test_vlm_build_model_raises_value_error_for_non_nemo_auto_model():
             return getattr(self, key, default)
 
     cfg_model = InvalidModelConfig()
-    cfg_opt = DummyOptConfig(lr=0.01)
 
     with pytest.raises(ValueError, match="VLM finetuning requires NeMoAutoModelForImageTextToText"):
-        build_model_and_optimizer(
+        build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
             seed=42,
@@ -572,7 +558,7 @@ def test_vlm_build_model_raises_value_error_for_non_nemo_auto_model():
 
 
 
-def test_vlm_build_model_disables_foreach_with_tp():
+def test_vlm_build_optimizer_disables_foreach_with_tp():
     """Test that when device_mesh has tp > 1, cfg_opt.foreach is set to False in VLM."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 
@@ -598,14 +584,14 @@ def test_vlm_build_model_disables_foreach_with_tp():
     mock_device_mesh.__getitem__ = lambda self, key: mock_tp_submesh if key == "tp" else MagicMock()
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
-        model, optimizer = build_model_and_optimizer(
+        model = build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
             seed=42,
             device_mesh=mock_device_mesh,
         )
+        optimizer = build_optimizer(model, cfg_opt, None, mock_device_mesh)
 
     assert cfg_opt.foreach is False
 
@@ -1659,12 +1645,12 @@ class TestForwardBackwardStepNonPP:
 
 
 # -----------------------------------------------------------------------------
-# build_model_and_optimizer returns list (diff coverage)
+# build_optimizer returns correct type (diff coverage)
 # -----------------------------------------------------------------------------
 
 
-def test_build_model_and_optimizer_returns_optimizer_list():
-    """Test that build_model_and_optimizer returns list of optimizers and disables foreach with TP."""
+def test_build_optimizer_disables_foreach_with_tp():
+    """Test that build_optimizer disables foreach with TP."""
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig(lr=0.01)
 
@@ -1676,14 +1662,14 @@ def test_build_model_and_optimizer_returns_optimizer_list():
     mock_device_mesh.__getitem__ = lambda self, key: mock_tp_submesh if key == "tp" else MagicMock()
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
-        model, optimizer = build_model_and_optimizer(
+        model = build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
             seed=42,
             device_mesh=mock_device_mesh,
         )
+        optimizer = build_optimizer(model, cfg_opt, None, mock_device_mesh)
 
     # Verify foreach was disabled due to TP > 1
     assert cfg_opt.foreach is False
@@ -1692,8 +1678,8 @@ def test_build_model_and_optimizer_returns_optimizer_list():
     assert len(optimizer) == 1
 
 
-def test_vlm_build_model_returns_model_optimizer_tuple():
-    """Test that VLM build_model_and_optimizer returns (model, optimizer) 2-tuple."""
+def test_vlm_build_model_and_optimizer_return_values():
+    """Test that VLM build_model and build_optimizer return proper values."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 
     class NeMoVLMModelConfig:
@@ -1710,18 +1696,14 @@ def test_vlm_build_model_returns_model_optimizer_tuple():
     cfg_opt = DummyOptConfig(lr=0.01)
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
-        result = build_model_and_optimizer(
+        model = build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
             seed=42,
         )
+        optimizer = build_optimizer(model, cfg_opt, None, None)
 
-    # Should return 2-tuple
-    assert isinstance(result, tuple)
-    assert len(result) == 2
-    model, optimizer = result
     assert model is not None
     assert optimizer is not None
 
@@ -1744,13 +1726,11 @@ def test_vlm_build_model_validates_nemo_auto_model_entry_points(entry_point):
             return getattr(self, key, default)
 
     cfg_model = NeMoVLMModelConfig()
-    cfg_opt = DummyOptConfig(lr=0.01)
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
         # Should not raise - entry point should be recognized
-        model, optimizer = build_model_and_optimizer(
+        model = build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
             seed=42,

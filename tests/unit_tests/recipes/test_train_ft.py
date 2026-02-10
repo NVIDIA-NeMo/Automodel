@@ -30,7 +30,8 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA n
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     build_dataloader,
-    build_model_and_optimizer,
+    build_model,
+    build_optimizer,
     build_validation_dataloader,
     compute_trust_remote_code_from_model,
 )
@@ -232,13 +233,12 @@ def test_peft_without_pipeline_parallelism(caplog):
                             mock_shard.return_value = DummyModel()
                             with caplog.at_level(logging.INFO):
                                 # This should work fine without PP
-                                # New API: no device param, returns 2-tuple
-                                model, optimizer = build_model_and_optimizer(
+                                model = build_model(
                                     cfg_model=cfg_model,
-                                    cfg_opt=cfg_opt,
                                     cfg_peft=cfg_peft,
                                     seed=42,
                                 )
+                                optimizer = build_optimizer(model, cfg_opt, None, None)
 
                             # Verify that apply_lora was called
                             assert mock_apply_lora.called, "apply_lora_to_linear_modules should be called"
@@ -345,13 +345,13 @@ def test_force_hf_true_disables_meta_init(monkeypatch):
     monkeypatch.setattr("nemo_automodel._transformers.auto_model._verify_sdpa_support", lambda *a, **k: None)
     monkeypatch.setattr("nemo_automodel._transformers.infrastructure.print_trainable_parameters", lambda *a, **k: None)
 
-    # Call under test - new API: no device param, returns 2-tuple
-    model, optimizer = build_model_and_optimizer(
+    # Call under test
+    model = build_model(
         cfg_model=cfg_model,
-        cfg_opt=cfg_opt,
         cfg_peft=cfg_peft,
         seed=123,
     )
+    optimizer = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated
     assert model is not None
@@ -411,12 +411,16 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         ),
     )
 
-    # Stub model/optimizer creation - new API returns 2-tuple (model, optimizer)
+    # Stub model/optimizer creation
     dummy_model = DummyModel()
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_model_and_optimizer",
-        lambda *a, **k: (dummy_model, [dummy_opt]),
+        "nemo_automodel.recipes.llm.train_ft.build_model",
+        lambda *a, **k: dummy_model,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.build_optimizer",
+        lambda *a, **k: [dummy_opt],
     )
 
     # Data-related stubs
@@ -531,14 +535,16 @@ def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
 
     parts = [DummyModel(), DummyModel()]
 
-    def _build_model_and_optimizer_stub(*args, **kwargs):
-        # New API returns 2-tuple (model, optimizer)
-        ap = DummyAutoPipeline(parts=parts, info=SimpleNamespace(has_last_stage=False, has_first_stage=False, schedule=None))
-        dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
-        return ap, [dummy_opt]
+    def _build_model_stub(*args, **kwargs):
+        return DummyAutoPipeline(parts=parts, info=SimpleNamespace(has_last_stage=False, has_first_stage=False, schedule=None))
 
-    # Override the default stub to return a pipeline-wrapped model
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model_and_optimizer", _build_model_and_optimizer_stub)
+    def _build_optimizer_stub(*args, **kwargs):
+        dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
+        return [dummy_opt]
+
+    # Override the default stubs to return a pipeline-wrapped model
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", _build_model_stub)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_optimizer", _build_optimizer_stub)
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.enable_nvtx = cfg.get("nvtx", False)
@@ -991,13 +997,12 @@ def test_build_model_state_dict_keys_uses_adapter(caplog):
         with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
                 with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
-                    # New API: no device param, returns 2-tuple
-                    model, optimizer = build_model_and_optimizer(
+                    model = build_model(
                         cfg_model=cfg_model,
-                        cfg_opt=cfg_opt,
                         cfg_peft=cfg_peft,
                         seed=42,
                     )
+                    optimizer = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated
     assert model is not None
@@ -1016,13 +1021,12 @@ def test_build_model_state_dict_keys_without_adapter():
         with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
                 with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
-                    # New API: no device param, returns 2-tuple
-                    model, optimizer = build_model_and_optimizer(
+                    model = build_model(
                         cfg_model=cfg_model,
-                        cfg_opt=cfg_opt,
                         cfg_peft=cfg_peft,
                         seed=42,
                     )
+                    optimizer = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated
     assert model is not None
@@ -1056,13 +1060,12 @@ def test_build_model_with_quantized_model_config():
         with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
                 with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
-                    # New API: no device param, returns 2-tuple
-                    model, optimizer = build_model_and_optimizer(
+                    model = build_model(
                         cfg_model=cfg_model,
-                        cfg_opt=cfg_opt,
                         cfg_peft=cfg_peft,
                         seed=42,
                     )
+                    optimizer = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated with quantization config
     assert model is not None
@@ -1081,13 +1084,12 @@ def test_build_model_without_quant_config():
         with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
                 with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
-                    # New API: no device param, returns 2-tuple
-                    model, optimizer = build_model_and_optimizer(
+                    model = build_model(
                         cfg_model=cfg_model,
-                        cfg_opt=cfg_opt,
                         cfg_peft=cfg_peft,
                         seed=42,
                     )
+                    optimizer = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated without quantization config
     assert model is not None
@@ -1095,12 +1097,12 @@ def test_build_model_without_quant_config():
 
 
 # =============================================================================
-# New tests for updated build_model_and_optimizer API
+# New tests for updated build_model / build_optimizer API
 # =============================================================================
 
 
 @requires_cuda
-def test_build_model_disables_foreach_with_tp():
+def test_build_optimizer_disables_foreach_with_tp():
     """Test that when device_mesh has tp > 1, cfg_opt.foreach is set to False."""
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig()
@@ -1117,21 +1119,21 @@ def test_build_model_disables_foreach_with_tp():
         with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
                 with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
-                    model, optimizer = build_model_and_optimizer(
+                    model = build_model(
                         cfg_model=cfg_model,
-                        cfg_opt=cfg_opt,
                         cfg_peft=None,
                         seed=42,
                         device_mesh=mock_mesh,
                     )
+                    optimizer = build_optimizer(model, cfg_opt, None, mock_mesh)
 
     # Verify foreach was disabled
     assert cfg_opt.foreach is False
 
 
 @requires_cuda
-def test_build_model_returns_model_optimizer_tuple():
-    """Test that build_model_and_optimizer returns (model, optimizer) 2-tuple."""
+def test_build_model_and_optimizer_return_values():
+    """Test that build_model and build_optimizer return proper values."""
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig()
 
@@ -1139,17 +1141,13 @@ def test_build_model_returns_model_optimizer_tuple():
         with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
                 with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
-                    result = build_model_and_optimizer(
+                    model = build_model(
                         cfg_model=cfg_model,
-                        cfg_opt=cfg_opt,
                         cfg_peft=None,
                         seed=42,
                     )
+                    optimizer = build_optimizer(model, cfg_opt, None, None)
 
-    # Should return 2-tuple
-    assert isinstance(result, tuple)
-    assert len(result) == 2
-    model, optimizer = result
     assert model is not None
     assert optimizer is not None
 
