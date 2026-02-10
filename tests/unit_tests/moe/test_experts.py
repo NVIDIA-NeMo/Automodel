@@ -25,6 +25,7 @@ SKIP_TE_TESTS = not (HAVE_TE and HAVE_CUDA)
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
+    _apply_bias,
     get_expert_activation,
     get_expert_activation_for_deepep,
     is_gated_activation,
@@ -581,7 +582,7 @@ class TestGroupedExpertsDeepEP:
         value = torch.randn(4, 8)
         tokens_per_expert = torch.tensor([2, 2])
 
-        result = experts._apply_bias(value, bias=None, tokens_per_expert=tokens_per_expert)
+        result = _apply_bias(value, bias=None, tokens_per_expert=tokens_per_expert)
 
         torch.testing.assert_close(result, value)
 
@@ -593,7 +594,7 @@ class TestGroupedExpertsDeepEP:
         bias = [torch.randn(8), torch.randn(8)]
         tokens_per_expert = torch.tensor([2, 2])
 
-        result = experts._apply_bias(value, bias=bias, tokens_per_expert=tokens_per_expert)
+        result = _apply_bias(value, bias=bias, tokens_per_expert=tokens_per_expert)
 
         assert result.shape == value.shape
         assert result.dtype == value.dtype
@@ -612,7 +613,7 @@ class TestGroupedExpertsDeepEP:
         # But looking at the code, it seems like permuted_probs should be per-token, not per-feature
         permuted_probs = torch.randn(4, 8)  # 4 tokens, 8 features each to match bias shape
 
-        result = experts._apply_bias(
+        result = _apply_bias(
             value, bias=bias, tokens_per_expert=tokens_per_expert, permuted_probs=permuted_probs
         )
 

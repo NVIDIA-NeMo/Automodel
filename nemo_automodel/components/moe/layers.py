@@ -517,17 +517,17 @@ class MoE(nn.Module):
                 category=UserWarning,
                 stacklevel=2,
             )
-            self.experts = GroupedExperts(config)
+            self.experts = GroupedExperts(config, backend=backend)
         elif backend.dispatcher == "deepep":
-            # DeepEP dispatcher requires TE or GMM experts (validated in BackendConfig)
-            if backend.experts == "gmm":
-                self.experts = GroupedExpertsDeepEP(config)
+            # DeepEP dispatcher requires TE, GMM, or torch_mm experts (validated in BackendConfig)
+            if backend.experts in ("gmm", "torch_mm"):
+                self.experts = GroupedExpertsDeepEP(config, backend=backend)
             else:
                 # experts == "te"
-                self.experts = GroupedExpertsTE(config)
+                self.experts = GroupedExpertsTE(config, backend=backend)
         else:
             # Default to torch experts
-            self.experts = GroupedExperts(config)
+            self.experts = GroupedExperts(config, backend=backend)
 
         if config.n_shared_experts > 0:
             self.shared_experts = MLP(

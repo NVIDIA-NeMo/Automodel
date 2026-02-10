@@ -23,6 +23,7 @@ import torch
 from torch import nn
 
 logger = logging.getLogger(__name__)
+from nemo_automodel.components.distributed.init_utils import get_rank_safe
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
@@ -141,7 +142,7 @@ class BackendConfig:
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
-    experts: Literal["torch", "te", "gmm"] = "gmm" if HAVE_GMM and torch.cuda.is_available() else "torch"
+    experts: Literal["torch", "te", "gmm", "torch_mm"] = "torch_mm" if torch.cuda.is_available() else "torch"
     dispatcher: Literal["torch", "deepep"] = "deepep" if HAVE_DEEP_EP and torch.cuda.is_available() else "torch"
     enable_deepep: bool | None = None  # Deprecated: use dispatcher="deepep" instead
     fake_balanced_gate: bool = False
@@ -176,16 +177,14 @@ class BackendConfig:
             self.enable_deepep = None
 
         # Backward compatibility
-        if (self.experts == "gmm" or self.experts == "te") and self.dispatcher != "deepep":
-            if (
-                torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
-            ) or not torch.distributed.is_initialized():
+        if self.experts in ("te", "gmm") and self.dispatcher != "deepep":
+            if get_rank_safe() == 0:
                 logger.info(
                     f"experts='{self.experts}' requires dispatcher='deepep', but got dispatcher='{self.dispatcher}'. "
-                    "Setting both to torch."
+                    "Setting dispatcher to torch and experts to torch_mm."
                 )
             self.dispatcher = "torch"
-            self.experts = "torch"
+            self.experts = "torch_mm"
 
         # FP8 requires at least one TE backend (applies to all TE modules: Linear, GroupedLinear, RMSNorm)
         if self.te_fp8 is not None and self.linear != "te" and self.experts != "te":

@@ -89,6 +89,18 @@ class TestBackendConfigExpertsDispatcherValidation:
         assert config.experts == "torch"
         assert config.dispatcher == "deepep"
 
+    def test_torch_mm_experts_with_torch_dispatcher_valid(self):
+        """Test that torch_mm experts with torch dispatcher is valid."""
+        config = BackendConfig(experts="torch_mm", dispatcher="torch")
+        assert config.experts == "torch_mm"
+        assert config.dispatcher == "torch"
+
+    def test_torch_mm_experts_with_deepep_dispatcher_valid(self):
+        """Test that torch_mm experts with deepep dispatcher is valid."""
+        config = BackendConfig(experts="torch_mm", dispatcher="deepep")
+        assert config.experts == "torch_mm"
+        assert config.dispatcher == "deepep"
+
 
 class TestBackendConfigEnableDeepepDeprecation:
     """Test backwards compatibility for deprecated enable_deepep parameter."""
