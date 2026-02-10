@@ -111,6 +111,7 @@ def initialize_rms_norm_module(
     if rms_norm_impl == "te":
         from transformer_engine.pytorch.module.rmsnorm import RMSNorm as TransformerEngineRMSNorm
 
+        _patch_te_modules()
         return TransformerEngineRMSNorm(normalized_shape=dim, eps=eps, device=device, params_dtype=dtype)
     elif rms_norm_impl == "torch":
         return nn.RMSNorm(dim, eps=eps, device=device, dtype=dtype)
@@ -147,6 +148,7 @@ def initialize_linear_module(
     elif linear_impl == "te":
         from transformer_engine.pytorch.module.linear import Linear as TransformerEngineLinear
 
+        _patch_te_modules()
         # Create TE module directly on meta device (same as GroupedExpertsTE)
         return TransformerEngineLinear(
             in_features=in_features, out_features=out_features, bias=bias, device=device, params_dtype=dtype
@@ -155,34 +157,46 @@ def initialize_linear_module(
         raise ValueError(f"Unsupported Linear implementation: {linear_impl}")
 
 
-def _patch_te_modules():
-    """Patch TE modules to handle unallocated tensors for PP shape inference."""
-    from transformer_engine.pytorch.module.linear import Linear as TELinear
-    from transformer_engine.pytorch.module.rmsnorm import RMSNorm as TERMSNorm
+def _make_lazy_te_patcher():
+    """Return a callable that patches TE modules exactly once.
 
-    _original_rmsnorm_forward = TERMSNorm.forward
-    _original_linear_forward = TELinear.forward
+    Uses a closure instead of module-level global state to track whether the
+    patch has already been applied.  The actual ``transformer_engine`` import
+    is deferred until the first call so that importing this module never
+    triggers heavy native-library loads (flash-attn, CUDA kernels, etc.).
+    """
+    patched = False
 
-    def _patched_rmsnorm_forward(self, x):
-        is_unallocated = is_tensor_unallocated(x)
-        if is_unallocated:
-            return torch.empty_like(x)
-        return _original_rmsnorm_forward(self, x)
+    def _patch():
+        nonlocal patched
+        if patched:
+            return
+        patched = True
 
-    def _patched_linear_forward(self, x):
-        is_unallocated = is_tensor_unallocated(x)
-        if is_unallocated:
-            out_shape = x.shape[:-1] + (self.weight.shape[0],)
-            return torch.empty(out_shape, dtype=x.dtype, device=x.device)
-        return _original_linear_forward(self, x)
+        from transformer_engine.pytorch.module.linear import Linear as TELinear
+        from transformer_engine.pytorch.module.rmsnorm import RMSNorm as TERMSNorm
 
-    TERMSNorm.forward = _patched_rmsnorm_forward
-    TELinear.forward = _patched_linear_forward
+        _original_rmsnorm_forward = TERMSNorm.forward
+        _original_linear_forward = TELinear.forward
+
+        def _patched_rmsnorm_forward(self, x):
+            if is_tensor_unallocated(x):
+                return torch.empty_like(x)
+            return _original_rmsnorm_forward(self, x)
+
+        def _patched_linear_forward(self, x):
+            if is_tensor_unallocated(x):
+                out_shape = x.shape[:-1] + (self.weight.shape[0],)
+                return torch.empty(out_shape, dtype=x.dtype, device=x.device)
+            return _original_linear_forward(self, x)
+
+        TERMSNorm.forward = _patched_rmsnorm_forward
+        TELinear.forward = _patched_linear_forward
+
+    return _patch
 
 
-# Apply TE patches automatically if transformer_engine is available
-if HAVE_TE:
-    _patch_te_modules()
+_patch_te_modules = _make_lazy_te_patcher()
 
 
 __all__ = [
