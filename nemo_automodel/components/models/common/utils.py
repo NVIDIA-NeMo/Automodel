@@ -86,26 +86,6 @@ class BackendConfig:
             )
 
 
-class Float32RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6, device=None, dtype=None):
-        """
-        Float32RMSNorm equivalent to HuggingFace's LlamaRMSNorm
-        """
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size, device=device, dtype=dtype))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-
-
 def initialize_rms_norm_module(
     rms_norm_impl: str,
     dim: int,
@@ -138,7 +118,14 @@ def initialize_rms_norm_module(
     elif rms_norm_impl == "torch":
         return nn.RMSNorm(dim, eps=eps, device=device, dtype=dtype)
     elif rms_norm_impl == "torch_fp32":
-        return Float32RMSNorm(dim, eps=eps, device=device, dtype=dtype)
+        # just use LlamaRMSNorm reference implementation for accuracy matching
+        from transformers.models.llama.modeling_llama import LlamaRMSNorm
+
+        norm = LlamaRMSNorm(dim, eps=eps)
+        # LlamaRMSNorm has no device/dtype in __init__
+        if device is not None or dtype is not None:
+            norm = norm.to(device=device, dtype=dtype)
+        return norm
     else:
         raise ValueError(f"Unsupported RMSNorm implementation: {rms_norm_impl}")
 
@@ -212,7 +199,6 @@ if HAVE_TE:
 
 __all__ = [
     "BackendConfig",
-    "Float32RMSNorm",
     "initialize_linear_module",
     "initialize_rms_norm_module",
 ]
