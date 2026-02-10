@@ -266,8 +266,75 @@ class CombinedProjectionStateDictAdapter:
             if key not in processed_keys:
                 hf_state_dict[key] = value
 
+        # Split any remaining combined-projection keys (e.g., LoRA adapter weights).
+        # These may have different prefixes (like "base_model.model.") not caught
+        # by the layer-indexed loop above, or may be adapter-specific keys (lora_A,
+        # lora_B, lora_magnitude) that the layer loop doesn't handle.
+        self._split_remaining_combined_projection_keys(hf_state_dict)
+
         # Apply exclusion regex if provided
         if exclude_key_regex:
             hf_state_dict = {k: v for k, v in hf_state_dict.items() if not re.match(exclude_key_regex, k)}
 
         return hf_state_dict
+
+    def _split_remaining_combined_projection_keys(self, hf_state_dict: dict[str, Any]) -> None:
+        """Split any remaining combined-projection keys in-place.
+
+        Handles LoRA adapter weights (lora_A, lora_B), DoRA magnitude vectors,
+        and any base weight/bias keys that weren't caught by the layer-indexed loop
+        (e.g., keys with a ``base_model.model.`` prefix from PEFT saving).
+
+        For keys containing ``.self_attn.qkv_proj.``:
+          - ``lora_A`` weights (input dimension) are duplicated to q/k/v projections.
+          - All other weights (lora_B, magnitude, weight, bias) are split along dim 0
+            using the Q/KV size ratio.
+
+        For keys containing ``.mlp.gate_up_proj.``:
+          - ``lora_A`` weights are duplicated to gate/up projections.
+          - All other weights are split in half along dim 0.
+
+        Args:
+            hf_state_dict: State dict to modify in-place.
+        """
+        combined_qkv_keys = [k for k in hf_state_dict if ".self_attn.qkv_proj." in k]
+        for key in combined_qkv_keys:
+            value = hf_state_dict.pop(key)
+            pre, suffix = key.split(".self_attn.qkv_proj.", 1)
+
+            if "lora_A" in suffix:
+                # Input-dimension LoRA weight: identical for all projections
+                hf_state_dict[f"{pre}.self_attn.q_proj.{suffix}"] = value
+                hf_state_dict[f"{pre}.self_attn.k_proj.{suffix}"] = value.clone()
+                hf_state_dict[f"{pre}.self_attn.v_proj.{suffix}"] = value.clone()
+            else:
+                # Output-dimension weight (lora_B, magnitude, base weight/bias): split
+                actual_size = value.shape[0]
+                total_size = self.q_size + 2 * self.kv_size
+                local_q_size = (self.q_size * actual_size) // total_size
+                local_kv_size = (self.kv_size * actual_size) // total_size
+
+                q_val, k_val, v_val = value.split(
+                    [local_q_size, local_kv_size, local_kv_size], dim=0
+                )
+                hf_state_dict[f"{pre}.self_attn.q_proj.{suffix}"] = q_val
+                hf_state_dict[f"{pre}.self_attn.k_proj.{suffix}"] = k_val
+                hf_state_dict[f"{pre}.self_attn.v_proj.{suffix}"] = v_val
+
+        combined_gate_up_keys = [k for k in hf_state_dict if ".mlp.gate_up_proj." in k]
+        for key in combined_gate_up_keys:
+            value = hf_state_dict.pop(key)
+            pre, suffix = key.split(".mlp.gate_up_proj.", 1)
+
+            if "lora_A" in suffix:
+                hf_state_dict[f"{pre}.mlp.gate_proj.{suffix}"] = value
+                hf_state_dict[f"{pre}.mlp.up_proj.{suffix}"] = value.clone()
+            else:
+                actual_size = value.shape[0]
+                local_intermediate_size = actual_size // 2
+
+                gate_val, up_val = value.split(
+                    [local_intermediate_size, local_intermediate_size], dim=0
+                )
+                hf_state_dict[f"{pre}.mlp.gate_proj.{suffix}"] = gate_val
+                hf_state_dict[f"{pre}.mlp.up_proj.{suffix}"] = up_val
