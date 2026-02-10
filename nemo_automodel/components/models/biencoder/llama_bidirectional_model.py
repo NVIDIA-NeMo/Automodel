@@ -630,8 +630,42 @@ class BiencoderModel(nn.Module):
         return model
 
     def save_pretrained(self, save_directory: str, **kwargs):
-        """Save model to output directory."""
+        """Save model to output directory.
 
+        When a ``checkpointer`` is supplied (the normal training path), saving
+        is delegated to :py:meth:`Checkpointer.save_model` so that:
+
+        * The ``state_dict_adapter`` (to_hf / from_hf) conversions are applied,
+          keeping the on-disk key format consistent with ``load_model``.
+        * Distributed / FSDP state dicts are handled correctly.
+        * Async and consolidated-safetensors paths are honoured.
+
+        Without a checkpointer the method falls back to HuggingFace-native
+        ``save_pretrained`` on the underlying encoder(s), which is useful for
+        standalone / non-distributed export.
+
+        Args:
+            save_directory: Output path for the checkpoint.
+            **kwargs: Forwarded from the recipe; expected keys include
+                ``checkpointer``, ``tokenizer``, and ``peft_config``.
+        """
+        checkpointer = kwargs.get("checkpointer", None)
+        if checkpointer is not None:
+            # Delegate to Checkpointer.save_model() which handles:
+            # - ModelState.state_dict()
+            # - _maybe_adapt_state_dict_to_hf() via state_dict_adapter
+            # - Distributed/sharded saving via DCP
+            # - Consolidated HF safetensors output
+            # - Async checkpointing if enabled
+            checkpointer.save_model(
+                model=self,
+                weights_path=save_directory,
+                peft_config=kwargs.get("peft_config", None),
+                tokenizer=kwargs.get("tokenizer", None),
+            )
+            return
+
+        # Fallback: HF-native save (no checkpointer available)
         logger.info(f"Saving BiencoderModel to {save_directory}")
 
         # Save the model
