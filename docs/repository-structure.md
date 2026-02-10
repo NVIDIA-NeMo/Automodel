@@ -110,7 +110,7 @@ The `automodel` CLI application simplifies job execution across different enviro
 single-GPU interactive sessions to batch multi-node runs. Currently, it supports Slurm clusters, with Kubernetes support coming soon.
 
 
-## Next steps
+## Next Steps
 
 Learn how to train models with NeMo AutoModel on:
 - **Your local workstation**: See [`docs/launcher/local-workstation.md`](launcher/local-workstation.md).
