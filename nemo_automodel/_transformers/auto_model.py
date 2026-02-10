@@ -232,9 +232,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # Use meta device initialization when:
         # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)
         # - AND either multi-GPU (world_size > 1) or single-GPU custom model (not HF)
-        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and (
-            get_world_size_safe() > 1 or not is_hf_model
-        ) and quantization_config is None
+        # - AND not using quantization (we let HF handle BitsAndBytes; don't init meta device)
+        is_meta_device = all(
+            [
+                not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)),
+                get_world_size_safe() > 1 or not is_hf_model,
+                quantization_config is None,
+            ]
+        )
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
         model = None  # Ensure 'model' is always bound for the except handler
@@ -513,9 +518,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             except Exception as e:
                 if "does not support" in str(e):
                     attn_implementation = _get_next_fallback_attn(attn_implementation)
-                    logger.warning(
-                        "Config rejected attention implementation, falling back to %s.", attn_implementation
-                    )
+                    logger.warning("Config rejected attention implementation, falling back to %s.", attn_implementation)
                     config = get_hf_config(config, attn_implementation, **kwargs)
                 else:
                     raise
