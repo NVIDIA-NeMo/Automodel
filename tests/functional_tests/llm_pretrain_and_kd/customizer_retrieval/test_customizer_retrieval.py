@@ -184,11 +184,19 @@ def _compute_pos_neg_diffs(model, collator, ds, device, batch_size, max_samples)
 
 
 def _load_finetuned_weights(model, checkpoint_dir: Path):
-    """Load fine-tuned weights into an existing model instance."""
+    """Load fine-tuned weights into an existing model instance.
+
+    The training recipe saves via ``Checkpointer.save_model`` which writes
+    safetensors into a ``model/`` sub-directory under the checkpoint step
+    folder.  The ``BiencoderStateDictAdapter`` on the model handles the
+    key translations (lm_q.* <-> model.*) so no explicit ``key_mapping``
+    is needed here.
+    """
     import glob as _glob
 
     from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
+    model_dir = checkpoint_dir / "model"
     st = _glob.glob(str(checkpoint_dir / "**" / "*.safetensors"), recursive=True)
     assert st, f"No .safetensors found under {checkpoint_dir}"
 
@@ -202,8 +210,7 @@ def _load_finetuned_weights(model, checkpoint_dir: Path):
         is_peft=False,
     )
     checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
-    key_mapping = {r"^(?!(model\.|linear_pooler\.))": "model."}
-    checkpointer.load_model(model, model_path=str(checkpoint_dir), key_mapping=key_mapping)
+    checkpointer.load_model(model, model_path=str(model_dir))
     checkpointer.close()
     return model
 
