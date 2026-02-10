@@ -102,7 +102,7 @@ def initialize_rms_norm_module(
         rms_norm_impl: Backend implementation ("te", "torch", or "torch_fp32")
             - "te": Transformer Engine fused RMSNorm kernel
             - "torch": PyTorch native nn.RMSNorm (computes in input dtype)
-            - "torch_fp32": Float32-upcast RMSNorm matching HF LlamaRMSNorm precision
+            - "torch_fp32": Float32 input upcast RMSNorm
         dim: Normalized dimension
         eps: Epsilon for numerical stability
         device: Device to create module on (None uses PyTorch default, typically CPU)
@@ -118,14 +118,10 @@ def initialize_rms_norm_module(
     elif rms_norm_impl == "torch":
         return nn.RMSNorm(dim, eps=eps, device=device, dtype=dtype)
     elif rms_norm_impl == "torch_fp32":
-        # just use LlamaRMSNorm reference implementation for accuracy matching
-        from transformers.models.llama.modeling_llama import LlamaRMSNorm
+        # LlamaRMSNorm reference: generic fp32-upcast implementation for accuracy matching
+        from transformers.models.llama.modeling_llama import LlamaRMSNorm as Float32RMSNorm
 
-        norm = LlamaRMSNorm(dim, eps=eps)
-        # LlamaRMSNorm has no device/dtype in __init__
-        if device is not None or dtype is not None:
-            norm = norm.to(device=device, dtype=dtype)
-        return norm
+        return Float32RMSNorm(dim, eps=eps).to(device=device, dtype=dtype)
     else:
         raise ValueError(f"Unsupported RMSNorm implementation: {rms_norm_impl}")
 
