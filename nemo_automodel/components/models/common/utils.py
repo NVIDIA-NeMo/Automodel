@@ -212,6 +212,7 @@ if HAVE_TE:
 
 __all__ = [
     "BackendConfig",
+    "Float32RMSNorm",
     "initialize_linear_module",
     "initialize_rms_norm_module",
 ]

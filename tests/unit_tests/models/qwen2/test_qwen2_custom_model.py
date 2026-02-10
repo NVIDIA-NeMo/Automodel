@@ -13,10 +13,6 @@
 # limitations under the License.
 
 
-import os
-import shutil
-import tempfile
-
 import numpy as np
 import pytest
 import torch
@@ -44,9 +40,17 @@ TINY_DEFAULT_QWEN2_CONFIG = dict(
 )
 
 
-def _create_checkpoint(config_kwargs):
-    """Create a tiny HF Qwen2 checkpoint in a temp directory."""
-    tmpdir = tempfile.mkdtemp()
+def _create_checkpoint(config_kwargs, tmpdir):
+    """Create a tiny HF Qwen2 checkpoint in the given directory.
+
+    Args:
+        config_kwargs: Dict of Qwen2Config keyword arguments.
+        tmpdir: Directory (str or Path) to save the checkpoint into.
+
+    Returns:
+        str path to the checkpoint directory.
+    """
+    tmpdir = str(tmpdir)
     config = Qwen2Config(**config_kwargs)
     config.save_pretrained(tmpdir)
     model = AutoModelForCausalLM.from_config(config)
@@ -60,18 +64,15 @@ def _create_checkpoint(config_kwargs):
 
 class TestQwen2Model:
 
-    @classmethod
-    def setup_class(cls):
-        """Create a tiny HF Qwen2 checkpoint shared across tests."""
-        cls.tiny_qwen2_checkpoint = _create_checkpoint(TINY_DEFAULT_QWEN2_CONFIG)
-
-    @classmethod
-    def teardown_class(cls):
-        """Clean up the temporary checkpoint directory."""
-        shutil.rmtree(cls.tiny_qwen2_checkpoint, ignore_errors=True)
+    @pytest.fixture(scope="class", autouse=True)
+    def _tiny_checkpoint(self, tmp_path_factory):
+        """Create a tiny HF Qwen2 checkpoint shared across tests (auto-cleaned by pytest)."""
+        self.__class__.tiny_qwen2_checkpoint = _create_checkpoint(
+            TINY_DEFAULT_QWEN2_CONFIG, tmp_path_factory.mktemp("qwen2_ckpt")
+        )
 
     @pytest.mark.parametrize("rms_norm", ["torch_fp32", "te"])
-    def test_model_matches_hf_with_adapter_bidirectional(self, rms_norm):
+    def test_model_matches_hf_with_adapter_bidirectional(self, rms_norm, tmp_path):
         """Test bidirectional conversion between HF and custom models produces identical outputs.
 
         Parametrized over:
@@ -89,7 +90,7 @@ class TestQwen2Model:
         }
         tol = tolerances[rms_norm]
 
-        checkpoint = _create_checkpoint(TINY_DEFAULT_QWEN2_CONFIG)
+        checkpoint = _create_checkpoint(TINY_DEFAULT_QWEN2_CONFIG, tmp_path)
         config = Qwen2Config.from_pretrained(checkpoint)
         adapter = Qwen2StateDictAdapter(config)
 
@@ -154,9 +155,8 @@ class TestQwen2Model:
         np.testing.assert_allclose(
             output_hf.logits.float().cpu().numpy(),
             output_custom.logits.float().cpu().numpy(),
-            atol=tol["atol"],
-            rtol=tol["rtol"],
             err_msg=f"HF → Custom conversion outputs don't match with {rms_norm=}",
+            **tol,
         )
 
         # Test reverse direction: Custom → HF

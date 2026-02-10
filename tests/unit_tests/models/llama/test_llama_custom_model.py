@@ -13,10 +13,6 @@
 # limitations under the License.
 
 
-import os
-import shutil
-import tempfile
-
 import numpy as np
 import pytest
 import torch
@@ -70,9 +66,17 @@ ROPE_CONFIGS = {
 }
 
 
-def _create_checkpoint(config_kwargs):
-    """Create a tiny HF Llama checkpoint in a temp directory."""
-    tmpdir = tempfile.mkdtemp()
+def _create_checkpoint(config_kwargs, tmpdir):
+    """Create a tiny HF Llama checkpoint in the given directory.
+
+    Args:
+        config_kwargs: Dict of LlamaConfig keyword arguments.
+        tmpdir: Directory (str or Path) to save the checkpoint into.
+
+    Returns:
+        str path to the checkpoint directory.
+    """
+    tmpdir = str(tmpdir)
     config = LlamaConfig(**config_kwargs)
     config.save_pretrained(tmpdir)
     model = AutoModelForCausalLM.from_config(config)
@@ -86,39 +90,35 @@ def _create_checkpoint(config_kwargs):
 
 class TestLlamaModel:
 
-    @classmethod
-    def setup_class(cls):
-        """Create a tiny HF Llama checkpoint shared across tests."""
-        cls.tiny_llama_checkpoint = _create_checkpoint(TINY_DEFAULT_ROPE_CONFIG)
-
-    @classmethod
-    def teardown_class(cls):
-        """Clean up the temporary checkpoint directory."""
-        shutil.rmtree(cls.tiny_llama_checkpoint, ignore_errors=True)
+    @pytest.fixture(scope="class", autouse=True)
+    def _tiny_checkpoint(self, tmp_path_factory):
+        """Create a tiny HF Llama checkpoint shared across tests (auto-cleaned by pytest)."""
+        self.__class__.tiny_llama_checkpoint = _create_checkpoint(
+            TINY_DEFAULT_ROPE_CONFIG, tmp_path_factory.mktemp("llama_ckpt")
+        )
 
     @pytest.mark.parametrize("rope_type", ["default", "llama3"])
     @pytest.mark.parametrize("rms_norm", ["torch_fp32", "te"])
-    def test_model_matches_hf_with_adapter_bidirectional(self, rope_type, rms_norm):
+    def test_model_matches_hf_with_adapter_bidirectional(self, rope_type, rms_norm, tmp_path):
         """Test bidirectional conversion between HF and custom models produces identical outputs.
 
         Parametrized over:
           - rope_type: "default" (no scaling) or "llama3" (Llama-3-style smooth scaling)
-          - rms_norm: "torch_fp32" | "torch" | "te"
+          - rms_norm: "torch_fp32" | "te"
 
         torch_fp32: float32-upcast RMSNorm matching HF LlamaRMSNorm exactly -> tight tol.
-        torch: PyTorch nn.RMSNorm (input-dtype precision) -> slightly relaxed tol.
         te: Transformer Engine fused RMSNorm kernel -> relaxed tol.
         """
         # Set tolerances based on norm backend precision
-        # torch: nn.RMSNorm computes in input dtype (bfloat16) -> bfloat16-level tolerance
-        # te: Transformer Engine fused kernel -> similar relaxed tolerance
+        # te: Transformer Engine fused kernel -> relaxed tolerance
+        # torch_fp32: matches HF exactly -> tight tolerance
         tolerances = {
             "te": dict(atol=1e-3, rtol=1e-3),
             "torch_fp32": dict(atol=1e-7, rtol=1e-7),
         }
         tol = tolerances[rms_norm]
 
-        checkpoint = _create_checkpoint(ROPE_CONFIGS[rope_type])
+        checkpoint = _create_checkpoint(ROPE_CONFIGS[rope_type], tmp_path)
         config = LlamaConfig.from_pretrained(checkpoint)
         adapter = LlamaStateDictAdapter(config)
 
