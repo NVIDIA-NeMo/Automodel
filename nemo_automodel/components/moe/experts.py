@@ -578,6 +578,13 @@ class GroupedExpertsTE(nn.Module):
 
         self.expert_activation = get_expert_activation_for_deepep(config)
 
+        # FP8 padding/unpadding for GEMM alignment (initialized with full expert count,
+        # re-created in init_token_dispatcher with num_local_experts for EP)
+        from transformer_engine.pytorch import Fp8Padding, Fp8Unpadding
+
+        self.fp8_padding = Fp8Padding(config.n_routed_experts)
+        self.fp8_unpadding = Fp8Unpadding(config.n_routed_experts)
+
         self.token_dispatcher = None
         self.ep_mesh = None
         self.moe_mesh = None
@@ -858,6 +865,12 @@ class GroupedExpertsTE(nn.Module):
             ep_group=ep_mesh.get_group(),
         )
 
+        # Re-create FP8 padding/unpadding with num_local_experts for EP
+        from transformer_engine.pytorch import Fp8Padding, Fp8Unpadding
+
+        self.fp8_padding = Fp8Padding(self.num_local_experts)
+        self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -897,6 +910,15 @@ class GroupedExpertsTE(nn.Module):
         else:
             m_splits = list(tokens_per_expert)
 
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+        fp8_active = FP8GlobalStateManager.is_fp8_enabled()
+        actual_m_splits = None
+        if fp8_active:
+            actual_m_splits = m_splits
+            permuted_local_hidden_states, m_splits = self.fp8_padding(permuted_local_hidden_states, m_splits)
+            permuted_probs, _ = self.fp8_padding(permuted_probs, actual_m_splits)
+
         if sum(m_splits) > 0:
             output1 = self.gate_up_linear(permuted_local_hidden_states, m_splits)
             output1 = self.expert_activation(output1, permuted_probs)
@@ -913,6 +935,9 @@ class GroupedExpertsTE(nn.Module):
             output1 = torch.matmul(x[0] * 0, to_local(self.gate_up_linear.weight0).T)
             output1_ = self.expert_activation(output1, permuted_probs)
             output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).T)
+
+        # if fp8_active and actual_m_splits is not None:
+        #     output2 = self.fp8_unpadding(output2, actual_m_splits)
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y

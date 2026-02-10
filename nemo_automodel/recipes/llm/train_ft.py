@@ -68,6 +68,7 @@ from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
+    prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
@@ -963,6 +964,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.model_parts = [model]
             self.pp = None
 
+        # Extract TE FP8 config from model backend (set after model construction)
+        self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
+
         self.dataloader, self.tokenizer = build_dataloader(
             self.cfg.dataset,
             self.cfg.dataloader,
@@ -1144,9 +1148,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
         )
         labels = batch.pop("labels")
+        fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
-            with train_ctx():
+            with train_ctx(), fp8_ctx:
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
                     masked_labels = labels.clone()
@@ -1191,7 +1196,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if is_train
                 else nullcontext()
             )
-            with train_ctx(), sync_ctx:
+            with train_ctx(), sync_ctx, fp8_ctx:
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)
@@ -1245,6 +1250,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
+
+            if i == 0:
+                prepare_after_first_microbatch()
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,

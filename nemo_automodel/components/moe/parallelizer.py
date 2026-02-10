@@ -123,7 +123,7 @@ def apply_ac(
             raise ValueError("hidden_size must be provided or model must have config.hidden_size attribute")
 
     if num_experts is None:
-        for attr in ["num_experts", "moe_num_experts"]:
+        for attr in ["num_experts", "moe_num_experts", "n_routed_experts"]:
             if hasattr(model, "config") and hasattr(model.config, attr):
                 num_experts = getattr(model.config, attr)
                 break
@@ -175,7 +175,7 @@ def apply_fsdp(
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
+            reduce_dtype=torch.bfloat16,
             output_dtype=torch.bfloat16,
             cast_forward_inputs=True,
         )
