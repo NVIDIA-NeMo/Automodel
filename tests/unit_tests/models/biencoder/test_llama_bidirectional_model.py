@@ -311,7 +311,7 @@ def test_biencoder_build_and_save(tmp_path, monkeypatch):
     # save with share_encoder=True and add_linear_pooler=True
     outdir = tmp_path / "save1"
     outdir.mkdir(parents=True, exist_ok=True)
-    model.save(str(outdir))
+    model.save_pretrained(str(outdir))
     assert any("save1" in p for p in model.lm_q.saved)
     assert os.path.exists(outdir / "pooler.pt")
 
@@ -324,7 +324,7 @@ def test_biencoder_build_and_save(tmp_path, monkeypatch):
         do_gradient_checkpointing=False,
     )
     outdir2 = tmp_path / "save2"
-    model2.save(str(outdir2))
+    model2.save_pretrained(str(outdir2))
     # separate subdirs created
     assert os.path.isdir(outdir2 / "query_model")
     assert os.path.isdir(outdir2 / "passage_model")
