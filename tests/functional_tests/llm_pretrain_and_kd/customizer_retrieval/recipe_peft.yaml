@@ -1,0 +1,83 @@
+seed: 42
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 5
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 8
+  ckpt_every_steps: 50
+  val_every_steps: 16
+  num_epochs: 1
+  max_steps: 4
+
+model:
+  _target_: nemo_automodel.components.models.biencoder.NeMoAutoModelBiencoder.from_pretrained
+  pretrained_model_name_or_path: /home/TestData/automodel/llama-nemotron-embed-1b-v2/
+  share_encoder: true
+  add_linear_pooler: false
+  out_dimension: 768
+  do_gradient_checkpointing: false
+  train_n_passages: 2
+  eval_negative_size: 1
+  pooling: avg
+  l2_normalize: true
+  t: 1.0
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  torch_dtype: bfloat16
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: true
+  dim: 8
+  alpha: 32
+  use_triton: false
+
+tokenizer:
+  _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: /home/TestData/automodel/llama-nemotron-embed-1b-v2/
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset
+    data_dir_list:
+    - /home/TestData/automodel/embedding_testdata/training.jsonl
+    data_type: train
+    train_n_passages: 2
+    seed: 42
+    do_shuffle: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.RetrievalBiencoderCollator
+    q_max_len: 1024
+    p_max_len: 1024
+    query_prefix: ""
+    passage_prefix: ""
+    padding: longest
+    pad_to_multiple_of: 8
+  shuffle: false
+  num_workers: 0
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.98]
+  eps: 1e-5
+  lr: 1.0e-5
+  weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 50
+  lr_decay_steps: 51
+  min_lr: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /workspace/output/biencoder_ckpt_restore_peft/checkpoints
+  model_save_format: safetensors
+  save_consolidated: false
