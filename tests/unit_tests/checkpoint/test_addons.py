@@ -102,11 +102,7 @@ def test_model_state_disables_tied_embeddings_for_non_tied_models():
     assert "lm_head.weight" in state_dict
 
 
-# ---------------------------------------------------------------------------
 # _extract_target_modules tests
-# ---------------------------------------------------------------------------
-
-
 def _make_model_with_named_modules(module_names):
     """Build a dummy model whose ``named_modules`` yields the given names.
 
