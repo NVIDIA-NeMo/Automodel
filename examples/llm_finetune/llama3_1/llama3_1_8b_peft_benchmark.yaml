@@ -31,7 +31,7 @@ benchmark:
 
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 2
+  local_batch_size: 1
   ckpt_every_steps: 50
   val_every_steps: 1000
   max_steps: 10
