@@ -21,7 +21,6 @@ import torch
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.training.utils import (
-    prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
 )
@@ -248,9 +247,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         )
 
                     torch.cuda.nvtx.range_pop()
-
-                    if ga_step_idx == 0:
-                        prepare_after_first_microbatch()
 
                 # Optimizer step
                 with self.timers("optimizer", log_level=2):

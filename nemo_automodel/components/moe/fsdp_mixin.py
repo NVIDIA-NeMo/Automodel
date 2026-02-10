@@ -20,8 +20,6 @@ from torch.distributed.fsdp import FSDPModule, fully_shard
 from torch.distributed.pipelining._backward import stage_backward, stage_backward_input, stage_backward_weight
 from torch.nn.parallel import DistributedDataParallel
 
-from nemo_automodel.components.models.common.utils import get_is_optim_step
-
 
 def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
     # Check main model
@@ -91,6 +89,10 @@ class MoEFSDPSyncMixin:
       one before optimizer step, where it manually triggers post-backward hooks and resharding.
     """
 
+    # Per-module flag read by patched_backward_maybe_with_nosync (PP path).
+    # Set to True by prepare_for_final_backward, False by prepare_for_grad_accumulation.
+    _is_optim_step: bool = False
+
     def prepare_for_grad_accumulation(self, pp_enabled: bool = False) -> None:
         """Prepare FSDP states before starting gradient accumulation.
 
@@ -98,11 +100,12 @@ class MoEFSDPSyncMixin:
             pp_enabled: Whether pipeline parallelism is enabled.
 
         Note:
-            When PP is enabled, FSDP state management is handled by the patched
-            _PipelineStageBase.backward_maybe_with_nosync method.
-            This method only applies optimizations for non-PP cases.
+            When PP is enabled, only the ``_is_optim_step`` flag is updated;
+            FSDP module configuration is handled by the patched
+            ``_PipelineStageBase.backward_maybe_with_nosync`` method.
         """
-        if not self.backend.enable_fsdp_optimizations:
+        self._is_optim_step = False
+        if not self.backend.enable_fsdp_optimizations or pp_enabled:
             return
 
         for fsdp_module in _iter_fsdp_modules(self):
@@ -120,11 +123,12 @@ class MoEFSDPSyncMixin:
             pp_enabled: Whether pipeline parallelism is enabled.
 
         Note:
-            When PP is enabled, FSDP state management is handled by the patched
-            _PipelineStageBase.backward_maybe_with_nosync method.
-            This method only applies optimizations for non-PP cases.
+            When PP is enabled, only the ``_is_optim_step`` flag is updated;
+            FSDP module configuration is handled by the patched
+            ``_PipelineStageBase.backward_maybe_with_nosync`` method.
         """
-        if not self.backend.enable_fsdp_optimizations:
+        self._is_optim_step = True
+        if not self.backend.enable_fsdp_optimizations or pp_enabled:
             return
 
         for fsdp_module in _iter_fsdp_modules(self):
@@ -258,7 +262,7 @@ def patched_backward_maybe_with_nosync(
     elif isinstance(self.submod, MoEFSDPSyncMixin):
         _disable_fsdp_for_moe_module(self.submod)
         result = perform_backward(backward_type)()
-        if last_backward and get_is_optim_step():
+        if last_backward and getattr(self.submod, "_is_optim_step", False):
             _run_post_backward_for_moe_module(self.submod)
     else:
         # Non-DP submodule, regular backward

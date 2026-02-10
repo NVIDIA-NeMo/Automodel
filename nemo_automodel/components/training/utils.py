@@ -21,8 +21,6 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.models.common.utils import set_is_first_microbatch, set_is_optim_step
-
 # Regex pattern to match expert parameters in GroupedExpertsTE.
 # Matches FQNs like:
 # - model.layers.X.mlp.experts.gate_up_linear.weight0
@@ -227,46 +225,30 @@ def clip_grad_norm(
 def prepare_for_grad_accumulation(model_parts: list[torch.nn.Module], pp_enabled: bool = False):
     """Prepare model parts before starting gradient accumulation.
 
-    This is typically called once at the start of gradient accumulation to prepare
-    FSDP states for the upcoming forward and backward passes.
+    Delegates to each model part's ``prepare_for_grad_accumulation`` method
+    (e.g. :class:`MoEFSDPSyncMixin`) which handles both the per-module
+    ``_is_optim_step`` flag and FSDP configuration internally.
 
     Args:
         model_parts: List of model parts (modules) to prepare.
         pp_enabled: Whether pipeline parallelism is enabled.
     """
-    set_is_optim_step(False)
-    set_is_first_microbatch(True)
-    if pp_enabled:
-        return
-
     for mp in model_parts:
         if hasattr(mp, "prepare_for_grad_accumulation"):
             mp.prepare_for_grad_accumulation(pp_enabled=pp_enabled)
 
 
-def prepare_after_first_microbatch():
-    """Disable first-microbatch flag after the first forward-backward pass.
-
-    Called after the first microbatch in gradient accumulation so that
-    subsequent microbatches reuse cached FP8 weights instead of re-quantizing.
-    """
-    set_is_first_microbatch(False)
-
-
 def prepare_for_final_backward(model_parts: list[torch.nn.Module], pp_enabled: bool = False):
     """Prepare model parts before the final backward pass.
 
-    This is typically called before the final gradient accumulation step to prepare
-    FSDP states for gradient synchronization and resharding.
+    Delegates to each model part's ``prepare_for_final_backward`` method
+    (e.g. :class:`MoEFSDPSyncMixin`) which handles both the per-module
+    ``_is_optim_step`` flag and FSDP configuration internally.
 
     Args:
         model_parts: List of model parts (modules) to prepare.
         pp_enabled: Whether pipeline parallelism is enabled.
     """
-    set_is_optim_step(True)
-    if pp_enabled:
-        return
-
     for mp in model_parts:
         if hasattr(mp, "prepare_for_final_backward"):
             mp.prepare_for_final_backward(pp_enabled=pp_enabled)

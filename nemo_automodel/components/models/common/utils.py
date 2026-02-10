@@ -26,53 +26,6 @@ from nemo_automodel.shared.utils import dtype_from_str
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_DEEP_EP = importlib.util.find_spec("deep_ep") is not None
 
-# ---------------------------------------------------------------------------
-#  Global state flags for training coordination
-#  Set by training utility functions, read by TE module patches and MoE modules.
-# ---------------------------------------------------------------------------
-
-IS_OPTIM_STEP = False
-IS_FIRST_MICROBATCH: bool | None = None
-
-
-def set_is_optim_step(value: bool) -> None:
-    """Set the global IS_OPTIM_STEP flag.
-
-    Args:
-        value: Whether we are in an optimization step.
-    """
-    global IS_OPTIM_STEP
-    IS_OPTIM_STEP = value
-
-
-def get_is_optim_step() -> bool:
-    """Get the global IS_OPTIM_STEP flag.
-
-    Returns:
-        Whether we are in an optimization step.
-    """
-    return IS_OPTIM_STEP
-
-
-def set_is_first_microbatch(value: bool | None) -> None:
-    """Set the global IS_FIRST_MICROBATCH flag for FP8 weight caching.
-
-    Args:
-        value: True for first microbatch (quantize+cache), False for subsequent
-               (use cached), None to disable caching.
-    """
-    global IS_FIRST_MICROBATCH
-    IS_FIRST_MICROBATCH = value
-
-
-def get_is_first_microbatch() -> bool | None:
-    """Get the global IS_FIRST_MICROBATCH flag.
-
-    Returns:
-        True/False/None indicating microbatch position for FP8 weight caching.
-    """
-    return IS_FIRST_MICROBATCH
-
 
 def is_tensor_unallocated(tensor: torch.Tensor) -> bool:
     """Check if tensor is unallocated (meta tensor, fake tensor, etc.).
@@ -103,33 +56,39 @@ class TEFp8Config:
 
     recipe: Literal["current", "block"] | Any = "current"
 
-    def build_recipe(self):
-        """Build and return the TE FP8 recipe object.
 
-        If ``recipe`` is already a TE recipe object (e.g. ``Float8CurrentScaling(...)``),
-        it is returned directly.  String values ``"current"`` and ``"block"`` are
-        mapped to the corresponding TE recipe class.
-        """
-        if not HAVE_TE:
-            return None
+def build_fp8_recipe(config: TEFp8Config):
+    """Build and return the TE FP8 recipe object from a :class:`TEFp8Config`.
 
-        # Pass through pre-built recipe objects directly
-        if not isinstance(self.recipe, str):
-            return self.recipe
+    If ``config.recipe`` is already a TE recipe object (e.g. ``Float8CurrentScaling(...)``),
+    it is returned directly.  String values ``"current"`` and ``"block"`` are
+    mapped to the corresponding TE recipe class.
+    """
+    if not HAVE_TE:
+        return None
 
-        from transformer_engine.common.recipe import Float8BlockScaling, Float8CurrentScaling
+    # Pass through pre-built recipe objects directly
+    if not isinstance(config.recipe, str):
+        return config.recipe
 
-        if self.recipe == "block":
-            return Float8BlockScaling()
-        return Float8CurrentScaling()
+    from transformer_engine.common.recipe import Float8BlockScaling, Float8CurrentScaling
 
-    def maybe_te_autocast(self):
-        """Return te_autocast context manager for FP8."""
-        if not HAVE_TE:
-            return nullcontext()
-        from transformer_engine.pytorch.quantization import autocast as te_autocast
+    if config.recipe == "block":
+        return Float8BlockScaling()
+    return Float8CurrentScaling()
 
-        return te_autocast(enabled=True, recipe=self.build_recipe())
+
+def maybe_te_fp8_autocast(config: TEFp8Config | None):
+    """Return a TE FP8 autocast context manager, or :func:`nullcontext` if disabled.
+
+    Args:
+        config: FP8 configuration, or ``None`` to disable.
+    """
+    if config is None or not HAVE_TE:
+        return nullcontext()
+    from transformer_engine.pytorch.quantization import autocast as te_autocast
+
+    return te_autocast(enabled=True, recipe=build_fp8_recipe(config))
 
 
 @dataclass(kw_only=True)
@@ -245,10 +204,9 @@ def initialize_linear_module(
     if linear_impl == "torch":
         return nn.Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
     elif linear_impl == "te":
-        from transformer_engine.pytorch.module.linear import Linear as TransformerEngineLinear
+        FP8CachingLinear = _make_fp8_caching_linear()
 
-        # Create TE module directly on meta device (same as GroupedExpertsTE)
-        return TransformerEngineLinear(
+        return FP8CachingLinear(
             in_features=in_features, out_features=out_features, bias=bias, device=device, params_dtype=dtype
         )
     else:
@@ -256,44 +214,31 @@ def initialize_linear_module(
 
 
 def _patch_te_modules():
-    """Patch TE modules for PP shape inference and FP8 weight caching.
+    """Patch TE modules so unallocated tensors short-circuit to empty outputs.
 
-    Two patches are applied:
-    1. Unallocated tensor handling: TE kernels don't support meta/fake tensors,
-       so we short-circuit with empty tensors for PP shape inference.
-    2. is_first_microbatch injection: Reads the global IS_FIRST_MICROBATCH flag and
-       passes it to TE Linear/GroupedLinear for FP8 weight caching during
-       gradient accumulation (quantize on first microbatch, reuse cached on rest).
+    TE kernels don't support meta/fake tensors.  During PP shape inference the
+    runtime may pass such tensors through TE modules; this patch detects them
+    and returns empty tensors of the correct shape instead of crashing.
     """
-    from transformer_engine.pytorch.module.grouped_linear import GroupedLinear as TEGroupedLinear
     from transformer_engine.pytorch.module.linear import Linear as TELinear
     from transformer_engine.pytorch.module.rmsnorm import RMSNorm as TERMSNorm
 
     _original_rmsnorm_forward = TERMSNorm.forward
     _original_linear_forward = TELinear.forward
-    _original_grouped_linear_forward = TEGroupedLinear.forward
 
     def _patched_rmsnorm_forward(self, x):
         if is_tensor_unallocated(x):
             return torch.empty_like(x)
         return _original_rmsnorm_forward(self, x)
 
-    def _patched_linear_forward(self, x, is_first_microbatch=None, **kwargs):
+    def _patched_linear_forward(self, x, **kwargs):
         if is_tensor_unallocated(x):
             out_shape = x.shape[:-1] + (self.weight.shape[0],)
             return torch.empty(out_shape, dtype=x.dtype, device=x.device)
-        if is_first_microbatch is None:
-            is_first_microbatch = get_is_first_microbatch()
-        return _original_linear_forward(self, x, is_first_microbatch=is_first_microbatch, **kwargs)
-
-    def _patched_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=None):
-        if is_first_microbatch is None:
-            is_first_microbatch = get_is_first_microbatch()
-        return _original_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=is_first_microbatch)
+        return _original_linear_forward(self, x, **kwargs)
 
     TERMSNorm.forward = _patched_rmsnorm_forward
     TELinear.forward = _patched_linear_forward
-    TEGroupedLinear.forward = _patched_grouped_linear_forward
 
 
 # Apply TE patches automatically if transformer_engine is available
@@ -301,13 +246,76 @@ if HAVE_TE:
     _patch_te_modules()
 
 
+# ---------------------------------------------------------------------------
+#  FP8 weight-caching subclasses
+#
+#  TE Linear and GroupedLinear accept ``is_first_microbatch`` to control FP8
+#  weight caching during gradient accumulation.  Rather than relying on
+#  external state, these subclasses auto-detect weight updates by tracking
+#  ``weight._version`` (incremented by every in-place op such as
+#  ``optimizer.step()``).  When the version changes the module re-quantises;
+#  otherwise it reuses the cached FP8 weights.
+# ---------------------------------------------------------------------------
+
+
+def _make_fp8_caching_linear():
+    """Build and return the FP8CachingLinear class (deferred TE import)."""
+    from transformer_engine.pytorch.module.linear import Linear as TELinear
+
+    class FP8CachingLinear(TELinear):
+        """TE Linear with automatic ``is_first_microbatch`` management.
+
+        Tracks ``self.weight._version`` to detect optimizer updates and passes
+        ``is_first_microbatch=True`` on the first forward after a weight change,
+        ``False`` on subsequent forwards.  Callers may still override explicitly.
+        """
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._prev_weight_version: int = -1
+
+        def forward(self, x: torch.Tensor, is_first_microbatch: bool | None = None, **kwargs: Any) -> torch.Tensor:
+            if is_first_microbatch is None:
+                v = self.weight._version
+                is_first_microbatch = v != self._prev_weight_version
+                self._prev_weight_version = v
+            return super().forward(x, is_first_microbatch=is_first_microbatch, **kwargs)
+
+    return FP8CachingLinear
+
+
+def _make_fp8_caching_grouped_linear():
+    """Build and return the FP8CachingGroupedLinear class (deferred TE import)."""
+    from transformer_engine.pytorch.module.grouped_linear import GroupedLinear as TEGroupedLinear
+
+    class FP8CachingGroupedLinear(TEGroupedLinear):
+        """TE GroupedLinear with automatic ``is_first_microbatch`` management.
+
+        Uses ``self.weight0._version`` as a sentinel (all expert weights are
+        updated in the same optimizer step).
+        """
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._prev_weight_version: int = -1
+
+        def forward(self, inp: torch.Tensor, m_splits: list[int], is_first_microbatch: bool | None = None):
+            if is_first_microbatch is None:
+                v = self.weight0._version
+                is_first_microbatch = v != self._prev_weight_version
+                self._prev_weight_version = v
+            return super().forward(inp, m_splits, is_first_microbatch=is_first_microbatch)
+
+    return FP8CachingGroupedLinear
+
+
 __all__ = [
     "BackendConfig",
     "TEFp8Config",
-    "get_is_first_microbatch",
-    "get_is_optim_step",
+    "_make_fp8_caching_grouped_linear",
+    "_make_fp8_caching_linear",
+    "build_fp8_recipe",
     "initialize_linear_module",
     "initialize_rms_norm_module",
-    "set_is_first_microbatch",
-    "set_is_optim_step",
+    "maybe_te_fp8_autocast",
 ]

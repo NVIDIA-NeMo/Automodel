@@ -24,7 +24,6 @@ from nemo_automodel.components.moe.fsdp_mixin import (
     patched_backward_maybe_with_nosync,
 )
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.utils import get_is_optim_step, set_is_optim_step
 
 
 class MockFSDPModule:
@@ -214,18 +213,20 @@ class TestPrepareForGradAccumulation:
         model = MockFSDPModule()
         moe_model = MockMoEModel(backend, model)
 
-        # Should return early without error
+        # Should return early without error, but still set _is_optim_step
         moe_model.prepare_for_grad_accumulation(pp_enabled=False)
+        assert moe_model._is_optim_step is False
 
     def test_pp_enabled_returns_early(self):
         backend = MockBackend(enable_fsdp_optimizations=True)
         model = MockFSDPModule()
         moe_model = MockMoEModel(backend, model)
 
-        # PP enabled should return early (handled by patched backward)
+        # PP enabled should skip FSDP config but still set _is_optim_step
         moe_model.prepare_for_grad_accumulation(pp_enabled=True)
+        assert moe_model._is_optim_step is False
 
-        # Flags should remain unchanged
+        # FSDP flags should remain unchanged
         assert model._is_last_backward is False
         assert model._reshard_after_backward is False
         assert model._requires_gradient_sync is False
@@ -252,6 +253,7 @@ class TestPrepareForGradAccumulation:
 
         moe_model.prepare_for_grad_accumulation(pp_enabled=False)
 
+        assert moe_model._is_optim_step is False
         # All should defer (not requires_gradient_sync, not reshard_after_backward)
         assert model._is_last_backward is False
         assert model._reshard_after_backward is False
@@ -272,18 +274,20 @@ class TestPrepareForFinalBackward:
         model = MockFSDPModule()
         moe_model = MockMoEModel(backend, model)
 
-        # Should return early without error
+        # Should return early without error, but still set _is_optim_step
         moe_model.prepare_for_final_backward(pp_enabled=False)
+        assert moe_model._is_optim_step is True
 
     def test_pp_enabled_returns_early(self):
         backend = MockBackend(enable_fsdp_optimizations=True)
         model = MockFSDPModule()
         moe_model = MockMoEModel(backend, model)
 
-        # PP enabled should return early (handled by patched backward)
+        # PP enabled should skip FSDP config but still set _is_optim_step
         moe_model.prepare_for_final_backward(pp_enabled=True)
+        assert moe_model._is_optim_step is True
 
-        # Flags should remain unchanged
+        # FSDP flags should remain unchanged
         assert model._is_last_backward is False
         assert model._reshard_after_backward is False
         assert model._requires_gradient_sync is False
@@ -310,6 +314,7 @@ class TestPrepareForFinalBackward:
 
         moe_model.prepare_for_final_backward(pp_enabled=False)
 
+        assert moe_model._is_optim_step is True
         # All should enable sync and resharding for the last backward
         assert model._is_last_backward is True
         assert model._reshard_after_backward is True
@@ -349,6 +354,7 @@ class TestFullWorkflow:
         moe_model.prepare_for_grad_accumulation(pp_enabled=False)
 
         # Verify all defer
+        assert moe_model._is_optim_step is False
         assert model._requires_gradient_sync is False
         assert model._reshard_after_backward is False
 
@@ -356,6 +362,7 @@ class TestFullWorkflow:
         moe_model.prepare_for_final_backward(pp_enabled=False)
 
         # Verify all enable sync/resharding
+        assert moe_model._is_optim_step is True
         assert model._is_last_backward is True
         assert model._reshard_after_backward is True
         assert model._requires_gradient_sync is True
@@ -365,17 +372,6 @@ class TestFullWorkflow:
         assert block.mlp.experts._is_last_backward is True
         assert block.mlp.experts._reshard_after_backward is True
         assert block.mlp.experts._requires_gradient_sync is True
-
-
-class TestGlobalOptimStepFlag:
-    """Test global optimization step flag functions."""
-
-    def test_set_and_get_is_optim_step(self):
-        set_is_optim_step(True)
-        assert get_is_optim_step() is True
-
-        set_is_optim_step(False)
-        assert get_is_optim_step() is False
 
 
 class TestRunPostBackwardHooks:
@@ -615,10 +611,9 @@ class TestPatchedBackwardMaybeWithNosync:
                 assert grads == ((), None)
                 assert param_groups is None
 
-    @patch('nemo_automodel.components.moe.fsdp_mixin.get_is_optim_step')
     @patch('nemo_automodel.components.moe.fsdp_mixin.isinstance')
-    def test_moe_fsdp_mixin_last_backward_with_optim_step(self, mock_isinstance, mock_get_optim):
-        """Test MoEFSDPSyncMixin path with last_backward=True and IS_OPTIM_STEP=True."""
+    def test_moe_fsdp_mixin_last_backward_with_optim_step(self, mock_isinstance):
+        """Test MoEFSDPSyncMixin path with last_backward=True and _is_optim_step=True."""
         def isinstance_side_effect(obj, cls):
             if cls == MoEFSDPSyncMixin:
                 return True
@@ -626,11 +621,11 @@ class TestPatchedBackwardMaybeWithNosync:
                 return isinstance(obj, MockFSDPModule)
             return False
         mock_isinstance.side_effect = isinstance_side_effect
-        mock_get_optim.return_value = True
 
         mock_stage = Mock()
         model = MockFSDPModule()
         moe_model = MockMoEModel(MockBackend(), model)
+        moe_model._is_optim_step = True
         mock_stage.submod = moe_model
 
         bwd_kwargs = {

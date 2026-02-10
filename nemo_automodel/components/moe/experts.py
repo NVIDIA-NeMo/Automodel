@@ -542,7 +542,9 @@ class GroupedExpertsTE(nn.Module):
         Args:
             config: MoE configuration containing expert parameters.
         """
-        from transformer_engine.pytorch import GroupedLinear
+        from nemo_automodel.components.models.common.utils import _make_fp8_caching_grouped_linear
+
+        FP8CachingGroupedLinear = _make_fp8_caching_grouped_linear()
 
         super().__init__()
 
@@ -557,8 +559,8 @@ class GroupedExpertsTE(nn.Module):
         # Non-gated (ReLU²): out_features = moe_inter_dim
         gate_up_out_features = config.moe_inter_dim * 2 if self.is_gated else config.moe_inter_dim
 
-        # Create TE GroupedLinear layers with full expert count on meta device first
-        self.gate_up_linear = GroupedLinear(
+        # Create FP8-caching GroupedLinear layers with full expert count on meta device first
+        self.gate_up_linear = FP8CachingGroupedLinear(
             num_gemms=config.n_routed_experts,
             in_features=config.dim,
             out_features=gate_up_out_features,
@@ -567,7 +569,7 @@ class GroupedExpertsTE(nn.Module):
             device="meta",
         )
         # down_linear: [moe_inter_dim] -> [dim]
-        self.down_linear = GroupedLinear(
+        self.down_linear = FP8CachingGroupedLinear(
             num_gemms=config.n_routed_experts,
             in_features=config.moe_inter_dim,
             out_features=config.dim,
@@ -815,7 +817,9 @@ class GroupedExpertsTE(nn.Module):
         Args:
             ep_mesh: Device mesh for expert parallelism.
         """
-        from transformer_engine.pytorch import GroupedLinear
+        from nemo_automodel.components.models.common.utils import _make_fp8_caching_grouped_linear
+
+        FP8CachingGroupedLinear = _make_fp8_caching_grouped_linear()
 
         self.ep_mesh = ep_mesh
         self.ep_rank = ep_mesh.get_local_rank()
@@ -829,7 +833,7 @@ class GroupedExpertsTE(nn.Module):
 
         gate_up_out_features = self.config.moe_inter_dim * 2 if self.is_gated else self.config.moe_inter_dim
 
-        self.gate_up_linear = GroupedLinear(
+        self.gate_up_linear = FP8CachingGroupedLinear(
             num_gemms=self.num_local_experts,
             in_features=self.config.dim,
             out_features=gate_up_out_features,
@@ -839,7 +843,7 @@ class GroupedExpertsTE(nn.Module):
         )
 
         # down_linear: [moe_inter_dim] -> [dim]
-        self.down_linear = GroupedLinear(
+        self.down_linear = FP8CachingGroupedLinear(
             num_gemms=self.num_local_experts,
             in_features=self.config.moe_inter_dim,
             out_features=self.config.dim,
