@@ -1,4 +1,4 @@
-# Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT) with NeMo Automodel
+# Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT) with NeMo AutoModel
 
 ## Introduction
 
@@ -9,7 +9,11 @@ high accuracy and relevance. There are two ways to do so
   (2) PEFT, specifically [Low-Rank Adapters (LoRA)](https://arxiv.org/abs/2106.09685) that updates only a small subset of parameters
 while keeping the base model weights frozen. It is lightweight and reduces the
 number of trainable parameters, often to less than 1%, while
-achieving decent accuracy. 
+As large language models (LLMs) become more powerful, adapting them to
+specific tasks through fine-tuning has become essential for achieving
+high accuracy and relevance. There are two ways to do so: 
+- **Supervised Fine-Tuning (SFT)** applies full-parameter update to the pretrained model. It is useful for tasks that require high precision although it requires more computational resources.
+- **PEFT**, specifically [Low-Rank Adapters (LoRA)](https://arxiv.org/abs/2106.09685), updates only a small subset of parameters while keeping the base model weights frozen. It is lightweight and reduces the number of trainable parameters, often to less than 1%, while achieving decent accuracy. 
 
 NeMo Automodel simplifies the fine-tuning process by offering seamless
 integration with Hugging Face Transformers. It allows you to fine-tune
@@ -17,7 +21,7 @@ models without converting checkpoints, ensuring full compatibility with
 the Hugging Face ecosystem.
 
 This guide walks you through the end-to-end process of fine-tuning
-models from the Hugging Face Hub using NeMo Automodel. You'll learn how
+models from the Hugging Face Hub using NeMo AutoModel. You'll learn how
 to prepare datasets, train models, generate text with fine-tuned
 checkpoints, evaluate performance using the LM Eval Harness, share your
 models on the Hugging Face Model Hub, and deploy them efficiently with
@@ -27,8 +31,10 @@ vLLM.
 which features a [standalone python3
 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py),
 offering hands-on demonstrations for quickly getting started with NeMo Automodel. -->
-
-## Run SFT and PEFT with NeMo Automodel
+In addition to this user guide, you can also explore our Quickstart,
+which features a [standalone python3 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py),
+offering hands-on demonstrations for quickly getting started with NeMo AutoModel. 
+## Run SFT and PEFT with NeMo AutoModel
 
 :::{important}
 Before proceeding with this guide, please ensure that you have NeMo Automodel installed on your
@@ -37,12 +43,15 @@ machine. This can be achieved by running:
 pip3 install nemo-automodel
 ```
 For a complete guide and additional options please consult the Automodel [installation guide](../installation.md).
-:::
+Before proceeding with this guide, please ensure that you have NeMo AutoModel installed on your machine. This can be achieved by running:
+
+```bash
+pip3 install nemo-automodel
 
 ### Model and Dataset Context
 In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Question Answering Dataset).
 
-#### 🔍 About LLaMA 3.2 1B
+#### About LLaMA 3.2 1B
 **LLaMA** is a family of decoder-only transformer models developed by Meta. The **LLaMA 3.2 1B** variant is a compact, lightweight model ideal for research and edge deployment. Despite its size, it maintains architectural features consistent with its larger siblings:
 
 - **Decoder-only architecture**: Follows a GPT-style, autoregressive design—optimized for generation tasks.
@@ -73,11 +82,22 @@ Some Hugging Face model repositories are **gated**, you must explicitly request 
 4.  Ensure the token you pass to your script (via `huggingface-cli login` or the `HF_TOKEN` environment variable) belongs to the account that was approved.
 
  Trying to pull a gated model without an authorized token will trigger a 403 "permission denied" error.
- :::
+#### Access Gated Models
+
+Some Hugging Face model repositories are **gated**, you must explicitly request permission before you can download their files. If the model page shows a "Request access" or "Agree and access" button:
+
+1.  Log in with your Hugging Face account.
+2.  Click the button and accept the license terms.
+3.  Wait for approval (usually instant; occasionally manual).
+4.  Ensure the token you pass to your script (via `huggingface-cli login` or the `HF_TOKEN` environment variable) belongs to the account that was approved.
+
+:::{note}
+Trying to pull a gated model without an authorized token will trigger a 403 "permission denied" error.
+:::
 
 
-#### 📚 About SQuAD
-Stanford Question Answering Dataset (SQuAD) is a **reading comprehension dataset**, consisting of questions posed by crowdworkers on a set of Wikipedia articles, where the answer to every question is a segment of text, or span, from the corresponding reading passage, or the question might be unanswerable.
+#### About SQuAD
+The Stanford Question Answering Dataset (SQuAD) is a **reading comprehension dataset**, consisting of questions posed by crowdworkers on a set of Wikipedia articles, where the answer to every question is a segment of text, or span, from the corresponding reading passage, or the question might be unanswerable.
 
 There are two major versions:
 
@@ -88,7 +108,7 @@ There are two major versions:
 In this tutorial, we’ll focus on **SQuAD v1.1**, which is more suitable for straightforward supervised fine-tuning without requiring additional handling of null answers.
 
 Here’s a glimpse of what the data looks like:
-``` json
+```json
 {
 
     "id": "5733be284776f41900661182",
@@ -115,12 +135,12 @@ To do so, edit the YAML `dataset` / `validation_dataset` sections (for example `
 
 ## Use a Recipe to Fine-Tune the Model
 
-This example demonstrates how to fine-tune a large language model using NVIDIA's NeMo Automodel library.
+This example demonstrates how to fine-tune a large language model using NVIDIA's NeMo AutoModel library.
 Specifically, we use the LLM [train-finetune recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py), and in particular, the `TrainFinetuneRecipeForNextTokenPrediction` class to orchestrate the fine-tuning process end-to-end: model loading, dataset preparation, optimizer setup, distributed training, checkpointing, and logging.
 
 ### What is a Recipe?
 
-A recipe in NeMo Automodel is a **self-contained orchestration module** that wires together all
+A recipe in NeMo AutoModel is a **self-contained orchestration module** that wires together all
 components needed to perform a specific task (e.g., fine-tuning for next-token prediction or instruction tuning).
 Think of it as the equivalent of a Trainer class, but highly modular, stateful, and reproducible.
 
@@ -157,7 +177,8 @@ peft:
 
 # As mentioned earlier, we are using the SQuAD dataset. NeMo Automodel provides the make_squad_dataset
 # function which formats the prepares the dataset (e.g., formatting). We are using the "train"
-# split for training.
+# As mentioned earlier, we are using the SQuAD dataset. NeMo AutoModel provides the make_squad_dataset
+# function which formats and prepares the dataset (e.g., formatting). We are using the "train"
 dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
@@ -185,7 +206,7 @@ rng:
   seed: 1111
   ranked: true
 
-# For distributed processing, we will FSDP2.
+# For distributed processing, we will use FSDP2.
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
@@ -241,7 +262,7 @@ those used for training.
 
 ### Introduction to QLoRA
 
-[QLoRA (Quantized LoRA)](https://arxiv.org/abs/2305.14314) is an PEFT technique that combines the benefits of LoRA with 4-bit quantization.
+[QLoRA (Quantized LoRA)](https://arxiv.org/abs/2305.14314) is a PEFT technique that combines the benefits of LoRA with 4-bit quantization.
 
 The key innovation of QLoRA is the use of **4-bit NormalFloat (NF4)** quantization, which is specifically designed for normally distributed weights commonly found in neural networks. This quantization technique, combined with double quantization and paged optimizers, dramatically reduces memory usage without significantly impacting model quality.
 
@@ -253,9 +274,9 @@ The key innovation of QLoRA is the use of **4-bit NormalFloat (NF4)** quantizati
 
 ### QLoRA Configuration
 
-To use QLoRA with NeMo Automodel, you need to configure both the quantization settings and the PEFT parameters. Here's an example:
+To use QLoRA with NeMo AutoModel, you need to configure both the quantization settings and the PEFT parameters. Here's an example:
 
-``` yaml
+```yaml
 # QLoRA configuration for Llama-3.1-8B on SQuAD dataset
 # Uses 4-bit quantization with LoRA adapters
 
@@ -289,9 +310,9 @@ In these scenarios, you can pass `is_meta_device: true` in the model config. The
 ## Run the Fine-Tune Recipe
 Assuming the above `yaml` is saved in a file named `sft_guide.yaml` (or `peft_guide.yaml` if you want to do PEFT), you can run the fine-tuning workflow either using the Automodel CLI or by directly invoking the recipe Python script.
 
-### Automodel CLI
+### AutoModel CLI
 
-When NeMo Automodel is installed on your system, it includes the `automodel` CLI program that you
+When NeMo AutoModel is installed on your system, it includes the `automodel` CLI program that you
 can use to run jobs, locally or on distributed environments.
 
 <!-- You can use PEFT recipes via the NeMo-Run CLI (See [NeMo-Run\'s
@@ -299,9 +320,13 @@ docs](https://github.com/NVIDIA/NeMo-Run) for more details). LoRA are
 registered as factory classes, so you can specify `peft=<lora/none>`
 directly in the terminal. This provides a quick and easy way to launch
 training jobs when you do not need to override any configuration from
-the default recipes. -->
+You can use PEFT recipes via the NeMo Run CLI (See [NeMo-Run 
+documentation](https://github.com/NVIDIA/NeMo-Run) for more details). LoRA are registered as factory classes, so you can specify `peft=<lora/none>`
+directly in the terminal. This provides a quick and easy way to launch
+training jobs when you do not need to override any configuration from
+the default recipes. 
 
-``` bash
+```bash
 automodel finetune llm -c sft_guide.yaml
 ```
 
@@ -311,7 +336,7 @@ where `finetune` is the CLI command (it maps to the LLM training recipe under `n
 
 Alternatively, you can run the recipe entrypoint [script](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/finetune.py) directly using [torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html), as shown below.
 
-``` bash
+```bash
 torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config sft_guide.yaml
 ```
 
@@ -339,7 +364,7 @@ For each training batch, the fine-tuning recipe logs the current loss, along wit
 
 In addition, the model checkpoint is saved under the `checkpoints/` directory. 
 For SFT, it will have the following contents:
-``` bash
+```bash
 $ tree checkpoints/epoch_0_step_10/
 checkpoints/epoch_0_step_10/
 ├── config.yaml
@@ -364,7 +389,7 @@ checkpoints/epoch_0_step_10/
 4 directories, 11 files
 ```
 For PEFT, it will have the following contents:
-``` bash
+```bash
 $ tree checkpoints/epoch_0_step_10/
 checkpoints/epoch_0_step_10/
 ├── dataloader.pt
@@ -382,13 +407,13 @@ checkpoints/epoch_0_step_10/
 2 directories, 8 files
 ```
 
-## Run Inference with the NeMo Automodel Fine-Tuned Checkpoint
+## Run Inference with the NeMo AutoModel Fine-Tuned Checkpoint
 
 Inference on the fine-tuned checkpoint or PEFT adapters is supported through the Hugging Face generate API. To use it, replace the path of the full model with the path to a SFT or PEFT checkpoint, which should include all necessary configuration settings such as model type, adapter type, and base model checkpoint path.
 
 The following is an example script using Hugging Face's Transformers library:
 
-``` python
+```python
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel #for PEFT
@@ -434,20 +459,20 @@ The following steps outline how to publish the fine-tuned checkpoint or PEFT ada
 
 1.  Install the Hugging Face Hub library (if not already installed):
 
-``` bash
+```bash
 pip3 install huggingface_hub
 ```
 
 2.  Log in to Hugging Face using your authentication token:
 
-``` bash
+```bash
 huggingface-cli login
 ```
 
 3.  Upload the fine-tuned checkpoint using the
     [huggingface_hub](https://github.com/huggingface/huggingface_hub) Python API:
 
-``` python
+```python
 from huggingface_hub import HfApi
 
 api = HfApi()
@@ -460,13 +485,13 @@ api.upload_folder(
 
 Once uploaded, the fine-tuned checkpoint can be loaded directly using:
 
-``` python
+```python
 from transformers import AutoModelForCausalLM
 
 model = AutoModelForCausalLM.from_pretrained("your-username/llama3.2_1b-finetuned-name")
 ```
 Similarly, the PEFT adapter can be loaded directly using: 
-``` python
+```python
 from peft import PeftModel, AutoModelForCausalLM
 
 model = AutoModelForCausalLM.from_pretrained("base-model")
@@ -496,7 +521,7 @@ In the following setup, we utilize the LM Evaluation Harness to evaluate
 the fine-tuned model on HellaSwag, a benchmark designed to measure
 commonsense reasoning capabilities.
 
-``` bash
+```bash
 ckpt="/ft_checkpoints/llama3.2_1b"
 python3 -m lm_eval --model hf \
     --model_args pretrained=$ckpt \
@@ -528,7 +553,7 @@ Make sure vLLM is installed (pip install vllm, or use the environment that inclu
 :::
 
 
-``` python
+```python
 from vllm import LLM, SamplingParams
 
 llm = LLM(model="checkpoints/epoch_0_step_10/model/consolidated/", model_impl="transformers")
@@ -548,7 +573,7 @@ Make sure vLLM is installed (pip install vllm, or use the environment
 that includes it) before proceeding with vLLMHFExporter.
 :::
 
-``` python
+```python
 from nemo.export.vllm_hf_exporter import vLLMHFExporter
 
 if __name__ == '__main__':

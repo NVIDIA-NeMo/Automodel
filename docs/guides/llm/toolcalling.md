@@ -5,17 +5,17 @@ This tutorial walks through fine-tuning [FunctionGemma](https://huggingface.co/g
 
 ## FunctionGemma introduction
 FunctionGemma is a lightweight, 270M-parameter variant built on the Gemma 3 architecture with a function-calling chat format. It is intended to be fine-tuned for task-specific function calling, and its compact size makes it practical for edge or resource-constrained deployments.
-- Gemma 3 architecture, updated tokenizer and function-calling chat format.
+- Gemma 3 architecture, updated tokenizer, and function-calling chat format.
 - Trained specifically for function calling: multiple tool definitions, parallel calls, tool responses, and natural-language summaries.
 - Small/edge friendly: ~270M params for fast, dense inference on-device.
 - Text-only, function-oriented model (not a general dialogue model), best used after task-specific finetuning.
 
 ## Prerequisites
-- Install NeMo Automodel and its extras: `pip install nemo-automodel`.
+- Install NeMo AutoModel and its extras: `pip install nemo-automodel`.
 - A FunctionGemma checkpoint available locally or via https://huggingface.co/google/functiongemma-270m-it.
 - Small model footprint: can be fine-tuned on a single GPU; scale batch/sequence as needed.
 
-## The xLAM dataset
+## xLAM Dataset
 xLAM is a function-calling dataset containing user queries, tool schemas, and tool call traces. It covers diverse tools and arguments so models learn to emit structured tool calls.
 - Dataset URL: https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k
 - Each sample provides:
@@ -84,7 +84,7 @@ def _format_example(
 
 
 
-## Run full-parameter SFT
+## Run Full-Parameter SFT
 Use the ready-made config at [`examples/llm_finetune/gemma/functiongemma_xlam.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/functiongemma_xlam.yaml) to start finetune:
 
 
