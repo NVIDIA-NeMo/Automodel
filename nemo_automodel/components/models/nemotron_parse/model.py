@@ -18,7 +18,6 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from einops import rearrange
-from torch.nn import CrossEntropyLoss
 from transformers import AutoConfig, AutoModel, GenerationMixin, PreTrainedModel
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_attn_mask_utils import (
@@ -72,12 +71,28 @@ class NemotronParseTextConfig(PretrainedConfig):
         use_cache: bool = True,
         num_labels: int = 3,
         forced_eos_token_id: int = 2,
+        pad_token_id: int = 1,
+        bos_token_id: int = 0,
+        eos_token_id: int = 2,
+        decoder_start_token_id: int = 2,
         add_cross_attention: bool = True,
         is_decoder: bool = True,
         max_sequence_length: int = 9000,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        # Populate special token ids on the config so downstream components
+        # (e.g., mBART decoder layers) can rely on them.
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            decoder_start_token_id=decoder_start_token_id,
+            forced_eos_token_id=forced_eos_token_id,
+            add_cross_attention=add_cross_attention,
+            is_decoder=is_decoder,
+            use_cache=use_cache,
+            **kwargs,
+        )
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.encoder_layers = encoder_layers
@@ -100,7 +115,6 @@ class NemotronParseTextConfig(PretrainedConfig):
         self.add_cross_attention = add_cross_attention
         self.is_decoder = is_decoder
         self.hidden_size = self.d_model
-        self.forced_eos_token_id = forced_eos_token_id
         self.num_attention_heads = self.encoder_attention_heads
         self.max_sequence_length = max_sequence_length
 
@@ -233,8 +247,6 @@ class NemotronParseDecoder(MBartPreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
         encoder_attention_mask: Optional[torch.LongTensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        cross_attn_head_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
@@ -267,7 +279,7 @@ class NemotronParseDecoder(MBartPreTrainedModel):
 
         if self.config._attn_implementation == "flash_attention_2":
             attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
-        elif self.config._attn_implementation == "sdpa" and not output_attentions and cross_attn_head_mask is None:
+        elif self.config._attn_implementation == "sdpa" and not output_attentions:
             attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
                 attention_mask, input_shape, inputs_embeds, past_key_values_length
             )
@@ -279,7 +291,7 @@ class NemotronParseDecoder(MBartPreTrainedModel):
         if encoder_hidden_states is not None and encoder_attention_mask is not None:
             if self.config._attn_implementation == "flash_attention_2":
                 encoder_attention_mask = encoder_attention_mask if 0 in encoder_attention_mask else None
-            elif self.config._attn_implementation == "sdpa" and cross_attn_head_mask is None and not output_attentions:
+            elif self.config._attn_implementation == "sdpa" and not output_attentions:
                 encoder_attention_mask = _prepare_4d_attention_mask_for_sdpa(
                     encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
                 )
@@ -294,12 +306,6 @@ class NemotronParseDecoder(MBartPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         all_cross_attentions = () if (output_attentions and encoder_hidden_states is not None) else None
-
-        for attn_mask, mask_name in zip([head_mask, cross_attn_head_mask], ["head_mask", "cross_attn_head_mask"]):
-            if attn_mask is not None and attn_mask.size()[0] != len(self.layers):
-                raise ValueError(
-                    f"The `{mask_name}` should be specified for {len(self.layers)} layers, but it is for {attn_mask.size()[0]}."
-                )
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -316,11 +322,9 @@ class NemotronParseDecoder(MBartPreTrainedModel):
                     attention_mask,
                     encoder_hidden_states,
                     encoder_attention_mask,
-                    head_mask[idx] if head_mask is not None else None,
-                    cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None,
-                    None,
+                    None,  # past_key_values
                     output_attentions,
-                    False,
+                    False,  # use_cache
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -328,11 +332,7 @@ class NemotronParseDecoder(MBartPreTrainedModel):
                     attention_mask=attention_mask,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
-                    layer_head_mask=(head_mask[idx] if head_mask is not None else None),
-                    cross_attn_layer_head_mask=(
-                        cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None
-                    ),
-                    past_key_value=None,
+                    past_key_values=None,
                     output_attentions=output_attentions,
                     use_cache=False,
                 )
@@ -431,8 +431,9 @@ class NemotronParsePreTrainedModel(PreTrainedModel):
 class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParsePreTrainedModel, GenerationMixin):
     """NemotronParse model for conditional generation tasks."""
 
-    def __init__(self, config: NemotronParseConfig, **kwargs):
+    def __init__(self, config: NemotronParseConfig, loss_fn=None, **kwargs):
         super().__init__(config)
+        self.loss_fn = loss_fn
 
         self.encoder = RadioWithNeck(config.encoder)
         self.encoder.main_input_name = "pixel_values"
@@ -529,50 +530,14 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
             **kwargs_decoder,
         )
 
-        loss = None
-        if labels is not None:
-            main_logits = self.lm_head(decoder_outputs.last_hidden_state)
-            logits = [main_logits]
-            decoder_inputs_embeds = decoder_outputs.inputs_embeds
-            for iii, head in enumerate(self.decoder.extra_heads):
-                decoder_input_embeds_shift = self.decoder.extra_proj[iii](
-                    torch.cat(
-                        (
-                            decoder_inputs_embeds[:, 1:, :],
-                            torch.zeros_like(decoder_inputs_embeds[:, 0, :].unsqueeze(1)),
-                        ),
-                        axis=1,
-                    )
-                )
-                hidden = head(decoder_outputs["hidden_states"][-1] + decoder_input_embeds_shift)
-                logits.append(self.lm_head(hidden))
-
-            logits = torch.stack(logits, dim=-2)
-            loss_fct = CrossEntropyLoss(reduction="none")
-
-            losses_per_head = []
-            tokens_per_head = []
-            for head_num in range(len(self.decoder.extra_heads) + 1):
-                logits_head = logits[:, :, head_num, :]
-                labels_head = torch.cat((labels[:, head_num:], torch.full_like(labels[:, :head_num], -100)), 1)
-                loss_full = loss_fct(logits_head.permute(0, 2, 1), labels_head)
-                loss_full[labels_head >= self.class_token_indx_start] *= 10
-                losses_per_head.append(loss_full.sum(1))
-                tokens_per_head.append((labels_head != -100).sum(1))
-
-            losses_per_sample = torch.stack(losses_per_head, dim=1).sum(1)
-            tokens_per_sample = torch.stack(tokens_per_head, dim=1).sum(1)
-            loss = losses_per_sample.sum() / (tokens_per_sample.sum() + 1e-6)
+        logits = self.lm_head(decoder_outputs.last_hidden_state)
 
         if not return_dict:
-            return (
-                (loss,) + decoder_outputs + encoder_outputs if loss is not None else decoder_outputs + encoder_outputs
-            )
+            return decoder_outputs + encoder_outputs
 
-        output_logits = self.lm_head(decoder_outputs.last_hidden_state)
         return Seq2SeqLMOutput(
-            loss=loss,
-            logits=output_logits,
+            loss=None,
+            logits=logits,
             past_key_values=decoder_outputs.past_key_values,
             decoder_hidden_states=decoder_outputs.hidden_states,
             decoder_attentions=decoder_outputs.attentions,

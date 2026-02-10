@@ -22,9 +22,9 @@ from contextlib import nullcontext
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
-    _freeze_model,
     _get_model_name,
-    build_model_and_optimizer,
+    build_model,
+    build_optimizer,
 )
 
 
@@ -109,110 +109,22 @@ class DummyModelConfig:
 
 
 # -----------------------------------------------------------------------------
-# _freeze_model
-# -----------------------------------------------------------------------------
-
-def test_freeze_model_embedding_only():
-    """When cfg_freeze is *None*, embeddings should be frozen by default."""
-    model = DummyModel()
-    assert model.embedding.weight.requires_grad  # sanity check – initially True
-
-    _freeze_model(model, cfg_freeze=None, freeze_embeddings=True)
-
-    # embedding weights must be frozen; linear layer should still train
-    assert not model.embedding.weight.requires_grad
-    assert model.language_model.weight.requires_grad
-
-
-def test_freeze_model_with_config(monkeypatch):
-    """Custom freeze config should be respected (freeze_language_model only)."""
-    model = DummyModel()
-
-    freeze_cfg = {
-        "freeze_embeddings": False,  # keep embeddings trainable
-        "freeze_language_model": True,
-    }
-
-    _freeze_model(model, cfg_freeze=freeze_cfg, freeze_embeddings=False)
-
-    # embedding remains trainable, language_model is frozen
-    assert model.embedding.weight.requires_grad
-    assert not model.language_model.weight.requires_grad
-
-
-def test_freeze_model_with_autopipeline():
-    """Test _freeze_model handles AutoPipeline by recursively freezing parts."""
-    from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
-
-    # Create multiple model parts
-    part1 = DummyModel()
-    part2 = DummyModel()
-
-    # Create a mock AutoPipeline
-    class MockAutoPipeline:
-        def __init__(self, parts):
-            self.parts = parts
-
-    # Patch isinstance check to recognize our mock as AutoPipeline
-    mock_pipeline = MockAutoPipeline([part1, part2])
-
-    # Verify parts are initially trainable
-    assert part1.embedding.weight.requires_grad
-    assert part2.embedding.weight.requires_grad
-
-    # Use the actual AutoPipeline class for isinstance check
-    # We'll test the logic directly since we can't easily mock isinstance
-    from nemo_automodel.recipes.vlm.finetune import _freeze_model
-
-    # Test with real AutoPipeline-like object
-    # The function checks isinstance(model, AutoPipeline), so we test the parts directly
-    _freeze_model(part1, cfg_freeze=None, freeze_embeddings=True)
-    _freeze_model(part2, cfg_freeze=None, freeze_embeddings=True)
-
-    # Both parts should have embeddings frozen
-    assert not part1.embedding.weight.requires_grad
-    assert not part2.embedding.weight.requires_grad
-
-
-def test_freeze_model_autopipeline_returns_model():
-    """Test _freeze_model returns the AutoPipeline model after freezing parts."""
-    # Test that the function returns the model unchanged after processing parts
-    # This tests the return statement: return model
-
-    part1 = DummyModel()
-    part2 = DummyModel()
-
-    # Freeze each part individually (simulating what _freeze_model does for AutoPipeline)
-    result1 = _freeze_model(part1, cfg_freeze=None, freeze_embeddings=True)
-    result2 = _freeze_model(part2, cfg_freeze=None, freeze_embeddings=True)
-
-    # _freeze_model should return the model
-    assert result1 is part1
-    assert result2 is part2
-
-
-# -----------------------------------------------------------------------------
-# build_model_and_optimizer
+# build_model / build_optimizer
 # -----------------------------------------------------------------------------
 
 def test_build_model_and_optimizer_basic():
-    """Test basic build_model_and_optimizer for VLM.
-    Note: New API no longer takes device as first param and returns 3-tuple (model, optimizer, loss_fn)."""
+    """Test basic build_model and build_optimizer for VLM."""
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig(lr=0.01)
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
-        # New API: no device param, returns 3-tuple (model, optimizer, loss_fn)
-        model, optim, loss_fn = build_model_and_optimizer(
+        model = build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
-            model_wrapper=SimpleNamespace(parallelize=lambda m: m),
             seed=123,
-            tp_size=1,
-            freeze_embeddings=True,
         )
+        optim = build_optimizer(model, cfg_opt, None, None)
 
     # Check returned objects and their properties
     assert isinstance(model, DummyModel)
@@ -220,13 +132,41 @@ def test_build_model_and_optimizer_basic():
     assert len(optim) == 1
     assert isinstance(optim[0], torch.optim.Optimizer)
 
-    # Embedding weights should be frozen by default
-    assert not model.embedding.weight.requires_grad
 
-    # Optimizer should hold only trainable parameters
-    trainable_param_count = _count_trainable(model.parameters())
-    optim_param_count = sum(p.numel() for group in optim[0].param_groups for p in group["params"])
-    assert trainable_param_count == optim_param_count
+def test_build_model_passes_freeze_config():
+    """Test that freeze_config is passed to model instantiation."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
+    captured_kwargs = {}
+
+    class CapturingModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
+        def instantiate(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = CapturingModelConfig()
+
+    class FreezeConfig:
+        def to_dict(self):
+            return {"freeze_embeddings": True, "freeze_language_model": False}
+
+    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+        model = build_model(
+            cfg_model=cfg_model,
+            cfg_freeze=FreezeConfig(),
+            cfg_peft=None,
+            seed=123,
+        )
+
+    # Verify freeze_config was passed to model instantiation
+    assert "freeze_config" in captured_kwargs
+    assert captured_kwargs["freeze_config"] == {"freeze_embeddings": True, "freeze_language_model": False}
 
 
 # -----------------------------------------------------------------------------
@@ -272,7 +212,7 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     recipe.cfg = _Cfg(fp8=None)
     recipe.lr_scheduler = None
     recipe.timestamp = 0.0
-    recipe.model_wrapper = None
+    recipe.distributed_config = None
 
     recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
     recipe._get_dp_group_size = lambda include_cp=True: 1
@@ -480,15 +420,11 @@ def test_vlm_build_model_with_adapter():
     cfg_model = NeMoModelConfigWithAdapter()
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
-        model, optim, loss_fn = build_model_and_optimizer(
+        model = build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
-            model_wrapper=SimpleNamespace(parallelize=lambda m: m),
             seed=123,
-            tp_size=1,
-            freeze_embeddings=True,
         )
 
     # Model should be instantiated with adapter
@@ -498,8 +434,6 @@ def test_vlm_build_model_with_adapter():
 
 def test_vlm_build_model_without_adapter():
     """Test that model without state_dict_adapter is properly instantiated in VLM."""
-
-    cfg_opt = DummyOptConfig(lr=0.01)
 
     # Create a config that simulates NeMoAutoModel's internal infrastructure handling (no adapter)
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
@@ -517,15 +451,11 @@ def test_vlm_build_model_without_adapter():
     cfg_model = NeMoModelConfigNoAdapter()
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
-        model, optim, loss_fn = build_model_and_optimizer(
+        model = build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
-            model_wrapper=SimpleNamespace(parallelize=lambda m: m),
             seed=123,
-            tp_size=1,
-            freeze_embeddings=True,
         )
 
     # Model should be instantiated without adapter
@@ -536,8 +466,6 @@ def test_vlm_build_model_without_adapter():
 def test_vlm_build_model_with_quantization_config():
     """Test that model with quantization_config is properly instantiated in VLM."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-
-    cfg_opt = DummyOptConfig(lr=0.01)
 
     # Create a model config that simulates NeMoAutoModel's internal infrastructure handling
     class DummyQuantizedVLMModelConfig:
@@ -556,15 +484,11 @@ def test_vlm_build_model_with_quantization_config():
     cfg_model = DummyQuantizedVLMModelConfig()
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
-        model, optim, loss_fn = build_model_and_optimizer(
+        model = build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
-            model_wrapper=SimpleNamespace(parallelize=lambda m: m),
             seed=123,
-            tp_size=1,
-            freeze_embeddings=True,
         )
 
     # Model should be instantiated with quantization config
@@ -575,8 +499,6 @@ def test_vlm_build_model_with_quantization_config():
 def test_vlm_build_model_without_quantization_config():
     """Test that model without quantization_config is properly instantiated in VLM."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-
-    cfg_opt = DummyOptConfig(lr=0.01)
 
     # Create a config that simulates NeMoAutoModel's internal infrastructure handling (no quant config)
     class DummyNoQuantVLMModelConfig:
@@ -592,15 +514,11 @@ def test_vlm_build_model_without_quantization_config():
     cfg_model = DummyNoQuantVLMModelConfig()
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
-        model, optim, loss_fn = build_model_and_optimizer(
+        model = build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
-            model_wrapper=SimpleNamespace(parallelize=lambda m: m),
             seed=123,
-            tp_size=1,
-            freeze_embeddings=True,
         )
 
     # Model should be instantiated without quantization config
@@ -609,12 +527,12 @@ def test_vlm_build_model_without_quantization_config():
 
 
 # =============================================================================
-# New tests for VLM-specific build_model_and_optimizer functionality
+# New tests for VLM-specific build_model / build_optimizer functionality
 # =============================================================================
 
 
 def test_vlm_build_model_raises_value_error_for_non_nemo_auto_model():
-    """Test that VLM build_model_and_optimizer raises ValueError when target is not NeMoAutoModelForImageTextToText."""
+    """Test that VLM build_model raises ValueError when target is not NeMoAutoModelForImageTextToText."""
 
     # Create a cfg_model that targets something other than NeMoAutoModelForImageTextToText
     class InvalidModelConfig:
@@ -628,55 +546,20 @@ def test_vlm_build_model_raises_value_error_for_non_nemo_auto_model():
             return getattr(self, key, default)
 
     cfg_model = InvalidModelConfig()
-    cfg_opt = DummyOptConfig(lr=0.01)
 
     with pytest.raises(ValueError, match="VLM finetuning requires NeMoAutoModelForImageTextToText"):
-        build_model_and_optimizer(
+        build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
-            model_wrapper=None,
             seed=42,
         )
 
 
-def test_vlm_build_model_applies_freeze_after_instantiation():
-    """Test that _freeze_model is called after model instantiation."""
-    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-
-    class NeMoVLMModelConfig:
-        def __init__(self):
-            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
-
-        def instantiate(self, **kwargs):
-            return DummyModel()
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-    cfg_model = NeMoVLMModelConfig()
-    cfg_opt = DummyOptConfig(lr=0.01)
-
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel.recipes.vlm.finetune._freeze_model') as mock_freeze:
-            mock_freeze.return_value = DummyModel()
-            model, optimizer, loss_fn = build_model_and_optimizer(
-                cfg_model=cfg_model,
-                cfg_opt=cfg_opt,
-                cfg_freeze={"freeze_language_model": True},
-                cfg_peft=None,
-                model_wrapper=None,
-                seed=42,
-                freeze_embeddings=True,
-            )
-
-            # Verify _freeze_model was called
-            mock_freeze.assert_called_once()
 
 
-def test_vlm_build_model_disables_foreach_with_tp():
-    """Test that when tp_size > 1, cfg_opt.foreach is set to False in VLM."""
+def test_vlm_build_optimizer_disables_foreach_with_tp():
+    """Test that when device_mesh has tp > 1, cfg_opt.foreach is set to False in VLM."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 
     class NeMoVLMModelConfig:
@@ -693,9 +576,27 @@ def test_vlm_build_model_disables_foreach_with_tp():
     cfg_opt = DummyOptConfig(lr=0.01)
     cfg_opt.foreach = True  # Initially True
 
+    # Create a mock device_mesh with tp size > 1
+    mock_tp_submesh = MagicMock()
+    mock_tp_submesh.size.return_value = 2
+    mock_device_mesh = MagicMock()
+    mock_device_mesh.mesh_dim_names = ("dp", "tp")
+    mock_device_mesh.__getitem__ = lambda self, key: mock_tp_submesh if key == "tp" else MagicMock()
+
+    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+        model = build_model(
+            cfg_model=cfg_model,
+            cfg_freeze=None,
+            cfg_peft=None,
+            seed=42,
+            device_mesh=mock_device_mesh,
+        )
+        optimizer = build_optimizer(model, cfg_opt, None, mock_device_mesh)
+
+    assert cfg_opt.foreach is False
+
 
 from nemo_automodel.recipes.vlm.finetune import (
-    parallelize_for_pp,
     build_step_scheduler,
     build_lr_scheduler,
     build_checkpoint_config,
@@ -923,6 +824,19 @@ class TestBuildCheckpointConfig:
                 is_peft=True,
             )
 
+    def test_build_checkpoint_config_uses_hf_hub_cache_when_cache_dir_none(self):
+        """Test that HF_HUB_CACHE is used when cache_dir is None."""
+        from huggingface_hub import constants as hf_constants
+
+        config = build_checkpoint_config(
+            cfg_ckpt=None,
+            cache_dir=None,
+            model_repo_id="org/model",
+            is_peft=False,
+        )
+
+        assert config.model_cache_dir == hf_constants.HF_HUB_CACHE
+
 
 # -----------------------------------------------------------------------------
 # calculate_loss tests
@@ -1087,7 +1001,7 @@ def _create_pp_recipe(model=None):
     recipe.__dict__["moe_mesh"] = None
     recipe.__dict__["pp_enabled"] = True
     recipe.__dict__["loss_fn"] = MagicMock()
-    recipe.__dict__["model_wrapper"] = None
+    recipe.__dict__["distributed_config"] = None
     recipe.__dict__["model_parts"] = [model]
     recipe.__dict__["_get_dp_group_size"] = lambda include_cp=True: 1
     return recipe
@@ -1150,6 +1064,51 @@ class TestForwardBackwardStepPP:
             "input_ids": torch.randint(0, 100, (batch_size, 10)),
             "pixel_values": pixel_values,
             "image_grid_hws": image_grid_hws,
+        }
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=40,
+            num_batches=1,
+            is_train=True,
+        )
+
+        # Verify chunking happened correctly
+        model = pp_recipe.model_parts[0]
+        assert model._vlm_pixel_values_chunks is None  # Cleared after step
+        assert model._vlm_image_grid_hws_chunks is None
+        assert model._vlm_chunk_idx is None
+
+        # Verify schedule.step was called
+        pp_recipe.pp.info.schedule.step.assert_called_once()
+
+        # Verify loss was computed
+        assert len(loss_buffer) == 1
+
+    def test_pp_vlm_chunking_with_image_grid_thw(self, pp_recipe, monkeypatch):
+        """Test VLM pixel_values chunking with image_grid_thw (3D grid) instead of image_grid_hws."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+        )
+
+        batch_size = 4
+        n_images = 4
+        # image_grid_thw: 4 images with T, H, W dimensions (uses .prod(dim=1) for patch counts)
+        image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 3], [1, 4, 4]])  # patch counts: 4, 9, 6, 16
+        total_patches = 4 + 9 + 6 + 16  # = 35
+        pixel_values = torch.randn(total_patches, 3, 14, 14)
+
+        batch = {
+            "labels": torch.randint(0, 100, (batch_size, 10)),
+            "input_ids": torch.randint(0, 100, (batch_size, 10)),
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,  # Using thw instead of hws
         }
         loss_buffer = []
 
@@ -1442,7 +1401,7 @@ def _create_non_pp_recipe(model, device="cpu"):
     recipe.__dict__["device_mesh"] = None
     recipe.__dict__["moe_mesh"] = None
     recipe.__dict__["pp_enabled"] = False
-    recipe.__dict__["model_wrapper"] = None
+    recipe.__dict__["distributed_config"] = None
     recipe.__dict__["model_parts"] = [model]
     recipe.__dict__["_get_dp_group_size"] = lambda include_cp=True: 1
     return recipe
@@ -1685,78 +1644,42 @@ class TestForwardBackwardStepNonPP:
         assert len(loss_buffer) == 1
 
 
-class TestParallelizeForPP:
-    """Tests for the new parallelize_for_pp function."""
-
-    def test_parallelize_for_pp_with_model_wrapper(self):
-        """Test that parallelize_for_pp calls model_wrapper.parallelize."""
-        model = nn.Linear(10, 10)
-        mock_wrapper = MagicMock()
-        parallelized_model = nn.Linear(10, 10)
-        mock_wrapper.parallelize.return_value = parallelized_model
-
-        result = parallelize_for_pp(
-            model,
-            world_mesh=MagicMock(),
-            model_wrapper=mock_wrapper,
-        )
-
-        mock_wrapper.parallelize.assert_called_once_with(model)
-        assert result is parallelized_model
-
-    def test_parallelize_for_pp_without_model_wrapper(self):
-        """Test that parallelize_for_pp returns model unchanged when no wrapper."""
-        model = nn.Linear(10, 10)
-
-        result = parallelize_for_pp(
-            model,
-            world_mesh=MagicMock(),
-            model_wrapper=None,
-        )
-
-        assert result is model
-
-    def test_parallelize_for_pp_wrapper_without_parallelize_method(self):
-        """Test behavior when wrapper doesn't have parallelize method."""
-        model = nn.Linear(10, 10)
-        mock_wrapper = MagicMock(spec=[])  # No parallelize method
-
-        result = parallelize_for_pp(
-            model,
-            world_mesh=MagicMock(),
-            model_wrapper=mock_wrapper,
-        )
-
-        assert result is model
-
-
 # -----------------------------------------------------------------------------
-# build_model_and_optimizer returns list (diff coverage)
+# build_optimizer returns correct type (diff coverage)
 # -----------------------------------------------------------------------------
 
 
-def test_build_model_and_optimizer_returns_optimizer_list():
-    """Test that build_model_and_optimizer returns list of optimizers."""
+def test_build_optimizer_disables_foreach_with_tp():
+    """Test that build_optimizer disables foreach with TP."""
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig(lr=0.01)
 
+    # Create a mock device_mesh with tp size > 1
+    mock_tp_submesh = MagicMock()
+    mock_tp_submesh.size.return_value = 2
+    mock_device_mesh = MagicMock()
+    mock_device_mesh.mesh_dim_names = ("dp", "tp")
+    mock_device_mesh.__getitem__ = lambda self, key: mock_tp_submesh if key == "tp" else MagicMock()
+
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
-        model, optimizer, loss_fn = build_model_and_optimizer(
+        model = build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
-            model_wrapper=None,
             seed=42,
-            tp_size=2,  # TP > 1
+            device_mesh=mock_device_mesh,
         )
+        optimizer = build_optimizer(model, cfg_opt, None, mock_device_mesh)
 
-    # Verify foreach was disabled
+    # Verify foreach was disabled due to TP > 1
     assert cfg_opt.foreach is False
+    # Verify optimizer is returned as a list
+    assert isinstance(optimizer, list)
+    assert len(optimizer) == 1
 
 
-def test_vlm_build_model_returns_model_optimizer_loss_fn_tuple():
-    """Test that VLM build_model_and_optimizer returns (model, optimizer, loss_fn) 3-tuple."""
+def test_vlm_build_model_and_optimizer_return_values():
+    """Test that VLM build_model and build_optimizer return proper values."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 
     class NeMoVLMModelConfig:
@@ -1773,20 +1696,14 @@ def test_vlm_build_model_returns_model_optimizer_loss_fn_tuple():
     cfg_opt = DummyOptConfig(lr=0.01)
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
-        result = build_model_and_optimizer(
+        model = build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
-            model_wrapper=None,
             seed=42,
-            loss_fn=MagicMock(),
         )
+        optimizer = build_optimizer(model, cfg_opt, None, None)
 
-    # Should return 3-tuple
-    assert isinstance(result, tuple)
-    assert len(result) == 3
-    model, optimizer, loss_fn = result
     assert model is not None
     assert optimizer is not None
 
@@ -1809,16 +1726,13 @@ def test_vlm_build_model_validates_nemo_auto_model_entry_points(entry_point):
             return getattr(self, key, default)
 
     cfg_model = NeMoVLMModelConfig()
-    cfg_opt = DummyOptConfig(lr=0.01)
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
         # Should not raise - entry point should be recognized
-        model, optimizer, loss_fn = build_model_and_optimizer(
+        model = build_model(
             cfg_model=cfg_model,
-            cfg_opt=cfg_opt,
             cfg_freeze=None,
             cfg_peft=None,
-            model_wrapper=None,
             seed=42,
         )
 

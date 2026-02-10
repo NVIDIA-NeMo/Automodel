@@ -18,7 +18,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: /home/TestData/automodel/hf_gemma3_2l/
+    pretrained_model_name_or_path: /home/TestData/automodel/hf_llama3_2_1b_2l/
 
 checkpoint:
   enabled: false
@@ -52,8 +52,10 @@ optimizer:
 
 # DDP / FSDP2 / etc
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
   tp_size: 1
   cp_size: 1
+
+distributed_config:
+  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false

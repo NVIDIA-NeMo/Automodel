@@ -14,7 +14,7 @@
 
 import logging
 import types
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
@@ -44,7 +44,7 @@ class TestPatchAttention:
         obj = DummyModule()
         original_forward = obj.forward
 
-        with patch("nemo_automodel._transformers.auto_model.sdpa_kernel") as mock_sdpa_kernel:
+        with patch("nemo_automodel._transformers.kernel_patches.sdpa_kernel") as mock_sdpa_kernel:
             result = _patch_attention(obj)
 
             assert result is obj
@@ -70,7 +70,7 @@ class TestPatchAttention:
         obj = DummyModule()
         custom_sdpa_method = [SDPBackend.FLASH_ATTENTION]
 
-        with patch("nemo_automodel._transformers.auto_model.sdpa_kernel") as mock_sdpa_kernel:
+        with patch("nemo_automodel._transformers.kernel_patches.sdpa_kernel") as mock_sdpa_kernel:
             result = _patch_attention(obj, custom_sdpa_method)
 
             assert result is obj
@@ -209,7 +209,7 @@ def prepare_env(monkeypatch, target_mod, *, has_liger=True, apply_ok=True):
 
 def test_patch_liger_kernel_success(monkeypatch):
     """Test _patch_liger_kernel successfully applies liger kernel when available."""
-    import nemo_automodel._transformers.auto_model as tgt
+    import nemo_automodel._transformers.kernel_patches as tgt
 
     apply_mock, attn_mock = prepare_env(monkeypatch, tgt, has_liger=True, apply_ok=True)
 
@@ -234,7 +234,7 @@ def test_liger_not_available(monkeypatch):
     Expect: return untouched model, _patch_attention still invoked,
             no exceptions thrown.
     """
-    import nemo_automodel._transformers.auto_model as tgt
+    import nemo_automodel._transformers.kernel_patches as tgt
 
     apply_mock, attn_mock = prepare_env(
         monkeypatch,
@@ -259,7 +259,7 @@ def test_liger_apply_failure_raises(monkeypatch):
     If _apply_liger_kernel_to_instance throws, _patch_liger_kernel must
     clean up and raise RuntimeError.
     """
-    import nemo_automodel._transformers.auto_model as tgt
+    import nemo_automodel._transformers.kernel_patches as tgt
 
     prepare_env(
         monkeypatch,
@@ -270,6 +270,35 @@ def test_liger_apply_failure_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Failed to patch model"):
         tgt._patch_liger_kernel(DummyModel())
+
+
+def test_patch_liger_kernel_skips_non_nn_module(monkeypatch, caplog):
+    """
+    When model is not an nn.Module (e.g., a lightweight mock), _patch_liger_kernel
+    should skip patching and return the model unchanged with a warning.
+    """
+    import nemo_automodel._transformers.kernel_patches as tgt
+
+    apply_mock, attn_mock = prepare_env(
+        monkeypatch,
+        tgt,
+        has_liger=True,
+        apply_ok=True,
+    )
+
+    # Create a non-nn.Module mock object
+    mock_model = MagicMock(spec=[])  # Empty spec means no nn.Module methods
+    mock_model.config = {}
+
+    with caplog.at_level(logging.WARNING):
+        result = tgt._patch_liger_kernel(mock_model)
+
+    # Should return the same mock unchanged
+    assert result is mock_model
+    # Liger kernel should NOT be applied
+    apply_mock.assert_not_called()
+    # Warning should be logged
+    assert "Skipping Liger Kernel patch for non-nn.Module model" in caplog.text
 
 
 # =============================================================================
@@ -304,11 +333,6 @@ class TestGetMixinWrappedClass:
         assert result.__name__ == PlainModel.__name__
 
 
-# NOTE: Tests for _init_model, apply_model_infrastructure, _shard_pp, _shard_ep_fsdp,
-# and from_pretrained/from_config with infrastructure kwargs have been moved to
-# integration tests since they require too many mocks and test complex orchestration.
-
-
 # =============================================================================
 # Tests for _apply_peft_and_lower_precision
 # =============================================================================
@@ -323,7 +347,7 @@ class TestApplyPeftAndLowerPrecision:
         mock_peft_config.use_triton = True
 
         with (
-            patch("nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules") as mock_apply_lora,
+            patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules") as mock_apply_lora,
             caplog.at_level(logging.INFO),
         ):
             result = _apply_peft_and_lower_precision(
@@ -348,7 +372,7 @@ class TestApplyPeftAndLowerPrecision:
         mock_autopipeline = MagicMock()
 
         with (
-            patch("nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules") as mock_apply_lora,
+            patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules") as mock_apply_lora,
             caplog.at_level(logging.INFO),
         ):
             result = _apply_peft_and_lower_precision(
@@ -369,7 +393,7 @@ class TestApplyPeftAndLowerPrecision:
         mock_model = MagicMock()
         mock_fp8_config = MagicMock()
 
-        with patch("nemo_automodel._transformers.auto_model.apply_fp8_to_model") as mock_apply_fp8:
+        with patch("nemo_automodel._transformers.infrastructure.apply_fp8_to_model") as mock_apply_fp8:
             mock_apply_fp8.return_value = mock_model
 
             result = _apply_peft_and_lower_precision(
@@ -476,5 +500,3 @@ class TestFilterKwargsForInit:
         result = _filter_kwargs_for_init(ModelWithVarKwargs, kwargs)
 
         assert result == kwargs
-
-

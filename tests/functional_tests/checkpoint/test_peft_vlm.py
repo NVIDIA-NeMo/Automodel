@@ -608,6 +608,7 @@ def test_hf_peft_checkpoint():
         "lora_alpha": 32,
         "peft_type": "LORA",
         "r": 8,
+        "use_dora": False,
         "target_modules": [
             "model.language_model.layers.0.mlp.down_proj",
             "model.language_model.layers.0.mlp.gate_proj",
@@ -634,6 +635,7 @@ def test_hf_peft_checkpoint():
         "lora_dtype": None,
         "match_all_linear": False,
         "target_modules": [],
+        "use_dora": False,
         "use_triton": True,
     }
 
@@ -690,11 +692,9 @@ def test_hf_peft_checkpoint():
         "model/adapter_config.json",
         "model/automodel_peft_config.json",
         "model/chat_template.jinja",
-        "model/preprocessor_config.json",
         "model/processor_config.json",
         "model/tokenizer_config.json",
         "model/tokenizer.json",
-        "model/special_tokens_map.json",
         "optim/__0_0.distcp",
         "optim/__1_0.distcp",
         "optim/.metadata",

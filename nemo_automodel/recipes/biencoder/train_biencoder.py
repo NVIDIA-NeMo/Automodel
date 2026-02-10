@@ -21,9 +21,9 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict
 
 import torch
+from huggingface_hub import constants as hf_constants
 from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-from transformers.utils.hub import TRANSFORMERS_CACHE
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
@@ -109,7 +109,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         checkpoint_dir="checkpoints/",
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
-        model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
+        model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HUB_CACHE,
         save_consolidated=False,
         is_peft=is_peft,
     )

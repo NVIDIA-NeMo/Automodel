@@ -8,6 +8,7 @@
 repository-structure.md
 guides/installation.md
 guides/configuration.md
+guides/huggingface-api-compatibility.md
 launcher/local-workstation.md
 launcher/cluster.md
 ```
@@ -24,6 +25,13 @@ Challenges in Enabling PyTorch Native Pipeline Parallelism for Hugging Face Tran
 Google Gemma 3n: Efficient Multimodal Fine-tuning Made Simple <https://github.com/NVIDIA-NeMo/Automodel/discussions/494>
 Fine-tune Hugging Face Models Instantly with Day-0 Support with NVIDIA NeMo AutoModel <https://github.com/NVIDIA-NeMo/Automodel/discussions/477>
 
+```
+
+```{toctree}
+:caption: Performance
+:hidden:
+
+performance-summary.md
 ```
 
 ```{toctree}
@@ -71,11 +79,4 @@ guides/fp8-training.md
 guides/mlflow-logging.md
 
 apidocs/index.rst
-```
-
-```{toctree}
-:caption: Performance
-:hidden:
-
-performance-summary.md
 ```

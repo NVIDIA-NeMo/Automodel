@@ -42,6 +42,6 @@ These cases typically stem from upstream packaging or dependency constraints. Yo
 
 If you encounter any issue, you can try:
 
-- Upgrade to a NeMo Automodel release that supports the required `transformers` version.
-- If the model uses custom code, set `trust_remote_code=True` when loading.
+- Upgrade to a NeMo Automodel release that supports the required `transformers` version (see [installation](../guides/installation.md)).
+- If the model uses custom code, set `trust_remote_code: true` when loading (typically under your `model:` config; see [Hugging Face API compatibility](../guides/huggingface-api-compatibility.md)).
 - Open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) with the model-id and error for us to prioritize support or add a registry-backed implementation.
