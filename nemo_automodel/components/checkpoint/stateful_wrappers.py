@@ -29,18 +29,18 @@ from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
 _PREFIX = "model."
 
 
-def _is_quantized_param(param: torch.Tensor) -> bool:
-    """Check if a parameter is a BitsAndBytes quantized type.
+def _is_quantized_module(module: torch.nn.Module) -> bool:
+    """Check if a module is a BitsAndBytes quantized type.
 
     Detects quantization by checking for `quant_state` attribute which is
-    common across BitsAndBytes quantized parameter types (Params4bit, Int8Params, etc.).
+    common across BitsAndBytes quantized module types (Params4bit, Int8Params, etc.).
     """
-    return getattr(param, "quant_state", None) is not None
+    return getattr(module, "quant_state", None) is not None
 
 
 def _has_quantized_params(model: torch.nn.Module) -> bool:
-    """Check if model has any BitsAndBytes quantized parameters."""
-    return any(map(_is_quantized_param, model.parameters()))
+    """Check if model has any BitsAndBytes quantized modules."""
+    return any(map(_is_quantized_module, model.modules()))
 
 
 def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
@@ -48,11 +48,12 @@ def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
 
     This function directly iterates over model parameters to collect trainable weights,
     avoiding PyTorch DCP's state_dict traversal which fails on BitsAndBytes quantized
-    parameters (Params4bit, Int8Params, etc.).
+    modules (Params4bit, Int8Params, etc.).
     """
     state_dict = {}
     for name, param in model.named_parameters():
         if param.requires_grad:
+            param = param.full_tensor() if hasattr(param, "full_tensor") else param
             state_dict[name] = param.detach().cpu()
     return state_dict
 
@@ -268,6 +269,7 @@ class OptimizerState:
         model: torch.nn.Module | list[torch.nn.Module],
         optimizer: torch.optim.Optimizer,
         scheduler: Optional[Any] = None,
+        is_peft: bool = False,
     ):
         """
         Initialize an OptimizerState instance.
@@ -285,10 +287,12 @@ class OptimizerState:
                 restored.
             scheduler (Optional[Any], optional): Learning-rate scheduler to track
                 alongside the optimizer. Pass ``None`` if no scheduler is used.
+            is_peft (bool): Whether the model uses PEFT adapters (e.g. LoRA/QLoRA).
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
         self.optimizer = [optimizer] if isinstance(optimizer, torch.optim.Optimizer) else optimizer
         self.scheduler = [scheduler] if isinstance(scheduler, torch.optim.lr_scheduler.LRScheduler) else scheduler
+        self.is_peft = is_peft
 
     def state_dict(self) -> dict[str, Any]:
         """
@@ -297,13 +301,21 @@ class OptimizerState:
         Returns:
             dict: Dictionary containing the optimizer and scheduler state dicts with CPU offloading enabled.
         """
-        # this line automatically manages FSDP FQN's, as well as sets the default state dict type
-        # to FSDP.SHARDED_STATE_DICT
-        func = partial(
-            get_optimizer_state_dict,
-            options=StateDictOptions(flatten_optimizer_state_dict=True),
-        )
-        optimizer_state_dict = {k: v for sd in map(func, self.model, self.optimizer) for k, v in sd.items()}
+        # For PEFT models with quantized parameters (e.g., QLoRA with BitsAndBytes),
+        # bypass PyTorch DCP's get_optimizer_state_dict() which fails because DCP
+        # cannot build a consistent parameter-ID-to-FQN mapping when the model
+        # contains quantized frozen params (Params4bit/Int8Params) alongside
+        # trainable LoRA params. Use native optimizer state_dict instead.
+        if self.is_peft and _has_quantized_params(self.model[0]):
+            optimizer_state_dict = self.optimizer[0].state_dict()
+        else:
+            # this line automatically manages FSDP FQN's, as well as sets the default state dict type
+            # to FSDP.SHARDED_STATE_DICT
+            func = partial(
+                get_optimizer_state_dict,
+                options=StateDictOptions(flatten_optimizer_state_dict=True),
+            )
+            optimizer_state_dict = {k: v for sd in map(func, self.model, self.optimizer) for k, v in sd.items()}
 
         state_dict = {
             "optim": optimizer_state_dict,
@@ -320,13 +332,17 @@ class OptimizerState:
         Args:
             state_dict (dict): State dictionary containing optimizer and scheduler states to load.
         """
-        # sets our state dicts on the optimizer, now that we've loaded
-        func = partial(
-            set_optimizer_state_dict,
-            optim_state_dict=state_dict["optim"],
-            options=StateDictOptions(flatten_optimizer_state_dict=True),
-        )
-        list(map(func, self.model, self.optimizer))
+        # For PEFT + quantized models, use native load to match the native save path.
+        if self.is_peft and _has_quantized_params(self.model[0]):
+            self.optimizer[0].load_state_dict(state_dict["optim"])
+        else:
+            # sets our state dicts on the optimizer, now that we've loaded
+            func = partial(
+                set_optimizer_state_dict,
+                optim_state_dict=state_dict["optim"],
+                options=StateDictOptions(flatten_optimizer_state_dict=True),
+            )
+            list(map(func, self.model, self.optimizer))
 
         # load the scheduler state if it exists
         if "sched" in state_dict and self.scheduler is not None:
