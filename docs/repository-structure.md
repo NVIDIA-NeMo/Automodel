@@ -1,6 +1,6 @@
 # Introduction to the NeMo Automodel Repository
 
-This introductory guide presents the structure of the NeMo Automodel repository, provides a brief overview of its parts, introduces concepts such as components and recipes, and explains how everything fits together.
+This introductory guide presents the structure of the NeMo AutoModel repository, provides a brief overview of its parts, introduces concepts such as components and recipes, and explains how everything fits together.
 
 ## What is NeMo Automodel?
 NeMo Automodel is a PyTorch library for fine-tuning and pre-training large scale models. In particular, it provides:
