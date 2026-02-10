@@ -78,6 +78,15 @@ DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if HAS_FA else "sdpa"
 
 logger = logging.getLogger(__name__)
 
+# Backward-compat shim for trust_remote_code models (e.g. DeciLM)
+# that import NEED_SETUP_CACHE_CLASSES_MAPPING from transformers.generation.utils.
+import transformers.generation.utils as _gen_utils  # noqa: E402
+
+if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
+    from transformers.cache_utils import StaticCache
+
+    _gen_utils.NEED_SETUP_CACHE_CLASSES_MAPPING = {"static": StaticCache}
+
 
 def _get_mixin_wrapped_class(model_class: type) -> type:
     """
@@ -399,7 +408,10 @@ def _init_model(
                 **kwargs,
             )
         # Get HF model class and wrap with mixin
-        hf_model_cls = cls._model_mapping[type(hf_config)]
+        try:
+            hf_model_cls = cls._model_mapping[type(hf_config)]
+        except KeyError:
+            hf_model_cls = type(model)
         model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
         return False, model
 
@@ -447,6 +459,10 @@ def _init_model(
             **kwargs,
         )
 
+    try:
+        hf_model_cls = cls._model_mapping[type(hf_config)]
+    except KeyError:
+        hf_model_cls = type(model)
     model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
     return False, model
 
