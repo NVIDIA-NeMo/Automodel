@@ -145,7 +145,7 @@ validation_dataloader:
 
 ---
 
-## 3. Launch training
+## Launch Training
 
 ### Single-GPU quick run
 
