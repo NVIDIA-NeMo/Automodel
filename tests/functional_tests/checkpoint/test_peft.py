@@ -237,6 +237,7 @@ def test_hf_peft_checkpoint(use_triton=False):
         "lora_alpha": 32,
         "peft_type": "LORA",
         "r": 8,
+        "use_dora": False,
         "target_modules": [
             "lm_head",
             "model.layers.0.self_attn.k_proj",
@@ -259,6 +260,7 @@ def test_hf_peft_checkpoint(use_triton=False):
         "lora_dtype": None,
         "match_all_linear": True,
         "target_modules": [],
+        "use_dora": False,
         "use_triton": False,
     }
 
@@ -478,6 +480,80 @@ def test_hf_peft_checkpoint(use_triton=False):
 
     if torch.distributed.get_rank() == 0:
         # delete the checkpoint directory
+        if Path(trainer.checkpointer.config.checkpoint_dir).exists():
+            shutil.rmtree(Path(trainer.checkpointer.config.checkpoint_dir))
+    torch.distributed.barrier()
+
+
+def test_hf_peft_dora_checkpoint():
+    """
+    Tests DoRA finetune 
+    """
+    default_cfg_path = Path(__file__).parents[3] / "examples" / "llm_finetune" / "llama3_2" / "llama3_2_1b_hellaswag_peft.yaml"
+    cfg = parse_args_and_load_config(default_cfg_path)
+
+    # Enable DoRA
+    cfg.peft.use_dora = True
+    cfg.peft.use_triton = False
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+    trainer.run_train_validation_loop()
+
+    model_state_dict = ModelState(
+        trainer.model_parts,
+        trainer.checkpointer.config.is_peft,
+    ).state_dict()
+
+    # Find the checkpoint (step count depends on config)
+    ckpt_dir = Path(trainer.checkpointer.config.checkpoint_dir)
+    ckpt_subdirs = sorted([d for d in ckpt_dir.iterdir() if d.is_dir() and "epoch" in d.name])
+    assert len(ckpt_subdirs) > 0, "No checkpoint found"
+    checkpoint_path = ckpt_subdirs[-1] / "model"
+
+    assert checkpoint_path.exists()
+    assert (checkpoint_path / "adapter_model.safetensors").exists()
+    assert (checkpoint_path / "adapter_config.json").exists()
+
+    # Verify DoRA flag is saved
+    restored_config = json.load(open(checkpoint_path / "adapter_config.json"))
+    assert restored_config["use_dora"] is True
+
+    # Verify DoRA magnitude vectors are saved
+    restored_model_dict = load_safetensors(checkpoint_path / "adapter_model.safetensors")
+    dora_keys = [k for k in restored_model_dict.keys() if "lora_magnitude" in k]
+    assert len(dora_keys) > 0, "DoRA magnitude vectors should be present"
+
+    # Verify adapter loads with HF PEFT
+    if torch.distributed.get_rank() == 0:
+        base = AutoModelForCausalLM.from_pretrained(cfg.model.pretrained_model_name_or_path)
+        peft_model = PeftModel.from_pretrained(base, checkpoint_path).to(trainer.model_parts[0].dtype)
+
+        # Verify DoRA magnitude vectors exist in loaded model
+        peft_dora_modules = [
+            name for name, mod in peft_model.named_modules()
+            if hasattr(mod, "lora_magnitude_vector") and len(mod.lora_magnitude_vector) > 0
+        ]
+        assert len(peft_dora_modules) > 0, "DoRA should be active in HF PEFT model"
+
+        # Verify LoRA params match
+        for source_key, source_param in model_state_dict.items():
+            if "lora_A" not in source_key and "lora_B" not in source_key:
+                continue
+            for peft_key, peft_param in peft_model.named_parameters():
+                if "lora" in peft_key and source_key.rsplit(".", 1)[0] in peft_key:
+                    assert torch.allclose(source_param, peft_param), f"Mismatch for {source_key}"
+
+        # Verify forward pass works
+        peft_model.eval()
+        test_input = torch.randint(0, base.config.vocab_size, (1, 10)).to(peft_model.device)
+        with torch.no_grad():
+            output = peft_model(test_input)
+            assert output.logits is not None
+
+    torch.distributed.barrier()
+
+    if torch.distributed.get_rank() == 0:
         if Path(trainer.checkpointer.config.checkpoint_dir).exists():
             shutil.rmtree(Path(trainer.checkpointer.config.checkpoint_dir))
     torch.distributed.barrier()

@@ -398,22 +398,56 @@ class BiencoderModel(nn.Module):
         )
         return model
 
-    def save(self, output_dir: str):
-        """Save model to output directory."""
+    def save_pretrained(self, save_directory: str, **kwargs):
+        """Save model to output directory.
 
-        logger.info(f"Saving BiencoderModel to {output_dir}")
+        When a ``checkpointer`` is supplied (the normal training path), saving
+        is delegated to :py:meth:`Checkpointer.save_model` so that:
+
+        * The ``state_dict_adapter`` (to_hf / from_hf) conversions are applied,
+          keeping the on-disk key format consistent with ``load_model``.
+        * Distributed / FSDP state dicts are handled correctly.
+        * Async and consolidated-safetensors paths are honoured.
+
+        Without a checkpointer the method falls back to HuggingFace-native
+        ``save_pretrained`` on the underlying encoder(s), which is useful for
+        standalone / non-distributed export.
+
+        Args:
+            save_directory: Output path for the checkpoint.
+            **kwargs: Forwarded from the recipe; expected keys include
+                ``checkpointer``, ``tokenizer``, and ``peft_config``.
+        """
+        checkpointer = kwargs.get("checkpointer", None)
+        if checkpointer is not None:
+            # Delegate to Checkpointer.save_model() which handles:
+            # - ModelState.state_dict()
+            # - _maybe_adapt_state_dict_to_hf() via state_dict_adapter
+            # - Distributed/sharded saving via DCP
+            # - Consolidated HF safetensors output
+            # - Async checkpointing if enabled
+            checkpointer.save_model(
+                model=self,
+                weights_path=save_directory,
+                peft_config=kwargs.get("peft_config", None),
+                tokenizer=kwargs.get("tokenizer", None),
+            )
+            return
+
+        # Fallback: HF-native save (no checkpointer available)
+        logger.info(f"Saving BiencoderModel to {save_directory}")
 
         # Save the model
         if self.share_encoder:
-            self.lm_q.save_pretrained(output_dir)
+            self.lm_q.save_pretrained(save_directory)
         else:
-            os.makedirs(os.path.join(output_dir, "query_model"), exist_ok=True)
-            os.makedirs(os.path.join(output_dir, "passage_model"), exist_ok=True)
-            self.lm_q.save_pretrained(os.path.join(output_dir, "query_model"))
-            self.lm_p.save_pretrained(os.path.join(output_dir, "passage_model"))
+            os.makedirs(os.path.join(save_directory, "query_model"), exist_ok=True)
+            os.makedirs(os.path.join(save_directory, "passage_model"), exist_ok=True)
+            self.lm_q.save_pretrained(os.path.join(save_directory, "query_model"))
+            self.lm_p.save_pretrained(os.path.join(save_directory, "passage_model"))
 
         # Save linear pooler if exists
         if self.add_linear_pooler:
-            pooler_path = os.path.join(output_dir, "pooler.pt")
+            pooler_path = os.path.join(save_directory, "pooler.pt")
             logger.info(f"Saving linear pooler to {pooler_path}")
             torch.save(self.linear_pooler.state_dict(), pooler_path)

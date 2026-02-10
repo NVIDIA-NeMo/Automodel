@@ -21,7 +21,8 @@ from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.gpt_oss.model import Block, GptOssForCausalLM, GptOssModel
-from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
+from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.layers import MLP, MoE
 from nemo_automodel.components.models.common import BackendConfig
 
 @pytest.fixture
@@ -91,7 +92,8 @@ def backend_config():
         linear="torch",
         attn="flex",
         rms_norm="torch",
-        enable_deepep=False,
+        experts="torch",
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
         rope_fusion=False,

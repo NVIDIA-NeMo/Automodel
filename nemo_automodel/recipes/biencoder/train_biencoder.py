@@ -35,9 +35,10 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel._transformers.infrastructure import MeshContext, instantiate_infrastructure, apply_model_infrastructure
 from nemo_automodel.components.distributed.device_mesh import create_device_mesh
-from nemo_automodel.recipes.llm.train_ft import build_distributed, build_optimizer, build_step_scheduler
+from nemo_automodel.recipes.llm.train_ft import build_distributed, build_step_scheduler
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 import wandb
@@ -361,7 +362,31 @@ class TrainBiencoderRecipe(BaseRecipe):
 
         # Build optimizer
         logger.info("Building optimizer...")
-        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+        # Mimic common LLM training practice: apply weight decay only to non-bias/non-norm params.
+        decay_params = []
+        no_decay_params = []
+        for name, param in self.model_parts[0].named_parameters():
+            if not param.requires_grad:
+                continue
+            name_l = name.lower()
+            if name.endswith(".bias") or ("norm" in name_l):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        trainable_params = decay_params + no_decay_params
+        assert len(trainable_params) > 0, "trainable_params cannot be empty"
+
+        param_groups = []
+        if decay_params:
+            param_groups.append({"params": decay_params})
+        if no_decay_params:
+            param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+
+        logger.info("Optimizer param groups: decay=%d, no_decay=%d", len(decay_params), len(no_decay_params))
+        self.optimizer = [self.cfg.optimizer.instantiate(params=param_groups)]
+
+        print_trainable_parameters(self.model_parts[0])
 
         # Build tokenizer
         self.tokenizer = self.cfg.tokenizer.instantiate()
@@ -480,7 +505,6 @@ class TrainBiencoderRecipe(BaseRecipe):
             k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
             for k, v in batch.items()
         }
-
         # Unpack query and passage inputs using the same logic as biencoder_trainer.py
         query, passage = _unpack_qp(batch)
 

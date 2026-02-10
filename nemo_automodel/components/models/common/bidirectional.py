@@ -21,7 +21,7 @@ to attend to all tokens bidirectionally, which is useful for embedding
 and retrieval tasks.
 """
 
-from typing import Any, Optional, Type
+from typing import Any, Optional, Tuple, Type
 
 from torch.distributed.device_mesh import DeviceMesh
 from transformers import PreTrainedModel
@@ -72,7 +72,7 @@ def create_bidirectional_model_class(
     base_model_class: Type[PreTrainedModel],
     base_config_class: Type[PretrainedConfig],
     model_type_suffix: str = "_bidirec",
-) -> Type[PreTrainedModel]:
+) -> Tuple[Type[PreTrainedModel], Type[PretrainedConfig]]:
     """
     Factory to create a bidirectional variant of any transformer model.
 
@@ -85,12 +85,12 @@ def create_bidirectional_model_class(
         model_type_suffix: Suffix to append to the model_type for the config.
 
     Returns:
-        A new class that is a bidirectional variant of the base model.
+        A tuple of (BidirectionalModel, BidirectionalConfig) classes.
 
     Example:
         >>> from transformers.models.llama.modeling_llama import LlamaModel
         >>> from transformers.models.llama.configuration_llama import LlamaConfig
-        >>> LlamaBidirectionalModel = create_bidirectional_model_class(
+        >>> LlamaBidirectionalModel, LlamaBidirectionalConfig = create_bidirectional_model_class(
         ...     LlamaModel, LlamaConfig
         ... )
     """
@@ -129,37 +129,44 @@ def create_bidirectional_model_class(
 
 
 class BiencoderStateDictAdapter(StateDictAdapter):
-    """Adapter for converting BiencoderModel state dict to single encoder format.
+    """Adapter for converting BiencoderModel state dict to/from single-encoder HF format.
 
-    This adapter extracts only the query encoder (lm_q) state dict and converts
-    the "lm_q." prefix to "model." prefix, making it compatible with standard
-    HuggingFace model format.
+    Extracts only the query encoder (lm_q) on save, mapping ``lm_q.`` to ``model.``.
+    On load, fans ``model.`` keys back out to both ``lm_q.`` and ``lm_p.``.
+    PEFT-prefixed keys (``base_model.model.``) are handled transparently.
     """
 
+    _PEFT_PREFIX = "base_model.model."
+
     def __init__(self):
-        """Initialize the adapter."""
         self._uses_model_prefix = True
 
-    def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
-        """Convert from biencoder state dict to HuggingFace format.
+    @staticmethod
+    def _swap_key(key: str, src: str, dst: str, peft_prefix: str) -> Optional[str]:
+        """Return *key* with *src* prefix replaced by *dst*, handling an optional PEFT wrapper.
 
-        Filters to only lm_q keys and converts "lm_q." prefix to "model." prefix.
-
-        Args:
-            state_dict: The biencoder model state dict
-
-        Returns:
-            The converted HuggingFace format state dict with only query encoder
+        Returns ``None`` when *key* doesn't match *src* (bare or PEFT-wrapped).
         """
+        if key.startswith(src):
+            return dst + key[len(src):]
+        peft_src = peft_prefix + src
+        if key.startswith(peft_src):
+            return peft_prefix + dst + key[len(peft_src):]
+        return None
+
+    @staticmethod
+    def _is_pooler_key(key: str, peft_prefix: str) -> bool:
+        return key.startswith("linear_pooler.") or key.startswith(peft_prefix + "linear_pooler.")
+
+    def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
+        """Convert biencoder state dict to HF format (lm_q -> model)."""
         hf_state_dict = {}
-
         for key, value in state_dict.items():
-            if key.startswith("lm_q."):
-                new_key = key.replace("lm_q.", "model.")
+            new_key = self._swap_key(key, "lm_q.", "model.", self._PEFT_PREFIX)
+            if new_key is not None:
                 hf_state_dict[new_key] = value
-            elif key.startswith("linear_pooler."):
+            elif self._is_pooler_key(key, self._PEFT_PREFIX):
                 hf_state_dict[key] = value
-
         return hf_state_dict
 
     def from_hf(
@@ -168,49 +175,24 @@ class BiencoderStateDictAdapter(StateDictAdapter):
         device_mesh: Optional["DeviceMesh"] = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Convert HuggingFace state dict to biencoder format.
-
-        Converts "model." prefix to "lm_q." prefix for loading into biencoder.
-
-        Args:
-            hf_state_dict: The HuggingFace format state dict
-            device_mesh: Optional device mesh (not used in this adapter)
-
-        Returns:
-            The converted biencoder format state dict
-        """
+        """Convert HF state dict to biencoder format (model -> lm_q + lm_p)."""
         biencoder_state_dict = {}
-
         for key, value in hf_state_dict.items():
-            if key.startswith("model."):
-                new_key_q = key.replace("model.", "lm_q.")
-                biencoder_state_dict[new_key_q] = value
-                new_key_p = key.replace("model.", "lm_p.")
-                biencoder_state_dict[new_key_p] = value
-            elif key.startswith("linear_pooler."):
+            q_key = self._swap_key(key, "model.", "lm_q.", self._PEFT_PREFIX)
+            if q_key is not None:
+                p_key = self._swap_key(key, "model.", "lm_p.", self._PEFT_PREFIX)
+                biencoder_state_dict[q_key] = value
+                biencoder_state_dict[p_key] = value
+            elif self._is_pooler_key(key, self._PEFT_PREFIX):
                 biencoder_state_dict[key] = value
-
         return biencoder_state_dict
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
-        """Convert a single tensor from biencoder format to HuggingFace format.
-
-        Args:
-            fqn: Fully qualified name of the tensor in biencoder format
-            tensor: The tensor to convert
-            **kwargs: Additional arguments (unused)
-
-        Returns:
-            List of (fqn, tensor) tuples in HuggingFace format.
-            Returns empty list if tensor is not part of lm_q.
-        """
+        """Convert a single tensor from biencoder to HF format. Skips non-lm_q tensors."""
         if fqn.startswith("lm_q."):
-            new_fqn = fqn.replace("lm_q.", "model.")
-            return [(new_fqn, tensor)]
+            return [("model." + fqn[len("lm_q."):], tensor)]
         if fqn.startswith("linear_pooler."):
             return [(fqn, tensor)]
-
-        # Skip tensors that are not part of lm_q
         return []
 
 
