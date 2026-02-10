@@ -40,9 +40,9 @@ python -m torch.distributed.run \
     --peft.use_triton false \
     --peft.use_dora true \
     --peft._target_ nemo_automodel.components._peft.lora.PeftConfig \
-    --distributed_config._target_ nemo_automodel.components.distributed.config.FSDP2Config \
+    --distributed._target_ nemo_automodel.components.distributed.config.FSDP2Config \
     --distributed.dp_size none \
     --distributed.tp_size 1 \
     --distributed.cp_size 1 \
-    --distributed_config.sequence_parallel false \
+    --distributed.sequence_parallel false \
 

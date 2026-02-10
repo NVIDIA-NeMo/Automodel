@@ -33,5 +33,5 @@ examples/llm_finetune/finetune.py \
   --dataset.limit_dataset_samples 10 \
   --validation_dataset.dataset_name $HF_CACHE/squad/ \
   --validation_dataset.limit_dataset_samples 10 \
-  --distributed_config._target_ nemo_automodel.components.distributed.config.DDPConfig \
-  --distributed_config.activation_checkpointing true
+  --distributed._target_ nemo_automodel.components.distributed.config.DDPConfig \
+  --distributed.activation_checkpointing true

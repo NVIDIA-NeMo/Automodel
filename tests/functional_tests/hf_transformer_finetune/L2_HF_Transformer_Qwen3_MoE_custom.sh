@@ -38,11 +38,11 @@ examples/llm_finetune/finetune.py \
     --validation_dataset.limit_dataset_samples 8 \
     --model.is_meta_device true \
     --checkpoint.enabled false \
-    --distributed_config._target_ nemo_automodel.components.distributed.config.FSDP2Config \
+    --distributed._target_ nemo_automodel.components.distributed.config.FSDP2Config \
     --distributed.tp_size 1 \
     --distributed.cp_size 1 \
     --distributed.pp_size 1 \
     --distributed.ep_size 2 \
-    --distributed_config.sequence_parallel false
+    --distributed.sequence_parallel false
 
 

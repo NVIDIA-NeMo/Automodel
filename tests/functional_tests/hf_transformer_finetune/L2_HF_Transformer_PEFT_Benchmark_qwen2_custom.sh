@@ -28,7 +28,7 @@ nemo_automodel/recipes/llm/benchmark.py \
     --model.pretrained_model_name_or_path=${MODLE_PATH} \
     --distributed.tp_size=2 \
     --distributed.pp_size=1 \
-    --distributed_config.sequence_parallel=True \
+    --distributed.sequence_parallel=True \
     --benchmark.warmup_steps=2 \
     --step_scheduler.max_steps=4 \
     --step_scheduler.global_batch_size=2 \

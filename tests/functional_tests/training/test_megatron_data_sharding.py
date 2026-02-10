@@ -34,7 +34,7 @@ def test_megatron_data_sharding():
     cfg_path = Path(__file__).parents[4] / "examples" / "llm_pretrain" / "megatron_pretrain_gpt2.yaml"
     cfg = parse_args_and_load_config(cfg_path)
     dist_env = build_distributed(cfg.get("dist_env", {}))
-    distributed_config = cfg.distributed_config.instantiate()
+    distributed_config = cfg.distributed.instantiate()
     device_mesh, _ = create_device_mesh(
         distributed_config,
         dp_size=cfg.get("distributed.dp_size", None),

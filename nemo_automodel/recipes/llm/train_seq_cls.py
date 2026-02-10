@@ -23,7 +23,7 @@ import wandb
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.distributed.device_mesh import create_device_mesh
+from nemo_automodel.components.distributed.config_factory import setup_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
@@ -56,21 +56,12 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         apply_cache_compatibility_patches()
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
-        self.device_mesh = None
-        self.moe_mesh = None
-        self.distributed_config = None
-        if "distributed_config" in self.cfg:
-            self.distributed_config = self.cfg.distributed_config.instantiate()
-            self.device_mesh, self.moe_mesh = create_device_mesh(
-                self.distributed_config,
-                dp_size=self.cfg.get("distributed.dp_size", None),
-                dp_replicate_size=self.cfg.get("distributed.dp_replicate_size", None),
-                tp_size=self.cfg.get("distributed.tp_size", 1),
-                pp_size=self.cfg.get("distributed.pp_size", 1),
-                cp_size=self.cfg.get("distributed.cp_size", 1),
-                ep_size=self.cfg.get("distributed.ep_size", 1),
-                world_size=self.dist_env.world_size,
-            )
+        self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+        self.distributed_config = self.dist_setup.strategy_config
+        self.device_mesh = self.dist_setup.device_mesh
+        self.moe_mesh = self.dist_setup.moe_mesh
+        self.pp_enabled = self.dist_setup.pp_enabled
+        self.pipeline_config = self.dist_setup.pipeline_config
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()

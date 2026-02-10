@@ -30,8 +30,8 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
     --validation_dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
     --checkpoint.checkpoint_dir checkpoints/ \
-    --distributed_config._target_ nemo_automodel.components.distributed.config.FSDP2Config \
+    --distributed._target_ nemo_automodel.components.distributed.config.FSDP2Config \
     --distributed.dp_size 1 \
     --distributed.tp_size 2 \
     --distributed.cp_size 1 \
-    --distributed_config.sequence_parallel false
+    --distributed.sequence_parallel false

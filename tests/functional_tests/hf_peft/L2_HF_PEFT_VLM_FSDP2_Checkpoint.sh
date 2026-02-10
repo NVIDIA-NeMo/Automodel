@@ -36,8 +36,8 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run  --master-port=29504 \
   --checkpoint.enabled true \
   --checkpoint.checkpoint_dir checkpoints/ \
   --checkpoint.model_save_format safetensors \
-  --distributed_config._target_ nemo_automodel.components.distributed.config.FSDP2Config \
+  --distributed._target_ nemo_automodel.components.distributed.config.FSDP2Config \
   --distributed.dp_size none \
   --distributed.tp_size 1 \
   --distributed.cp_size 1 \
-  --distributed_config.sequence_parallel false
+  --distributed.sequence_parallel false

@@ -207,14 +207,7 @@ def _shard_pp(autopipeline, model, loss_fn, parallelize_fn):
 
 
 def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh):
-    """Apply EP + FSDP sharding (non-PP path).
-
-    Args:
-        model: The model to shard.
-        model_wrapper: Distributed manager instance.
-        parallelize_fn: MoE parallelizer (EP path) or None.
-        mesh: MeshContext holding meshes and axis names.
-    """
+    """Apply EP + FSDP sharding (non-PP path)."""
     if parallelize_fn is not None and get_world_size_safe() > 1:
         parallelize_fn(
             model,
@@ -297,17 +290,8 @@ def _instantiate_pipeline(
 def _instantiate_qat(
     config: Optional[QATConfig],
 ) -> Optional[Union["Int4WeightOnlyQATQuantizer", "Int8DynActInt4WeightQATQuantizer"]]:
-    """Instantiate QAT quantizer from config.
-
-    Args:
-        config: QAT config. If None, returns None.
-
-    Returns:
-        QAT quantizer instance, or None if QAT is not enabled.
-    """
     if config is None:
         return None
-
     return config.create_quantizer()
 
 
@@ -343,6 +327,7 @@ def instantiate_infrastructure(
     pipeline_config: Optional[PipelineConfig] = None,
     qat_config: Optional[QATConfig] = None,
     moe_config: Optional[MoEParallelizerConfig] = None,
+    activation_checkpointing: bool = False,
     device: Optional[torch.device] = None,
     mesh: Optional[MeshContext] = None,
     # Deprecated -- prefer passing ``mesh`` directly
@@ -362,6 +347,8 @@ def instantiate_infrastructure(
         pipeline_config: Pipeline parallelism config.
         qat_config: Quantization-aware training config.
         moe_config: MoE parallelizer config (for expert parallel models).
+        activation_checkpointing: Enable activation checkpointing for transformer blocks.
+            Defaults to False.
         device: Target device for model.
         mesh: MeshContext holding device meshes, sizes, and axis names.
             If None, built from the legacy ``device_mesh`` / ``moe_mesh`` params.
@@ -382,22 +369,17 @@ def instantiate_infrastructure(
 
     ep_size = mesh.ep_size if mesh.ep_size > 1 else ep_size
 
-    # Instantiate distributed manager
     model_wrapper = _instantiate_distributed(distributed_config, mesh)
-
-    # Instantiate pipeline
     autopipeline = _instantiate_pipeline(pipeline_config, mesh, device)
 
-    # Build parallelize_fn for EP or PP
     parallelize_fn = None
     if ep_size > 1:
         from nemo_automodel.components.moe.parallelizer import parallelize_model
 
-        parallelize_fn = partial(parallelize_model, **moe_config.to_dict())
+        parallelize_fn = partial(parallelize_model, activation_checkpointing=activation_checkpointing, **moe_config.to_dict())
     elif autopipeline is not None and model_wrapper is not None:
         parallelize_fn = partial(parallelize_for_pp, model_wrapper=model_wrapper)
 
-    # Instantiate QAT quantizer
     qat_quantizer = _instantiate_qat(qat_config)
 
     return model_wrapper, autopipeline, parallelize_fn, qat_quantizer

@@ -29,8 +29,8 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --dataset.limit_dataset_samples 1000 \
     --step_scheduler.global_batch_size 8 \
     --step_scheduler.local_batch_size 4 \
-    --distributed_config._target_ nemo_automodel.components.distributed.config.FSDP2Config \
+    --distributed._target_ nemo_automodel.components.distributed.config.FSDP2Config \
     --distributed.dp_size none \
     --distributed.tp_size 1 \
     --distributed.cp_size 1 \
-    --distributed_config.sequence_parallel false
+    --distributed.sequence_parallel false

@@ -28,10 +28,6 @@ rng:
   seed: 1234
   ranked: true
 
-moe_config:
-  _target_: nemo_automodel.components.moe.config.MoEParallelizerConfig
-  activation_checkpointing: false
-
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
@@ -77,23 +73,21 @@ checkpoint:
   save_consolidated: false
 
 distributed:
+  strategy: fsdp2
   tp_size: 1
   cp_size: 1
   pp_size: 1
   ep_size: 2
 
-distributed_config:
-  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false
 
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.config.PipelineConfig
-  pp_schedule: interleaved1f1b
-  pp_microbatch_size: 1
-  round_virtual_stages_to_pp_multiple: up
-  scale_grads_in_schedule: false
-  patch_inner_model: false
-  patch_causal_lm_model: false
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    round_virtual_stages_to_pp_multiple: up
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

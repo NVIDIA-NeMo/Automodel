@@ -30,9 +30,9 @@ examples/llm_finetune/finetune.py \
   --dataset.limit_dataset_samples 10 \
   --validation_dataset.dataset_name $HF_CACHE/squad/ \
   --validation_dataset.limit_dataset_samples 10 \
-  --distributed_config._target_ nemo_automodel.components.distributed.config.FSDP2Config \
+  --distributed._target_ nemo_automodel.components.distributed.config.FSDP2Config \
   --distributed.dp_size none \
   --distributed.tp_size 2 \
   --distributed.cp_size 1 \
-  --distributed_config.sequence_parallel false \
-  --distributed_config.activation_checkpointing true
+  --distributed.sequence_parallel false \
+  --distributed.activation_checkpointing true
