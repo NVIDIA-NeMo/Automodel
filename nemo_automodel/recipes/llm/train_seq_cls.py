@@ -35,7 +35,8 @@ from nemo_automodel.recipes.llm.train_ft import (
     build_dataloader,
     build_distributed,
     build_lr_scheduler,
-    build_model_and_optimizer,
+    build_model,
+    build_optimizer,
     build_step_scheduler,
 )
 
@@ -112,9 +113,8 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         self.peft_config = self.cfg.instantiate_path("peft")
-        model, self.optimizer = build_model_and_optimizer(
+        model = build_model(
             cfg_model=self.cfg.model,
-            cfg_opt=self.cfg.optimizer,
             cfg_peft=self.peft_config,
             seed=self.cfg.get("seed", 42),
             has_packed_sequence=use_hf_fa2,
@@ -125,6 +125,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             distributed_config=self.distributed_config,
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )
+        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 
         self.model_parts = [model]
 
