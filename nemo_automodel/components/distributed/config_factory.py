@@ -129,7 +129,10 @@ def parse_distributed_section(cfg_dict: dict) -> DistributedSetup:
 
     strategy_config = strategy_cls(**strategy_kwargs)
     pipeline_config = PipelineConfig(**pipeline_dict) if pipeline_dict is not None and parallelism["pp_size"] > 1 else None
-    moe_config = MoEParallelizerConfig(**moe_dict) if moe_dict is not None and parallelism["ep_size"] > 1 else None
+    if parallelism["ep_size"] > 1:
+        moe_config = MoEParallelizerConfig(**(moe_dict or {}))
+    else:
+        moe_config = None
 
     return DistributedSetup(
         strategy_config=strategy_config,

@@ -608,44 +608,41 @@ Add pipeline parallelism to an existing config using command-line arguments:
 ```bash
 uv run torchrun --nproc_per_node=2 examples/llm/finetune.py \
     --config examples/llm/llama_3_2_1b_squad.yaml \
-    --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
+    --distributed.strategy fsdp2 \
     --distributed.pp_size 2 \
-    --autopipeline._target_ nemo_automodel.components.distributed.pipelining.AutoPipeline \
-    --autopipeline.pp_schedule 1f1b \
-    --autopipeline.pp_microbatch_size 1 \
-    --autopipeline.round_virtual_stages_to_pp_multiple up \
-    --autopipeline.scale_grads_in_schedule false
+    --distributed.pipeline._target_ nemo_automodel.components.distributed.pipelining.AutoPipeline \
+    --distributed.pipeline.pp_schedule 1f1b \
+    --distributed.pipeline.pp_microbatch_size 1 \
+    --distributed.pipeline.round_virtual_stages_to_pp_multiple up \
+    --distributed.pipeline.scale_grads_in_schedule false
 ```
 
 Key parameters to override:
 - `--distributed.pp_size`: Number of pipeline stages (must match nproc_per_node)
-- `--autopipeline._target_`: Specify AutoPipeline class
+- `--distributed.pipeline._target_`: Specify AutoPipeline class
 - `pp_batch_size` is automatically inferred from `--dataloader.batch_size`
-- `--autopipeline.pp_schedule`: Pipeline schedule (1f1b, interleaved_1f1b, etc.)
+- `--distributed.pipeline.pp_schedule`: Pipeline schedule (1f1b, interleaved_1f1b, etc.)
 
 ### YAML Configuration Method
 
 Add these sections to your existing YAML config:
 
 ```yaml
-# Modify existing distributed section
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   dp_size: 1
   tp_size: 1
   cp_size: 1
   pp_size: 4  # Enable 4-way pipeline parallelism
   sequence_parallel: false
-
-# Add new autopipeline section
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
-  pp_schedule: 1f1b
-  pp_microbatch_size: 1
-  # pp_batch_size is automatically inferred from dataloader.batch_size
-  round_virtual_stages_to_pp_multiple: up
-  scale_grads_in_schedule: false
-  layers_per_stage: null  # Auto-compute, or specify number
+  pipeline:
+    _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
+    pp_schedule: 1f1b
+    pp_microbatch_size: 1
+    # pp_batch_size is automatically inferred from dataloader.batch_size
+    round_virtual_stages_to_pp_multiple: up
+    scale_grads_in_schedule: false
+    layers_per_stage: null  # Auto-compute, or specify number
 ```
 
 ### Mixed Parallelism Examples
@@ -685,21 +682,20 @@ AutoPipeline seamlessly integrates with NeMo AutoModel's recipe system. Here's a
 ```yaml
 # config.yaml
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   dp_size: 1
   tp_size: 1
   cp_size: 1
   pp_size: 2          # 2-way pipeline parallelism
   sequence_parallel: false
-
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
-  pp_schedule: 1f1b
-  pp_microbatch_size: 1
-  # pp_batch_size is automatically inferred from dataloader.batch_size
-  layers_per_stage: null  # Auto-compute layer distribution
-  round_virtual_stages_to_pp_multiple: up
-  scale_grads_in_schedule: false
+  pipeline:
+    _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
+    pp_schedule: 1f1b
+    pp_microbatch_size: 1
+    # pp_batch_size is automatically inferred from dataloader.batch_size
+    layers_per_stage: null  # Auto-compute layer distribution
+    round_virtual_stages_to_pp_multiple: up
+    scale_grads_in_schedule: false
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
