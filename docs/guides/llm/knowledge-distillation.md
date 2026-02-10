@@ -25,7 +25,7 @@ $$p^{s} = softmax(z^{s}, T)$$.
 
 ---
 
-## 2. Prepare the YAML config
+## Prepare the YAML Config
 
 A ready-to-use example is provided at
 `examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml`.  Important sections:
