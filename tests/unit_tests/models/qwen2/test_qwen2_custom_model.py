@@ -63,7 +63,6 @@ def _create_checkpoint(config_kwargs, tmpdir):
 
 
 class TestQwen2Model:
-
     @pytest.fixture(scope="class", autouse=True)
     def _tiny_checkpoint(self, tmp_path_factory):
         """Create a tiny HF Qwen2 checkpoint shared across tests (auto-cleaned by pytest)."""
@@ -166,9 +165,7 @@ class TestQwen2Model:
 
         # Create new HF model and load converted state dict
         qwen2_model_hf_converted = (
-            AutoModelForCausalLM.from_pretrained(
-                checkpoint, attn_implementation="eager", torch_dtype=torch.bfloat16
-            )
+            AutoModelForCausalLM.from_pretrained(checkpoint, attn_implementation="eager", torch_dtype=torch.bfloat16)
             .to("cuda")
             .to(torch.bfloat16)
         )  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype

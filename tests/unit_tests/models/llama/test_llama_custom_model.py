@@ -89,7 +89,6 @@ def _create_checkpoint(config_kwargs, tmpdir):
 
 
 class TestLlamaModel:
-
     @pytest.fixture(scope="class", autouse=True)
     def _tiny_checkpoint(self, tmp_path_factory):
         """Create a tiny HF Llama checkpoint shared across tests (auto-cleaned by pytest)."""
@@ -194,9 +193,7 @@ class TestLlamaModel:
 
         # Create new HF model and load converted state dict
         llama_model_hf_converted = (
-            AutoModelForCausalLM.from_pretrained(
-                checkpoint, attn_implementation="eager", torch_dtype=torch.bfloat16
-            )
+            AutoModelForCausalLM.from_pretrained(checkpoint, attn_implementation="eager", torch_dtype=torch.bfloat16)
             .to("cuda")
             .to(torch.bfloat16)
         )  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
