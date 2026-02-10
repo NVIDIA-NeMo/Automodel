@@ -37,6 +37,12 @@ FROM ${BASE_IMAGE} AS update_base_container
 ENV PIP_NO_CACHE_DIR=1
 WORKDIR /opt
 
+ENV DEBIAN_FRONTEND=noninteractive
+# Address CVE-2025-68973
+RUN apt-get update && apt install -y --only-upgrade gnupg && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
 # Install uv
 ENV UV_VERSION="0.8.22"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
