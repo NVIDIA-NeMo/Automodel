@@ -137,7 +137,7 @@ validation_dataloader:
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
 ```
 
-### Current limitations
+### Current Limitations
 
 * Pipeline parallelism (`pp_size > 1`) is not yet supported – planned for a future release.
 * Distilling Vision-Language models (`vlm` recipe) is currently not supported.
