@@ -48,7 +48,7 @@ def is_tensor_unallocated(tensor: torch.Tensor) -> bool:
 class BackendConfig:
     attn: Literal["te", "sdpa", "flex"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
-    rms_norm: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
+    rms_norm: Literal["torch", "torch_fp32", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
     experts: Literal["torch", "te", "gmm"] = "torch"
     dispatcher: Literal["torch", "deepep"] = "torch"
@@ -86,6 +86,28 @@ class BackendConfig:
             )
 
 
+class _Float32RMSNorm(nn.Module):
+    """RMSNorm with explicit float32 upcast, matching HuggingFace's LlamaRMSNorm precision.
+
+    PyTorch's nn.RMSNorm computes in the input dtype (e.g. bfloat16),
+    but HF's LlamaRMSNorm upcasts to float32 for variance/rsqrt to avoid
+    precision loss. This class matches HF's behavior so that custom model
+    outputs are numerically identical to HF.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6, device=None, dtype=None):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim, device=device, dtype=dtype))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+
 def initialize_rms_norm_module(
     rms_norm_impl: str,
     dim: int,
@@ -99,7 +121,10 @@ def initialize_rms_norm_module(
     Call reset_parameters() to materialize weights if created on meta device.
 
     Args:
-        rms_norm_impl: Backend implementation ("te" or "torch")
+        rms_norm_impl: Backend implementation ("te", "torch", or "torch_fp32")
+            - "te": Transformer Engine fused RMSNorm kernel
+            - "torch": PyTorch native nn.RMSNorm (computes in input dtype)
+            - "torch_fp32": Float32-upcast RMSNorm matching HF LlamaRMSNorm precision
         dim: Normalized dimension
         eps: Epsilon for numerical stability
         device: Device to create module on (None uses PyTorch default, typically CPU)
@@ -114,6 +139,8 @@ def initialize_rms_norm_module(
         return TransformerEngineRMSNorm(normalized_shape=dim, eps=eps, device=device, params_dtype=dtype)
     elif rms_norm_impl == "torch":
         return nn.RMSNorm(dim, eps=eps, device=device, dtype=dtype)
+    elif rms_norm_impl == "torch_fp32":
+        return _Float32RMSNorm(dim, eps=eps, device=device, dtype=dtype)
     else:
         raise ValueError(f"Unsupported RMSNorm implementation: {rms_norm_impl}")
 

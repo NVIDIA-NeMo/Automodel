@@ -22,50 +22,84 @@ import torch
 from transformers import AutoModelForCausalLM, LlamaConfig
 
 from nemo_automodel import NeMoAutoModelForCausalLM
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
+# Tiny config with rope_type="default" (no rope_scaling)
+TINY_DEFAULT_ROPE_CONFIG = dict(
+    vocab_size=1024,
+    hidden_size=256,
+    intermediate_size=512,
+    num_hidden_layers=2,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    max_position_embeddings=128,
+    rms_norm_eps=1e-6,
+    tie_word_embeddings=True,
+)
 
-@pytest.fixture(scope="class")
-def tiny_llama_checkpoint():
-    """Create a tiny Llama model with random weights in a temporary directory."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Create a small config for fast testing
-        config = LlamaConfig(
-            vocab_size=1024,
-            hidden_size=256,
-            intermediate_size=512,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,  # GQA
-            max_position_embeddings=128,
-            rms_norm_eps=1e-6,
-            tie_word_embeddings=True,
-        )
+# Tiny config with rope_type="llama3" (Llama-3-style RoPE scaling)
+TINY_LLAMA3_ROPE_CONFIG = dict(
+    vocab_size=1024,
+    hidden_size=256,
+    intermediate_size=512,
+    num_hidden_layers=2,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    max_position_embeddings=256,
+    rms_norm_eps=1e-6,
+    tie_word_embeddings=True,
+    rope_theta=500000.0,
+    rope_scaling=dict(
+        rope_type="llama3",
+        factor=8.0,
+        low_freq_factor=1.0,
+        high_freq_factor=4.0,
+        original_max_position_embeddings=128,
+    ),
+)
 
-        # Save config
-        config.save_pretrained(tmpdir)
+ROPE_CONFIGS = {
+    "default": TINY_DEFAULT_ROPE_CONFIG,
+    "llama3": TINY_LLAMA3_ROPE_CONFIG,
+}
 
-        # Create model with random weights
-        model = AutoModelForCausalLM.from_config(config)
 
-        # Save model
-        model.save_pretrained(tmpdir)
-
-        yield tmpdir
+def _create_checkpoint(config_kwargs):
+    """Create a tiny HF Llama checkpoint in a temp directory."""
+    tmpdir = tempfile.mkdtemp()
+    config = LlamaConfig(**config_kwargs)
+    config.save_pretrained(tmpdir)
+    model = AutoModelForCausalLM.from_config(config)
+    model.save_pretrained(tmpdir)
+    return tmpdir
 
 
 class TestLlamaModel:
-    def test_model_matches_hf_with_adapter_bidirectional(self, tiny_llama_checkpoint):
-        """Test bidirectional conversion between HF and custom models produces identical outputs."""
-        config = LlamaConfig.from_pretrained(tiny_llama_checkpoint)
+
+    @pytest.mark.parametrize("rope_type", ["default", "llama3"])
+    @pytest.mark.parametrize("rms_norm", ["torch_fp32", "torch", "te"])
+    def test_model_matches_hf_with_adapter_bidirectional(self, rope_type, rms_norm):
+        """Test bidirectional conversion between HF and custom models produces identical outputs.
+
+        Parametrized over:
+          - rope_type: "default" (no scaling) or "llama3" (Llama-3-style smooth scaling)
+          - rms_norm: "torch_fp32" | "torch" | "te"
+
+        torch_fp32: float32-upcast RMSNorm matching HF LlamaRMSNorm exactly -> tight tol.
+        torch: PyTorch nn.RMSNorm (input-dtype precision) -> slightly relaxed tol.
+        te: Transformer Engine fused RMSNorm kernel -> relaxed tol.
+        """
+        checkpoint = _create_checkpoint(ROPE_CONFIGS[rope_type])
+        config = LlamaConfig.from_pretrained(checkpoint)
         adapter = LlamaStateDictAdapter(config)
 
         # Load HF model
         llama_model_hf = (
             AutoModelForCausalLM.from_pretrained(
-                pretrained_model_name_or_path=tiny_llama_checkpoint,
+                pretrained_model_name_or_path=checkpoint,
                 attn_implementation="eager",
                 torch_dtype=torch.bfloat16,
             )
@@ -74,11 +108,13 @@ class TestLlamaModel:
         )  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
         llama_model_hf.eval()
 
-        # Build custom model
+        # Build custom model with specified norm backend
+        backend = BackendConfig(rms_norm=rms_norm)
         llama_model_custom = NeMoAutoModelForCausalLM.from_pretrained(
-            pretrained_model_name_or_path=tiny_llama_checkpoint,
+            pretrained_model_name_or_path=checkpoint,
             attn_implementation="eager",
             torch_dtype=torch.bfloat16,
+            backend=backend,
         ).to("cuda")
         llama_model_custom.eval()
 
@@ -134,7 +170,7 @@ class TestLlamaModel:
         # Create new HF model and load converted state dict
         llama_model_hf_converted = (
             AutoModelForCausalLM.from_pretrained(
-                tiny_llama_checkpoint, attn_implementation="eager", torch_dtype=torch.bfloat16
+                checkpoint, attn_implementation="eager", torch_dtype=torch.bfloat16
             )
             .to("cuda")
             .to(torch.bfloat16)
