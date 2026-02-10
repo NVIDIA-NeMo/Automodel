@@ -54,10 +54,10 @@ class BiencoderStateDictAdapter(StateDictAdapter):
 
         for key, value in state_dict.items():
             if key.startswith("lm_q."):
-                new_key = "model." + key[len("lm_q."):]
+                new_key = "model." + key[len("lm_q.") :]
                 hf_state_dict[new_key] = value
             elif key.startswith(peft_lm_q):
-                new_key = self._PEFT_PREFIX + "model." + key[len(peft_lm_q):]
+                new_key = self._PEFT_PREFIX + "model." + key[len(peft_lm_q) :]
                 hf_state_dict[new_key] = value
             elif key.startswith("linear_pooler.") or key.startswith(peft_pooler):
                 hf_state_dict[key] = value
@@ -89,11 +89,11 @@ class BiencoderStateDictAdapter(StateDictAdapter):
 
         for key, value in hf_state_dict.items():
             if key.startswith("model."):
-                suffix = key[len("model."):]
+                suffix = key[len("model.") :]
                 biencoder_state_dict["lm_q." + suffix] = value
                 biencoder_state_dict["lm_p." + suffix] = value
             elif key.startswith(peft_model):
-                suffix = key[len(peft_model):]
+                suffix = key[len(peft_model) :]
                 biencoder_state_dict[self._PEFT_PREFIX + "lm_q." + suffix] = value
                 biencoder_state_dict[self._PEFT_PREFIX + "lm_p." + suffix] = value
             elif key.startswith("linear_pooler.") or key.startswith(peft_pooler):
