@@ -105,6 +105,8 @@ class TestCombinedProjectionLoRASplitting:
         torch.testing.assert_close(hf_sd[q_key], lora_a)
         torch.testing.assert_close(hf_sd[k_key], lora_a)
         torch.testing.assert_close(hf_sd[v_key], lora_a)
+        # Combined key must be removed
+        assert "base_model.model.model.layers.0.self_attn.qkv_proj.lora_A.default.weight" not in hf_sd
 
     # gate_up projection LoRA splitting
     def test_gate_up_lora_b_weight_split(self):
@@ -149,6 +151,8 @@ class TestCombinedProjectionLoRASplitting:
         assert up_key in hf_sd
         torch.testing.assert_close(hf_sd[gate_key], lora_a)
         torch.testing.assert_close(hf_sd[up_key], lora_a)
+        # Combined key must be removed
+        assert "base_model.model.model.layers.0.mlp.gate_up_proj.lora_A.default.weight" not in hf_sd
 
     # DoRA magnitude splitting
     def test_qkv_dora_magnitude_split(self):
@@ -178,6 +182,8 @@ class TestCombinedProjectionLoRASplitting:
         assert hf_sd[q_key].shape == (256,)
         assert hf_sd[k_key].shape == (128,)
         assert hf_sd[v_key].shape == (128,)
+        # Combined key must be removed
+        assert "base_model.model.model.layers.0.self_attn.qkv_proj.lora_magnitude_vector.default" not in hf_sd
 
     # Non-LoRA keys pass through
     def test_non_lora_keys_preserved(self):
@@ -295,6 +301,29 @@ class TestLlamaLoRAFunctionalSplit:
 
         combined = [k for k in hf_sd if "qkv_proj" in k or "gate_up_proj" in k]
         assert combined == [], f"Combined keys should be split, found: {combined}"
+
+    def test_no_combined_lora_keys_in_state_dict(self):
+        """Explicitly verify that every combined-projection LoRA variant is absent."""
+        model, _ = self._make_tiny_llama()
+        hf_sd = self._simulate_peft_save(model)
+
+        # Every combined fragment that must NOT appear in any key
+        forbidden_fragments = [
+            "qkv_proj.lora_A",
+            "qkv_proj.lora_B",
+            "qkv_proj.lora_magnitude",
+            "gate_up_proj.lora_A",
+            "gate_up_proj.lora_B",
+            "gate_up_proj.lora_magnitude",
+            # Also check bare combined projection names (covers base weight keys)
+            ".qkv_proj.",
+            ".gate_up_proj.",
+        ]
+        for fragment in forbidden_fragments:
+            offending = [k for k in hf_sd if fragment in k]
+            assert offending == [], (
+                f"Found forbidden fragment '{fragment}' in converted state dict keys: {offending}"
+            )
 
     def test_split_qkv_lora_a_identical(self):
         """lora_A weights for q/k/v must be identical (replicated, not split)."""

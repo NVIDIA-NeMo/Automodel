@@ -154,6 +154,10 @@ class CombinedProjectionStateDictAdapter:
             if key not in processed_keys:
                 custom_state_dict[key] = value
 
+        # Recombine any split projection LoRA/DoRA keys back to combined format.
+        # This is the reverse of _split_remaining_combined_projection_keys in to_hf().
+        self._recombine_split_projection_keys(custom_state_dict)
+
         # Handle tied weights: if lm_head.weight is missing but embed_tokens exists, tie them
         # This is common in Qwen2 and Llama where lm_head shares weights with embeddings
         # Only do this if config specifies tie_word_embeddings=True
@@ -338,3 +342,83 @@ class CombinedProjectionStateDictAdapter:
                 )
                 hf_state_dict[f"{pre}.mlp.gate_proj.{suffix}"] = gate_val
                 hf_state_dict[f"{pre}.mlp.up_proj.{suffix}"] = up_val
+
+    def _recombine_split_projection_keys(self, state_dict: dict[str, Any]) -> None:
+        """Recombine split projection LoRA/DoRA keys back to combined format.
+
+        This is the reverse of ``_split_remaining_combined_projection_keys``.
+        It handles LoRA adapter weights and DoRA magnitude vectors that were
+        split for HF-PEFT compatibility during ``to_hf()`` and need to be
+        recombined when loading back into a model with combined projections.
+
+        For keys containing ``.self_attn.q_proj.<suffix>``:
+          - ``lora_A`` weights (which were duplicated during split) are
+            deduplicated — we take the ``q_proj`` version.
+          - All other weights (``lora_B``, magnitude, etc.) are concatenated
+            along dim 0 in Q, K, V order.
+
+        For keys containing ``.mlp.gate_proj.<suffix>``:
+          - ``lora_A`` weights are deduplicated — we take the ``gate_proj`` version.
+          - All other weights are concatenated along dim 0 in gate, up order.
+
+        Keys that end with ``.weight`` or ``.bias`` directly on the projection
+        (e.g., ``q_proj.weight``) are skipped because those are already handled
+        by the layer-indexed loop in ``from_hf``.
+
+        Args:
+            state_dict: State dict to modify in-place.
+        """
+        # --- QKV recombination ---
+        # Find q_proj keys that are NOT base weight/bias (already handled by layer loop)
+        q_keys = [
+            k for k in list(state_dict.keys())
+            if ".self_attn.q_proj." in k
+            and not k.endswith(".self_attn.q_proj.weight")
+            and not k.endswith(".self_attn.q_proj.bias")
+        ]
+
+        for q_key in q_keys:
+            k_key = q_key.replace(".self_attn.q_proj.", ".self_attn.k_proj.")
+            v_key = q_key.replace(".self_attn.q_proj.", ".self_attn.v_proj.")
+
+            if k_key not in state_dict or v_key not in state_dict:
+                continue
+
+            combined_key = q_key.replace(".self_attn.q_proj.", ".self_attn.qkv_proj.")
+
+            q_val = state_dict.pop(q_key)
+            k_val = state_dict.pop(k_key)
+            v_val = state_dict.pop(v_key)
+
+            if "lora_A" in q_key:
+                # lora_A weights were duplicated during split — just take one
+                state_dict[combined_key] = q_val
+            else:
+                # lora_B, magnitude, etc. — concatenate along dim 0
+                state_dict[combined_key] = torch.cat([q_val, k_val, v_val], dim=0)
+
+        # --- gate_up recombination ---
+        gate_keys = [
+            k for k in list(state_dict.keys())
+            if ".mlp.gate_proj." in k
+            and not k.endswith(".mlp.gate_proj.weight")
+            and not k.endswith(".mlp.gate_proj.bias")
+        ]
+
+        for gate_key in gate_keys:
+            up_key = gate_key.replace(".mlp.gate_proj.", ".mlp.up_proj.")
+
+            if up_key not in state_dict:
+                continue
+
+            combined_key = gate_key.replace(".mlp.gate_proj.", ".mlp.gate_up_proj.")
+
+            gate_val = state_dict.pop(gate_key)
+            up_val = state_dict.pop(up_key)
+
+            if "lora_A" in gate_key:
+                # lora_A weights were duplicated during split — just take one
+                state_dict[combined_key] = gate_val
+            else:
+                # lora_B, magnitude, etc. — concatenate along dim 0
+                state_dict[combined_key] = torch.cat([gate_val, up_val], dim=0)

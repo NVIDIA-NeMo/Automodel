@@ -13,16 +13,15 @@
 # limitations under the License.
 
 #!/bin/bash
-set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
+set -xeuo pipefail
 
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0"
 
-# This test uses a tiny Llama model (from_config, random weights) with fused
-# QKV projections and LoRA.  It trains for 2 steps, saves a PEFT checkpoint,
-# resumes from it, and verifies HF-PEFT compatibility.  No pretrained model
-# download is needed.
+# Functional test: PEFT LoRA + fused QKV checkpoint save / resume / HF-PEFT
+# Uses a tiny Llama model (from_config, random weights) with combined qkv_proj
+# and gate_up_proj projections.  No pretrained model download needed.
 
 python -m torch.distributed.run \
---master-port=29504 --nproc_per_node=1 --nnodes=1 -m pytest \
-tests/functional_tests/checkpoint/test_peft_fused_qkv.py::test_peft_fused_qkv_checkpoint -xvs
+    --master-port=29504 --nproc_per_node=1 --nnodes=1 \
+    -m pytest tests/functional_tests/checkpoint/test_peft_fused_qkv.py::test_peft_fused_qkv_checkpoint -xvs

@@ -213,3 +213,4 @@ class TestExtractTargetModules:
         result = _extract_target_modules(model)
         assert result == sorted(result)
 
+
