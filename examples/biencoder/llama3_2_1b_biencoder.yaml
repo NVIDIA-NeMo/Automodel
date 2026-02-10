@@ -25,6 +25,7 @@ step_scheduler:
   ckpt_every_steps: 500
   val_every_steps: 500
   num_epochs: 1
+  max_steps: 50
 
 dist_env:
   backend: nccl
@@ -55,9 +56,9 @@ dataloader:
   dataset:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
     data_dir_list:
-      - training_datasets/nqsh_shuffled_50k.json
-      - training_datasets/miracl_train_es_llama3_1b_4m_512len.json
-      - training_datasets/mldr_en_perc95_small.json
+      - retriever_models_research/training_datasets/nqsh_shuffled_50k.json
+      - retriever_models_research/training_datasets/miracl_train_es_llama3_1b_4m_512len.json
+      - retriever_models_research/training_datasets/mldr_en_perc95_small.json
     data_type: train
     train_n_passages: 5
     eval_negative_size: 4
@@ -122,11 +123,11 @@ optimizer:
   weight_decay: 0.01
   adam_w_mode: true
   bias_correction: true
-  master_weights: true
+  master_weights: false
 
 # Learning rate scheduler
 lr_scheduler:
-  lr_warmup_steps: 100
+  lr_warmup_steps: 5
 
 checkpoint:
   enabled: true
@@ -143,8 +144,8 @@ distributed:
   sequence_parallel: false
 
 # Uncomment and configure for W&B logging
-# wandb:
-#   project: biencoder-finetuning
-#   entity: your_entity
-#   name: llama3_2_1b_biencoder
+wandb:
+  project: "adil-workspace"
+  entity: "Nemo-automodel"
+  name: llama3_2_1b_biencoder_main_ref_two_gpu
 

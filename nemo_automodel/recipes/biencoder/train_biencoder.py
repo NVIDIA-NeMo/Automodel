@@ -18,7 +18,7 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Dict
+from typing import Dict
 
 import torch
 from huggingface_hub import constants as hf_constants
@@ -26,25 +26,19 @@ from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
-from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.distributed.utils import FirstRankPerNode
+from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist, MetricsSample
+from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
-from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
-from nemo_automodel.components.utils.model_utils import print_trainable_parameters
+from nemo_automodel._transformers.infrastructure import MeshContext, instantiate_infrastructure, apply_model_infrastructure
+from nemo_automodel.components.distributed.device_mesh import create_device_mesh
+from nemo_automodel.recipes.llm.train_ft import build_distributed, build_optimizer, build_step_scheduler
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-
-if TYPE_CHECKING:
-    from nemo_automodel.components.distributed.init_utils import DistInfo
 
 import wandb
 from wandb import Settings
@@ -75,20 +69,6 @@ def _unpack_qp(inputs: Dict[str, torch.Tensor]) -> tuple:
         doc_batch_dict = None
 
     return query_batch_dict, doc_batch_dict
-
-
-def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
-    """Build and initialize distributed training resources.
-
-    Args:
-        cfg_dist: Configuration for distributed training.
-
-    Returns:
-        Distributed training information from initialize_distributed.
-    """
-    backend = cfg_dist.get("backend", "nccl")
-    timeout = cfg_dist.get("timeout_minutes", 1)
-    return initialize_distributed(backend=backend, timeout_minutes=timeout)
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
@@ -124,32 +104,6 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         )
     checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
     return checkpoint_config
-
-
-def build_step_scheduler(cfg, dataloader, dp_group_size, local_batch_size):
-    """Build the step scheduler.
-
-    Args:
-        cfg: configuration for the StepScheduler class.
-        dataloader: the training dataloader, used for extracting the epoch_len (in batches).
-        dp_group_size: the size of the data parallel group.
-        local_batch_size: the size of the local batch.
-
-    Returns:
-        StepScheduler: the configured StepScheduler.
-    """
-    assert "_target_" not in cfg, "_target_ not permitted in step scheduler"
-    default_kwargs = dict(
-        num_epochs=10,
-        global_batch_size=32,
-        local_batch_size=local_batch_size,
-        dp_size=dp_group_size,
-        ckpt_every_steps=100,
-        dataloader=dataloader,
-    )
-    if cfg is not None:
-        default_kwargs |= cfg.to_dict()
-    return StepScheduler(**default_kwargs)
 
 
 def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamScheduler] | None:  # noqa: F821
@@ -236,13 +190,6 @@ def build_wandb(cfg) -> wandb.Run:
     return run
 
 
-def get_sync_ctx(model, sync_this_step):
-    """Get synchronization context for gradient accumulation."""
-    if hasattr(model, "no_sync") and not sync_this_step:
-        return model.no_sync()
-    return nullcontext()
-
-
 def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_world_size=1):
     """Build a DataLoader for biencoder training.
 
@@ -325,11 +272,19 @@ class TrainBiencoderRecipe(BaseRecipe):
 
         self.device_mesh = None
         self.moe_mesh = None
-        self.model_wrapper = None
-        if "distributed" in self.cfg:
-            self.model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
-            self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
-            self.moe_mesh = getattr(self.model_wrapper, "moe_mesh", None)
+        self.distributed_config = None
+        if "distributed_config" in self.cfg:
+            self.distributed_config = self.cfg.distributed_config.instantiate()
+            self.device_mesh, self.moe_mesh = create_device_mesh(
+                self.distributed_config,
+                dp_size=self.cfg.get("distributed.dp_size", None),
+                dp_replicate_size=self.cfg.get("distributed.dp_replicate_size", None),
+                tp_size=self.cfg.get("distributed.tp_size", 1),
+                pp_size=self.cfg.get("distributed.pp_size", 1),
+                cp_size=self.cfg.get("distributed.cp_size", 1),
+                ep_size=self.cfg.get("distributed.ep_size", 1),
+                world_size=self.dist_env.world_size,
+            )
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -340,54 +295,12 @@ class TrainBiencoderRecipe(BaseRecipe):
         self._log_experiment_details()
         self._log_library_versions()
 
-        self.pp_enabled: bool = (
-            True if hasattr(self.model_wrapper, "pp_size") and self.model_wrapper.pp_size > 1 else False
-        )
-        autopipeline_cfg = self.cfg.get("autopipeline", None)
+        self.pp_enabled: bool = self.cfg.get("distributed.pp_size", 1) > 1
         if self.pp_enabled:
-            pp_batch_size = self.cfg.step_scheduler.local_batch_size
-            pp_microbatch_size = self.cfg.autopipeline.pp_microbatch_size
-            assert pp_batch_size // self.cfg.autopipeline.pp_microbatch_size >= self.model_wrapper.pp_size, (
-                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {self.cfg.autopipeline.pp_microbatch_size} must be greater than or equal to pp_size {self.model_wrapper.pp_size}"
+            raise NotImplementedError(
+                "Pipeline parallelism is not yet supported for biencoder models. "
+                "Please set distributed.pp_size to 1."
             )
-
-            assert autopipeline_cfg is not None, (
-                "AutoPipeline configuration is required when pipeline parallelism is enabled"
-            )
-            assert not isinstance(self.model_wrapper, MegatronFSDPManager), (
-                "MegatronFSDPManager is not supported when pipeline parallelism is enabled"
-            )
-            # Create AutoPipeline from config
-            autopipeline = autopipeline_cfg.instantiate(
-                world_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                pp_axis_name="pp",
-                dp_axis_names=(
-                    ("dp_replicate", "dp_shard_cp")
-                    if "dp_replicate" in self.device_mesh.mesh_dim_names
-                    and "dp_shard_cp" in self.device_mesh.mesh_dim_names
-                    else ("dp_shard_cp",)
-                ),
-                cp_axis_name="cp" if "cp" in self.device_mesh.mesh_dim_names else None,
-                tp_axis_name="tp" if "tp" in self.device_mesh.mesh_dim_names else None,
-                ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
-                ep_shard_axis_names=(
-                    ("ep_shard",) if self.moe_mesh is not None and "ep_shard" in self.moe_mesh.mesh_dim_names else None
-                ),
-                pp_batch_size=pp_batch_size,
-                pp_microbatch_size=pp_microbatch_size,
-                patch_stage_backward_maybe_with_nosync=self.cfg.get("model.backend.enable_fsdp_optimizations", False),
-                device=torch.cuda.current_device(),
-            )
-            assert isinstance(autopipeline, AutoPipeline), (
-                f"autopipeline {autopipeline.__class__} is not an instance of AutoPipeline"
-            )
-            logger.warning(
-                "Pipeline parallelism is enabled for biencoder training. "
-                "Note that biencoder models typically do not benefit from PP and this is experimental."
-            )
-        else:
-            autopipeline = None
 
         # Build components
         self.peft_config = None
@@ -402,6 +315,12 @@ class TrainBiencoderRecipe(BaseRecipe):
             True if self.cfg.get("peft", None) else False,
         )
 
+        if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
+            self.max_grad_norm = float(self.cfg.clip_grad_norm.max_norm)
+        else:
+            logging.info("No clip_grad_norm.max_norm specified in config, using default value of 1.0")
+            self.max_grad_norm = 1.0
+
         # Create Checkpointer instance
         self.checkpointer = Checkpointer(
             config=checkpoint_config,
@@ -413,54 +332,36 @@ class TrainBiencoderRecipe(BaseRecipe):
 
         # Build biencoder model
         logger.info("Building biencoder model...")
-        if self.pp_enabled:
-            raise NotImplementedError(
-                "Pipeline parallelism is not yet supported for biencoder models. "
-                "Please disable pipeline parallelism in the distributed config."
-            )
-
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
             model = self.cfg.model.instantiate()
 
-            # Apply PEFT (LoRA) if configured
-            if self.peft_config is not None:
-                tp_size = self.cfg.get("distributed.tp_size", 1)
-                if tp_size > 1:
-                    logger.info("Disabling Triton with TP ({})".format(tp_size))
-                    self.peft_config.use_triton = False
-                if autopipeline is not None:
-                    logger.info("Enabling PEFT with Pipeline Parallelism")
-                    logger.info("Disabling Triton with Pipeline Parallelism Enabled.")
-                    self.peft_config.use_triton = False
+        mesh = MeshContext.from_meshes(self.device_mesh, self.moe_mesh)
+        model_wrapper, _, parallelize_fn, _ = instantiate_infrastructure(
+            distributed_config=self.distributed_config,
+            pipeline_config=None,
+            device=torch.device("cuda", torch.cuda.current_device()),
+            mesh=mesh,
+        )
 
-                logger.info("Applying LoRA to biencoder model")
-                apply_lora_to_linear_modules(model, self.peft_config, quantization_config=None)
+        model = apply_model_infrastructure(
+            model,
+            is_meta_device=False,
+            device=torch.cuda.current_device(),
+            mesh=mesh,
+            model_wrapper=model_wrapper,
+            autopipeline=None,
+            parallelize_fn=parallelize_fn,
+            peft_config=self.peft_config,
+            load_base_model=False,
+            pretrained_model_name_or_path=None,
+        )
 
-        # Apply parallelism wrapper if needed
-        if self.model_wrapper is not None:
-            model = self.model_wrapper.parallelize(model)
-
-        # Ensure the model is on the correct device
-        model = model.to(self.dist_env.device)
-
-        # Setup model_parts for consistency with train_ft.py
-        if isinstance(model, AutoPipeline):
-            self.model_parts = model.parts
-            self.pp = model
-        else:
-            self.model_parts = [model]
-            self.pp = None
-
-        self.checkpointer.config.model_state_dict_keys = ["model." + k for k in model.lm_q.state_dict().keys()]
+        self.model_parts = [model]
+        self.pp = None
 
         # Build optimizer
         logger.info("Building optimizer...")
-        trainable_params = list(filter(lambda x: x.requires_grad, self.model_parts[0].parameters()))
-        assert len(trainable_params) > 0, "trainable_params cannot be empty"
-        self.optimizer = [self.cfg.optimizer.instantiate(params=trainable_params)]
-
-        # Print trainable parameters after model has been moved to device
-        trainable_params, total_params = print_trainable_parameters(self.model_parts[0])
+        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 
         # Build tokenizer
         self.tokenizer = self.cfg.tokenizer.instantiate()
@@ -512,10 +413,10 @@ class TrainBiencoderRecipe(BaseRecipe):
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 
         # Initialize JSONL loggers
-        self.metric_logger_train = MetricLoggerDist(
+        self.metric_logger_train = build_metric_logger(
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
         )
-        self.metric_logger_valid = MetricLoggerDist(
+        self.metric_logger_valid = build_metric_logger(
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl"
         )
 
@@ -536,7 +437,7 @@ class TrainBiencoderRecipe(BaseRecipe):
             self.step_scheduler.set_epoch(epoch)
             # The step scheduler yields a list of batches for gradient accumulation
             for batches in self.step_scheduler:
-                train_log_data = self._run_train_optim_step(batches, 1.0)
+                train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
 
                 # Log metrics
                 self.log_train_metrics(train_log_data)
@@ -586,7 +487,7 @@ class TrainBiencoderRecipe(BaseRecipe):
         # Forward pass
         model = self.model_parts[0]
         train_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext()
-        sync_ctx = get_sync_ctx(model, idx == num_batches - 1) if is_train else nullcontext()
+        sync_ctx = get_sync_ctx(model, idx == num_batches - 1, defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True)) if is_train else nullcontext()
 
         with train_ctx, sync_ctx:
             outputs = model(query=query, passage=passage)
@@ -630,6 +531,7 @@ class TrainBiencoderRecipe(BaseRecipe):
             dp_group_size=self._get_dp_group_size(include_cp=True),
         )
 
+        self.checkpointer.maybe_wait_for_staging()
         # Optimizer step
         for opt in self.optimizer:
             opt.step()
