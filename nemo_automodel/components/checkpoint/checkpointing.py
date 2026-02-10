@@ -275,7 +275,7 @@ class Checkpointer:
         """
         optimizer_path = os.path.join(weights_path, "optim")
         _ensure_dirs(optimizer_path)
-        optimizer_state = OptimizerState(model, optimizer, scheduler)
+        optimizer_state = OptimizerState(model, optimizer, scheduler, is_peft=self.config.is_peft)
         state_dict = optimizer_state.state_dict()
         self._optim_ctx.future = self._do_save(state_dict, optimizer_path)
 
@@ -291,7 +291,7 @@ class Checkpointer:
             weights_path: Base directory for checkpoints.
             scheduler: Optional LR scheduler to populate.
         """
-        optimizer_state = OptimizerState(model, optimizer, scheduler)
+        optimizer_state = OptimizerState(model, optimizer, scheduler, is_peft=self.config.is_peft)
         state_dict = optimizer_state.state_dict()
         self._do_load(state_dict, os.path.join(weights_path, "optim"))
         optimizer_state.load_state_dict(state_dict)

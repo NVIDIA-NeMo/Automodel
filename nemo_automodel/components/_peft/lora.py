@@ -230,7 +230,11 @@ class LinearLoRA(nn.Linear):
             assert fwd != self.forward
             res = fwd(x)
         else:
-            res = F.linear(x, self.weight, self.bias)
+            # TE Linear can expose an empty .bias tensor (numel()==0) when bias=False; treat as no bias.
+            bias = self.bias
+            if bias is not None and bias.numel() == 0:
+                bias = None
+            res = F.linear(x, self.weight, bias)
 
         if not self.use_dora:
             if self.dropout_position == "pre":
@@ -273,7 +277,7 @@ class LinearLoRA(nn.Linear):
         # HF PEFT subtracts bias from base_result before applying scaling terms.
         if base_result is not None:
             bias = self.bias
-            if bias is not None:
+            if bias is not None and bias.numel() > 0:
                 base_no_bias = base_result - bias
             else:
                 base_no_bias = base_result
@@ -524,7 +528,8 @@ def apply_lora_to_linear_modules(
                     setattr(parent, child_name, new_module)
         else:
             # Standard Linear patching
-            if isinstance(module, nn.Linear) and matcher.match(module, name):
+            linear_types = [nn.Linear] + ([transformer_engine.pytorch.Linear] if HAS_TE else [])
+            if isinstance(module, tuple(linear_types)) and matcher.match(module, name):
                 num_modules_matched += 1
                 # For QLora, set lora_dtype to float16/bfloat16 since base weights are quantized
                 lora_dtype = peft_config.lora_dtype
