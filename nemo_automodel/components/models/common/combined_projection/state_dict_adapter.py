@@ -318,9 +318,7 @@ class CombinedProjectionStateDictAdapter:
                 local_q_size = (self.q_size * actual_size) // total_size
                 local_kv_size = (self.kv_size * actual_size) // total_size
 
-                q_val, k_val, v_val = value.split(
-                    [local_q_size, local_kv_size, local_kv_size], dim=0
-                )
+                q_val, k_val, v_val = value.split([local_q_size, local_kv_size, local_kv_size], dim=0)
                 hf_state_dict[f"{pre}.self_attn.q_proj.{suffix}"] = q_val
                 hf_state_dict[f"{pre}.self_attn.k_proj.{suffix}"] = k_val
                 hf_state_dict[f"{pre}.self_attn.v_proj.{suffix}"] = v_val
@@ -337,9 +335,7 @@ class CombinedProjectionStateDictAdapter:
                 actual_size = value.shape[0]
                 local_intermediate_size = actual_size // 2
 
-                gate_val, up_val = value.split(
-                    [local_intermediate_size, local_intermediate_size], dim=0
-                )
+                gate_val, up_val = value.split([local_intermediate_size, local_intermediate_size], dim=0)
                 hf_state_dict[f"{pre}.mlp.gate_proj.{suffix}"] = gate_val
                 hf_state_dict[f"{pre}.mlp.up_proj.{suffix}"] = up_val
 
@@ -371,7 +367,8 @@ class CombinedProjectionStateDictAdapter:
         # --- QKV recombination ---
         # Find q_proj keys that are NOT base weight/bias (already handled by layer loop)
         q_keys = [
-            k for k in list(state_dict.keys())
+            k
+            for k in list(state_dict.keys())
             if ".self_attn.q_proj." in k
             and not k.endswith(".self_attn.q_proj.weight")
             and not k.endswith(".self_attn.q_proj.bias")
@@ -399,7 +396,8 @@ class CombinedProjectionStateDictAdapter:
 
         # --- gate_up recombination ---
         gate_keys = [
-            k for k in list(state_dict.keys())
+            k
+            for k in list(state_dict.keys())
             if ".mlp.gate_proj." in k
             and not k.endswith(".mlp.gate_proj.weight")
             and not k.endswith(".mlp.gate_proj.bias")
