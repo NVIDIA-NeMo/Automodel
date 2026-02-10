@@ -936,8 +936,8 @@ class GroupedExpertsTE(nn.Module):
             output1_ = self.expert_activation(output1, permuted_probs)
             output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).T)
 
-        # if fp8_active and actual_m_splits is not None:
-        #     output2 = self.fp8_unpadding(output2, actual_m_splits)
+        if fp8_active and actual_m_splits is not None:
+            output2 = self.fp8_unpadding(output2, actual_m_splits)
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
