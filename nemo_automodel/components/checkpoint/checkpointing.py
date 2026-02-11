@@ -427,6 +427,8 @@ class Checkpointer:
                 key_mapping=key_mapping,
             )
 
+        _reinit_rope_buffers(model, device)
+
         is_tied_lm_head = is_tied_word_embeddings(model)
         self.config.original_model_root_dir = root_dir
         if hasattr(model, "tie_weights") and is_tied_lm_head:
@@ -835,6 +837,29 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
                 module.init_lora_weights(peft_init_method)
             except Exception as e:
                 logging.warning(f"Failed to initialize weights for PEFT adapter `{module.__class__.__name__}`: {e}")
+
+
+def _reinit_rope_buffers(model: nn.Module, device: torch.device) -> None:
+    """
+    Recompute non-persistent RoPE ``inv_freq`` buffers for DeciLM models.
+    Args:
+        model: Model to reinitialize RoPE buffers for.
+        device: Device to create the new buffers on.
+    """
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    if model_type != "deci":
+        return
+
+    for name, module in model.named_modules():
+        if hasattr(module, "rope_init_fn") and hasattr(module, "inv_freq") and hasattr(module, "rope_kwargs"):
+            try:
+                inv_freq, _ = module.rope_init_fn(module.config, device, **module.rope_kwargs)
+                module.inv_freq = inv_freq
+                if hasattr(module, "original_inv_freq"):
+                    module.original_inv_freq = inv_freq.clone()
+                logging.debug(f"Reinitialized RoPE inv_freq for {name} on device {device}")
+            except Exception as e:
+                logging.warning(f"Failed to reinitialize RoPE inv_freq for {name}: {e}")
 
 
 def _apply(module, fn, recurse=True) -> nn.Module:

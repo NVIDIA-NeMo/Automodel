@@ -437,8 +437,6 @@ def _init_model(
             return True, model_cls(hf_config, *model_args, **kwargs)
 
     # 3. fallback to HF model class wrapped with mixin
-    hf_model_cls = cls._model_mapping[type(hf_config)]
-
     model = None
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
