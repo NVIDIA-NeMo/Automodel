@@ -581,8 +581,8 @@ class TestModelMappingKeyErrorFallback:
         cls._from_config_parent_class = MagicMock(return_value=fake_model)
 
         with (
-            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=fake_config),
-            patch("nemo_automodel._transformers.auto_model._get_mixin_wrapped_class") as mock_wrap,
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
         ):
             mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
             is_custom, model = _init_model(
@@ -615,8 +615,8 @@ class TestModelMappingKeyErrorFallback:
         cls._from_config_parent_class = MagicMock(return_value=fake_model)
 
         with (
-            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=fake_config),
-            patch("nemo_automodel._transformers.auto_model._get_mixin_wrapped_class") as mock_wrap,
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
         ):
             mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
             is_custom, model = _init_model(
@@ -649,9 +649,9 @@ class TestModelMappingKeyErrorFallback:
         cls._from_config_parent_class = MagicMock(return_value=fake_model)
 
         with (
-            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=fake_config),
-            patch("nemo_automodel._transformers.auto_model.get_architectures", return_value=[]),
-            patch("nemo_automodel._transformers.auto_model._get_mixin_wrapped_class") as mock_wrap,
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch("nemo_automodel._transformers.model_init.get_architectures", return_value=[]),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
         ):
             mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
             is_custom, model = _init_model(
@@ -683,9 +683,9 @@ class TestModelMappingKeyErrorFallback:
         cls._from_config_parent_class = MagicMock(return_value=fake_model)
 
         with (
-            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=fake_config),
-            patch("nemo_automodel._transformers.auto_model.get_architectures", return_value=[]),
-            patch("nemo_automodel._transformers.auto_model._get_mixin_wrapped_class") as mock_wrap,
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch("nemo_automodel._transformers.model_init.get_architectures", return_value=[]),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
         ):
             mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
             is_custom, model = _init_model(

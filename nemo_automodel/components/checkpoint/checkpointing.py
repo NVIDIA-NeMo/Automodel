@@ -852,7 +852,7 @@ def _reinit_rope_buffers(model: nn.Module, device: torch.device) -> None:
         device: Device to create the new buffers on.
     """
     model_type = getattr(getattr(model, "config", None), "model_type", None)
-    if model_type != "deci":
+    if model_type not in ("nemotron-nas"):
         return
 
     for name, module in model.named_modules():
