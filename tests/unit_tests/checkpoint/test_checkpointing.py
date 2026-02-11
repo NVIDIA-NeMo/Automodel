@@ -153,7 +153,7 @@ class TestReinitRopeBuffers:
         """DeciLM model with rope modules gets inv_freq recomputed."""
         model = torch.nn.Module()
         config = MagicMock()
-        config.model_type = "deci"
+        config.model_type = "nemotron-nas"
         model.config = config
 
         new_inv_freq = torch.tensor([1.0, 2.0, 3.0, 4.0])
@@ -181,7 +181,7 @@ class TestReinitRopeBuffers:
         """DeciLM model with original_inv_freq gets both buffers updated."""
         model = torch.nn.Module()
         config = MagicMock()
-        config.model_type = "deci"
+        config.model_type = "nemotron-nas"
         model.config = config
 
         new_inv_freq = torch.tensor([1.0, 2.0, 3.0])
@@ -204,7 +204,7 @@ class TestReinitRopeBuffers:
         """DeciLM model without rope_init_fn/inv_freq/rope_kwargs gracefully skips."""
         model = torch.nn.Module()
         config = MagicMock()
-        config.model_type = "deci"
+        config.model_type = "nemotron-nas"
         model.config = config
 
         # Add a module without any rope attributes
@@ -224,7 +224,7 @@ class TestReinitRopeBuffers:
         """If rope_init_fn raises, a warning is logged and other modules continue."""
         model = torch.nn.Module()
         config = MagicMock()
-        config.model_type = "deci"
+        config.model_type = "nemotron-nas"
         model.config = config
 
         rope = MagicMock()

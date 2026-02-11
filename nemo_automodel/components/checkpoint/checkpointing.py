@@ -846,13 +846,13 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
 
 def _reinit_rope_buffers(model: nn.Module, device: torch.device) -> None:
     """
-    Recompute non-persistent RoPE ``inv_freq`` buffers for DeciLM models.
+    Recompute non-persistent RoPE ``inv_freq`` buffers for Nemotron-NAS models.
     Args:
         model: Model to reinitialize RoPE buffers for.
         device: Device to create the new buffers on.
     """
     model_type = getattr(getattr(model, "config", None), "model_type", None)
-    if model_type not in ("nemotron-nas"):
+    if model_type not in ("nemotron-nas",):
         return
 
     for name, module in model.named_modules():
