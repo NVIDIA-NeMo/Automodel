@@ -48,9 +48,37 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 from .state_dict_adapter import Qwen3_5MoeStateDictAdapter
 
 
-# ---------------------------------------------------------------------------
-# Fp32-safe rotary embedding wrappers
-# ---------------------------------------------------------------------------
+class Qwen3_5MoeBlock(Block):
+    """Block that uses the Qwen3.5-MoE native GatedDeltaNet (separate in_proj_qkv,
+    in_proj_z, in_proj_b, in_proj_a)"""
+
+    def __init__(self, layer_idx, config, moe_config, backend):
+        super().__init__(layer_idx, config, moe_config, backend)
+        # Replace the Qwen3Next fused GatedDeltaNet with the Qwen3.5-MoE native one
+        if self.layer_type == "linear_attention":
+            self.linear_attn = Qwen3_5MoeGatedDeltaNet(config, layer_idx)
+
+    def init_weights(self, buffer_device: torch.device):
+        for norm in (self.input_layernorm, self.post_attention_layernorm):
+            norm.reset_parameters()
+        if self.layer_type == "full_attention":
+            self.self_attn.init_weights(buffer_device)
+        elif self.layer_type == "linear_attention":
+            self.linear_attn.dt_bias.data.fill_(1.0)
+            self.linear_attn.A_log.data.uniform_(0, 16).log_()
+            linear_list = [
+                self.linear_attn.in_proj_qkv,
+                self.linear_attn.in_proj_z,
+                self.linear_attn.in_proj_b,
+                self.linear_attn.in_proj_a,
+                self.linear_attn.out_proj,
+            ]
+            for linear in linear_list:
+                nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
+            self.linear_attn.norm.reset_parameters()
+        self.mlp.init_weights(buffer_device)
+
+
 class Fp32SafeQwen3_5MoeTextRotaryEmbedding(Qwen3_5MoeTextRotaryEmbedding):
     """Ensure inv_freq stays in float32 across ``.to(dtype)`` calls."""
 
@@ -211,10 +239,10 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
             config.vocab_size, config.hidden_size, self.padding_idx, dtype=embed_dtype
         )
 
-        # Reuse Qwen3Next Block — handles hybrid layer_types + MoE
+        # Use Qwen3_5MoeBlock — same as Qwen3Next Block but with native GatedDeltaNet
         self.layers = nn.ModuleDict(
             {
-                str(layer_id): Block(layer_id, config, self.moe_config, backend)
+                str(layer_id): Qwen3_5MoeBlock(layer_id, config, self.moe_config, backend)
                 for layer_id in range(config.num_hidden_layers)
             }
         )
