@@ -419,6 +419,7 @@ def _init_model(
         init_param_names = _get_init_param_names(model_cls)
         _consume_config_overrides(hf_config, kwargs, init_param_names=init_param_names)
         kwargs = _filter_kwargs_for_init(model_cls, kwargs)
+        kwargs.pop("config", None)
         # Override config's torch_dtype with user-requested dtype so model __init__ uses correct dtype
         if torch_dtype != "auto":
             hf_config.torch_dtype = torch_dtype
