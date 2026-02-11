@@ -532,9 +532,19 @@ def _mamba_layer_flops(config, gbs, seq_len):
     """Model FLOPs for Mamba layer. We ignore part of the flops of scan because the
     chunk size is not known from model config."""
     hs = config.hidden_size
-    mamba_state_dim = config.mamba_state_dim
+    if hasattr(config, "mamba_state_dim"):
+        mamba_state_dim = config.mamba_state_dim
+    elif hasattr(config, "ssm_state_size"):
+        mamba_state_dim = config.ssm_state_size
+    else:
+        raise ValueError("Expected config to have 'mamba_state_dim' or 'ssm_state_size'")
     mamba_head_dim = config.mamba_head_dim
-    mamba_num_groups = config.mamba_num_groups
+    if hasattr(config, "mamba_num_groups"):
+        mamba_num_groups = config.mamba_num_groups
+    elif hasattr(config, "n_groups"):
+        mamba_num_groups = config.n_groups
+    else:
+        raise ValueError("Expected config to have 'mamba_num_groups' or 'n_groups'")
 
     if hasattr(config, "mamba_num_heads") and config.mamba_num_heads:
         nheads = config.mamba_num_heads
@@ -551,8 +561,11 @@ def _mamba_layer_flops(config, gbs, seq_len):
 
 def _hybrid_model_flops(config, gbs, seq_len):
     """Model FLOPs for hybrid model"""
-    if not config.is_hybrid_model:
-        raise ValueError("Config must have is_hybrid_model=True")
+    if hasattr(config, "is_hybrid_model"):
+        if not config.is_hybrid_model:
+            raise ValueError("Config must have is_hybrid_model=True")
+    elif not hasattr(config, "hybrid_override_pattern"):
+        raise ValueError("Expected config to have `is_hybrid_model` or `hybrid_override_pattern`")
 
     hybrid_override_pattern = config.hybrid_override_pattern
     hs = config.hidden_size
@@ -845,6 +858,7 @@ def get_flops_formula_for_hf_config(config: Any) -> Optional[Callable]:
         "MT5Config": transformer_flops,
         # Nemotron
         "NemotronConfig": nemotron_flops,
+        "NemotronHConfig": nemotronh_flops,
         # General transformer fallback
         "OPTConfig": transformer_flops,
         "BloomConfig": transformer_flops,
