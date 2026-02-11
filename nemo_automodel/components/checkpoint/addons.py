@@ -227,6 +227,11 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
     """
     Extract the target modules from the model used by LoRA/PEFT layers.
 
+    Combined-projection module names (e.g. ``qkv_proj``, ``gate_up_proj``) are
+    expanded to the individual Hugging Face projection names so that the saved
+    ``adapter_config.json`` is compatible with vLLM, TensorRT-LLM and the
+    Hugging Face PEFT library.
+
     Note:
         When torch.compile is used, module names get prefixed with `_orig_mod.`.
         This function strips those prefixes to get the original module names.
@@ -237,6 +242,12 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
     Returns:
         A sorted list of unique module name prefixes that contain LoRA layers.
     """
+    # Mapping from combined projection names to their HF-compatible split names.
+    _COMBINED_TO_SPLIT = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     final_target_modules = set()
     for name, _ in model.named_modules():
         if "lora" in name.lower():
@@ -244,7 +255,16 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
             target_name = name.rsplit(".", 1)[0]
             if target_name.startswith("_orig_mod."):
                 target_name = target_name[len("_orig_mod.") :]
-            final_target_modules.add(target_name)
+
+            # Expand combined projection names to individual HF projection names
+            last_component = target_name.rsplit(".", 1)[-1]
+            if last_component in _COMBINED_TO_SPLIT:
+                parent = target_name.rsplit(".", 1)[0] if "." in target_name else ""
+                for split_name in _COMBINED_TO_SPLIT[last_component]:
+                    expanded = f"{parent}.{split_name}" if parent else split_name
+                    final_target_modules.add(expanded)
+            else:
+                final_target_modules.add(target_name)
     return sorted(list(final_target_modules))
 
 
