@@ -16,8 +16,6 @@
 
 from nemo_automodel.components.models.common.bidirectional import (
     BiencoderStateDictAdapter,
-    create_bidirectional_model_class,
-    make_bidirectional,
 )
 from nemo_automodel.components.models.common.combined_projection import (
     CombinedGateUpMLP,
@@ -37,8 +35,6 @@ from nemo_automodel.components.models.common.utils import (
 
 __all__ = [
     # Bidirectional utilities
-    "make_bidirectional",
-    "create_bidirectional_model_class",
     "BiencoderStateDictAdapter",
     # Combined projection
     "CombinedQKVAttentionMixin",

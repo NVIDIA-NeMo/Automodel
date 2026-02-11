@@ -703,6 +703,7 @@ class NeMoAutoModelForBiencoder:
         do_gradient_checkpointing: bool = False,
         pooling: str = "avg",
         l2_normalize: bool = True,
+        attn_implementation: str = "flash_attention_2",
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
         sdpa_method: Optional[List[SDPBackend]] = None,
@@ -730,6 +731,9 @@ class NeMoAutoModelForBiencoder:
             do_gradient_checkpointing: Whether to enable gradient checkpointing.
             pooling: Pooling strategy ('avg', 'cls', 'last', etc.).
             l2_normalize: Whether to L2 normalize embeddings.
+            attn_implementation: Attention implementation to use (e.g.,
+                ``"flash_attention_2"``, ``"sdpa"``, ``"eager"``).
+                Defaults to ``"flash_attention_2"``.
             use_liger_kernel: Whether to apply Liger kernel optimizations.
             use_sdpa_patching: Whether to apply SDPA patching.
             sdpa_method: SDPA backend methods to use.
@@ -762,6 +766,7 @@ class NeMoAutoModelForBiencoder:
                 do_gradient_checkpointing=do_gradient_checkpointing,
                 pooling=pooling,
                 l2_normalize=l2_normalize,
+                attn_implementation=attn_implementation,
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
@@ -795,13 +800,9 @@ class NeMoAutoModelForBiencoder:
         )
         loss_fn = None
 
-        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and (
-            get_world_size_safe() > 1
-        )
+        is_meta_device = False
         device = torch.cuda.current_device()
 
-        hf_kwargs = {"attn_implementation": "flash_attention_2"}
-        kwargs.update(hf_kwargs)
         model = BiencoderModel.build(
             model_name_or_path=pretrained_model_name_or_path,
             share_encoder=share_encoder,
@@ -810,6 +811,7 @@ class NeMoAutoModelForBiencoder:
             do_gradient_checkpointing=do_gradient_checkpointing,
             pooling=pooling,
             l2_normalize=l2_normalize,
+            attn_implementation=attn_implementation,
             **kwargs,
         )
 

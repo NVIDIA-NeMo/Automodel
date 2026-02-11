@@ -33,8 +33,6 @@ from transformers.models.llama.modeling_llama import LlamaForSequenceClassificat
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring
 
-from nemo_automodel.components.models.common.bidirectional import make_bidirectional
-
 try:
     from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 
@@ -96,8 +94,6 @@ class LlamaBidirectionalModel(LlamaModel):
             config: Model configuration
         """
         super().__init__(config)
-        # Disable causal attention for all layers using the factory utility
-        make_bidirectional(self)
 
     def _update_causal_mask(
         self,

@@ -32,10 +32,7 @@ from transformers.utils import logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
 
-try:
-    from nemo_automodel.components.models.common.bidirectional import BiencoderStateDictAdapter
-except ImportError:
-    BiencoderStateDictAdapter = object
+from nemo_automodel.components.models.common.bidirectional import BiencoderStateDictAdapter
 
 
 logger = logging.get_logger(__name__)

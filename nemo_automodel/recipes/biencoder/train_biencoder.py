@@ -28,11 +28,6 @@ from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from wandb import Settings
 
-from nemo_automodel._transformers.infrastructure import (
-    MeshContext,
-    apply_model_infrastructure,
-    instantiate_infrastructure,
-)
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -331,15 +326,11 @@ class TrainBiencoderRecipe(BaseRecipe):
                 "Pipeline parallelism is not yet supported for biencoder models. Please set distributed.pp_size to 1."
             )
 
-        self.peft_config = None
-        if self.cfg.get("peft", None) is not None:
-            self.peft_config = self.cfg.peft.instantiate()
-
         checkpoint_config = build_checkpoint_config(
             self.cfg.get("checkpoint", None),
             self.cfg.get("model.cache_dir", None),
             self.cfg.model.pretrained_model_name_or_path,
-            True if self.cfg.get("peft", None) else False,
+            is_peft=False,
         )
 
         if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
@@ -358,28 +349,7 @@ class TrainBiencoderRecipe(BaseRecipe):
 
         logger.info("Building biencoder model...")
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
-            model = self.cfg.model.instantiate()
-
-        mesh = MeshContext.from_meshes(self.device_mesh, self.moe_mesh)
-        model_wrapper, _, parallelize_fn, _ = instantiate_infrastructure(
-            distributed_config=self.distributed_config,
-            pipeline_config=None,
-            device=torch.device("cuda", torch.cuda.current_device()),
-            mesh=mesh,
-        )
-
-        model = apply_model_infrastructure(
-            model,
-            is_meta_device=False,
-            device=torch.cuda.current_device(),
-            mesh=mesh,
-            model_wrapper=model_wrapper,
-            autopipeline=None,
-            parallelize_fn=parallelize_fn,
-            peft_config=self.peft_config,
-            load_base_model=False,
-            pretrained_model_name_or_path=None,
-        )
+            model = self.cfg.model.instantiate(device_mesh=self.device_mesh, moe_mesh=self.moe_mesh)
 
         self.model_parts = [model]
         self.pp = None
