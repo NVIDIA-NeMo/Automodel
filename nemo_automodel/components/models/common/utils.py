@@ -48,7 +48,7 @@ def is_tensor_unallocated(tensor: torch.Tensor) -> bool:
 class BackendConfig:
     attn: Literal["te", "sdpa", "flex"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
-    rms_norm: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
+    rms_norm: Literal["torch", "torch_fp32", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
     experts: Literal["torch", "te", "gmm"] = "torch"
     dispatcher: Literal["torch", "deepep"] = "torch"
@@ -99,7 +99,10 @@ def initialize_rms_norm_module(
     Call reset_parameters() to materialize weights if created on meta device.
 
     Args:
-        rms_norm_impl: Backend implementation ("te" or "torch")
+        rms_norm_impl: Backend implementation ("te", "torch", or "torch_fp32")
+            - "te": Transformer Engine fused RMSNorm kernel
+            - "torch": PyTorch native nn.RMSNorm (computes in input dtype)
+            - "torch_fp32": Float32 input upcast RMSNorm
         dim: Normalized dimension
         eps: Epsilon for numerical stability
         device: Device to create module on (None uses PyTorch default, typically CPU)
@@ -115,6 +118,11 @@ def initialize_rms_norm_module(
         return TransformerEngineRMSNorm(normalized_shape=dim, eps=eps, device=device, params_dtype=dtype)
     elif rms_norm_impl == "torch":
         return nn.RMSNorm(dim, eps=eps, device=device, dtype=dtype)
+    elif rms_norm_impl == "torch_fp32":
+        # LlamaRMSNorm reference: generic fp32-upcast implementation for accuracy matching
+        from transformers.models.llama.modeling_llama import LlamaRMSNorm as Float32RMSNorm
+
+        return Float32RMSNorm(dim, eps=eps).to(device=device, dtype=dtype)
     else:
         raise ValueError(f"Unsupported RMSNorm implementation: {rms_norm_impl}")
 
