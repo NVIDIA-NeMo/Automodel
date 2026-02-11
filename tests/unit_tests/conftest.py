@@ -11,11 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import importlib
 import os
+import sys
+import types
 from pathlib import Path
 from shutil import rmtree
 
 import pytest
+
+# ---------------------------------------------------------------------------
+# Shim: ``transformers.initialization`` was added in transformers >=4.48.
+# Older versions keep ``no_init_weights`` in ``transformers.modeling_utils``.
+# Provide a thin compatibility module so that
+# ``from transformers.initialization import no_init_weights`` works regardless
+# of the installed version.
+# ---------------------------------------------------------------------------
+if "transformers.initialization" not in sys.modules:
+    try:
+        importlib.import_module("transformers.initialization")
+    except ModuleNotFoundError:
+        from transformers.modeling_utils import no_init_weights
+
+        _compat = types.ModuleType("transformers.initialization")
+        _compat.no_init_weights = no_init_weights
+        sys.modules["transformers.initialization"] = _compat
 
 
 def pytest_addoption(parser):
