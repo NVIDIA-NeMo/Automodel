@@ -232,8 +232,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # Use meta device initialization when:
         # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)
         # - AND either multi-GPU (world_size > 1) or single-GPU custom model (not HF)
-        is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and (
-            get_world_size_safe() > 1 or not is_hf_model
+        # - AND not using quantization (we let HF handle BitsAndBytes; don't init meta device)
+        is_meta_device = all(
+            [
+                not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)),
+                get_world_size_safe() > 1 or not is_hf_model,
+                quantization_config is None,
+            ]
         )
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
@@ -413,10 +418,16 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         )
         loss_fn = pipeline_config.loss_fn if pipeline_config is not None else None
 
-        is_hf_model = get_is_hf_model(
-            get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs),
-            force_hf,
-        )
+        try:
+            hf_config = get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs)
+        except Exception as e:
+            if "does not support" in str(e):
+                attn_implementation = _get_next_fallback_attn(attn_implementation)
+                logger.warning("Config rejected attention implementation, falling back to %s.", attn_implementation)
+                hf_config = get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs)
+            else:
+                raise
+        is_hf_model = get_is_hf_model(hf_config, force_hf)
 
         return cls._build_model(
             pretrained_model_name_or_path,
@@ -507,7 +518,16 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         kwargs["trust_remote_code"] = kwargs.get(
             "trust_remote_code", resolve_trust_remote_code(name_or_path) if name_or_path else False
         )
-        config = get_hf_config(config, attn_implementation, **kwargs) if isinstance(config, str) else config
+        if isinstance(config, str):
+            try:
+                config = get_hf_config(config, attn_implementation, **kwargs)
+            except Exception as e:
+                if "does not support" in str(e):
+                    attn_implementation = _get_next_fallback_attn(attn_implementation)
+                    logger.warning("Config rejected attention implementation, falling back to %s.", attn_implementation)
+                    config = get_hf_config(config, attn_implementation, **kwargs)
+                else:
+                    raise
         _consume_config_overrides(config, kwargs)
         is_hf_model = get_is_hf_model(config, force_hf)
 
