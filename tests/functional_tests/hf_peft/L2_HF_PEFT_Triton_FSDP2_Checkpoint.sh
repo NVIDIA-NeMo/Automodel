@@ -39,7 +39,6 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run \
     --peft.alpha 32 \
     --peft.use_triton true \
     --peft._target_ nemo_automodel.components._peft.lora.PeftConfig \
-    --distributed._target_ nemo_automodel.components.distributed.config.FSDP2Config \
     --distributed.dp_size none \
     --distributed.tp_size 1 \
     --distributed.cp_size 1 \

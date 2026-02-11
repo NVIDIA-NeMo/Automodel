@@ -35,7 +35,6 @@ nemo_automodel/recipes/llm/train_ft.py \
     --step_scheduler.ckpt_every_steps 10 \
     --checkpoint.enabled true \
     --checkpoint.checkpoint_dir checkpoints/ \
-    --distributed._target_ nemo_automodel.components.distributed.config.FSDP2Config \
     --distributed.dp_size none \
     --distributed.tp_size 1 \
     --distributed.cp_size 1 \

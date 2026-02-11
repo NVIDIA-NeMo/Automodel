@@ -93,13 +93,14 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     # (the MoE infra reads it from there).
     ep_size: int = parallelism.get("ep_size", 1)
 
-    # YAML-level sanity: user provided a sub-config that doesn't make sense
-    # with the given parallelism sizes.
+    # YAML-level sanity: silently discard sub-configs that don't apply to the
+    # current parallelism sizes (e.g. pipeline section present but pp_size=1,
+    # which is common when a YAML template is overridden via CLI).
     pp_size: int = parallelism.get("pp_size", 1)
     if pipeline_dict is not None and pp_size <= 1:
-        raise ValueError("pipeline config requires pp_size > 1")
+        pipeline_dict = None
     if moe_dict is not None and ep_size <= 1:
-        raise ValueError("moe config requires ep_size > 1")
+        moe_dict = None
     if ep_size <= 1:
         strategy_kwargs["activation_checkpointing"] = activation_checkpointing
 

@@ -25,7 +25,7 @@ examples/vlm_finetune/finetune.py \
   --dataset._target_=nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset \
   --dataset.path_or_dataset $HF_CACHE/mini_cord_v2/ \
   --dataset.limit_dataset_samples 10 \
-  --distributed._target_ nemo_automodel.components.distributed.config.MegatronFSDPConfig \
+  --distributed.strategy megatron_fsdp \
   --distributed.dp_size none \
   --distributed.tp_size 2 \
   --distributed.cp_size 1

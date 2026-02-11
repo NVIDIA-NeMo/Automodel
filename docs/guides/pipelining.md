@@ -610,7 +610,6 @@ uv run torchrun --nproc_per_node=2 examples/llm/finetune.py \
     --config examples/llm/llama_3_2_1b_squad.yaml \
     --distributed.strategy fsdp2 \
     --distributed.pp_size 2 \
-    --distributed.pipeline._target_ nemo_automodel.components.distributed.pipelining.AutoPipeline \
     --distributed.pipeline.pp_schedule 1f1b \
     --distributed.pipeline.pp_microbatch_size 1 \
     --distributed.pipeline.round_virtual_stages_to_pp_multiple up \
@@ -619,7 +618,6 @@ uv run torchrun --nproc_per_node=2 examples/llm/finetune.py \
 
 Key parameters to override:
 - `--distributed.pp_size`: Number of pipeline stages (must match nproc_per_node)
-- `--distributed.pipeline._target_`: Specify AutoPipeline class
 - `pp_batch_size` is automatically inferred from `--dataloader.batch_size`
 - `--distributed.pipeline.pp_schedule`: Pipeline schedule (1f1b, interleaved_1f1b, etc.)
 
