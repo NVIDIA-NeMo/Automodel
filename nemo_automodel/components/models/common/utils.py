@@ -138,6 +138,32 @@ class TEFp8Config:
 
 @dataclass(kw_only=True)
 class BackendConfig:
+    """Backend configuration for model components.
+
+    Attributes:
+        attn: Attention backend ("te", "sdpa", or "flex").
+        linear: Linear layer backend ("torch" or "te").
+        rms_norm: RMSNorm backend ("torch" or "te").
+        rope_fusion: Whether to use fused RoPE (requires TE).
+        experts: MoE expert GEMM backend. "torch" uses per-expert loop,
+            "te" uses TE GroupedLinear, "gmm" uses grouped_gemm.ops.gmm,
+            "torch_mm" uses torch._grouped_mm.
+        dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
+            "deepep" uses DeepEP for token dispatch.
+        enable_deepep: Deprecated. Use dispatcher="deepep" and experts="gmm" instead.
+        fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
+            that assigns tokens to experts without learned routing weights.
+        fake_gate_noise: Noise level [0, 1] for FakeBalancedGate. When > 0, uses
+            biased topk selection seeded from the input content so routing varies
+            dynamically across training steps (like real Gate) while remaining
+            deterministic for activation checkpointing recompute (same input = same
+            routing). Only used when fake_balanced_gate=True.
+        enable_hf_state_dict_adapter: Whether to enable HuggingFace state dict adapter.
+        enable_fsdp_optimizations: Whether to enable FSDP2 optimizations.
+        gate_precision: Optional dtype override for the gate computation. Accepts
+            torch.dtype or string (e.g., "torch.float32", "float32").
+    """
+
     attn: Literal["te", "sdpa", "flex"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
@@ -146,6 +172,9 @@ class BackendConfig:
     dispatcher: Literal["torch", "deepep"] = "deepep" if HAVE_DEEP_EP and torch.cuda.is_available() else "torch"
     enable_deepep: bool | None = None  # Deprecated: use dispatcher="deepep" instead
     fake_balanced_gate: bool = False
+    # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
+    # 0.0→1.00x, 0.1→~1.2x, 0.3→~1.6x, 0.5→~2.0x, 1.0→~2.8x.
+    fake_gate_noise: float = 0.0
     enable_hf_state_dict_adapter: bool = True
     enable_fsdp_optimizations: bool = False
     te_fp8: TEFp8Config | None = None

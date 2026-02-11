@@ -102,6 +102,26 @@ class TestBackendConfigExpertsDispatcherValidation:
         assert config.dispatcher == "deepep"
 
 
+class TestBackendConfigFakeGateNoise:
+    """Test BackendConfig fake_gate_noise field."""
+
+    def test_fake_gate_noise_default(self):
+        """Test that fake_gate_noise defaults to 0.0."""
+        config = BackendConfig()
+        assert config.fake_gate_noise == 0.0
+
+    def test_fake_gate_noise_custom_value(self):
+        """Test that fake_gate_noise accepts a custom float value."""
+        config = BackendConfig(fake_gate_noise=0.5)
+        assert config.fake_gate_noise == 0.5
+
+    def test_fake_gate_noise_with_fake_balanced_gate(self):
+        """Test that fake_gate_noise can be set alongside fake_balanced_gate."""
+        config = BackendConfig(fake_balanced_gate=True, fake_gate_noise=0.3)
+        assert config.fake_balanced_gate is True
+        assert config.fake_gate_noise == 0.3
+
+
 class TestBackendConfigEnableDeepepDeprecation:
     """Test backwards compatibility for deprecated enable_deepep parameter."""
 

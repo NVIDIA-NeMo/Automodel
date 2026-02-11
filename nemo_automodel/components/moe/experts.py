@@ -454,6 +454,9 @@ class GroupedExperts(nn.Module):
             permuted_probs = sorted_weights.unsqueeze(-1)
 
             if self.expert_bias:
+                # torch._grouped_mm does not support bias yet (raises
+                # "RuntimeError: Bias not supported yet" as of PyTorch 2.10).
+                # Apply bias manually after each grouped GEMM via _apply_bias.
                 gate_up_proj_bias = (
                     self.gate_up_proj_bias.to_local()
                     if isinstance(self.gate_up_proj_bias, DTensor)
@@ -661,6 +664,9 @@ class GroupedExpertsDeepEP(nn.Module):
                 )
 
                 if self.expert_bias:
+                    # torch._grouped_mm does not support bias yet (raises
+                    # "RuntimeError: Bias not supported yet" as of PyTorch 2.10).
+                    # Apply bias manually after each grouped GEMM via _apply_bias.
                     offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
                     output1 = torch._grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs=offs)
                     gate_up_proj_bias = self.gate_up_proj_bias.to_local()

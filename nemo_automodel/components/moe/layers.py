@@ -118,13 +118,18 @@ class FakeBalancedGate(nn.Module):
     Load balanced gate implementation, spreads tokens uniformly across all experts.
     The rationale for this class is to do performance experiments to understand
     how the load imbalance with real data is impacting end-to-end performance.
+
+    When ``noise > 0``, random perturbation is added to mimic realistic routing
+    imbalance.  A noise value of 0.0 gives perfectly balanced assignment, while
+    1.0 gives fully random expert selection and non-uniform weights.
     """
 
-    def __init__(self, config: MoEConfig, skip_first_n_experts: int = 0):
+    def __init__(self, config: MoEConfig, skip_first_n_experts: int = 0, noise: float = 0.0):
         super().__init__()
         self.n_routed_experts = config.n_routed_experts
         self.n_activated_experts = config.n_activated_experts
         self.skip_first_n_experts = skip_first_n_experts
+        self.noise = noise
 
     def forward(
         self,
@@ -148,13 +153,41 @@ class FakeBalancedGate(nn.Module):
         del token_mask
         del cp_mesh
 
+        n_tokens = x.size(0)
         n_exp = self.n_routed_experts
         a_exp = self.n_activated_experts
-        weights = torch.ones(x.size(0), a_exp, device=x.device) / a_exp
         available_experts = n_exp - self.skip_first_n_experts
-        indices = (
-            torch.arange(x.size(0) * a_exp, device=x.device).view(-1, a_exp) % available_experts
-        ) + self.skip_first_n_experts
+
+        if self.noise > 0:
+            # Derive the generator seed from the input content so that:
+            #  - Forward and activation-checkpointing recompute get the same x,
+            #    hence the same seed, hence identical routing (no shape mismatch).
+            #  - Different training steps get different x (different data + updated
+            #    weights), hence different seeds, hence dynamic routing that
+            #    reproduces the varying tokens_per_expert pattern of real Gate.
+            seed = int(x.view(-1)[:4].to(torch.float32).sum().item() * 1e6) & 0x7FFFFFFF
+            gen = torch.Generator(device=x.device).manual_seed(seed)
+
+            # Noisy weights: interpolate between uniform (1/a_exp) and random
+            uniform_weights = torch.ones(n_tokens, a_exp, device=x.device) / a_exp
+            raw_weights = torch.rand(n_tokens, a_exp, device=x.device, generator=gen)
+            raw_weights = raw_weights / raw_weights.sum(dim=-1, keepdim=True)
+            weights = (1 - self.noise) * uniform_weights + self.noise * raw_weights
+
+            # Noisy indices via biased topk selection to mimic real routing where
+            # some experts are systematically "hot".  A per-expert popularity bias
+            # creates correlated selections across tokens; the noise parameter
+            # scales this bias.  topk guarantees unique experts per token (required
+            # by the downstream scatter-back which uses y[token_ids] += ...).
+            expert_bias = torch.randn(available_experts, device=x.device, generator=gen) * self.noise * 0.1
+            scores = torch.rand(n_tokens, available_experts, device=x.device, generator=gen) + expert_bias
+            _, indices = scores.topk(a_exp, dim=-1)
+            indices = indices + self.skip_first_n_experts
+        else:
+            weights = torch.ones(n_tokens, a_exp, device=x.device) / a_exp
+            indices = (
+                torch.arange(n_tokens * a_exp, device=x.device).view(-1, a_exp) % available_experts
+            ) + self.skip_first_n_experts
 
         return weights.type_as(x), indices, None
 
@@ -507,7 +540,7 @@ class MoE(nn.Module):
         self.n_activated_experts = config.n_activated_experts
 
         if backend.fake_balanced_gate:
-            self.gate = FakeBalancedGate(config)
+            self.gate = FakeBalancedGate(config, noise=backend.fake_gate_noise)
         else:
             self.gate = Gate(config, gate_precision=backend.gate_precision)
         if backend.dispatcher == "deepep" and get_world_size_safe() == 1:
