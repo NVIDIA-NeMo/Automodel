@@ -21,11 +21,10 @@ from nemo_automodel.components.moe.fsdp_mixin import (
     _iter_fsdp_modules,
     _run_post_backward_for_moe_module,
     _run_post_backward_hooks,
-    get_is_optim_step,
     patched_backward_maybe_with_nosync,
-    set_is_optim_step,
 )
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.utils import get_is_optim_step, set_is_optim_step
 
 
 class MockFSDPModule:
