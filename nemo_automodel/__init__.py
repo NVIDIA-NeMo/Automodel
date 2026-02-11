@@ -29,6 +29,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "nemo_automodel._transformers.auto_model",
         "NeMoAutoModelForSequenceClassification",
     ),
+    "NeMoAutoModelForSpeechSeq2Seq": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForSpeechSeq2Seq"),
     "NeMoAutoModelForTextToWaveform": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForTextToWaveform"),
     "NeMoAutoTokenizer": ("nemo_automodel._transformers.auto_tokenizer", "NeMoAutoTokenizer"),
 }

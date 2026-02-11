@@ -127,11 +127,17 @@ vlm = [
     "mistral_common[opencv]>=1.9.0",
     "albumentations"
 ]
+asr = [
+    "torchaudio",
+    "soundfile",
+    "torchcodec; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+]
 all = [
     "nemo_automodel[cuda]",
     "nemo_automodel[delta-databricks]",
     "nemo_automodel[extra]",
     "nemo_automodel[vlm]",
+    "nemo_automodel[asr]",
 ]
 
 [project.urls]
