@@ -32,7 +32,6 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.distributed.config_factory import setup_distributed
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
-from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist, MetricsSample
@@ -382,7 +381,7 @@ class TrainBiencoderRecipe(BaseRecipe):
 
         # Apply parallelism wrapper if needed (FSDP/DDP)
         if self.distributed_config is not None:
-            from nemo_automodel.components.distributed.config import FSDP2Config, MegatronFSDPConfig, DDPConfig
+            from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
             from nemo_automodel.components.distributed.ddp import DDPManager
             from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 
