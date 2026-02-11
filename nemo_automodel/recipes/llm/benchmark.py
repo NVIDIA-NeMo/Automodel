@@ -283,6 +283,11 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     f"loss={reporting_loss:.4f}"
                 )
 
+            # Collect and log MoE load balance metrics (inherited from train_ft)
+            self._collect_moe_load_balance()
+            if self._wandb_enabled and self.wandb_run is not None:
+                self._log_moe_metrics(i, self.wandb_run.log)
+
             # Calculate and log MFU
             self._log_iteration_metrics(iter_timer, ga_steps, peak_tflops, rank, i)
 

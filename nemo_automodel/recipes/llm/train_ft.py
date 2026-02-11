@@ -1014,6 +1014,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Handle delayed fake-quant toggling for QAT if configured
         self._qat_disable_fn, self._qat_enable_fn, self._qat_enable_after = self._setup_qat(self.cfg, self.model_parts)
 
+        # Enable MoE load balance tracking if configured
+        moe_metrics_cfg = self.cfg.get("moe_metrics", None)
+        if moe_metrics_cfg and moe_metrics_cfg.get("enabled", False):
+            from nemo_automodel.components.moe.load_balance_metrics import enable_load_balance_tracking
+
+            for mp in self.model_parts:
+                enable_load_balance_tracking(mp)
+
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         # Initialize JSONL loggers
         self.metric_logger_train = build_metric_logger(
@@ -1032,6 +1040,55 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
+
+    def _collect_moe_load_balance(self):
+        """Collect MoE load balance metrics with DP all-reduce.
+
+        Must be called on ALL ranks (the all-reduce is collective).
+        Stores the result in ``self._moe_layer_loads`` for rank-0 logging.
+        """
+        moe_metrics_cfg = self.cfg.get("moe_metrics", None)
+        if not (moe_metrics_cfg and moe_metrics_cfg.get("enabled", False)):
+            self._moe_layer_loads = None
+            return
+
+        from nemo_automodel.components.moe.load_balance_metrics import collect_expert_loads
+
+        dp_group = self._get_dp_group(include_cp=True)
+        all_loads: dict = {}
+        for mp in self.model_parts:
+            all_loads.update(collect_expert_loads(mp, dp_group=dp_group))
+        self._moe_layer_loads = all_loads if all_loads else None
+
+    def _log_moe_metrics(self, step: int, wandb_log_fn) -> None:
+        """Log MoE load balance metrics to wandb.
+
+        Call after :meth:`_collect_moe_load_balance`.  Only logs when
+        ``_moe_layer_loads`` is populated and a wandb log function is provided.
+
+        Args:
+            step: Current training/benchmark step for wandb x-axis.
+            wandb_log_fn: Callable like ``wandb.log`` or ``wandb_run.log``.
+        """
+        if not getattr(self, "_moe_layer_loads", None):
+            return
+
+        from nemo_automodel.components.moe.load_balance_metrics import (
+            compute_brief_metrics,
+            compute_detailed_metrics,
+        )
+
+        moe_metrics_cfg = self.cfg.get("moe_metrics", None)
+        mode = moe_metrics_cfg.get("mode", "brief") if moe_metrics_cfg else "brief"
+        top_k = moe_metrics_cfg.get("top_k_experts", 5) if moe_metrics_cfg else 5
+        if mode == "detailed":
+            detailed_every = moe_metrics_cfg.get("detailed_every_steps", None) if moe_metrics_cfg else None
+            if detailed_every is None or step % detailed_every == 0:
+                wandb_log_fn(compute_detailed_metrics(self._moe_layer_loads, top_k=top_k), step=step)
+            else:
+                wandb_log_fn(compute_brief_metrics(self._moe_layer_loads, top_k=top_k), step=step)
+        else:
+            wandb_log_fn(compute_brief_metrics(self._moe_layer_loads, top_k=top_k), step=step)
 
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
@@ -1095,6 +1152,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # If QAT delayed fake-quant is configured, enable after threshold
                 self._enable_qat_if_delayed(self.step_scheduler.step)
                 train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                # Collect MoE load balance metrics (all ranks participate in all-reduce)
+                self._collect_moe_load_balance()
                 # log
                 self.log_train_metrics(train_log_data)
 
@@ -1453,6 +1512,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
             if self.mlflow_logger is not None:
                 self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
+
+        # Log MoE load balance metrics (already collected/reduced on all ranks)
+        if self.step_scheduler.is_remote_logging_step and wandb.run is not None:
+            self._log_moe_metrics(self.step_scheduler.step, wandb.log)
 
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
