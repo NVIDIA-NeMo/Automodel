@@ -96,29 +96,33 @@ def _compute_default_inv_freq(config, device: Optional[torch.device] = None) -> 
 
 
 def _compute_llama3_inv_freq(config, device: Optional[torch.device] = None) -> tuple[torch.Tensor, float]:
-    """Computes inverse frequencies for Llama3-style RoPE with smooth interpolation."""
+    """Computes inverse frequencies for Llama3-style RoPE with smooth interpolation.
+
+    Branch logic (matches HF _compute_llama3_parameters):
+      - Long wavelength  (low freq,  wavelen > low_freq_wavelen)  → scale by factor
+      - Short wavelength (high freq, wavelen < high_freq_wavelen) → unchanged
+      - Medium band → smooth interpolation
+    """
     inv_freq, _ = _compute_default_inv_freq(config, device)
 
     _, rope_scaling = _get_rope_config(config)
     factor = rope_scaling.get("factor", 1.0)
     low_freq_factor = rope_scaling.get("low_freq_factor", 1.0)
     high_freq_factor = rope_scaling.get("high_freq_factor", 4.0)
-    original_max_pos = rope_scaling.get("original_max_position_embeddings", config.max_position_embeddings)
+    old_context_len = rope_scaling.get("original_max_position_embeddings", config.max_position_embeddings)
 
-    low_freq_wavelen = original_max_pos / low_freq_factor
-    high_freq_wavelen = original_max_pos / high_freq_factor
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
 
     wavelen = 2 * math.pi / inv_freq
-    smooth = (original_max_pos / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
-    smooth = smooth.clamp(0, 1)
-
-    scaled_inv_freq = inv_freq / factor
-    inv_freq = torch.where(
-        wavelen > low_freq_wavelen,
-        inv_freq,
-        torch.where(wavelen < high_freq_wavelen, scaled_inv_freq, (1 - smooth) * scaled_inv_freq + smooth * inv_freq),
-    )
-    return inv_freq, 1.0
+    # Long wavelen (low freq) → scale; short wavelen (high freq) → unchanged
+    inv_freq_llama = torch.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
+    # Medium band: smooth interpolation
+    smooth_factor = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+    smoothed_inv_freq = (1 - smooth_factor) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
+    is_medium_freq = (~(wavelen < high_freq_wavelen)) & (~(wavelen > low_freq_wavelen))
+    inv_freq_llama = torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
+    return inv_freq_llama, 1.0
 
 
 class LlamaRotaryEmbedding(nn.Module):

@@ -20,7 +20,7 @@ step_scheduler:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 1
+  timeout_minutes: 10
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
