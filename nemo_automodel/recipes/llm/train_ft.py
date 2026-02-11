@@ -37,10 +37,10 @@ from wandb import Settings
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM, NeMoAutoModelForSequenceClassification
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.infrastructure import (
-    MeshContext,
     apply_model_infrastructure,
     instantiate_infrastructure,
 )
+from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
@@ -164,7 +164,7 @@ def build_model(
         distributed_config: Strategy-specific distributed config (FSDP2Config, etc.).
         pipeline_config: Pipeline parallelism config.
         cfg_qat: Configuration for QAT (will be instantiated to QATConfig).
-        cfg_moe: MoEParallelizerConfig instance, or OmegaConf config to be instantiated.
+        cfg_moe: MoEParallelizerConfig instance, or ConfigNode to be converted.
         activation_checkpointing: Whether to enable activation checkpointing.
         unfreeze_modules: List of module names/substrings to unfreeze.
     """
@@ -189,9 +189,8 @@ def build_model(
             if isinstance(cfg_moe, MoEParallelizerConfig):
                 kwargs["moe_config"] = cfg_moe
             else:
-                from omegaconf import OmegaConf
-                moe_dict = OmegaConf.to_container(cfg_moe, resolve=True)
-                # activation_checkpointing is handled separately; strip OmegaConf keys
+                moe_dict = cfg_moe.to_dict() if hasattr(cfg_moe, "to_dict") else dict(cfg_moe)
+                # activation_checkpointing is handled separately; strip config keys
                 moe_dict.pop("activation_checkpointing", None)
                 moe_dict.pop("_target_", None)
                 kwargs["moe_config"] = MoEParallelizerConfig(**moe_dict)
