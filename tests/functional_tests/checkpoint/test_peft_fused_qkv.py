@@ -220,13 +220,14 @@ def test_peft_fused_qkv_checkpoint():
             for saved_key, saved_param in saved_adapter_sd.items():
                 if "lora" not in saved_key.lower():
                     continue
-                saved_param = saved_param.to(dtype=trainer.model_parts[0].dtype)
                 matched = False
                 for peft_key, peft_param in peft_model.named_parameters():
                     if "lora" in peft_key and saved_key.rsplit(".", 1)[0] in peft_key:
-                        assert torch.allclose(saved_param, peft_param.data.cpu(), atol=1e-6), (
-                            f"PEFT adapter weight mismatch for {saved_key} <-> {peft_key}"
-                        )
+                        # Compare in float32 to avoid dtype mismatch (safetensors
+                        # may store bf16 while HF PEFT loads as fp32).
+                        assert torch.allclose(
+                            saved_param.float(), peft_param.data.cpu().float(), atol=1e-6
+                        ), f"PEFT adapter weight mismatch for {saved_key} <-> {peft_key}"
                         matched = True
                         break
                 assert matched, f"No matching PEFT param found for saved key: {saved_key}"
