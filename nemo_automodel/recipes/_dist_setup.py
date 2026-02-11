@@ -22,11 +22,6 @@ All dict handling lives here; the component layer (``mesh``) stays purely typed.
 import dataclasses
 from typing import Any, Dict, Optional
 
-from nemo_automodel.components.distributed.config import (
-    DDPConfig,
-    FSDP2Config,
-    MegatronFSDPConfig,
-)
 from nemo_automodel.components.distributed.mesh import (
     STRATEGY_MAP,
     MeshContext,
@@ -53,9 +48,7 @@ def _validate_strategy_kwargs(
     valid_fields = {f.name for f in dataclasses.fields(strategy_cls)}
     unknown = set(strategy_kwargs) - valid_fields
     if unknown:
-        raise ValueError(
-            f"Unknown options for strategy '{strategy_name}': {sorted(unknown)}"
-        )
+        raise ValueError(f"Unknown options for strategy '{strategy_name}': {sorted(unknown)}")
 
 
 def parse_distributed_section(cfg_dict: dict) -> dict:
@@ -79,10 +72,7 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     # -- strategy -----------------------------------------------------------
     strategy_name: str = cfg.pop("strategy", "fsdp2")
     if strategy_name not in STRATEGY_MAP:
-        raise ValueError(
-            f"Unknown strategy: {strategy_name}. "
-            f"Valid strategies: {list(STRATEGY_MAP.keys())}"
-        )
+        raise ValueError(f"Unknown strategy: {strategy_name}. Valid strategies: {list(STRATEGY_MAP.keys())}")
     strategy_cls = STRATEGY_MAP[strategy_name]
 
     # -- parallelism sizes --------------------------------------------------

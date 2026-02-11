@@ -38,9 +38,10 @@ from nemo_automodel.components.distributed.config import (
 )
 
 if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
+
     from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
     from nemo_automodel.components.moe.config import MoEParallelizerConfig
-    from torch.distributed.device_mesh import DeviceMesh
 
 
 #: Maps strategy name (from YAML) → strategy dataclass.
@@ -213,6 +214,7 @@ class MeshContext:
             moe_mesh=moe_mesh,
         )
 
+
 # misc utils
 def _get_axis_size(mesh: Optional["DeviceMesh"], axis: MeshAxisName) -> Optional[str]:
     """Return the size of *axis* if present in *mesh*, else ``None``."""
@@ -227,6 +229,7 @@ def _optional_axis(mesh: Optional["DeviceMesh"], axis: MeshAxisName) -> Optional
         return axis
     return None
 
+
 # Validation utils
 def _validate_mesh_dim_names(mesh_context: "MeshContext") -> None:
     """Ensure every dimension name in the attached meshes is a :class:`MeshAxisName`."""
@@ -237,8 +240,7 @@ def _validate_mesh_dim_names(mesh_context: "MeshContext") -> None:
         bad = {n for n in mesh.mesh_dim_names if n not in _VALID_AXIS_NAMES}
         if bad:
             raise ValueError(
-                f"{label} contains unknown dimension names {bad}; "
-                f"allowed names are {sorted(_VALID_AXIS_NAMES)}"
+                f"{label} contains unknown dimension names {bad}; allowed names are {sorted(_VALID_AXIS_NAMES)}"
             )
 
 
