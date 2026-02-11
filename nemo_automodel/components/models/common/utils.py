@@ -24,6 +24,7 @@ from nemo_automodel.shared.utils import dtype_from_str
 
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_DEEP_EP = importlib.util.find_spec("deep_ep") is not None
+HAVE_GMM = importlib.util.find_spec("grouped_gemm") is not None
 
 
 def is_tensor_unallocated(tensor: torch.Tensor) -> bool:
@@ -50,7 +51,7 @@ class BackendConfig:
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
-    experts: Literal["torch", "te", "gmm"] = "gmm" if HAVE_TE and torch.cuda.is_available() else "torch"
+    experts: Literal["torch", "te", "gmm"] = "gmm" if HAVE_GMM and torch.cuda.is_available() else "torch"
     dispatcher: Literal["torch", "deepep"] = "deepep" if HAVE_DEEP_EP and torch.cuda.is_available() else "torch"
     enable_deepep: bool | None = None  # Deprecated: use dispatcher="deepep" instead
     fake_balanced_gate: bool = False
