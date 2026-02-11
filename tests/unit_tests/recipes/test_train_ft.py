@@ -189,7 +189,7 @@ class DummyModelConfig:
 
     def get(self, key, default=None):
         return getattr(self, key, default)
-    
+
     def get_as_string(self, key, default=None):
         return str(getattr(self, key, default))
 
@@ -667,6 +667,7 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
     object.__setattr__(recipe, "pp_enabled", True)
     object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info))
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
+    object.__setattr__(recipe, "te_fp8", None)
 
     return recipe
 
