@@ -21,16 +21,30 @@ Whisper models use encoder-decoder architecture with CrossEntropy loss and suppo
 - Splits: train.100, train.clean.360, train.other.500, test, test.other
 - Readily available on HuggingFace
 
-### Common Voice (Relocated)
-- **mozilla-foundation/common_voice_17_0** - 100+ languages, community-contributed recordings
-- ⚠️ **Note**: As of October 2025, Mozilla Common Voice datasets are exclusively available through [Mozilla Data Collective](https://datacollective.mozillafoundation.org)
-- The HuggingFace repo is now empty - use Mozilla Data Collective to download
-- Good for multilingual fine-tuning once downloaded
 
 ### Custom Datasets
 Use `make_custom_asr_dataset` to load any HuggingFace audio dataset with audio and text fields.
 
 ## Installation
+
+### System Dependencies
+
+ASR requires FFmpeg libraries for audio decoding (used by torchcodec). Install them based on your OS:
+
+**Ubuntu/Debian:**
+```bash
+sudo apt-get update
+sudo apt-get install -y ffmpeg libavcodec-dev libavformat-dev libavutil-dev
+```
+
+**macOS:**
+```bash
+brew install ffmpeg
+```
+
+**Note**: If using the Docker container, these dependencies are already included.
+
+### Python Dependencies
 
 ```bash
 # Install ASR dependencies
@@ -39,6 +53,28 @@ uv sync --extra asr
 # Or install all extras including ASR
 uv sync --all-extras
 ```
+
+### Using Docker (Recommended)
+
+Docker containers include all system dependencies pre-installed:
+
+```bash
+# Build ASR-specific container
+docker build \
+  --build-arg BASE_IMAGE=cuda \
+  --build-arg AUTOMODEL_INSTALL="asr" \
+  -t nemo-automodel-asr:latest \
+  -f docker/Dockerfile \
+  .
+
+# Run training with GPU support
+docker run --rm --gpus all \
+  nemo-automodel-asr:latest \
+  uv run examples/asr_finetune/finetune.py \
+    --config examples/asr_finetune/whisper/whisper_small_librispeech.yaml
+```
+
+**Benefits**: Pre-configured environment, no system dependency installation required.
 
 ## Quick Start
 

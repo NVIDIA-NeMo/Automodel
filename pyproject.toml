@@ -128,8 +128,6 @@ vlm = [
     "albumentations"
 ]
 asr = [
-    "torchaudio",
-    "soundfile",
     "torchcodec; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
 ]
 all = [
