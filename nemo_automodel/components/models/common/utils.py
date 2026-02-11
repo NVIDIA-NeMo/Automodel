@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.util
+import logging
 import warnings
 from dataclasses import dataclass
 from typing import Literal
@@ -20,7 +21,7 @@ from typing import Literal
 import torch
 from torch import nn
 
-from nemo_automodel.components.loggers.log_utils import logger
+logger = logging.getLogger(__name__)
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
@@ -83,10 +84,13 @@ class BackendConfig:
 
         # Backward compatibility
         if (self.experts == "gmm" or self.experts == "te") and self.dispatcher != "deepep":
-            logger.info(
-                f"experts='{self.experts}' requires dispatcher='deepep', but got dispatcher='{self.dispatcher}'. "
-                "Setting both to torch."
-            )
+            if (
+                torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
+            ) or not torch.distributed.is_initialized():
+                logger.info(
+                    f"experts='{self.experts}' requires dispatcher='deepep', but got dispatcher='{self.dispatcher}'. "
+                    "Setting both to torch."
+                )
             self.dispatcher = "torch"
             self.experts = "torch"
 
