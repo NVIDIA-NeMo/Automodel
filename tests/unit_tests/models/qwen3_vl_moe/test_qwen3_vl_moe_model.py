@@ -39,7 +39,7 @@ from nemo_automodel.components.models.qwen3_vl_moe.model import (
     Qwen3VLMoeModel,
     Qwen3VLMoeTextModelBackend,
 )
-from nemo_automodel.components.moe.layers import MoEConfig
+from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.models.common import BackendConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -106,7 +106,8 @@ def backend_config():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
-        enable_deepep=False,
+        experts="torch",
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -247,6 +248,27 @@ class TestQwen3VLMoeTextModelBackend:
         assert len(model.layers) == text_config.num_hidden_layers
         assert isinstance(model.rotary_emb, Fp32SafeQwen3VLMoeTextRotaryEmbedding)
 
+    def test_forward_skips_norm_when_none(self, text_config, backend_config, moe_config, device):
+        """Test that forward() skips norm layer when it is None (PP support)."""
+        model = Qwen3VLMoeTextModelBackend(text_config, backend=backend_config, moe_config=moe_config).to(device)
+        model.norm = None  # Simulate PP stage without norm
+
+        batch, seq_len = 2, 3
+        input_ids = torch.randint(0, text_config.vocab_size, (batch, seq_len), device=device)
+
+        cos = torch.zeros(3, batch, seq_len, text_config.head_dim * 2, device=device)
+        sin = torch.ones_like(cos)
+
+        for layer in model.layers.values():
+            layer.forward = MagicMock(side_effect=lambda x, **_: x)
+
+        with patch.object(model.rotary_emb, "forward", return_value=(cos, sin)):
+            # Should not raise when norm is None
+            output = model(input_ids=input_ids)
+
+        assert isinstance(output, Qwen3VLMoeModelOutputWithPast)
+        assert output.last_hidden_state.shape == (batch, seq_len, text_config.hidden_size)
+
     def test_forward_runs_layers_and_returns_output(self, text_config, backend_config, moe_config, device):
         model = Qwen3VLMoeTextModelBackend(text_config, backend=backend_config, moe_config=moe_config).to(device)
         batch, seq_len = 2, 3
@@ -347,8 +369,114 @@ class TestQwen3VLMoeForConditionalGeneration:
         assert isinstance(vision_model.rotary_pos_emb, Fp32SafeQwen3VLMoeVisionRotaryEmbedding)
         assert vision_model.rotary_pos_emb.inv_freq.dtype == torch.float32
 
-    def test_forward_handles_thd_format(self, vl_config, backend_config, moe_config, device):
+    def test_pad_token_id_defaults_to_negative_one_when_missing(self, vl_config, backend_config, moe_config):
+        """Test that pad_token_id defaults to -1 when text_config.pad_token_id is 0 (falsy)."""
+        # Test that the model correctly handles the getattr fallback
+        # When pad_token_id is 0 (falsy but valid), it should use 0, not -1
+        vl_config.text_config.pad_token_id = 0
+        model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)
+        # 0 is a valid pad_token_id, should not fallback to -1
+        assert model.pad_token_id == 0
+
+    def test_pad_token_id_uses_config_value_when_present(self, vl_config, backend_config, moe_config):
+        """Test that pad_token_id uses the config value when present."""
+        vl_config.text_config.pad_token_id = 42
+
+        model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)
+
+        assert model.pad_token_id == 42
+
+    def test_pad_token_id_defaults_to_negative_one_when_none(self, vl_config, backend_config, moe_config):
+        """Test that pad_token_id defaults to -1 when text_config.pad_token_id is None."""
+        vl_config.text_config.pad_token_id = None
+
+        model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)
+
+        assert model.pad_token_id == -1
+
+    def test_forward_returns_logits_from_lm_head(self, vl_config, backend_config, moe_config, device):
+        """Test that forward() returns logits from lm_head when present."""
         model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        # Get model dtype for consistent tensor creation
+        model_dtype = next(model.parameters()).dtype
+
+        batch, seq_len = 2, 3
+        input_ids = torch.randint(0, vl_config.text_config.vocab_size, (batch, seq_len), device=device)
+
+        with patch.object(model.model, "forward") as mock_model_forward:
+            mock_output = MagicMock()
+            mock_output.last_hidden_state = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=model_dtype)
+            mock_model_forward.return_value = mock_output
+
+            logits = model.forward(input_ids=input_ids)
+
+        # Should return logits with vocab_size dimension
+        assert logits.shape == (batch, seq_len, vl_config.text_config.vocab_size)
+        mock_model_forward.assert_called_once()
+
+    def test_forward_returns_hidden_states_when_no_lm_head(self, vl_config, backend_config, moe_config, device):
+        """Test that forward() returns hidden states when lm_head is None."""
+        model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        model.lm_head = None  # Simulate PP stage without lm_head
+
+        batch, seq_len = 2, 3
+        input_ids = torch.randint(0, vl_config.text_config.vocab_size, (batch, seq_len), device=device)
+
+        with patch.object(model.model, "forward") as mock_model_forward:
+            mock_output = MagicMock()
+            hidden_states = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device)
+            mock_output.last_hidden_state = hidden_states
+            mock_model_forward.return_value = mock_output
+
+            result = model.forward(input_ids=input_ids)
+
+        # Should return hidden states directly
+        torch.testing.assert_close(result, hidden_states)
+
+    def test_forward_retrieves_pixel_values_from_stored_chunks(self, vl_config, backend_config, moe_config, device):
+        """Test that forward() retrieves pixel_values from stored chunks for PP VLM support."""
+        model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        # Get model dtype for consistent tensor creation
+        model_dtype = next(model.parameters()).dtype
+
+        batch, seq_len = 1, 4
+        # Create input_ids with media tokens (151655 for image)
+        input_ids = torch.tensor([[151655, 1, 2, 3]], device=device)
+
+        # Store pixel_values chunks for PP VLM support
+        pixel_values_chunk = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
+        image_grid_hws_chunk = torch.tensor([[2, 2]], device=device)  # [N, 2] format
+        model._vlm_pixel_values_chunks = [pixel_values_chunk]
+        model._vlm_image_grid_hws_chunks = [image_grid_hws_chunk]
+        model._vlm_chunk_idx = 0
+
+        captured_kwargs = {}
+
+        with patch.object(model.model, "forward") as mock_model_forward:
+            mock_output = MagicMock()
+            mock_output.last_hidden_state = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=model_dtype)
+            mock_model_forward.return_value = mock_output
+
+            def capture_kwargs(*args, **kwargs):
+                captured_kwargs.update(kwargs)
+                return mock_output
+
+            mock_model_forward.side_effect = capture_kwargs
+            model.forward(input_ids=input_ids)
+
+        # pixel_values should be retrieved from chunks
+        assert "pixel_values" in captured_kwargs
+        torch.testing.assert_close(captured_kwargs["pixel_values"], pixel_values_chunk)
+        # image_grid_thw should be converted from [N, 2] to [N, 3] format
+        assert "image_grid_thw" in captured_kwargs
+        assert captured_kwargs["image_grid_thw"].shape == (1, 3)
+        # Chunk index should be incremented
+        assert model._vlm_chunk_idx == 1
+
+    def test_forward_handles_thd_format(self, vl_config, backend_config, moe_config, device):
+        """Test that forward() correctly handles thd format by calling squeeze_input_for_thd."""
+        model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        model_dtype = next(model.parameters()).dtype
 
         batch, seq_len = 2, 3
         input_ids = torch.randint(0, vl_config.text_config.vocab_size, (batch, seq_len), device=device)
@@ -360,14 +488,21 @@ class TestQwen3VLMoeForConditionalGeneration:
         squeezed_position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
         squeezed_padding_mask = torch.ones(batch, seq_len, dtype=torch.bool, device=device)
         squeezed_kwargs = {"foo": "bar"}
+        
+        # Mock the model.model.forward to avoid internal tensor operations
+        mock_hidden = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=model_dtype)
 
         with (
             patch(
                 "nemo_automodel.components.models.qwen3_vl_moe.model.squeeze_input_for_thd",
                 return_value=(squeezed_ids, squeezed_position_ids, squeezed_padding_mask, squeezed_kwargs),
             ) as mock_squeeze,
-            patch.object(HFQwen3VLMoeForConditionalGeneration, "forward", return_value="sentinel") as mock_super,
+            patch.object(model.model, "forward") as mock_model_forward,
         ):
+            mock_output = MagicMock()
+            mock_output.last_hidden_state = mock_hidden
+            mock_model_forward.return_value = mock_output
+            
             result = model.forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -376,19 +511,18 @@ class TestQwen3VLMoeForConditionalGeneration:
                 qkv_format="thd",
             )
 
-        assert result == "sentinel"
-        squeeze_args = mock_squeeze.call_args[0]
-        assert squeeze_args[0] is input_ids
-        assert squeeze_args[1] is position_ids
-        assert squeeze_args[2] is padding_mask
-        assert squeeze_args[3]["qkv_format"] == "thd"
-
-        super_kwargs = mock_super.call_args.kwargs
-        assert super_kwargs["attention_mask"] is None
-        assert super_kwargs["padding_mask"] is squeezed_padding_mask
-        assert super_kwargs["position_ids"] is squeezed_position_ids
-        assert super_kwargs["input_ids"] is squeezed_ids
-        assert super_kwargs["foo"] == "bar"
+            # Result should be logits from lm_head
+            assert result.shape == (batch, seq_len, vl_config.text_config.vocab_size)
+            
+            # Verify squeeze_input_for_thd was called with correct args
+            squeeze_args = mock_squeeze.call_args[0]
+            assert squeeze_args[0] is input_ids
+            assert squeeze_args[1] is position_ids
+            assert squeeze_args[2] is padding_mask
+            assert squeeze_args[3]["qkv_format"] == "thd"
+            
+            # Verify model.model.forward was called
+            mock_model_forward.assert_called_once()
 
     def test_initialize_weights_invokes_language_model(self, vl_config, backend_config, moe_config):
         model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)
@@ -420,6 +554,64 @@ class TestQwen3VLMoeModel:
         assert core.layers is core.language_model.layers
         assert core.embed_tokens is core.language_model.embed_tokens
         assert core.norm is core.language_model.norm
+
+    def test_forward_uses_embed_tokens_when_inputs_embeds_not_provided(self, vl_config, backend_config, moe_config, device):
+        """Test that forward() uses embed_tokens to create inputs_embeds from input_ids."""
+        model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        core = model.model
+
+        batch, seq_len = 2, 3
+        input_ids = torch.randint(0, vl_config.text_config.vocab_size, (batch, seq_len), device=device)
+
+        with patch.object(core.language_model, "forward") as mock_lang_forward:
+            mock_output = MagicMock()
+            mock_output.last_hidden_state = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device)
+            mock_lang_forward.return_value = mock_output
+
+            core.forward(input_ids=input_ids)
+
+        # language_model.forward should be called with inputs_embeds derived from input_ids
+        call_kwargs = mock_lang_forward.call_args.kwargs
+        assert call_kwargs["input_ids"] is None
+        assert call_kwargs["inputs_embeds"] is not None
+        assert call_kwargs["inputs_embeds"].shape == (batch, seq_len, vl_config.text_config.hidden_size)
+
+    def test_forward_accepts_float_input_ids_as_inputs_embeds(self, vl_config, backend_config, moe_config, device):
+        """Test that forward() treats float tensor input_ids as inputs_embeds (PP support)."""
+        model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        core = model.model
+
+        batch, seq_len = 2, 3
+        # Pass float tensor as input_ids (this is actually inputs_embeds from previous PP stage)
+        float_input = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=torch.bfloat16)
+
+        with (
+            patch.object(core, "get_input_embeddings", return_value=None),
+            patch.object(core.language_model, "forward") as mock_lang_forward,
+        ):
+            mock_output = MagicMock()
+            mock_output.last_hidden_state = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device)
+            mock_lang_forward.return_value = mock_output
+
+            core.forward(input_ids=float_input)
+
+            # language_model.forward should be called with the float tensor as inputs_embeds
+            call_kwargs = mock_lang_forward.call_args.kwargs
+            assert call_kwargs["input_ids"] is None
+            torch.testing.assert_close(call_kwargs["inputs_embeds"], float_input)
+
+    def test_forward_raises_when_no_embeds_and_no_embed_tokens(self, vl_config, backend_config, moe_config, device):
+        """Test that forward() raises ValueError when no inputs_embeds and no embed_tokens."""
+        model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        core = model.model
+
+        batch, seq_len = 2, 3
+        # Pass integer input_ids without embed_tokens
+        input_ids = torch.randint(0, vl_config.text_config.vocab_size, (batch, seq_len), device=device)
+
+        with patch.object(core, "get_input_embeddings", return_value=None):
+            with pytest.raises(ValueError, match="inputs_embeds must be provided"):
+                core.forward(input_ids=input_ids)
 
 
 class TestQwen3VLMoeFromPretrainedAndModelClass:

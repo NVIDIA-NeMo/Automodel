@@ -34,7 +34,15 @@ FROM ${PYTORCH_IMAGE} AS pytorch
 
 FROM ${BASE_IMAGE} AS update_base_container
 
+ENV PIP_NO_CACHE_DIR=1
 WORKDIR /opt
+
+ENV DEBIAN_FRONTEND=noninteractive
+# Address CVE-2025-68973
+RUN apt-get update && apt install -y --only-upgrade gnupg && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
 # Install uv
 ENV UV_VERSION="0.8.22"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
@@ -82,6 +90,14 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     rm -rf /opt/deepep.patch && \
     rm -rf DeepEP; \
     fi
+
+# Address base image CVE
+RUN pip install "aiohttp>=3.13.3" \
+        "jaraco-context>=6.1.0" \
+        "protobuf>=6.3.5" \
+        "setuptools>=80.10.2" \
+        "urllib3>=2.6.0" \
+        "wheel>=0.46.2"
 
 FROM automodel_dep as automodel_final
 

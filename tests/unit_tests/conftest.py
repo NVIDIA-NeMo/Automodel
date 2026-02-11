@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
+import sys
 import os
 import sys
 import types
@@ -36,6 +37,12 @@ if "transformers.initialization" not in sys.modules:
         _compat = types.ModuleType("transformers.initialization")
         _compat.no_init_weights = no_init_weights
         sys.modules["transformers.initialization"] = _compat
+
+# Ensure tests import the in-repo sources (not an installed site-packages copy).
+# This is important when `nemo_automodel` is also installed in the environment.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 
 def pytest_addoption(parser):

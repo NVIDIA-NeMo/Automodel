@@ -72,7 +72,8 @@ model:
     attn: sdpa
     linear: torch
     rms_norm: torch
-    enable_deepep: false
+    experts: torch
+    dispatcher: torch
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
@@ -90,19 +91,20 @@ checkpoint:
   model_save_format: safetensors
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
-  dp_replicate_size: 1
   tp_size: 1
   cp_size: 1
+
+distributed_config:
+  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: train
   tokenizer:
     pretrained_model_name_or_path: TinyLlama/TinyLlama-1.1B-Chat-v1.0
@@ -114,10 +116,10 @@ dataloader:
   num_workers: 2
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: validation
-  num_samples_limit: 128
+  limit_dataset_samples: 128
   tokenizer:
     pretrained_model_name_or_path: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 
