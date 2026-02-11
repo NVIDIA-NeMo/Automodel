@@ -1754,6 +1754,20 @@ class TestTorchGroupedMM:
         torch_mm_config.expert_bias = True
         return torch_mm_config
 
+    @staticmethod
+    def _unwrap_compiled(fn):
+        """Unwrap a torch.compile decorated function to its eager version."""
+        from functools import partial
+
+        if isinstance(fn, partial):
+            inner = TestTorchGroupedMM._unwrap_compiled(fn.func)
+            if inner is not fn.func:
+                return partial(inner, *fn.args, **fn.keywords)
+            return fn
+        if hasattr(fn, '_torchdynamo_orig_callable'):
+            return fn._torchdynamo_orig_callable
+        return fn
+
     def _init_experts(self, config, backend, device):
         """Create and initialize GroupedExperts on device."""
         experts = GroupedExperts(config, backend=backend).to(device)
@@ -1763,6 +1777,10 @@ class TestTorchGroupedMM:
             if experts.expert_bias:
                 experts.gate_up_proj_bias.zero_()
                 experts.down_proj_bias.zero_()
+        # Use eager (non-compiled) activation functions to avoid recompilation issues in tests
+        experts.expert_activation = self._unwrap_compiled(experts.expert_activation)
+        if hasattr(experts, 'expert_activation_grouped'):
+            experts.expert_activation_grouped = self._unwrap_compiled(experts.expert_activation_grouped)
         return experts
 
     def test_init_sets_use_torch_mm(self, torch_mm_config, torch_mm_backend):
@@ -1814,6 +1832,7 @@ class TestTorchGroupedMM:
 
         experts_mm = self._init_experts(torch_mm_config, torch_mm_backend, device)
         experts_loop = GroupedExperts(torch_mm_config).to(device)
+        experts_loop.expert_activation = self._unwrap_compiled(experts_loop.expert_activation)
         # Copy weights
         with torch.no_grad():
             experts_loop.gate_and_up_projs.copy_(experts_mm.gate_and_up_projs)
