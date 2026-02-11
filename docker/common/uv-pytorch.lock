@@ -2400,7 +2400,7 @@ wheels = [
 [[package]]
 name = "liger-kernel"
 version = "0.6.5"
-source = { git = "https://github.com/linkedin/Liger-Kernel.git?rev=380b34d0b4591a9c1ab8f3c117f8741673ffef2d#380b34d0b4591a9c1ab8f3c117f8741673ffef2d" }
+source = { git = "https://github.com/linkedin/Liger-Kernel.git?rev=1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6#1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" }
 dependencies = [
     { name = "torch", marker = "platform_machine == 'x86_64' and sys_platform == 'never'" },
     { name = "triton", marker = "platform_machine == 'x86_64' and sys_platform == 'never'" },
@@ -3342,7 +3342,7 @@ build = [
 dev = [
     { name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" },
     { name = "dion", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", git = "https://github.com/microsoft/dion.git" },
-    { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", git = "https://github.com/linkedin/Liger-Kernel.git?rev=380b34d0b4591a9c1ab8f3c117f8741673ffef2d" },
+    { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", git = "https://github.com/linkedin/Liger-Kernel.git?rev=1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" },
 ]
 docs = [
     { name = "myst-parser" },
