@@ -69,6 +69,10 @@ if TYPE_CHECKING:
     from nemo_automodel.components.utils.compile_utils import CompileConfig
 
 #  Re-exports from sibling modules (backward compatibility)
+# Backward-compat shim for trust_remote_code models (e.g. DeciLM)
+# that import NEED_SETUP_CACHE_CLASSES_MAPPING from transformers.generation.utils.
+import transformers.generation.utils as _gen_utils  # noqa: E402
+
 from nemo_automodel._transformers.infrastructure import (  # noqa: E402, F401
     MeshContext,
     _apply_peft_and_lower_precision,
@@ -102,11 +106,6 @@ from nemo_automodel._transformers.model_init import (  # noqa: E402, F401
     get_is_hf_model,
     local_torch_dtype,
 )
-
-
-# Backward-compat shim for trust_remote_code models (e.g. DeciLM)
-# that import NEED_SETUP_CACHE_CLASSES_MAPPING from transformers.generation.utils.
-import transformers.generation.utils as _gen_utils  # noqa: E402
 
 if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
     from transformers.cache_utils import StaticCache
