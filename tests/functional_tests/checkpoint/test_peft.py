@@ -267,6 +267,9 @@ def test_hf_peft_checkpoint(use_triton=False):
     script_path = Path(__file__).parent.resolve()
     cfg = parse_args_and_load_config(script_path / "llama3_2" / "llama3_2_1b_hellaswag_peft.yaml")
 
+    # Limit training to the minimum steps needed for a checkpoint
+    cfg.step_scheduler.max_steps = 10
+
     # set use_triton value based on parsed input
     expected_automodel_peft_config["use_triton"] = cfg.peft.use_triton
 
@@ -491,6 +494,10 @@ def test_hf_peft_dora_checkpoint():
     """
     default_cfg_path = Path(__file__).parents[3] / "examples" / "llm_finetune" / "llama3_2" / "llama3_2_1b_hellaswag_peft.yaml"
     cfg = parse_args_and_load_config(default_cfg_path)
+
+    # Limit training to the minimum steps needed for a checkpoint
+    cfg.step_scheduler.max_steps = 10
+    cfg.step_scheduler.ckpt_every_steps = 10
 
     # Enable DoRA
     cfg.peft.use_dora = True
