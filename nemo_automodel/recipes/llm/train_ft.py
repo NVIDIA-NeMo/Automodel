@@ -905,7 +905,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 loss_fn=self.loss_fn,
             )
             # Infer pp_seq_len from dataset config if not explicitly set
-            if self.pipeline_config.pp_seq_len is None:
+            if hasattr(self.pipeline_config, "pp_seq_len") and self.pipeline_config.pp_seq_len is None:
                 packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
                 if packed_seq_size > 0:
                     self.pipeline_config.pp_seq_len = packed_seq_size
