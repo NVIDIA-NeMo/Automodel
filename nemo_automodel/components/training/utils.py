@@ -21,7 +21,7 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.moe.fsdp_mixin import set_is_optim_step
+from nemo_automodel.components.models.common.utils import set_is_first_microbatch, set_is_optim_step
 
 # Regex pattern to match expert parameters in GroupedExpertsTE.
 # Matches FQNs like:
@@ -235,12 +235,22 @@ def prepare_for_grad_accumulation(model_parts: list[torch.nn.Module], pp_enabled
         pp_enabled: Whether pipeline parallelism is enabled.
     """
     set_is_optim_step(False)
+    set_is_first_microbatch(True)
     if pp_enabled:
         return
 
     for mp in model_parts:
         if hasattr(mp, "prepare_for_grad_accumulation"):
             mp.prepare_for_grad_accumulation(pp_enabled=pp_enabled)
+
+
+def prepare_after_first_microbatch():
+    """Disable first-microbatch flag after the first forward-backward pass.
+
+    Called after the first microbatch in gradient accumulation so that
+    subsequent microbatches reuse cached FP8 weights instead of re-quantizing.
+    """
+    set_is_first_microbatch(False)
 
 
 def prepare_for_final_backward(model_parts: list[torch.nn.Module], pp_enabled: bool = False):
