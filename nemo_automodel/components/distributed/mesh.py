@@ -151,12 +151,12 @@ class MeshContext:
     @property
     def dp_size(self) -> Optional[int]:
         """Data-parallel degree (from ``device_mesh``, default ``None``)."""
-        return _get_axis_size(self.device_mesh, MeshAxisName.DP)
+        return _get_axis_size(self.device_mesh, MeshAxisName.DP, default=None)
 
     @property
     def dp_replicate_size(self) -> Optional[int]:
         """HSDP replication degree (from ``device_mesh``, default ``None``)."""
-        return _get_axis_size(self.device_mesh, MeshAxisName.DP_REPLICATE)
+        return _get_axis_size(self.device_mesh, MeshAxisName.DP_REPLICATE, default=None)
 
     # Axis-name helpers (used by AutoPipeline and parallelize_model)
     def _dp_axis_names(self) -> Tuple[str, ...]:
@@ -216,11 +216,11 @@ class MeshContext:
 
 
 # misc utils
-def _get_axis_size(mesh: Optional["DeviceMesh"], axis: MeshAxisName) -> Optional[str]:
-    """Return the size of *axis* if present in *mesh*, else ``None``."""
+def _get_axis_size(mesh: Optional["DeviceMesh"], axis: MeshAxisName, default=1) -> Optional[int]:
+    """Return the size of *axis* if present in *mesh*, else *default*."""
     if mesh is not None and axis in mesh.mesh_dim_names:
         return mesh[axis].size()
-    return 1
+    return default
 
 
 def _optional_axis(mesh: Optional["DeviceMesh"], axis: MeshAxisName) -> Optional[str]:
