@@ -216,6 +216,19 @@ class TestValidation:
         with pytest.raises(ValueError, match="Unknown options"):
             parse_distributed_section({"strategy": "ddp", "sequence_parallel": True})
 
+    def test_hydra_meta_keys_ignored(self):
+        """Hydra/OmegaConf internal keys (``_target_``, ``_recursive_``, etc.)
+        must be silently stripped and not treated as unknown strategy options."""
+        cfg = {"strategy": "megatron_fsdp", "_target_": "some.hydra.Target"}
+        result = parse_distributed_section(cfg)
+        assert isinstance(result["strategy_config"], MegatronFSDPConfig)
+
+    @pytest.mark.parametrize("meta_key", ["_target_", "_recursive_", "_convert_"])
+    def test_various_hydra_meta_keys_ignored(self, meta_key):
+        cfg = {"strategy": "fsdp2", meta_key: "value"}
+        result = parse_distributed_section(cfg)
+        assert isinstance(result["strategy_config"], FSDP2Config)
+
 
 # ---------------------------------------------------------------------------
 # Integration: full YAML-like dicts
