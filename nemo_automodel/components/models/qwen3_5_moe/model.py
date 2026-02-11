@@ -27,6 +27,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeForConditionalGeneration as HFQwen3_5MoeForConditionalGeneration,
 )
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    Qwen3_5MoeGatedDeltaNet,
     Qwen3_5MoeModel as HFQwen3_5MoeModel,
 )
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
@@ -37,6 +38,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.model import Block
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
@@ -217,7 +219,8 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
             }
         )
 
-        self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        # Use Qwen3NextRMSNorm (1+weight formula)
+        self.norm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # M-RoPE (interleaved) — use HF implementation, kept in fp32
         self.rotary_emb = Fp32SafeQwen3_5MoeTextRotaryEmbedding(config=config)
