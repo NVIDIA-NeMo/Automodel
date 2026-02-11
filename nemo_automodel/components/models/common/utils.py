@@ -20,6 +20,7 @@ from typing import Literal
 import torch
 from torch import nn
 
+from nemo_automodel.components.loggers.log_utils import logger
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
@@ -80,11 +81,14 @@ class BackendConfig:
             # Clear the deprecated field after conversion
             self.enable_deepep = None
 
-        # TE and GMM experts require DeepEP dispatcher
-        if self.experts in ("te", "gmm") and self.dispatcher != "deepep":
-            raise ValueError(
-                f"experts='{self.experts}' requires dispatcher='deepep', but got dispatcher='{self.dispatcher}'"
+        # Backward compatibility
+        if (self.experts == "gmm" or self.experts == "te") and self.dispatcher != "deepep":
+            logger.info(
+                f"experts='{self.experts}' requires dispatcher='deepep', but got dispatcher='{self.dispatcher}'. "
+                "Setting both to torch."
             )
+            self.dispatcher = "torch"
+            self.experts = "torch"
 
 
 def initialize_rms_norm_module(
