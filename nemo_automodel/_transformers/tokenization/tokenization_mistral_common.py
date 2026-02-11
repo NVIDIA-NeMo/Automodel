@@ -269,6 +269,8 @@ class MistralCommonBackend(PushToHubMixin):
         self._tokenizer_path = Path(tokenizer_path)
         self._mode = self._get_validation_mode(mode)
         self.tokenizer: MistralTokenizer = MistralTokenizer.from_file(str(self._tokenizer_path), mode=self._mode)
+        self._pad_token_id_override: int | None = None
+        self._pad_token_override: str | None = None
         self._tokenizer_type = (
             MistralTokenizerType.tekken
             if isinstance(self.tokenizer.instruct_tokenizer.tokenizer, Tekkenizer)
@@ -344,11 +346,22 @@ class MistralCommonBackend(PushToHubMixin):
         return self.tokenizer.instruct_tokenizer.tokenizer.unk_id
 
     @property
-    def pad_token_id(self) -> int:
+    def pad_token_id(self) -> int | None:
         """
         Id of the padding token in the vocabulary.
+        Returns None if no valid pad token is configured.
         """
-        return self.tokenizer.instruct_tokenizer.tokenizer.pad_id
+        if self._pad_token_id_override is not None:
+            return self._pad_token_id_override
+        pad_id = self.tokenizer.instruct_tokenizer.tokenizer.pad_id
+        if pad_id is None or pad_id < 0:
+            return None
+        return pad_id
+
+    @pad_token_id.setter
+    def pad_token_id(self, value: int | None) -> None:
+        """Set the padding token id, overriding the underlying tokenizer's value."""
+        self._pad_token_id_override = value
 
     @property
     def bos_token(self) -> str:
@@ -372,11 +385,25 @@ class MistralCommonBackend(PushToHubMixin):
         return self.convert_ids_to_tokens(self.unk_token_id)
 
     @property
-    def pad_token(self) -> str:
+    def pad_token(self) -> str | None:
         """
         String associated to the padding token in the vocabulary.
+        Returns None if no valid pad token is configured.
         """
-        return self.convert_ids_to_tokens(self.pad_token_id)
+        if self._pad_token_override is not None:
+            return self._pad_token_override
+        pad_id = self.pad_token_id
+        if pad_id is None:
+            return None
+        try:
+            return self.convert_ids_to_tokens(pad_id)
+        except (IndexError, ValueError):
+            return None
+
+    @pad_token.setter
+    def pad_token(self, value: str | None) -> None:
+        """Set the padding token string, overriding the underlying tokenizer's value."""
+        self._pad_token_override = value
 
     @property
     def all_special_ids(self) -> list[int]:
