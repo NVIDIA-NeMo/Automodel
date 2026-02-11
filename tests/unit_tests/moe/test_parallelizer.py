@@ -274,6 +274,20 @@ def _install_torch_and_layers_stubs(monkeypatch):
         sys.modules, "nemo_automodel.components.moe.layers", layers_stub
     )
 
+    # Stub experts module to avoid importing torch.nn.functional
+    experts_stub = types.ModuleType(
+        "nemo_automodel.components.moe.experts"
+    )
+
+    class GroupedExpertsTE:
+        pass
+
+    experts_stub.GroupedExpertsDeepEP = GroupedExpertsDeepEP
+    experts_stub.GroupedExpertsTE = GroupedExpertsTE
+    monkeypatch.setitem(
+        sys.modules, "nemo_automodel.components.moe.experts", experts_stub
+    )
+
 
 def _import_parallelizer_with_stubs(monkeypatch):
     import importlib
@@ -282,6 +296,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
     for mod in [
         "nemo_automodel.components.moe.parallelizer",
         "nemo_automodel.components.moe.layers",
+        "nemo_automodel.components.moe.experts",
         "nemo_automodel.components.distributed.pipelining",
         "nemo_automodel.components.distributed.pipelining.hf_utils",
     ]:
