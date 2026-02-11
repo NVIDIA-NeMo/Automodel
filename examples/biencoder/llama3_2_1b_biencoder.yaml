@@ -19,6 +19,10 @@
 
 seed: 42
 
+train_n_passages: 5
+eval_negative_size: 4
+temperature: 0.02
+
 step_scheduler:
   global_batch_size: 128
   local_batch_size: 4
@@ -38,11 +42,8 @@ model:
   add_linear_pooler: false
   out_dimension: 768
   do_gradient_checkpointing: false
-  train_n_passages: 5
-  eval_negative_size: 4
   pooling: avg
   l2_normalize: true
-  t: 0.02
   use_liger_kernel: true
   use_sdpa_patching: true
   torch_dtype: bfloat16
@@ -145,8 +146,8 @@ distributed_config:
   sequence_parallel: false
 
 # Uncomment and configure for W&B logging
-wandb:
-  project: "adil-workspace"
-  entity: "Nemo-automodel"
-  name: llama3_2_1b_biencoder_main_ref_two_gpu
+# wandb:
+#   project: "adil-workspace"
+#   entity: "Nemo-automodel"
+#   name: llama3_2_1b_biencoder_main_ref_two_gpu
 

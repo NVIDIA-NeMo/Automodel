@@ -24,10 +24,10 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from nemo_automodel._transformers.auto_model import NeMoAutoModelForBiencoder
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.datasets.llm.retrieval_dataset import load_datasets
 from nemo_automodel.components.distributed.init_utils import DistInfo, initialize_distributed
-from nemo_automodel._transformers.auto_model import NeMoAutoModelForBiencoder
 
 logger = logging.getLogger(__name__)
 
@@ -521,8 +521,7 @@ class MineHardNegativesRecipe:
 
             # Encode using the appropriate encoder
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
-                encoder = self.model.lm_q if encoder_type == "query" else self.model.lm_p
-                batch_embeds = self.model._encode(encoder, inputs)
+                batch_embeds = self.model.encode(inputs, encoder=encoder_type)
 
             embeddings.append(batch_embeds.cpu().float().numpy())
 

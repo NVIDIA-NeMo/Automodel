@@ -22,15 +22,12 @@ dynamically based on the model type.
 
 import copy
 import os
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
 from transformers import AutoConfig, PreTrainedModel
-from transformers.modeling_outputs import ModelOutput
 from transformers.utils import logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
@@ -42,31 +39,6 @@ except ImportError:
 
 
 logger = logging.get_logger(__name__)
-
-
-def contrastive_scores_and_labels(
-    query: torch.Tensor, key: torch.Tensor, current_train_n_passages: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute contrastive scores and labels without in-batch negatives.
-
-    Args:
-        query: Query embeddings [batch_size, hidden_dim]
-        key: Key/passage embeddings [batch_size * n_passages, hidden_dim]
-        current_train_n_passages: Number of passages per query
-
-    Returns:
-        Tuple of (scores, labels) where scores is [batch_size, n_passages]
-        and labels is [batch_size] of zeros (positive is first passage)
-    """
-    assert key.shape[0] % query.shape[0] == 0, "{} % {} > 0".format(key.shape[0], query.shape[0])
-    query_shape = query.shape
-    repeated_query = query.repeat(1, 1, current_train_n_passages).reshape(
-        query_shape[0] * current_train_n_passages, query_shape[1]
-    )
-    qk = torch.sum(repeated_query * key, dim=-1).reshape(query_shape[0], current_train_n_passages)
-    labels = torch.zeros(query_shape[0], dtype=torch.long, device=query.device)
-    return qk, labels
 
 
 def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_type: str) -> torch.Tensor:
@@ -107,35 +79,22 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
     return emb
 
 
-@dataclass
-class BiencoderOutput(ModelOutput):
-    """Output dataclass for biencoder model."""
-
-    q_reps: Optional[Tensor] = None
-    p_reps: Optional[Tensor] = None
-    loss: Optional[Tensor] = None
-    labels: Optional[Tensor] = None
-    scores: Optional[Tensor] = None
-
-
 # Mapping from HuggingFace model_type to bidirectional architecture name
 # These architecture names must match the class names exported via ModelClass
 # in the corresponding bidirectional model module (e.g., llama_bidirectional/model.py)
 SUPPORTED_BACKBONES = {
     "llama": "LlamaBidirectionalModel",
     # Add more backbones as needed:
-    # "qwen2": "Qwen2BidirectionalModel",
-    # "mistral": "MistralBidirectionalModel",
 }
 
 
 class BiencoderModel(nn.Module):
     """
-    Biencoder Model with essential functions for training.
+    Biencoder model for embedding and retrieval.
 
-    This model encodes queries and passages separately using bidirectional
-    backbone models and computes contrastive loss. The backbone is loaded
-    dynamically from the ModelRegistry based on the model type.
+    Encodes queries and passages separately using bidirectional backbone models.
+    The backbone is loaded dynamically from the ModelRegistry based on model type.
+    Training logic (loss, optimizer, etc.) lives in the recipe layer.
     """
 
     def __init__(
@@ -143,71 +102,43 @@ class BiencoderModel(nn.Module):
         lm_q: PreTrainedModel,
         lm_p: PreTrainedModel,
         linear_pooler: nn.Module = None,
-        train_n_passages: int = 1,
-        eval_negative_size: int = 0,
         pooling: str = "avg",
         l2_normalize: bool = True,
-        t: float = 1.0,
         share_encoder: bool = True,
         add_linear_pooler: bool = False,
     ):
         super().__init__()
         self.lm_q = lm_q
         self.lm_p = lm_p
-        self.train_n_passages = train_n_passages
-        self.eval_negative_size = eval_negative_size
         self.pooling = pooling
         self.l2_normalize = l2_normalize
-        self.t = t
         self.share_encoder = share_encoder
         self.add_linear_pooler = add_linear_pooler
-        self.cross_entropy = nn.CrossEntropyLoss(reduction="mean")
         self.linear_pooler = linear_pooler if linear_pooler is not None else nn.Identity()
         self.config = self.lm_q.config
-        self.trainer = None
 
-        # For HuggingFace consolidated checkpoint compatibility
+        # HuggingFace consolidated checkpoint compatibility
         self.name_or_path = os.path.abspath(__file__)
         self.state_dict_adapter = BiencoderStateDictAdapter()
-        # Set architectures dynamically based on the encoder class
         encoder_class_name = self.lm_q.__class__.__name__
         self.config.architectures = [encoder_class_name]
-        # Set auto_map to point to the bidirectional model module
         self.config.auto_map = {
             "AutoModel": f"model.{encoder_class_name}",
             "AutoConfig": f"model.{encoder_class_name.replace('Model', 'Config')}",
         }
 
-    def forward(self, query: Dict[str, Tensor] = None, passage: Dict[str, Tensor] = None):
-        """Forward pass for training."""
+    def encode(self, input_dict: dict, encoder: str = "query") -> Optional[torch.Tensor]:
+        """Encode inputs using the query or passage encoder.
 
-        # Get current number of passages per query
-        if self.training:
-            current_train_n_passages = self.train_n_passages
-        else:
-            current_train_n_passages = self.eval_negative_size + 1
+        Args:
+            input_dict: Tokenized inputs (input_ids, attention_mask, etc.)
+            encoder: "query" or "passage"
 
-        # Compute scores (encoding happens inside _compute_scores)
-        scores, labels, q_reps, p_reps = self._compute_scores(
-            query=query,
-            passage=passage,
-            current_train_n_passages=current_train_n_passages,
-        )
-        loss = self.cross_entropy(scores, labels)
-
-        # Adding Dummy Gradients for vlm-based models
-        if hasattr(self.lm_q, "module") and hasattr(self.lm_q.module, "post_loss"):
-            loss = self.lm_q.module.post_loss(loss, passage)
-        elif hasattr(self.lm_q, "post_loss"):
-            loss = self.lm_q.post_loss(loss, passage)
-
-        return BiencoderOutput(
-            loss=loss,
-            q_reps=q_reps,
-            p_reps=p_reps,
-            labels=labels.contiguous(),
-            scores=scores,
-        )
+        Returns:
+            Embeddings [batch_size, hidden_dim], or None if input_dict is empty.
+        """
+        model = self.lm_q if encoder == "query" else self.lm_p
+        return self._encode(model, input_dict)
 
     def _encode(self, encoder: PreTrainedModel, input_dict: dict) -> Optional[torch.Tensor]:
         """Encode input using the encoder."""
@@ -216,65 +147,34 @@ class BiencoderModel(nn.Module):
 
         import inspect
 
-        # Remove token_type_ids if encoder doesn't support it
         if (
             "token_type_ids" not in inspect.getfullargspec(encoder.forward).args
             and "token_type_ids" in input_dict.keys()
         ):
             input_dict = {k: v for k, v in input_dict.items() if k != "token_type_ids"}
 
-        # Get encoder outputs
         outputs = encoder(
             **{k: v for k, v in input_dict.items() if k not in ["kd_labels"]},
             return_dict=True,
             output_hidden_states=True,
         )
 
-        # Extract hidden states
         if hasattr(outputs, "last_hidden_state"):
             hidden_state = outputs.last_hidden_state
         else:
             hidden_state = outputs.hidden_states[-1]
 
-        # Pool the representations
         embeds = pool(
             last_hidden_states=hidden_state,
             attention_mask=input_dict["attention_mask"],
             pool_type=self.pooling,
         )
-
-        # Apply linear pooler
         embeds = self.linear_pooler(embeds)
 
-        # L2 normalize if required
         if self.l2_normalize:
             embeds = F.normalize(embeds, dim=-1)
 
         return embeds.contiguous()
-
-    def _compute_scores(
-        self,
-        current_train_n_passages: int,
-        query: Dict[str, Tensor] = None,
-        passage: Dict[str, Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute similarity scores and labels."""
-
-        # Encode query and passage
-        q_reps = self._encode(self.lm_q, query)
-        p_reps = self._encode(self.lm_p, passage)
-
-        # Compute similarity scores using contrastive_scores_and_labels
-        scores, labels = contrastive_scores_and_labels(
-            query=q_reps,
-            key=p_reps,
-            current_train_n_passages=current_train_n_passages,
-        )
-
-        if self.l2_normalize:
-            scores = scores / self.t
-
-        return scores, labels, q_reps, p_reps
 
     @classmethod
     def build(
@@ -284,11 +184,8 @@ class BiencoderModel(nn.Module):
         add_linear_pooler: bool = False,
         out_dimension: int = 768,
         do_gradient_checkpointing: bool = False,
-        train_n_passages: int = 1,
-        eval_negative_size: int = 0,
         pooling: str = "avg",
         l2_normalize: bool = True,
-        t: float = 1.0,
         trust_remote_code: bool = False,
         **hf_kwargs,
     ):
@@ -301,22 +198,17 @@ class BiencoderModel(nn.Module):
             add_linear_pooler: Whether to add a linear pooler layer
             out_dimension: Output dimension for linear pooler
             do_gradient_checkpointing: Whether to enable gradient checkpointing
-            train_n_passages: Number of passages per query during training
-            eval_negative_size: Number of negative samples during evaluation
             pooling: Pooling strategy ('avg', 'cls', 'last', etc.)
             l2_normalize: Whether to L2 normalize embeddings
-            t: Temperature for scaling similarity scores
             trust_remote_code: Whether to trust remote code
             **hf_kwargs: Additional arguments passed to model loading
         """
 
         logger.info(f"Building BiencoderModel from {model_name_or_path}")
 
-        # Get model type from config using AutoConfig
         config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
         model_type = getattr(config, "model_type", "")
 
-        # Get bidirectional model class from registry using SUPPORTED_BACKBONES mapping
         arch_name = SUPPORTED_BACKBONES.get(model_type)
         if arch_name is None:
             supported = ", ".join(SUPPORTED_BACKBONES.keys())
@@ -327,7 +219,6 @@ class BiencoderModel(nn.Module):
                 "create a bidirectional model class with ModelClass export."
             )
 
-        # Get the bidirectional model class from the registry
         if arch_name not in ModelRegistry.model_arch_name_to_cls:
             raise ValueError(
                 f"Bidirectional model class '{arch_name}' not found in ModelRegistry. "
@@ -336,7 +227,6 @@ class BiencoderModel(nn.Module):
         BidirectionalModelClass = ModelRegistry.model_arch_name_to_cls[arch_name]
         logger.info(f"Using {arch_name} from registry")
 
-        # Load model locally or from hub using the bidirectional model class from registry
         if os.path.isdir(model_name_or_path):
             if share_encoder:
                 lm_q = BidirectionalModelClass.from_pretrained(
@@ -366,13 +256,11 @@ class BiencoderModel(nn.Module):
             else:
                 lm_p = copy.deepcopy(lm_q)
 
-        # Enable gradient checkpointing if requested
         if do_gradient_checkpointing:
             lm_q.gradient_checkpointing_enable()
             if lm_p is not lm_q:
                 lm_p.gradient_checkpointing_enable()
 
-        # Create linear pooler if needed
         if add_linear_pooler:
             linear_pooler = nn.Linear(lm_q.config.hidden_size, out_dimension)
 
@@ -388,11 +276,8 @@ class BiencoderModel(nn.Module):
             lm_q=lm_q,
             lm_p=lm_p,
             linear_pooler=linear_pooler,
-            train_n_passages=train_n_passages,
-            eval_negative_size=eval_negative_size,
             pooling=pooling,
             l2_normalize=l2_normalize,
-            t=t,
             share_encoder=share_encoder,
             add_linear_pooler=add_linear_pooler,
         )
@@ -437,7 +322,6 @@ class BiencoderModel(nn.Module):
         # Fallback: HF-native save (no checkpointer available)
         logger.info(f"Saving BiencoderModel to {save_directory}")
 
-        # Save the model
         if self.share_encoder:
             self.lm_q.save_pretrained(save_directory)
         else:
@@ -446,7 +330,6 @@ class BiencoderModel(nn.Module):
             self.lm_q.save_pretrained(os.path.join(save_directory, "query_model"))
             self.lm_p.save_pretrained(os.path.join(save_directory, "passage_model"))
 
-        # Save linear pooler if exists
         if self.add_linear_pooler:
             pooler_path = os.path.join(save_directory, "pooler.pt")
             logger.info(f"Saving linear pooler to {pooler_path}")

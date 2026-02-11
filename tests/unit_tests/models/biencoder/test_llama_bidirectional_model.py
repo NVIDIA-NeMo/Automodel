@@ -17,14 +17,15 @@ import os
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 
 # Import from the new canonical locations
 from nemo_automodel._transformers.biencoder import (
     BiencoderModel,
-    contrastive_scores_and_labels,
     pool,
 )
+from nemo_automodel.recipes.biencoder.train_biencoder import contrastive_scores_and_labels
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
@@ -201,54 +202,37 @@ def test_biencoder_encode_and_compute_scores_and_forward(monkeypatch):
     lm_q = NoTTIDLm(hidden=8)
     lm_p = NoTTIDLm(hidden=8)
     model = BiencoderModel(
-        lm_q=lm_q, lm_p=lm_p, train_n_passages=2, eval_negative_size=1, pooling="avg", l2_normalize=True, t=0.5
+        lm_q=lm_q, lm_p=lm_p, pooling="avg", l2_normalize=True
     )
-    # _encode removes token_type_ids and normalizes
+    # encode removes token_type_ids and normalizes
     q = {
         "input_ids": torch.ones(2, 3, dtype=torch.long),
         "attention_mask": torch.ones(2, 3, dtype=torch.long),
         "token_type_ids": torch.zeros(2, 3, dtype=torch.long),
     }
-    v = model._encode(lm_q, q)
+    v = model.encode(q, encoder="query")
     assert v.shape == (2, 8)
     assert torch.allclose(torch.linalg.norm(v, dim=-1), torch.ones(2), atol=1e-5)
     # Compute scores explicitly to avoid coupling to internal repeat implementation
     p = {"input_ids": torch.ones(4, 3, dtype=torch.long), "attention_mask": torch.ones(4, 3, dtype=torch.long)}
-    q_reps = model._encode(lm_q, q)
-    p_reps = model._encode(lm_p, p)
+    q_reps = model.encode(q, encoder="query")
+    p_reps = model.encode(p, encoder="passage")
     assert q_reps.shape == (2, 8) and p_reps.shape == (4, 8)
     scores, labels = contrastive_scores_and_labels(q_reps, p_reps, current_train_n_passages=2)
-    if model.l2_normalize:
-        scores = scores / model.t
     assert scores.shape == (2, 2) and torch.all(labels == 0)
-    # eval path uses eval_negative_size + 1 passages (so total passages = batch * 2 = 4)
+    # Test explicit loss computation
     model.eval()
     p2 = {
         "input_ids": torch.ones(4, 3, dtype=torch.long),
         "attention_mask": torch.ones(4, 3, dtype=torch.long),
     }
-    out_eval = model(query=q, passage=p2)
-    assert out_eval.scores.shape[1] == model.eval_negative_size + 1
+    q_reps2 = model.encode(q, encoder="query")
+    p_reps2 = model.encode(p2, encoder="passage")
+    scores2, labels2 = contrastive_scores_and_labels(q_reps2, p_reps2, current_train_n_passages=2)
+    loss2 = F.cross_entropy(scores2, labels2)
+    assert loss2 is not None and torch.is_tensor(loss2)
 
-    # post_loss hook via attribute (also works in eval mode)
-    class PostLossLM(NoTTIDLm):
-        def post_loss(self, loss, passage):
-            return loss + 1.0
-
-    model.lm_q = PostLossLM(hidden=8)
-    out_eval2 = model(query=q, passage=p2)
-    assert (out_eval2.loss - out_eval.loss).abs() > 0
-
-    # Train path: passages per query = train_n_passages (2) => total rows = 4
-    model.train()
-    p_train = {
-        "input_ids": torch.ones(4, 3, dtype=torch.long),
-        "attention_mask": torch.ones(4, 3, dtype=torch.long),
-    }
-    out_train = model(query=q, passage=p_train)
-    assert out_train.scores.shape == (2, 2)
-
-    # _encode path using hidden_states when last_hidden_state absent
+    # encode path using hidden_states when last_hidden_state absent
     class OnlyHiddenOutputs:
         def __init__(self, hidden_states):
             self.hidden_states = hidden_states
@@ -260,26 +244,15 @@ def test_biencoder_encode_and_compute_scores_and_forward(monkeypatch):
             hidden_states = [torch.ones(bsz, seqlen, h) * (i + 1) for i in range(2)]
             return OnlyHiddenOutputs(hidden_states)
 
-    v2 = model._encode(
-        NoLastLM(hidden=8),
+    # Test with model using NoLastLM for query encoder
+    model_no_last = BiencoderModel(
+        lm_q=NoLastLM(hidden=8), lm_p=NoTTIDLm(hidden=8), pooling="avg", l2_normalize=True
+    )
+    v2 = model_no_last.encode(
         {"input_ids": torch.ones(2, 3, dtype=torch.long), "attention_mask": torch.ones(2, 3, dtype=torch.long)},
+        encoder="query"
     )
     assert v2.shape == (2, 8)
-
-    # Post-loss via lm_q.module.post_loss
-    class Mod(nn.Module):
-        def post_loss(self, loss, passage):
-            return loss + 2.0
-
-    class WrapperNoTTID(NoTTIDLm):
-        def __init__(self, hidden=8):
-            super().__init__(hidden=hidden)
-            self.module = Mod()
-
-    model.eval()
-    model.lm_q = WrapperNoTTID(hidden=8)
-    out_eval3 = model(query=q, passage=p2)
-    assert out_eval3.loss is not None
 
 
 def test_biencoder_build_and_save(tmp_path, monkeypatch):
@@ -290,7 +263,6 @@ def test_biencoder_build_and_save(tmp_path, monkeypatch):
             return cls(hidden=16)
 
     # Patch the registry to return our fake model
-    original_registry = ModelRegistry.model_arch_name_to_cls.copy()
     ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
     monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
 
@@ -314,11 +286,8 @@ def test_biencoder_build_and_save(tmp_path, monkeypatch):
         add_linear_pooler=True,
         out_dimension=16,
         do_gradient_checkpointing=True,
-        train_n_passages=2,
-        eval_negative_size=1,
         pooling="avg",
         l2_normalize=True,
-        t=0.5,
     )
     assert isinstance(model, BiencoderModel)
     # gradient checkpointing enabled on lm_q (and lm_p is same object)

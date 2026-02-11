@@ -148,10 +148,10 @@ class BiencoderStateDictAdapter(StateDictAdapter):
         Returns ``None`` when *key* doesn't match *src* (bare or PEFT-wrapped).
         """
         if key.startswith(src):
-            return dst + key[len(src):]
+            return dst + key[len(src) :]
         peft_src = peft_prefix + src
         if key.startswith(peft_src):
-            return peft_prefix + dst + key[len(peft_src):]
+            return peft_prefix + dst + key[len(peft_src) :]
         return None
 
     @staticmethod
@@ -190,7 +190,7 @@ class BiencoderStateDictAdapter(StateDictAdapter):
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         """Convert a single tensor from biencoder to HF format. Skips non-lm_q tensors."""
         if fqn.startswith("lm_q."):
-            return [("model." + fqn[len("lm_q."):], tensor)]
+            return [("model." + fqn[len("lm_q.") :], tensor)]
         if fqn.startswith("linear_pooler."):
             return [(fqn, tensor)]
         return []

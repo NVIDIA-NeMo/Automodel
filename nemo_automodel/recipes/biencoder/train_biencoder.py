@@ -18,16 +18,25 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from typing import Dict
+from typing import Dict, Tuple
 
 import torch
+import torch.nn.functional as F
+import wandb
 from huggingface_hub import constants as hf_constants
 from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+from wandb import Settings
 
+from nemo_automodel._transformers.infrastructure import (
+    MeshContext,
+    apply_model_infrastructure,
+    instantiate_infrastructure,
+)
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.device_mesh import create_device_mesh
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -35,16 +44,34 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
-from nemo_automodel.components.utils.model_utils import print_trainable_parameters
-from nemo_automodel._transformers.infrastructure import MeshContext, instantiate_infrastructure, apply_model_infrastructure
-from nemo_automodel.components.distributed.device_mesh import create_device_mesh
-from nemo_automodel.recipes.llm.train_ft import build_distributed, build_step_scheduler
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-
-import wandb
-from wandb import Settings
+from nemo_automodel.recipes.llm.train_ft import build_distributed, build_step_scheduler
 
 logger = logging.getLogger(__name__)
+
+
+def contrastive_scores_and_labels(
+    query: torch.Tensor, key: torch.Tensor, current_train_n_passages: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute contrastive scores and labels without in-batch negatives.
+
+    Args:
+        query: Query embeddings [batch_size, hidden_dim]
+        key: Key/passage embeddings [batch_size * n_passages, hidden_dim]
+        current_train_n_passages: Number of passages per query
+
+    Returns:
+        Tuple of (scores, labels) where scores is [batch_size, n_passages]
+        and labels is [batch_size] of zeros (positive is first passage)
+    """
+    assert key.shape[0] % query.shape[0] == 0, "{} % {} > 0".format(key.shape[0], query.shape[0])
+    query_shape = query.shape
+    repeated_query = query.repeat(1, 1, current_train_n_passages).reshape(
+        query_shape[0] * current_train_n_passages, query_shape[1]
+    )
+    qk = torch.sum(repeated_query * key, dim=-1).reshape(query_shape[0], current_train_n_passages)
+    labels = torch.zeros(query_shape[0], dtype=torch.long, device=query.device)
+    return qk, labels
 
 
 def _unpack_qp(inputs: Dict[str, torch.Tensor]) -> tuple:
@@ -260,15 +287,18 @@ class TrainBiencoderRecipe(BaseRecipe):
         """
         self.cfg = cfg
 
+        # Recipe-level training configuration
+        self.train_n_passages = self.cfg.get("train_n_passages", 1)
+        self.eval_negative_size = self.cfg.get("eval_negative_size", 0)
+        self.temperature = self.cfg.get("temperature", 1.0)
+
     def setup(self):
         """Build all components needed for training/validation/logging/checkpointing."""
         torch.cuda.reset_peak_memory_stats()
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
-        # setups logging and adds the rankfilter to logging
         setup_logging()
 
         apply_cache_compatibility_patches()
-        # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         self.device_mesh = None
@@ -292,23 +322,19 @@ class TrainBiencoderRecipe(BaseRecipe):
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
 
-        # Log experiment details on main rank
         self._log_experiment_details()
         self._log_library_versions()
 
         self.pp_enabled: bool = self.cfg.get("distributed.pp_size", 1) > 1
         if self.pp_enabled:
             raise NotImplementedError(
-                "Pipeline parallelism is not yet supported for biencoder models. "
-                "Please set distributed.pp_size to 1."
+                "Pipeline parallelism is not yet supported for biencoder models. Please set distributed.pp_size to 1."
             )
 
-        # Build components
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
 
-        # Build checkpoint config
         checkpoint_config = build_checkpoint_config(
             self.cfg.get("checkpoint", None),
             self.cfg.get("model.cache_dir", None),
@@ -322,7 +348,6 @@ class TrainBiencoderRecipe(BaseRecipe):
             logging.info("No clip_grad_norm.max_norm specified in config, using default value of 1.0")
             self.max_grad_norm = 1.0
 
-        # Create Checkpointer instance
         self.checkpointer = Checkpointer(
             config=checkpoint_config,
             dp_rank=self._get_dp_rank(include_cp=True),
@@ -331,7 +356,6 @@ class TrainBiencoderRecipe(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
-        # Build biencoder model
         logger.info("Building biencoder model...")
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
             model = self.cfg.model.instantiate()
@@ -360,9 +384,8 @@ class TrainBiencoderRecipe(BaseRecipe):
         self.model_parts = [model]
         self.pp = None
 
-        # Build optimizer
         logger.info("Building optimizer...")
-        # Mimic common LLM training practice: apply weight decay only to non-bias/non-norm params.
+        # Apply weight decay only to non-bias/non-norm params
         decay_params = []
         no_decay_params = []
         for name, param in self.model_parts[0].named_parameters():
@@ -386,17 +409,11 @@ class TrainBiencoderRecipe(BaseRecipe):
         logger.info("Optimizer param groups: decay=%d, no_decay=%d", len(decay_params), len(no_decay_params))
         self.optimizer = [self.cfg.optimizer.instantiate(params=param_groups)]
 
-        print_trainable_parameters(self.model_parts[0])
-
-        # Build tokenizer
         self.tokenizer = self.cfg.tokenizer.instantiate()
-
-        # Set up padding token if not present
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.padding_side = "left"
 
-        # Build dataloader
         logger.info("Building dataloader...")
         self.dataloader = build_dataloader(
             self.cfg.dataloader,
@@ -407,7 +424,6 @@ class TrainBiencoderRecipe(BaseRecipe):
             dp_world_size=self._get_dp_group_size(),
         )
 
-        # Build validation dataloader if provided
         self.val_dataloader = None
         if "validation_dataloader" in self.cfg:
             logger.info("Building validation dataloader...")
@@ -423,7 +439,6 @@ class TrainBiencoderRecipe(BaseRecipe):
                 dp_world_size=self._get_dp_group_size(),
             )
 
-        # Build step scheduler
         self.step_scheduler = build_step_scheduler(
             self.cfg.get("step_scheduler", None),
             self.dataloader,
@@ -431,13 +446,9 @@ class TrainBiencoderRecipe(BaseRecipe):
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
         )
 
-        # Build learning rate scheduler
         self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
-
-        # Log model and optimizer details
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 
-        # Initialize JSONL loggers
         self.metric_logger_train = build_metric_logger(
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
         )
@@ -445,11 +456,8 @@ class TrainBiencoderRecipe(BaseRecipe):
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl"
         )
 
-        # Optionally resume from checkpoint
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         self.load_checkpoint(restore_from)
-
-        # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
 
     def run_train_validation_loop(self):
@@ -463,11 +471,8 @@ class TrainBiencoderRecipe(BaseRecipe):
             # The step scheduler yields a list of batches for gradient accumulation
             for batches in self.step_scheduler:
                 train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-
-                # Log metrics
                 self.log_train_metrics(train_log_data)
 
-                # Run validation every val_every_steps
                 val_loss = None
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     val_log_data = self._run_validation_epoch(self.val_dataloader)
@@ -476,7 +481,6 @@ class TrainBiencoderRecipe(BaseRecipe):
                     for mp in self.model_parts:
                         mp.train()
 
-                # Save checkpoint every ckpt_every_steps
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(
                         epoch,
@@ -485,7 +489,6 @@ class TrainBiencoderRecipe(BaseRecipe):
                         val_loss=val_loss,
                     )
 
-        # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
         self.checkpointer.close()
@@ -500,22 +503,33 @@ class TrainBiencoderRecipe(BaseRecipe):
             num_batches: Total number of batches in gradient accumulation
             is_train: Whether this is a training step
         """
-        # Move batch to device
         batch = {
             k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
             for k, v in batch.items()
         }
-        # Unpack query and passage inputs using the same logic as biencoder_trainer.py
         query, passage = _unpack_qp(batch)
 
-        # Forward pass
         model = self.model_parts[0]
         train_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext()
-        sync_ctx = get_sync_ctx(model, idx == num_batches - 1, defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True)) if is_train else nullcontext()
+        sync_ctx = (
+            get_sync_ctx(
+                model,
+                idx == num_batches - 1,
+                defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
+            )
+            if is_train
+            else nullcontext()
+        )
 
         with train_ctx, sync_ctx:
-            outputs = model(query=query, passage=passage)
-            loss = outputs.loss
+            q_reps = model.encode(query, encoder="query")
+            p_reps = model.encode(passage, encoder="passage")
+
+            n_passages = self.train_n_passages
+            scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
+            if model.l2_normalize:
+                scores = scores / self.temperature
+            loss = F.cross_entropy(scores, labels)
 
             loss_buffer.append(loss.clone().detach())
 
@@ -556,32 +570,24 @@ class TrainBiencoderRecipe(BaseRecipe):
         )
 
         self.checkpointer.maybe_wait_for_staging()
-        # Optimizer step
         for opt in self.optimizer:
             opt.step()
             opt.zero_grad()
 
-        # LR scheduler step
         if self.lr_scheduler is not None:
             for scheduler in self.lr_scheduler:
                 scheduler.step(1)
 
-        # Compute average loss across gradient accumulation and DP ranks
+        # Average loss across gradient accumulation steps and DP ranks
         reporting_loss = torch.mean(torch.stack(loss_buffer))
         if torch.distributed.is_initialized():
             reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
-            # Divide by DP group size to get average across all ranks
             reporting_loss = reporting_loss / self._get_dp_group_size(include_cp=True)
         reporting_loss = reporting_loss.cpu().item()
 
-        # Get current learning rate
         lr = self.optimizer[0].param_groups[0]["lr"]
-
-        # Compute throughput
         elapsed = time.perf_counter() - self.timestamp
         self.timestamp = time.perf_counter()
-
-        # Memory stats
         mem_allocated = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
 
         metrics = {
@@ -611,36 +617,35 @@ class TrainBiencoderRecipe(BaseRecipe):
             for mp in self.model_parts:
                 mp.eval()
             loss_buffer = []
-
-            # Metrics buffers
             all_scores = []
             all_labels = []
 
             with torch.no_grad():
                 for batch in val_dataloader:
-                    # Move batch to device
                     batch = {
                         k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
                         for k, v in batch.items()
                     }
-
-                    # Unpack query and passage inputs using the same logic as biencoder_trainer.py
                     query, passage = _unpack_qp(batch)
 
-                    # Forward pass
-                    outputs = self.model_parts[0](query=query, passage=passage)
-                    loss_buffer.append(outputs.loss.clone().detach())
+                    model = self.model_parts[0]
+                    q_reps = model.encode(query, encoder="query")
+                    p_reps = model.encode(passage, encoder="passage")
 
-                    # Store scores and labels for metrics
-                    all_scores.append(outputs.scores.detach().cpu())
-                    all_labels.append(outputs.labels.detach().cpu())
+                    n_passages = self.eval_negative_size + 1
+                    scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
+                    if model.l2_normalize:
+                        scores = scores / self.temperature
+                    loss = F.cross_entropy(scores, labels)
 
-            # Compute average loss
+                    loss_buffer.append(loss.clone().detach())
+                    all_scores.append(scores.detach().cpu())
+                    all_labels.append(labels.detach().cpu())
+
             avg_loss = torch.stack(loss_buffer).mean()
             if torch.distributed.is_initialized():
                 avg_loss = self._dp_allreduce(avg_loss, include_cp=True)
 
-            # Compute accuracy and MRR
             scores = torch.cat(all_scores, dim=0)
             labels = torch.cat(all_labels, dim=0)
 
@@ -675,12 +680,10 @@ class TrainBiencoderRecipe(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        # Log to remote services (WandB) according to step_scheduler frequency
         if self.step_scheduler.is_remote_logging_step:
             if wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
 
-        # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
 
         logging.info(
@@ -706,11 +709,9 @@ class TrainBiencoderRecipe(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        # Always log validation to remote services (validation is already infrequent via val_every_steps)
         if wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
 
-        # JSONL validation log
         self.metric_logger_valid.log(log_data)
 
         logging.info(

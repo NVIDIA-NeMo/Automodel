@@ -27,7 +27,7 @@ Heavy-lifting helpers live in sibling modules:
 import gc
 import logging
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 from torch.nn.attention import SDPBackend
@@ -53,7 +53,7 @@ from nemo_automodel.components.distributed.config import (  # noqa: E402
 from nemo_automodel.components.distributed.ddp import DDPManager  # noqa: E402
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe  # noqa: E402
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager  # noqa: E402
-from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline  # noqa: E402
+from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline  # noqa: E402, F401
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig  # noqa: E402
 from nemo_automodel.components.moe.config import MoEParallelizerConfig  # noqa: E402
 from nemo_automodel.components.quantization.qat import QATConfig  # noqa: E402
@@ -689,7 +689,7 @@ class NeMoAutoModelForBiencoder:
     >>> model = NeMoAutoModelForBiencoder.from_pretrained("meta-llama/Llama-3.2-1B")
     >>> model = NeMoAutoModelForBiencoder.from_pretrained(
     ...     "meta-llama/Llama-3.2-1B",
-    ...     peft_config={"r": 16, "lora_alpha": 32},
+    ...     distributed_config=FSDP2Config(),
     ... )
     """
 
@@ -699,23 +699,19 @@ class NeMoAutoModelForBiencoder:
         pretrained_model_name_or_path: str,
         share_encoder: bool = True,
         add_linear_pooler: bool = False,
-        out_dimension: Optional[int] = None,
+        out_dimension: int = 768,
         do_gradient_checkpointing: bool = False,
-        train_n_passages: int = 1,
-        eval_negative_size: int = 0,
         pooling: str = "avg",
         l2_normalize: bool = True,
-        t: float = 1.0,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
         sdpa_method: Optional[List[SDPBackend]] = None,
-        model_wrapper=None,
-        autopipeline: AutoPipeline | None = None,
-        parallelize_fn: Callable | None = None,
-        peft_config: Optional[dict] = None,
-        fp8_config: Optional["FP8Config"] = None,
-        qat_quantizer: Optional[Union["Int4WeightOnlyQATQuantizer", "Int8DynActInt4WeightQATQuantizer"]] = None,
-        loss_fn: Optional[Callable] = None,
+        torch_dtype="auto",
+        device_mesh: Optional["DeviceMesh"] = None,
+        moe_mesh: Optional["DeviceMesh"] = None,
+        tp_plan: Optional[dict] = None,
+        distributed_config: Optional[DistributedConfig] = None,
+        moe_config: Optional[MoEParallelizerConfig] = None,
         compile_config: Optional["CompileConfig"] = None,
         **kwargs,
     ) -> PreTrainedModel:
@@ -723,35 +719,31 @@ class NeMoAutoModelForBiencoder:
         Load a biencoder model from pretrained weights with full infrastructure support.
 
         This method builds a biencoder using BiencoderModel.build(), applies kernel
-        patching, and then applies all infrastructure (PEFT, FSDP, checkpointing, etc.)
+        patching, and then applies all infrastructure (FSDP, checkpointing, etc.)
         through apply_model_infrastructure().
 
         Args:
-            pretrained_model_name_or_path: Path to pretrained model or model identifier
-            share_encoder: Whether to share encoder weights between query and passage
-            add_linear_pooler: Whether to add a linear pooler layer
-            out_dimension: Output dimension for linear pooler (default: 768)
-            do_gradient_checkpointing: Whether to enable gradient checkpointing
-            train_n_passages: Number of passages per query during training
-            eval_negative_size: Number of negative samples during evaluation
-            pooling: Pooling strategy ('avg', 'cls', 'last', etc.)
-            l2_normalize: Whether to L2 normalize embeddings
-            t: Temperature for scaling similarity scores
-            use_liger_kernel: Whether to apply Liger kernel optimizations
-            use_sdpa_patching: Whether to apply SDPA patching
-            sdpa_method: SDPA backend methods to use
-            model_wrapper: Parallelism wrapper instance (e.g., FSDP2Manager, DDPManager)
-            autopipeline: AutoPipeline instance for pipeline parallelism
-            parallelize_fn: Custom function to apply parallelization (EP + FSDP2)
-            peft_config: PEFT/LoRA configuration dictionary
-            fp8_config: FP8 quantization configuration
-            qat_quantizer: Quantization-Aware Training quantizer instance
-            loss_fn: Loss function to use
-            compile_config: Configuration for torch.compile
-            **kwargs: Additional arguments passed to BiencoderModel.build
+            pretrained_model_name_or_path: Path to pretrained model or model identifier.
+            share_encoder: Whether to share encoder weights between query and passage.
+            add_linear_pooler: Whether to add a linear pooler layer.
+            out_dimension: Output dimension for linear pooler.
+            do_gradient_checkpointing: Whether to enable gradient checkpointing.
+            pooling: Pooling strategy ('avg', 'cls', 'last', etc.).
+            l2_normalize: Whether to L2 normalize embeddings.
+            use_liger_kernel: Whether to apply Liger kernel optimizations.
+            use_sdpa_patching: Whether to apply SDPA patching.
+            sdpa_method: SDPA backend methods to use.
+            torch_dtype: Data type passed to the underlying model initialization.
+            device_mesh: Pre-created device mesh for distributed training.
+            moe_mesh: Device mesh for expert parallelism (FSDP2 only).
+            tp_plan: Custom tensor parallel plan; overrides distributed_config.tp_plan.
+            distributed_config: Strategy-specific distributed training configuration.
+            moe_config: MoE parallelizer configuration.
+            compile_config: Configuration for torch.compile.
+            **kwargs: Additional arguments passed to BiencoderModel.build.
 
         Returns:
-            BiencoderModel instance with loaded weights and all infrastructure applied
+            BiencoderModel instance with loaded weights and all infrastructure applied.
 
         Notes:
             If kernel patching fails, the method retries with adjusted parameters.
@@ -768,54 +760,59 @@ class NeMoAutoModelForBiencoder:
                 add_linear_pooler=add_linear_pooler,
                 out_dimension=out_dimension,
                 do_gradient_checkpointing=do_gradient_checkpointing,
-                train_n_passages=train_n_passages,
-                eval_negative_size=eval_negative_size,
                 pooling=pooling,
                 l2_normalize=l2_normalize,
-                t=t,
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
-                model_wrapper=model_wrapper,
-                autopipeline=autopipeline,
-                parallelize_fn=parallelize_fn,
-                peft_config=peft_config,
-                fp8_config=fp8_config,
-                qat_quantizer=qat_quantizer,
-                loss_fn=loss_fn,
+                torch_dtype=torch_dtype,
+                device_mesh=device_mesh,
+                moe_mesh=moe_mesh,
+                tp_plan=tp_plan,
+                distributed_config=distributed_config,
+                moe_config=moe_config,
                 compile_config=compile_config,
                 **kwargs,
             )
 
-        # Remove keys that are not relevant for BiencoderModel.build
+        kwargs = dict(kwargs)
         kwargs.pop("tp_size", None)
         kwargs.pop("cp_size", None)
         kwargs.pop("has_packed_sequence", None)
 
-        # Determine if we need meta device initialization
+        if tp_plan is not None and distributed_config is not None:
+            distributed_config.tp_plan = tp_plan
+
+        mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+
+        model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
+            distributed_config=distributed_config,
+            pipeline_config=None,
+            qat_config=None,
+            moe_config=moe_config,
+            device=torch.device("cuda", torch.cuda.current_device()),
+            mesh=mesh,
+        )
+        loss_fn = None
+
         is_meta_device = not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)) and (
             get_world_size_safe() > 1
         )
         device = torch.cuda.current_device()
 
-        # Build biencoder model using BiencoderModel.build
         hf_kwargs = {"attn_implementation": "flash_attention_2"}
         kwargs.update(hf_kwargs)
         model = BiencoderModel.build(
             model_name_or_path=pretrained_model_name_or_path,
             share_encoder=share_encoder,
             add_linear_pooler=add_linear_pooler,
-            out_dimension=out_dimension if out_dimension is not None else 768,
+            out_dimension=out_dimension,
             do_gradient_checkpointing=do_gradient_checkpointing,
-            train_n_passages=train_n_passages,
-            eval_negative_size=eval_negative_size,
             pooling=pooling,
             l2_normalize=l2_normalize,
-            t=t,
             **kwargs,
         )
 
-        # Apply kernel patching
         try:
             if use_liger_kernel:
                 logger.info("Applying Liger kernel patching to biencoder")
@@ -829,22 +826,23 @@ class NeMoAutoModelForBiencoder:
         try:
             if use_sdpa_patching:
                 logger.info("Applying SDPA patching to biencoder")
-                model = _patch_attention(model, sdpa_method)
+                model = _patch_attention(model, sdpa_method)  # noqa: F821
         except Exception:
             logger.warning("Retrying without SDPA patching.")
             del model
             gc.collect()
             return _retry(use_sdpa_patching=False)
 
-        # Apply model infrastructure (PEFT, FSDP, checkpointing, etc.)
         model = apply_model_infrastructure(
-            model=model,
+            model=model,  # noqa: F821
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             is_meta_device=is_meta_device,
             device=device,
             model_wrapper=model_wrapper,
-            peft_config=peft_config,
-            fp8_config=fp8_config,
+            mesh=mesh,
+            peft_config=None,
+            quantization_config=None,
+            fp8_config=None,
             qat_quantizer=qat_quantizer,
             loss_fn=loss_fn,
             autopipeline=autopipeline,

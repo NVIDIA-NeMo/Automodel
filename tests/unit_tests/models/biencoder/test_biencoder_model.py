@@ -58,11 +58,8 @@ def test_from_pretrained_happy_path(monkeypatch):
         add_linear_pooler=False,
         out_dimension=None,
         do_gradient_checkpointing=True,
-        train_n_passages=4,
-        eval_negative_size=2,
         pooling="avg",
         l2_normalize=True,
-        t=0.5,
         use_liger_kernel=True,
         use_sdpa_patching=True,
         sdpa_method=None,
@@ -73,8 +70,6 @@ def test_from_pretrained_happy_path(monkeypatch):
     assert "liger" in model.marker and "sdpa" in model.marker
     # Ensure HF kwargs injected + passthrough of parameters to build
     assert last_kwargs["attn_implementation"] == "flash_attention_2"
-    assert last_kwargs["train_n_passages"] == 4
-    assert last_kwargs["eval_negative_size"] == 2
     assert last_kwargs["some_other_kwarg"] == "x"
 
 
