@@ -163,7 +163,7 @@ torchrun --nproc-per-node $(nvidia-smi -L | wc -l) \
     -c examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml
 ```
 
-### SLURM cluster
+### SLURM Cluster
 
 The CLI seamlessly submits SLURM jobs when a `slurm` section is added to the
 YAML.  Refer to `docs/guides/installation.md` for cluster instructions.
