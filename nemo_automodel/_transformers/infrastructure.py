@@ -376,7 +376,9 @@ def instantiate_infrastructure(
     if ep_size > 1:
         from nemo_automodel.components.moe.parallelizer import parallelize_model
 
-        parallelize_fn = partial(parallelize_model, activation_checkpointing=activation_checkpointing, **moe_config.to_dict())
+        parallelize_fn = partial(
+            parallelize_model, activation_checkpointing=activation_checkpointing, **moe_config.to_dict()
+        )
     elif autopipeline is not None and model_wrapper is not None:
         parallelize_fn = partial(parallelize_for_pp, model_wrapper=model_wrapper)
 
