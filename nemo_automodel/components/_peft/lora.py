@@ -196,8 +196,8 @@ class LinearLoRA(nn.Linear):
         if obj.use_dora:
             # initialize DoRA magnitude vector to ||W|| (row-wise L2 norm).
             with torch.no_grad():
-                weight_norm = torch.linalg.norm(obj.weight.data, dim=1).to(dtype)
-            obj.lora_magnitude = nn.Parameter(weight_norm, requires_grad=True, device=device)
+                weight_norm = torch.linalg.norm(obj.weight.data, dim=1).to(dtype=dtype, device=device)
+            obj.lora_magnitude = nn.Parameter(weight_norm, requires_grad=True)
 
     def _dora_weight_norm(self) -> torch.Tensor:
         """
