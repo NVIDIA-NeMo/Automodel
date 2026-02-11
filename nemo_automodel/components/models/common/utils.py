@@ -50,8 +50,8 @@ class BackendConfig:
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
-    experts: Literal["torch", "te", "gmm"] = "torch"
-    dispatcher: Literal["torch", "deepep"] = "torch"
+    experts: Literal["torch", "te", "gmm"] = "gmm" if HAVE_TE and torch.cuda.is_available() else "torch"
+    dispatcher: Literal["torch", "deepep"] = "deepep" if HAVE_TE and torch.cuda.is_available() else "torch"
     enable_deepep: bool | None = None  # Deprecated: use dispatcher="deepep" instead
     fake_balanced_gate: bool = False
     enable_hf_state_dict_adapter: bool = True
