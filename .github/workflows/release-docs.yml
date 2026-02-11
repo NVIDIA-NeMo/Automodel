@@ -65,7 +65,7 @@ jobs:
           dry-run: ${{ env.DRY_RUN }}
           artifacts-name: docs-html
           artifacts-path: _build/html
-          emails-csv: ${{ env.NOTIFY_EMAILS && format('{0},{1}', vars.docs_release_emails, inputs.notify-emails) || vars.docs_release_emails }}
+          emails-csv: ${{ env.NOTIFY_EMAILS }}
           overwrite-latest-on-tag: false
           run-on-version-tag-only: ${{ github.ref_name != 'main' }}
           request-name: automodel-publish-docs-${{ github.run_id }}

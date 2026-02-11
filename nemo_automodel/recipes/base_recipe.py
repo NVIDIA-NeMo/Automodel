@@ -684,7 +684,13 @@ class BaseRecipe:
 
     def _get_dp_group_size(self, include_cp: bool = False):
         dp_group = self._get_dp_group(include_cp=include_cp)
-        return 1 if dp_group is None else dp_group.size()
+        if dp_group is None:
+            # For DDP without a device mesh, all ranks form a single
+            # data-parallel group whose size equals the world size.
+            if dist.is_initialized():
+                return dist.get_world_size()
+            return 1
+        return dp_group.size()
 
     def _get_cp_group_size(self):
         if not self.device_mesh or self.device_mesh["cp"].size() == 1:
@@ -693,6 +699,9 @@ class BaseRecipe:
 
     def _get_dp_rank(self, include_cp: bool = False):
         if not self.device_mesh:
+            # For DDP without a device mesh, the global rank is the DP rank.
+            if dist.is_initialized():
+                return dist.get_rank()
             return 0
         if include_cp and self.device_mesh["cp"].size() > 1:
             return self.device_mesh.get_local_rank("dp_cp")
