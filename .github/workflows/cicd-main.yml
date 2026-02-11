@@ -215,29 +215,45 @@ jobs:
           - test-name: L2_Pretrain_and_KD
             test-folder: llm_pretrain_and_kd
             timeout: 20
+            runner: self-hosted-nemo
+            test-data-path: "/mnt/datadrive/TestData"
           - test-name: L2_HF_DCP
             test-folder: hf_dcp
             timeout: 40
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_PEFT
             test-folder: hf_peft
             timeout: 30
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_Transformer
             test-folder: hf_transformer
             timeout: 20
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_Transformer_Finetune
             test-folder: hf_transformer_finetune
             timeout: 40
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_Transformer_LLM
             test-folder: hf_transformer_llm
             timeout: 40
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_Transformer_VLM
             test-folder: hf_transformer_vlm
             timeout: 60
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Datasets
             test-folder: data
             timeout: 20
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
     needs: [pre-flight, cicd-unit-tests]
-    runs-on: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+    runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
     environment: nemo-ci
     if: |
@@ -261,9 +277,9 @@ jobs:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
-          test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          test-data-path: ${{ matrix.test-data-path }}
           container-image: ${{ env.container-registry }}/automodel:${{ github.sha }}
-          runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+          runner: ${{ matrix.runner }}
 
   Nemo_CICD_Test:
     needs:
