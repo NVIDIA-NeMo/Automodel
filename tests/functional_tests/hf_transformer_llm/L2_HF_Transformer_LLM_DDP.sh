@@ -24,7 +24,7 @@ examples/llm_finetune/finetune.py \
   --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
   --step_scheduler.max_steps 3 \
   --step_scheduler.global_batch_size 8 \
-  --step_scheduler.local_batch_size 8 \
+  --step_scheduler.local_batch_size 4 \
   --step_scheduler.val_every_steps 1 \
   --loss_fn._target_ nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy \
   --dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
