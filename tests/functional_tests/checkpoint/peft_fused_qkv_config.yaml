@@ -1,0 +1,80 @@
+# Tiny Llama config for testing PEFT + fused QKV checkpoint save/resume.
+# Uses random weights (from_config) and a mock dataset — no downloads needed.
+
+step_scheduler:
+  global_batch_size: 2
+  local_batch_size: 2
+  ckpt_every_steps: 2
+  val_every_steps: 999999
+  num_epochs: 1
+  max_steps: 2
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 1
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.LlamaConfig
+    num_hidden_layers: 2
+    num_attention_heads: 4
+    num_key_value_heads: 2
+    hidden_size: 64
+    intermediate_size: 128
+    vocab_size: 256
+    max_position_embeddings: 128
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: true
+  dim: 4
+  alpha: 16
+  use_triton: false
+
+distributed:
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+
+distributed_config:
+  _target_: nemo_automodel.components.distributed.config.FSDP2Config
+  sequence_parallel: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
+  num_sentences: 32
+  vocab_size: 256
+  max_sentence_len: 32
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
+  num_sentences: 8
+  vocab_size: 256
+  max_sentence_len: 32
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-4
+  weight_decay: 0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints_peft_fused_qkv_test/
