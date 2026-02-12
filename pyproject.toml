@@ -78,7 +78,7 @@ dependencies = [
     "diffusers",
     "ftfy",
     "imageio-ffmpeg",
-    "megatron-fsdp",
+    "megatron-fsdp>=0.2.3",
     "opencv-python-headless==4.10.0.84",
     "pybind11",
     "pyyaml",
@@ -233,6 +233,9 @@ name = "nv_grouped_gemm"
 # This version has to match the version in the commit/rev/tag used
 version = "1.1.4.post8"
 requires-dist = ["torch", "packaging", "ninja", "setuptools"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
 
 [tool.coverage.paths]
 source = [".", "/workspace", "/home/runner/work/Automodel/Automodel"]

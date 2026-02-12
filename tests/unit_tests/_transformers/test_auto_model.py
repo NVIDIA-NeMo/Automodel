@@ -45,7 +45,7 @@ class TestPatchAttention:
         obj = DummyModule()
         original_forward = obj.forward
 
-        with patch("nemo_automodel._transformers.auto_model.sdpa_kernel") as mock_sdpa_kernel:
+        with patch("nemo_automodel._transformers.kernel_patches.sdpa_kernel") as mock_sdpa_kernel:
             result = _patch_attention(obj)
 
             assert result is obj
@@ -71,7 +71,7 @@ class TestPatchAttention:
         obj = DummyModule()
         custom_sdpa_method = [SDPBackend.FLASH_ATTENTION]
 
-        with patch("nemo_automodel._transformers.auto_model.sdpa_kernel") as mock_sdpa_kernel:
+        with patch("nemo_automodel._transformers.kernel_patches.sdpa_kernel") as mock_sdpa_kernel:
             result = _patch_attention(obj, custom_sdpa_method)
 
             assert result is obj
@@ -210,7 +210,7 @@ def prepare_env(monkeypatch, target_mod, *, has_liger=True, apply_ok=True):
 
 def test_patch_liger_kernel_success(monkeypatch):
     """Test _patch_liger_kernel successfully applies liger kernel when available."""
-    import nemo_automodel._transformers.auto_model as tgt
+    import nemo_automodel._transformers.kernel_patches as tgt
 
     apply_mock, attn_mock = prepare_env(monkeypatch, tgt, has_liger=True, apply_ok=True)
 
@@ -235,7 +235,7 @@ def test_liger_not_available(monkeypatch):
     Expect: return untouched model, _patch_attention still invoked,
             no exceptions thrown.
     """
-    import nemo_automodel._transformers.auto_model as tgt
+    import nemo_automodel._transformers.kernel_patches as tgt
 
     apply_mock, attn_mock = prepare_env(
         monkeypatch,
@@ -260,7 +260,7 @@ def test_liger_apply_failure_raises(monkeypatch):
     If _apply_liger_kernel_to_instance throws, _patch_liger_kernel must
     clean up and raise RuntimeError.
     """
-    import nemo_automodel._transformers.auto_model as tgt
+    import nemo_automodel._transformers.kernel_patches as tgt
 
     prepare_env(
         monkeypatch,
@@ -278,7 +278,7 @@ def test_patch_liger_kernel_skips_non_nn_module(monkeypatch, caplog):
     When model is not an nn.Module (e.g., a lightweight mock), _patch_liger_kernel
     should skip patching and return the model unchanged with a warning.
     """
-    import nemo_automodel._transformers.auto_model as tgt
+    import nemo_automodel._transformers.kernel_patches as tgt
 
     apply_mock, attn_mock = prepare_env(
         monkeypatch,
@@ -348,7 +348,7 @@ class TestApplyPeftAndLowerPrecision:
         mock_peft_config.use_triton = True
 
         with (
-            patch("nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules") as mock_apply_lora,
+            patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules") as mock_apply_lora,
             caplog.at_level(logging.INFO),
         ):
             result = _apply_peft_and_lower_precision(
@@ -373,7 +373,7 @@ class TestApplyPeftAndLowerPrecision:
         mock_autopipeline = MagicMock()
 
         with (
-            patch("nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules") as mock_apply_lora,
+            patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules") as mock_apply_lora,
             caplog.at_level(logging.INFO),
         ):
             result = _apply_peft_and_lower_precision(
@@ -394,7 +394,7 @@ class TestApplyPeftAndLowerPrecision:
         mock_model = MagicMock()
         mock_fp8_config = MagicMock()
 
-        with patch("nemo_automodel._transformers.auto_model.apply_fp8_to_model") as mock_apply_fp8:
+        with patch("nemo_automodel._transformers.infrastructure.apply_fp8_to_model") as mock_apply_fp8:
             mock_apply_fp8.return_value = mock_model
 
             result = _apply_peft_and_lower_precision(

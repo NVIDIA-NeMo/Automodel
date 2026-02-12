@@ -124,6 +124,77 @@ def is_model(object):
     )
 
 
+def _list_existing_checkpoints(ckpt_root: Path) -> list[Path]:
+    """Return existing checkpoint directories under ckpt_root (matching '*step_*')."""
+    if not ckpt_root.exists():
+        return []
+    return list(ckpt_root.glob("*step_*"))
+
+
+def _resolve_restore_from_to_ckpt_dir(checkpoint_dir: str, restore_from: str) -> str | None:
+    """
+    Resolve restore_from to a checkpoint directory.
+
+    Returns:
+        - str: resolved checkpoint directory
+        - None: if restore_from='LATEST' but no checkpoint found (caller should start fresh)
+    """
+    # Handle "LATEST" keyword for convenience
+    if restore_from.upper() == "LATEST":
+        return _find_latest_checkpoint(checkpoint_dir)
+
+    # If restore_from is just a directory name (no path separator), treat it as
+    # relative to checkpoint_dir. Otherwise use as-is (absolute or relative path).
+    if os.path.sep not in restore_from and not os.path.isabs(restore_from):
+        return os.path.join(checkpoint_dir, restore_from)
+    return restore_from
+
+
+def _format_missing_checkpoint_dir_error(checkpoint_dir: str, restore_from: str, resolved_ckpt_dir: str) -> str:
+    """Format a helpful error message for a missing checkpoint directory."""
+    error_msg = [
+        f"\n{'=' * 80}",
+        "ERROR: Checkpoint directory does not exist",
+        f"{'=' * 80}",
+        f"Specified: checkpoint.restore_from: '{restore_from}'",
+        f"Resolved to: {resolved_ckpt_dir}",
+        "",
+        "Please check:",
+        "  1. The checkpoint directory exists",
+        f"  2. The path is correct (restore_from: '{restore_from}')",
+        f"  3. Available checkpoints in {checkpoint_dir}:",
+    ]
+
+    ckpt_root = Path(checkpoint_dir)
+    available_ckpts = _list_existing_checkpoints(ckpt_root)
+    if available_ckpts:
+        error_msg += [f"       {', '.join([p.name for p in available_ckpts[:5]])}"]
+        if len(available_ckpts) > 5:
+            error_msg += [f"       ... and {len(available_ckpts) - 5} more"]
+    else:
+        error_msg += (
+            ["       (no checkpoints found)"] if ckpt_root.exists() else ["       (checkpoint_dir does not exist)"]
+        )
+
+    error_msg += [f"{'=' * 80}"]
+    return "\n".join(error_msg)
+
+
+def _is_rank_0() -> bool:
+    """True if distributed is not initialized or this process is rank 0.
+    TODO(@akoumpa): deprecate in favor of deviemesh api
+    """
+    return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+
+
+def _dist_barrier() -> None:
+    """Barrier if torch.distributed is initialized.
+    TODO(@akoumpa): deprecate in favor of deviemesh api
+    """
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
 class BaseRecipe:
     """
     BaseRecipe provides checkpoint load/save functionality for recipes.
@@ -352,45 +423,119 @@ class BaseRecipe:
                 f"Updated LOWEST_VAL checkpoint symlink to {os.path.basename(target_dir)} (val_loss={val_loss:.4f})"
             )
 
-    def load_checkpoint(self, restore_from: str | None = None):
-        """
-        Loads the latest checkpoint.
-        """
-        if not self.checkpointer.config.enabled:
-            if (
-                not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-            ) and restore_from is not None:
-                print("Enable checkpointing to resume from a checkpoint, skipping...", flush=True)
+    def _validate_checkpoint_dir_exists(self, ckpt_dir: str, restore_from: str, is_rank_0: bool) -> None:
+        """Validate resolved checkpoint directory exists; raise FileNotFoundError with a helpful message."""
+        if os.path.exists(ckpt_dir):
             return
 
-        if restore_from:
-            ckpt_dir = restore_from
+        # Build helpful error message on rank 0
+        if is_rank_0:
+            error_msg = _format_missing_checkpoint_dir_error(
+                checkpoint_dir=self.checkpointer.config.checkpoint_dir,
+                restore_from=restore_from,
+                resolved_ckpt_dir=ckpt_dir,
+            )
         else:
-            # Determine the latest checkpoint directory (e.g. ".../step_42").
-            ckpt_dir = _find_latest_checkpoint(self.checkpointer.config.checkpoint_dir)
-            if ckpt_dir is None:
-                return
+            error_msg = f"Checkpoint directory does not exist: {ckpt_dir}"
 
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-            print(f"Loading checkpoint from {ckpt_dir}", flush=True)
+        # Ensure all ranks fail together (before raising)
+        _dist_barrier()
+        raise FileNotFoundError(error_msg)
 
+    def _load_checkpoint_tracked_state(self, ckpt_dir: str):
+        """Load tracked state and return (model, optimizer, scheduler) for downstream loader calls."""
         model, optimizer, scheduler = None, None, None
 
         for key in sorted(self.__dict__["__state_tracked"]):
-            if is_model(getattr(self, key)):
-                model = getattr(self, key)
-            elif is_optimizer(getattr(self, key)):
-                optimizer = getattr(self, key)
-            elif is_lr_scheduler(getattr(self, key)):
-                scheduler = getattr(self, key)
-            elif is_dataloader(getattr(self, key)) or isinstance(getattr(self, key), StatefulRNG):
-                self.checkpointer.load_on_dp_ranks(getattr(self, key), key, ckpt_dir)
-            elif is_tokenizer(getattr(self, key)) or isinstance(getattr(self, key), ConfigNode):
+            obj = getattr(self, key)
+            if is_model(obj):
+                if key == "teacher_model":
+                    continue
+                model = obj
+            elif is_optimizer(obj):
+                optimizer = obj
+            elif is_lr_scheduler(obj):
+                scheduler = obj
+            elif is_dataloader(obj) or isinstance(obj, StatefulRNG):
+                self.checkpointer.load_on_dp_ranks(obj, key, ckpt_dir)
+            elif is_tokenizer(obj) or isinstance(obj, ConfigNode):
                 # we don't need to load the tokenizer or config from the checkpoint
                 # we only save the tokenizer for consolidated checkpoints for downstream use
                 continue
             else:
-                getattr(self, key).load_state_dict(torch.load(os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False))
+                obj.load_state_dict(torch.load(os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False))
+
+        return model, optimizer, scheduler
+
+    def load_checkpoint(self, restore_from: str | None = None):
+        """
+        Loads checkpoint with automatic compatibility checking.
+
+        This method will:
+        - If restore_from is set to a path or "LATEST": resolve and load that checkpoint
+        - If restore_from is None: auto-detect the latest checkpoint in checkpoint_dir
+        - Before loading, check if the checkpoint is compatible with the current model config
+        - If incompatible: print a warning and proceed with the restore anyway
+
+        Args:
+            restore_from: Path to checkpoint directory to restore from. Options:
+                         - None: Auto-detect latest checkpoint in checkpoint_dir
+                         - "LATEST": Explicitly auto-detect latest checkpoint
+                         - "epoch_0_step_100": Subdirectory name (relative to checkpoint_dir)
+                         - "./path/to/checkpoint": Absolute or relative path
+        """
+        if not self.checkpointer.config.enabled:
+            if _is_rank_0() and restore_from is not None:
+                print("Enable checkpointing to resume from a checkpoint, skipping...", flush=True)
+            return
+
+        is_rank_0 = _is_rank_0()
+
+        if restore_from:
+            ckpt_dir = _resolve_restore_from_to_ckpt_dir(self.checkpointer.config.checkpoint_dir, restore_from)
+            if ckpt_dir is None:
+                # LATEST keyword with no checkpoints found
+                if is_rank_0:
+                    logging.warning(
+                        "restore_from='LATEST' specified but no checkpoint found in "
+                        f"{self.checkpointer.config.checkpoint_dir}. Starting fresh."
+                    )
+                return
+            self._validate_checkpoint_dir_exists(ckpt_dir, restore_from=restore_from, is_rank_0=is_rank_0)
+        else:
+            # Auto-detect latest checkpoint
+            ckpt_dir = _find_latest_checkpoint(self.checkpointer.config.checkpoint_dir)
+            if ckpt_dir is None:
+                return
+            ckpt_dir = str(ckpt_dir)
+
+        # Check if the checkpoint is compatible with the current model configuration.
+        #  - Auto-detected checkpoints (restore_from=None) are SKIPPED when
+        #    incompatible, because they likely belong to a different training run
+        #    that happened to share the same checkpoint_dir.
+        #  - Explicitly requested checkpoints still proceed (user's intent).
+        cfg = getattr(self, "cfg", None)
+        if cfg is not None:
+            ok, reason = _is_checkpoint_model_config_compatible(cfg, ckpt_dir)
+            if not ok and is_rank_0:
+                if not restore_from:
+                    # Auto-detected: skip restore to avoid loading stale/incompatible checkpoints
+                    logging.warning(
+                        f"Auto-detected checkpoint at {ckpt_dir} is incompatible with current "
+                        f"model configuration: {reason}. Skipping restore."
+                    )
+                    return
+                else:
+                    # Explicit restore_from: warn but honour the user's request
+                    logging.warning(
+                        f"Checkpoint at {ckpt_dir} may be incompatible with current model "
+                        f"configuration: {reason}. Proceeding with restore anyway."
+                    )
+
+        if is_rank_0:
+            print(f"Loading checkpoint from {ckpt_dir}", flush=True)
+
+        model, optimizer, scheduler = self._load_checkpoint_tracked_state(ckpt_dir)
 
         self.checkpointer.load_model(model, os.path.join(ckpt_dir, "model"))
         self.checkpointer.load_optimizer(optimizer, model, ckpt_dir, scheduler)
@@ -539,7 +684,13 @@ class BaseRecipe:
 
     def _get_dp_group_size(self, include_cp: bool = False):
         dp_group = self._get_dp_group(include_cp=include_cp)
-        return 1 if dp_group is None else dp_group.size()
+        if dp_group is None:
+            # For DDP without a device mesh, all ranks form a single
+            # data-parallel group whose size equals the world size.
+            if dist.is_initialized():
+                return dist.get_world_size()
+            return 1
+        return dp_group.size()
 
     def _get_cp_group_size(self):
         if not self.device_mesh or self.device_mesh["cp"].size() == 1:
@@ -548,6 +699,9 @@ class BaseRecipe:
 
     def _get_dp_rank(self, include_cp: bool = False):
         if not self.device_mesh:
+            # For DDP without a device mesh, the global rank is the DP rank.
+            if dist.is_initialized():
+                return dist.get_rank()
             return 0
         if include_cp and self.device_mesh["cp"].size() > 1:
             return self.device_mesh.get_local_rank("dp_cp")
@@ -623,3 +777,82 @@ def _find_latest_checkpoint(checkpoint_dir):
         return
 
     return latest
+
+
+def _extract_model_signature(cfg: dict) -> dict:
+    """
+    Extract a stable subset of the model config used to decide checkpoint compatibility.
+
+    This includes model architecture fields AND training-mode indicators (e.g. PEFT)
+    that affect the checkpoint format.
+    """
+    if not isinstance(cfg, dict):
+        return {}
+    model_cfg = cfg.get("model", {})
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+    keys = (
+        # the most common identifier in this repo's configs
+        "pretrained_model_name_or_path",
+        # common HF config-ish fields that indicate architecture
+        "architectures",
+        "model_type",
+        "hidden_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "intermediate_size",
+        "vocab_size",
+        "tie_word_embeddings",
+        "rope_theta",
+        "rope_scaling",
+    )
+    sig = {k: model_cfg.get(k, None) for k in keys}
+
+    # PEFT presence affects checkpoint format (adapter-only vs full model).
+    # A PEFT checkpoint is NOT loadable into a non-PEFT model and vice-versa.
+    peft_cfg = cfg.get("peft", None)
+    sig["_has_peft"] = peft_cfg is not None and isinstance(peft_cfg, dict)
+
+    return sig
+
+
+def _is_checkpoint_model_config_compatible(current_cfg, ckpt_dir: str) -> tuple[bool, str]:
+    """
+    Compare the checkpoint's saved ``config.yaml`` model signature to the
+    current run's model signature.
+
+    Uses ``raw_config`` (when available) for comparison because
+    ``save_config`` serialises ``raw_config`` to YAML.  Round-tripping
+    through YAML preserves types, avoiding false mismatches that would
+    arise from using ``to_dict()`` (which may apply type conversions).
+    """
+    config_path = os.path.join(os.fspath(ckpt_dir), "config.yaml")
+    if not os.path.exists(config_path):
+        return True, "checkpoint has no config.yaml (cannot validate)"
+    try:
+        with open(config_path, "r") as f:
+            ckpt_cfg = yaml.safe_load(f) or {}
+    except Exception as e:
+        return True, f"failed to read checkpoint config.yaml (cannot validate): {e}"
+
+    # Prefer raw_config (same representation that was saved) to avoid
+    # type-coercion mismatches between to_dict() and yaml.safe_load().
+    try:
+        if hasattr(current_cfg, "raw_config"):
+            cur_cfg = current_cfg.raw_config
+        elif hasattr(current_cfg, "to_dict"):
+            cur_cfg = current_cfg.to_dict()
+        else:
+            cur_cfg = dict(current_cfg)
+    except Exception:
+        cur_cfg = {}
+
+    ckpt_sig = _extract_model_signature(ckpt_cfg)
+    cur_sig = _extract_model_signature(cur_cfg)
+    if not ckpt_sig or not cur_sig:
+        return True, "could not extract model signature (cannot validate)"
+
+    if ckpt_sig != cur_sig:
+        return False, f"model signature mismatch (checkpoint={ckpt_sig}, current={cur_sig})"
+    return True, "model signature matches"

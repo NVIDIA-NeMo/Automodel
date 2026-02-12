@@ -33,16 +33,17 @@ step_scheduler:
   max_steps: 30
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   tp_size: 1
   cp_size: 1
   pp_size: 4
-  dp_replicate_size: 1
   ep_size: 64
+
+distributed_config:
+  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false
 
 autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
+  _target_: nemo_automodel.components.distributed.pipelining.config.PipelineConfig
   pp_schedule: interleaved1f1b
   pp_microbatch_size: 1
   round_virtual_stages_to_pp_multiple: down
@@ -55,14 +56,14 @@ dist_env:
   backend: nccl
   timeout_minutes: 10
 
-parallelizer:
-  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
+moe_config:
+  _target_: nemo_automodel.components.moe.config.MoEParallelizerConfig
   activation_checkpointing: true
   reshard_after_forward: false
   wrap_outer_model: false
 
 model:
-  _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
@@ -73,7 +74,8 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    enable_deepep: true
+    experts: gmm
+    dispatcher: deepep
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false
     enable_fsdp_optimizations: true

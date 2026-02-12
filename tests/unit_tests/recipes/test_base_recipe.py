@@ -50,7 +50,7 @@ def _patch_checkpoint_ops(monkeypatch):
 
     class MockCheckpointer:
         """Mock Checkpointer for testing."""
-        
+
         def __init__(self, config, dp_rank, tp_rank, pp_rank, moe_mesh=None):
             self.config = config
             self.dp_rank = dp_rank
@@ -65,14 +65,14 @@ def _patch_checkpoint_ops(monkeypatch):
             model_dir = os.path.join(weights_path, "model")
             os.makedirs(model_dir, exist_ok=True)
             torch.save(model.state_dict(), os.path.join(model_dir, "model.pt"))
-        
-        def load_model(self, model, model_path, is_init_step=False, use_checkpoint_id=True, 
+
+        def load_model(self, model, model_path, is_init_step=False, use_checkpoint_id=True,
                       key_mapping=None, quantization=False):
             """Load model state dict."""
             if model is None:
                 return
             model.load_state_dict(torch.load(os.path.join(model_path, "model.pt"), weights_only=False))
-        
+
         def save_optimizer(self, optimizer, model, weights_path, scheduler=None):
             """Save optimizer state dict."""
             if optimizer is None:
@@ -80,30 +80,30 @@ def _patch_checkpoint_ops(monkeypatch):
             optim_dir = os.path.join(weights_path, "optim")
             os.makedirs(optim_dir, exist_ok=True)
             torch.save(optimizer.state_dict(), os.path.join(optim_dir, "optimizer.pt"))
-        
+
         def load_optimizer(self, optimizer, model, weights_path, scheduler=None):
             """Load optimizer state dict."""
             if optimizer is None:
                 return
             optim_path = os.path.join(weights_path, "optim")
             optimizer.load_state_dict(torch.load(os.path.join(optim_path, "optimizer.pt"), weights_only=False))
-        
+
         def async_wait(self):
             """No-op for tests to satisfy BaseRecipe interface."""
             return
-        
+
         def save_on_dp_ranks(self, state, state_name, path):
             """Save stateful object (e.g., dataloader, rng)."""
             state_dir = os.path.join(path, state_name)
             os.makedirs(state_dir, exist_ok=True)
             if self.tp_rank == 0 and self.pp_rank == 0:
                 torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}.pt"))
-        
+
         def load_on_dp_ranks(self, state, state_name, path):
             """Load stateful object (e.g., dataloader, rng)."""
             state_dir = os.path.join(path, state_name)
             state.load_state_dict(torch.load(os.path.join(state_dir, f"{state_name}.pt"), weights_only=False))
-    
+
     monkeypatch.setattr(checkpointing, "Checkpointer", MockCheckpointer)
     yield
 
@@ -146,9 +146,9 @@ class _ToyRecipe(BaseRecipe):
     Minimal concrete implementation of BaseRecipe for testing.
     """
 
-    def __init__(self, checkpoint_dir):
+    def __init__(self, checkpoint_dir, cfg_dict=None):
         super().__init__()
-        
+
         from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
         checkpoint_config = CheckpointingConfig(
@@ -175,7 +175,9 @@ class _ToyRecipe(BaseRecipe):
         self.custom_state = _DummyStateful()
         self.peft_config = None
 
-        self.cfg = ConfigNode({"test": "config"})
+        if cfg_dict is None:
+            cfg_dict = {"test": "config"}
+        self.cfg = ConfigNode(cfg_dict)
 
 
 def test_find_latest_checkpoint(tmp_path):
@@ -253,9 +255,332 @@ def test_save_and_load_roundtrip(tmp_path, symlink_supported, monkeypatch):
     assert not torch.allclose(recipe_inst.model.weight, weight_after_step)
     assert not torch.allclose(recipe_inst.custom_state.foo, foo_after_step)
 
-    # Restore from latest checkpoint in the directory.
-    recipe_inst.load_checkpoint()
+    # Restore from latest checkpoint in the directory using 'LATEST' keyword.
+    recipe_inst.load_checkpoint(restore_from="LATEST")
 
     # Expect exact values from the moment of save().
     assert torch.allclose(recipe_inst.model.weight, weight_after_step)
     assert torch.allclose(recipe_inst.custom_state.foo, foo_after_step)
+
+
+def test_load_checkpoint_fresh_start_empty_dir(tmp_path):
+    """
+    Test that load_checkpoint() with restore_from=None and empty directory works (fresh start).
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    # Should succeed - no checkpoints exist
+    recipe_inst.load_checkpoint(restore_from=None)
+
+
+def test_load_checkpoint_auto_detect_restores_latest(tmp_path):
+    """
+    Test that load_checkpoint() with restore_from=None auto-detects and restores the
+    latest checkpoint when one exists (the old default behavior).
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    # Perform training and save checkpoint
+    x = torch.randn(4, 2)
+    loss = recipe_inst.model(x).sum()
+    loss.backward()
+    recipe_inst.optimizer.step()
+
+    weight_after_step = recipe_inst.model.weight.clone()
+    recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
+
+    # Modify model
+    recipe_inst.model.weight.data.add_(42.0)
+    assert not torch.allclose(recipe_inst.model.weight, weight_after_step)
+
+    # Load with restore_from=None should auto-detect and restore
+    recipe_inst.load_checkpoint(restore_from=None)
+
+    # Should restore to saved state
+    assert torch.allclose(recipe_inst.model.weight, weight_after_step)
+
+
+def test_load_checkpoint_with_latest_keyword(tmp_path):
+    """
+    Test that restore_from='LATEST' loads the latest checkpoint.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    # Perform training and save checkpoint
+    x = torch.randn(4, 2)
+    loss = recipe_inst.model(x).sum()
+    loss.backward()
+    recipe_inst.optimizer.step()
+
+    weight_after_step = recipe_inst.model.weight.clone()
+    recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
+
+    # Modify model
+    recipe_inst.model.weight.data.add_(42.0)
+    assert not torch.allclose(recipe_inst.model.weight, weight_after_step)
+
+    # Load using 'LATEST' keyword
+    recipe_inst.load_checkpoint(restore_from="LATEST")
+
+    # Should restore to saved state
+    assert torch.allclose(recipe_inst.model.weight, weight_after_step)
+
+
+def test_load_checkpoint_with_latest_keyword_case_insensitive(tmp_path):
+    """
+    Test that restore_from='latest' (lowercase) also works.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    # Save checkpoint
+    x = torch.randn(4, 2)
+    loss = recipe_inst.model(x).sum()
+    loss.backward()
+    recipe_inst.optimizer.step()
+
+    weight_after_step = recipe_inst.model.weight.clone()
+    recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
+
+    # Modify model
+    recipe_inst.model.weight.data.add_(42.0)
+
+    # Load using lowercase 'latest'
+    recipe_inst.load_checkpoint(restore_from="latest")
+
+    # Should restore to saved state
+    assert torch.allclose(recipe_inst.model.weight, weight_after_step)
+
+
+@pytest.mark.parametrize("model,compatible", [("toy/model-a", True), ("toy/model-a2", False)])
+def test_load_checkpoint_explicit_restore_incompatible_warns_and_continues(tmp_path, model, compatible):
+    """
+    When an explicit restore_from is given (e.g. "LATEST"), an incompatible
+    checkpoint still proceeds with the restore -- the user explicitly asked
+    for that checkpoint, so we honour the request and just warn.
+    """
+    # Create a checkpoint with a specific model signature
+    recipe_a = _ToyRecipe(tmp_path, cfg_dict={"model": {"pretrained_model_name_or_path": "toy/model-a"}})
+
+    x = torch.randn(4, 2)
+    loss = recipe_a.model(x).sum()
+    loss.backward()
+    recipe_a.optimizer.step()
+    weight_after_step = recipe_a.model.weight.clone()
+    recipe_a.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
+
+    # Attempt to restore with a (possibly different) model signature using the 'LATEST' keyword
+    recipe_b = _ToyRecipe(tmp_path, cfg_dict={"model": {"pretrained_model_name_or_path": model}})
+
+    # Should NOT raise - always restores with explicit restore_from; warns if incompatible
+    recipe_b.load_checkpoint(restore_from="LATEST")
+
+    # Both compatible and incompatible cases restore the checkpoint weights
+    # because restore_from was explicitly set.
+    assert torch.allclose(recipe_b.model.weight, weight_after_step)
+
+
+def test_load_checkpoint_autodetect_skips_incompatible(tmp_path):
+    """
+    When restore_from is None (auto-detect), an incompatible checkpoint is
+    SKIPPED -- this prevents stale/leftover checkpoints from a different
+    training run (e.g. PEFT vs full fine-tune) from breaking training.
+    """
+    # Create a checkpoint with model-a
+    recipe_a = _ToyRecipe(tmp_path, cfg_dict={"model": {"pretrained_model_name_or_path": "toy/model-a"}})
+
+    x = torch.randn(4, 2)
+    loss = recipe_a.model(x).sum()
+    loss.backward()
+    recipe_a.optimizer.step()
+    weight_after_step = recipe_a.model.weight.clone()
+    recipe_a.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
+
+    # Create a new recipe with a DIFFERENT model signature and auto-detect (restore_from=None)
+    recipe_b = _ToyRecipe(tmp_path, cfg_dict={"model": {"pretrained_model_name_or_path": "toy/model-b"}})
+    weight_before_load = recipe_b.model.weight.clone()
+
+    # Auto-detect should skip the incompatible checkpoint
+    recipe_b.load_checkpoint(restore_from=None)
+
+    # Weights should NOT have been restored (incompatible → skipped)
+    assert torch.allclose(recipe_b.model.weight, weight_before_load)
+    assert not torch.allclose(recipe_b.model.weight, weight_after_step)
+
+
+def test_load_checkpoint_autodetect_skips_peft_mismatch(tmp_path):
+    """
+    A checkpoint saved with PEFT config is incompatible with a non-PEFT run
+    (and vice-versa) because the checkpoint format differs (adapter-only vs
+    full model). Auto-detect should skip such checkpoints.
+    """
+    # Save a checkpoint WITH a peft section in config
+    recipe_peft = _ToyRecipe(tmp_path, cfg_dict={
+        "model": {"pretrained_model_name_or_path": "toy/model-a"},
+        "peft": {"dim": 8, "alpha": 32},
+    })
+    x = torch.randn(4, 2)
+    loss = recipe_peft.model(x).sum()
+    loss.backward()
+    recipe_peft.optimizer.step()
+    recipe_peft.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
+
+    # Create a new recipe WITHOUT peft (same model architecture)
+    recipe_no_peft = _ToyRecipe(tmp_path, cfg_dict={
+        "model": {"pretrained_model_name_or_path": "toy/model-a"},
+    })
+    weight_before_load = recipe_no_peft.model.weight.clone()
+
+    # Auto-detect should skip because PEFT mismatch
+    recipe_no_peft.load_checkpoint(restore_from=None)
+
+    # Weights should NOT have been restored
+    assert torch.allclose(recipe_no_peft.model.weight, weight_before_load)
+
+
+def test_load_checkpoint_with_latest_no_checkpoints_warns(tmp_path):
+    """
+    Test that restore_from='LATEST' with no checkpoints warns and continues.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    # Should not raise, just warn and return
+    recipe_inst.load_checkpoint(restore_from="LATEST")
+
+
+def test_load_checkpoint_with_subdirectory_name(tmp_path):
+    """
+    Test that restore_from='epoch_0_step_100' (subdirectory name) works.
+    This is a convenience feature - it looks in checkpoint_dir for the subdirectory.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    # Perform training and save checkpoint
+    x = torch.randn(4, 2)
+    loss = recipe_inst.model(x).sum()
+    loss.backward()
+    recipe_inst.optimizer.step()
+
+    weight_after_step = recipe_inst.model.weight.clone()
+    recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
+
+    # Modify model
+    recipe_inst.model.weight.data.add_(42.0)
+    assert not torch.allclose(recipe_inst.model.weight, weight_after_step)
+
+    # Load using just the subdirectory name (no path separator)
+    recipe_inst.load_checkpoint(restore_from="epoch_0_step_100")
+
+    # Should restore to saved state
+    assert torch.allclose(recipe_inst.model.weight, weight_after_step)
+
+
+def test_load_checkpoint_with_full_path(tmp_path):
+    """
+    Test that restore_from with full path works.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    # Perform training and save checkpoint
+    x = torch.randn(4, 2)
+    loss = recipe_inst.model(x).sum()
+    loss.backward()
+    recipe_inst.optimizer.step()
+
+    weight_after_step = recipe_inst.model.weight.clone()
+    recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
+
+    # Modify model
+    recipe_inst.model.weight.data.add_(42.0)
+
+    # Load using full path
+    ckpt_path = tmp_path / "epoch_0_step_100"
+    recipe_inst.load_checkpoint(restore_from=str(ckpt_path))
+
+    # Should restore to saved state
+    assert torch.allclose(recipe_inst.model.weight, weight_after_step)
+
+
+def test_load_checkpoint_nonexistent_subdirectory_fails(tmp_path):
+    """
+    Test that restore_from with non-existent subdirectory name fails with helpful error.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    # Create some checkpoints for the error message to list
+    (tmp_path / "epoch_0_step_100").mkdir()
+    (tmp_path / "epoch_0_step_200").mkdir()
+
+    # Try to load non-existent checkpoint
+    with pytest.raises(FileNotFoundError, match="Checkpoint directory does not exist"):
+        recipe_inst.load_checkpoint(restore_from="epoch_0_step_999")
+
+
+def test_load_checkpoint_nonexistent_path_fails(tmp_path):
+    """
+    Test that restore_from with non-existent full path fails with helpful error.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    # Try to load non-existent path
+    with pytest.raises(FileNotFoundError, match="Checkpoint directory does not exist"):
+        recipe_inst.load_checkpoint(restore_from=str(tmp_path / "nonexistent_checkpoint"))
+
+
+def test_load_checkpoint_multiple_checkpoints_with_latest(tmp_path):
+    """
+    Test that 'LATEST' correctly picks the highest step number among multiple checkpoints.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    # Save multiple checkpoints
+    for step in [50, 100, 75, 200]:
+        x = torch.randn(4, 2)
+        loss = recipe_inst.model(x).sum()
+        loss.backward()
+        recipe_inst.optimizer.step()
+
+        if step == 200:
+            # Save the state at step 200 for verification
+            weight_at_step_200 = recipe_inst.model.weight.clone()
+
+        recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()))
+
+    # Modify model
+    recipe_inst.model.weight.data.add_(42.0)
+
+    # Load with LATEST - should pick step 200
+    recipe_inst.load_checkpoint(restore_from="LATEST")
+
+    # Should restore to step 200 state
+    assert torch.allclose(recipe_inst.model.weight, weight_at_step_200)
+
+
+def test_load_checkpoint_path_with_separator_treated_as_full_path(tmp_path):
+    """
+    Test that restore_from containing path separator is treated as full path,
+    not as subdirectory name.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    # Create a nested structure
+    nested_dir = tmp_path / "nested"
+    nested_dir.mkdir()
+    ckpt_dir = nested_dir / "epoch_0_step_100"
+    ckpt_dir.mkdir()
+
+    # Manually create checkpoint structure
+    model_dir = ckpt_dir / "model"
+    model_dir.mkdir()
+    torch.save(recipe_inst.model.state_dict(), model_dir / "model.pt")
+
+    optim_dir = ckpt_dir / "optim"
+    optim_dir.mkdir()
+    torch.save(recipe_inst.optimizer.state_dict(), optim_dir / "optimizer.pt")
+
+    # Also save custom_state since BaseRecipe will try to load it
+    torch.save(recipe_inst.custom_state.state_dict(), ckpt_dir / "custom_state.pt")
+
+    # Load using relative path with separator
+    recipe_inst.load_checkpoint(restore_from=str(nested_dir / "epoch_0_step_100"))
+
+    # Should succeed without FileNotFoundError

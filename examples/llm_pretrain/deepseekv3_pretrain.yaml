@@ -40,8 +40,8 @@ rng:
   seed: 1111
   ranked: true
 
-parallelize_fn:
-  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
+moe_config:
+  _target_: nemo_automodel.components.moe.config.MoEParallelizerConfig
   activation_checkpointing: false
 
 # Option 1 - shorthand builder w/ automatic optimized path
@@ -62,7 +62,8 @@ model:
 #     attn: te
 #     linear: te
 #     rms_norm: te
-#     enable_deepep: true
+#     experts: te
+#     dispatcher: deepep
 #     fake_balanced_gate: false
 #     enable_hf_state_dict_adapter: true
 #   moe_config:
@@ -77,13 +78,14 @@ checkpoint:
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   tp_size: 1
   cp_size: 1
   pp_size: 8
-  dp_replicate_size: 1
   dp_size: 16
   ep_size: 16
+
+distributed_config:
+  _target_: nemo_automodel.components.distributed.config.FSDP2Config
 
 loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
@@ -136,7 +138,7 @@ lr_scheduler:
   min_lr: 0.0
 
 autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.autopipeline.AutoPipeline
+  _target_: nemo_automodel.components.distributed.pipelining.config.PipelineConfig
   pp_microbatch_size: 1
   pp_schedule: interleaved1f1b
   scale_grads_in_schedule: False

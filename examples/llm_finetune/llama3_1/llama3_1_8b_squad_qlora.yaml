@@ -37,6 +37,7 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
+  torch_dtype: bfloat16
   force_hf: true # @akoumpa: remove once checkpointer works with quantization
 
 peft:
@@ -47,11 +48,12 @@ peft:
   dropout: 0.1
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
-  dp_replicate_size: 1
   tp_size: 1
   cp_size: 1
+
+distributed_config:
+  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false
 
 quantization:
