@@ -135,6 +135,87 @@ uv run automodel finetune asr \
   --slurm.gpus_per_node 8
 ```
 
+## Parameter-Efficient Fine-Tuning (PEFT)
+
+PEFT with LoRA (Low-Rank Adaptation) enables memory-efficient ASR training by only training small adapter layers while keeping the base model frozen.
+
+### Benefits
+- **40-60% Memory Reduction**: Train larger models or use bigger batch sizes
+- **10-30x Smaller Checkpoints**: Adapter weights are only 5-50MB
+- **Faster Convergence**: Higher learning rates (5-10x) accelerate training
+- **Multi-Task Adapters**: Share base model across multiple domains
+
+### Quick Start
+
+```bash
+# Whisper Small + LoRA (244M base, ~2M trainable params)
+uv run examples/asr_finetune/finetune.py \
+  --config examples/asr_finetune/whisper/whisper_small_librispeech_peft.yaml
+
+# Parakeet CTC 0.6B + LoRA
+uv run examples/asr_finetune/finetune.py \
+  --config examples/asr_finetune/parakeet/parakeet_ctc_0.6b_librispeech_peft.yaml
+```
+
+### Multi-GPU PEFT Training
+
+```bash
+# 8 GPUs with data parallelism
+uv run torchrun --nproc-per-node=8 examples/asr_finetune/finetune.py \
+  --config examples/asr_finetune/whisper/whisper_medium_librispeech_peft.yaml
+```
+
+### Configuration
+
+PEFT configs add this section to the YAML:
+
+```yaml
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules:
+    - "*.q_proj"    # Attention query
+    - "*.v_proj"    # Attention value
+  dim: 16           # LoRA rank (8/16/32)
+  alpha: 32         # Scaling factor
+  dropout: 0.1      # Regularization
+  use_triton: true  # Optimized kernels
+```
+
+**Target Modules**:
+- **Whisper**: Attention layers (`q_proj`, `k_proj`, `v_proj`, `o_proj`) in both encoder and decoder
+- **Parakeet**: Conformer attention (`*.self_attn.*`) and feed-forward layers (`*.feed_forward.*`)
+
+**Hyperparameter Guidelines**:
+
+| Setting | Conservative | Balanced | High-Capacity |
+|---------|-------------|----------|---------------|
+| `dim` | 8 | 16 | 32 |
+| `alpha` | 16 | 32 | 32 |
+| Learning Rate | 5e-5 | 1e-4 | 5e-5 |
+
+### Performance Comparison
+
+| Model | Method | Memory (GB) | Checkpoint Size | Training Speed |
+|-------|--------|-------------|-----------------|----------------|
+| Whisper Small | Full | 12 | 500MB | 1.0x |
+| Whisper Small | LoRA-16 | 7 | 15MB | 1.3x |
+| Whisper Medium | Full | 32 | 1.5GB | 1.0x |
+| Whisper Medium | LoRA-32 | 18 | 45MB | 1.5x |
+
+*Estimated on A100 80GB GPU*
+
+### When to Use PEFT
+
+**Use PEFT when:**
+- Training on limited GPU memory (consumer GPUs, single GPU)
+- Need multiple task-specific models (domain adaptation)
+- Fast iteration and experimentation
+
+**Use Full Finetuning when:**
+- Maximum accuracy is critical
+- Large domain shift from base model
+- Sufficient compute resources available
+
 ## Attention Implementations
 
 The example configs use **SDPA** (Scaled Dot Product Attention) by default, which is PyTorch-native and requires no extra dependencies.
@@ -334,8 +415,14 @@ Training and validation metrics are logged to:
 
 | Config | Model | Dataset | GPUs | Batch Size | Steps | Notes |
 |--------|-------|---------|------|------------|-------|-------|
-| whisper_small_librispeech.yaml | Whisper Small (244M) | LibriSpeech 100h | 1-8 | 32 | 1000 | Quick start, clean English |
-| whisper_medium_librispeech.yaml | Whisper Medium (769M) | LibriSpeech Full | 8+ | 64 | 5000 | TP=2, production quality |
+| whisper_small_librispeech.yaml | Whisper Small (244M) | LibriSpeech 100h | 1-8 | 32 | 1000 | Full finetune, clean English |
+| whisper_small_librispeech_peft.yaml | Whisper Small (244M) | LibriSpeech 100h | 1-8 | 64 | 1000 | PEFT LoRA-16, memory-efficient |
+| whisper_medium_librispeech.yaml | Whisper Medium (769M) | LibriSpeech Full | 8+ | 32 | 1000 | Full finetune, production quality |
+| whisper_medium_librispeech_peft.yaml | Whisper Medium (769M) | LibriSpeech Full | 8+ | 64 | 1000 | PEFT LoRA-32, TP support |
+| parakeet_ctc_0.6b_librispeech.yaml | Parakeet CTC 0.6B | LibriSpeech 100h | 1-8 | 32 | 1000 | Full finetune, fast CTC |
+| parakeet_ctc_0.6b_librispeech_peft.yaml | Parakeet CTC 0.6B | LibriSpeech 100h | 1-8 | 64 | 1000 | PEFT LoRA-16, efficient |
+| parakeet_ctc_1.1b_librispeech.yaml | Parakeet CTC 1.1B | LibriSpeech 100h | 8+ | 32 | 1000 | Full finetune, high accuracy |
+| parakeet_ctc_1.1b_librispeech_peft.yaml | Parakeet CTC 1.1B | LibriSpeech 100h | 8+ | 64 | 1000 | PEFT LoRA-32, memory-efficient |
 
 ## Next Steps
 

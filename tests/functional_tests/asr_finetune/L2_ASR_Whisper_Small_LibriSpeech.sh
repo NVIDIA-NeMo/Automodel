@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+#!/bin/bash
+# Copyright (c) 2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-#!/bin/bash
-set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
+
+set -xeuo pipefail
 
 export CUDA_VISIBLE_DEVICES="0"
 

@@ -14,17 +14,22 @@
 # limitations under the License.
 
 
-set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
+set -xeuo pipefail
 
 export CUDA_VISIBLE_DEVICES="0"
 
 python -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
 examples/asr_finetune/finetune.py \
-  --config examples/asr_finetune/parakeet/parakeet_ctc_0.6b_librispeech.yaml \
+  --config examples/asr_finetune/whisper/whisper_small_librispeech_peft.yaml \
   --step_scheduler.max_steps 3 \
   --step_scheduler.global_batch_size 2 \
   --step_scheduler.local_batch_size 2 \
-  --step_scheduler.val_every_steps 1 \
+  --step_scheduler.val_every_steps 2 \
+  --step_scheduler.ckpt_every_steps 2 \
   --dataset.limit_dataset_samples 10 \
   --validation_dataset.limit_dataset_samples 10 \
-  --checkpoint.enabled false
+  --checkpoint.enabled true \
+  --checkpoint.checkpoint_dir checkpoints/asr_whisper_peft_test
+
+# Cleanup
+rm -rf checkpoints/asr_whisper_peft_test
