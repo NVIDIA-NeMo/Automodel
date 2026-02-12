@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Generic Biencoder Model for embedding and retrieval tasks.
-
-This module provides the BiencoderModel class that works with any bidirectional
-backbone registered in the ModelRegistry. The backbone models are loaded
-dynamically based on the model type.
-"""
+"""Generic Biencoder Model for embedding and retrieval tasks."""
 
 import copy
 import inspect
@@ -75,23 +69,15 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
     return emb
 
 
-# Mapping from HuggingFace model_type to bidirectional architecture name
-# These architecture names must match the class names exported via ModelClass
-# in the corresponding bidirectional model module (e.g., llama_bidirectional/model.py)
+# HuggingFace model_type -> bidirectional architecture class name in ModelRegistry
 SUPPORTED_BACKBONES = {
     "llama": "LlamaBidirectionalModel",
-    # Add more backbones as needed:
+    "llama_bidirec": "LlamaBidirectionalModel",
 }
 
 
 class BiencoderModel(nn.Module):
-    """
-    Biencoder model for embedding and retrieval.
-
-    Encodes queries and passages separately using bidirectional backbone models.
-    The backbone is loaded dynamically from the ModelRegistry based on model type.
-    Training logic (loss, optimizer, etc.) lives in the recipe layer.
-    """
+    """Biencoder model that encodes queries and passages separately using bidirectional backbones."""
 
     def __init__(
         self,
@@ -187,27 +173,14 @@ class BiencoderModel(nn.Module):
         trust_remote_code: bool = False,
         **hf_kwargs,
     ):
-        """
-        Build biencoder model from pretrained.
-
-        Args:
-            model_name_or_path: Path to pretrained model or model identifier
-            share_encoder: Whether to share encoder weights between query and passage
-            add_linear_pooler: Whether to add a linear pooler layer
-            out_dimension: Output dimension for linear pooler
-            do_gradient_checkpointing: Whether to enable gradient checkpointing
-            pooling: Pooling strategy ('avg', 'cls', 'last', etc.)
-            l2_normalize: Whether to L2 normalize embeddings
-            trust_remote_code: Whether to trust remote code
-            **hf_kwargs: Additional arguments passed to model loading
-        """
+        """Build biencoder model from a pretrained backbone."""
 
         logger.info(f"Building BiencoderModel from {model_name_or_path}")
 
         config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
         model_type = getattr(config, "model_type", "")
 
-        arch_name = SUPPORTED_BACKBONES.get(model_type)
+        arch_name = SUPPORTED_BACKBONES.get(model_type.lower())
         if arch_name is None:
             supported = ", ".join(SUPPORTED_BACKBONES.keys())
             raise ValueError(
@@ -246,7 +219,6 @@ class BiencoderModel(nn.Module):
                     _psg_model_path, trust_remote_code=trust_remote_code, **hf_kwargs
                 )
         else:
-            # Load from hub
             lm_q = BidirectionalModelClass.from_pretrained(model_name_or_path, **hf_kwargs)
 
             if share_encoder:
@@ -284,31 +256,11 @@ class BiencoderModel(nn.Module):
     def save_pretrained(self, save_directory: str, **kwargs):
         """Save model to output directory.
 
-        When a ``checkpointer`` is supplied (the normal training path), saving
-        is delegated to :py:meth:`Checkpointer.save_model` so that:
-
-        * The ``state_dict_adapter`` (to_hf / from_hf) conversions are applied,
-          keeping the on-disk key format consistent with ``load_model``.
-        * Distributed / FSDP state dicts are handled correctly.
-        * Async and consolidated-safetensors paths are honoured.
-
-        Without a checkpointer the method falls back to HuggingFace-native
-        ``save_pretrained`` on the underlying encoder(s), which is useful for
-        standalone / non-distributed export.
-
-        Args:
-            save_directory: Output path for the checkpoint.
-            **kwargs: Forwarded from the recipe; expected keys include
-                ``checkpointer``, ``tokenizer``, and ``peft_config``.
+        If ``checkpointer`` is in kwargs, delegates to Checkpointer.save_model
+        for distributed/FSDP-safe saving. Otherwise falls back to HF-native save.
         """
         checkpointer = kwargs.get("checkpointer", None)
         if checkpointer is not None:
-            # Delegate to Checkpointer.save_model() which handles:
-            # - ModelState.state_dict()
-            # - _maybe_adapt_state_dict_to_hf() via state_dict_adapter
-            # - Distributed/sharded saving via DCP
-            # - Consolidated HF safetensors output
-            # - Async checkpointing if enabled
             checkpointer.save_model(
                 model=self,
                 weights_path=save_directory,
@@ -322,7 +274,6 @@ class BiencoderModel(nn.Module):
                 torch.save(self.linear_pooler.state_dict(), pooler_path)
             return
 
-        # Fallback: HF-native save (no checkpointer available)
         logger.info(f"Saving BiencoderModel to {save_directory}")
 
         if self.share_encoder:

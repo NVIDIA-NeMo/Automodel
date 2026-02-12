@@ -352,6 +352,49 @@ def test_sequence_classification_regression_multi_output(monkeypatch):
     assert out.loss is not None
 
 
+def test_biencoder_build_llama_bidirec_model_type_generic_path(tmp_path, monkeypatch):
+    """Regression test: model_type 'llama_bidirec' at a generic path without 'llama' in it.
+
+    When the customizer API downloads the model, the path is something like
+    /var/run/scratch/job/model which does not contain 'llama'. The build()
+    method must still recognise the model via config.json's model_type field.
+    """
+
+    class FakeBidirectionalModel(FakeLM):
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls(hidden=16)
+
+    # Patch the registry to return our fake model
+    ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
+    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+
+    # Create a model directory whose path has no 'llama' substring
+    model_dir = tmp_path / "scratch" / "job" / "model"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text(json.dumps({"model_type": "llama_bidirec"}))
+
+    # Mock AutoConfig.from_pretrained to return a config with the llama_bidirec model_type
+    import nemo_automodel._transformers.biencoder as biencoder_module
+
+    class FakeConfig:
+        model_type = "llama_bidirec"
+
+    def fake_auto_config_from_pretrained(*args, **kwargs):
+        return FakeConfig()
+
+    monkeypatch.setattr(biencoder_module.AutoConfig, "from_pretrained", fake_auto_config_from_pretrained)
+
+    model = BiencoderModel.build(
+        model_name_or_path=str(model_dir),
+        share_encoder=True,
+        pooling="avg",
+        l2_normalize=True,
+        t=0.5,
+    )
+    assert isinstance(model, BiencoderModel)
+
+
 def test_biencoder_build_hub_and_errors(tmp_path, monkeypatch):
     # Patch ModelClass.from_pretrained to return FakeLM for hub path
     class FakeBidirectionalModel(FakeLM):

@@ -343,6 +343,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         pipeline_config: Optional[PipelineConfig] = None,
         qat_config: Optional[QATConfig] = None,
         moe_config: Optional[MoEParallelizerConfig] = None,
+        activation_checkpointing: bool = False,
         peft_config: Optional[dict] = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
@@ -396,6 +397,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 configuration. Default: None.
             moe_config (MoEParallelizerConfig | None, optional): MoE parallelizer
                 configuration. Default: None.
+            activation_checkpointing (bool, default=False): Enable activation checkpointing
+                for transformer blocks to reduce memory usage. Default: False.
             peft_config (dict | None, optional): PEFT/LoRA configuration dictionary.
                 If provided, LoRA adapters will be applied to the model. Default: None.
             fp8_config (FP8Config | None, optional): FP8 quantization configuration.
@@ -420,6 +423,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             pipeline_config=pipeline_config,
             qat_config=qat_config,
             moe_config=moe_config,
+            activation_checkpointing=activation_checkpointing,
             device=torch.device("cuda", torch.cuda.current_device()),
             mesh=mesh,
         )
@@ -479,6 +483,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         pipeline_config: Optional[PipelineConfig] = None,
         qat_config: Optional[QATConfig] = None,
         moe_config: Optional[MoEParallelizerConfig] = None,
+        activation_checkpointing: bool = False,
         peft_config: Optional[dict] = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
@@ -512,6 +517,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 pipeline_config=pipeline_config,
                 qat_config=qat_config,
                 moe_config=moe_config,
+                activation_checkpointing=activation_checkpointing,
                 device=torch.device("cuda", torch.cuda.current_device()),
                 mesh=mesh,
             )

@@ -73,6 +73,8 @@ class AutoPipeline:
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
         scale_grads_in_schedule: bool = False,
+        # Shape inference optimization
+        pp_seq_len: Optional[int] = None,
     ):
         # Validation
         if pp_schedule_csv is None and pp_schedule is None:
@@ -104,6 +106,7 @@ class AutoPipeline:
         self._device: torch.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
         self.scale_grads_in_schedule = scale_grads_in_schedule
+        self.pp_seq_len = pp_seq_len
 
         self.pp_mesh: DeviceMesh = self.world_mesh[pp_axis_name]
 
@@ -154,6 +157,7 @@ class AutoPipeline:
             scale_grads=self.scale_grads_in_schedule,
             round_to_pp_multiple=self.round_virtual_stages_to_pp_multiple,
             patch_stage_backward_maybe_with_nosync=self.patch_stage_backward_maybe_with_nosync,
+            seq_len=self.pp_seq_len,
         )
 
         # Update PipelineInfo state

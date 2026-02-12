@@ -18,36 +18,38 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from typing import Dict, Tuple
 
 import torch
 import torch.nn.functional as F
 import wandb
-from huggingface_hub import constants as hf_constants
 from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-from wandb import Settings
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.distributed.device_mesh import create_device_mesh
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.recipes.llm.train_ft import build_distributed, build_step_scheduler
+from nemo_automodel.recipes.llm.train_ft import (
+    build_checkpoint_config,
+    build_distributed,
+    build_lr_scheduler,
+    build_step_scheduler,
+    build_wandb,
+)
 
 logger = logging.getLogger(__name__)
 
 
 def contrastive_scores_and_labels(
     query: torch.Tensor, key: torch.Tensor, current_train_n_passages: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute contrastive scores and labels without in-batch negatives.
 
     Args:
@@ -69,7 +71,7 @@ def contrastive_scores_and_labels(
     return qk, labels
 
 
-def _unpack_qp(inputs: Dict[str, torch.Tensor]) -> tuple:
+def _unpack_qp(inputs: dict[str, torch.Tensor]) -> tuple:
     """Unpack query and passage inputs from batch dictionary.
 
     Args:
@@ -94,150 +96,16 @@ def _unpack_qp(inputs: Dict[str, torch.Tensor]) -> tuple:
     return query_batch_dict, doc_batch_dict
 
 
-def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
-    """Build a checkpoint configuration.
-
-    Args:
-        cfg_ckpt: Configuration for checkpointing.
-        cache_dir: Cache directory for the model.
-        model_repo_id: Model repository ID.
-        is_peft: Whether the model is PEFT.
-
-    Returns:
-        The instantiated checkpoint configuration.
-    """
-
-    ckpt_kwargs = dict(
-        enabled=False,
-        checkpoint_dir="checkpoints/",
-        model_save_format="safetensors",
-        model_repo_id=model_repo_id,
-        model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HUB_CACHE,
-        save_consolidated=False,
-        is_peft=is_peft,
-    )
-    if cfg_ckpt is not None:
-        cfg_ckpt = cfg_ckpt.to_dict()
-        cfg_ckpt.pop("restore_from", None)
-        cfg_ckpt.pop("load_base_model", None)
-        ckpt_kwargs |= cfg_ckpt
-    if ckpt_kwargs.get("is_peft", False) and ckpt_kwargs.get("model_save_format") == "torch_save":
-        raise ValueError(
-            "PEFT checkpointing is not supported for torch_save format. Save using `safetensors` format instead."
-        )
-    checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
-    return checkpoint_config
-
-
-def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamScheduler] | None:  # noqa: F821
-    """Build the learning rate scheduler.
-
-    Args:
-        cfg: Configuration for the OptimizerParamScheduler.
-        optimizer: The optimizer to be scheduled.
-        step_scheduler: The step scheduler to extract training parameters.
-
-    Returns:
-        OptimizerParamScheduler: The configured learning rate scheduler, or None if not configured.
-    """
-    if cfg is None:
-        return None
-
-    # Calculate total steps for the training run
-    total_epochs = step_scheduler.num_epochs
-    epoch_len = len(step_scheduler.dataloader)
-    grad_acc_steps = step_scheduler.grad_acc_steps
-
-    # Total optimizer steps (accounting for gradient accumulation)
-    total_steps = (total_epochs * epoch_len) // grad_acc_steps
-    if step_scheduler.max_steps is not None:
-        total_steps = min(total_steps, step_scheduler.max_steps)
-
-    # Set defaults for scheduler parameters
-    optimizer_param_schedulers = []
-    user_kwargs = cfg.to_dict()
-    default_kwargs = dict(
-        lr_warmup_steps=min(1000, total_steps // 10),  # 10% warmup or max 1000 steps
-        lr_decay_steps=total_steps,
-        lr_decay_style="linear",
-        wd_incr_steps=total_steps,
-        wd_incr_style="constant",
-    )
-
-    if not isinstance(optimizer, list):
-        optimizer = [optimizer]
-
-    for opt in optimizer:
-        base_lr = opt.param_groups[0]["lr"]
-        default_kwargs.update(
-            dict(
-                optimizer=opt,
-                init_lr=0.0,
-                max_lr=base_lr,
-                min_lr=0.0,
-                start_wd=opt.param_groups[0].get("weight_decay", 0.0),
-                end_wd=opt.param_groups[0].get("weight_decay", 0.0),
-            )
-        )
-        default_kwargs.update(user_kwargs)
-        optimizer_param_schedulers.append(OptimizerParamScheduler(**default_kwargs))
-
-    logger.info(
-        f"Building LR scheduler with total_steps={total_steps}, "
-        f"warmup_steps={default_kwargs['lr_warmup_steps']}, "
-        f"decay_style={default_kwargs['lr_decay_style']}"
-    )
-
-    return optimizer_param_schedulers
-
-
-def build_wandb(cfg) -> wandb.Run:
-    """Instantiates wandb and returns the instance. If no name is given, it will use the model name.
-
-    Args:
-        cfg: Configuration for wandb.
-
-    Returns:
-        The wandb instance.
-    """
-    assert cfg.get("wandb", None) is not None
-    kwargs = cfg.wandb.to_dict()
-    if kwargs.get("name", "") == "":
-        model_name_or_path = cfg.model.get("pretrained_model_name_or_path", "biencoder_model")
-        kwargs["name"] = "_".join(model_name_or_path.split("/")[-2:])
-    run = wandb.init(
-        **kwargs,
-        config=cfg.to_dict(),
-        settings=Settings(silent=True),
-    )
-    return run
-
-
 def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_world_size=1):
-    """Build a DataLoader for biencoder training.
-
-    Args:
-        cfg_dl: DataLoader configuration.
-        tokenizer: The tokenizer to use for collate_fn.
-        seed: Random seed.
-        batch_size: Batch size for the dataloader. Optional.
-        dp_rank: Data parallel rank.
-        dp_world_size: Data parallel world size.
-
-    Returns:
-        The instantiated DataLoader.
-    """
+    """Build a DataLoader for biencoder training."""
     with ScopedRNG(seed=seed, ranked=True):
-        # Build dataset
         with FirstRankPerNode():
             dataset = cfg_dl.dataset.instantiate()
 
-        # Build collate_fn if it's a ConfigNode with _target_
         collate_fn = None
         if hasattr(cfg_dl, "collate_fn") and hasattr(cfg_dl.collate_fn, "_target_"):
             collate_fn = cfg_dl.collate_fn.instantiate(tokenizer=tokenizer)
 
-        # Build dataloader with instantiated components
         if not isinstance(dataset, IterableDataset):
             shuffle = cfg_dl.get("shuffle", True)
             if "shuffle" in cfg_dl:
@@ -267,22 +135,11 @@ def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_wor
 
 
 class TrainBiencoderRecipe(BaseRecipe):
-    """Recipe for training biencoder models.
-
-    This class orchestrates biencoder training, from setup to main training loop.
-    It handles the unique aspects of biencoder training including dual encoders
-    and contrastive learning.
-    """
+    """Recipe for training biencoder models with contrastive learning."""
 
     def __init__(self, cfg):
-        """Initialize the recipe with configuration.
-
-        Args:
-            cfg: Configuration dictionary/object for training.
-        """
         self.cfg = cfg
 
-        # Recipe-level training configuration
         self.train_n_passages = self.cfg.get("train_n_passages", 1)
         self.eval_negative_size = self.cfg.get("eval_negative_size", 0)
         self.temperature = self.cfg.get("temperature", 1.0)
@@ -296,21 +153,15 @@ class TrainBiencoderRecipe(BaseRecipe):
         apply_cache_compatibility_patches()
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
-        self.device_mesh = None
-        self.moe_mesh = None
-        self.distributed_config = None
-        if "distributed_config" in self.cfg:
-            self.distributed_config = self.cfg.distributed_config.instantiate()
-            self.device_mesh, self.moe_mesh = create_device_mesh(
-                self.distributed_config,
-                dp_size=self.cfg.get("distributed.dp_size", None),
-                dp_replicate_size=self.cfg.get("distributed.dp_replicate_size", None),
-                tp_size=self.cfg.get("distributed.tp_size", 1),
-                pp_size=self.cfg.get("distributed.pp_size", 1),
-                cp_size=self.cfg.get("distributed.cp_size", 1),
-                ep_size=self.cfg.get("distributed.ep_size", 1),
-                world_size=self.dist_env.world_size,
-            )
+        self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+        self.distributed_config = self.dist_setup.strategy_config
+        self.device_mesh = self.dist_setup.device_mesh
+        self.moe_mesh = self.dist_setup.moe_mesh
+        self.pp_enabled = self.dist_setup.pp_enabled
+        self.pipeline_config = self.dist_setup.pipeline_config
+
+        if self.pp_enabled:
+            raise NotImplementedError("Biencoder does not support pipeline parallelism")
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -320,11 +171,9 @@ class TrainBiencoderRecipe(BaseRecipe):
         self._log_experiment_details()
         self._log_library_versions()
 
-        self.pp_enabled: bool = self.cfg.get("distributed.pp_size", 1) > 1
-        if self.pp_enabled:
-            raise NotImplementedError(
-                "Pipeline parallelism is not yet supported for biencoder models. Please set distributed.pp_size to 1."
-            )
+        self.peft_config = None
+        if self.cfg.get("peft", None) is not None:
+            self.peft_config = self.cfg.peft.instantiate()
 
         checkpoint_config = build_checkpoint_config(
             self.cfg.get("checkpoint", None),
@@ -347,11 +196,6 @@ class TrainBiencoderRecipe(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
-        self.peft_config = None
-        if self.cfg.get("peft", None) is not None:
-            self.peft_config = self.cfg.peft.instantiate()
-
-        logger.info("Building biencoder model...")
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
             model = self.cfg.model.instantiate(
                 device_mesh=self.device_mesh,
@@ -363,7 +207,6 @@ class TrainBiencoderRecipe(BaseRecipe):
         self.model_parts = [model]
         self.pp = None
 
-        logger.info("Building optimizer...")
         # Apply weight decay only to non-bias/non-norm params
         decay_params = []
         no_decay_params = []
@@ -376,8 +219,7 @@ class TrainBiencoderRecipe(BaseRecipe):
             else:
                 decay_params.append(param)
 
-        trainable_params = decay_params + no_decay_params
-        assert len(trainable_params) > 0, "trainable_params cannot be empty"
+        assert decay_params or no_decay_params, "no trainable parameters found"
 
         param_groups = []
         if decay_params:
@@ -393,7 +235,6 @@ class TrainBiencoderRecipe(BaseRecipe):
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.padding_side = "left"
 
-        logger.info("Building dataloader...")
         self.dataloader = build_dataloader(
             self.cfg.dataloader,
             self.tokenizer,
@@ -405,7 +246,6 @@ class TrainBiencoderRecipe(BaseRecipe):
 
         self.val_dataloader = None
         if "validation_dataloader" in self.cfg:
-            logger.info("Building validation dataloader...")
             val_batch_size = self.cfg.get(
                 "validation_dataloader.batch_size", self.cfg.get("step_scheduler.local_batch_size", 1)
             )
@@ -473,15 +313,7 @@ class TrainBiencoderRecipe(BaseRecipe):
         self.checkpointer.close()
 
     def _forward_backward_step(self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True):
-        """Forward and backward pass for a single batch.
-
-        Args:
-            idx: Index of the batch in gradient accumulation steps
-            batch: Input batch containing query and document tensors
-            loss_buffer: List to accumulate losses
-            num_batches: Total number of batches in gradient accumulation
-            is_train: Whether this is a training step
-        """
+        """Forward and backward pass for a single micro-batch."""
         batch = {
             k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
             for k, v in batch.items()
@@ -519,18 +351,8 @@ class TrainBiencoderRecipe(BaseRecipe):
                 scaled_loss.backward()
 
     def _run_train_optim_step(self, batches, max_grad_norm=None):
-        """Run one optimization step with gradient accumulation.
-
-        Args:
-            batches: List of batches for gradient accumulation
-            max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
-
-        Returns:
-            MetricsSample with training metrics
-        """
+        """Run one optimization step with gradient accumulation."""
         loss_buffer = []
-
-        # Gradient accumulation
         for idx, batch in enumerate(batches):
             self._forward_backward_step(idx, batch, loss_buffer=loss_buffer, num_batches=len(batches), is_train=True)
 
@@ -584,14 +406,7 @@ class TrainBiencoderRecipe(BaseRecipe):
         )
 
     def _run_validation_epoch(self, val_dataloader):
-        """Run validation for one epoch.
-
-        Args:
-            val_dataloader: Validation data loader
-
-        Returns:
-            MetricsSample with validation metrics
-        """
+        """Run validation for one epoch and compute loss, accuracy@1, and MRR."""
         with ScopedRNG(seed=1, ranked=True):
             for mp in self.model_parts:
                 mp.eval()
@@ -651,11 +466,6 @@ class TrainBiencoderRecipe(BaseRecipe):
             )
 
     def log_train_metrics(self, log_data: MetricsSample):
-        """Log training metrics.
-
-        Args:
-            log_data: MetricsSample containing training metrics
-        """
         if not self.dist_env.is_main:
             return
 
@@ -680,11 +490,6 @@ class TrainBiencoderRecipe(BaseRecipe):
         torch.cuda.reset_peak_memory_stats()
 
     def log_val_metrics(self, log_data: MetricsSample):
-        """Log validation metrics.
-
-        Args:
-            log_data: MetricsSample containing validation metrics
-        """
         if not self.dist_env.is_main:
             return
 
@@ -707,13 +512,6 @@ class TrainBiencoderRecipe(BaseRecipe):
 
 
 def main(default_config_path="examples/biencoder/llama3_2_1b_biencoder.yaml"):
-    """Main entry point for the biencoder fine-tuning recipe.
-
-    Loads the configuration, sets up the recipe, and initiates the training loop.
-
-    Args:
-        default_config_path: Path to the default configuration file
-    """
     cfg = parse_args_and_load_config(default_config_path)
     recipe = TrainBiencoderRecipe(cfg)
     recipe.setup()
