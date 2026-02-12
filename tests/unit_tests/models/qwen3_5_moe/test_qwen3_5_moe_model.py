@@ -19,6 +19,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 import torch.nn as nn
+
+# Skip entire module when transformers has no Qwen3.5-MoE (e.g. older CI environments).
+pytest.importorskip("transformers.models.qwen3_5_moe")
+
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig,
