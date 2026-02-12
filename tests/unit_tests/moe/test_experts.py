@@ -1793,7 +1793,8 @@ class TestTorchGroupedMM:
         """Test that use_torch_mm is False without backend."""
         experts = GroupedExperts(torch_mm_config)
         assert experts.use_torch_mm is False
-        assert not hasattr(experts, "expert_activation_grouped")
+        # expert_activation_grouped is always initialized (used by both loop and grouped_mm paths)
+        assert hasattr(experts, "expert_activation_grouped")
 
     def test_forward_shape(self, torch_mm_config, torch_mm_backend, device):
         """Test grouped_mm forward produces correct output shape."""
@@ -1980,3 +1981,222 @@ class TestTorchMMExpertsFwd:
 
         assert output.shape == (total_tokens, dim)
         assert not torch.isnan(output).any()
+
+
+class TestGroupedExpertsConvergenceFixes:
+    """Test fixes for GroupedExperts convergence with expert parallelism.
+
+    These tests verify:
+    1. expert_activation_grouped is always initialized (needed for restructured loop path)
+    2. Loop path uses WeightedSwiGLUFunction (matching DeepEP compute pattern)
+    3. Float32 scatter_add accumulation with correct output dtype
+    4. Backward gradient flow through both loop and grouped_mm paths
+    """
+
+    @pytest.fixture
+    def config(self):
+        return MoEConfig(
+            n_routed_experts=4,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=False,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=64,
+            inter_dim=128,
+            moe_inter_dim=128,
+            norm_topk_prob=False,
+            router_bias=False,
+            expert_bias=False,
+            expert_activation="swiglu",
+            activation_alpha=1.702,
+            activation_limit=7.0,
+            dtype=torch.bfloat16,
+        )
+
+    @pytest.fixture
+    def torch_mm_backend(self):
+        return BackendConfig(experts="torch_mm", dispatcher="torch")
+
+    @staticmethod
+    def _unwrap_compiled(fn):
+        from functools import partial
+
+        if isinstance(fn, partial):
+            inner = TestGroupedExpertsConvergenceFixes._unwrap_compiled(fn.func)
+            if inner is not fn.func:
+                return partial(inner, *fn.args, **fn.keywords)
+            return fn
+        if hasattr(fn, '_torchdynamo_orig_callable'):
+            return fn._torchdynamo_orig_callable
+        return fn
+
+    def _init_experts(self, config, backend=None, device=None):
+        experts = GroupedExperts(config, backend=backend)
+        if device:
+            experts = experts.to(device)
+        with torch.no_grad():
+            experts.gate_and_up_projs.normal_(0, 0.02)
+            experts.down_projs.normal_(0, 0.02)
+            if experts.expert_bias:
+                experts.gate_up_proj_bias.zero_()
+                experts.down_proj_bias.zero_()
+        experts.expert_activation = self._unwrap_compiled(experts.expert_activation)
+        experts.expert_activation_grouped = self._unwrap_compiled(experts.expert_activation_grouped)
+        return experts
+
+    # --- Test 1: expert_activation_grouped always initialized ---
+
+    def test_expert_activation_grouped_always_present(self, config):
+        """expert_activation_grouped must be available for both loop and grouped_mm paths."""
+        experts_no_backend = GroupedExperts(config)
+        assert hasattr(experts_no_backend, "expert_activation_grouped")
+        assert callable(experts_no_backend.expert_activation_grouped)
+
+        experts_with_backend = GroupedExperts(config, backend=BackendConfig(experts="torch_mm", dispatcher="torch"))
+        assert hasattr(experts_with_backend, "expert_activation_grouped")
+        assert callable(experts_with_backend.expert_activation_grouped)
+
+    # --- Test 2: Output dtype matches input dtype (float32 accumulation cast back) ---
+
+    def test_output_dtype_matches_input_bf16(self, config, device):
+        """Output should be bf16 when input is bf16 (float32 accumulation cast back)."""
+        experts = self._init_experts(config, device=device)
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, config.n_activated_experts, dtype=torch.bfloat16, device=device)
+        indices = torch.randint(0, config.n_routed_experts, (num_tokens, config.n_activated_experts), device=device)
+
+        output = experts(x, token_mask, weights, indices)
+        assert output.dtype == torch.bfloat16
+
+    def test_output_dtype_matches_input_fp32(self, config, device):
+        """Output should be float32 when input is float32."""
+        config.dtype = torch.float32
+        experts = self._init_experts(config, device=device)
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, config.dim, dtype=torch.float32, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, config.n_activated_experts, dtype=torch.float32, device=device)
+        indices = torch.randint(0, config.n_routed_experts, (num_tokens, config.n_activated_experts), device=device)
+
+        output = experts(x, token_mask, weights, indices)
+        assert output.dtype == torch.float32
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for torch._grouped_mm")
+    def test_output_dtype_grouped_mm_bf16(self, config, torch_mm_backend, device):
+        """grouped_mm path output should be bf16 when input is bf16."""
+        experts = self._init_experts(config, backend=torch_mm_backend, device=device)
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, config.n_activated_experts, dtype=torch.bfloat16, device=device)
+        indices = torch.randint(0, config.n_routed_experts, (num_tokens, config.n_activated_experts), device=device)
+
+        output = experts(x, token_mask, weights, indices)
+        assert output.dtype == torch.bfloat16
+
+    # --- Test 3: Loop path matches grouped_mm (restructured to use WeightedSwiGLUFunction) ---
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for torch._grouped_mm")
+    def test_loop_path_matches_grouped_mm_path(self, config, torch_mm_backend, device):
+        """Loop path (restructured) should produce similar output to grouped_mm path."""
+        config.dtype = torch.float32
+
+        experts_mm = self._init_experts(config, backend=torch_mm_backend, device=device)
+        experts_loop = self._init_experts(config, device=device)
+        with torch.no_grad():
+            experts_loop.gate_and_up_projs.copy_(experts_mm.gate_and_up_projs)
+            experts_loop.down_projs.copy_(experts_mm.down_projs)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, config.dim, dtype=torch.float32, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, config.n_activated_experts, dtype=torch.float32, device=device)
+        indices = torch.randint(0, config.n_routed_experts, (num_tokens, config.n_activated_experts), device=device)
+
+        out_mm = experts_mm(x, token_mask, weights, indices)
+        out_loop = experts_loop(x, token_mask, weights, indices)
+
+        torch.testing.assert_close(out_mm, out_loop, rtol=1e-3, atol=1e-3)
+
+    # --- Test 4: Backward produces correct gradients ---
+
+    def test_loop_path_backward_all_params_have_grad(self, config, device):
+        """Loop path backward should produce gradients for input and all expert params."""
+        config.dtype = torch.float32
+        experts = self._init_experts(config, device=device)
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, config.dim, dtype=torch.float32, device=device, requires_grad=True)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, config.n_activated_experts, dtype=torch.float32, device=device)
+        indices = torch.randint(0, config.n_routed_experts, (num_tokens, config.n_activated_experts), device=device)
+
+        output = experts(x, token_mask, weights, indices)
+        output.sum().backward()
+
+        assert x.grad is not None, "Input x should have gradients"
+        assert not torch.isnan(x.grad).any(), "Input gradients should not be NaN"
+        assert experts.gate_and_up_projs.grad is not None, "gate_and_up_projs should have gradients"
+        assert experts.down_projs.grad is not None, "down_projs should have gradients"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for torch._grouped_mm")
+    def test_loop_and_grouped_mm_backward_gradients_match(self, config, torch_mm_backend, device):
+        """Loop and grouped_mm paths should produce similar gradients."""
+        config.dtype = torch.float32
+
+        experts_mm = self._init_experts(config, backend=torch_mm_backend, device=device)
+        experts_loop = self._init_experts(config, device=device)
+        with torch.no_grad():
+            experts_loop.gate_and_up_projs.copy_(experts_mm.gate_and_up_projs)
+            experts_loop.down_projs.copy_(experts_mm.down_projs)
+
+        num_tokens = 16
+        x_mm = torch.randn(num_tokens, config.dim, dtype=torch.float32, device=device, requires_grad=True)
+        x_loop = x_mm.detach().clone().requires_grad_(True)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, config.n_activated_experts, dtype=torch.float32, device=device)
+        indices = torch.randint(0, config.n_routed_experts, (num_tokens, config.n_activated_experts), device=device)
+
+        experts_mm(x_mm, token_mask, weights, indices).sum().backward()
+        experts_loop(x_loop, token_mask, weights, indices).sum().backward()
+
+        torch.testing.assert_close(x_mm.grad, x_loop.grad, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(
+            experts_mm.gate_and_up_projs.grad, experts_loop.gate_and_up_projs.grad, rtol=1e-3, atol=1e-3
+        )
+        torch.testing.assert_close(
+            experts_mm.down_projs.grad, experts_loop.down_projs.grad, rtol=1e-3, atol=1e-3
+        )
+
+    # --- Test 5: Loop path with bias ---
+
+    def test_loop_path_with_bias_forward_and_backward(self, config, device):
+        """Loop path should work correctly with expert bias."""
+        config.dtype = torch.float32
+        config.expert_bias = True
+        experts = self._init_experts(config, device=device)
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, config.dim, dtype=torch.float32, device=device, requires_grad=True)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, config.n_activated_experts, dtype=torch.float32, device=device)
+        indices = torch.randint(0, config.n_routed_experts, (num_tokens, config.n_activated_experts), device=device)
+
+        output = experts(x, token_mask, weights, indices)
+        assert output.shape == x.shape
+        assert not torch.isnan(output).any()
+
+        output.sum().backward()
+        assert x.grad is not None
+        assert experts.gate_up_proj_bias.grad is not None, "gate_up_proj_bias should have gradients"
+        assert experts.down_projs.grad is not None
