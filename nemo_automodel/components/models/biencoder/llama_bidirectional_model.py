@@ -564,8 +564,9 @@ class BiencoderModel(nn.Module):
             # If no config, infer from model name
             model_type = ""
 
-        # Select model class based on model type
-        if model_type == "llama" or "llama" in model_name_or_path.lower():
+        # Select model class based on model type from config.json, falling
+        # back to the model name/path only when no config was found.
+        if "llama" in model_type.lower() or (not model_type and "llama" in model_name_or_path.lower()):
             ModelClass = LlamaBidirectionalModel
             logger.info("Using LlamaBidirectionalModel")
         else:
