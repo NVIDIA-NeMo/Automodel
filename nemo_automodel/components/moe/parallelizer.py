@@ -317,7 +317,7 @@ def parallelize_model(
     if activation_checkpointing:
         apply_ac(model, ignore_router=ignore_router_for_ac)
 
-    if ep_shard_axis_names is not None:
+    if ep_shard_axis_names is not None and moe_mesh is not None:
         ep_shard_mesh = moe_mesh[ep_shard_axis_names]
     else:
         ep_shard_mesh = None
