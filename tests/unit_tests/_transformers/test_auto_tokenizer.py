@@ -25,6 +25,8 @@ class _StubHFTokenizer:
     def __init__(self, bos_id=101, eos_id=102):
         self.bos_token_id = bos_id
         self.eos_token_id = eos_id
+        self.add_bos_token = True
+        self.add_eos_token = True
 
     def __call__(self, *args, **kwargs):
         return BatchEncoding(
@@ -39,10 +41,15 @@ class _StubHFTokenizer:
         return [5, 6]
 
 
+class _StubConfig:
+    model_type = "stub"
+
+
 class TestNeMoAutoTokenizerFromPretrained:
     def test_patched_adds_bos_eos(self):
         stub = _StubHFTokenizer()
-        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub):
+        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub), \
+             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()):
             tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
             out = tok(["x"])
             assert isinstance(out, BatchEncoding)
@@ -61,6 +68,31 @@ class TestNeMoAutoTokenizerFromPretrained:
 
             enc = tok.encode("x", add_special_tokens=False)
             assert enc == [5, 6]
+
+    def test_cls_sep_pattern_fixed_when_tokens_missing(self):
+        """Transformers >=5.0 defaults special_tokens_pattern to 'cls_sep'.
+        When cls/sep token IDs are None (e.g. Moonlight TikTokenTokenizer),
+        the wrapper should reset it to 'none' to avoid None in input_ids."""
+        stub = _StubHFTokenizer()
+        # Simulate a tokenizer that got the default "cls_sep" pattern but has no CLS/SEP
+        stub.special_tokens_pattern = "cls_sep"
+        stub.cls_token_id = None
+        stub.sep_token_id = None
+        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub), \
+             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()):
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            assert tok.special_tokens_pattern == "none"
+
+    def test_cls_sep_pattern_preserved_when_tokens_present(self):
+        """When cls/sep token IDs are properly defined, the pattern should stay."""
+        stub = _StubHFTokenizer()
+        stub.special_tokens_pattern = "cls_sep"
+        stub.cls_token_id = 200
+        stub.sep_token_id = 201
+        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub), \
+             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()):
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            assert tok.special_tokens_pattern == "cls_sep"
 
     def test_force_hf_passthrough(self):
         stub = _StubHFTokenizer()
@@ -125,5 +157,3 @@ class TestAddTokenHelper:
         enc = BatchEncoding({"input_ids": "not-a-list"})
         with pytest.raises(ValueError):
             _add_token(enc, 101, 0, "input_ids")
-
-

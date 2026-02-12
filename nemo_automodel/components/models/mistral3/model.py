@@ -144,7 +144,7 @@ class Ministral3Config(PretrainedConfig):
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
-            ignore_keys_at_rope_validation=["llama_4_scaling_beta"],
+            ignore_keys_at_rope_validation={"llama_4_scaling_beta"},
             **kwargs,
         )
 
@@ -195,7 +195,10 @@ class Ministral3RotaryEmbedding(nn.Module):
 
         self.config = config
 
-        self.rope_type = self.config.rope_parameters["type"]
+        # Support both transformers v4 ("type") and v5 ("rope_type") key names
+        self.rope_type = self.config.rope_parameters.get("rope_type") or self.config.rope_parameters.get(
+            "type", "default"
+        )
         rope_init_fn = self.compute_default_rope_parameters
         if self.rope_type != "default":
             rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
@@ -315,11 +318,13 @@ class Ministral3Attention(nn.Module):
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        query_states = query_states * _get_llama_4_attn_scale(
-            cache_position,
-            self.config.rope_parameters.get("llama_4_scaling_beta"),
-            self.config.rope_parameters.get("original_max_position_embeddings"),
-        ).to(query_states.dtype)
+        llama_4_beta = self.config.rope_parameters.get("llama_4_scaling_beta")
+        if llama_4_beta is not None:
+            query_states = query_states * _get_llama_4_attn_scale(
+                cache_position,
+                llama_4_beta,
+                self.config.rope_parameters.get("original_max_position_embeddings"),
+            ).to(query_states.dtype)
 
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -537,8 +542,13 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
         )
 
         hidden_states = outputs.last_hidden_state
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        # DTensor compatibility: when logits_to_keep=0, slice(0, None) would select all
+        # elements but DTensor cannot handle the resulting aten.alias op. Skip slicing.
+        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            logits = self.lm_head(hidden_states)
+        else:
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
         if labels is not None:

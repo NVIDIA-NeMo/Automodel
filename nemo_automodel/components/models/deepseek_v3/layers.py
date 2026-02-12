@@ -67,7 +67,9 @@ class MLA(nn.Module):
             self.q_a_proj = initialize_linear_module(
                 linear_impl=linear_impl, in_features=hidden_size, out_features=self.q_lora_rank, bias=False
             )
-            self.q_a_layernorm = initialize_rms_norm_module(rms_norm_impl=rms_norm_impl, dim=self.q_lora_rank)
+            self.q_a_layernorm = initialize_rms_norm_module(
+                rms_norm_impl=rms_norm_impl, dim=self.q_lora_rank, eps=config.rms_norm_eps
+            )
             self.q_b_proj = initialize_linear_module(
                 linear_impl=linear_impl,
                 in_features=self.q_lora_rank,
@@ -81,7 +83,9 @@ class MLA(nn.Module):
             out_features=self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
         )
-        self.kv_a_layernorm = initialize_rms_norm_module(rms_norm_impl=rms_norm_impl, dim=self.kv_lora_rank)
+        self.kv_a_layernorm = initialize_rms_norm_module(
+            rms_norm_impl=rms_norm_impl, dim=self.kv_lora_rank, eps=config.rms_norm_eps
+        )
         self.kv_b_proj = initialize_linear_module(
             linear_impl=linear_impl,
             in_features=self.kv_lora_rank,
@@ -96,12 +100,13 @@ class MLA(nn.Module):
         )
         self.softmax_scale = self.qk_head_dim**-0.5
 
-        rope_scaling = config.rope_scaling
-
-        if rope_scaling:
-            factor = rope_scaling["factor"]
-            mscale = rope_scaling["mscale"]
-            original_seq_len = rope_scaling["original_max_position_embeddings"]
+        rope_parameters = config.rope_parameters if hasattr(config, "rope_parameters") else config.rope_scaling
+        if rope_parameters and all(
+            map(lambda x: x in rope_parameters, ["factor", "mscale", "original_max_position_embeddings"])
+        ):
+            factor = rope_parameters["factor"]
+            mscale = rope_parameters["mscale"]
+            original_seq_len = rope_parameters["original_max_position_embeddings"]
             if config.max_position_embeddings > original_seq_len:
                 mscale = yarn_get_mscale(factor, mscale)
             self.softmax_scale = self.softmax_scale * mscale * mscale

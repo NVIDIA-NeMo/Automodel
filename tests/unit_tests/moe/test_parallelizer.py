@@ -274,6 +274,20 @@ def _install_torch_and_layers_stubs(monkeypatch):
         sys.modules, "nemo_automodel.components.moe.layers", layers_stub
     )
 
+    # Stub experts module to avoid importing torch.nn.functional
+    experts_stub = types.ModuleType(
+        "nemo_automodel.components.moe.experts"
+    )
+
+    class GroupedExpertsTE:
+        pass
+
+    experts_stub.GroupedExpertsDeepEP = GroupedExpertsDeepEP
+    experts_stub.GroupedExpertsTE = GroupedExpertsTE
+    monkeypatch.setitem(
+        sys.modules, "nemo_automodel.components.moe.experts", experts_stub
+    )
+
 
 def _import_parallelizer_with_stubs(monkeypatch):
     import importlib
@@ -282,11 +296,36 @@ def _import_parallelizer_with_stubs(monkeypatch):
     for mod in [
         "nemo_automodel.components.moe.parallelizer",
         "nemo_automodel.components.moe.layers",
+        "nemo_automodel.components.moe.experts",
+        "nemo_automodel.components.distributed.pipelining",
+        "nemo_automodel.components.distributed.pipelining.hf_utils",
     ]:
         if mod in sys.modules:
             sys.modules.pop(mod)
 
     _install_torch_and_layers_stubs(monkeypatch)
+
+    # Stub the pipelining module and hf_utils
+    pipelining_stub = types.ModuleType("nemo_automodel.components.distributed.pipelining")
+    hf_utils_stub = types.ModuleType("nemo_automodel.components.distributed.pipelining.hf_utils")
+
+    def get_text_module(model):
+        """Return model.model if exists, otherwise model."""
+        if hasattr(model, "model") and model.model is not None:
+            return model.model
+        return model
+
+    hf_utils_stub.get_text_module = get_text_module
+    pipelining_stub.hf_utils = hf_utils_stub
+
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.pipelining", pipelining_stub)
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.pipelining.hf_utils", hf_utils_stub)
+
+    # Stub dtype_from_str utility
+    shared_utils_stub = types.ModuleType("nemo_automodel.shared.utils")
+    shared_utils_stub.dtype_from_str = lambda val, default=None: default
+    monkeypatch.setitem(sys.modules, "nemo_automodel.shared.utils", shared_utils_stub)
+
     return importlib.import_module(
         "nemo_automodel.components.moe.parallelizer"
     )
@@ -1384,3 +1423,249 @@ def test_parallelize_model_ignore_router_for_ac_defaults_to_false(monkeypatch):
     apply_ac_mock.assert_called_once()
     args, kwargs = apply_ac_mock.call_args
     assert kwargs.get("ignore_router") is False
+
+
+# ============================================================================
+# Tests for block.moe attribute handling (Step3p5 style models)
+# ============================================================================
+
+
+class DummyBlockWithMoeAttr:
+    """Block with separate moe attribute (Step3p5 style)."""
+
+    def __init__(self, moe=None, mlp=None):
+        self.moe = moe
+        self.mlp = mlp
+
+
+def test_apply_ep_handles_block_with_moe_attribute(monkeypatch):
+    """Test that apply_ep correctly handles blocks with 'moe' attribute (Step3p5 style)."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    # Patch MoE symbol for isinstance
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    parallelize_module_mock = MagicMock()
+    monkeypatch.setattr(P, "parallelize_module", parallelize_module_mock)
+
+    moe = DummyMoE()
+    # Block has moe attribute instead of mlp
+    block = DummyBlockWithMoeAttr(moe=moe, mlp=None)
+    model = DummyModel([block])
+    ep_mesh = type("Mesh", (), {"size": lambda self: 2})()
+
+    P.apply_ep(model, ep_mesh)
+
+    assert parallelize_module_mock.call_count == 1
+    args, kwargs = parallelize_module_mock.call_args
+    # Should use block.moe.experts, not block.mlp.experts
+    assert kwargs["module"] is moe.experts
+    assert kwargs["device_mesh"] is ep_mesh
+    assert isinstance(kwargs["parallelize_plan"], P.ExpertParallel)
+
+
+def test_apply_ep_prefers_moe_over_mlp(monkeypatch):
+    """Test that apply_ep prefers block.moe over block.mlp when both exist."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    parallelize_module_mock = MagicMock()
+    monkeypatch.setattr(P, "parallelize_module", parallelize_module_mock)
+
+    moe = DummyMoE()
+    mlp = DummyMoE()  # A different MoE object
+    block = DummyBlockWithMoeAttr(moe=moe, mlp=mlp)
+    model = DummyModel([block])
+    ep_mesh = type("Mesh", (), {"size": lambda self: 2})()
+
+    P.apply_ep(model, ep_mesh)
+
+    assert parallelize_module_mock.call_count == 1
+    args, kwargs = parallelize_module_mock.call_args
+    # Should use block.moe.experts (not block.mlp.experts)
+    assert kwargs["module"] is moe.experts
+
+
+def test_apply_ep_falls_back_to_mlp(monkeypatch):
+    """Test that apply_ep falls back to block.mlp when block.moe doesn't exist."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    parallelize_module_mock = MagicMock()
+    monkeypatch.setattr(P, "parallelize_module", parallelize_module_mock)
+
+    mlp = DummyMoE()
+    # Block with mlp but no moe attribute
+    block = DummyBlock(mlp=mlp)
+    model = DummyModel([block])
+    ep_mesh = type("Mesh", (), {"size": lambda self: 2})()
+
+    P.apply_ep(model, ep_mesh)
+
+    assert parallelize_module_mock.call_count == 1
+    args, kwargs = parallelize_module_mock.call_args
+    assert kwargs["module"] is mlp.experts
+
+
+def test_apply_ac_derives_num_experts_from_moe_num_experts(monkeypatch):
+    """Test that apply_ac derives num_experts from config.moe_num_experts when num_experts is absent."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    captured_num_experts = None
+
+    def fake_create_selective_checkpoint_contexts(policy_cb):
+        nonlocal captured_num_experts
+        torch_stub = sys.modules["torch"]
+        # Test with various shapes to determine what was captured
+        for ne in [8, 16, 32, 64]:
+            rhs = type("Mat", (), {"shape": (256, ne)})()
+            result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs)
+            if result == P.CheckpointPolicy.MUST_SAVE:
+                captured_num_experts = ne
+                break
+        return "CTX"
+
+    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+        if context_fn is not None:
+            context_fn()
+        return block
+
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
+
+    # Create model with config containing only moe_num_experts (not num_experts)
+    class Config:
+        hidden_size = 256
+        moe_num_experts = 32  # Only moe_num_experts, not num_experts
+
+    class ModelWithMoeNumExperts:
+        def __init__(self):
+            self.config = Config()
+            self.layers = LayerContainer([DummyBlock()])
+
+    model = ModelWithMoeNumExperts()
+
+    P.apply_ac(model, ignore_router=True)
+
+    # Should find moe_num_experts
+    assert captured_num_experts == 32
+
+
+def test_apply_ac_prefers_num_experts_over_moe_num_experts(monkeypatch):
+    """Test that apply_ac prefers config.num_experts over config.moe_num_experts."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    captured_num_experts = None
+
+    def fake_create_selective_checkpoint_contexts(policy_cb):
+        nonlocal captured_num_experts
+        torch_stub = sys.modules["torch"]
+        for ne in [8, 16, 32, 64]:
+            rhs = type("Mat", (), {"shape": (256, ne)})()
+            result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs)
+            if result == P.CheckpointPolicy.MUST_SAVE:
+                captured_num_experts = ne
+                break
+        return "CTX"
+
+    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+        if context_fn is not None:
+            context_fn()
+        return block
+
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
+
+    # Create model with both num_experts and moe_num_experts
+    class Config:
+        hidden_size = 256
+        num_experts = 16  # Should be preferred
+        moe_num_experts = 64  # Should be ignored
+
+    class ModelWithBothExperts:
+        def __init__(self):
+            self.config = Config()
+            self.layers = LayerContainer([DummyBlock()])
+
+    model = ModelWithBothExperts()
+
+    P.apply_ac(model, ignore_router=True)
+
+    # Should find num_experts first
+    assert captured_num_experts == 16
+
+
+def test_apply_fsdp_handles_block_with_moe_attribute(monkeypatch):
+    """Test that apply_fsdp correctly handles blocks with 'moe' attribute (Step3p5 style)."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    fully_shard_mock = MagicMock()
+    mp_policy_mock = MagicMock(return_value="MP_POLICY")
+    shard_sentinel = object()
+
+    def fake_shard(dim):
+        assert dim == 1
+        return shard_sentinel
+
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", mp_policy_mock)
+    monkeypatch.setattr(P, "Shard", fake_shard)
+
+    moe = DummyMoE()
+    block = DummyBlockWithMoeAttr(moe=moe, mlp=None)
+    model = DummyModel([block])
+
+    fsdp_mesh = type("Mesh", (), {"size": lambda self: 2})()
+    ep_shard_mesh = type("Mesh", (), {"size": lambda self: 2})()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=fsdp_mesh,
+        ep_enabled=True,
+        ep_shard_enabled=True,
+        ep_shard_mesh=ep_shard_mesh,
+    )
+
+    # Experts should have a dedicated shard call using block.moe.experts
+    experts = moe.experts
+    experts_call = _find_call_by_first_arg(fully_shard_mock, experts)
+    assert experts_call is not None
+    _, experts_kwargs = experts_call
+    assert experts_kwargs["mesh"] is ep_shard_mesh
+
+    # Block should be sharded with ignored_params from moe.experts
+    block_call = _find_call_by_first_arg(fully_shard_mock, block)
+    assert block_call is not None
+    _, block_kwargs = block_call
+    ignored = block_kwargs.get("ignored_params")
+    assert isinstance(ignored, set) and len(ignored) == len(list(experts.parameters()))
+
+
+def test_apply_fsdp_uses_moe_for_ignored_params(monkeypatch):
+    """Test that apply_fsdp uses block.moe.experts for ignored_params when ep_enabled."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    moe = DummyMoE()
+    mlp = DummyMoE()  # Different object
+    block = DummyBlockWithMoeAttr(moe=moe, mlp=mlp)
+    model = DummyModel([block])
+    fsdp_mesh = object()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=fsdp_mesh,
+        ep_enabled=True,
+        ep_shard_enabled=False,
+        ep_shard_mesh=None,
+    )
+
+    block_call = _find_call_by_first_arg(fully_shard_mock, block)
+    assert block_call is not None
+    _, block_kwargs = block_call
+    ignored = block_kwargs.get("ignored_params")
+    # Should use moe.experts, not mlp.experts
+    assert isinstance(ignored, set)
+    moe_params = set(moe.experts.parameters())
+    assert ignored == moe_params

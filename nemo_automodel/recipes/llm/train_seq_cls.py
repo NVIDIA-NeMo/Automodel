@@ -23,6 +23,7 @@ import wandb
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.device_mesh import create_device_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
@@ -34,7 +35,8 @@ from nemo_automodel.recipes.llm.train_ft import (
     build_dataloader,
     build_distributed,
     build_lr_scheduler,
-    build_model_and_optimizer,
+    build_model,
+    build_optimizer,
     build_step_scheduler,
 )
 
@@ -54,13 +56,21 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         apply_cache_compatibility_patches()
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
-        self.model_wrapper = None
         self.device_mesh = None
         self.moe_mesh = None
-        if "distributed" in self.cfg:
-            self.model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
-            self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
-            self.moe_mesh = getattr(self.model_wrapper, "moe_mesh", None)
+        self.distributed_config = None
+        if "distributed_config" in self.cfg:
+            self.distributed_config = self.cfg.distributed_config.instantiate()
+            self.device_mesh, self.moe_mesh = create_device_mesh(
+                self.distributed_config,
+                dp_size=self.cfg.get("distributed.dp_size", None),
+                dp_replicate_size=self.cfg.get("distributed.dp_replicate_size", None),
+                tp_size=self.cfg.get("distributed.tp_size", 1),
+                pp_size=self.cfg.get("distributed.pp_size", 1),
+                cp_size=self.cfg.get("distributed.cp_size", 1),
+                ep_size=self.cfg.get("distributed.ep_size", 1),
+                world_size=self.dist_env.world_size,
+            )
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -103,24 +113,19 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         self.peft_config = self.cfg.instantiate_path("peft")
-        model, self.optimizer, self.loss_fn = build_model_and_optimizer(
+        model = build_model(
             cfg_model=self.cfg.model,
-            cfg_opt=self.cfg.optimizer,
             cfg_peft=self.peft_config,
-            has_packed_sequence=use_hf_fa2,
-            model_wrapper=self.model_wrapper,
             seed=self.cfg.get("seed", 42),
-            tp_size=self.cfg.get("distributed.tp_size", 1),
-            cp_size=self.cfg.get("distributed.cp_size", 1),
-            cfg_fp8=None,
+            has_packed_sequence=use_hf_fa2,
             cfg_compile=self.cfg.get("compile", None),
             cfg_quantization=self.cfg.get("quantization", None),
-            autopipeline=None,
-            loss_fn=self.loss_fn,
-            parallelize_fn=None,
-            checkpointer=self.checkpointer,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            distributed_config=self.distributed_config,
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )
+        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 
         self.model_parts = [model]
 

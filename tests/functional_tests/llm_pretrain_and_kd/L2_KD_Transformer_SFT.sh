@@ -32,6 +32,6 @@ examples/llm_kd/kd.py \
   --dataset.limit_dataset_samples 8 \
   --validation_dataset.dataset_name $HF_CACHE/squad/ \
   --validation_dataset.limit_dataset_samples 8 \
-  --distributed.activation_checkpointing true
+  --distributed_config.activation_checkpointing true
 
 

@@ -1,0 +1,42 @@
+#!/bin/bash
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -exo pipefail
+
+# Run the biencoder recipe (uses nemo_automodel/recipes/biencoder/train_biencoder.py via module entrypoint).
+python3 -m nemo_automodel.recipes.biencoder.train_biencoder \
+    --config \
+    tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/recipe.yaml \
+    --model.pretrained_model_name_or_path $TEST_DATA_DIR/llama-nemotron-embed-1b-v2/ \
+    --tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/llama-nemotron-embed-1b-v2/ \
+    --dataloader.dataset.data_dir_list [$TEST_DATA_DIR/embedding_testdata/training.jsonl] \
+
+# Compare baseline vs finetuned biencoder checkpoint (pos-neg separation should not degrade).
+python3 \
+    tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/compare_biencoder_models.py \
+    $TEST_DATA_DIR/llama-nemotron-embed-1b-v2 \
+    /workspace/output/biencoder_inline/checkpoints/epoch_0_step_31/ \
+    $TEST_DATA_DIR/embedding_testdata/testing.jsonl
+
+# ---- Checkpoint restoration tests ----
+# Test 1: Full-model checkpoint restoration (NeMo -> save -> transformers load)
+# Test 2: PEFT (LoRA) checkpoint restoration (NeMo -> save -> transformers + safetensors load)
+BASE_MODEL_PATH=$TEST_DATA_DIR/llama-nemotron-embed-1b-v2 \
+CHECKPOINT_DIR=/workspace/output/biencoder_ckpt_restore/checkpoints \
+PEFT_CHECKPOINT_DIR=/workspace/output/biencoder_ckpt_restore_peft/checkpoints \
+RECIPE_YAML=tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/recipe_ckpt_restore.yaml \
+PEFT_RECIPE_YAML=tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/recipe_peft.yaml \
+python3 -m pytest -xvs \
+    tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/test_biencoder_checkpoint_restoration.py

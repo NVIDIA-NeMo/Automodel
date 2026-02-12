@@ -21,9 +21,9 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict
 
 import torch
+from huggingface_hub import constants as hf_constants
 from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-from transformers.utils.hub import TRANSFORMERS_CACHE
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
@@ -109,7 +109,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         checkpoint_dir="checkpoints/",
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
-        model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
+        model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HUB_CACHE,
         save_consolidated=False,
         is_peft=is_peft,
     )
@@ -455,9 +455,29 @@ class TrainBiencoderRecipe(BaseRecipe):
 
         # Build optimizer
         logger.info("Building optimizer...")
-        trainable_params = list(filter(lambda x: x.requires_grad, self.model_parts[0].parameters()))
+        # Mimic common LLM training practice: apply weight decay only to non-bias/non-norm params.
+        decay_params = []
+        no_decay_params = []
+        for name, param in self.model_parts[0].named_parameters():
+            if not param.requires_grad:
+                continue
+            name_l = name.lower()
+            if name.endswith(".bias") or ("norm" in name_l):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        trainable_params = decay_params + no_decay_params
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
-        self.optimizer = [self.cfg.optimizer.instantiate(params=trainable_params)]
+
+        param_groups = []
+        if decay_params:
+            param_groups.append({"params": decay_params})
+        if no_decay_params:
+            param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+
+        logger.info("Optimizer param groups: decay=%d, no_decay=%d", len(decay_params), len(no_decay_params))
+        self.optimizer = [self.cfg.optimizer.instantiate(params=param_groups)]
 
         # Print trainable parameters after model has been moved to device
         trainable_params, total_params = print_trainable_parameters(self.model_parts[0])
@@ -579,7 +599,6 @@ class TrainBiencoderRecipe(BaseRecipe):
             k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
             for k, v in batch.items()
         }
-
         # Unpack query and passage inputs using the same logic as biencoder_trainer.py
         query, passage = _unpack_qp(batch)
 

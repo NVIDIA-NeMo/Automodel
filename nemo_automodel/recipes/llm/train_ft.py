@@ -19,26 +19,28 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from functools import partial
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.nn as nn
 import wandb
+from huggingface_hub import constants as hf_constants
+from megatron_fsdp import MegatronFSDP
 from megatron_fsdp.fully_shard import fully_shard_optimizer
-from torch.distributed.device_mesh import DeviceMesh
 from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoConfig
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers.utils import TRANSFORMERS_CACHE
-from transformers.utils.hub import TRANSFORMERS_CACHE
 from wandb import Settings
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM, NeMoAutoModelForSequenceClassification
-from nemo_automodel._transformers.auto_model import apply_model_infrastructure
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+from nemo_automodel._transformers.infrastructure import (
+    MeshContext,
+    apply_model_infrastructure,
+    instantiate_infrastructure,
+)
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
@@ -48,11 +50,12 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
+from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.device_mesh import create_device_mesh
 from nemo_automodel.components.distributed.init_utils import (
     initialize_distributed,
 )
-from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -62,11 +65,14 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
+from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
+    prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
@@ -127,66 +133,67 @@ def _get_num_thd_chunks(pp_enabled, cfg):
     return 1
 
 
-def build_model_and_optimizer(
+def build_model(
     cfg_model,
-    cfg_opt,
     cfg_peft,
-    model_wrapper,
     seed,
-    checkpointer: Checkpointer,
     has_packed_sequence=False,
-    tp_size=1,
-    cp_size=1,
     cfg_fp8=None,
     cfg_compile=None,
-    cfg_qat=None,
     cfg_quantization=None,
-    autopipeline: AutoPipeline | None = None,
-    loss_fn=None,
-    parallelize_fn=None,
+    device_mesh=None,
+    moe_mesh=None,
+    distributed_config=None,
+    pipeline_config=None,
+    cfg_qat=None,
+    cfg_moe=None,
     unfreeze_modules: list[str] | None = None,
-) -> tuple[nn.Module | AutoPipeline, list["Optimizer"], nn.Module]:  # noqa: F821
+) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """
     Build and initialize a model and optimizer.
 
     Args:
-        device: The target device.
-        model_wrapper: Optional parallelism wrapper.
         cfg_model: Configuration for model instantiation.
-        cfg_opt: Configuration for optimizer instantiation.
-        use_hf_fa2: Whether to use HF's flash_attention_2. This takes precedence over Pytorch's sdpa_methods for attn.
         cfg_peft: Configuration for PEFT.
-        model_wrapper: Optional parallelism wrapper.
         seed: Random seed.
-        tp_size: Tensor parallel size.
-        cp_size: Column parallel size.
+        has_packed_sequence: Whether using packed sequences.
         cfg_fp8: Configuration for FP8.
         cfg_compile: Configuration for torch.compile.
-        unfreeze_modules: List of module names/substrings to unfreeze (e.g. ["classifier"]). Applied after PEFT freezing but before optimizer creation.
+        cfg_quantization: Configuration for BitsAndBytes quantization.
+        device_mesh: Device mesh for distributed training. Parallelism sizes are inferred from this.
+        moe_mesh: MOE mesh for expert parallelism.
+        distributed_config: Strategy-specific distributed config (FSDP2Config, etc.).
+        pipeline_config: Pipeline parallelism config.
+        cfg_qat: Configuration for QAT (will be instantiated to QATConfig).
+        cfg_moe: Configuration for MOE (will be instantiated to MoEParallelizerConfig).
+        unfreeze_modules: List of module names/substrings to unfreeze.
 
     Returns:
-        The instantiated model on the specified device, the state dict keys before any parallelization, the optimizer, the loss function, and param_info dict.
+        Tuple of (model, optimizer_list).
     """
     with ScopedRNG(seed=seed, ranked=True):
         kwargs = {
-            "tp_size": tp_size,
-            "cp_size": cp_size,
             "has_packed_sequence": has_packed_sequence,
-            "autopipeline": autopipeline,
-            "parallelize_fn": parallelize_fn,
-            "checkpointer": checkpointer,
             "peft_config": cfg_peft,
-            "model_wrapper": model_wrapper,
-            "loss_fn": loss_fn,
+            "device_mesh": device_mesh,
+            "moe_mesh": moe_mesh,
+            "distributed_config": distributed_config,
+            "pipeline_config": pipeline_config,
         }
-        if cfg_fp8 is not None:
-            fp8_config = build_fp8_config(cfg_fp8)
-            kwargs["fp8_config"] = fp8_config
+
+        # Instantiate QATConfig from cfg_qat if provided
         if cfg_qat is not None and cfg_qat.get("enabled", False):
             if cfg_peft is not None:
                 raise ValueError("QAT with PEFT is not currently supported")
-            quantizer = cfg_qat.quantizer.instantiate(precision=torch.bfloat16, scales_precision=torch.bfloat16)
-            kwargs["qat_quantizer"] = quantizer
+            kwargs["qat_config"] = cfg_qat.qat_config.instantiate()
+
+        # Instantiate MoEParallelizerConfig from cfg_moe if provided
+        if cfg_moe is not None:
+            kwargs["moe_config"] = cfg_moe.instantiate()
+
+        if cfg_fp8 is not None:
+            fp8_config = build_fp8_config(cfg_fp8)
+            kwargs["fp8_config"] = fp8_config
         if cfg_compile is not None:
             kwargs["compile_config"] = build_compile_config(cfg_compile)
         if cfg_quantization is not None:
@@ -207,22 +214,41 @@ def build_model_and_optimizer(
             model = cfg_model.instantiate(**kwargs)
         else:
             # For non-NemoAutoModel entry points (e.g., build_gpt2_model),
-            # instantiate the model first, then apply infrastructure separately
+            # instantiate the model first, then apply infrastructure separately.
+            # We must convert config objects into runtime objects (model_wrapper,
+            # autopipeline, parallelize_fn, etc.) via instantiate_infrastructure,
+            # exactly as from_pretrained/from_config do internally.
             model = cfg_model.instantiate()
+
+            mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+            model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
+                distributed_config=distributed_config,
+                pipeline_config=pipeline_config,
+                qat_config=kwargs.get("qat_config"),
+                moe_config=kwargs.get("moe_config"),
+                device=torch.device("cuda", torch.cuda.current_device()),
+                mesh=mesh,
+            )
+            loss_fn = pipeline_config.loss_fn if pipeline_config is not None else None
+
             model = apply_model_infrastructure(
                 model,
-                is_hf_model=False,
                 is_meta_device=False,
                 device=torch.cuda.current_device(),
-                model_name_or_path=None,
+                mesh=mesh,
+                model_wrapper=model_wrapper,
+                autopipeline=autopipeline,
+                parallelize_fn=parallelize_fn,
+                qat_quantizer=qat_quantizer,
+                loss_fn=loss_fn,
+                peft_config=kwargs.get("peft_config"),
+                fp8_config=kwargs.get("fp8_config"),
+                compile_config=kwargs.get("compile_config"),
+                quantization_config=kwargs.get("quantization_config"),
+                pretrained_model_name_or_path=None,
                 load_base_model=False,
-                cache_dir=TRANSFORMERS_CACHE,
-                **kwargs,
+                cache_dir=hf_constants.HF_HUB_CACHE,
             )
-
-    if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
-        logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
-        loss_fn = MaskedCrossEntropy()
 
     # Explicitly unfreeze specified modules (e.g. task heads) that need full fine-tuning
     if unfreeze_modules:
@@ -231,25 +257,47 @@ def build_model_and_optimizer(
                 param.requires_grad_(True)
         logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
 
-    if tp_size > 1:
+    return model
+
+
+def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
+    """Build an optimizer for the model.
+
+    Args:
+        model: The model to build an optimizer for.
+        cfg_opt: The configuration for the optimizer.
+        distributed_config: The distributed configuration.
+        device_mesh: The device mesh.
+    """
+    if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
         # TP does not support foreach
         cfg_opt.foreach = False
 
-    if hasattr(model, "parts"):
-        optimizer = []
-        for part in model.parts:
-            trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
-            assert len(trainable_params) > 0, "trainable_params cannot be empty"
-            optimizer.append(cfg_opt.instantiate(params=trainable_params))
-    else:
-        trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
+    optimizer = []
+    has_dion_optimizer = is_dion_optimizer(cfg_opt)
+    for part in getattr(model, "parts", [model]):
+        trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
-        optimizer = cfg_opt.instantiate(params=trainable_params)
-        if isinstance(model_wrapper, MegatronFSDPManager) and torch.distributed.get_world_size() > 1:
-            fully_shard_optimizer(model, optimizer)
-        optimizer = [optimizer]
+        # TODO(@akoumparouli): no branching for building the optimizer, refactor.
+        if has_dion_optimizer:
+            tmp_optimizer = build_dion_optimizer(
+                cfg_opt=cfg_opt,
+                model=part,
+                distributed_mesh=device_mesh,
+            )
+        else:
+            tmp_optimizer = cfg_opt.instantiate(params=trainable_params)
+        if isinstance(distributed_config, MegatronFSDPConfig) and torch.distributed.get_world_size() > 1:
+            assert not has_dion_optimizer, "Dion optimizer does not support fully_shard_optimizer"
+            # Only call fully_shard_optimizer when the model was actually wrapped
+            # with MegatronFSDP. When dp_mesh.size()==1 the parallelizer skips
+            # MegatronFSDP wrapping and the parameters won't carry the required
+            # _megatron_fsdp_model attribute.
+            if isinstance(part, MegatronFSDP):
+                fully_shard_optimizer(tmp_optimizer)
+        optimizer.append(tmp_optimizer)
 
-    return model, optimizer, loss_fn
+    return optimizer
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
@@ -271,7 +319,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         checkpoint_dir="checkpoints/",
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
-        model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
+        model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HUB_CACHE,
         save_consolidated=True,
         is_peft=is_peft,
     )
@@ -740,24 +788,6 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
     return val_dataloaders
 
 
-def parallelize_for_pp(
-    model: nn.Module,
-    *,
-    world_mesh: DeviceMesh,
-    moe_mesh: Optional[DeviceMesh] = None,
-    dp_axis_names: Union[tuple[str, ...], str] = ("data_parallel",),
-    cp_axis_name: Optional[str] = None,
-    tp_axis_name: Optional[str] = None,
-    ep_axis_name: Optional[str] = None,
-    ep_shard_axis_names: Optional[tuple[str, ...]] = None,
-    model_wrapper: Optional[Any] = None,
-) -> nn.Module:
-    if model_wrapper is not None:
-        if callable(getattr(model_wrapper, "parallelize", None)):
-            model = model_wrapper.parallelize(model)
-    return model
-
-
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
 # ---------------------------------------------------------------------------
@@ -799,11 +829,23 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         self.device_mesh = None
         self.moe_mesh = None
-        self.model_wrapper = None
-        if "distributed" in self.cfg:
-            self.model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
-            self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
-            self.moe_mesh = getattr(self.model_wrapper, "moe_mesh", None)
+        self.distributed_config = None
+
+        if "distributed_config" in self.cfg:
+            # Strategy-specific config from distributed_config section
+            self.distributed_config = self.cfg.distributed_config.instantiate()
+
+            # Parallelism sizes from distributed section, create device mesh
+            self.device_mesh, self.moe_mesh = create_device_mesh(
+                self.distributed_config,
+                dp_size=self.cfg.get("distributed.dp_size", None),
+                dp_replicate_size=self.cfg.get("distributed.dp_replicate_size", None),
+                tp_size=self.cfg.get("distributed.tp_size", 1),
+                pp_size=self.cfg.get("distributed.pp_size", 1),
+                cp_size=self.cfg.get("distributed.cp_size", 1),
+                ep_size=self.cfg.get("distributed.ep_size", 1),
+                world_size=self.dist_env.world_size,
+            )
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -820,16 +862,20 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._log_experiment_details()
         self._log_library_versions()
 
-        self.pp_enabled: bool = (
-            True if hasattr(self.model_wrapper, "pp_size") and self.model_wrapper.pp_size > 1 else False
-        )
-        autopipeline_cfg = self.cfg.get("autopipeline", None)
+        self.pp_enabled: bool = self.cfg.get("distributed.pp_size", 1) > 1
+
+        # Build pipeline config if PP enabled
+        self.pipeline_config = None
         if self.pp_enabled:
+            pp_size = self.cfg.get("distributed.pp_size", 1)
             pp_batch_size = self.cfg.step_scheduler.local_batch_size
             pp_microbatch_size = self.cfg.autopipeline.pp_microbatch_size
-            assert pp_batch_size // self.cfg.autopipeline.pp_microbatch_size >= self.model_wrapper.pp_size, (
-                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {self.cfg.autopipeline.pp_microbatch_size} must be greater than or equal to pp_size {self.model_wrapper.pp_size}"
+
+            assert pp_batch_size // pp_microbatch_size >= pp_size, (
+                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {pp_size}"
             )
+
+            # THD override logic
             if (
                 self.cfg.distributed.get("cp_size", 1) > 1
                 and _uses_te_dot_product_attention(self.cfg.model)
@@ -841,48 +887,30 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     f"Overriding pp_batch_size: {pp_batch_size}, pp_microbatch_size: {pp_microbatch_size} for THD"
                 )
 
-            assert autopipeline_cfg is not None, (
+            assert self.cfg.get("autopipeline", None) is not None, (
                 "AutoPipeline configuration is required when pipeline parallelism is enabled"
             )
-            assert not isinstance(self.model_wrapper, MegatronFSDPManager), (
-                "MegatronFSDPManager is not supported when pipeline parallelism is enabled"
+            assert not isinstance(self.distributed_config, MegatronFSDPConfig), (
+                "MegatronFSDPConfig is not supported when pipeline parallelism is enabled"
             )
-            # Create AutoPipeline from config
-            autopipeline = autopipeline_cfg.instantiate(
-                world_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                pp_axis_name="pp",
-                dp_axis_names=(
-                    ("dp_replicate", "dp_shard_cp")
-                    if "dp_replicate" in self.device_mesh.mesh_dim_names
-                    and "dp_shard_cp" in self.device_mesh.mesh_dim_names
-                    else ("dp_shard_cp",)
-                ),
-                cp_axis_name="cp" if "cp" in self.device_mesh.mesh_dim_names else None,
-                tp_axis_name="tp" if "tp" in self.device_mesh.mesh_dim_names else None,
-                ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
-                ep_shard_axis_names=(
-                    ("ep_shard",) if self.moe_mesh is not None and "ep_shard" in self.moe_mesh.mesh_dim_names else None
-                ),
-                pp_batch_size=pp_batch_size,
+
+            # Build loss_fn first (needed for pipeline_config)
+            self.loss_fn = build_loss_fn(self.cfg.loss_fn)
+
+            # Instantiate PipelineConfig from YAML, override runtime-computed args
+            self.pipeline_config = self.cfg.autopipeline.instantiate(
                 pp_microbatch_size=pp_microbatch_size,
+                pp_batch_size=pp_batch_size,
                 patch_stage_backward_maybe_with_nosync=self.cfg.get("model.backend.enable_fsdp_optimizations", False),
-                device=torch.cuda.current_device(),
-            )
-            assert isinstance(autopipeline, AutoPipeline), (
-                f"autopipeline {autopipeline.__class__} is not an instance of AutoPipeline"
+                loss_fn=self.loss_fn,
             )
         else:
-            autopipeline = None
+            self.loss_fn = build_loss_fn(self.cfg.loss_fn)
 
         # Build components
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
-        self.loss_fn = build_loss_fn(self.cfg.loss_fn)
-        parallelize_fn = getattr(self.cfg.get("parallelizer", None), "instantiate", None)
-        if parallelize_fn is None and self.pp_enabled:
-            parallelize_fn = partial(parallelize_for_pp, model_wrapper=self.model_wrapper)
 
         # Build checkpoint config
         checkpoint_config = build_checkpoint_config(
@@ -907,24 +935,26 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
-        model, self.optimizer, self.loss_fn = build_model_and_optimizer(
+        model = build_model(
             self.cfg.model,
-            self.cfg.optimizer,
             self.peft_config,
-            self.model_wrapper,
             has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
             seed=self.cfg.get("seed", 42),
-            tp_size=self.cfg.get("distributed.tp_size", 1),
-            cp_size=self.cfg.get("distributed.cp_size", 1),
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
             cfg_quantization=self.cfg.get("quantization", None),
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            distributed_config=self.distributed_config,
+            pipeline_config=self.pipeline_config,
             cfg_qat=self.cfg.get("qat", None),
-            autopipeline=autopipeline,
-            loss_fn=self.loss_fn,
-            parallelize_fn=parallelize_fn,
-            checkpointer=self.checkpointer,
+            cfg_moe=self.cfg.get("moe_config", None),
         )
+        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+
+        if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
+            logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
+            self.loss_fn = MaskedCrossEntropy()
 
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
@@ -943,6 +973,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 autonvtx.patch(model, name=model.__class__.__name__)
             self.model_parts = [model]
             self.pp = None
+
+        # Extract TE FP8 config from model backend (set after model construction)
+        self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
 
         self.dataloader, self.tokenizer = build_dataloader(
             self.cfg.dataset,
@@ -985,6 +1018,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Handle delayed fake-quant toggling for QAT if configured
         self._qat_disable_fn, self._qat_enable_fn, self._qat_enable_after = self._setup_qat(self.cfg, self.model_parts)
 
+        # Enable MoE load balance tracking if configured
+        moe_metrics_cfg = self.cfg.get("moe_metrics", None)
+        if moe_metrics_cfg and moe_metrics_cfg.get("enabled", False):
+            from nemo_automodel.components.moe.load_balance_metrics import enable_load_balance_tracking
+
+            for mp in self.model_parts:
+                enable_load_balance_tracking(mp)
+
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         # Initialize JSONL loggers
         self.metric_logger_train = build_metric_logger(
@@ -1004,6 +1045,55 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
 
+    def _collect_moe_load_balance(self):
+        """Collect MoE load balance metrics with DP all-reduce.
+
+        Must be called on ALL ranks (the all-reduce is collective).
+        Stores the result in ``self._moe_layer_loads`` for rank-0 logging.
+        """
+        moe_metrics_cfg = self.cfg.get("moe_metrics", None)
+        if not (moe_metrics_cfg and moe_metrics_cfg.get("enabled", False)):
+            self._moe_layer_loads = None
+            return
+
+        from nemo_automodel.components.moe.load_balance_metrics import collect_expert_loads
+
+        dp_group = self._get_dp_group(include_cp=True)
+        all_loads: dict = {}
+        for mp in self.model_parts:
+            all_loads.update(collect_expert_loads(mp, dp_group=dp_group))
+        self._moe_layer_loads = all_loads if all_loads else None
+
+    def _log_moe_metrics(self, step: int, wandb_log_fn) -> None:
+        """Log MoE load balance metrics to wandb.
+
+        Call after :meth:`_collect_moe_load_balance`.  Only logs when
+        ``_moe_layer_loads`` is populated and a wandb log function is provided.
+
+        Args:
+            step: Current training/benchmark step for wandb x-axis.
+            wandb_log_fn: Callable like ``wandb.log`` or ``wandb_run.log``.
+        """
+        if not getattr(self, "_moe_layer_loads", None):
+            return
+
+        from nemo_automodel.components.moe.load_balance_metrics import (
+            compute_brief_metrics,
+            compute_detailed_metrics,
+        )
+
+        moe_metrics_cfg = self.cfg.get("moe_metrics", None)
+        mode = moe_metrics_cfg.get("mode", "brief") if moe_metrics_cfg else "brief"
+        top_k = moe_metrics_cfg.get("top_k_experts", 5) if moe_metrics_cfg else 5
+        if mode == "detailed":
+            detailed_every = moe_metrics_cfg.get("detailed_every_steps", None) if moe_metrics_cfg else None
+            if detailed_every is None or step % detailed_every == 0:
+                wandb_log_fn(compute_detailed_metrics(self._moe_layer_loads, top_k=top_k), step=step)
+            else:
+                wandb_log_fn(compute_brief_metrics(self._moe_layer_loads, top_k=top_k), step=step)
+        else:
+            wandb_log_fn(compute_brief_metrics(self._moe_layer_loads, top_k=top_k), step=step)
+
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
             return None, None, None
@@ -1015,9 +1105,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         qat_cfg = cfg.qat
         _qat_enable_after = qat_cfg.get("fake_quant_after_n_steps", 0)
         # Collect mode from any model part that has it
-        qat_mode = None
-        if hasattr(model_parts[0], "_qat_mode"):
-            qat_mode = getattr(model_parts[0], "_qat_mode")
+        qat_mode = getattr(model_parts[0], "_qat_mode", None)
 
         if qat_mode is None:
             return None, None, None
@@ -1068,6 +1156,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # If QAT delayed fake-quant is configured, enable after threshold
                 self._enable_qat_if_delayed(self.step_scheduler.step)
                 train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                # Collect MoE load balance metrics (all ranks participate in all-reduce)
+                self._collect_moe_load_balance()
                 # log
                 self.log_train_metrics(train_log_data)
 
@@ -1111,7 +1201,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
         batch = {
             k: (
-                {dk: dv.to(self.dist_env.device, non_blocking=True) if dv is not None else None for dk, dv in v.items()}
+                {dk: dv.to(self.dist_env.device, non_blocking=True) for dk, dv in v.items() if dv is not None}
                 if isinstance(v, dict)
                 else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
             )
@@ -1125,9 +1215,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
         )
         labels = batch.pop("labels")
+        fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
-            with train_ctx():
+            with train_ctx(), fp8_ctx:
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
                     masked_labels = labels.clone()
@@ -1136,18 +1227,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     targets = None
 
                 input_ids = batch.pop("input_ids")
+
+                # Filter out None values and empty dicts from batch to avoid PP chunking errors
+                batch_filtered = {
+                    k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
+                }
+
                 if is_train:
                     # Use step for training (forward + backward)
                     if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
+                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch_filtered)
                     else:
-                        self.pp.info.schedule.step(target=targets, losses=losses, **batch)
+                        self.pp.info.schedule.step(target=targets, losses=losses, **batch_filtered)
                 else:
                     # Use eval for validation (forward only, no backward)
                     if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch)
+                        self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch_filtered)
                     else:
-                        self.pp.info.schedule.eval(target=targets, losses=losses, **batch)
+                        self.pp.info.schedule.eval(target=targets, losses=losses, **batch_filtered)
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))
@@ -1161,12 +1258,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 get_sync_ctx(
                     model,
                     idx == num_batches - 1,
-                    defer_fsdp_grad_sync=getattr(self.model_wrapper, "defer_fsdp_grad_sync", True),
+                    defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
                 )
                 if is_train
                 else nullcontext()
             )
-            with train_ctx(), sync_ctx:
+            with train_ctx(), sync_ctx, fp8_ctx:
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)
@@ -1182,7 +1279,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     logits=getattr(out, "logits", out),
                     labels=labels,
                     model=model,
-                    hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
+                    hidden_states=get_final_hidden_states(out),
                     num_label_tokens=num_label_tokens,
                 )
                 loss_buffer.append(local_loss.clone().detach())
@@ -1220,6 +1317,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
+
+            if i == 0:
+                prepare_after_first_microbatch()
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
@@ -1420,6 +1520,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
             if self.mlflow_logger is not None:
                 self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
+
+        # Log MoE load balance metrics (already collected/reduced on all ranks)
+        if self.step_scheduler.is_remote_logging_step and wandb.run is not None:
+            self._log_moe_metrics(self.step_scheduler.step, wandb.log)
 
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
