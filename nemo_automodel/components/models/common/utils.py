@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.util
+import logging
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -21,10 +22,12 @@ from typing import Any, Literal
 import torch
 from torch import nn
 
+logger = logging.getLogger(__name__)
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_DEEP_EP = importlib.util.find_spec("deep_ep") is not None
+HAVE_GMM = importlib.util.find_spec("grouped_gemm") is not None
 
 # ---------------------------------------------------------------------------
 #  Global state flags for training coordination
@@ -138,8 +141,8 @@ class BackendConfig:
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
-    experts: Literal["torch", "te", "gmm"] = "torch"
-    dispatcher: Literal["torch", "deepep"] = "torch"
+    experts: Literal["torch", "te", "gmm"] = "gmm" if HAVE_GMM and torch.cuda.is_available() else "torch"
+    dispatcher: Literal["torch", "deepep"] = "deepep" if HAVE_DEEP_EP and torch.cuda.is_available() else "torch"
     enable_deepep: bool | None = None  # Deprecated: use dispatcher="deepep" instead
     fake_balanced_gate: bool = False
     enable_hf_state_dict_adapter: bool = True
@@ -172,11 +175,17 @@ class BackendConfig:
             # Clear the deprecated field after conversion
             self.enable_deepep = None
 
-        # TE and GMM experts require DeepEP dispatcher
-        if self.experts in ("te", "gmm") and self.dispatcher != "deepep":
-            raise ValueError(
-                f"experts='{self.experts}' requires dispatcher='deepep', but got dispatcher='{self.dispatcher}'"
-            )
+        # Backward compatibility
+        if (self.experts == "gmm" or self.experts == "te") and self.dispatcher != "deepep":
+            if (
+                torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
+            ) or not torch.distributed.is_initialized():
+                logger.info(
+                    f"experts='{self.experts}' requires dispatcher='deepep', but got dispatcher='{self.dispatcher}'. "
+                    "Setting both to torch."
+                )
+            self.dispatcher = "torch"
+            self.experts = "torch"
 
         # FP8 requires at least one TE backend (applies to all TE modules: Linear, GroupedLinear, RMSNorm)
         if self.te_fp8 is not None and self.linear != "te" and self.experts != "te":
