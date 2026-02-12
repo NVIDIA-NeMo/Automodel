@@ -102,6 +102,8 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: train
+  tokenizer:
+    pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
 
 packed_sequence:
   packed_sequence_size: 0
@@ -116,6 +118,8 @@ validation_dataset:
   dataset_name: rajpurkar/squad
   split: validation
   limit_dataset_samples: 64
+  tokenizer:
+    pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
