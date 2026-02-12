@@ -1,9 +1,9 @@
-# Function Calling with NeMo Automodel using FunctionGemma
+# Function Calling with NeMo AutoModel using FunctionGemma
 
-This tutorial walks through fine-tuning [FunctionGemma](https://huggingface.co/google/functiongemma-270m-it), Google's 270m function-calling model with NeMo Automodel on the xLAM function-calling dataset.
+This tutorial walks through fine-tuning [FunctionGemma](https://huggingface.co/google/functiongemma-270m-it), Google's 270m function-calling model with NeMo AutoModel on the xLAM function-calling dataset.
 
 
-## FunctionGemma introduction
+## FunctionGemma Introduction
 FunctionGemma is a lightweight, 270M-parameter variant built on the Gemma 3 architecture with a function-calling chat format. It is intended to be fine-tuned for task-specific function calling, and its compact size makes it practical for edge or resource-constrained deployments.
 - Gemma 3 architecture, updated tokenizer, and function-calling chat format.
 - Trained specifically for function calling: multiple tool definitions, parallel calls, tool responses, and natural-language summaries.
@@ -85,7 +85,7 @@ def _format_example(
 
 
 ## Run Full-Parameter SFT
-Use the ready-made config at [`examples/llm_finetune/gemma/functiongemma_xlam.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/functiongemma_xlam.yaml) to start finetune:
+Use the ready-made config at [`examples/llm_finetune/gemma/functiongemma_xlam.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/functiongemma_xlam.yaml) to start fine-tuning:
 
 
 
@@ -96,7 +96,7 @@ torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py \
   --config examples/llm_finetune/gemma/functiongemma_xlam.yaml
 ```
 
-You should be able to see training loss curve similar to the below:
+You should be able to see a training loss curve similar to the one shown below:
 
 <p align="center">
   <img src="https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/functiongemma-sft-loss.png" alt="FunctionGemma SFT loss" width="400">

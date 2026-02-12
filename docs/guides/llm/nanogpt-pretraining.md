@@ -6,7 +6,7 @@ This guide covers **FineWeb** data preparation, **defining** a [NanoGPT‑style]
 
 ## Set Up Your Environment
 
-In this guide, we will use an interactive environment to install NeMo Automodel from Git. You can also install NeMo Automodel from PyPI or use our bi-monthly Docker container (see the [Installation Guide](../installation.md)).
+In this guide, we will use an interactive environment to install NeMo AutoModel from Git. You can also install NeMo AutoModel from PyPI or use our bi-monthly Docker container (see the [Installation Guide](../installation.md)).
 
 ```bash
 # clone / install AutoModel (editable for local hacks)
@@ -26,7 +26,7 @@ To run this guide on a single GPU, use the single-GPU command in the **Launch Tr
 
 ---
 
-## Pre-process the FineWeb Dataset
+## Pre-Process the FineWeb Dataset
 
 ::::{warning}
 **File Size Limitation**: The `nanogpt_data_processor.py` script has a **4GB file size limit** (~2^32 bytes) due to 32-bit position tracking in the BOS index. This translates to:
@@ -47,7 +47,7 @@ Briefly, FineWeb is built by extracting main text from CommonCrawl WARC HTML, ke
 To train on more than 2B tokens from FineWeb, see [pretraining.md](pretraining.md) which uses Megatron Core's sharded dataset format without file size constraints.
 :::
 
-### Pre-processing and Tokenization
+### Pre-Processing and Tokenization
 
 For the purposes of this guide, we provide a data preprocessing tool at [`nanogpt_data_processor.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/nanogpt_data_processor.py) that streams datasets from the Hugging Face Hub, tokenizes using Hugging Face's `transformers.AutoTokenizer` (default: GPT-2), and writes the output in **memory-mapped binary shards** to files. During training, we use the [`NanogptDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/nanogpt_dataset.py) class that can stream efficiently at training time.
 
@@ -76,9 +76,9 @@ Consider the following options:
 
 ---
 
-## Understand the NeMo Automodel Training Workflow
+## Understand the NeMo AutoModel Training Workflow
 
-NeMo Automodel follows a simple but powerful flow for training:
+NeMo AutoModel follows a simple but powerful flow for training:
 
 1. A Python recipe script (for example, [`examples/llm_pretrain/pretrain.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/pretrain.py)) serves as the entry point that wires up all training components based on a YAML configuration file. Any configuration option can be overridden via CLI arguments (e.g., `--model.name abc`).
 2. The YAML file describes each component of the training job (such as `model`, `dataset`, `optimizer`, `distributed`, `checkpoint`, and optional `wandb`).
@@ -95,7 +95,7 @@ With this context, let’s define a model via `_target_`, then point the dataset
 
 ## Define Your Own Model Architecture
 
-NeMo Automodel relies on a YAML-driven configuration to build every training component. In particular, the `model._target_` must reference a callable that returns an `nn.Module` (or a compatible Hugging Face model). You can point `_target_` at:
+NeMo AutoModel relies on a YAML-driven configuration to build every training component. In particular, the `model._target_` must reference a callable that returns an `nn.Module` (or a compatible Hugging Face model). You can point `_target_` at:
 
 - An import path to a Python object.
 - A local Python file plus the object name using `path.py:object_name`.
@@ -431,7 +431,7 @@ automodel pretrain llm -c examples/llm_pretrain/nanogpt_pretrain.yaml
 automodel --nproc-per-node 8 pretrain llm \
   -c examples/llm_pretrain/nanogpt_pretrain.yaml
 ```
-:::tip
+:::{tip}
 Adjust the `distributed` section in the YAML config to change between DDP, FSDP2, etc.
 :::
 

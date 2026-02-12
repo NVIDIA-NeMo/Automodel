@@ -1,4 +1,4 @@
-# Introduction to the NeMo Automodel Repository
+# Introduction to the NeMo AutoModel Repository
 
 This introductory guide presents the structure of the NeMo AutoModel repository, provides a brief overview of its parts, introduces concepts such as components and recipes, and explains how everything fits together.
 
@@ -50,7 +50,7 @@ $ tree -L 1 nemo_automodel/components/
 
 ### Recipes Directory
 Recipes define **end-to-end workflows** (data and model loading → training with custom loop → saving the output checkpoint)
-for a variety of tasks, such as, training, fine-tuning, knowledge distillation, and combining components into usable pipelines.
+for a variety of tasks, such as, training, fine-tuning, and knowledge distillation.
 
 #### Available Recipes
 The following directory listing shows all components along with explanations of their contents.

@@ -65,7 +65,7 @@ For team collaboration, we recommend setting up a remote tracking server.
 
 ## What Gets Logged
 
-NeMo Automodel automatically logs the following information to MLflow:
+NeMo AutoModel automatically logs the following information to MLflow:
 
 ### Metrics
 - Training loss at each step
@@ -97,7 +97,7 @@ Only rank 0 in distributed training logs to MLflow to avoid duplicate entries an
 
 Here's a complete example of training with MLflow logging enabled:
 
-### 1. Configure Your Recipe
+### Configure Your Recipe
 
 Add the MLflow configuration to your YAML file (e.g., `llama3_2_1b_squad.yaml`):
 
@@ -123,7 +123,7 @@ mlflow:
     model: "llama-3.2-1b"
 ```
 
-### 2. Run Training
+### Run Training
 
 ```bash
 uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py \
@@ -137,7 +137,7 @@ MLflow run started: abc123def456
 View run at: file:///path/to/mlruns/#/experiments/1/runs/abc123def456
 ```
 
-### 3. View Results in MLflow UI
+### View Results in MLflow UI
 
 Launch the MLflow UI to visualize your experiments:
 

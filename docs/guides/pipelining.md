@@ -88,7 +88,7 @@ if __name__ == "__main__":
     print(ap.pretty_print_stages())
 ```
 
-### Running the Quick Start Example
+### Run the Quick Start Example
 
 Save the above code as `pipeline_example.py` and run with:
 
@@ -216,7 +216,7 @@ ap = AutoPipeline(
 ).build(model, loss_fn=loss_fn)
 ```
 
-## Understanding Model Splitting
+## Understand Model Splitting
 
 When AutoPipeline splits your model, it intelligently distributes components across pipeline stages. Here's how a typical model gets split:
 
@@ -276,7 +276,7 @@ Key observations:
 - **Rotary embeddings** are shared across all stages (for position encoding)
 - **Transformer layers** are evenly distributed
 
-## Using the Functional API for Custom Models
+## Use the Functional API for Custom Models
 
 While AutoPipeline is specifically designed as a high-level interface for Hugging Face models, the functional API in `nemo_automodel.components.distributed.pipelining.functional` provides more modular and accessible building blocks that can be used with any PyTorch model, including custom architectures. This separation allows for cleaner code organization where AutoPipeline handles Hugging Face-specific optimizations while the functional module remains model-agnostic.
 
@@ -284,7 +284,7 @@ While AutoPipeline is specifically designed as a high-level interface for Huggin
 
 The functional API provides several utilities for building custom pipeline parallel systems:
 
-#### 1. Stage ID Calculation
+#### Stage ID Calculation
 ```python
 from nemo_automodel.components.distributed.pipelining.functional import stage_ids_this_rank
 
@@ -298,7 +298,7 @@ stage_ids = stage_ids_this_rank(pp_rank=0, pp_size=4, num_stages=8, style="v")
 # Returns: (0, 7) - rank 0 gets stages 0 and 7
 ```
 
-#### 2. Module Name Generation
+#### Module Name Generation
 ```python
 from nemo_automodel.components.distributed.pipelining.functional import (
     generate_hf_model_fqn_per_model_part
@@ -315,7 +315,7 @@ module_names = generate_hf_model_fqn_per_model_part(
 )
 ```
 
-#### 3. Virtual Stage Calculation
+#### Virtual Stage Calculation
 ```python
 from nemo_automodel.components.distributed.pipelining.functional import calculate_virtual_stages
 
@@ -329,7 +329,7 @@ num_virtual_stages, stages_per_rank = calculate_virtual_stages(
 )
 ```
 
-#### 4. Pipeline Schedule Building
+#### Pipeline Schedule Build
 ```python
 from nemo_automodel.components.distributed.pipelining.functional import build_pipeline_schedule
 
@@ -552,7 +552,7 @@ ap = AutoPipeline(world_mesh=world_mesh).build(
 )
 ```
 
-## Monitoring and Debugging
+## Monitor and Debug
 
 AutoPipeline provides comprehensive tools for understanding your pipeline configuration:
 
@@ -597,7 +597,7 @@ ap.scale_grads_by_divisor(divisor=8)
 grad_norm = ap.clip_grad_norm(max_norm=1.0, norm_type=2.0)
 ```
 
-## Adding Pipeline Parallelism to Existing Configurations
+## Add Pipeline Parallelism to Existing Configurations
 
 You can easily add pipeline parallelism to any existing training configuration through command-line overrides or YAML modifications.
 
@@ -678,7 +678,7 @@ uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py \
     --dataloader.batch_size 32
 ```
 
-## Integration with Training Recipes
+## Integrate with Training Recipes
 
 AutoPipeline seamlessly integrates with NeMo AutoModel's recipe system. Here's a complete example YAML configuration:
 

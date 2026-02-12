@@ -147,14 +147,14 @@ validation_dataloader:
 
 ## Launch Training
 
-### Single-GPU quick run
+### Single-GPU Quick Run
 
 ```bash
 # Runs on a single device of the current host
 automodel kd llm --nproc-per-node=1 -c examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml
 ```
 
-### Multi-GPU (single node)
+### Multi-GPU (Single Node)
 
 ```bash
 # Leverage all GPUs on the local machine
@@ -163,21 +163,21 @@ torchrun --nproc-per-node $(nvidia-smi -L | wc -l) \
     -c examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml
 ```
 
-### SLURM Cluster
+### Slurm Cluster
 
-The CLI seamlessly submits SLURM jobs when a `slurm` section is added to the
+The CLI seamlessly submits Slurm jobs when a `slurm` section is added to the
 YAML.  Refer to `docs/guides/installation.md` for cluster instructions.
 
 ---
 
-## 4. Monitoring
+## Monitoring
 
 Metrics such as *train_loss*, *kd_loss*, *learning_rate* and *tokens/sec* are
 logged to **WandB** when the corresponding section is enabled.
 
 ---
 
-## 5. Checkpoints & Inference
+## Checkpoints and Inference
 
 - Checkpoints are written under the directory configured in the `checkpoint.checkpoint_dir` field at every `ckpt_every_steps`.
 - The final student model is saved according to the `checkpoint` section (e.g., `model_save_format: safetensors`, consolidated weights if `save_consolidated: true`).

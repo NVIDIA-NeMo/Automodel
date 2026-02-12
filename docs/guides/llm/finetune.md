@@ -4,18 +4,11 @@
 
 As large language models (LLMs) become more powerful, adapting them to
 specific tasks through fine-tuning has become essential for achieving
-high accuracy and relevance. There are two ways to do so 
-  (1)Supervised Fine-Tuning (SFT) that applies full-parameter update to the pretrained model. It is useful for tasks that requires high precision although it requires more computational resources.
-  (2) PEFT, specifically [Low-Rank Adapters (LoRA)](https://arxiv.org/abs/2106.09685) that updates only a small subset of parameters
-while keeping the base model weights frozen. It is lightweight and reduces the
-number of trainable parameters, often to less than 1%, while
-As large language models (LLMs) become more powerful, adapting them to
-specific tasks through fine-tuning has become essential for achieving
 high accuracy and relevance. There are two ways to do so: 
 - **Supervised Fine-Tuning (SFT)** applies full-parameter update to the pretrained model. It is useful for tasks that require high precision although it requires more computational resources.
 - **PEFT**, specifically [Low-Rank Adapters (LoRA)](https://arxiv.org/abs/2106.09685), updates only a small subset of parameters while keeping the base model weights frozen. It is lightweight and reduces the number of trainable parameters, often to less than 1%, while achieving decent accuracy. 
 
-NeMo Automodel simplifies the fine-tuning process by offering seamless
+NeMo AutoModel simplifies the fine-tuning process by offering seamless
 integration with Hugging Face Transformers. It allows you to fine-tune
 models without converting checkpoints, ensuring full compatibility with
 the Hugging Face ecosystem.
@@ -23,33 +16,26 @@ the Hugging Face ecosystem.
 This guide walks you through the end-to-end process of fine-tuning
 models from the Hugging Face Hub using NeMo AutoModel. You'll learn how
 to prepare datasets, train models, generate text with fine-tuned
-checkpoints, evaluate performance using the LM Eval Harness, share your
-models on the Hugging Face Model Hub, and deploy them efficiently with
-vLLM.
+checkpoints, share your models on the Hugging Face Model Hub, and deploy
+them efficiently with vLLM.
 
-<!-- In addition to this user guide, you can also explore our Quickstart,
-which features a [standalone python3
-recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py),
-offering hands-on demonstrations for quickly getting started with NeMo Automodel. -->
 In addition to this user guide, you can also explore our Quickstart,
 which features a [standalone python3 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py),
 offering hands-on demonstrations for quickly getting started with NeMo AutoModel. 
+
 ## Run SFT and PEFT with NeMo AutoModel
 
 :::{important}
-Before proceeding with this guide, please ensure that you have NeMo Automodel installed on your
+Before proceeding with this guide, please ensure that you have NeMo AutoModel installed on your
 machine. This can be achieved by running:
 ```bash
 pip3 install nemo-automodel
 ```
-For a complete guide and additional options please consult the Automodel [installation guide](../installation.md).
-Before proceeding with this guide, please ensure that you have NeMo AutoModel installed on your machine. This can be achieved by running:
-
-```bash
-pip3 install nemo-automodel
+For a complete guide and additional options please consult the AutoModel [installation guide](../installation.md).
+:::
 
 ### Model and Dataset Context
-In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Question Answering Dataset).
+In this guide, we will fine-tune Meta's `LLaMA 3.2 1B` model on the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Question Answering Dataset).
 
 #### About LLaMA 3.2 1B
 **LLaMA** is a family of decoder-only transformer models developed by Meta. The **LLaMA 3.2 1B** variant is a compact, lightweight model ideal for research and edge deployment. Despite its size, it maintains architectural features consistent with its larger siblings:
@@ -64,24 +50,6 @@ In this guide, we will fine-tune Meta’s `LLaMA 3.2 1B` model on the popular [S
 
 - **Multi-layer residual connections**: Enhances training stability and depth scaling.
 
-These design choices make LLaMA models highly competitive across various benchmarks, and their open weights make them a strong base for task-specific fine-tuning.
-
-:::{tip}
-In this guide, `meta-llama/Llama-3.2-1B` is used only as a placeholder
-model ID. You can replace it with any valid Hugging Face model ID, such
-as `Qwen/Qwen2.5-1.5B`, or any other checkpoint you have access to on
-the Hugging Face Hub that is supported as per [model coverage](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm.md) list.
-:::
-
-:::{important}
-Some Hugging Face model repositories are **gated**, you must explicitly request permission before you can download their files. If the model page shows a "Request access" or "Agree and access" button:
-
-1.  Log in with your Hugging Face account.
-2.  Click the button and accept the license terms.
-3.  Wait for approval (usually instant; occasionally manual).
-4.  Ensure the token you pass to your script (via `huggingface-cli login` or the `HF_TOKEN` environment variable) belongs to the account that was approved.
-
- Trying to pull a gated model without an authorized token will trigger a 403 "permission denied" error.
 #### Access Gated Models
 
 Some Hugging Face model repositories are **gated**, you must explicitly request permission before you can download their files. If the model page shows a "Request access" or "Agree and access" button:
@@ -95,7 +63,6 @@ Some Hugging Face model repositories are **gated**, you must explicitly request 
 Trying to pull a gated model without an authorized token will trigger a 403 "permission denied" error.
 :::
 
-
 #### About SQuAD
 The Stanford Question Answering Dataset (SQuAD) is a **reading comprehension dataset**, consisting of questions posed by crowdworkers on a set of Wikipedia articles, where the answer to every question is a segment of text, or span, from the corresponding reading passage, or the question might be unanswerable.
 
@@ -105,9 +72,9 @@ There are two major versions:
 
 - **SQuAD v2.0**: Introduces unanswerable questions, adding complexity and realism.
 
-In this tutorial, we’ll focus on **SQuAD v1.1**, which is more suitable for straightforward supervised fine-tuning without requiring additional handling of null answers.
+In this tutorial, we'll focus on **SQuAD v1.1**, which is more suitable for straightforward supervised fine-tuning without requiring additional handling of null answers.
 
-Here’s a glimpse of what the data looks like:
+Here's a glimpse of what the data looks like:
 ```json
 {
 
@@ -175,8 +142,6 @@ peft:
   use_triton: True  # enabled optimized LoRA kernel written in triton-lang
 
 
-# As mentioned earlier, we are using the SQuAD dataset. NeMo Automodel provides the make_squad_dataset
-# function which formats the prepares the dataset (e.g., formatting). We are using the "train"
 # As mentioned earlier, we are using the SQuAD dataset. NeMo AutoModel provides the make_squad_dataset
 # function which formats and prepares the dataset (e.g., formatting). We are using the "train"
 dataset:
@@ -308,18 +273,13 @@ The common model loading pipeline when doing distributed training is that each G
 In these scenarios, you can pass `is_meta_device: true` in the model config. The model will then be instantiated using [PyTorch's Meta device](https://docs.pytorch.org/docs/stable/meta.html) which loads no data, but stores all other parameter metadata necessary for sharding the model. Once the model is sharded, the model weights will be populated by only loading the weights required by the respective model shard.
 
 ## Run the Fine-Tune Recipe
-Assuming the above `yaml` is saved in a file named `sft_guide.yaml` (or `peft_guide.yaml` if you want to do PEFT), you can run the fine-tuning workflow either using the Automodel CLI or by directly invoking the recipe Python script.
+Assuming the above `yaml` is saved in a file named `sft_guide.yaml` (or `peft_guide.yaml` if you want to do PEFT), you can run the fine-tuning workflow either using the AutoModel CLI or by directly invoking the recipe Python script.
 
 ### AutoModel CLI
 
 When NeMo AutoModel is installed on your system, it includes the `automodel` CLI program that you
 can use to run jobs, locally or on distributed environments.
 
-<!-- You can use PEFT recipes via the NeMo-Run CLI (See [NeMo-Run\'s
-docs](https://github.com/NVIDIA/NeMo-Run) for more details). LoRA are
-registered as factory classes, so you can specify `peft=<lora/none>`
-directly in the terminal. This provides a quick and easy way to launch
-training jobs when you do not need to override any configuration from
 You can use PEFT recipes via the NeMo Run CLI (See [NeMo-Run 
 documentation](https://github.com/NVIDIA/NeMo-Run) for more details). LoRA are registered as factory classes, so you can specify `peft=<lora/none>`
 directly in the terminal. This provides a quick and easy way to launch
@@ -395,12 +355,12 @@ checkpoints/epoch_0_step_10/
 ├── dataloader.pt
 ├── config.yaml
 ├── model
-│   ├── adapter_config.json
-│   ├── adapter_model.safetensors
-│   └── automodel_peft_config.json
+│   ├── adapter_config.json
+│   ├── adapter_model.safetensors
+│   └── automodel_peft_config.json
 ├── optim
-│   ├── __0_0.distcp
-│   └── __1_0.distcp
+│   ├── __0_0.distcp
+│   └── __1_0.distcp
 ├── rng.pt
 └── step_scheduler.pt
 
@@ -531,7 +491,7 @@ python3 -m lm_eval --model hf \
 ```
 
 This command will run lm_eval on hellaswag using the NeMo
-Automodel fine-tuned checkpoint of [meta-llama/Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B).
+AutoModel fine-tuned checkpoint of [meta-llama/Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B).
 
 Before running this command, make sure you have specified the checkpoint
 path that you used during fine-tuning, we will use

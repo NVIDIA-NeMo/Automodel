@@ -6,7 +6,7 @@ FP8 (8-bit floating point) quantization can provide substantial speedups for mod
 
 ### Requirements for FP8 Training in NeMo AutoModel
 
-To enable FP8 training in NeMo Automodel, the following hardware and software requirements must be met:
+To enable FP8 training in NeMo AutoModel, the following hardware and software requirements must be met:
 
 - **Hardware**:  
   An NVIDIA H100 GPU or newer is required. These GPUs feature FP8 tensor cores that accelerate training.
@@ -47,7 +47,7 @@ fp8:
   emulate: false
 ```
 
-### FP8Config Parameters
+### FP8 Config Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -126,14 +126,14 @@ uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config ex
 
 ## Performance Considerations
 
-#### FP8 requires specific conditions to be effective:
+FP8 requires specific conditions to be effective:
 - Input tensors must have dimensions divisible by 16 
 - Using compatible hardware (H100+)
 - Training with `torch.compile`
 
 FP8 works best when the majority of GEMM operations are sufficiently large such that the speedup achieved by using FP8 tensor cores is greater than the overhead of dynamic quantization.
 
-#### Ideal Conditions for FP8 Performance
+### Ideal Conditions for FP8 Performance
 
 - Linear layers are large and compute-intensive
 - The model consists of fewer small operations and more large matrix multiplications
