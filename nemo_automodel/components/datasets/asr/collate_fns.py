@@ -43,7 +43,8 @@ def shift_tokens_right(
     shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()
     shifted_input_ids[:, 0] = decoder_start_token_id
 
-    # Replace any -100 (label masking) with pad_token_id in decoder inputs
+    # Replace -100 with pad_token_id to handle HuggingFace's standard label masking convention
+    # (-100 is used to ignore certain tokens in loss computation, but decoder inputs need valid token IDs)
     if -100 in shifted_input_ids:
         shifted_input_ids = shifted_input_ids.masked_fill(shifted_input_ids == -100, pad_token_id)
 
@@ -71,19 +72,16 @@ def whisper_collate_fn(
             - decoder_input_ids: (batch, text_seq_len) shifted labels for decoder
             - labels: (batch, text_seq_len) tokenized transcriptions for loss
     """
-    # Extract audio arrays and text
     audios = [ex["audio"]["array"] for ex in examples]
     text_key = "sentence" if "sentence" in examples[0] else "text"
     texts = [ex[text_key] for ex in examples]
 
-    # Process audio to mel spectrograms (automatically pads to 3000 frames / 30 seconds)
     audio_features = processor.feature_extractor(
         audios,
         sampling_rate=16000,
         return_tensors="pt",
     )
 
-    # Tokenize text transcriptions
     text_encodings = processor.tokenizer(
         texts,
         return_tensors="pt",

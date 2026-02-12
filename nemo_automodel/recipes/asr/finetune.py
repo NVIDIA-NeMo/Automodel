@@ -146,7 +146,7 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
         device_mesh: The device mesh.
     """
     if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
-        # TP does not support foreach
+        # Disable foreach optimization for TP due to incompatibility with DTensor gradient accumulation
         cfg_opt.foreach = False
 
     optimizer = []
@@ -484,7 +484,6 @@ class FinetuneRecipeForASR(BaseRecipe):
 
         apply_cache_compatibility_patches()
 
-        # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         self.device_mesh = None
@@ -725,7 +724,8 @@ class FinetuneRecipeForASR(BaseRecipe):
         model = self.model_parts[0] if not self.pp_enabled else self.pp.model
         is_ctc_model = hasattr(model, "config") and hasattr(model.config, "ctc_loss_reduction")
 
-        # Convert input_features to model dtype (for both CTC and Seq2Seq models)
+        # Convert input_features to model dtype to avoid dtype mismatch errors during forward pass
+        # (processors default to float32, but models may use bfloat16/float16 for training)
         if "input_features" in batch:
             model_dtype = next(model.parameters()).dtype
             batch["input_features"] = batch["input_features"].to(dtype=model_dtype)
@@ -905,7 +905,6 @@ class FinetuneRecipeForASR(BaseRecipe):
                 torch.distributed.recv(reporting_loss, src=src_rank)
 
         reporting_loss = reporting_loss.item()
-        # fix reporting_loss, tps across ranks
 
         return MetricsSample(
             step=self.step_scheduler.step,
@@ -940,11 +939,14 @@ class FinetuneRecipeForASR(BaseRecipe):
                 labels = batch.pop("labels")
                 num_label_tokens = (labels != -100).sum().item()
 
-                # Convert input_features to model dtype (for both CTC and Seq2Seq models)
+                # Convert input_features to model dtype to avoid dtype mismatch errors during forward pass
+                # (processors default to float32, but models may use bfloat16/float16 for training)
                 if "input_features" in batch:
                     model_dtype = next(model.parameters()).dtype
                     batch["input_features"] = batch["input_features"].to(dtype=model_dtype)
 
+                # Generate position_ids when using CP or TP, as some models require explicit position IDs
+                # for proper attention computation with sharded sequences
                 if (
                     self.device_mesh
                     and "position_ids" not in batch
