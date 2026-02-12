@@ -32,7 +32,7 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 from wandb import Settings
 
-from nemo_automodel._transformers import NeMoAutoModelForSpeechSeq2Seq
+from nemo_automodel._transformers import NeMoAutoModelForCTC, NeMoAutoModelForSpeechSeq2Seq
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -121,6 +121,8 @@ def build_model(
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
             NeMoAutoModelForSpeechSeq2Seq.from_config,
             NeMoAutoModelForSpeechSeq2Seq.from_pretrained,
+            NeMoAutoModelForCTC.from_config,
+            NeMoAutoModelForCTC.from_pretrained,
         )
 
         if is_nemo_auto_model:
@@ -128,7 +130,7 @@ def build_model(
             model = cfg_model.instantiate(**kwargs)
         else:
             raise ValueError(
-                f"ASR finetuning requires NeMoAutoModelForSpeechSeq2Seq. "
+                f"ASR finetuning requires NeMoAutoModelForSpeechSeq2Seq or NeMoAutoModelForCTC. "
                 f"Got model target: {cfg_model.get('_target_', None)}"
             )
     return model
@@ -247,10 +249,18 @@ def build_dataloader(
         if processor is None:
             try:
                 processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
+                logging.info(f"Successfully loaded AutoProcessor for {pretrained_model_name_or_path}")
             except Exception as e:
                 # Some models do not provide an AutoProcessor
                 processor = None
-                logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
+                logging.error(
+                    f"Failed to load AutoProcessor for {pretrained_model_name_or_path}. "
+                    f"Exception: {type(e).__name__}: {str(e)}"
+                )
+                raise RuntimeError(
+                    f"AutoProcessor is required but failed to load for {pretrained_model_name_or_path}. "
+                    f"Error: {type(e).__name__}: {str(e)}"
+                ) from e
 
         with FirstRankPerNode():
             ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
@@ -711,9 +721,12 @@ class FinetuneRecipeForASR(BaseRecipe):
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
 
-        # Convert input_features to model dtype for Whisper (required for bfloat16/float16)
+        # Determine model type
+        model = self.model_parts[0] if not self.pp_enabled else self.pp.model
+        is_ctc_model = hasattr(model, "config") and hasattr(model.config, "ctc_loss_reduction")
+
+        # Convert input_features to model dtype (for both CTC and Seq2Seq models)
         if "input_features" in batch:
-            model = self.model_parts[0] if not self.pp_enabled else self.pp.model
             model_dtype = next(model.parameters()).dtype
             batch["input_features"] = batch["input_features"].to(dtype=model_dtype)
 
@@ -755,25 +768,32 @@ class FinetuneRecipeForASR(BaseRecipe):
                 else nullcontext()
             )
             with train_ctx(), sync_ctx:
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                    # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(logits_to_keep=1, **batch)
-                    if "hidden_states" not in out:
-                        raise ValueError(
-                            "FusedLinearCrossEntropy requires the model to output hidden states. "
-                            "Set `model.text_config.output_hidden_states=True` in the config."
-                        )
+                if is_ctc_model:
+                    # CTC models: Pass labels to model (loss computed internally)
+                    out = model(labels=labels if is_train else None, **batch)
+                    local_loss = out.loss if is_train else torch.tensor(0.0, device=self.dist_env.device)
                 else:
-                    out = model(**batch)
+                    # Seq2Seq models: Use external loss function
+                    if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                        # use num_logits_to_keep to avoid full logits matrix in memory
+                        out = model(logits_to_keep=1, **batch)
+                        if "hidden_states" not in out:
+                            raise ValueError(
+                                "FusedLinearCrossEntropy requires the model to output hidden states. "
+                                "Set `model.text_config.output_hidden_states=True` in the config."
+                            )
+                    else:
+                        out = model(**batch)
 
-                local_loss = calculate_loss(
-                    self.loss_fn,
-                    logits=getattr(out, "logits", out),
-                    labels=labels,
-                    model=model,
-                    hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
-                    num_label_tokens=num_label_tokens,
-                )
+                    local_loss = calculate_loss(
+                        self.loss_fn,
+                        logits=getattr(out, "logits", out),
+                        labels=labels,
+                        model=model,
+                        hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
+                        num_label_tokens=num_label_tokens,
+                    )
+
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
@@ -909,6 +929,9 @@ class FinetuneRecipeForASR(BaseRecipe):
             for mp in self.model_parts:
                 mp.eval()
 
+            model = self.model_parts[0]
+            is_ctc_model = hasattr(model, "config") and hasattr(model.config, "ctc_loss_reduction")
+
             total_loss = 0.0
             total_tokens = 0
             total_num_label_tokens = 0
@@ -917,9 +940,9 @@ class FinetuneRecipeForASR(BaseRecipe):
                 labels = batch.pop("labels")
                 num_label_tokens = (labels != -100).sum().item()
 
-                # Convert input_features to model dtype for Whisper (required for bfloat16/float16)
+                # Convert input_features to model dtype (for both CTC and Seq2Seq models)
                 if "input_features" in batch:
-                    model_dtype = next(self.model_parts[0].parameters()).dtype
+                    model_dtype = next(model.parameters()).dtype
                     batch["input_features"] = batch["input_features"].to(dtype=model_dtype)
 
                 if (
@@ -933,20 +956,26 @@ class FinetuneRecipeForASR(BaseRecipe):
 
                 train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
                 with train_ctx():
-                    if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                        out = self.model_parts[0](logits_to_keep=1, **batch)
+                    if is_ctc_model:
+                        # CTC models compute loss internally
+                        out = model(labels=labels, **batch)
+                        local_loss = out.loss
                     else:
-                        out = self.model_parts[0](**batch)
-                    local_loss = calculate_loss(
-                        self.loss_fn,
-                        logits=getattr(out, "logits", out),
-                        labels=labels,
-                        model=self.model_parts[0],
-                        hidden_states=out.hidden_states[-1]
-                        if getattr(out, "hidden_states", None) is not None
-                        else None,
-                        num_label_tokens=num_label_tokens,
-                    )
+                        # Seq2Seq models use external loss
+                        if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                            out = model(logits_to_keep=1, **batch)
+                        else:
+                            out = model(**batch)
+                        local_loss = calculate_loss(
+                            self.loss_fn,
+                            logits=getattr(out, "logits", out),
+                            labels=labels,
+                            model=model,
+                            hidden_states=out.hidden_states[-1]
+                            if getattr(out, "hidden_states", None) is not None
+                            else None,
+                            num_label_tokens=num_label_tokens,
+                        )
                     total_num_label_tokens += num_label_tokens
 
                 total_loss += local_loss.item() * num_label_tokens

@@ -3187,6 +3187,7 @@ all = [
     { name = "databricks-sql-connector" },
     { name = "deltalake" },
     { name = "flash-linear-attention" },
+    { name = "librosa" },
     { name = "mamba-ssm" },
     { name = "mistral-common", extra = ["opencv"] },
     { name = "numba", version = "0.53.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
@@ -3205,6 +3206,7 @@ all = [
     { name = "transformer-engine", extra = ["pytorch"] },
 ]
 asr = [
+    { name = "librosa" },
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
 ]
 cuda = [
@@ -3301,6 +3303,7 @@ requires-dist = [
     { name = "flash-linear-attention", marker = "extra == 'extra'" },
     { name = "ftfy" },
     { name = "imageio-ffmpeg" },
+    { name = "librosa", marker = "extra == 'asr'" },
     { name = "mamba-ssm", marker = "extra == 'cuda'" },
     { name = "megatron-fsdp", specifier = ">=0.2.3" },
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'", specifier = ">=1.9.0" },

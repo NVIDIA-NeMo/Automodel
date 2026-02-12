@@ -120,7 +120,51 @@ def whisper_collate_fn(
     return batch
 
 
+def parakeet_collate_fn(
+    examples: Sequence[Dict[str, Any]],
+    processor,
+    max_length: int | None = None,
+) -> Dict[str, torch.Tensor]:
+    """Collate function for Parakeet CTC ASR models.
+
+    Processes raw audio samples into mel spectrograms and tokenizes transcriptions
+    for CTC training.
+
+    Args:
+        examples: Batch of samples with 'audio' and 'text' or 'sentence' fields
+        processor: ParakeetProcessor for audio and text processing
+        max_length: Maximum length for audio in seconds (optional)
+
+    Returns:
+        Batch dict with:
+            - input_features: (batch, feature_dim, time) mel spectrograms
+            - attention_mask: (batch, time) attention mask for variable length sequences
+            - labels: (batch, text_seq_len) tokenized transcriptions for CTC loss
+    """
+    # Extract audio arrays and text
+    audios = [ex["audio"]["array"] for ex in examples]
+    text_key = "sentence" if "sentence" in examples[0] else "text"
+    texts = [ex[text_key] for ex in examples]
+
+    # Process audio to mel spectrograms
+    processor_kwargs = {
+        "sampling_rate": 16000,
+        "return_tensors": "pt",
+        "return_attention_mask": True,
+    }
+
+    if max_length is not None:
+        processor_kwargs["padding"] = "max_length"
+        processor_kwargs["max_length"] = max_length * 16000  # Convert seconds to samples
+
+    # Process audio and text together (processor handles both)
+    batch = processor(audio=audios, text=texts, **processor_kwargs)
+
+    return batch
+
+
 COLLATE_FNS = {
     "WhisperProcessor": whisper_collate_fn,
+    "ParakeetProcessor": parakeet_collate_fn,
     "default": whisper_collate_fn,
 }

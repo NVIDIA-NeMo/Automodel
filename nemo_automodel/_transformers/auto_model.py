@@ -38,6 +38,7 @@ apply_torch_patches()
 from huggingface_hub import constants as hf_constants  # noqa: E402
 from transformers import (  # noqa: E402
     AutoModelForCausalLM,
+    AutoModelForCTC,
     AutoModelForImageTextToText,
     AutoModelForSequenceClassification,
     AutoModelForSpeechSeq2Seq,
@@ -710,6 +711,51 @@ class NeMoAutoModelForSpeechSeq2Seq(_BaseNeMoAutoModelClass, AutoModelForSpeechS
     >>> peft_config = PeftConfig(lora_rank=16, lora_alpha=32)
     >>> model = NeMoAutoModelForSpeechSeq2Seq.from_pretrained(
     ...     "openai/whisper-medium",
+    ...     peft_config=peft_config
+    ... )
+    """
+
+    pass
+
+
+class NeMoAutoModelForCTC(_BaseNeMoAutoModelClass, AutoModelForCTC):
+    """Drop-in replacement for ``transformers.AutoModelForCTC`` for CTC-based ASR models.
+
+    NeMo-wrapped version of HuggingFace's AutoModelForCTC that adds support for:
+    - FSDP2/MegatronFSDP with tensor/context/sequence/pipeline parallelism
+    - PEFT (LoRA and other parameter-efficient fine-tuning methods)
+    - FP8 quantization via torchao
+    - Pipeline parallelism for large-scale distributed training
+    - Torch.compile for improved performance
+
+    This class is designed for CTC-based ASR models like Parakeet that take audio
+    inputs and generate text transcriptions using Connectionist Temporal Classification.
+    It maintains API compatibility with the HuggingFace version while adding NeMo's
+    distributed training infrastructure.
+
+    The class only overrides ``from_pretrained`` and ``from_config`` to add optional
+    infrastructure configuration. All model forward signatures, generation utilities,
+    and weight shapes remain identical to the base HuggingFace implementation.
+
+    Examples:
+    --------
+    >>> # Load Parakeet CTC model with infrastructure
+    >>> model = NeMoAutoModelForCTC.from_pretrained("nvidia/parakeet-ctc-1.1b")
+
+    >>> # Load with FSDP2 configuration
+    >>> from nemo_automodel.components.distributed.config import FSDP2Config
+    >>> distributed_config = FSDP2Config(sequence_parallel=True)
+    >>> model = NeMoAutoModelForCTC.from_pretrained(
+    ...     "nvidia/parakeet-ctc-0.6b",
+    ...     distributed_config=distributed_config,
+    ...     torch_dtype="bfloat16"
+    ... )
+
+    >>> # Load with LoRA PEFT
+    >>> from nemo_automodel.components._peft import PeftConfig
+    >>> peft_config = PeftConfig(lora_rank=16, lora_alpha=32)
+    >>> model = NeMoAutoModelForCTC.from_pretrained(
+    ...     "nvidia/parakeet-ctc-1.1b",
     ...     peft_config=peft_config
     ... )
     """
