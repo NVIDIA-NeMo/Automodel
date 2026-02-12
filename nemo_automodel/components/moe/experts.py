@@ -277,8 +277,7 @@ class GroupedExperts(nn.Module):
             self.down_proj_bias = None
 
         self.expert_activation = get_expert_activation(config)
-        if self.use_torch_mm:
-            self.expert_activation_grouped = get_expert_activation_for_deepep(config)
+        self.expert_activation_grouped = get_expert_activation_for_deepep(config)
 
     def forward(
         self,
@@ -304,6 +303,7 @@ class GroupedExperts(nn.Module):
                 Shape is [num_tokens, model_dim]
         """
         assert not isinstance(x, DTensor)
+        input_dtype = x.dtype
 
         # Get the projection tensor for EP mesh extraction
         if isinstance(self.gate_and_up_projs, DTensor):
@@ -326,10 +326,16 @@ class GroupedExperts(nn.Module):
         )
         down_projs = self.down_projs.to_local() if isinstance(self.down_projs, DTensor) else self.down_projs
 
-        # Original DTensor path: all-gather/reduce-scatter
+        # DTensor all-gather/reduce-scatter for expert parallelism
         if ep_size > 1:
-            x = DTensor.from_local(x, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
-            weights = DTensor.from_local(weights.float(), device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
+            # grad_placements=[Partial()] ensures backward does reduce-scatter
+            # (default Replicate would just slice, losing cross-rank gradient contributions)
+            x = DTensor.from_local(x, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
+                grad_placements=[Partial()]
+            )
+            weights = DTensor.from_local(weights.float(), device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
+                grad_placements=[Partial()]
+            )
             indices = DTensor.from_local(indices, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
             token_mask = DTensor.from_local(token_mask, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
 
@@ -365,7 +371,7 @@ class GroupedExperts(nn.Module):
             y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
             y = y.redistribute(placements=[Shard(0)]).to_local()
 
-        return y
+        return y.to(input_dtype)
 
     def _forward_loop(
         self,
@@ -380,7 +386,7 @@ class GroupedExperts(nn.Module):
         experts_end_idx,
     ):
         """Per-expert loop forward path using gather/scatter."""
-        y = torch.zeros_like(x)
+        y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
 
         active_local_experts = 0
         for i in range(experts_start_idx, experts_end_idx):
@@ -400,29 +406,30 @@ class GroupedExperts(nn.Module):
 
             gate_and_up_proj = gate_and_up_projs[local_idx]
             gate_up_proj_bias = self.gate_up_proj_bias[local_idx] if self.expert_bias else None
-            expert_out = (
-                self.expert_activation(
-                    x_idx,
-                    gate_and_up_proj=gate_and_up_proj,
-                    down_proj=down_proj,
-                    gate_up_proj_bias=gate_up_proj_bias,
-                    down_proj_bias=down_proj_bias,
-                )
-                * weights[idx, top, None]
-            )
 
-            y.scatter_add_(dim=0, index=idx_b, src=expert_out.to(x.dtype))
+            # Up projection (separate from activation, matching DeepEP pattern)
+            gate_and_up_out = x_idx @ gate_and_up_proj
+            if gate_up_proj_bias is not None:
+                gate_and_up_out = gate_and_up_out + gate_up_proj_bias
+
+            # Weighted activation (routing weight applied BETWEEN up and down projections)
+            # Uses WeightedSwiGLUFunction with float32 backward precision
+            w = weights[idx, top, None]
+            activated = self.expert_activation_grouped(gate_and_up_out, w)
+
+            # Down projection
+            expert_out = activated @ down_proj
+            if down_proj_bias is not None:
+                expert_out = expert_out + down_proj_bias * w
+
+            y.scatter_add_(dim=0, index=idx_b, src=expert_out.float())
 
         # Dummy computation for gradient flow when no tokens routed locally
         if active_local_experts == 0:
-            expert_out = (
-                self.expert_activation(
-                    torch.zeros_like(x[0]).unsqueeze(0),
-                    gate_and_up_proj=gate_and_up_projs[0],
-                    down_proj=down_projs[0],
-                )
-                * weights[0, 0, None]
-            )
+            dummy_x = torch.zeros_like(x[0]).unsqueeze(0)
+            gate_and_up_out = dummy_x @ gate_and_up_projs[0]
+            activated = self.expert_activation_grouped(gate_and_up_out, weights[0, 0, None].unsqueeze(0))
+            expert_out = activated @ down_projs[0]
             y[0] += expert_out[0]
 
         return y
@@ -447,7 +454,7 @@ class GroupedExperts(nn.Module):
             experts_start_idx,
         )
 
-        y = torch.zeros_like(x)
+        y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
 
         if tokens_per_expert.sum() > 0:
             permuted_x = x[sorted_token_ids]
@@ -482,7 +489,7 @@ class GroupedExperts(nn.Module):
                 )
 
             scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
-            y.scatter_add_(0, scatter_ids, output2.to(x.dtype))
+            y.scatter_add_(0, scatter_ids, output2.float())
         else:
             # Dummy computation for gradient flow
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
