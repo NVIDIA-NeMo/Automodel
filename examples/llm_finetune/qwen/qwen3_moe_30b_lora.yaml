@@ -52,18 +52,12 @@ checkpoint:
   checkpoint_dir: checkpoints/qwen3_moe_lora
   model_save_format: safetensors
 
-moe_config:
-  _target_: nemo_automodel.components.moe.config.MoEParallelizerConfig
-  activation_checkpointing: true
-
 distributed:
+  strategy: fsdp2
   tp_size: 1
   cp_size: 1
   pp_size: 1
   ep_size: 8
-
-distributed_config:
-  _target_: nemo_automodel.components.distributed.config.FSDP2Config
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

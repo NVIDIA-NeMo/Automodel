@@ -87,24 +87,22 @@ optimizer:
 
 # DDP / FSDP2 / etc
 distributed:
+  strategy: fsdp2
   dp_size: none
   tp_size: 4
   cp_size: 1  # Change to 2 once packed sequence is supported with CP
   pp_size: 4
 
-distributed_config:
-  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false
   activation_checkpointing: true
 
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.config.PipelineConfig
-  pp_schedule: interleaved1f1b
-  pp_microbatch_size: 1
-  layers_per_stage: 4
-  scale_grads_in_schedule: false
-  round_virtual_stages_to_pp_multiple: up
-  dtype: bf16
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 4
+    scale_grads_in_schedule: false
+    round_virtual_stages_to_pp_multiple: up
+    dtype: bf16
 
 packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences

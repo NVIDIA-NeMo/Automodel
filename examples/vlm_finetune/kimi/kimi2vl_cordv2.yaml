@@ -29,28 +29,22 @@ rng:
   ranked: true
 
 distributed:
+  strategy: fsdp2
   tp_size: 1
   cp_size: 1
   pp_size: 1
   ep_size: 8
 
-distributed_config:
-  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false
 
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.config.PipelineConfig
-  pp_schedule: interleaved1f1b
-  pp_microbatch_size: 2
-  round_virtual_stages_to_pp_multiple: down
-  scale_grads_in_schedule: false
-  layers_per_stage: 7
-  patch_inner_model: false
-  patch_causal_lm_model: false
-
-moe_config:
-  _target_: nemo_automodel.components.moe.config.MoEParallelizerConfig
-  activation_checkpointing: false
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 2
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    layers_per_stage: 7
+    patch_inner_model: false
+    patch_causal_lm_model: false
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained

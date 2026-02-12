@@ -56,12 +56,11 @@ peft:
   # lora_dtype: torch.bfloat16
 
 distributed:
+  strategy: fsdp2
   dp_size: none
   tp_size: 1
   cp_size: 1
 
-distributed_config:
-  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false
 
 loss_fn:

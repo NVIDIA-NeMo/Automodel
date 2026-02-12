@@ -39,12 +39,10 @@ model:
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
 
 distributed:
+  strategy: megatron_fsdp
   dp_size: none
   tp_size: 1
   cp_size: 1
-
-distributed_config:
-  _target_: nemo_automodel.components.distributed.config.MegatronFSDPConfig
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

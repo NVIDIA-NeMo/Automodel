@@ -28,10 +28,6 @@ rng:
   seed: 1111
   ranked: true
 
-moe_config:
-  _target_: nemo_automodel.components.moe.config.MoEParallelizerConfig
-  activation_checkpointing: false
-
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
@@ -46,13 +42,12 @@ checkpoint:
   enabled: false
 
 distributed:
+  strategy: fsdp2
   dp_size: none
   tp_size: 1
   cp_size: 1
   ep_size: 2
 
-distributed_config:
-  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false
   defer_fsdp_grad_sync: false
 
