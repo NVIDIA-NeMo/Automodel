@@ -57,6 +57,7 @@ class NeMoAutoModelBiencoder(_BaseNeMoAutoModelClass):
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
         sdpa_method: Optional[List[SDPBackend]] = None,
+        attn_implementation: str = "flash_attention_2",
         **kwargs,
     ):
         """
@@ -81,6 +82,7 @@ class NeMoAutoModelBiencoder(_BaseNeMoAutoModelClass):
             use_liger_kernel: Whether to apply Liger kernel optimizations
             use_sdpa_patching: Whether to apply SDPA patching
             sdpa_method: SDPA backend methods to use
+            attn_implementation: Attention implementation to use
             **kwargs: Additional arguments passed to BiencoderModel.build
 
         Returns:
@@ -113,7 +115,7 @@ class NeMoAutoModelBiencoder(_BaseNeMoAutoModelClass):
             )
 
         # Use BiencoderModel.build to initialize model with base encoders
-        hf_kwargs = {"attn_implementation": "flash_attention_2"}
+        hf_kwargs = {"attn_implementation": attn_implementation}
         kwargs.update(hf_kwargs)
         model = BiencoderModel.build(
             model_name_or_path=pretrained_model_name_or_path,
