@@ -21,6 +21,7 @@ import torch
 
 from nemo_automodel._transformers.auto_model import (
     _get_next_fallback_attn,
+    _init_model,
     _patch_attention,
     _get_mixin_wrapped_class,
     _apply_peft_and_lower_precision,
@@ -500,3 +501,93 @@ class TestFilterKwargsForInit:
         result = _filter_kwargs_for_init(ModelWithVarKwargs, kwargs)
 
         assert result == kwargs
+
+
+class TestInitModelConfigKwargRemoval:
+    """Tests for _init_model popping 'config' from kwargs to prevent duplicate argument errors."""
+
+    def test_config_kwarg_removed_before_custom_model_init(self):
+        """When _filter_kwargs_for_init preserves 'config' (e.g. model has **kwargs),
+        _init_model should still remove it so config isn't passed both positionally and as kwarg."""
+        from nemo_automodel._transformers.registry import ModelRegistry
+
+        captured_kwargs = {}
+
+        class FakeModelCls:
+            def __init__(self, config, **kwargs):
+                captured_kwargs.update(kwargs)
+
+        fake_config = MagicMock()
+        fake_config.to_dict.return_value = {}
+        fake_config.architectures = ["FakeModel"]
+        fake_config.torch_dtype = "bfloat16"
+        fake_config.name_or_path = "fake/model"
+
+        fake_cls = MagicMock()
+        fake_cls._model_mapping = {}
+
+        with (
+            patch.object(ModelRegistry, "model_arch_name_to_cls", {"FakeModel": FakeModelCls}),
+            patch(
+                "nemo_automodel._transformers.auto_model.get_hf_config",
+                return_value=fake_config,
+            ),
+            patch(
+                "nemo_automodel._transformers.auto_model._download_model_weights",
+            ),
+        ):
+            # Pass "config" in kwargs — this simulates the scenario where HF's
+            # from_pretrained puts `config` into kwargs
+            _, model = _init_model(
+                fake_cls,
+                "fake/model",
+                "sdpa",
+                "bfloat16",
+                None,
+                False,
+                config=fake_config,
+                trust_remote_code=False,
+            )
+
+        # "config" should NOT appear in the kwargs received by the model
+        assert "config" not in captured_kwargs
+
+    def test_config_kwarg_absent_no_error(self):
+        """When 'config' is not in kwargs, _init_model should not raise."""
+        from nemo_automodel._transformers.registry import ModelRegistry
+
+        class FakeModelCls:
+            def __init__(self, config, **kwargs):
+                pass
+
+        fake_config = MagicMock()
+        fake_config.to_dict.return_value = {}
+        fake_config.architectures = ["FakeModel2"]
+        fake_config.torch_dtype = "bfloat16"
+        fake_config.name_or_path = "fake/model"
+
+        fake_cls = MagicMock()
+        fake_cls._model_mapping = {}
+
+        with (
+            patch.object(ModelRegistry, "model_arch_name_to_cls", {"FakeModel2": FakeModelCls}),
+            patch(
+                "nemo_automodel._transformers.auto_model.get_hf_config",
+                return_value=fake_config,
+            ),
+            patch(
+                "nemo_automodel._transformers.auto_model._download_model_weights",
+            ),
+        ):
+            # No "config" in kwargs — should work fine
+            _, model = _init_model(
+                fake_cls,
+                "fake/model",
+                "sdpa",
+                "bfloat16",
+                None,
+                False,
+                trust_remote_code=False,
+            )
+
+        assert model is not None
