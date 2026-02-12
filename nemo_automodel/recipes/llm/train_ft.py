@@ -904,6 +904,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 patch_stage_backward_maybe_with_nosync=self.cfg.get("model.backend.enable_fsdp_optimizations", False),
                 loss_fn=self.loss_fn,
             )
+            # Infer pp_seq_len from dataset config if not explicitly set
+            if hasattr(self.pipeline_config, "pp_seq_len") and self.pipeline_config.pp_seq_len is None:
+                packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
+                if packed_seq_size > 0:
+                    self.pipeline_config.pp_seq_len = packed_seq_size
+                elif self.cfg.get("dataset.seq_len", None) is not None:
+                    self.pipeline_config.pp_seq_len = self.cfg.dataset.seq_len
         else:
             self.loss_fn = build_loss_fn(self.cfg.loss_fn)
 
