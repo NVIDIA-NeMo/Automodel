@@ -5,8 +5,6 @@ larger **teacher** model using the `kd` (knowledge distillation) recipe.
 
 In particular, we will show how to distill a 3B (`meta-llama/Llama-3.2-3B`) model into a 1B (`meta-llama/Llama-3.2-1B`) model.
 
----
-
 ## What is Knowledge Distillation?
 
 Knowledge distillation (KD) transfers the *dark knowledge* of a high-capacity
@@ -22,8 +20,6 @@ $$
 
 where $\(\alpha\)$ is the `kd_ratio`, $\(T\)$ softmax `temperature` and $y$ the labels. For the arguments p:
 $$p^{s} = softmax(z^{s}, T)$$.
-
----
 
 ## Prepare the YAML Config
 
@@ -168,14 +164,10 @@ torchrun --nproc-per-node $(nvidia-smi -L | wc -l) \
 The CLI seamlessly submits Slurm jobs when a `slurm` section is added to the
 YAML.  Refer to `docs/guides/installation.md` for cluster instructions.
 
----
-
 ## Monitoring
 
 Metrics such as *train_loss*, *kd_loss*, *learning_rate* and *tokens/sec* are
 logged to **WandB** when the corresponding section is enabled.
-
----
 
 ## Checkpoints and Inference
 

@@ -2,8 +2,6 @@
 
 This guide covers **FineWeb** data preparation, **defining** a [NanoGPT‑style](https://github.com/KellerJordan/modded-nanogpt) model, and **launching and monitoring** a NeMo AutoModel pre‑training run.
 
----
-
 ## Set Up Your Environment
 
 In this guide, we will use an interactive environment to install NeMo AutoModel from Git. You can also install NeMo AutoModel from PyPI or use our bi-monthly Docker container (see the [Installation Guide](../installation.md)).
@@ -23,8 +21,6 @@ For this guide we will use a single machine equipped with 8xH100 NVIDIA GPUs.
 :::tip
 To run this guide on a single GPU, use the single-GPU command in the **Launch Training** section below and scale down the YAML (for example, reduce `step_scheduler.global_batch_size` / `local_batch_size`, and shrink the model via `model.n_layer` / `model.n_embd` / `model.n_head`). For more launch patterns, see [Run on Your Local Workstation](../../launcher/local-workstation.md).
 :::
-
----
 
 ## Pre-Process the FineWeb Dataset
 
@@ -409,8 +405,6 @@ Update the `file_pattern` to match your data location. For example, if using `to
 
 Scale **width/depth**, `batch_size`, or `seq_len` as needed - the recipe is model-agnostic.
 
----
-
 ## Launch Training
 
 ```bash
@@ -457,8 +451,6 @@ wandb:
   entity: "your-wandb-entity"
   name: "nanogpt-500M-tokens"
 ```
-
----
 
 ## Explore Further Work
 

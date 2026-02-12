@@ -24,7 +24,6 @@ This guide explains how to install NeMo AutoModel for LLM, VLM, and OMNI models 
 - **CPU**: Multi-core processor (8+ cores recommended)
 - **Network**: Stable internet connection for downloading models
 
----
 ## Installation Options for Non-Developers
 This section explains the easiest installation options for non-developers, including using pip3 via PyPI or leveraging a preconfigured NVIDIA NeMo Docker container. Both methods offer quick access to the latest stable release of NeMo AutoModel with all required dependencies.
 ### Install via PyPI (Recommended)
@@ -54,7 +53,6 @@ docker run --gpus all -it --rm \
   nvcr.io/nvidia/nemo-automodel:25.11.00
 ```
 
----
 ## Installation Options for Developers
 This section provides installation options for developers, including pulling the latest source from GitHub, using editable mode, or mounting the repo inside a NeMo Docker container.
 ### Install from GitHub (Source)

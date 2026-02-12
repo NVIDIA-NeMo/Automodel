@@ -3,8 +3,6 @@
 Gradient checkpointing - also called _activation checkpointing_ - trades a little extra compute for a **large reduction in GPU memory** by recomputing intermediate activations during the backwards pass instead of storing them.  
 It is especially powerful when combined with memory-efficient loss functions (e.g. Linear-Cut Cross-Entropy) and parameter sharding via FSDP.
 
----
-
 ## Enable Gradient Checkpointing
 
 ### Configure in YAML
@@ -29,8 +27,6 @@ from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 fsdp2_manager = FSDP2Manager(activation_checkpointing=True)
 model = fsdp2_manager.parallelize(model)
 ```
-
----
 
 ## Combine with Linear-Cut Cross-Entropy (LC-CE)
 
@@ -65,13 +61,9 @@ LC-CE and gradient checkpointing target **different memory hot-spots** (output l
 - Expect ±5 % variance depending on exact model, sequence length and GPU architecture.
 :::
 
----
-
 ## Performance Considerations
 1. **Extra compute** - Each checkpointed segment is recomputed once during the backward pass. In practice the wall-clock overhead is ≈ 5-10 % for transformer models.
 2. **Throughput vs Batch Size** - The goal is usually to _increase batch size_ or _sequence length_ while keeping throughput constant.
-
----
 
 ## Verify It Works
 Run your training script and inspect the peak memory:
