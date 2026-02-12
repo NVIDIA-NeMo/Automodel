@@ -23,7 +23,6 @@ import torch
 from torch import nn
 
 logger = logging.getLogger(__name__)
-from nemo_automodel.components.distributed.init_utils import get_rank_safe
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
@@ -207,7 +206,9 @@ class BackendConfig:
 
         # Backward compatibility
         if self.experts in ("te", "gmm") and self.dispatcher != "deepep":
-            if get_rank_safe() == 0:
+            if (
+                torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
+            ) or not torch.distributed.is_initialized():
                 logger.info(
                     f"experts='{self.experts}' requires dispatcher='deepep', but got dispatcher='{self.dispatcher}'. "
                     "Setting dispatcher to torch and experts to torch_mm."
