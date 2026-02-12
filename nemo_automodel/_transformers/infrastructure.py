@@ -170,7 +170,8 @@ def _apply_peft_and_lower_precision(
             logger.info("Enabling PEFT with Pipeline Parallelism")
             logger.info("Disabling Triton with Pipeline Parallelism Enabled.")
             peft_config.use_triton = False
-        apply_lora_to_linear_modules(model, peft_config, quantization_config=quantization_config)
+        # Skip freeze here - will do global freeze after checkpoint loading
+        apply_lora_to_linear_modules(model, peft_config, quantization_config=quantization_config, skip_freeze=True)
 
     # FP8
     if fp8_config is not None:
@@ -551,17 +552,15 @@ def apply_model_infrastructure(
                 lora_a_init,
                 load_base_model=load_base_model,
             )
-        
-        # Re-freeze expert parameters after checkpoint loading (checkpoint loading can reset requires_grad)
-        if peft_config is not None:
-            from nemo_automodel.components.moe.experts import GroupedExpertsTE
-            for mp in models_to_load:
-                for module in mp.modules():
-                    if isinstance(module, GroupedExpertsTE):
-                        for param in module.gate_up_linear.parameters():
-                            param.requires_grad_(False)
-                        for param in module.down_linear.parameters():
-                            param.requires_grad_(False)
+    
+    # Freeze parameters after checkpoint loading and parallelization
+    # This catches params created during parallelization (e.g., GroupedExpertsTE in init_token_dispatcher)
+    if peft_config is not None:
+        models_to_freeze = model.parts if hasattr(model, "parts") else [model]
+        for mp in models_to_freeze:
+            for name, param in mp.named_parameters():
+                if "lora_" not in name and param.requires_grad:
+                    param.requires_grad_(False)
 
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
