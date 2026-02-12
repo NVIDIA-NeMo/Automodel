@@ -90,3 +90,23 @@ class MoEConfig:
     def __post_init__(self):
         if isinstance(self.dtype, str):
             self.dtype = dtype_from_str(self.dtype, default=torch.bfloat16)
+
+
+@dataclass
+class MoEMetricsConfig:
+    """Configuration for MoE load balance metrics logging.
+
+    Attributes:
+        enabled: Whether to enable load balance metric tracking.
+        mode: Logging mode - "brief" for scalar line charts only,
+            "detailed" adds per-layer breakdowns.
+        detailed_every_steps: How often to log detailed metrics (only used when mode="detailed").
+            None means every step.
+        top_k_experts: Number of top (highest) and bottom (lowest) utilization experts
+            to emit per layer. Reduces wandb key count for models with many experts.
+    """
+
+    enabled: bool = False
+    mode: str = "brief"
+    detailed_every_steps: Optional[int] = None
+    top_k_experts: int = 5

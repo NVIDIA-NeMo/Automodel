@@ -237,6 +237,11 @@ class Gate(nn.Module):
         # accumulation steps.
         self._cumulative_expert_load: Optional[torch.Tensor] = None
 
+        # Load balance tracking (enabled externally via enable_load_balance_tracking)
+        self._track_load_balance: bool = False
+        self._last_expert_load: Optional[torch.Tensor] = None
+        self._last_aux_loss: Optional[torch.Tensor] = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -313,8 +318,11 @@ class Gate(nn.Module):
             weights = weights.to(dtype=original_dtype)
             original_scores = original_scores.to(dtype=original_dtype)
 
-        if self.bias_update_factor > 0 or self.aux_loss_coeff > 0:
+        if self.bias_update_factor > 0 or self.aux_loss_coeff > 0 or self._track_load_balance:
             expert_load = self._compute_expert_load(indices, token_mask)
+
+        if self._track_load_balance:
+            self._last_expert_load = expert_load.detach()
 
         if self.bias_update_factor > 0 and self.training:
             if self._cumulative_expert_load is None:
@@ -329,6 +337,9 @@ class Gate(nn.Module):
             # Training scales all gradients by 1/(number of tokens).
             # To correct this scaling, we need to scale the aux_loss by number of tokens here.
             MoEAuxLossAutoScaler.apply(weights, aux_loss * weights.shape[0])
+
+        if self._track_load_balance and aux_loss is not None:
+            self._last_aux_loss = aux_loss.detach()
 
         return weights.type_as(x), indices, aux_loss
 
