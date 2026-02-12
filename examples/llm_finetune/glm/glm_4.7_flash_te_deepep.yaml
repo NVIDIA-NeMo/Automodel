@@ -31,8 +31,8 @@ rng:
   seed: 1111
   ranked: true
 
-parallelizer:
-  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
+moe_config:
+  _target_: nemo_automodel.components.moe.config.MoEParallelizerConfig
   activation_checkpointing: false
 
 model:
