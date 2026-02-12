@@ -75,9 +75,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         }
         self.internal_to_hf_map = {v: k for k, v in self.hf_to_internal_map.items()}
 
-    def _apply_key_mapping(
-        self, state_dict: dict[str, Any], mapping: dict[str, str]
-    ) -> dict[str, Any]:
+    def _apply_key_mapping(self, state_dict: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any]:
         """Apply key substring mappings to state dict keys."""
         new_state_dict = {}
         for key, value in state_dict.items():
@@ -116,12 +114,12 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                     )
 
                     if state_dict_utils.is_dtensor(tensor):
-                        split_weights, expert_ids = (
-                            state_dict_utils.split_experts_weights_dtensor_aware(tensor, n_experts)
+                        split_weights, expert_ids = state_dict_utils.split_experts_weights_dtensor_aware(
+                            tensor, n_experts
                         )
                     else:
-                        start_expert, end_expert = (
-                            state_dict_utils.get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
+                        start_expert, end_expert = state_dict_utils.get_expert_range_for_rank_from_mesh(
+                            device_mesh, n_experts
                         )
                         split_weights = [tensor[i].to(self.dtype).cpu() for i in range(tensor.shape[0])]
                         expert_ids = list(range(start_expert, end_expert))
@@ -135,9 +133,9 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
 
                         if ep_group is not None:
                             payload = (expert_ids, [w.cpu() for w in split_weights])
-                            gathered: list[tuple[list[int], list[torch.Tensor]]] = [
-                                None
-                            ] * dist.get_world_size(ep_group)
+                            gathered: list[tuple[list[int], list[torch.Tensor]]] = [None] * dist.get_world_size(
+                                ep_group
+                            )
                             dist.all_gather_object(gathered, payload, group=ep_group)
                             for ids, weights in gathered:
                                 for eid, w in zip(ids, weights):
@@ -181,22 +179,16 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
     ) -> dict[str, Any]:
         # Detect model prefix convention
         expert_keys = [
-            key
-            for key in hf_state_dict.keys()
-            if ".mlp.experts.gate_up_proj" in key or ".mlp.experts.down_proj" in key
+            key for key in hf_state_dict.keys() if ".mlp.experts.gate_up_proj" in key or ".mlp.experts.down_proj" in key
         ]
         if not expert_keys:
-            raise RuntimeError(
-                "Expected aggregated expert weights (gate_up_proj / down_proj) in the checkpoint."
-            )
+            raise RuntimeError("Expected aggregated expert weights (gate_up_proj / down_proj) in the checkpoint.")
         self._uses_model_prefix = any(key.startswith("model.") for key in expert_keys)
         model_prefix = "model." if self._uses_model_prefix else ""
 
         n_experts = self.moe_config.n_routed_experts
         if device_mesh is not None:
-            start_expert, end_expert = state_dict_utils.get_expert_range_for_rank_from_mesh(
-                device_mesh, n_experts
-            )
+            start_expert, end_expert = state_dict_utils.get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
             rank = (
                 state_dict_utils.get_submesh(device_mesh, ("ep",)).get_rank()
                 if "ep" in device_mesh.mesh_dim_names
@@ -219,9 +211,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                 local_tensor = value[start_expert:end_expert].transpose(1, 2).to(self.dtype)
                 native_key = f"{model_prefix}language_model.layers.{layer_num}.mlp.experts."
                 native_key += "gate_and_up_projs" if which == "gate_up_proj" else "down_projs"
-                state_dict[native_key] = state_dict_utils.create_dtensor_from_local(
-                    local_tensor, device_mesh, rank
-                )
+                state_dict[native_key] = state_dict_utils.create_dtensor_from_local(local_tensor, device_mesh, rank)
                 continue
 
             # Skip quantization scale keys

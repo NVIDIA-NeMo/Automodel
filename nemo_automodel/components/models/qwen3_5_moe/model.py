@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen3.5-MoE (VL) NeMo Automodel support.
-"""
+"""Qwen3.5-MoE (VL) NeMo Automodel support."""
 
 from typing import Any
 
@@ -28,15 +27,15 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeGatedDeltaNet,
-    Qwen3_5MoeModel as HFQwen3_5MoeModel,
-)
-from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeModelOutputWithPast,
     Qwen3_5MoeTextRotaryEmbedding,
     Qwen3_5MoeVisionRotaryEmbedding,
 )
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    Qwen3_5MoeModel as HFQwen3_5MoeModel,
+)
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.model import Block
@@ -190,8 +189,7 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
 # Text decoder backend (replaces HF Qwen3_5MoeTextModel with NeMo blocks)
 # ---------------------------------------------------------------------------
 class Qwen3_5MoeTextModelBackend(nn.Module):
-    """Qwen3.5-MoE text decoder rebuilt on top of the Qwen3-Next Block.
-    """
+    """Qwen3.5-MoE text decoder rebuilt on top of the Qwen3-Next Block."""
 
     def __init__(
         self,
@@ -235,9 +233,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
 
         # --------------- Layers ---------------
         embed_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, self.padding_idx, dtype=embed_dtype
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx, dtype=embed_dtype)
 
         # Use Qwen3_5MoeBlock — same as Qwen3Next Block but with native GatedDeltaNet
         self.layers = nn.ModuleDict(
@@ -339,9 +335,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
 # ---------------------------------------------------------------------------
 # Top-level conditional generation model
 # ---------------------------------------------------------------------------
-class Qwen3_5MoeForConditionalGeneration(
-    HFCheckpointingMixin, HFQwen3_5MoeForConditionalGeneration, MoEFSDPSyncMixin
-):
+class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForConditionalGeneration, MoEFSDPSyncMixin):
     """Qwen3.5-MoE VL conditional generation model using NeMo backend components.
 
     Inherits the HF model to reuse:
@@ -392,9 +386,7 @@ class Qwen3_5MoeForConditionalGeneration(
 
         # Replace HF text decoder with our NeMo backend
         text_config = config.text_config if hasattr(config, "text_config") else config
-        self.model.language_model = Qwen3_5MoeTextModelBackend(
-            text_config, backend=self.backend, moe_config=moe_config
-        )
+        self.model.language_model = Qwen3_5MoeTextModelBackend(text_config, backend=self.backend, moe_config=moe_config)
 
         # Replace lm_head with NeMo backend linear
         self.lm_head = initialize_linear_module(
