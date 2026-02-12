@@ -19,13 +19,14 @@ export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
 # revert back to Qwen/Qwen2.5-1.5B when we can use cache from HF_HOME
-MODLE_PATH=/home/TestData/HF_HOME/hub/models--Qwen--Qwen2.5-1.5B/snapshots/8faed761d45a263340a0528343f099c05c9a4323
+MODEL_PATH=/home/TestData/HF_HOME/hub/models--Qwen--Qwen2.5-1.5B/snapshots/8faed761d45a263340a0528343f099c05c9a4323
 
 # override with a smaller model Qwen/Qwen2.5-1.5B for testing
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --master-port=29513 --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
 nemo_automodel/recipes/llm/benchmark.py \
     --config examples/llm_finetune/qwen/custom_qwen2_5_32b_peft_benchmark.yaml \
-    --model.pretrained_model_name_or_path=${MODLE_PATH} \
+    --model.pretrained_model_name_or_path=${MODEL_PATH} \
+    --model.num_hidden_layers=2 \
     --distributed.tp_size=2 \
     --distributed.pp_size=1 \
     --distributed_config.sequence_parallel=True \
