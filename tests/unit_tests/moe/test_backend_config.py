@@ -53,15 +53,17 @@ class TestBackendConfigGatePrecision:
 class TestBackendConfigExpertsDispatcherValidation:
     """Test BackendConfig validation for experts and dispatcher fields."""
 
-    def test_te_experts_requires_deepep(self):
-        """Test that BackendConfig validates te experts requires deepep dispatcher."""
-        with pytest.raises(ValueError, match="experts='te' requires dispatcher='deepep'"):
-            BackendConfig(experts="te", dispatcher="torch")
+    def test_te_experts_falls_back_to_torch(self):
+        """Test that BackendConfig falls back te experts to torch when dispatcher is not deepep."""
+        config = BackendConfig(experts="te", dispatcher="torch")
+        assert config.experts == "torch"
+        assert config.dispatcher == "torch"
 
-    def test_gmm_experts_requires_deepep(self):
-        """Test that BackendConfig validates gmm experts requires deepep dispatcher."""
-        with pytest.raises(ValueError, match="experts='gmm' requires dispatcher='deepep'"):
-            BackendConfig(experts="gmm", dispatcher="torch")
+    def test_gmm_experts_falls_back_to_torch(self):
+        """Test that BackendConfig falls back gmm experts to torch when dispatcher is not deepep."""
+        config = BackendConfig(experts="gmm", dispatcher="torch")
+        assert config.experts == "torch"
+        assert config.dispatcher == "torch"
 
     def test_te_experts_with_deepep_valid(self):
         """Test that te experts with deepep dispatcher is valid."""
@@ -117,10 +119,12 @@ class TestBackendConfigEnableDeepepDeprecation:
 
     def test_enable_deepep_none_no_warning(self):
         """Test that enable_deepep=None (default) does not trigger warning."""
+        from nemo_automodel.components.models.common.utils import HAVE_DEEP_EP
+
+        expected_dispatcher = "deepep" if HAVE_DEEP_EP and torch.cuda.is_available() else "torch"
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             config = BackendConfig()
-            assert config.dispatcher == "torch"  # Default value
             assert config.enable_deepep is None
             # No deprecation warning should be raised
             deprecation_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
