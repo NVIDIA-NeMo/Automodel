@@ -200,7 +200,10 @@ def _init_model(
                 **kwargs,
             )
         # Get HF model class and wrap with mixin
-        hf_model_cls = cls._model_mapping[type(hf_config)]
+        try:
+            hf_model_cls = cls._model_mapping[type(hf_config)]
+        except KeyError:
+            hf_model_cls = type(model)
         model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
         return False, model
 
@@ -247,7 +250,10 @@ def _init_model(
             **kwargs,
         )
 
-    hf_model_cls = cls._model_mapping[type(hf_config)]
+    try:
+        hf_model_cls = cls._model_mapping[type(hf_config)]
+    except KeyError:
+        hf_model_cls = type(model)
     model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
     return False, model
 
