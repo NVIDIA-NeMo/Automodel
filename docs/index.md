@@ -13,7 +13,7 @@ launcher/local-workstation.md
 launcher/cluster.md
 ```
 
-<!-- 
+<!--
 environment/cluster.md
 -->
 
@@ -54,6 +54,7 @@ guides/llm/databricks.md
 model-coverage/overview.md
 model-coverage/llm.md
 model-coverage/vlm.md
+model-coverage/asr.md
 ```
 
 ```{toctree}
@@ -66,6 +67,7 @@ guides/llm/retrieval-dataset.md
 guides/llm/column-mapped-text-instruction-dataset.md
 guides/llm/column-mapped-text-instruction-iterable-dataset.md
 guides/vlm/dataset.md
+guides/asr/dataset.md
 ```
 
 ```{toctree}
