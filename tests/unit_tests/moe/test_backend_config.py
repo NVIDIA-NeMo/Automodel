@@ -54,15 +54,15 @@ class TestBackendConfigExpertsDispatcherValidation:
     """Test BackendConfig validation for experts and dispatcher fields."""
 
     def test_te_experts_falls_back_to_torch(self):
-        """Test that BackendConfig falls back te experts to torch when dispatcher is not deepep."""
+        """Test that BackendConfig falls back te experts to torch_mm when dispatcher is not deepep."""
         config = BackendConfig(experts="te", dispatcher="torch")
-        assert config.experts == "torch"
+        assert config.experts == "torch_mm"
         assert config.dispatcher == "torch"
 
     def test_gmm_experts_falls_back_to_torch(self):
-        """Test that BackendConfig falls back gmm experts to torch when dispatcher is not deepep."""
+        """Test that BackendConfig falls back gmm experts to torch_mm when dispatcher is not deepep."""
         config = BackendConfig(experts="gmm", dispatcher="torch")
-        assert config.experts == "torch"
+        assert config.experts == "torch_mm"
         assert config.dispatcher == "torch"
 
     def test_te_experts_with_deepep_valid(self):
