@@ -790,7 +790,9 @@ class FinetuneRecipeForASR(BaseRecipe):
                         logits=getattr(out, "logits", out),
                         labels=labels,
                         model=model,
-                        hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
+                        hidden_states=out.hidden_states[-1]
+                        if getattr(out, "hidden_states", None) is not None
+                        else None,
                         num_label_tokens=num_label_tokens,
                     )
 

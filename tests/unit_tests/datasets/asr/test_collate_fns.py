@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
 import torch
 
 from nemo_automodel.components.datasets.asr.collate_fns import (
@@ -75,9 +74,7 @@ class TestShiftTokensRight:
 class TestWhisperCollateFn:
     """Test whisper_collate_fn behavior."""
 
-    def test_whisper_collate_fn_produces_correct_output_structure(
-        self, dummy_whisper_processor, dummy_audio_samples
-    ):
+    def test_whisper_collate_fn_produces_correct_output_structure(self, dummy_whisper_processor, dummy_audio_samples):
         """Verify whisper_collate_fn returns dict with required keys."""
         result = whisper_collate_fn(dummy_audio_samples, dummy_whisper_processor)
 
@@ -108,15 +105,11 @@ class TestWhisperCollateFn:
         # Text dimension should be same across batch (due to padding)
         assert result["labels"].shape[0] == batch_size
 
-    def test_whisper_collate_fn_shifts_decoder_inputs_from_labels(
-        self, dummy_whisper_processor, dummy_audio_samples
-    ):
+    def test_whisper_collate_fn_shifts_decoder_inputs_from_labels(self, dummy_whisper_processor, dummy_audio_samples):
         """Verify decoder_input_ids are shifted right from labels (teacher forcing)."""
         result = whisper_collate_fn(dummy_audio_samples, dummy_whisper_processor)
 
-        decoder_start_token_id = dummy_whisper_processor.tokenizer.convert_tokens_to_ids(
-            "<|startoftranscript|>"
-        )
+        decoder_start_token_id = dummy_whisper_processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
 
         # First token of decoder_input_ids should be decoder_start_token_id
         assert (result["decoder_input_ids"][:, 0] == decoder_start_token_id).all()
@@ -132,18 +125,16 @@ class TestWhisperCollateFn:
                 label_prev = labels[batch_idx, pos - 1]
                 # For non-padding labels, verify they were shifted correctly
                 if label_prev != pad_token_id:
-                    assert (
-                        decoder_input_ids[batch_idx, pos] == label_prev
-                    ), f"Batch {batch_idx}, position {pos}: expected {label_prev}, got {decoder_input_ids[batch_idx, pos]}"
+                    assert decoder_input_ids[batch_idx, pos] == label_prev, (
+                        f"Batch {batch_idx}, position {pos}: expected {label_prev}, got {decoder_input_ids[batch_idx, pos]}"
+                    )
 
     def test_whisper_collate_fn_handles_different_text_fields(
         self, dummy_whisper_processor, dummy_audio_samples_with_sentence_field
     ):
         """Verify collation works with both 'text' and 'sentence' fields."""
         # Test with 'sentence' field (Common Voice format)
-        result_sentence = whisper_collate_fn(
-            dummy_audio_samples_with_sentence_field, dummy_whisper_processor
-        )
+        result_sentence = whisper_collate_fn(dummy_audio_samples_with_sentence_field, dummy_whisper_processor)
 
         # Should produce same structure regardless of field name
         assert "input_features" in result_sentence
@@ -183,9 +174,7 @@ class TestWhisperCollateFn:
 class TestParakeetCollateFn:
     """Test parakeet_collate_fn behavior."""
 
-    def test_parakeet_collate_fn_produces_correct_output_structure(
-        self, dummy_parakeet_processor, dummy_audio_samples
-    ):
+    def test_parakeet_collate_fn_produces_correct_output_structure(self, dummy_parakeet_processor, dummy_audio_samples):
         """Verify parakeet_collate_fn returns dict with required keys."""
         result = parakeet_collate_fn(dummy_audio_samples, dummy_parakeet_processor)
 
@@ -199,9 +188,7 @@ class TestParakeetCollateFn:
         assert isinstance(result["attention_mask"], torch.Tensor)
         assert isinstance(result["labels"], torch.Tensor)
 
-    def test_parakeet_collate_fn_produces_correct_shapes(
-        self, dummy_parakeet_processor, dummy_audio_samples
-    ):
+    def test_parakeet_collate_fn_produces_correct_shapes(self, dummy_parakeet_processor, dummy_audio_samples):
         """Verify output tensor shapes are correct for CTC models."""
         batch_size = len(dummy_audio_samples)
         result = parakeet_collate_fn(dummy_audio_samples, dummy_parakeet_processor)
@@ -217,9 +204,7 @@ class TestParakeetCollateFn:
         # labels should have batch dimension
         assert result["labels"].shape[0] == batch_size
 
-    def test_parakeet_collate_fn_attention_mask_is_binary(
-        self, dummy_parakeet_processor, dummy_audio_samples
-    ):
+    def test_parakeet_collate_fn_attention_mask_is_binary(self, dummy_parakeet_processor, dummy_audio_samples):
         """Verify attention mask contains only 0s and 1s."""
         result = parakeet_collate_fn(dummy_audio_samples, dummy_parakeet_processor)
 

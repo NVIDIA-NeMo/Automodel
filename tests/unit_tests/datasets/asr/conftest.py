@@ -171,7 +171,7 @@ class DummyParakeetProcessor:
                 labels_list.append(torch.tensor(label_ids, dtype=torch.long))
 
             # Pad labels to same length
-            max_label_len = max(len(l) for l in labels_list)
+            max_label_len = max(len(label_seq) for label_seq in labels_list)
             labels = torch.zeros(batch_size, max_label_len, dtype=torch.long)
             for i, label in enumerate(labels_list):
                 labels[i, : len(label)] = label

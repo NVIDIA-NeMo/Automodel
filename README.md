@@ -332,7 +332,7 @@ uv run examples/asr_finetune/finetune.py \
 
 **Benefits**: 40-60% memory reduction, 10-30x smaller checkpoints, faster training with higher learning rates.
 
-See [ASR Fine-tuning Guide](examples/asr_finetune/README.md#parameter-efficient-fine-tuning-peft) for details.
+See [ASR Fine-tuning Guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/asr_finetune/README.md#parameter-efficient-fine-tuning-peft) for details.
 
 
 ## Supported Models

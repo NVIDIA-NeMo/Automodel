@@ -69,9 +69,7 @@ class TestMakeLibrispeechDataset:
     """Test make_librispeech_dataset behavior."""
 
     @patch("nemo_automodel.components.datasets.asr.datasets.load_dataset")
-    def test_make_librispeech_dataset_returns_correct_structure(
-        self, mock_load_dataset, mock_librispeech_dataset
-    ):
+    def test_make_librispeech_dataset_returns_correct_structure(self, mock_load_dataset, mock_librispeech_dataset):
         """Verify LibriSpeech loader returns dataset with audio and text fields."""
         mock_load_dataset.return_value = mock_librispeech_dataset
 
@@ -99,7 +97,7 @@ class TestMakeLibrispeechDataset:
         """Verify custom split parameter is passed correctly."""
         mock_load_dataset.return_value = mock_librispeech_dataset
 
-        dataset = make_librispeech_dataset(split="test")
+        _dataset = make_librispeech_dataset(split="test")
 
         # Should use custom split in load_dataset call
         mock_load_dataset.assert_called_once_with(
@@ -107,9 +105,7 @@ class TestMakeLibrispeechDataset:
         )
 
     @patch("nemo_automodel.components.datasets.asr.datasets.load_dataset")
-    def test_make_librispeech_dataset_limits_samples_when_specified(
-        self, mock_load_dataset, mock_librispeech_dataset
-    ):
+    def test_make_librispeech_dataset_limits_samples_when_specified(self, mock_load_dataset, mock_librispeech_dataset):
         """Verify limit_dataset_samples parameter correctly limits dataset size."""
         mock_load_dataset.return_value = mock_librispeech_dataset
 
@@ -143,7 +139,7 @@ class TestMakeLibrispeechDataset:
         mock_load_dataset.return_value = mock_streaming_dataset
 
         limit = 10
-        dataset = make_librispeech_dataset(streaming=True, limit_dataset_samples=limit)
+        _dataset = make_librispeech_dataset(streaming=True, limit_dataset_samples=limit)
 
         # Should call load_dataset with streaming=True
         mock_load_dataset.assert_called_once_with(
@@ -158,9 +154,7 @@ class TestMakeCommonVoiceDataset:
     """Test make_common_voice_dataset behavior."""
 
     @patch("nemo_automodel.components.datasets.asr.datasets.load_dataset")
-    def test_make_common_voice_dataset_returns_correct_structure(
-        self, mock_load_dataset, mock_common_voice_dataset
-    ):
+    def test_make_common_voice_dataset_returns_correct_structure(self, mock_load_dataset, mock_common_voice_dataset):
         """Verify Common Voice loader returns dataset with audio and sentence fields."""
         mock_load_dataset.return_value = mock_common_voice_dataset
 
@@ -188,22 +182,18 @@ class TestMakeCommonVoiceDataset:
         assert isinstance(dataset[0]["sentence"], str)
 
     @patch("nemo_automodel.components.datasets.asr.datasets.load_dataset")
-    def test_make_common_voice_dataset_with_custom_language(
-        self, mock_load_dataset, mock_common_voice_dataset
-    ):
+    def test_make_common_voice_dataset_with_custom_language(self, mock_load_dataset, mock_common_voice_dataset):
         """Verify language parameter is passed correctly."""
         mock_load_dataset.return_value = mock_common_voice_dataset
 
-        dataset = make_common_voice_dataset(language="es")
+        _dataset = make_common_voice_dataset(language="es")
 
         # Should use custom language in load_dataset call
         args, kwargs = mock_load_dataset.call_args
         assert args[1] == "es"
 
     @patch("nemo_automodel.components.datasets.asr.datasets.load_dataset")
-    def test_make_common_voice_dataset_limits_samples(
-        self, mock_load_dataset, mock_common_voice_dataset
-    ):
+    def test_make_common_voice_dataset_limits_samples(self, mock_load_dataset, mock_common_voice_dataset):
         """Verify limit_dataset_samples parameter correctly limits dataset size."""
         mock_load_dataset.return_value = mock_common_voice_dataset
 
@@ -218,9 +208,7 @@ class TestMakeCustomAsrDataset:
     """Test make_custom_asr_dataset behavior."""
 
     @patch("nemo_automodel.components.datasets.asr.datasets.load_dataset")
-    def test_make_custom_asr_dataset_returns_correct_structure(
-        self, mock_load_dataset, mock_librispeech_dataset
-    ):
+    def test_make_custom_asr_dataset_returns_correct_structure(self, mock_load_dataset, mock_librispeech_dataset):
         """Verify custom dataset loader returns dataset with audio and text fields."""
         mock_load_dataset.return_value = mock_librispeech_dataset
 
@@ -249,9 +237,7 @@ class TestMakeCustomAsrDataset:
         mock_dataset = Dataset.from_dict(data)
         mock_load_dataset.return_value = mock_dataset
 
-        dataset = make_custom_asr_dataset(
-            "custom_dataset", audio_column="recording", text_column="transcription"
-        )
+        dataset = make_custom_asr_dataset("custom_dataset", audio_column="recording", text_column="transcription")
 
         # Should rename columns to standard names
         assert "audio" in dataset.column_names
@@ -280,7 +266,7 @@ class TestMakeCustomAsrDataset:
         mock_load_dataset.return_value = mock_streaming_dataset
 
         limit = 5
-        dataset = make_custom_asr_dataset("custom_dataset", streaming=True, limit_dataset_samples=limit)
+        _dataset = make_custom_asr_dataset("custom_dataset", streaming=True, limit_dataset_samples=limit)
 
         # Should call load_dataset with streaming=True
         mock_load_dataset.assert_called_once_with(
