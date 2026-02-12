@@ -124,6 +124,13 @@ class BiencoderModel(nn.Module):
             "AutoConfig": f"model.{encoder_class_name.replace('Model', 'Config')}",
         }
 
+    def forward(self, input_dict: dict, encoder: str = "query") -> Optional[torch.Tensor]:
+        """Forward pass — delegates to encode().
+
+        Going through forward() ensures FSDP2 unshard hooks fire via __call__.
+        """
+        return self.encode(input_dict, encoder)
+
     def encode(self, input_dict: dict, encoder: str = "query") -> Optional[torch.Tensor]:
         """Encode inputs using the query or passage encoder.
 

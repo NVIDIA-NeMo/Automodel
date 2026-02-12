@@ -349,7 +349,11 @@ class TrainBiencoderRecipe(BaseRecipe):
 
         logger.info("Building biencoder model...")
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
-            model = self.cfg.model.instantiate(device_mesh=self.device_mesh, moe_mesh=self.moe_mesh)
+            model = self.cfg.model.instantiate(
+                device_mesh=self.device_mesh,
+                moe_mesh=self.moe_mesh,
+                distributed_config=self.distributed_config,
+            )
 
         self.model_parts = [model]
         self.pp = None
@@ -492,8 +496,8 @@ class TrainBiencoderRecipe(BaseRecipe):
         )
 
         with train_ctx, sync_ctx:
-            q_reps = model.encode(query, encoder="query")
-            p_reps = model.encode(passage, encoder="passage")
+            q_reps = model(query, encoder="query")
+            p_reps = model(passage, encoder="passage")
 
             n_passages = self.train_n_passages
             scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
@@ -599,8 +603,8 @@ class TrainBiencoderRecipe(BaseRecipe):
                     query, passage = _unpack_qp(batch)
 
                     model = self.model_parts[0]
-                    q_reps = model.encode(query, encoder="query")
-                    p_reps = model.encode(passage, encoder="passage")
+                    q_reps = model(query, encoder="query")
+                    p_reps = model(passage, encoder="passage")
 
                     n_passages = self.eval_negative_size + 1
                     scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
