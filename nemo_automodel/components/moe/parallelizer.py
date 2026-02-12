@@ -206,6 +206,7 @@ def apply_fsdp(
                 shard_placement_fn=lambda _: Shard(1),
                 reshard_after_forward=reshard_after_forward,
             )
+        
         # If FSDP is disabled for grouped experts because the parameters are already
         # fully sharded by PP and EP, then we need to explicitly remove the parameters
         # from FSDP for the transformer block.

@@ -878,6 +878,14 @@ class GroupedExpertsTE(nn.Module):
 
         self.fp8_padding = Fp8Padding(self.num_local_experts)
         self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
+        
+        # Freeze expert parameters for LoRA training
+        # These GroupedLinear modules are created after the global parameter freeze in PEFT patching,
+        # so they default to requires_grad=True and must be explicitly frozen.
+        for param in self.gate_up_linear.parameters():
+            param.requires_grad_(False)
+        for param in self.down_linear.parameters():
+            param.requires_grad_(False)
 
     def forward(
         self,

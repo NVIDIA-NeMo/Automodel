@@ -950,6 +950,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_qat=self.cfg.get("qat", None),
             cfg_moe=self.cfg.get("moe_config", None),
         )
+        
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
@@ -1339,6 +1340,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # self.model_parts[0].finish_grad_sync()
 
         self.checkpointer.maybe_wait_for_staging()
+        
         for opt in self.optimizer:
             opt.step()
             opt.zero_grad()

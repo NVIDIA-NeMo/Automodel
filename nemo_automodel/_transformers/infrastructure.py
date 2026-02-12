@@ -551,6 +551,17 @@ def apply_model_infrastructure(
                 lora_a_init,
                 load_base_model=load_base_model,
             )
+        
+        # Re-freeze expert parameters after checkpoint loading (checkpoint loading can reset requires_grad)
+        if peft_config is not None:
+            from nemo_automodel.components.moe.experts import GroupedExpertsTE
+            for mp in models_to_load:
+                for module in mp.modules():
+                    if isinstance(module, GroupedExpertsTE):
+                        for param in module.gate_up_linear.parameters():
+                            param.requires_grad_(False)
+                        for param in module.down_linear.parameters():
+                            param.requires_grad_(False)
 
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
