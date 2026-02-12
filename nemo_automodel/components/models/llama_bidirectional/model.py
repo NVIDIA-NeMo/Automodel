@@ -273,7 +273,7 @@ class LlamaBidirectionalForSequenceClassification(LlamaForSequenceClassification
 
 
 # Export for ModelRegistry auto-discovery
-ModelClass = LlamaBidirectionalModel
+ModelClass = [LlamaBidirectionalModel, LlamaBidirectionalForSequenceClassification]
 
 __all__ = [
     "LlamaBidirectionalModel",
