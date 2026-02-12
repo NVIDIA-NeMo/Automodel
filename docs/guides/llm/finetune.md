@@ -50,6 +50,13 @@ In this guide, we will fine-tune Meta's `LLaMA 3.2 1B` model on the popular [SQu
 
 - **Multi-layer residual connections**: Enhances training stability and depth scaling.
 
+:::{tip}
+In this guide, `meta-llama/Llama-3.2-1B` is used only as a placeholder
+model ID. You can replace it with any valid Hugging Face model ID, such
+as `Qwen/Qwen2.5-1.5B`, or any other checkpoint you have access to on
+the Hugging Face Hub that is supported as per [model coverage](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm.md) list.
+:::
+
 #### Access Gated Models
 
 Some Hugging Face model repositories are **gated**, you must explicitly request permission before you can download their files. If the model page shows a "Request access" or "Agree and access" button:
