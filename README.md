@@ -308,11 +308,13 @@ uv run torchrun --nproc-per-node=8 \
 ```
 
 **Supported ASR Models:**
+- **Parakeet CTC** (NVIDIA): Fast CTC-based speech recognition
+  - Models: parakeet-ctc-0.6b, parakeet-ctc-1.1b
 - **Whisper** (OpenAI): Multilingual speech recognition and translation (99 languages)
   - Models: whisper-tiny, small, medium, large-v3
 - **Datasets**: LibriSpeech (readily available), Common Voice (via Mozilla Data Collective), custom audio datasets
 
-See [examples/asr_finetune/README.md](examples/asr_finetune/README.md) for more details, dataset information, and advanced configurations.
+See [ASR Fine-tuning Guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/asr_finetune/README.md) for more details, dataset information, and advanced configurations.
 
 
 ## Supported Models

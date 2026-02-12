@@ -4,6 +4,12 @@ Examples for fine-tuning ASR (Automatic Speech Recognition) models with NeMo Aut
 
 ## Supported Models
 
+### Parakeet CTC (NVIDIA)
+- **nvidia/parakeet-ctc-0.6b** (600M params) - Fast CTC-based ASR
+- **nvidia/parakeet-ctc-1.1b** (1.1B params) - High-accuracy CTC-based ASR
+
+Parakeet models use CTC (Connectionist Temporal Classification) loss with encoder-only architecture for efficient speech recognition.
+
 ### Whisper (OpenAI)
 - **openai/whisper-tiny** (39M params) - Fast, lower accuracy
 - **openai/whisper-base** (74M params) - Balanced speed/accuracy
@@ -81,6 +87,14 @@ docker run --rm --gpus all \
 ### Single GPU Training
 
 ```bash
+# Parakeet CTC 0.6B on LibriSpeech
+uv run examples/asr_finetune/finetune.py \
+  --config examples/asr_finetune/parakeet/parakeet_ctc_0.6b_librispeech.yaml
+
+# Parakeet CTC 1.1B on LibriSpeech
+uv run examples/asr_finetune/finetune.py \
+  --config examples/asr_finetune/parakeet/parakeet_ctc_1.1b_librispeech.yaml
+
 # Whisper Small on LibriSpeech (100h clean English)
 uv run examples/asr_finetune/finetune.py \
   --config examples/asr_finetune/whisper/whisper_small_librispeech.yaml
