@@ -228,9 +228,15 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
     Extract the target modules from the model used by LoRA/PEFT layers.
 
     Combined-projection module names (e.g. ``qkv_proj``, ``gate_up_proj``) are
-    expanded to the individual Hugging Face projection names so that the saved
-    ``adapter_config.json`` is compatible with vLLM, TensorRT-LLM and the
-    Hugging Face PEFT library.
+    expanded to the individual Hugging Face projection names **only** when the
+    model has a ``state_dict_adapter`` with a ``fused_modules_mapping`` that
+    specifies a non-identity split (e.g. ``qkv_proj → [q_proj, k_proj, v_proj]``
+    for Llama/Qwen2).
+
+    Models whose HF implementation already uses fused projections (e.g. Phi3/Phi4
+    where ``qkv_proj → [qkv_proj]``) will *not* have their names expanded,
+    keeping the ``adapter_config.json`` compatible with vLLM, TensorRT-LLM and
+    Hugging Face PEFT.
 
     Note:
         When torch.compile is used, module names get prefixed with `_orig_mod.`.
@@ -242,11 +248,11 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
     Returns:
         A sorted list of unique module name prefixes that contain LoRA layers.
     """
-    # Mapping from combined projection names to their HF-compatible split names.
-    _COMBINED_TO_SPLIT = {
-        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
+    # Get packed-modules mapping from the model's state dict adapter (if any).
+    # Only adapters that actually split fused projections will provide a mapping;
+    # models without an adapter (or with identity mappings) keep fused names.
+    adapter = getattr(model, "state_dict_adapter", None)
+    fused_mapping: dict[str, list[str]] = getattr(adapter, "fused_modules_mapping", {}) if adapter else {}
 
     final_target_modules = set()
     for name, _ in model.named_modules():
@@ -257,10 +263,12 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
                 target_name = target_name[len("_orig_mod.") :]
 
             # Expand combined projection names to individual HF projection names
+            # only when the mapping is non-identity (split names differ from fused name).
             last_component = target_name.rsplit(".", 1)[-1]
-            if last_component in _COMBINED_TO_SPLIT:
+            split_names = fused_mapping.get(last_component)
+            if split_names is not None and split_names != [last_component]:
                 parent = target_name.rsplit(".", 1)[0] if "." in target_name else ""
-                for split_name in _COMBINED_TO_SPLIT[last_component]:
+                for split_name in split_names:
                     expanded = f"{parent}.{split_name}" if parent else split_name
                     final_target_modules.add(expanded)
             else:

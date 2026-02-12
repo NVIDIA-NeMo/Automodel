@@ -45,23 +45,82 @@ class CombinedProjectionStateDictAdapter:
     - num_key_value_heads
     - hidden_size
 
+    The ``fused_modules_mapping`` property controls how fused module names are
+    mapped to HF-compatible split names when saving LoRA adapters and writing
+    ``adapter_config.json``.  The default (Llama-style) splits ``qkv_proj`` into
+    ``[q_proj, k_proj, v_proj]`` and ``gate_up_proj`` into ``[gate_proj, up_proj]``.
+    Subclasses can override this property for models that use a different convention
+    (e.g. Phi3/Phi4 identity mapping where ``qkv_proj`` → ``[qkv_proj]``).
+
+    There are two ways to customise the mapping:
+
+    1. **Constructor argument** (preferred for one-off overrides)::
+
+           adapter = CombinedProjectionStateDictAdapter(
+               config,
+               fused_modules_mapping={
+                   "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                   "gate_up_proj": ["gate_up_proj"],  # identity -- don't split
+               },
+           )
+
+    2. **Subclass override** (preferred when the mapping is always the same for a
+       model family)::
+
+           class MyModelStateDictAdapter(CombinedProjectionStateDictAdapter):
+               _FUSED_MODULES_MAPPING = {
+                   "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                   "gate_up_proj": ["gate_up_proj"],
+               }
+
     Args:
         config: Model config (LlamaConfig, Qwen2Config, etc.)
+        fused_modules_mapping: Optional mapping of fused module name suffixes to
+            their HF-compatible split names.  When provided, overrides the class-level
+            ``_FUSED_MODULES_MAPPING``.  An *identity* entry
+            (e.g. ``{"gate_up_proj": ["gate_up_proj"]}``) means the fused name is
+            kept as-is (no splitting).
 
-    Example:
-        # For Llama
+    Example::
+
+        # For Llama (default mapping -- split everything)
         from transformers import LlamaConfig
-        adapter = CombinedProjectionStateDictAdapter(LlamaConfig.from_pretrained("meta-llama/Llama-3-8B"))
+        adapter = CombinedProjectionStateDictAdapter(
+            LlamaConfig.from_pretrained("meta-llama/Llama-3-8B"),
+        )
 
-        # For Qwen2
-        from transformers import Qwen2Config
-        adapter = CombinedProjectionStateDictAdapter(Qwen2Config.from_pretrained("Qwen/Qwen2.5-7B"))
+        # For a model that splits QKV but keeps gate_up_proj fused
+        adapter = CombinedProjectionStateDictAdapter(
+            config,
+            fused_modules_mapping={
+                "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                "gate_up_proj": ["gate_up_proj"],
+            },
+        )
     """
 
-    def __init__(self, config):
-        """Initialize the adapter with model config."""
+    # Default packed-modules mapping (Llama-style: split everything).
+    # Maps fused module name suffix → list of HF-compatible split names.
+    # Override in subclasses for models with different conventions, e.g.:
+    #   {"qkv_proj": ["qkv_proj"], "gate_up_proj": ["gate_up_proj"]}  # identity (Phi3/Phi4)
+    _FUSED_MODULES_MAPPING: dict[str, list[str]] = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
+    def __init__(self, config, fused_modules_mapping: dict[str, list[str]] | None = None):
+        """Initialize the adapter with model config.
+
+        Args:
+            config: Model config with num_hidden_layers, num_attention_heads, etc.
+            fused_modules_mapping: Optional override for
+                :attr:`_FUSED_MODULES_MAPPING`.  When provided, the
+                :meth:`fused_modules_mapping` property returns this mapping
+                instead of the class-level default.
+        """
         self.config = config
         self._uses_model_prefix = True
+        self._instance_fused_modules_mapping = fused_modules_mapping
 
         # Extract config parameters
         self.num_layers = config.num_hidden_layers
@@ -73,6 +132,33 @@ class CombinedProjectionStateDictAdapter:
         # Compute projection sizes
         self.q_size = self.num_attention_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
+
+    @property
+    def fused_modules_mapping(self) -> dict[str, list[str]]:
+        """Return the mapping of fused module name suffixes to their split names.
+
+        This mapping controls:
+        - How LoRA adapter weights are split/kept when converting to HF format.
+        - What target module names appear in ``adapter_config.json``.
+
+        An *identity* mapping (e.g. ``{"qkv_proj": ["qkv_proj"]}``) means the
+        fused name is kept as-is (no splitting).
+
+        Precedence:
+        1. Instance override (passed via ``fused_modules_mapping`` constructor arg).
+        2. Class-level ``_FUSED_MODULES_MAPPING``.
+
+        Returns:
+            dict mapping fused suffix to list of HF-compatible names.
+        """
+        if self._instance_fused_modules_mapping is not None:
+            return self._instance_fused_modules_mapping
+        return self._FUSED_MODULES_MAPPING
+
+    def _is_identity_mapping(self, fused_name: str) -> bool:
+        """Check if a fused module name has an identity mapping (should not be split)."""
+        mapping = self.fused_modules_mapping
+        return fused_name in mapping and mapping[fused_name] == [fused_name]
 
     def from_hf(self, hf_state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
         """Convert HuggingFace state dict to combined-projection format.
@@ -96,58 +182,63 @@ class CombinedProjectionStateDictAdapter:
         custom_state_dict = {}
         processed_keys = set()
 
+        combine_qkv = not self._is_identity_mapping("qkv_proj")
+        combine_gate_up = not self._is_identity_mapping("gate_up_proj")
+
         # Process each layer
         for layer_idx in range(self.num_layers):
             prefix = f"model.layers.{layer_idx}" if self._uses_model_prefix else f"layers.{layer_idx}"
 
-            # Combine Q, K, V into qkv_proj
-            q_weight_key = f"{prefix}.self_attn.q_proj.weight"
-            k_weight_key = f"{prefix}.self_attn.k_proj.weight"
-            v_weight_key = f"{prefix}.self_attn.v_proj.weight"
+            # Combine Q, K, V into qkv_proj (unless identity mapping)
+            if combine_qkv:
+                q_weight_key = f"{prefix}.self_attn.q_proj.weight"
+                k_weight_key = f"{prefix}.self_attn.k_proj.weight"
+                v_weight_key = f"{prefix}.self_attn.v_proj.weight"
 
-            if q_weight_key in hf_state_dict:
-                q_weight = hf_state_dict[q_weight_key]
-                k_weight = hf_state_dict[k_weight_key]
-                v_weight = hf_state_dict[v_weight_key]
+                if q_weight_key in hf_state_dict:
+                    q_weight = hf_state_dict[q_weight_key]
+                    k_weight = hf_state_dict[k_weight_key]
+                    v_weight = hf_state_dict[v_weight_key]
 
-                # Concatenate along output dimension
-                qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
-                custom_state_dict[f"{prefix}.self_attn.qkv_proj.weight"] = qkv_weight
-                processed_keys.update([q_weight_key, k_weight_key, v_weight_key])
+                    # Concatenate along output dimension
+                    qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+                    custom_state_dict[f"{prefix}.self_attn.qkv_proj.weight"] = qkv_weight
+                    processed_keys.update([q_weight_key, k_weight_key, v_weight_key])
 
-                # Handle biases if present
-                q_bias_key = f"{prefix}.self_attn.q_proj.bias"
-                if q_bias_key in hf_state_dict:
-                    k_bias_key = f"{prefix}.self_attn.k_proj.bias"
-                    v_bias_key = f"{prefix}.self_attn.v_proj.bias"
+                    # Handle biases if present
+                    q_bias_key = f"{prefix}.self_attn.q_proj.bias"
+                    if q_bias_key in hf_state_dict:
+                        k_bias_key = f"{prefix}.self_attn.k_proj.bias"
+                        v_bias_key = f"{prefix}.self_attn.v_proj.bias"
 
-                    qkv_bias = torch.cat(
-                        [hf_state_dict[q_bias_key], hf_state_dict[k_bias_key], hf_state_dict[v_bias_key]], dim=0
-                    )
-                    custom_state_dict[f"{prefix}.self_attn.qkv_proj.bias"] = qkv_bias
-                    processed_keys.update([q_bias_key, k_bias_key, v_bias_key])
+                        qkv_bias = torch.cat(
+                            [hf_state_dict[q_bias_key], hf_state_dict[k_bias_key], hf_state_dict[v_bias_key]], dim=0
+                        )
+                        custom_state_dict[f"{prefix}.self_attn.qkv_proj.bias"] = qkv_bias
+                        processed_keys.update([q_bias_key, k_bias_key, v_bias_key])
 
-            # Combine gate and up into gate_up_proj
-            gate_weight_key = f"{prefix}.mlp.gate_proj.weight"
-            up_weight_key = f"{prefix}.mlp.up_proj.weight"
+            # Combine gate and up into gate_up_proj (unless identity mapping)
+            if combine_gate_up:
+                gate_weight_key = f"{prefix}.mlp.gate_proj.weight"
+                up_weight_key = f"{prefix}.mlp.up_proj.weight"
 
-            if gate_weight_key in hf_state_dict:
-                gate_weight = hf_state_dict[gate_weight_key]
-                up_weight = hf_state_dict[up_weight_key]
+                if gate_weight_key in hf_state_dict:
+                    gate_weight = hf_state_dict[gate_weight_key]
+                    up_weight = hf_state_dict[up_weight_key]
 
-                # Concatenate along output dimension
-                gate_up_weight = torch.cat([gate_weight, up_weight], dim=0)
-                custom_state_dict[f"{prefix}.mlp.gate_up_proj.weight"] = gate_up_weight
-                processed_keys.update([gate_weight_key, up_weight_key])
+                    # Concatenate along output dimension
+                    gate_up_weight = torch.cat([gate_weight, up_weight], dim=0)
+                    custom_state_dict[f"{prefix}.mlp.gate_up_proj.weight"] = gate_up_weight
+                    processed_keys.update([gate_weight_key, up_weight_key])
 
-                # Handle biases if present
-                gate_bias_key = f"{prefix}.mlp.gate_proj.bias"
-                if gate_bias_key in hf_state_dict:
-                    up_bias_key = f"{prefix}.mlp.up_proj.bias"
+                    # Handle biases if present
+                    gate_bias_key = f"{prefix}.mlp.gate_proj.bias"
+                    if gate_bias_key in hf_state_dict:
+                        up_bias_key = f"{prefix}.mlp.up_proj.bias"
 
-                    gate_up_bias = torch.cat([hf_state_dict[gate_bias_key], hf_state_dict[up_bias_key]], dim=0)
-                    custom_state_dict[f"{prefix}.mlp.gate_up_proj.bias"] = gate_up_bias
-                    processed_keys.update([gate_bias_key, up_bias_key])
+                        gate_up_bias = torch.cat([hf_state_dict[gate_bias_key], hf_state_dict[up_bias_key]], dim=0)
+                        custom_state_dict[f"{prefix}.mlp.gate_up_proj.bias"] = gate_up_bias
+                        processed_keys.update([gate_bias_key, up_bias_key])
 
         # Copy all other weights that weren't processed
         for key, value in hf_state_dict.items():
@@ -198,14 +289,17 @@ class CombinedProjectionStateDictAdapter:
                 self._uses_model_prefix = key.startswith("model.")
                 break
 
+        split_qkv = not self._is_identity_mapping("qkv_proj")
+        split_gate_up = not self._is_identity_mapping("gate_up_proj")
+
         # Process each layer
         for layer_idx in range(self.num_layers):
             prefix = f"model.layers.{layer_idx}" if self._uses_model_prefix else f"layers.{layer_idx}"
 
-            # Split qkv_proj into separate Q, K, V
+            # Split qkv_proj into separate Q, K, V (unless identity mapping)
             qkv_weight_key = f"{prefix}.self_attn.qkv_proj.weight"
 
-            if qkv_weight_key in state_dict:
+            if split_qkv and qkv_weight_key in state_dict:
                 qkv_weight = state_dict[qkv_weight_key]
 
                 # Compute local split sizes based on actual tensor size (handles TP sharding)
@@ -236,10 +330,10 @@ class CombinedProjectionStateDictAdapter:
                     hf_state_dict[f"{prefix}.self_attn.v_proj.bias"] = v_bias
                     processed_keys.add(qkv_bias_key)
 
-            # Split gate_up_proj into separate gate and up
+            # Split gate_up_proj into separate gate and up (unless identity mapping)
             gate_up_weight_key = f"{prefix}.mlp.gate_up_proj.weight"
 
-            if gate_up_weight_key in state_dict:
+            if split_gate_up and gate_up_weight_key in state_dict:
                 gate_up_weight = state_dict[gate_up_weight_key]
 
                 # Compute local split sizes
@@ -298,46 +392,56 @@ class CombinedProjectionStateDictAdapter:
           - ``lora_A`` weights are duplicated to gate/up projections.
           - All other weights are split in half along dim 0.
 
+        Fused modules with *identity* mappings (e.g. Phi3/Phi4 where
+        ``qkv_proj → [qkv_proj]``) are left untouched.
+
         Args:
             hf_state_dict: State dict to modify in-place.
         """
-        combined_qkv_keys = [k for k in hf_state_dict if ".self_attn.qkv_proj." in k]
-        for key in combined_qkv_keys:
-            value = hf_state_dict.pop(key)
-            pre, suffix = key.split(".self_attn.qkv_proj.", 1)
+        # --- QKV splitting (skip if identity mapping) ---
+        if not self._is_identity_mapping("qkv_proj"):
+            qkv_targets = self.fused_modules_mapping.get("qkv_proj", ["q_proj", "k_proj", "v_proj"])
+            combined_qkv_keys = [k for k in hf_state_dict if ".self_attn.qkv_proj." in k]
+            for key in combined_qkv_keys:
+                value = hf_state_dict.pop(key)
+                pre, suffix = key.split(".self_attn.qkv_proj.", 1)
 
-            if "lora_A" in suffix:
-                # Input-dimension LoRA weight: identical for all projections
-                hf_state_dict[f"{pre}.self_attn.q_proj.{suffix}"] = value
-                hf_state_dict[f"{pre}.self_attn.k_proj.{suffix}"] = value.clone()
-                hf_state_dict[f"{pre}.self_attn.v_proj.{suffix}"] = value.clone()
-            else:
-                # Output-dimension weight (lora_B, magnitude, base weight/bias): split
-                actual_size = value.shape[0]
-                total_size = self.q_size + 2 * self.kv_size
-                local_q_size = (self.q_size * actual_size) // total_size
-                local_kv_size = (self.kv_size * actual_size) // total_size
+                if "lora_A" in suffix:
+                    # Input-dimension LoRA weight: identical for all projections
+                    hf_state_dict[f"{pre}.self_attn.{qkv_targets[0]}.{suffix}"] = value
+                    for target in qkv_targets[1:]:
+                        hf_state_dict[f"{pre}.self_attn.{target}.{suffix}"] = value.clone()
+                else:
+                    # Output-dimension weight (lora_B, magnitude, base weight/bias): split
+                    actual_size = value.shape[0]
+                    total_size = self.q_size + 2 * self.kv_size
+                    local_q_size = (self.q_size * actual_size) // total_size
+                    local_kv_size = (self.kv_size * actual_size) // total_size
 
-                q_val, k_val, v_val = value.split([local_q_size, local_kv_size, local_kv_size], dim=0)
-                hf_state_dict[f"{pre}.self_attn.q_proj.{suffix}"] = q_val
-                hf_state_dict[f"{pre}.self_attn.k_proj.{suffix}"] = k_val
-                hf_state_dict[f"{pre}.self_attn.v_proj.{suffix}"] = v_val
+                    q_val, k_val, v_val = value.split([local_q_size, local_kv_size, local_kv_size], dim=0)
+                    hf_state_dict[f"{pre}.self_attn.{qkv_targets[0]}.{suffix}"] = q_val
+                    hf_state_dict[f"{pre}.self_attn.{qkv_targets[1]}.{suffix}"] = k_val
+                    hf_state_dict[f"{pre}.self_attn.{qkv_targets[2]}.{suffix}"] = v_val
 
-        combined_gate_up_keys = [k for k in hf_state_dict if ".mlp.gate_up_proj." in k]
-        for key in combined_gate_up_keys:
-            value = hf_state_dict.pop(key)
-            pre, suffix = key.split(".mlp.gate_up_proj.", 1)
+        # --- gate_up splitting (skip if identity mapping) ---
+        if not self._is_identity_mapping("gate_up_proj"):
+            gate_up_targets = self.fused_modules_mapping.get("gate_up_proj", ["gate_proj", "up_proj"])
+            combined_gate_up_keys = [k for k in hf_state_dict if ".mlp.gate_up_proj." in k]
+            for key in combined_gate_up_keys:
+                value = hf_state_dict.pop(key)
+                pre, suffix = key.split(".mlp.gate_up_proj.", 1)
 
-            if "lora_A" in suffix:
-                hf_state_dict[f"{pre}.mlp.gate_proj.{suffix}"] = value
-                hf_state_dict[f"{pre}.mlp.up_proj.{suffix}"] = value.clone()
-            else:
-                actual_size = value.shape[0]
-                local_intermediate_size = actual_size // 2
+                if "lora_A" in suffix:
+                    hf_state_dict[f"{pre}.mlp.{gate_up_targets[0]}.{suffix}"] = value
+                    for target in gate_up_targets[1:]:
+                        hf_state_dict[f"{pre}.mlp.{target}.{suffix}"] = value.clone()
+                else:
+                    actual_size = value.shape[0]
+                    local_intermediate_size = actual_size // 2
 
-                gate_val, up_val = value.split([local_intermediate_size, local_intermediate_size], dim=0)
-                hf_state_dict[f"{pre}.mlp.gate_proj.{suffix}"] = gate_val
-                hf_state_dict[f"{pre}.mlp.up_proj.{suffix}"] = up_val
+                    gate_val, up_val = value.split([local_intermediate_size, local_intermediate_size], dim=0)
+                    hf_state_dict[f"{pre}.mlp.{gate_up_targets[0]}.{suffix}"] = gate_val
+                    hf_state_dict[f"{pre}.mlp.{gate_up_targets[1]}.{suffix}"] = up_val
 
     def _recombine_split_projection_keys(self, state_dict: dict[str, Any]) -> None:
         """Recombine split projection LoRA/DoRA keys back to combined format.
@@ -361,62 +465,77 @@ class CombinedProjectionStateDictAdapter:
         (e.g., ``q_proj.weight``) are skipped because those are already handled
         by the layer-indexed loop in ``from_hf``.
 
+        Fused modules with *identity* mappings are left untouched (nothing to
+        recombine).
+
         Args:
             state_dict: State dict to modify in-place.
         """
-        # --- QKV recombination ---
-        # Find q_proj keys that are NOT base weight/bias (already handled by layer loop)
-        q_keys = [
-            k
-            for k in list(state_dict.keys())
-            if ".self_attn.q_proj." in k
-            and not k.endswith(".self_attn.q_proj.weight")
-            and not k.endswith(".self_attn.q_proj.bias")
-        ]
+        # --- QKV recombination (skip if identity mapping) ---
+        if not self._is_identity_mapping("qkv_proj"):
+            qkv_targets = self.fused_modules_mapping.get("qkv_proj", ["q_proj", "k_proj", "v_proj"])
+            first_target = qkv_targets[0]  # e.g. "q_proj"
 
-        for q_key in q_keys:
-            k_key = q_key.replace(".self_attn.q_proj.", ".self_attn.k_proj.")
-            v_key = q_key.replace(".self_attn.q_proj.", ".self_attn.v_proj.")
+            # Find first-target keys that are NOT base weight/bias (already handled by layer loop)
+            first_keys = [
+                k
+                for k in list(state_dict.keys())
+                if f".self_attn.{first_target}." in k
+                and not k.endswith(f".self_attn.{first_target}.weight")
+                and not k.endswith(f".self_attn.{first_target}.bias")
+            ]
 
-            if k_key not in state_dict or v_key not in state_dict:
-                continue
+            for first_key in first_keys:
+                other_keys = [
+                    first_key.replace(f".self_attn.{first_target}.", f".self_attn.{t}.")
+                    for t in qkv_targets[1:]
+                ]
 
-            combined_key = q_key.replace(".self_attn.q_proj.", ".self_attn.qkv_proj.")
+                if any(k not in state_dict for k in other_keys):
+                    continue
 
-            q_val = state_dict.pop(q_key)
-            k_val = state_dict.pop(k_key)
-            v_val = state_dict.pop(v_key)
+                combined_key = first_key.replace(f".self_attn.{first_target}.", ".self_attn.qkv_proj.")
 
-            if "lora_A" in q_key:
-                # lora_A weights were duplicated during split — just take one
-                state_dict[combined_key] = q_val
-            else:
-                # lora_B, magnitude, etc. — concatenate along dim 0
-                state_dict[combined_key] = torch.cat([q_val, k_val, v_val], dim=0)
+                first_val = state_dict.pop(first_key)
+                other_vals = [state_dict.pop(k) for k in other_keys]
 
-        # --- gate_up recombination ---
-        gate_keys = [
-            k
-            for k in list(state_dict.keys())
-            if ".mlp.gate_proj." in k
-            and not k.endswith(".mlp.gate_proj.weight")
-            and not k.endswith(".mlp.gate_proj.bias")
-        ]
+                if "lora_A" in first_key:
+                    # lora_A weights were duplicated during split — just take one
+                    state_dict[combined_key] = first_val
+                else:
+                    # lora_B, magnitude, etc. — concatenate along dim 0
+                    state_dict[combined_key] = torch.cat([first_val] + other_vals, dim=0)
 
-        for gate_key in gate_keys:
-            up_key = gate_key.replace(".mlp.gate_proj.", ".mlp.up_proj.")
+        # --- gate_up recombination (skip if identity mapping) ---
+        if not self._is_identity_mapping("gate_up_proj"):
+            gate_up_targets = self.fused_modules_mapping.get("gate_up_proj", ["gate_proj", "up_proj"])
+            first_target = gate_up_targets[0]  # e.g. "gate_proj"
 
-            if up_key not in state_dict:
-                continue
+            first_keys = [
+                k
+                for k in list(state_dict.keys())
+                if f".mlp.{first_target}." in k
+                and not k.endswith(f".mlp.{first_target}.weight")
+                and not k.endswith(f".mlp.{first_target}.bias")
+            ]
 
-            combined_key = gate_key.replace(".mlp.gate_proj.", ".mlp.gate_up_proj.")
+            for first_key in first_keys:
+                other_keys = [
+                    first_key.replace(f".mlp.{first_target}.", f".mlp.{t}.")
+                    for t in gate_up_targets[1:]
+                ]
 
-            gate_val = state_dict.pop(gate_key)
-            up_val = state_dict.pop(up_key)
+                if any(k not in state_dict for k in other_keys):
+                    continue
 
-            if "lora_A" in gate_key:
-                # lora_A weights were duplicated during split — just take one
-                state_dict[combined_key] = gate_val
-            else:
-                # lora_B, magnitude, etc. — concatenate along dim 0
-                state_dict[combined_key] = torch.cat([gate_val, up_val], dim=0)
+                combined_key = first_key.replace(f".mlp.{first_target}.", ".mlp.gate_up_proj.")
+
+                first_val = state_dict.pop(first_key)
+                other_vals = [state_dict.pop(k) for k in other_keys]
+
+                if "lora_A" in first_key:
+                    # lora_A weights were duplicated during split — just take one
+                    state_dict[combined_key] = first_val
+                else:
+                    # lora_B, magnitude, etc. — concatenate along dim 0
+                    state_dict[combined_key] = torch.cat([first_val] + other_vals, dim=0)

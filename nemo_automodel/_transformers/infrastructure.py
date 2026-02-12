@@ -33,6 +33,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
     _maybe_adapt_state_dict_to_hf,
+    to_empty_parameters_only,
 )
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
@@ -551,6 +552,16 @@ def apply_model_infrastructure(
                 lora_a_init,
                 load_base_model=load_base_model,
             )
+    elif is_meta_device:
+        # Meta device but no checkpoint load (e.g. from_config with multi-GPU): materialize then move
+        models_to_materialize = model.parts if hasattr(model, "parts") else [model]
+        for mp in models_to_materialize:
+            to_empty_parameters_only(mp, device=device)
+            for _, module in mp.named_modules():
+                if hasattr(module, "_is_hf_initialized"):
+                    module._is_hf_initialized = False
+            if hasattr(mp, "initialize_weights"):
+                mp.initialize_weights()
 
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded

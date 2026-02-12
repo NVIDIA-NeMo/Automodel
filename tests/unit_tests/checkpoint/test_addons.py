@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from types import SimpleNamespace
 
 import torch
 from torch import nn
@@ -22,6 +23,9 @@ from nemo_automodel.components.checkpoint.addons import (
     _maybe_save_custom_model_code,
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
+from nemo_automodel.components.models.common.combined_projection.state_dict_adapter import (
+    CombinedProjectionStateDictAdapter,
+)
 
 
 def _write(path: str, content: str) -> None:
@@ -123,8 +127,24 @@ def _make_model_with_named_modules(module_names):
     return root
 
 
+def _llama_style_adapter():
+    """Create a CombinedProjectionStateDictAdapter with default Llama-style mapping."""
+    config = SimpleNamespace(
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        hidden_size=256,
+    )
+    return CombinedProjectionStateDictAdapter(config)
+
+
 class TestExtractTargetModules:
-    """Tests for _extract_target_modules with combined-projection expansion."""
+    """Tests for _extract_target_modules with combined-projection expansion.
+
+    Expansion only happens when the model has a ``state_dict_adapter`` with
+    a non-identity ``fused_modules_mapping``.  Tests that verify expansion
+    attach a Llama-style adapter to the dummy model.
+    """
 
     def test_simple_non_combined_modules(self):
         """Non-combined module names pass through unchanged."""
@@ -140,13 +160,14 @@ class TestExtractTargetModules:
         assert "model.layers.0.mlp.down_proj" in result
 
     def test_qkv_proj_expanded(self):
-        """qkv_proj is expanded to q_proj, k_proj, v_proj."""
+        """qkv_proj is expanded to q_proj, k_proj, v_proj when adapter is present."""
         model = _make_model_with_named_modules(
             [
                 "model.layers.0.self_attn.qkv_proj.lora_A",
                 "model.layers.0.self_attn.qkv_proj.lora_B",
             ]
         )
+        model.state_dict_adapter = _llama_style_adapter()
         result = _extract_target_modules(model)
         assert "model.layers.0.self_attn.q_proj" in result
         assert "model.layers.0.self_attn.k_proj" in result
@@ -155,20 +176,21 @@ class TestExtractTargetModules:
         assert all("qkv_proj" not in m for m in result)
 
     def test_gate_up_proj_expanded(self):
-        """gate_up_proj is expanded to gate_proj, up_proj."""
+        """gate_up_proj is expanded to gate_proj, up_proj when adapter is present."""
         model = _make_model_with_named_modules(
             [
                 "model.layers.0.mlp.gate_up_proj.lora_A",
                 "model.layers.0.mlp.gate_up_proj.lora_B",
             ]
         )
+        model.state_dict_adapter = _llama_style_adapter()
         result = _extract_target_modules(model)
         assert "model.layers.0.mlp.gate_proj" in result
         assert "model.layers.0.mlp.up_proj" in result
         assert all("gate_up_proj" not in m for m in result)
 
     def test_mixed_combined_and_regular(self):
-        """Mixed combined and regular module names."""
+        """Mixed combined and regular module names with adapter present."""
         model = _make_model_with_named_modules(
             [
                 "model.layers.0.self_attn.qkv_proj.lora_A",
@@ -177,6 +199,7 @@ class TestExtractTargetModules:
                 "model.layers.0.mlp.down_proj.lora_A",
             ]
         )
+        model.state_dict_adapter = _llama_style_adapter()
         result = _extract_target_modules(model)
         expected = {
             "model.layers.0.self_attn.q_proj",
@@ -196,6 +219,7 @@ class TestExtractTargetModules:
                 "_orig_mod.model.layers.0.self_attn.qkv_proj.lora_A",
             ]
         )
+        model.state_dict_adapter = _llama_style_adapter()
         result = _extract_target_modules(model)
         assert "model.layers.0.self_attn.q_proj" in result
         assert "model.layers.0.self_attn.k_proj" in result
@@ -210,7 +234,21 @@ class TestExtractTargetModules:
                 "model.layers.0.self_attn.qkv_proj.lora_A",
             ]
         )
+        model.state_dict_adapter = _llama_style_adapter()
         result = _extract_target_modules(model)
         assert result == sorted(result)
+
+    def test_no_expansion_without_adapter(self):
+        """Without a state_dict_adapter, fused names should NOT be expanded."""
+        model = _make_model_with_named_modules(
+            [
+                "model.layers.0.self_attn.qkv_proj.lora_A",
+                "model.layers.0.mlp.gate_up_proj.lora_A",
+            ]
+        )
+        result = _extract_target_modules(model)
+        assert "model.layers.0.self_attn.qkv_proj" in result
+        assert "model.layers.0.mlp.gate_up_proj" in result
+        assert all("q_proj" not in m for m in result)
 
 
