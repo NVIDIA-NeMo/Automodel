@@ -21,6 +21,7 @@ import torch
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.training.utils import (
+    prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
 )
@@ -248,6 +249,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
                     torch.cuda.nvtx.range_pop()
 
+                    if ga_step_idx == 0:
+                        prepare_after_first_microbatch()
+
                 # Optimizer step
                 with self.timers("optimizer", log_level=2):
                     for opt in self.optimizer:
@@ -282,6 +286,11 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     f"Max Memory Allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB | "
                     f"loss={reporting_loss:.4f}"
                 )
+
+            # Collect and log MoE load balance metrics (inherited from train_ft)
+            self._collect_moe_load_balance()
+            if self._wandb_enabled and self.wandb_run is not None:
+                self._log_moe_metrics(i, self.wandb_run.log)
 
             # Calculate and log MFU
             self._log_iteration_metrics(iter_timer, ga_steps, peak_tflops, rank, i)

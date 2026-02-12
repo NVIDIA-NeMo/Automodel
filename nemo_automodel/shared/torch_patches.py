@@ -144,4 +144,24 @@ def apply_torch_patches() -> None:
     except (ImportError, AttributeError) as e:
         _logger.debug(f"Could not apply DeviceMesh patch: {e}")
 
+    # -------------------------------------------------------------------------
+    # Patch #3: aten.alias.default sharding strategy (PyTorch 2.9 regression)
+    # torch.ops.aten.alias.default has no sharding strategy registered in
+    # PyTorch 2.9.0, causing NotImplementedError when DTensor dispatches
+    # through aten.alias (e.g. via HF Qwen3's logits_to_keep slice).
+    # See https://github.com/pytorch/pytorch/pull/166867 for the upstream fix.
+    # Remove this patch once we upgrade to a torch version that includes it.
+    # -------------------------------------------------------------------------
+    try:
+        from packaging.version import parse as _vparse
+
+        if _vparse(_torch.__version__).base_version == "2.9.0":
+            from torch.distributed.tensor._ops._tensor_ops import propagate_single_input_strategy
+            from torch.distributed.tensor._ops.utils import register_op_strategy
+
+            register_op_strategy(_torch.ops.aten.alias.default)(propagate_single_input_strategy)
+            _logger.debug("Applied aten.alias.default sharding strategy patch for PyTorch 2.9.0")
+    except Exception as e:
+        _logger.debug(f"Could not apply aten.alias.default sharding strategy patch: {e}")
+
     _TORCH_PATCHES_APPLIED = True

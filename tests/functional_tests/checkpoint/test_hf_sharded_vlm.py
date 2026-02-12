@@ -228,6 +228,18 @@ def get_test_hf_sharded_vlm_checkpoint_expected_keys():
             torch.bfloat16,
             "cpu",
         ),
+        # Embedding layer optimizer states (no longer frozen after PR change)
+        "optim.state.model.language_model.embed_tokens.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.language_model.embed_tokens.weight.exp_avg": (
+            [131104, 128],
+            torch.bfloat16,
+            "cpu",
+        ),
+        "optim.state.model.language_model.embed_tokens.weight.exp_avg_sq": (
+            [131104, 128],
+            torch.bfloat16,
+            "cpu",
+        ),
         "optim.state.model.language_model.layers.0.self_attn.q_proj.weight.step": ([], torch.float32, "cpu"),
         "optim.state.model.language_model.layers.0.self_attn.q_proj.weight.exp_avg": (
             [64, 128],

@@ -29,8 +29,8 @@ rng:
   seed: 1111
   ranked: true
 
-parallelizer:
-  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
+moe_config:
+  _target_: nemo_automodel.components.moe.config.MoEParallelizerConfig
   activation_checkpointing: false
 
 model:
@@ -42,7 +42,8 @@ model:
   #   attn: sdpa
   #   linear: te
   #   rms_norm: te
-  #   enable_deepep: true
+  #   experts: te
+  #   dispatcher: deepep
   #   fake_balanced_gate: false
   #   enable_hf_state_dict_adapter: true
 
@@ -54,12 +55,13 @@ checkpoint:
   save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  dp_replicate_size: 1
   ep_size: 8
+
+distributed_config:
+  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false
 
 freeze_config:

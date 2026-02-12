@@ -30,7 +30,8 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA n
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     build_dataloader,
-    build_model_and_optimizer,
+    build_model,
+    build_optimizer,
     build_validation_dataloader,
     compute_trust_remote_code_from_model,
 )
@@ -188,53 +189,29 @@ class DummyModelConfig:
 
     def get(self, key, default=None):
         return getattr(self, key, default)
-    
+
     def get_as_string(self, key, default=None):
         return str(getattr(self, key, default))
 
 
-@requires_cuda
 def test_peft_with_pipeline_parallelism_enabled(caplog):
-    """Test that PEFT can be applied with pipeline parallelism enabled"""
+    """Test that _apply_peft_and_lower_precision disables triton with PP."""
+    from nemo_automodel._transformers.auto_model import _apply_peft_and_lower_precision
 
-    # Create mock configs
-    cfg_model = DummyModelConfig()
-    cfg_opt = DummyOptConfig()
     cfg_peft = DummyPeftConfig()
-
-    # Create mock autopipeline
+    model = DummyModel()
     mock_autopipeline = MagicMock()
-    mock_autopipeline.parts = []
 
-    # Mock the apply_lora_to_linear_modules function (now inside apply_model_infrastructure)
-    with patch('nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules') as mock_apply_lora:
-        with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
-            with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-                with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
-                    with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                        with patch('nemo_automodel._transformers.auto_model._shard_pp') as mock_shard_pp:
-                            mock_shard_pp.return_value = mock_autopipeline
-                            with caplog.at_level(logging.INFO):
-                                # This should NOT raise an assertion error
-                                # New API: no device param, returns 3-tuple
-                                model, optimizer, loss_fn = build_model_and_optimizer(
-                                    cfg_model=cfg_model,
-                                    cfg_opt=cfg_opt,
-                                    cfg_peft=cfg_peft,
-                                    model_wrapper=None,
-                                    seed=42,
-                                    autopipeline=mock_autopipeline,
-                                    loss_fn=None,
-                                )
+    with patch('nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules') as mock_apply_lora:
+        with caplog.at_level(logging.INFO):
+            _apply_peft_and_lower_precision(
+                model, tp_size=1, autopipeline=mock_autopipeline,
+                peft_config=cfg_peft, quantization_config=None, fp8_config=None, qat_quantizer=None,
+            )
 
-                                # Verify that apply_lora was called
-                                assert mock_apply_lora.called, "apply_lora_to_linear_modules should be called"
-
-                                # Verify that use_triton was disabled
-                                assert cfg_peft.use_triton == False, "use_triton should be disabled for PP"
-
-                                # Verify the log message was generated
-                                assert "Enabling PEFT with Pipeline Parallelism" in caplog.text
+    assert mock_apply_lora.called, "apply_lora_to_linear_modules should be called"
+    assert cfg_peft.use_triton == False, "use_triton should be disabled for PP"
+    assert "Enabling PEFT with Pipeline Parallelism" in caplog.text
 
 
 @requires_cuda
@@ -247,25 +224,21 @@ def test_peft_without_pipeline_parallelism(caplog):
     cfg_peft = DummyPeftConfig()
 
     # Mock the apply_lora_to_linear_modules function (now inside apply_model_infrastructure)
-    with patch('nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules') as mock_apply_lora:
-        with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
+    with patch('nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules') as mock_apply_lora:
+        with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
             with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-                with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
+                with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
                     with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                        with patch('nemo_automodel._transformers.auto_model._shard_ep_fsdp') as mock_shard:
+                        with patch('nemo_automodel._transformers.infrastructure._shard_ep_fsdp') as mock_shard:
                             mock_shard.return_value = DummyModel()
                             with caplog.at_level(logging.INFO):
                                 # This should work fine without PP
-                                # New API: no device param, returns 3-tuple
-                                model, optimizer, loss_fn = build_model_and_optimizer(
+                                model = build_model(
                                     cfg_model=cfg_model,
-                                    cfg_opt=cfg_opt,
                                     cfg_peft=cfg_peft,
-                                    model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                                     seed=42,
-                                    autopipeline=None,  # No pipeline parallelism
-                                    loss_fn=None,
                                 )
+                                optimizer = build_optimizer(model, cfg_opt, None, None)
 
                             # Verify that apply_lora was called
                             assert mock_apply_lora.called, "apply_lora_to_linear_modules should be called"
@@ -275,42 +248,22 @@ def test_peft_without_pipeline_parallelism(caplog):
                             assert "Enabling PEFT with Pipeline Parallelism" not in caplog.text
 
 
-@requires_cuda
 def test_peft_with_tp_disables_triton(caplog):
-    """Test that PEFT with tensor parallelism disables triton"""
+    """Test that _apply_peft_and_lower_precision disables triton with TP."""
+    from nemo_automodel._transformers.auto_model import _apply_peft_and_lower_precision
 
-    # Create mock configs
-    cfg_model = DummyModelConfig()
-    cfg_opt = DummyOptConfig()
     cfg_peft = DummyPeftConfig()
+    model = DummyModel()
 
-    # Mock the apply_lora_to_linear_modules function (now inside apply_model_infrastructure)
-    with patch('nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules') as mock_apply_lora:
-        with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
-            with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-                with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
-                    with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                        with patch('nemo_automodel._transformers.auto_model._shard_ep_fsdp') as mock_shard:
-                            mock_shard.return_value = DummyModel()
-                            with caplog.at_level(logging.INFO):
-                                # Test with TP > 1
-                                # New API: no device param, returns 3-tuple
-                                model, optimizer, loss_fn = build_model_and_optimizer(
-                                    cfg_model=cfg_model,
-                                    cfg_opt=cfg_opt,
-                                    cfg_peft=cfg_peft,
-                                    model_wrapper=SimpleNamespace(parallelize=lambda m: m),
-                                    seed=42,
-                                    tp_size=2,  # Enable TP
-                                    autopipeline=None,
-                                    loss_fn=None,
-                                )
+    with patch('nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules'):
+        with caplog.at_level(logging.INFO):
+            _apply_peft_and_lower_precision(
+                model, tp_size=2, autopipeline=None,
+                peft_config=cfg_peft, quantization_config=None, fp8_config=None, qat_quantizer=None,
+            )
 
-                            # Verify that use_triton was disabled
-                            assert cfg_peft.use_triton == False, "use_triton should be disabled for TP"
-
-                            # Verify the TP log message was generated
-                            assert "Disabling Triton with TP" in caplog.text
+    assert cfg_peft.use_triton == False, "use_triton should be disabled for TP"
+    assert "Disabling Triton with TP" in caplog.text
 
 
 def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatch):
@@ -388,21 +341,17 @@ def test_force_hf_true_disables_meta_init(monkeypatch):
     cfg_peft = None
 
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep", lambda *a, **k: True)
-    monkeypatch.setattr("nemo_automodel._transformers.auto_model._supports_logits_to_keep", lambda *a, **k: True)
+    monkeypatch.setattr("nemo_automodel._transformers.infrastructure._supports_logits_to_keep", lambda *a, **k: True)
     monkeypatch.setattr("nemo_automodel._transformers.auto_model._verify_sdpa_support", lambda *a, **k: None)
-    monkeypatch.setattr("nemo_automodel._transformers.auto_model.print_trainable_parameters", lambda *a, **k: None)
+    monkeypatch.setattr("nemo_automodel._transformers.infrastructure.print_trainable_parameters", lambda *a, **k: None)
 
-    # Call under test - new API: no device param, returns 3-tuple
-    model, optimizer, loss_fn = build_model_and_optimizer(
+    # Call under test
+    model = build_model(
         cfg_model=cfg_model,
-        cfg_opt=cfg_opt,
         cfg_peft=cfg_peft,
-        model_wrapper=SimpleNamespace(parallelize=lambda m: m),
         seed=123,
-        autopipeline=None,
-        loss_fn=None,
-        parallelize_fn=None,
     )
+    optimizer = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated
     assert model is not None
@@ -462,12 +411,16 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         ),
     )
 
-    # Stub model/optimizer creation - new API returns 3-tuple (model, optimizer, loss_fn)
+    # Stub model/optimizer creation
     dummy_model = DummyModel()
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_model_and_optimizer",
-        lambda *a, **k: (dummy_model, [dummy_opt], "loss_fn"),
+        "nemo_automodel.recipes.llm.train_ft.build_model",
+        lambda *a, **k: dummy_model,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.build_optimizer",
+        lambda *a, **k: [dummy_opt],
     )
 
     # Data-related stubs
@@ -582,14 +535,16 @@ def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
 
     parts = [DummyModel(), DummyModel()]
 
-    def _build_model_and_optimizer_stub(*args, **kwargs):
-        # New API returns 3-tuple (model, optimizer, loss_fn)
-        ap = DummyAutoPipeline(parts=parts, info=SimpleNamespace(has_last_stage=False, has_first_stage=False, schedule=None))
-        dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
-        return ap, [dummy_opt], "loss_fn"
+    def _build_model_stub(*args, **kwargs):
+        return DummyAutoPipeline(parts=parts, info=SimpleNamespace(has_last_stage=False, has_first_stage=False, schedule=None))
 
-    # Override the default stub to return a pipeline-wrapped model
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model_and_optimizer", _build_model_and_optimizer_stub)
+    def _build_optimizer_stub(*args, **kwargs):
+        dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
+        return [dummy_opt]
+
+    # Override the default stubs to return a pipeline-wrapped model
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", _build_model_stub)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_optimizer", _build_optimizer_stub)
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.enable_nvtx = cfg.get("nvtx", False)
@@ -712,6 +667,7 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
     object.__setattr__(recipe, "pp_enabled", True)
     object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info))
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
+    object.__setattr__(recipe, "te_fp8", None)
 
     return recipe
 
@@ -1039,19 +995,15 @@ def test_build_model_state_dict_keys_uses_adapter(caplog):
     cfg_peft = None
 
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
+        with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
-                    # New API: no device param, returns 3-tuple
-                    model, optimizer, loss_fn = build_model_and_optimizer(
+                with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
+                    model = build_model(
                         cfg_model=cfg_model,
-                        cfg_opt=cfg_opt,
                         cfg_peft=cfg_peft,
-                        model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                         seed=42,
-                        autopipeline=None,
-                        loss_fn=None,
                     )
+                    optimizer = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated
     assert model is not None
@@ -1067,19 +1019,15 @@ def test_build_model_state_dict_keys_without_adapter():
     cfg_peft = None
 
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
+        with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
-                    # New API: no device param, returns 3-tuple
-                    model, optimizer, loss_fn = build_model_and_optimizer(
+                with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
+                    model = build_model(
                         cfg_model=cfg_model,
-                        cfg_opt=cfg_opt,
                         cfg_peft=cfg_peft,
-                        model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                         seed=42,
-                        autopipeline=None,
-                        loss_fn=None,
                     )
+                    optimizer = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated
     assert model is not None
@@ -1110,19 +1058,15 @@ def test_build_model_with_quantized_model_config():
     cfg_model = DummyQuantizedModelConfig()
 
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
+        with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
-                    # New API: no device param, returns 3-tuple
-                    model, optimizer, loss_fn = build_model_and_optimizer(
+                with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
+                    model = build_model(
                         cfg_model=cfg_model,
-                        cfg_opt=cfg_opt,
                         cfg_peft=cfg_peft,
-                        model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                         seed=42,
-                        autopipeline=None,
-                        loss_fn=None,
                     )
+                    optimizer = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated with quantization config
     assert model is not None
@@ -1138,19 +1082,15 @@ def test_build_model_without_quant_config():
     cfg_peft = None
 
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
+        with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
-                    # New API: no device param, returns 3-tuple
-                    model, optimizer, loss_fn = build_model_and_optimizer(
+                with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
+                    model = build_model(
                         cfg_model=cfg_model,
-                        cfg_opt=cfg_opt,
                         cfg_peft=cfg_peft,
-                        model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                         seed=42,
-                        autopipeline=None,
-                        loss_fn=None,
                     )
+                    optimizer = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated without quantization config
     assert model is not None
@@ -1158,60 +1098,57 @@ def test_build_model_without_quant_config():
 
 
 # =============================================================================
-# New tests for updated build_model_and_optimizer API
+# New tests for updated build_model / build_optimizer API
 # =============================================================================
 
 
 @requires_cuda
-def test_build_model_disables_foreach_with_tp():
-    """Test that when tp_size > 1, cfg_opt.foreach is set to False."""
+def test_build_optimizer_disables_foreach_with_tp():
+    """Test that when device_mesh has tp > 1, cfg_opt.foreach is set to False."""
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig()
     cfg_opt.foreach = True  # Initially True
 
+    # Create mock device_mesh with TP > 1
+    mock_tp = MagicMock()
+    mock_tp.size.return_value = 2
+    mock_mesh = MagicMock()
+    mock_mesh.mesh_dim_names = ("dp", "tp")
+    mock_mesh.__getitem__ = lambda self, key: mock_tp if key == "tp" else MagicMock()
+
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
+        with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
-                    model, optimizer, loss_fn = build_model_and_optimizer(
+                with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
+                    model = build_model(
                         cfg_model=cfg_model,
-                        cfg_opt=cfg_opt,
                         cfg_peft=None,
-                        model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                         seed=42,
-                        tp_size=2,  # TP > 1
-                        autopipeline=None,
-                        loss_fn=None,
+                        device_mesh=mock_mesh,
                     )
+                    optimizer = build_optimizer(model, cfg_opt, None, mock_mesh)
 
     # Verify foreach was disabled
     assert cfg_opt.foreach is False
 
 
 @requires_cuda
-def test_build_model_returns_model_optimizer_loss_fn_tuple():
-    """Test that build_model_and_optimizer returns (model, optimizer, loss_fn) 3-tuple."""
+def test_build_model_and_optimizer_return_values():
+    """Test that build_model and build_optimizer return proper values."""
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig()
 
     with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel._transformers.auto_model._supports_logits_to_keep', return_value=True):
+        with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
             with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                with patch('nemo_automodel._transformers.auto_model.print_trainable_parameters'):
-                    result = build_model_and_optimizer(
+                with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
+                    model = build_model(
                         cfg_model=cfg_model,
-                        cfg_opt=cfg_opt,
                         cfg_peft=None,
-                        model_wrapper=SimpleNamespace(parallelize=lambda m: m),
                         seed=42,
-                        autopipeline=None,
-                        loss_fn=MagicMock(),
                     )
+                    optimizer = build_optimizer(model, cfg_opt, None, None)
 
-    # Should return 3-tuple
-    assert isinstance(result, tuple)
-    assert len(result) == 3
-    model, optimizer, loss_fn = result
     assert model is not None
     assert optimizer is not None
 
