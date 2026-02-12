@@ -12,12 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/moonlight/moonlight_16b_te.yaml
-# Adjust --nproc-per-node to the number of GPUs available on your host machine.
-
-
 step_scheduler:
   global_batch_size: 32
   local_batch_size: 4
