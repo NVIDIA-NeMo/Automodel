@@ -552,7 +552,7 @@ def apply_model_infrastructure(
                 lora_a_init,
                 load_base_model=load_base_model,
             )
-    
+
     # Freeze parameters after checkpoint loading and parallelization
     # This catches params created during parallelization (e.g., GroupedExpertsTE in init_token_dispatcher)
     if peft_config is not None:
