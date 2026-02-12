@@ -52,78 +52,6 @@ def is_gated_activation(activation: str) -> bool:
     return activation in ("swiglu", "quick_geglu")
 
 
-@torch.compile(fullgraph=True, options={"max_autotune": True})
-def swiglu(x, *, gate_and_up_proj, down_proj, gate_up_proj_bias=None, down_proj_bias=None):
-    gate_and_up_out = x @ gate_and_up_proj
-    if gate_up_proj_bias is not None:
-        gate_and_up_out = gate_and_up_out + gate_up_proj_bias
-    gate_out, up_out = torch.chunk(gate_and_up_out, 2, -1)
-    inter = F.silu(gate_out) * up_out
-
-    inter = inter @ down_proj
-    if down_proj_bias is not None:
-        inter = inter + down_proj_bias
-    return inter
-
-
-@torch.compile(fullgraph=True, options={"max_autotune": True})
-def quick_geglu(
-    x,
-    *,
-    gate_and_up_proj,
-    down_proj,
-    gate_up_proj_bias=None,
-    down_proj_bias=None,
-    alpha: float = 1.702,
-    limit: float | None = 7.0,
-):
-    gate_and_up_out = x @ gate_and_up_proj
-    if gate_up_proj_bias is not None:
-        gate_and_up_out = gate_and_up_out + gate_up_proj_bias
-    gate_out, up_out = gate_and_up_out[:, ::2], gate_and_up_out[:, 1::2]
-    # Clamp the input values
-    gate_out = gate_out.clamp(min=None, max=limit)
-    up_out = up_out.clamp(min=-limit, max=limit)
-    out_glu = gate_out * torch.sigmoid(alpha * gate_out)
-    # Note we add an extra bias of 1 to the linear layer
-    inter = out_glu * (up_out + 1)
-    inter = inter @ down_proj
-    if down_proj_bias is not None:
-        inter = inter + down_proj_bias
-    return inter
-
-
-@torch.compile(fullgraph=True, options={"max_autotune": True})
-def relu2(x, *, gate_and_up_proj, down_proj, gate_up_proj_bias=None, down_proj_bias=None):
-    """ReLU² activation: relu(x)^2
-
-    Uses efficient gate_and_up_proj tensor with shape [dim, inter_dim].
-    Memory-efficient pathway - no duplication of weights.
-    """
-    up_out = x @ gate_and_up_proj
-    if gate_up_proj_bias is not None:
-        up_out = up_out + gate_up_proj_bias
-
-    # ReLU² activation
-    inter = F.relu(up_out).pow(2)
-
-    inter = inter @ down_proj
-    if down_proj_bias is not None:
-        inter = inter + down_proj_bias
-    return inter
-
-
-def get_expert_activation(config: MoEConfig):
-    if config.expert_activation == "swiglu":
-        return swiglu
-    elif config.expert_activation == "quick_geglu":
-        return partial(quick_geglu, alpha=config.activation_alpha, limit=config.activation_limit)
-    elif config.expert_activation == "relu2":
-        return relu2
-    else:
-        raise ValueError(f"Invalid expert activation: {config.expert_activation}")
-
-
 def _permute_tokens_for_grouped_mm(
     indices: torch.Tensor,
     weights: torch.Tensor,
@@ -276,7 +204,6 @@ class GroupedExperts(nn.Module):
             self.gate_up_proj_bias = None
             self.down_proj_bias = None
 
-        self.expert_activation = get_expert_activation(config)
         self.expert_activation_grouped = get_expert_activation_for_deepep(config)
 
     def forward(

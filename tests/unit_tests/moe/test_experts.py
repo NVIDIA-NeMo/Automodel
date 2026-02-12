@@ -28,11 +28,8 @@ from nemo_automodel.components.moe.experts import (
     _apply_bias,
     _permute_tokens_for_grouped_mm,
     _torch_mm_experts_fwd,
-    get_expert_activation,
     get_expert_activation_for_deepep,
     is_gated_activation,
-    relu2,
-    swiglu,
 )
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.models.common import BackendConfig
@@ -73,63 +70,6 @@ def moe_config():
 
 class TestActivationFunctions:
     """Test activation functions used in MoE layers."""
-
-    def test_swiglu_shape_preservation(self, device):
-        """Test that swiglu preserves expected output shape."""
-        batch_size, seq_len, dim = 4, 8, 64
-        inter_dim = 128
-
-        x = torch.randn(batch_size, seq_len, dim, dtype=torch.bfloat16, device=device)
-        gate_and_up_proj = torch.randn(dim, inter_dim * 2, dtype=torch.bfloat16, device=device)
-        down_proj = torch.randn(inter_dim, dim, dtype=torch.bfloat16, device=device)
-
-        result = swiglu(x, gate_and_up_proj=gate_and_up_proj, down_proj=down_proj)
-
-        assert result.shape == (batch_size, seq_len, dim)
-        assert result.device == device
-
-    def test_swiglu_with_bias(self, device):
-        """Test swiglu with bias terms."""
-        batch_size, seq_len, dim = 2, 4, 32
-        inter_dim = 64
-
-        x = torch.randn(batch_size, seq_len, dim, dtype=torch.bfloat16, device=device)
-        gate_and_up_proj = torch.randn(dim, inter_dim * 2, dtype=torch.bfloat16, device=device)
-        down_proj = torch.randn(inter_dim, dim, dtype=torch.bfloat16, device=device)
-        gate_up_proj_bias = torch.randn(inter_dim * 2, dtype=torch.bfloat16, device=device)
-        down_proj_bias = torch.randn(dim, dtype=torch.bfloat16, device=device)
-
-        result = swiglu(
-            x,
-            gate_and_up_proj=gate_and_up_proj,
-            down_proj=down_proj,
-            gate_up_proj_bias=gate_up_proj_bias,
-            down_proj_bias=down_proj_bias,
-        )
-
-        assert result.shape == (batch_size, seq_len, dim)
-
-    def test_get_expert_activation_swiglu(self, moe_config):
-        """Test getting swiglu activation function."""
-        moe_config.expert_activation = "swiglu"
-        activation_fn = get_expert_activation(moe_config)
-
-        assert activation_fn == swiglu
-
-    def test_get_expert_activation_quick_geglu(self, moe_config):
-        """Test getting quick_geglu activation function."""
-        moe_config.expert_activation = "quick_geglu"
-        activation_fn = get_expert_activation(moe_config)
-
-        # Should be a partial function
-        assert callable(activation_fn)
-
-    def test_get_expert_activation_invalid(self, moe_config):
-        """Test error handling for invalid activation."""
-        moe_config.expert_activation = "invalid"
-
-        with pytest.raises(ValueError, match="Invalid expert activation"):
-            get_expert_activation(moe_config)
 
     def test_get_expert_activation_for_deepep_swiglu(self, moe_config):
         """Test getting swiglu activation for DeepEP."""
@@ -772,41 +712,6 @@ class TestNonGatedActivations:
         assert output.device == device
         assert not torch.isnan(output).any(), "Output should not contain NaN values"
 
-    def test_relu2_function_shape_preservation(self, device):
-        """Test that relu2 function preserves expected output shape."""
-        batch_size, seq_len, dim = 4, 8, 64
-        inter_dim = 128
-
-        x = torch.randn(batch_size, seq_len, dim, dtype=torch.bfloat16, device=device)
-        gate_and_up_proj = torch.randn(dim, inter_dim, dtype=torch.bfloat16, device=device)
-        down_proj = torch.randn(inter_dim, dim, dtype=torch.bfloat16, device=device)
-
-        result = relu2(x, gate_and_up_proj=gate_and_up_proj, down_proj=down_proj)
-
-        assert result.shape == (batch_size, seq_len, dim)
-        assert result.device == device
-
-    def test_relu2_function_with_bias(self, device):
-        """Test relu2 with bias terms."""
-        batch_size, seq_len, dim = 2, 4, 32
-        inter_dim = 64
-
-        x = torch.randn(batch_size, seq_len, dim, dtype=torch.bfloat16, device=device)
-        gate_and_up_proj = torch.randn(dim, inter_dim, dtype=torch.bfloat16, device=device)
-        down_proj = torch.randn(inter_dim, dim, dtype=torch.bfloat16, device=device)
-        gate_up_proj_bias = torch.randn(inter_dim, dtype=torch.bfloat16, device=device)
-        down_proj_bias = torch.randn(dim, dtype=torch.bfloat16, device=device)
-
-        result = relu2(
-            x,
-            gate_and_up_proj=gate_and_up_proj,
-            down_proj=down_proj,
-            gate_up_proj_bias=gate_up_proj_bias,
-            down_proj_bias=down_proj_bias,
-        )
-
-        assert result.shape == (batch_size, seq_len, dim)
-
     def test_relu2_memory_efficiency(self, relu2_config, swiglu_config):
         """Test that ReLU² uses ~50% less memory for up projection weights than SwiGLU."""
         relu2_experts = GroupedExperts(relu2_config)
@@ -818,11 +723,6 @@ class TestNonGatedActivations:
 
         # ReLU² should have exactly half the up projection parameters
         assert relu2_up_params * 2 == swiglu_up_params
-
-    def test_get_expert_activation_relu2(self, relu2_config):
-        """Test getting relu2 activation function."""
-        activation_fn = get_expert_activation(relu2_config)
-        assert activation_fn == relu2
 
     def test_grouped_experts_deepep_relu2_uses_smaller_projections(self, relu2_config):
         """Test that GroupedExpertsDeepEP with ReLU² uses smaller gate_and_up_projs."""
@@ -1778,9 +1678,7 @@ class TestTorchGroupedMM:
                 experts.gate_up_proj_bias.zero_()
                 experts.down_proj_bias.zero_()
         # Use eager (non-compiled) activation functions to avoid recompilation issues in tests
-        experts.expert_activation = self._unwrap_compiled(experts.expert_activation)
-        if hasattr(experts, 'expert_activation_grouped'):
-            experts.expert_activation_grouped = self._unwrap_compiled(experts.expert_activation_grouped)
+        experts.expert_activation_grouped = self._unwrap_compiled(experts.expert_activation_grouped)
         return experts
 
     def test_init_sets_use_torch_mm(self, torch_mm_config, torch_mm_backend):
@@ -1833,7 +1731,7 @@ class TestTorchGroupedMM:
 
         experts_mm = self._init_experts(torch_mm_config, torch_mm_backend, device)
         experts_loop = GroupedExperts(torch_mm_config).to(device)
-        experts_loop.expert_activation = self._unwrap_compiled(experts_loop.expert_activation)
+        experts_loop.expert_activation_grouped = self._unwrap_compiled(experts_loop.expert_activation_grouped)
         # Copy weights
         with torch.no_grad():
             experts_loop.gate_and_up_projs.copy_(experts_mm.gate_and_up_projs)
@@ -2045,7 +1943,6 @@ class TestGroupedExpertsConvergenceFixes:
             if experts.expert_bias:
                 experts.gate_up_proj_bias.zero_()
                 experts.down_proj_bias.zero_()
-        experts.expert_activation = self._unwrap_compiled(experts.expert_activation)
         experts.expert_activation_grouped = self._unwrap_compiled(experts.expert_activation_grouped)
         return experts
 
