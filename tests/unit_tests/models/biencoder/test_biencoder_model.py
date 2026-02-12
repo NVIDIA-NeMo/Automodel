@@ -24,6 +24,17 @@ class DummyModel:
         self.marker = []
 
 
+class DummyMesh:
+    pass
+
+
+def _apply_common_mocks(monkeypatch):
+    """Mock CUDA-dependent infrastructure so tests run without a GPU."""
+    monkeypatch.setattr(am, "instantiate_infrastructure", lambda **kwargs: (None, None, None, None))
+    monkeypatch.setattr(am, "MeshContext", type("MeshContext", (), {"from_meshes": staticmethod(lambda *a, **k: DummyMesh())}))
+    monkeypatch.setattr(am.torch.cuda, "current_device", lambda: 0)
+
+
 def test_from_pretrained_happy_path(monkeypatch):
     calls = {"build": 0, "liger": 0, "sdpa": 0}
     last_kwargs = {}
@@ -47,6 +58,7 @@ def test_from_pretrained_happy_path(monkeypatch):
     def fake_apply_infrastructure(model, **kwargs):
         return model
 
+    _apply_common_mocks(monkeypatch)
     monkeypatch.setattr(BiencoderModel, "build", staticmethod(fake_build))
     monkeypatch.setattr(am, "_patch_liger_kernel", fake_liger)
     monkeypatch.setattr(am, "_patch_attention", fake_sdpa)
@@ -91,6 +103,7 @@ def test_from_pretrained_retries_without_liger(monkeypatch):
     def fake_apply_infrastructure(model, **kwargs):
         return model
 
+    _apply_common_mocks(monkeypatch)
     monkeypatch.setattr(BiencoderModel, "build", staticmethod(fake_build))
     monkeypatch.setattr(am, "_patch_liger_kernel", fake_liger)
     monkeypatch.setattr(am, "_patch_attention", fake_sdpa)
@@ -124,6 +137,7 @@ def test_from_pretrained_retries_without_sdpa(monkeypatch):
     def fake_apply_infrastructure(model, **kwargs):
         return model
 
+    _apply_common_mocks(monkeypatch)
     monkeypatch.setattr(BiencoderModel, "build", staticmethod(fake_build))
     monkeypatch.setattr(am, "_patch_liger_kernel", fake_liger)
     monkeypatch.setattr(am, "_patch_attention", fake_sdpa)

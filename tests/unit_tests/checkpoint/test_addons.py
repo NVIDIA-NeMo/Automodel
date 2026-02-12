@@ -49,9 +49,9 @@ def test_maybe_save_custom_model_code_copies_py_files_and_structure(tmp_path):
     # Act
     _maybe_save_custom_model_code(str(src_root), str(dst_root))
 
-    # Assert: .py files copied with preserved structure; non-.py ignored
+    # Assert: .py files copied with preserved structure; non-.py and __init__.py ignored
     assert (dst_root / "main.py").exists()
-    assert (dst_root / "pkg" / "__init__.py").exists()
+    assert not (dst_root / "pkg" / "__init__.py").exists()
     assert (dst_root / "pkg" / "subpkg" / "module.py").exists()
     assert not (dst_root / "pkg" / "readme.txt").exists()
 

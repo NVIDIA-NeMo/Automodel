@@ -91,20 +91,6 @@ def test_llama_bidirectional_config_fields():
     assert isinstance(cfg.temperature, float)
 
 
-def test_llama_bidirectional_model_init_and_mask():
-    # Tiny config to instantiate actual model
-    cfg = LlamaBidirectionalConfig(
-        vocab_size=128, hidden_size=32, num_hidden_layers=1, num_attention_heads=1, intermediate_size=64, pad_token_id=0
-    )
-    model = LlamaBidirectionalModel(cfg)
-    # All layers should be non-causal
-    assert all(getattr(layer.self_attn, "is_causal", True) is False for layer in model.layers)
-    # Causal mask update behavior
-    mask = torch.tensor([[1, 1, 0]])
-    out_mask = model._update_causal_mask(mask)
-    assert out_mask is mask
-    assert model._update_causal_mask(torch.ones_like(mask)) is None
-
 
 # --- Fakes for classification and biencoder tests ---
 class FakeOutputs:

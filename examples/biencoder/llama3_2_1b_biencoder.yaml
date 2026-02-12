@@ -146,11 +146,6 @@ distributed_config:
   sequence_parallel: false
 
 # Uncomment and configure for W&B logging
-wandb:
-  project: "adil-workspace"
-  entity: "Nemo-automodel"
-  name: llama3_2_1b_biencoder_refactored_two_gpu
-
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
