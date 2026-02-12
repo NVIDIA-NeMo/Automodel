@@ -36,7 +36,7 @@ dist_env:
   timeout_minutes: 1
 
 model:
-  _target_: nemo_automodel._transformers.auto_model.NeMoAutoModelForBiencoder.from_pretrained
+  _target_: nemo_automodel.NeMoAutoModelForBiencoder.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
   share_encoder: true
   add_linear_pooler: false
@@ -49,7 +49,7 @@ model:
   torch_dtype: bfloat16
 
 tokenizer:
-  _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+  _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
 
 dataloader:
@@ -146,8 +146,13 @@ distributed_config:
   sequence_parallel: false
 
 # Uncomment and configure for W&B logging
-# wandb:
-#   project: "adil-workspace"
-#   entity: "Nemo-automodel"
-#   name: llama3_2_1b_biencoder_main_ref_two_gpu
+wandb:
+  project: "adil-workspace"
+  entity: "Nemo-automodel"
+  name: llama3_2_1b_biencoder_refactored_two_gpu
 
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_exp_name>
+#   save_dir: <your_wandb_save_dir> 

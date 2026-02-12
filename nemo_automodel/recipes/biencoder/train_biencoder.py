@@ -40,7 +40,7 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.recipes.llm.train_ft import build_distributed, build_step_scheduler
+from nemo_automodel.recipes.llm.train_ft import build_distributed, build_optimizer, build_step_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -347,12 +347,17 @@ class TrainBiencoderRecipe(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
+        self.peft_config = None
+        if self.cfg.get("peft", None) is not None:
+            self.peft_config = self.cfg.peft.instantiate()
+
         logger.info("Building biencoder model...")
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
             model = self.cfg.model.instantiate(
                 device_mesh=self.device_mesh,
                 moe_mesh=self.moe_mesh,
                 distributed_config=self.distributed_config,
+                peft_config=self.peft_config,
             )
 
         self.model_parts = [model]

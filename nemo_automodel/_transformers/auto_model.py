@@ -714,6 +714,7 @@ class NeMoAutoModelForBiencoder:
         distributed_config: Optional[DistributedConfig] = None,
         moe_config: Optional[MoEParallelizerConfig] = None,
         compile_config: Optional["CompileConfig"] = None,
+        peft_config: Optional[dict] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -777,6 +778,7 @@ class NeMoAutoModelForBiencoder:
                 distributed_config=distributed_config,
                 moe_config=moe_config,
                 compile_config=compile_config,
+                peft_config=peft_config,
                 **kwargs,
             )
 
@@ -842,7 +844,7 @@ class NeMoAutoModelForBiencoder:
             device=device,
             model_wrapper=model_wrapper,
             mesh=mesh,
-            peft_config=None,
+            peft_config=peft_config,
             quantization_config=None,
             fp8_config=None,
             qat_quantizer=qat_quantizer,

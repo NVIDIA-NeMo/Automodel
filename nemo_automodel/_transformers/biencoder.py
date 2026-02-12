@@ -21,6 +21,7 @@ dynamically based on the model type.
 """
 
 import copy
+import inspect
 import os
 from typing import Optional
 
@@ -31,9 +32,7 @@ from transformers import AutoConfig, PreTrainedModel
 from transformers.utils import logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
-
 from nemo_automodel.components.models.common.bidirectional import BiencoderStateDictAdapter
-
 
 logger = logging.get_logger(__name__)
 
@@ -115,7 +114,7 @@ class BiencoderModel(nn.Module):
         self.config = self.lm_q.config
 
         # HuggingFace consolidated checkpoint compatibility
-        self.name_or_path = os.path.abspath(__file__)
+        self.name_or_path = os.path.dirname(inspect.getfile(type(self.lm_q)))
         self.state_dict_adapter = BiencoderStateDictAdapter()
         encoder_class_name = self.lm_q.__class__.__name__
         self.config.architectures = [encoder_class_name]
@@ -149,12 +148,7 @@ class BiencoderModel(nn.Module):
         if not input_dict:
             return None
 
-        import inspect
-
-        if (
-            "token_type_ids" not in inspect.getfullargspec(encoder.forward).args
-            and "token_type_ids" in input_dict.keys()
-        ):
+        if "token_type_ids" not in inspect.getfullargspec(encoder.forward).args and "token_type_ids" in input_dict:
             input_dict = {k: v for k, v in input_dict.items() if k != "token_type_ids"}
 
         outputs = encoder(

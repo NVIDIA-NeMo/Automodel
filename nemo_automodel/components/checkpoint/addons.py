@@ -261,8 +261,9 @@ def _maybe_save_custom_model_code(original_model_path: str | None, hf_metadata_d
     else:
         return
     for src_path in glob.glob(pattern, recursive=True):
-        # Skip any .hidden paths
         rel_path = os.path.relpath(src_path, original_model_path)
+        if os.path.basename(src_path) == "__init__.py":
+            continue
         dst_path = os.path.join(hf_metadata_dir, rel_path)
         os.makedirs(os.path.dirname(dst_path), exist_ok=True)
         shutil.copy2(src_path, dst_path)
