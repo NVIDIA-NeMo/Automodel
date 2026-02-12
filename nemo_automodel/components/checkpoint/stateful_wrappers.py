@@ -16,6 +16,32 @@ from functools import partial
 from typing import Any, Optional
 
 import torch
+import transformer_engine.pytorch.module.base as te_base
+import transformer_engine.pytorch.ops.op as te_ops
+
+# The Conflict:
+# PyTorch DCP passes an _EXTRA_STATE sentinel for missing keys, but Transformer Engine (TE)
+# throws a RuntimeError if it receives anything other than None or a Tensor.
+#
+# The Fix (Monkeypatch):
+# Intercept set_extra_state calls. If the input is the _EXTRA_STATE sentinel, return early
+# (doing nothing) to safely ignore the missing state without crashing TE.
+_original_set_extra_state = te_base.TransformerEngineBaseModule.set_extra_state
+_original_op_set_extra_state = te_ops.BasicOperation.set_extra_state
+
+def _safe_set_extra_state(self, state):
+    if state is not None and "EXTRA_STATE" in str(type(state)):
+        return
+    return _original_set_extra_state(self, state)
+
+def _safe_op_set_extra_state(self, state):
+    if state is not None and "EXTRA_STATE" in str(type(state)):
+        return
+    return _original_op_set_extra_state(self, state)
+
+te_base.TransformerEngineBaseModule.set_extra_state = _safe_set_extra_state
+te_ops.BasicOperation.set_extra_state = _safe_op_set_extra_state
+
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -172,17 +198,16 @@ class ModelState:
         if self.is_init_step:
             return self._get_base_model_state_dict()
 
-        # For PEFT models with quantized parameters (e.g., QLoRA with BitsAndBytes),
-        # bypass PyTorch DCP's get_model_state_dict() which fails when traversing
-        # quantized parameter types like Params4bit. Instead, directly collect
-        # trainable PEFT adapter weights.
-        if self.is_peft and _has_quantized_params(self.model[0]):
+        # For PEFT (LoRA/QLoRA/DoRA), only save trainable adapter weights. We bypass
+        # get_model_state_dict() because: (1) with quantized params (QLoRA) DCP fails
+        # traversing Params4bit; (2) with expert parallelism (MoE+EP) DCP expects
+        # full-model FQNs and raises KeyError when popping expert params that are
+        # sharded across ranks. Direct collection ensures we save only adapter weights,
+        # matching dense LLaMA/Qwen LoRA behavior and fixing MoE LoRA checkpointing.
+        if self.is_peft:
             model_state_dict = {k: v for sd in map(_get_peft_state_dict, self.model) for k, v in sd.items()}
         else:
-            options = None
-            if self.is_peft:
-                options = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=True)
-
+            options = StateDictOptions(full_state_dict=True, cpu_offload=True)
             func = partial(get_model_state_dict, options=options)
             model_state_dict = {k: v for sd in map(func, self.model) for k, v in sd.items()}
 
@@ -216,7 +241,8 @@ class ModelState:
             _drop_outer_prefix(state_dict, "base_model.model.")
             # DoRA: reverse the HF PEFT key rename so DCP can match model params
             _rename_dora_keys_from_hf(state_dict)
-            options = StateDictOptions(strict=False, broadcast_from_rank0=True, full_state_dict=True)
+            
+            options = StateDictOptions(strict=False, full_state_dict=True)
 
         # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
         # PyTorch will complain during load even with strict=False.
@@ -312,12 +338,11 @@ class OptimizerState:
         Returns:
             dict: Dictionary containing the optimizer and scheduler state dicts with CPU offloading enabled.
         """
-        # For PEFT models with quantized parameters (e.g., QLoRA with BitsAndBytes),
-        # bypass PyTorch DCP's get_optimizer_state_dict() which fails because DCP
-        # cannot build a consistent parameter-ID-to-FQN mapping when the model
-        # contains quantized frozen params (Params4bit/Int8Params) alongside
-        # trainable LoRA params. Use native optimizer state_dict instead.
-        if self.is_peft and _has_quantized_params(self.model[0]):
+        # For PEFT (LoRA/QLoRA/DoRA), bypass DCP's get_optimizer_state_dict() which
+        # builds a parameter-ID-to-FQN mapping from the full model and then fails
+        # (KeyError) when the optimizer only has state for trainable params and the
+        # model is sharded (e.g. MoE+EP). Use native optimizer state_dict instead.
+        if self.is_peft:
             optimizer_state_dict = self.optimizer[0].state_dict()
         else:
             # this line automatically manages FSDP FQN's, as well as sets the default state dict type
@@ -343,8 +368,8 @@ class OptimizerState:
         Args:
             state_dict (dict): State dictionary containing optimizer and scheduler states to load.
         """
-        # For PEFT + quantized models, use native load to match the native save path.
-        if self.is_peft and _has_quantized_params(self.model[0]):
+        # For PEFT, use native load to match the native save path.
+        if self.is_peft:
             self.optimizer[0].load_state_dict(state_dict["optim"])
         else:
             # sets our state dicts on the optimizer, now that we've loaded

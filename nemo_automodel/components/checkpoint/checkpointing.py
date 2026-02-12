@@ -527,8 +527,9 @@ class Checkpointer:
         is_model = True if "/model" in path else False
         # PEFT loading is broadcasted from rank0 so it is a special case
         if self.config.is_peft and is_model and (not is_init_step):
-            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
+            # Load the adapter model on all ranks. Safetensors uses mmap so this is efficient
+            # and avoids the complexity of broadcasting the state dict.
+            state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
         else:
             dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
         return state_dict
