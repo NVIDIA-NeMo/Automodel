@@ -35,8 +35,7 @@ TRANSFORMERS_OFFLINE=1 python -m coverage run --data-file=/workspace/.coverage -
     --checkpoint.checkpoint_dir checkpoints/ \
     --checkpoint.model_save_format safetensors \
     --checkpoint.save_consolidated true \
-    --distributed_config._target_ nemo_automodel.components.distributed.config.FSDP2Config \
     --distributed.dp_size none \
     --distributed.tp_size 1 \
     --distributed.cp_size 1 \
-    --distributed_config.sequence_parallel false
+    --distributed.sequence_parallel false

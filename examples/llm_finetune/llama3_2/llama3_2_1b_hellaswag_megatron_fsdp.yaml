@@ -45,12 +45,10 @@ checkpoint:
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
+  strategy: megatron_fsdp
   dp_size: none
   tp_size: 1
   cp_size: 1
-
-distributed_config:
-  _target_: nemo_automodel.components.distributed.config.MegatronFSDPConfig
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

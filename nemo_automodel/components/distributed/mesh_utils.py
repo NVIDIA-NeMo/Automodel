@@ -19,7 +19,7 @@ distributed config type (FSDP2, MegatronFSDP, or DDP).
 
 Usage:
     from nemo_automodel.components.distributed.config import FSDP2Config
-    from nemo_automodel.components.distributed.device_mesh import create_device_mesh
+    from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
 
     config = FSDP2Config(sequence_parallel=True)
     device_mesh, moe_mesh = create_device_mesh(
@@ -40,6 +40,7 @@ from nemo_automodel.components.distributed.config import (
     FSDP2Config,
     MegatronFSDPConfig,
 )
+from nemo_automodel.components.distributed.mesh import MeshAxisName
 
 
 def create_device_mesh(
@@ -187,7 +188,13 @@ def _create_fsdp2_device_mesh(
 
     # Build main device mesh
     mesh_shape = (pp_size, dp_replicate_size, dp_shard_size, cp_size, tp_size)
-    mesh_names = ("pp", "dp_replicate", "dp_shard", "cp", "tp")
+    mesh_names = (
+        MeshAxisName.PP,
+        MeshAxisName.DP_REPLICATE,
+        MeshAxisName.DP_SHARD,
+        MeshAxisName.CP,
+        MeshAxisName.TP,
+    )
     for shape, name in zip(mesh_shape, mesh_names):
         assert isinstance(shape, int), f"Expected {name} to be an int, but got {type(shape)}"
         assert shape > 0, f"Expected {name} > 0, got {shape}"
@@ -205,20 +212,20 @@ def _create_fsdp2_device_mesh(
     dp_cp_mesh_dim_names = []  # Mesh for loss all-reduce
 
     # for dp_replicate:
-    dp_mesh_dim_names.append("dp_replicate")
-    dp_cp_mesh_dim_names.append("dp_replicate")
+    dp_mesh_dim_names.append(MeshAxisName.DP_REPLICATE)
+    dp_cp_mesh_dim_names.append(MeshAxisName.DP_REPLICATE)
     # for dp_shard:
-    dp_mesh_dim_names.append("dp_shard")
-    dp_shard_cp_mesh_dim_names.append("dp_shard")
-    dp_cp_mesh_dim_names.append("dp_shard")
+    dp_mesh_dim_names.append(MeshAxisName.DP_SHARD)
+    dp_shard_cp_mesh_dim_names.append(MeshAxisName.DP_SHARD)
+    dp_cp_mesh_dim_names.append(MeshAxisName.DP_SHARD)
     # for cp:
-    dp_shard_cp_mesh_dim_names.append("cp")
-    dp_cp_mesh_dim_names.append("cp")
+    dp_shard_cp_mesh_dim_names.append(MeshAxisName.CP)
+    dp_cp_mesh_dim_names.append(MeshAxisName.CP)
 
     # Flatten submeshes
-    device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
-    device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_cp")
-    device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
+    device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP)
+    device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_SHARD_CP)
+    device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_CP)
 
     # Create MOE mesh if ep_size > 1
     moe_mesh = None
@@ -273,7 +280,7 @@ def _create_megatron_fsdp_device_mesh(
         dp_size = world_size // total_parallel_ranks
 
     mesh_shape = (dp_size, cp_size, tp_size)
-    mesh_names = ("dp", "cp", "tp")
+    mesh_names = (MeshAxisName.DP, MeshAxisName.CP, MeshAxisName.TP)
     for shape, name in zip(mesh_shape, mesh_names):
         assert isinstance(shape, int), f"Expected {name} to be an int, but got {type(shape)}"
         assert shape > 0, f"Expected {name} > 0, got {shape}"
@@ -287,7 +294,7 @@ def _create_megatron_fsdp_device_mesh(
 
     # Flatten dp+cp if cp > 1
     if cp_size > 1:
-        device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
+        device_mesh[(MeshAxisName.DP, MeshAxisName.CP)]._flatten(mesh_dim_name=MeshAxisName.DP_CP)
 
     return device_mesh
 
@@ -314,7 +321,7 @@ def _create_moe_mesh(
         DeviceMesh: The MOE mesh for expert parallelism.
     """
     mesh_shape = (pp_size, ep_shard_size, ep_size)
-    mesh_names = ("pp", "ep_shard", "ep")
+    mesh_names = (MeshAxisName.PP, MeshAxisName.EP_SHARD, MeshAxisName.EP)
     for shape, name in zip(mesh_shape, mesh_names):
         assert isinstance(shape, int), f"Expected {name} to be an int, but got {type(shape)}"
         assert shape > 0, f"Expected {name} > 0, got {shape}"

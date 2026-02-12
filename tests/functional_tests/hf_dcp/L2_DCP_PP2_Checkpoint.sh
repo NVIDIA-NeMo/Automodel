@@ -38,14 +38,12 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --checkpoint.enabled true \
     --checkpoint.checkpoint_dir checkpoints/ \
     --checkpoint.model_save_format torch_save \
-    --distributed_config._target_ nemo_automodel.components.distributed.config.FSDP2Config \
     --distributed.dp_size 1 \
     --distributed.tp_size 1 \
     --distributed.cp_size 1 \
     --distributed.pp_size 2 \
-    --distributed_config.sequence_parallel false \
-    --autopipeline._target_ nemo_automodel.components.distributed.pipelining.config.PipelineConfig \
-    --autopipeline.pp_schedule 1f1b \
-    --autopipeline.pp_microbatch_size 1 \
-    --autopipeline.round_virtual_stages_to_pp_multiple up \
-    --autopipeline.scale_grads_in_schedule false
+    --distributed.sequence_parallel false \
+    --distributed.pipeline.pp_schedule 1f1b \
+    --distributed.pipeline.pp_microbatch_size 1 \
+    --distributed.pipeline.round_virtual_stages_to_pp_multiple up \
+    --distributed.pipeline.scale_grads_in_schedule false
