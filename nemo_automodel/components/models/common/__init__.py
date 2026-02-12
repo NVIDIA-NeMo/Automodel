@@ -14,9 +14,6 @@
 
 """Common/shared components for model implementations."""
 
-from nemo_automodel.components.models.common.bidirectional import (
-    BiencoderStateDictAdapter,
-)
 from nemo_automodel.components.models.common.combined_projection import (
     CombinedGateUpMLP,
     CombinedQKVAttentionMixin,
@@ -34,8 +31,6 @@ from nemo_automodel.components.models.common.utils import (
 )
 
 __all__ = [
-    # Bidirectional utilities
-    "BiencoderStateDictAdapter",
     # Combined projection
     "CombinedQKVAttentionMixin",
     "CombinedGateUpMLP",
