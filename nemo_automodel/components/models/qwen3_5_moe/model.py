@@ -18,22 +18,41 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
-    Qwen3_5MoeConfig,
-    Qwen3_5MoeTextConfig,
-)
-from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-    Qwen3_5MoeForConditionalGeneration as HFQwen3_5MoeForConditionalGeneration,
-)
-from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-    Qwen3_5MoeGatedDeltaNet,
-    Qwen3_5MoeModelOutputWithPast,
-    Qwen3_5MoeTextRotaryEmbedding,
-    Qwen3_5MoeVisionRotaryEmbedding,
-)
-from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-    Qwen3_5MoeModel as HFQwen3_5MoeModel,
-)
+
+from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
+
+def _make_missing(name: str):
+    return UnavailableMeta(name, (), {"_msg": "transformers.models.qwen3_5_moe is not available."})
+
+
+try:
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+        Qwen3_5MoeConfig,
+        Qwen3_5MoeTextConfig,
+    )
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        Qwen3_5MoeForConditionalGeneration as HFQwen3_5MoeForConditionalGeneration,
+    )
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        Qwen3_5MoeGatedDeltaNet,
+        Qwen3_5MoeModelOutputWithPast,
+        Qwen3_5MoeTextRotaryEmbedding,
+        Qwen3_5MoeVisionRotaryEmbedding,
+    )
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        Qwen3_5MoeModel as HFQwen3_5MoeModel,
+    )
+    _QWEN3_5_MOE_HF_AVAILABLE = True
+except ModuleNotFoundError:
+    _QWEN3_5_MOE_HF_AVAILABLE = False
+    Qwen3_5MoeConfig = _make_missing("Qwen3_5MoeConfig")
+    Qwen3_5MoeTextConfig = _make_missing("Qwen3_5MoeTextConfig")
+    HFQwen3_5MoeForConditionalGeneration = _make_missing("Qwen3_5MoeForConditionalGeneration")
+    Qwen3_5MoeGatedDeltaNet = _make_missing("Qwen3_5MoeGatedDeltaNet")
+    Qwen3_5MoeModelOutputWithPast = _make_missing("Qwen3_5MoeModelOutputWithPast")
+    Qwen3_5MoeTextRotaryEmbedding = _make_missing("Qwen3_5MoeTextRotaryEmbedding")
+    Qwen3_5MoeVisionRotaryEmbedding = _make_missing("Qwen3_5MoeVisionRotaryEmbedding")
+    HFQwen3_5MoeModel = _make_missing("Qwen3_5MoeModel")
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -365,6 +384,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         *model_args,
         **kwargs,
     ):
+        if not _QWEN3_5_MOE_HF_AVAILABLE:
+            raise UnavailableError("transformers.models.qwen3_5_moe is not available.")
         config = Qwen3_5MoeConfig.from_pretrained(pretrained_model_name_or_path)
         return cls.from_config(config, *model_args, **kwargs)
 
@@ -375,6 +396,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         backend: BackendConfig | None = None,
         **kwargs,
     ):
+        if not _QWEN3_5_MOE_HF_AVAILABLE:
+            raise UnavailableError("transformers.models.qwen3_5_moe is not available.")
         backend = backend or BackendConfig()
         # Initialize HF parent (creates self.model, self.lm_head, vision encoder, etc.)
         super().__init__(config)
@@ -522,4 +545,5 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             self.model.language_model.rotary_emb.device = buffer_device
 
 
-ModelClass = Qwen3_5MoeForConditionalGeneration
+if _QWEN3_5_MOE_HF_AVAILABLE:
+    ModelClass = Qwen3_5MoeForConditionalGeneration
