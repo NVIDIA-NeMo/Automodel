@@ -191,13 +191,8 @@ def _instantiate_pipeline(
     return AutoPipeline(
         world_mesh=mesh.device_mesh,
         moe_mesh=mesh.moe_mesh,
-        pp_axis_name=mesh.pp_axis_name,
-        dp_axis_names=mesh.dp_axis_names,
-        cp_axis_name=mesh.cp_axis_name,
-        tp_axis_name=mesh.tp_axis_name,
-        ep_axis_name=mesh.ep_axis_name,
-        ep_shard_axis_names=mesh.ep_shard_axis_names,
         device=device,
+        **mesh.pipeline_axis_kwargs(),
         **config_dict,
     )
 
