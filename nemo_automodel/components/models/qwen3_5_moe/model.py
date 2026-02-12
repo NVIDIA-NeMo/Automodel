@@ -21,6 +21,7 @@ import torch.nn as nn
 
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
 
+
 def _make_missing(name: str):
     return UnavailableMeta(name, (), {"_msg": "transformers.models.qwen3_5_moe is not available."})
 
@@ -42,6 +43,7 @@ try:
     from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
         Qwen3_5MoeModel as HFQwen3_5MoeModel,
     )
+
     _QWEN3_5_MOE_HF_AVAILABLE = True
 except ModuleNotFoundError:
     _QWEN3_5_MOE_HF_AVAILABLE = False
