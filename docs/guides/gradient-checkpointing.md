@@ -44,8 +44,6 @@ loss_fn:
 
 LC-CE and gradient checkpointing target **different memory hot-spots** (output layer vs transformer blocks) so their benefits stack almost linearly.
 
----
-
 ## Example Memory Savings (H100-80GB, Llama-3.2-1B)
 | Technique | Max GPU Mem (GB) | Δ vs Baseline |
 |-----------|-----------------|---------------|

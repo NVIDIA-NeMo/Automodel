@@ -139,8 +139,6 @@ validation_dataloader:
 * Distilling Vision-Language models (`vlm` recipe) is currently not supported.
 * Student and teacher models must share the same tokenizer for now; support for different tokenizers will be added in the future.
 
----
-
 ## Launch Training
 
 ### Single-GPU Quick Run

@@ -70,8 +70,6 @@ Consider the following options:
 3. Use `--num-workers` to control parallelization.
 4. Specify `--output-dir` to change the output location.
 
----
-
 ## Understand the NeMo AutoModel Training Workflow
 
 NeMo AutoModel follows a simple but powerful flow for training:
@@ -361,8 +359,6 @@ Notes:
 - Any nested mapping that includes `_target_` (e.g., `config:`) is instantiated first and its result is passed upward. This is how the Hugging Face `from_config` pattern works.
 - You can keep using the same training recipe (optimizer, data, distributed settings); only the `model:` block changes.
 
----
-
 ## Inspect and Adjust the YAML Configuration
 
 [`examples/llm_pretrain/nanogpt_pretrain.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/nanogpt_pretrain.yaml) is a complete configuration that:
@@ -435,8 +431,6 @@ The `TrainFinetuneRecipeForNextTokenPrediction` class handles:
 * Validation loops if you supply `validation_dataset`.
 
 Checkpoints are written under `checkpoints/` by default as `safetensors` or `torch_save` (YAML-configurable).
-
----
 
 ## Monitor and Evaluate Training
 
