@@ -39,6 +39,7 @@ performance-summary.md
 :hidden:
 guides/overview.md
 guides/llm/finetune.md
+guides/llm/finetuning-guide.md
 guides/llm/toolcalling.md
 guides/llm/pretraining.md
 guides/llm/nanogpt-pretraining.md
