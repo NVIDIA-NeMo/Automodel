@@ -29,7 +29,7 @@ rng:
 
 moe_config:
   _target_: nemo_automodel.components.moe.config.MoEParallelizerConfig
-  activation_checkpointing: false
+  activation_checkpointing: true
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
