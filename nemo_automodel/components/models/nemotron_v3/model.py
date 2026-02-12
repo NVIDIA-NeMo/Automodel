@@ -103,7 +103,7 @@ class NemotronV3Model(nn.Module):
         *,
         attention_mask: torch.Tensor | None = None,
         causal_mask_mapping: dict[str, torch.Tensor] | None = None,
-        input_embeds: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Forward pass through the model.
@@ -112,19 +112,19 @@ class NemotronV3Model(nn.Module):
             input_ids: Input token IDs [batch_size, seq_len] (optional)
             attention_mask: 2D padding mask [batch_size, seq_len] (1=real, 0=padding)
             causal_mask_mapping: Dict with precomputed 4D causal masks for attention layers
-            input_embeds: Input embeddings [batch_size, seq_len, hidden_size] (optional)
+            inputs_embeds: Input embeddings [batch_size, seq_len, hidden_size] (optional)
             **kwargs: Additional arguments (ignored)
 
         Returns:
             Hidden states tensor [batch_size, seq_len, hidden_size]
         """
         # Get embeddings
-        if input_embeds is None:
+        if inputs_embeds is None:
             if input_ids is None:
-                raise ValueError("input_ids must be provided if input_embeds is not provided")
+                raise ValueError("input_ids must be provided if inputs_embeds is not provided")
             hidden_states = self.embed_tokens(input_ids)
         else:
-            hidden_states = input_embeds
+            hidden_states = inputs_embeds
 
         # TODO: attention mask currently does not work. A default causal mask is applied.
 
