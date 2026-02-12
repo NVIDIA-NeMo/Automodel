@@ -197,20 +197,28 @@ class TestValidation:
             parse_distributed_section({"strategy": "unknown"})
 
     def test_pipeline_requires_pp_gt_1(self):
-        with pytest.raises(ValueError, match="pp_size > 1"):
-            parse_distributed_section({"pp_size": 1, "pipeline": {"pp_schedule": "1f1b"}})
+        """Pipeline section is silently discarded when pp_size <= 1
+        (common when a YAML template is overridden via CLI)."""
+        result = parse_distributed_section({"pp_size": 1, "pipeline": {"pp_schedule": "1f1b"}})
+        assert result["pipeline_config"] is None
+        assert result["pp_enabled"] is False
 
     def test_pipeline_rejects_default_pp_size(self):
-        with pytest.raises(ValueError, match="pp_size > 1"):
-            parse_distributed_section({"pipeline": {"pp_schedule": "1f1b"}})
+        """Pipeline section is silently discarded when pp_size defaults to 1."""
+        result = parse_distributed_section({"pipeline": {"pp_schedule": "1f1b"}})
+        assert result["pipeline_config"] is None
+        assert result["pp_enabled"] is False
 
     def test_moe_requires_ep_gt_1(self):
-        with pytest.raises(ValueError, match="ep_size > 1"):
-            parse_distributed_section({"ep_size": 1, "moe": {"ignore_router_for_ac": True}})
+        """MoE section is silently discarded when ep_size <= 1
+        (common when a YAML template is overridden via CLI)."""
+        result = parse_distributed_section({"ep_size": 1, "moe": {"ignore_router_for_ac": True}})
+        assert result["moe_config"] is None
 
     def test_moe_rejects_default_ep_size(self):
-        with pytest.raises(ValueError, match="ep_size > 1"):
-            parse_distributed_section({"moe": {"ignore_router_for_ac": True}})
+        """MoE section is silently discarded when ep_size defaults to 1."""
+        result = parse_distributed_section({"moe": {"ignore_router_for_ac": True}})
+        assert result["moe_config"] is None
 
     def test_unknown_field_for_strategy(self):
         with pytest.raises(ValueError, match="Unknown options"):

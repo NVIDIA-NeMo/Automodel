@@ -83,6 +83,13 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     moe_dict: Optional[dict] = cfg.pop("moe", None)
     activation_checkpointing: bool = cfg.pop("activation_checkpointing", False)
 
+    # Strip Hydra / OmegaConf meta keys (e.g. ``_target_``, ``_recursive_``,
+    # ``_convert_``) that may leak from YAML configs.  They have no meaning
+    # for the strategy constructor and should not trigger validation errors.
+    _HYDRA_META_KEYS = {"_target_", "_recursive_", "_convert_"}
+    for key in _HYDRA_META_KEYS:
+        cfg.pop(key, None)
+
     # Everything still in *cfg* is forwarded to the strategy constructor.
     strategy_kwargs: Dict[str, Any] = cfg
 
