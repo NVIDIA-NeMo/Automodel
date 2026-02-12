@@ -168,14 +168,12 @@ torchrun --nproc-per-node $(nvidia-smi -L | wc -l) \
 The CLI seamlessly submits Slurm jobs when a `slurm` section is added to the
 YAML.  Refer to `docs/guides/installation.md` for cluster instructions.
 
----
 
 ## Monitoring
 
 Metrics such as *train_loss*, *kd_loss*, *learning_rate* and *tokens/sec* are
 logged to **WandB** when the corresponding section is enabled.
 
----
 
 ## Checkpoints and Inference
 

@@ -1,8 +1,6 @@
 # FP8 Training in NeMo AutoModel
 
-NeMo AutoModel supports FP8 quantization using [TorchAO](https://github.com/pytorch/ao) and `torch.compile` to accelerate training on compatible hardware.
-
-FP8 (8-bit floating point) quantization can provide substantial speedups for models where the majority of GEMMs are sufficiently large. The speedup from using FP8 tensor cores must outweigh the overhead of dynamic quantization.
+NeMo AutoModel supports FP8 (8-bit floating point) quantization using [TorchAO](https://github.com/pytorch/ao) and `torch.compile` to accelerate training on compatible hardware.
 
 ### Requirements for FP8 Training in NeMo AutoModel
 
@@ -126,19 +124,13 @@ uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config ex
 
 ## Performance Considerations
 
-FP8 requires specific conditions to be effective:
-- Input tensors must have dimensions divisible by 16 
-- Using compatible hardware (H100+)
-- Training with `torch.compile`
+FP8 works best when the speedup from FP8 tensor cores outweighs the overhead of dynamic quantization. Key requirements:
 
-FP8 works best when the majority of GEMM operations are sufficiently large such that the speedup achieved by using FP8 tensor cores is greater than the overhead of dynamic quantization.
-
-### Ideal Conditions for FP8 Performance
-
-- Linear layers are large and compute-intensive
-- The model consists of fewer small operations and more large matrix multiplications
-- You have modern (H100+) hardware optimized for FP8 acceleration
-- Moderate numerical precision is acceptable and slight approximations won't affect outcomes
+- **Hardware**: H100 or newer GPUs with FP8 tensor cores
+- **Tensor dimensions**: must be divisible by 16
+- **`torch.compile`**: must be enabled for meaningful speedup
+- **Large GEMMs**: linear layers should be compute-intensive; models dominated by large matrix multiplications benefit most
+- **Precision tolerance**: slight numerical approximations must be acceptable for the task
 
 
 

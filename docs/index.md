@@ -74,6 +74,7 @@ guides/vlm/dataset.md
 guides/checkpointing.md
 guides/gradient-checkpointing.md
 guides/pipelining.md
+guides/pipelining-advanced.md
 guides/llm/knowledge-distillation.md
 guides/fp8-training.md
 guides/mlflow-logging.md

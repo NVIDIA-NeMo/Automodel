@@ -78,7 +78,12 @@ Then submit the job:
 automodel finetune llm -c your_config_with_slurm.yaml
 ```
 
-The AutoModel CLI is the preferred method for most users. It provides a unified interface for running jobs, from local environments (e.g., [workstation](./local-workstation.md)) to large clusters (e.g., Slurm batch jobs). The CLI will automatically submit the job to Slurm and handle the distributed setup. The above example launches one node with eight workers per node using torchrun (`--nproc-per-node=8`). The Slurm script itself uses `#SBATCH --ntasks-per-node 1`, and when `gpus_per_node` is set, it adds `#SBATCH --gpus-per-node=8` as well.
+The AutoModel CLI is the preferred method for most users:
+
+- Provides a unified interface from [local workstations](./local-workstation.md) to Slurm clusters
+- Automatically submits the job to Slurm and handles distributed setup
+- The example above launches **one node with eight workers** via torchrun (`--nproc-per-node=8`)
+- Slurm script uses `#SBATCH --ntasks-per-node 1`; when `gpus_per_node` is set, it adds `#SBATCH --gpus-per-node=8`
 
 
 The CLI follows this format:
