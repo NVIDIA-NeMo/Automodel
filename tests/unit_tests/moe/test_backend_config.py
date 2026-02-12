@@ -143,7 +143,8 @@ class TestBackendConfigEnableDeepepDeprecation:
             warnings.simplefilter("always")
             config = BackendConfig(enable_deepep=False)
             assert config.dispatcher == "torch"
-            assert config.experts == "torch_mm"  # experts unchanged when enable_deepep=False
+            expected_experts = "torch_mm" if torch.cuda.is_available() else "torch"
+            assert config.experts == expected_experts  # experts unchanged when enable_deepep=False
             assert config.enable_deepep is None  # Should be cleared after conversion
             assert len(w) == 1
             assert issubclass(w[0].category, DeprecationWarning)
