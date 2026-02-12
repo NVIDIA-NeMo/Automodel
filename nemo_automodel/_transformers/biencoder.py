@@ -315,6 +315,11 @@ class BiencoderModel(nn.Module):
                 peft_config=kwargs.get("peft_config", None),
                 tokenizer=kwargs.get("tokenizer", None),
             )
+
+            if self.add_linear_pooler:
+                pooler_path = os.path.join(save_directory, "pooler.pt")
+                logger.info(f"Saving linear pooler to {pooler_path}")
+                torch.save(self.linear_pooler.state_dict(), pooler_path)
             return
 
         # Fallback: HF-native save (no checkpointer available)
