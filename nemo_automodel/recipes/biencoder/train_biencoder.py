@@ -40,7 +40,7 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.recipes.llm.train_ft import build_distributed, build_optimizer, build_step_scheduler
+from nemo_automodel.recipes.llm.train_ft import build_distributed, build_step_scheduler
 
 logger = logging.getLogger(__name__)
 
