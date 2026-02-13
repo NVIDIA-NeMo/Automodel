@@ -97,7 +97,7 @@ class CombinedProjectionStateDictAdapter:
         m = _LAYER_QKV_NATIVE_RE.match(native_key)
         if m:
             self._uses_model_prefix = m.group(1) is not None
-            layer_idx, suffix = m.group(3)
+            layer_idx, suffix = int(m.group(2)), m.group(3)
             prefix = self._prefix(layer_idx)
             return [
                 f"{prefix}.self_attn.q_proj.{suffix}",
