@@ -63,6 +63,17 @@ def _is_geq_torch_2_9() -> bool:
     return parse(torch.__version__).base_version >= "2.9.0"
 
 
+def _is_safetensors_checkpoint(path: str) -> bool:
+    """Return True if path looks like a safetensors checkpoint (so we can preserve dtype); else DCP or other."""
+    if os.path.isfile(path):
+        return path.endswith(".safetensors")
+    if not os.path.isdir(path):
+        return False
+    if os.path.isfile(os.path.join(path, "model.safetensors.index.json")):
+        return True
+    return len(glob.glob(os.path.join(path, "*.safetensors"))) > 0
+
+
 if _is_geq_torch_2_9():
     from torch.distributed.checkpoint.staging import DefaultStager
     from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType, AsyncSaveResponse
@@ -342,7 +353,20 @@ class Checkpointer:
                 _load_full_state_dict_into_model(model_state.model, converted_state_dict)
                 return
 
-        # Standard loading path
+        # When loading base model for a single (unsharded) model and the checkpoint is safetensors
+        # (not DCP), load into new tensors so checkpoint dtypes (e.g. bf16) are preserved.
+        if is_init_step and len(model_state.model) == 1 and _is_safetensors_checkpoint(model_path):
+            state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
+            if state_dict_from_disk is not None:
+                state_dict_from_disk = _maybe_adapt_state_dict_from_hf(
+                    model_state.model[0], state_dict_from_disk, moe_mesh=self.moe_mesh
+                )
+                model_state.load_state_dict(
+                    state_dict_from_disk, strict=not (len(model_state.model) > 1 or has_state_dict_adapter)
+                )
+                return
+
+        # Standard loading path (DCP copies into model's existing tensors; dtypes follow the model)
         state_dict = model_state.state_dict()
         # When the model has a state_dict_adapter, it handles all key transformations
         # (to_hf/from_hf). Passing key_mapping to the storage reader would double-transform
@@ -1137,6 +1161,44 @@ def _equally_divide_layers(num_shards: int, keys: list[str]) -> dict[str, int]:
             fqn_to_index_mapping[key] = shard_index
         start = end
     return fqn_to_index_mapping
+
+
+def _load_hf_checkpoint_preserving_dtype(model_path: str) -> Optional[dict[str, torch.Tensor]]:
+    """
+    Load a HuggingFace checkpoint (safetensors) into a new state dict so tensor dtypes
+    match the checkpoint (e.g. bf16). Used when loading the base model so FSDP sees
+    uniform dtype instead of the model's init dtypes (e.g. float32).
+    Returns None if the path is not a valid safetensors checkpoint.
+    """
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        return None
+    if not os.path.isdir(model_path) and not (os.path.isfile(model_path) and model_path.endswith(".safetensors")):
+        return None
+    out: dict[str, torch.Tensor] = {}
+    if os.path.isfile(model_path):
+        return dict(load_file(model_path))
+    # Directory: try index first, then glob
+    index_file = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.isfile(index_file):
+        import json
+        with open(index_file) as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map", {})
+        for key, filename in weight_map.items():
+            sf_path = os.path.join(model_path, filename)
+            if not os.path.isfile(sf_path):
+                continue
+            with safe_open(sf_path, framework="pt", device="cpu") as f:
+                if key in f.keys():
+                    out[key] = f.get_tensor(key)
+    else:
+        for sf_path in glob.glob(os.path.join(model_path, "*.safetensors")):
+            with safe_open(sf_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    out[key] = f.get_tensor(key)
+    return out if out else None
 
 
 def _maybe_adapt_state_dict_from_hf(
