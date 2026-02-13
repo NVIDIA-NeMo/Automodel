@@ -321,6 +321,190 @@ class TestFakeBalancedGate:
         assert weights_fp16.dtype == torch.float16
 
 
+class TestFakeBalancedGateNoise:
+    """Test FakeBalancedGate with configurable noise."""
+
+    def test_noise_zero_matches_balanced(self, moe_config, device):
+        """Test that noise=0 gives identical results to the default balanced gate."""
+        gate_default = FakeBalancedGate(moe_config)
+        gate_zero = FakeBalancedGate(moe_config, noise=0.0)
+        gate_default.to(device)
+        gate_zero.to(device)
+
+        x = torch.randn(16, moe_config.dim, dtype=torch.bfloat16, device=device)
+        mask = torch.ones(16, dtype=torch.bool, device=device)
+
+        w1, i1, _ = gate_default(x, mask, cp_mesh=None)
+        w2, i2, _ = gate_zero(x, mask, cp_mesh=None)
+
+        torch.testing.assert_close(w1, w2)
+        assert torch.equal(i1, i2)
+
+    def test_noise_one_random_indices(self, moe_config, device):
+        """Test that noise=1.0 produces fully random indices (not perfectly balanced)."""
+        gate = FakeBalancedGate(moe_config, noise=1.0)
+        gate.to(device)
+
+        # Large batch to ensure statistical detection of randomness
+        n_tokens = 1000
+        x = torch.randn(n_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        mask = torch.ones(n_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, _ = gate(x, mask, cp_mesh=None)
+
+        # With noise=1.0, weights should NOT be uniform
+        expected_uniform = 1.0 / moe_config.n_activated_experts
+        assert not torch.allclose(weights, torch.full_like(weights, expected_uniform))
+
+        # Weights should still sum to ~1 per token
+        weight_sums = weights.sum(dim=-1)
+        torch.testing.assert_close(weight_sums, torch.ones_like(weight_sums), atol=1e-3, rtol=1e-3)
+
+    def test_noise_creates_load_imbalance(self, moe_config, device):
+        """Test that noise creates measurable load imbalance across experts."""
+        gate = FakeBalancedGate(moe_config, noise=0.5)
+        gate.to(device)
+
+        n_tokens = 2000
+        x = torch.randn(n_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        mask = torch.ones(n_tokens, dtype=torch.bool, device=device)
+
+        _, indices, _ = gate(x, mask, cp_mesh=None)
+
+        # Count tokens per expert
+        counts = torch.zeros(moe_config.n_routed_experts, device=device)
+        for i in range(moe_config.n_routed_experts):
+            counts[i] = (indices == i).sum()
+
+        # With noise, std dev should be nonzero (not perfectly balanced)
+        assert counts.float().std() > 0
+
+    def test_noise_output_shapes(self, moe_config, device):
+        """Test that noisy gate outputs have correct shapes."""
+        gate = FakeBalancedGate(moe_config, noise=0.3)
+        gate.to(device)
+
+        n_tokens = 32
+        x = torch.randn(n_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        mask = torch.ones(n_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, mask, cp_mesh=None)
+
+        assert weights.shape == (n_tokens, moe_config.n_activated_experts)
+        assert indices.shape == (n_tokens, moe_config.n_activated_experts)
+        assert aux_loss is None
+
+    def test_noise_indices_in_valid_range(self, moe_config, device):
+        """Test that noisy indices stay within valid expert range."""
+        gate = FakeBalancedGate(moe_config, noise=1.0)
+        gate.to(device)
+
+        n_tokens = 200
+        x = torch.randn(n_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        mask = torch.ones(n_tokens, dtype=torch.bool, device=device)
+
+        _, indices, _ = gate(x, mask, cp_mesh=None)
+
+        assert indices.min() >= 0
+        assert indices.max() < moe_config.n_routed_experts
+
+    def test_noise_with_skip_experts(self, moe_config, device):
+        """Test that noise respects skip_first_n_experts."""
+        skip_n = 2
+        gate = FakeBalancedGate(moe_config, skip_first_n_experts=skip_n, noise=0.8)
+        gate.to(device)
+
+        n_tokens = 200
+        x = torch.randn(n_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        mask = torch.ones(n_tokens, dtype=torch.bool, device=device)
+
+        _, indices, _ = gate(x, mask, cp_mesh=None)
+
+        # Skipped experts should never appear
+        assert indices.min() >= skip_n
+        assert indices.max() < moe_config.n_routed_experts
+
+    def test_noise_indices_unique_per_token(self, moe_config, device):
+        """Test that each token's expert indices are unique (no duplicates).
+
+        Duplicate expert indices per token cause undefined behavior in the
+        scatter-back step (y[token_ids] += ...) during the MoE forward pass.
+        """
+        gate = FakeBalancedGate(moe_config, noise=1.0)
+        gate.to(device)
+
+        n_tokens = 500
+        x = torch.randn(n_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        mask = torch.ones(n_tokens, dtype=torch.bool, device=device)
+
+        _, indices, _ = gate(x, mask, cp_mesh=None)
+
+        # Each row should have unique expert indices
+        for i in range(n_tokens):
+            row = indices[i]
+            assert row.unique().numel() == row.numel(), f"Token {i} has duplicate experts: {row}"
+
+    def test_noise_weights_positive(self, moe_config, device):
+        """Test that noisy weights are all positive."""
+        gate = FakeBalancedGate(moe_config, noise=0.9)
+        gate.to(device)
+
+        n_tokens = 64
+        x = torch.randn(n_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        mask = torch.ones(n_tokens, dtype=torch.bool, device=device)
+
+        weights, _, _ = gate(x, mask, cp_mesh=None)
+
+        assert (weights > 0).all()
+
+    def test_noise_deterministic_for_same_input(self, moe_config, device):
+        """Test that same input produces same routing (activation checkpointing safe).
+
+        The seed is derived from the input content, so forward and recompute
+        (which receive the same x) produce identical routing.
+        """
+        gate = FakeBalancedGate(moe_config, noise=0.7)
+        gate.to(device)
+
+        n_tokens = 64
+        x = torch.randn(n_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        mask = torch.ones(n_tokens, dtype=torch.bool, device=device)
+
+        w1, i1, _ = gate(x, mask, cp_mesh=None)
+        w2, i2, _ = gate(x, mask, cp_mesh=None)
+
+        torch.testing.assert_close(w1, w2)
+        assert torch.equal(i1, i2)
+
+    def test_noise_dynamic_for_different_input(self, moe_config, device):
+        """Test that different inputs produce different routing.
+
+        This mimics real training where each step has different hidden states,
+        reproducing the dynamic tokens_per_expert pattern of real Gate.
+        """
+        gate = FakeBalancedGate(moe_config, noise=0.7)
+        gate.to(device)
+
+        n_tokens = 64
+        mask = torch.ones(n_tokens, dtype=torch.bool, device=device)
+
+        x1 = torch.randn(n_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        x2 = torch.randn(n_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+
+        _, i1, _ = gate(x1, mask, cp_mesh=None)
+        _, i2, _ = gate(x2, mask, cp_mesh=None)
+
+        assert not torch.equal(i1, i2)
+
+    def test_noise_stored_as_attribute(self, moe_config):
+        """Test that noise is stored as an attribute."""
+        gate = FakeBalancedGate(moe_config, noise=0.42)
+        assert gate.noise == 0.42
+
+        gate_default = FakeBalancedGate(moe_config)
+        assert gate_default.noise == 0.0
+
+
 class TestGate:
     """Test Gate (router) module."""
 
@@ -696,6 +880,15 @@ class TestMoE:
 
         assert isinstance(moe.gate, FakeBalancedGate)
         assert isinstance(moe.experts, GroupedExperts)
+
+    def test_moe_init_fake_gate_noise_passed_through(self, moe_config, backend_config):
+        """Test that fake_gate_noise from BackendConfig is passed to FakeBalancedGate."""
+        backend_config.fake_balanced_gate = True
+        backend_config.fake_gate_noise = 0.5
+        moe = MoE(moe_config, backend_config)
+
+        assert isinstance(moe.gate, FakeBalancedGate)
+        assert moe.gate.noise == 0.5
 
     def test_moe_init_with_deepep_single_device(self, moe_config, backend_config):
         """DeepEP dispatcher enabled but world size == 1 should fall back to GroupedExperts."""
