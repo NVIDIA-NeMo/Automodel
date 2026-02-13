@@ -392,6 +392,26 @@ def apply_model_infrastructure(
             model, mesh.tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
         )
 
+    # When no PP and no TP, load checkpoint first (unwrapped model) so weights and dtypes come from
+    # the checkpoint; then apply FSDP. Otherwise we shard first and load after.
+    no_pp = autopipeline is None
+    no_tp = mesh.tp_size <= 1
+    need_checkpoint_load = bool(pretrained_model_name_or_path and load_base_model)
+    load_before_shard = no_pp and no_tp and need_checkpoint_load
+
+    checkpoint_already_loaded = False
+    if load_before_shard:
+        lora_a_init = getattr(peft_config, "lora_A_init", None)
+        checkpointer.load_base_model(
+            model,
+            device,
+            cache_dir,
+            pretrained_model_name_or_path,
+            lora_a_init,
+            load_base_model=load_base_model,
+        )
+        checkpoint_already_loaded = True
+
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
     pre_shard_hf_state_dict_keys = list(
         _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=dequantize_base_checkpoint).keys()
@@ -421,17 +441,16 @@ def apply_model_infrastructure(
         else:
             setattr(model, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
 
-    # Load the checkpoint if needed and return
-    # Weights need to be loaded for meta device models:
-    # 1. Single GPU custom models (no parallelization but still need weights)
-    # 2. When parallelize_fn was used (which will internally apply FSDP2/EP sharding)
-    # 3. When FSDP2Manager.parallelize was used (but not MegatronFSDP which handles weights internally)
-    should_load_checkpoint = is_meta_device and any(
-        [
-            get_world_size_safe() == 1,
-            parallelize_fn is not None and get_world_size_safe() > 1,
-            callable(getattr(model_wrapper, "parallelize", None)),
-        ]
+    # Load the checkpoint if needed (meta path, or PP/TP path where we did not load before shard)
+    should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded and (
+        is_meta_device
+        and any(
+            [
+                get_world_size_safe() == 1,
+                parallelize_fn is not None and get_world_size_safe() > 1,
+                callable(getattr(model_wrapper, "parallelize", None)),
+            ]
+        )
     )
     if should_load_checkpoint:
         models_to_load = model.parts if hasattr(model, "parts") else [model]
