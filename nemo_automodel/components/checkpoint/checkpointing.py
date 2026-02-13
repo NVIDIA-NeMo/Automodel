@@ -353,17 +353,26 @@ class Checkpointer:
                 _load_full_state_dict_into_model(model_state.model, converted_state_dict)
                 return
 
-        # When loading base model for a single (unsharded) model and the checkpoint is safetensors
-        # (not DCP), load into new tensors so checkpoint dtypes (e.g. bf16) are preserved.
-        if is_init_step and len(model_state.model) == 1 and _is_safetensors_checkpoint(model_path):
+        # When loading base model for a single model and the checkpoint is safetensors (not DCP),
+        # load into new tensors so checkpoint dtypes (e.g. bf16) are preserved. If the model is
+        # already sharded (DTensors), use set_model_state_dict with full_state_dict=True to
+        # scatter into the sharded model (same as tensor-merging path).
+        if (
+            is_init_step
+            and len(model_state.model) == 1
+            and _is_safetensors_checkpoint(model_path)
+        ):
             state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
             if state_dict_from_disk is not None:
                 state_dict_from_disk = _maybe_adapt_state_dict_from_hf(
                     model_state.model[0], state_dict_from_disk, moe_mesh=self.moe_mesh
                 )
-                model_state.load_state_dict(
-                    state_dict_from_disk, strict=not (len(model_state.model) > 1 or has_state_dict_adapter)
-                )
+                if _model_has_dtensors(model_state.model[0]):
+                    _load_full_state_dict_into_model(model_state.model, state_dict_from_disk)
+                else:
+                    model_state.load_state_dict(
+                        state_dict_from_disk, strict=not (len(model_state.model) > 1 or has_state_dict_adapter)
+                    )
                 return
 
         # Standard loading path (DCP copies into model's existing tensors; dtypes follow the model)
@@ -1161,6 +1170,11 @@ def _equally_divide_layers(num_shards: int, keys: list[str]) -> dict[str, int]:
             fqn_to_index_mapping[key] = shard_index
         start = end
     return fqn_to_index_mapping
+
+
+def _model_has_dtensors(module: nn.Module) -> bool:
+    """True if any parameter is a DTensor (model is already sharded)."""
+    return any(type(p).__name__ == "DTensor" for p in module.parameters())
 
 
 def _load_hf_checkpoint_preserving_dtype(model_path: str) -> Optional[dict[str, torch.Tensor]]:
