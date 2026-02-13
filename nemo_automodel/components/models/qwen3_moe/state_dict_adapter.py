@@ -18,12 +18,12 @@ from typing import Any, Optional
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import (
+from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.state_dict_lazy import (
     LazyHFStateDict,
     LazyNativeStateDict,
-    StateDictAdapter,
 )
-from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 
@@ -85,7 +85,6 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
                 self._uses_model_prefix = key.startswith("model.")
                 break
         if inplace:
-            from nemo_automodel.components.checkpoint.state_dict_adapter import LazyHFStateDict
             if isinstance(hf_state_dict, LazyHFStateDict):
                 # Round-trip: return native tensors from the backing dict (zero copy, peak = 1x).
                 return LazyNativeStateDict(

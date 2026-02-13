@@ -31,6 +31,11 @@ import torch
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
+from nemo_automodel.components.models.common.state_dict_lazy import (
+    LazyHFStateDict,
+    LazyNativeStateDict,
+)
+
 logger = logging.getLogger(__name__)
 
 # Layer key pattern: optional "model." prefix, then "layers.{i}.self_attn.(q|k|v)_proj.{suffix}" or "layers.{i}.mlp.(gate|up)_proj.{suffix}"
@@ -337,9 +342,6 @@ class CombinedProjectionStateDictAdapter:
         inplace = bool(kwargs.get("inplace", False))
         if inplace:
             # Lazy/JIT: convert on key access so only one tensor (view) is materialized at a time.
-            # Deferred import to avoid components.checkpoint in the static import graph.
-            from nemo_automodel.components.checkpoint.state_dict_adapter import LazyHFStateDict
-
             return LazyHFStateDict(state_dict, self)
         hf_state_dict = {}
         processed_keys = set()
