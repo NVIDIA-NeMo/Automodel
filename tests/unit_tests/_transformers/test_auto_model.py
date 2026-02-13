@@ -699,3 +699,180 @@ class TestModelMappingKeyErrorFallback:
 
         assert is_custom is False
         mock_wrap.assert_called_once_with(FakeModel)
+
+
+# =============================================================================
+# Tests for pad_token_id fix and config forwarding in _init_model
+# =============================================================================
+
+
+class TestPadTokenIdFix:
+    """Test the pad_token_id = None patch for transformers v5 compatibility."""
+
+    def test_pad_token_id_set_when_missing(self):
+        """Config without pad_token_id gets it set to None."""
+
+        class BareConfig:
+            name_or_path = "test-model"
+
+        config = BareConfig()
+        assert not hasattr(config, "pad_token_id")
+
+        cls = MagicMock()
+        cls._model_mapping = {}
+        cls._from_config_parent_class = MagicMock(return_value=MagicMock())
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_architectures", return_value=[]),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class", side_effect=lambda c: c),
+        ):
+            _init_model(
+                cls,
+                config,
+                attn_implementation="eager",
+                torch_dtype="auto",
+                quantization_config=None,
+                force_hf=False,
+            )
+
+        assert hasattr(config, "pad_token_id")
+        assert config.pad_token_id is None
+
+    def test_pad_token_id_preserved_when_present(self):
+        """Config that already has pad_token_id keeps its value unchanged."""
+
+        class ConfigWithPad:
+            name_or_path = "test-model"
+            pad_token_id = 42
+
+        config = ConfigWithPad()
+
+        cls = MagicMock()
+        cls._model_mapping = {}
+        cls._from_config_parent_class = MagicMock(return_value=MagicMock())
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_architectures", return_value=[]),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class", side_effect=lambda c: c),
+        ):
+            _init_model(
+                cls,
+                config,
+                attn_implementation="eager",
+                torch_dtype="auto",
+                quantization_config=None,
+                force_hf=False,
+            )
+
+        assert config.pad_token_id == 42
+
+
+class TestConfigForwardingInPretrainedPaths:
+    """Test that the patched config is forwarded to HF from_pretrained calls
+    so they don't reload a fresh copy missing the pad_token_id fix."""
+
+    def _make_cls(self, model_mapping_dict=None):
+        cls = MagicMock()
+        cls._model_mapping = model_mapping_dict or {}
+        return cls
+
+    def _make_fake_config(self, *, has_pad_token_id=False):
+        config = MagicMock()
+        config.architectures = []
+        config.to_dict.return_value = {}
+        if not has_pad_token_id:
+            del config.pad_token_id  # ensure hasattr returns False
+        return config
+
+    def test_force_hf_pretrained_forwards_config_in_kwargs(self):
+        """force_hf + from_pretrained path passes config in kwargs."""
+        fake_config = self._make_fake_config()
+        fake_model = MagicMock()
+
+        cls = self._make_cls({type(fake_config): type(fake_model)})
+        cls._from_pretrained_parent_class = MagicMock(return_value=fake_model)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class", side_effect=lambda c: c),
+        ):
+            _init_model(
+                cls,
+                "some-model-name",  # string triggers is_pretrained_init=True
+                attn_implementation="eager",
+                torch_dtype="auto",
+                quantization_config=None,
+                force_hf=True,
+            )
+
+        # Verify _from_pretrained_parent_class was called with config in kwargs
+        call_kwargs = cls._from_pretrained_parent_class.call_args[1]
+        assert "config" in call_kwargs
+        assert call_kwargs["config"] is fake_config
+
+    def test_fallback_hf_pretrained_forwards_config_in_kwargs(self):
+        """Fallback HF + from_pretrained path passes config in kwargs."""
+        fake_config = self._make_fake_config()
+        fake_model = MagicMock()
+
+        cls = self._make_cls({type(fake_config): type(fake_model)})
+        cls._from_pretrained_parent_class = MagicMock(return_value=fake_model)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch("nemo_automodel._transformers.model_init.get_architectures", return_value=[]),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class", side_effect=lambda c: c),
+        ):
+            _init_model(
+                cls,
+                "some-model-name",  # string triggers is_pretrained_init=True
+                attn_implementation="eager",
+                torch_dtype="auto",
+                quantization_config=None,
+                force_hf=False,
+            )
+
+        call_kwargs = cls._from_pretrained_parent_class.call_args[1]
+        assert "config" in call_kwargs
+        assert call_kwargs["config"] is fake_config
+
+    def test_custom_model_pretrained_does_not_receive_config_in_kwargs(self):
+        """Custom model path must NOT get config in kwargs (it's passed positionally)."""
+        fake_config = MagicMock()
+        fake_config.architectures = ["FakeArch"]
+        fake_config.to_dict.return_value = {}
+        fake_config.torch_dtype = "bfloat16"
+        # Ensure pad_token_id is missing so the fix sets it
+        del fake_config.pad_token_id
+
+        class FakeCustomModel(torch.nn.Module):
+            def __init__(self, config, **kwargs):
+                super().__init__()
+                self.config = config
+                # Store kwargs so we can inspect them in the test
+                self._init_kwargs = kwargs
+
+        cls = MagicMock()
+        registry_mock = {"FakeArch": FakeCustomModel}
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch("nemo_automodel._transformers.model_init.get_architectures", return_value=["FakeArch"]),
+            patch("nemo_automodel._transformers.model_init.ModelRegistry") as mock_registry,
+            patch("nemo_automodel._transformers.model_init._download_model_weights"),
+        ):
+            mock_registry.model_arch_name_to_cls = registry_mock
+            is_custom, model = _init_model(
+                cls,
+                "some-model-name",  # string triggers is_pretrained_init=True
+                attn_implementation="eager",
+                torch_dtype="bfloat16",
+                quantization_config=None,
+                force_hf=False,
+            )
+
+        assert is_custom is True
+        # config was passed positionally
+        assert model.config is fake_config
+        # config must NOT be in kwargs (would cause TypeError: got multiple values)
+        assert "config" not in model._init_kwargs
