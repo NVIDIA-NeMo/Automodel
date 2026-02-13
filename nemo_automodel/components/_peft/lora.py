@@ -464,6 +464,7 @@ def apply_lora_to_linear_modules(
     model: nn.Module,
     peft_config: PeftConfig,
     quantization_config=None,
+    skip_freeze: bool = False,
 ) -> int:
     """
     Replace selected nn.Linear layers with LinearLoRA layers (in-place).
@@ -472,6 +473,7 @@ def apply_lora_to_linear_modules(
         model: The model to apply LoRA to.
         peft_config: PEFT configuration for LoRA parameters.
         quantization_config: Optional separate QLoRA quantization configuration.
+        skip_freeze: If True, skip the global parameter freeze (caller will handle it later).
 
     Returns:
         Number of modules that were modified with LoRA.
@@ -480,8 +482,9 @@ def apply_lora_to_linear_modules(
         target_modules accepts wildcard fragments, e.g. ["q_proj", "k_proj", ".*fc.*"].
     """
     # Freeze base model parameters
-    for w in model.parameters():
-        w.requires_grad_(False)
+    if not skip_freeze:
+        for w in model.parameters():
+            w.requires_grad_(False)
 
     is_causal_lm = False
     try:
