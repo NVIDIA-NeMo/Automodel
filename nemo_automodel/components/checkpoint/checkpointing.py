@@ -1183,6 +1183,7 @@ def _load_hf_checkpoint_preserving_dtype(model_path: str) -> Optional[dict[str, 
     index_file = os.path.join(model_path, "model.safetensors.index.json")
     if os.path.isfile(index_file):
         import json
+
         with open(index_file) as f:
             index = json.load(f)
         weight_map = index.get("weight_map", {})

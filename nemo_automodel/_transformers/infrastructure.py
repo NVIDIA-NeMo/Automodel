@@ -443,14 +443,18 @@ def apply_model_infrastructure(
             setattr(model, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
 
     # Load the checkpoint if needed (meta path, or PP/TP path where we did not load before shard)
-    should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded and (
-        is_meta_device
-        and any(
-            [
-                get_world_size_safe() == 1,
-                parallelize_fn is not None and get_world_size_safe() > 1,
-                callable(getattr(model_wrapper, "parallelize", None)),
-            ]
+    should_load_checkpoint = (
+        need_checkpoint_load
+        and not checkpoint_already_loaded
+        and (
+            is_meta_device
+            and any(
+                [
+                    get_world_size_safe() == 1,
+                    parallelize_fn is not None and get_world_size_safe() > 1,
+                    callable(getattr(model_wrapper, "parallelize", None)),
+                ]
+            )
         )
     )
     if should_load_checkpoint:
