@@ -187,6 +187,76 @@ class TestNemotronV3Model:
 
         assert output.shape == (batch_size, seq_len, config.hidden_size)
 
+    def test_model_forward_with_inputs_embeds(self, config, backend):
+        """Test model forward pass with inputs_embeds instead of input_ids."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model
+
+        model = NemotronV3Model(config, backend=backend)
+        model = model.to(torch.bfloat16)
+
+        batch_size, seq_len = 2, 8
+        inputs_embeds = torch.randn(batch_size, seq_len, config.hidden_size, dtype=torch.bfloat16)
+
+        output = model(inputs_embeds=inputs_embeds)
+
+        assert output.shape == (batch_size, seq_len, config.hidden_size)
+
+    def test_model_forward_inputs_embeds_bypasses_embedding(self, config, backend):
+        """Test that inputs_embeds bypasses the embedding layer."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model
+
+        model = NemotronV3Model(config, backend=backend)
+        model = model.to(torch.bfloat16)
+
+        batch_size, seq_len = 2, 8
+        inputs_embeds = torch.randn(batch_size, seq_len, config.hidden_size, dtype=torch.bfloat16)
+
+        # Should work even with input_ids=None (the default)
+        output = model(input_ids=None, inputs_embeds=inputs_embeds)
+
+        assert output.shape == (batch_size, seq_len, config.hidden_size)
+
+    def test_model_forward_inputs_embeds_takes_precedence(self, config, backend):
+        """Test that inputs_embeds takes precedence over input_ids when both provided."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model
+
+        model = NemotronV3Model(config, backend=backend)
+        model = model.to(torch.bfloat16)
+
+        batch_size, seq_len = 2, 8
+        input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+        inputs_embeds = torch.randn(batch_size, seq_len, config.hidden_size, dtype=torch.bfloat16)
+
+        # When both are provided, inputs_embeds should be used (input_ids ignored)
+        output = model(input_ids, inputs_embeds=inputs_embeds)
+
+        assert output.shape == (batch_size, seq_len, config.hidden_size)
+
+    def test_model_forward_no_input_ids_no_inputs_embeds_raises(self, config, backend):
+        """Test that ValueError is raised when neither input_ids nor inputs_embeds is provided."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model
+
+        model = NemotronV3Model(config, backend=backend)
+        model = model.to(torch.bfloat16)
+
+        with pytest.raises(ValueError, match="input_ids must be provided if inputs_embeds is not provided"):
+            model(input_ids=None)
+
+    def test_model_forward_inputs_embeds_with_mask(self, config, backend):
+        """Test model forward pass with inputs_embeds and attention mask."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model
+
+        model = NemotronV3Model(config, backend=backend)
+        model = model.to(torch.bfloat16)
+
+        batch_size, seq_len = 2, 8
+        inputs_embeds = torch.randn(batch_size, seq_len, config.hidden_size, dtype=torch.bfloat16)
+        attention_mask = torch.ones(batch_size, seq_len)
+
+        output = model(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+
+        assert output.shape == (batch_size, seq_len, config.hidden_size)
+
     def test_model_moe_config_creation(self, config, backend):
         """Test that model creates MoE config correctly."""
         from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model
@@ -306,6 +376,31 @@ class TestNemotronHForCausalLM:
         logits = model(input_ids)
 
         assert logits.dtype == torch.float32
+
+    def test_causal_lm_forward_with_inputs_embeds(self, config, backend):
+        """Test causal LM forward pass with inputs_embeds."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        model = NemotronHForCausalLM(config, backend=backend)
+        model = model.to(torch.bfloat16)
+
+        batch_size, seq_len = 2, 8
+        inputs_embeds = torch.randn(batch_size, seq_len, config.hidden_size, dtype=torch.bfloat16)
+
+        logits = model(inputs_embeds=inputs_embeds)
+
+        assert logits.shape == (batch_size, seq_len, config.vocab_size)
+        assert logits.dtype == torch.float32
+
+    def test_causal_lm_forward_no_input_ids_no_inputs_embeds_raises(self, config, backend):
+        """Test that ValueError is raised when neither input_ids nor inputs_embeds is provided."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        model = NemotronHForCausalLM(config, backend=backend)
+        model = model.to(torch.bfloat16)
+
+        with pytest.raises(ValueError, match="input_ids must be provided if inputs_embeds is not provided"):
+            model()
 
     def test_causal_lm_from_config(self, config, backend):
         """Test from_config classmethod."""
