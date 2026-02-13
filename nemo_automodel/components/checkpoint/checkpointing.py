@@ -1174,7 +1174,7 @@ def _load_hf_checkpoint_preserving_dtype(model_path: str) -> Optional[dict[str, 
         from safetensors import safe_open
     except ImportError:
         return None
-    if not os.path.isdir(model_path) and not (os.path.isfile(model_path) and model_path.endswith(".safetensors")):
+    if not _is_safetensors_checkpoint(model_path):
         return None
     out: dict[str, torch.Tensor] = {}
     if os.path.isfile(model_path):
