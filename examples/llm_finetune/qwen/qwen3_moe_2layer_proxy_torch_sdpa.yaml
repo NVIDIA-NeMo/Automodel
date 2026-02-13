@@ -28,10 +28,6 @@ rng:
   seed: 1234
   ranked: true
 
-moe_config:
-  _target_: nemo_automodel.components.moe.config.MoEParallelizerConfig
-  activation_checkpointing: false
-
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
@@ -77,23 +73,21 @@ checkpoint:
   save_consolidated: false
 
 distributed:
+  strategy: fsdp2
   tp_size: 1
   cp_size: 1
   pp_size: 1
   ep_size: 2
 
-distributed_config:
-  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false
 
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.config.PipelineConfig
-  pp_schedule: interleaved1f1b
-  pp_microbatch_size: 1
-  round_virtual_stages_to_pp_multiple: up
-  scale_grads_in_schedule: false
-  patch_inner_model: false
-  patch_causal_lm_model: false
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    round_virtual_stages_to_pp_multiple: up
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -102,6 +96,8 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: train
+  tokenizer:
+    pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
 
 packed_sequence:
   packed_sequence_size: 0
@@ -116,6 +112,8 @@ validation_dataset:
   dataset_name: rajpurkar/squad
   split: validation
   limit_dataset_samples: 64
+  tokenizer:
+    pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

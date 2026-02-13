@@ -108,7 +108,8 @@ def _rename_dora_keys_from_hf(sd: dict[str, Any]) -> None:
 def _get_lm_head_weight_and_name(model: torch.nn.Module) -> Optional[tuple[torch.Tensor, str]]:
     for name, param in model.named_parameters(remove_duplicate=False):
         if "lm_head" in name and name.endswith(".weight"):
-            return param, name
+            normalized_name = name.replace("_orig_mod.", "")
+            return param, normalized_name
 
     return None, None
 
