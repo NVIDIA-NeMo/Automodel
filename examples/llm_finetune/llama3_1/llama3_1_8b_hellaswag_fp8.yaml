@@ -14,7 +14,7 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml
+# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 #
 # This example demonstrates FP8 quantization for improved training performance on H100+ GPUs.
@@ -49,12 +49,11 @@ checkpoint:
   save_consolidated: false 
 
 distributed:
+  strategy: fsdp2
   dp_size: none
   tp_size: 1
   cp_size: 1
 
-distributed_config:
-  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false
 
 compile:

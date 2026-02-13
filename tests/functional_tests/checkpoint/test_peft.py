@@ -28,6 +28,7 @@ from peft import PeftModel
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM
 import yaml
+import pytest
 
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
@@ -226,7 +227,14 @@ def get_test_hf_peft_checkpoint_expected_keys():
     return expected_model_keys, expected_optim_keys
 
 
-def test_hf_peft_checkpoint(use_triton=False):
+@pytest.mark.parametrize(
+    "force_hf,use_triton",
+    [
+        (pytest.param(True, id="force_hf"), pytest.param(False, id="no_force_hf")),
+        (pytest.param(False, id="no_force_hf"), pytest.param(False, id="no_use_triton")),
+    ],
+)
+def test_hf_peft_checkpoint(force_hf, use_triton):
     """
     Tests HF PEFT checkpoint
     """
@@ -267,296 +275,346 @@ def test_hf_peft_checkpoint(use_triton=False):
     script_path = Path(__file__).parent.resolve()
     cfg = parse_args_and_load_config(script_path / "llama3_2" / "llama3_2_1b_hellaswag_peft.yaml")
 
-    # set use_triton value based on parsed input
-    expected_automodel_peft_config["use_triton"] = cfg.peft.use_triton
+    # Limit training to the minimum steps needed for a checkpoint
+    cfg.step_scheduler.max_steps = 10
+    cfg.model.force_hf = force_hf
 
-    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-    trainer.setup()
-    trainer.run_train_validation_loop()
+    try:
+        # set use_triton value based on parsed input
+        expected_automodel_peft_config["use_triton"] = cfg.peft.use_triton
 
-    # checkpoint is saved at this point
-    # first extract the in-memory checkpoint
-    model_state_dict = ModelState(
-        trainer.model_parts,
-        trainer.checkpointer.config.is_peft,
-    ).state_dict()
-    optimizer_state_dict = to_cpu(
-        OptimizerState(
+        trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+        trainer.setup()
+        trainer.run_train_validation_loop()
+
+        # checkpoint is saved at this point
+        # first extract the in-memory checkpoint
+        model_state_dict = ModelState(
             trainer.model_parts,
-            trainer.optimizer,
-            trainer.lr_scheduler,
-        ).state_dict()["optim"]
-    )
-
-    # assert the correct paths exist
-    output_files = [
-        "model",
-        "optim",
-        "step_scheduler.pt",
-        "dataloader/dataloader_dp_rank_0.pt",
-        "dataloader/dataloader_dp_rank_1.pt",
-        "rng/rng_dp_rank_0.pt",
-        "rng/rng_dp_rank_1.pt",
-        "model/adapter_model.safetensors",
-        "model/adapter_config.json",
-        "model/automodel_peft_config.json",
-        "model/tokenizer_config.json",
-        "model/tokenizer.json",
-        "optim/__0_0.distcp",
-        "optim/__1_0.distcp",
-        "optim/.metadata",
-        "step_scheduler.pt",
-        "config.yaml",
-        "losses.json",
-    ]
-
-    for file in output_files:
-        path = Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / file
-        assert path.exists(), f"Expected {path} to exist"
-        if "." in file:
-            assert path.is_file(), f"Expected {path} to be a file"
-        else:
-            assert path.is_dir(), f"Expected {path} to be a directory"
-        assert os.access(path, os.R_OK), f"Expected {path} to be readable"
-        assert path.stat().st_size > 0, f"Expected {path} to be non-empty"
-    restored_optim_dict, saved_lr_scheduler_state = load_dcp(
-        Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "optim",
-    )
-    # Remove "sched." prefix from keys in saved_lr_scheduler_state if present
-    if saved_lr_scheduler_state is not None:
-        saved_lr_scheduler_state = {
-            (k[6:] if k.startswith("sched.") else k): v for k, v in saved_lr_scheduler_state.items()
-        }
-
-    if saved_lr_scheduler_state is not None and trainer.lr_scheduler is not None:
-        assert hasattr(trainer, "lr_scheduler") and trainer.lr_scheduler is not None, (
-            "test_dcp_checkpoint: lr_scheduler not found in restored trainer"
+            trainer.checkpointer.config.is_peft,
+        ).state_dict()
+        optimizer_state_dict = to_cpu(
+            OptimizerState(
+                trainer.model_parts,
+                trainer.optimizer,
+                trainer.lr_scheduler,
+            ).state_dict()["optim"]
         )
 
-        restored_lr_state = trainer.lr_scheduler[0].state_dict()
+        # assert the correct paths exist
+        output_files = [
+            "model",
+            "optim",
+            "step_scheduler.pt",
+            "dataloader/dataloader_dp_rank_0.pt",
+            "dataloader/dataloader_dp_rank_1.pt",
+            "rng/rng_dp_rank_0.pt",
+            "rng/rng_dp_rank_1.pt",
+            "model/adapter_model.safetensors",
+            "model/adapter_config.json",
+            "model/automodel_peft_config.json",
+            "model/tokenizer_config.json",
+            "model/tokenizer.json",
+            "optim/__0_0.distcp",
+            "optim/__1_0.distcp",
+            "optim/.metadata",
+            "step_scheduler.pt",
+            "config.yaml",
+            "losses.json",
+        ]
 
-        for key in saved_lr_scheduler_state:
-            assert key in restored_lr_state, f"test_dcp_checkpoint: lr_scheduler key {key} missing in restored state"
-            saved_val = saved_lr_scheduler_state[key]
-            restored_val = restored_lr_state[key]
-
-            if isinstance(saved_val, torch.Tensor):
-                assert torch.equal(saved_val, restored_val), (
-                    f"test_dcp_checkpoint: lr_scheduler tensor mismatch for {key}"
-                )
+        for file in output_files:
+            path = Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / file
+            assert path.exists(), f"Expected {path} to exist"
+            if "." in file:
+                assert path.is_file(), f"Expected {path} to be a file"
             else:
-                assert saved_val == restored_val, (
-                    f"test_dcp_checkpoint: lr_scheduler value mismatch for {key}: saved={saved_val} != restored={restored_val}"
+                assert path.is_dir(), f"Expected {path} to be a directory"
+            assert os.access(path, os.R_OK), f"Expected {path} to be readable"
+            assert path.stat().st_size > 0, f"Expected {path} to be non-empty"
+        restored_optim_dict, saved_lr_scheduler_state = load_dcp(
+            Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "optim",
+        )
+        # Remove "sched." prefix from keys in saved_lr_scheduler_state if present
+        if saved_lr_scheduler_state is not None:
+            saved_lr_scheduler_state = {
+                (k[6:] if k.startswith("sched.") else k): v for k, v in saved_lr_scheduler_state.items()
+            }
+
+        if saved_lr_scheduler_state is not None and trainer.lr_scheduler is not None:
+            assert hasattr(trainer, "lr_scheduler") and trainer.lr_scheduler is not None, (
+                "test_dcp_checkpoint: lr_scheduler not found in restored trainer"
+            )
+
+            restored_lr_state = trainer.lr_scheduler[0].state_dict()
+
+            for key in saved_lr_scheduler_state:
+                assert key in restored_lr_state, f"test_dcp_checkpoint: lr_scheduler key {key} missing in restored state"
+                saved_val = saved_lr_scheduler_state[key]
+                restored_val = restored_lr_state[key]
+
+                if isinstance(saved_val, torch.Tensor):
+                    assert torch.equal(saved_val, restored_val), (
+                        f"test_dcp_checkpoint: lr_scheduler tensor mismatch for {key}"
+                    )
+                else:
+                    assert saved_val == restored_val, (
+                        f"test_dcp_checkpoint: lr_scheduler value mismatch for {key}: saved={saved_val} != restored={restored_val}"
+                    )
+
+        restored_model_dict_consolidated = load_safetensors(
+            Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model" / "adapter_model.safetensors",
+        )
+        restored_config = json.load(
+            open(Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model" / "adapter_config.json"),
+        )
+        restored_automodel_peft_config = json.load(
+            open(
+                Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model" / "automodel_peft_config.json"
+            ),
+        )
+        _compare_dicts(expected_config, restored_config)
+        _compare_dicts(expected_automodel_peft_config, restored_automodel_peft_config)
+
+        # check if new model and current model give the same CE loss
+        val_batch = next(iter(trainer.val_dataloaders['default']))
+        restored_model = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+        restored_model.setup()
+        restored_model = restored_model.model_parts[0]
+        source_model_loss = get_validation_loss(trainer.model_parts[0], val_batch, trainer.loss_fn, trainer.dist_env.device)
+        restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
+        assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
+
+        # compare the recipe configs
+        with open(Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "config.yaml", "r") as f:
+            restored_config = yaml.safe_load(f)
+        compare_configs(trainer.cfg.raw_config, restored_config)
+
+        # the saved optimizer state has an "optim." prefix that DCP adds.
+        # For the on-disk view to match, it needs to be prepended with the "optim." prefix
+        optimizer_state_dict = _rename_keys(optimizer_state_dict, "optim.")
+
+        # ---------------------------------------------------------------------
+        # Compare the flattened in-memory model state with the on-disk view
+        # ---------------------------------------------------------------------
+        assert set(expected_model_keys.keys()) == set(restored_model_dict_consolidated.keys()), (
+            "Mismatch between in-memory and on-disk consolidated model keys."
+        )
+
+        # ---------------------------------------------------------------------
+        # Compare the flattened in-memory optimizer state with the on-disk view
+        # ---------------------------------------------------------------------
+        assert set(expected_optim_keys.keys()) == set(restored_optim_dict.keys()), (
+            "Mismatch between in-memory and on-disk optimizer keys."
+        )
+
+        # Compare the values, shapes, dtype, and device of the in-memory and on-disk consolidated model state
+        if torch.distributed.get_rank() != 0:
+            assert len(model_state_dict) == 0, "Model state dict should be empty on non-rank-0 processes"
+
+        if torch.distributed.get_rank() == 0:
+            for k in expected_model_keys.keys():
+                v = model_state_dict[k].cpu()
+                assert k in restored_model_dict_consolidated, f"Key {k} not found in restored model state"
+                assert isinstance(
+                    restored_model_dict_consolidated[k],
+                    torch.Tensor,
+                ), f"Value for key {k} is not a tensor"
+
+                # Get expected shape, dtype, device from expected_model_keys
+                expected_shape, expected_dtype, expected_device = expected_model_keys[k]
+
+                full_shard = restored_model_dict_consolidated[k]
+
+                assert list(full_shard.shape) == expected_shape, (
+                    f"Shape mismatch for key {k}. Expected shape {expected_shape} but got {full_shard.shape}"
                 )
+                assert full_shard.dtype == expected_dtype, (
+                    f"Dtype mismatch for key {k}. Expected dtype {expected_dtype} but got {full_shard.dtype}"
+                )
+                assert str(full_shard.device) == expected_device, (
+                    f"Device mismatch for key {k}. Expected device {expected_device} but got {full_shard.device}"
+                )
+                assert torch.allclose(v, full_shard), f"Value mismatch for key {k}. Tensors are not numerically close"
 
-    restored_model_dict_consolidated = load_safetensors(
-        Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model" / "adapter_model.safetensors",
-    )
-    restored_config = json.load(
-        open(Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model" / "adapter_config.json"),
-    )
-    restored_automodel_peft_config = json.load(
-        open(
-            Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model" / "automodel_peft_config.json"
-        ),
-    )
-    _compare_dicts(expected_config, restored_config)
-    _compare_dicts(expected_automodel_peft_config, restored_automodel_peft_config)
-
-    # check if new model and current model give the same CE loss
-    val_batch = next(iter(trainer.val_dataloaders['default']))
-    restored_model = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-    restored_model.setup()
-    restored_model = restored_model.model_parts[0]
-    source_model_loss = get_validation_loss(trainer.model_parts[0], val_batch, trainer.loss_fn, trainer.dist_env.device)
-    restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
-    assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
-
-    # compare the recipe configs
-    with open(Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "config.yaml", "r") as f:
-        restored_config = yaml.safe_load(f)
-    compare_configs(trainer.cfg.raw_config, restored_config)
-
-    # the saved optimizer state has an "optim." prefix that DCP adds.
-    # For the on-disk view to match, it needs to be prepended with the "optim." prefix
-    optimizer_state_dict = _rename_keys(optimizer_state_dict, "optim.")
-
-    # ---------------------------------------------------------------------
-    # Compare the flattened in-memory model state with the on-disk view
-    # ---------------------------------------------------------------------
-    assert set(expected_model_keys.keys()) == set(restored_model_dict_consolidated.keys()), (
-        "Mismatch between in-memory and on-disk consolidated model keys."
-    )
-
-    # ---------------------------------------------------------------------
-    # Compare the flattened in-memory optimizer state with the on-disk view
-    # ---------------------------------------------------------------------
-    assert set(expected_optim_keys.keys()) == set(restored_optim_dict.keys()), (
-        "Mismatch between in-memory and on-disk optimizer keys."
-    )
-
-    # Compare the values, shapes, dtype, and device of the in-memory and on-disk consolidated model state
-    if torch.distributed.get_rank() != 0:
-        assert len(model_state_dict) == 0, "Model state dict should be empty on non-rank-0 processes"
-
-    if torch.distributed.get_rank() == 0:
-        for k in expected_model_keys.keys():
-            v = model_state_dict[k].cpu()
-            assert k in restored_model_dict_consolidated, f"Key {k} not found in restored model state"
+        # Compare the values, shapes, dtype, and device of the in-memory and on-disk optimizer state
+        for k, v in optimizer_state_dict.items():
+            if isinstance(v, torch.distributed.tensor.DTensor):
+                v = v.to_local()
+            assert k in restored_optim_dict, f"Key {k} not found in restored optimizer state"
             assert isinstance(
-                restored_model_dict_consolidated[k],
+                restored_optim_dict[k],
                 torch.Tensor,
             ), f"Value for key {k} is not a tensor"
 
-            # Get expected shape, dtype, device from expected_model_keys
-            expected_shape, expected_dtype, expected_device = expected_model_keys[k]
+            # Get expected shape, dtype, device from expected_optim_keys
+            expected_shape, expected_dtype, expected_device = expected_optim_keys[k]
 
-            full_shard = restored_model_dict_consolidated[k]
-
-            assert list(full_shard.shape) == expected_shape, (
-                f"Shape mismatch for key {k}. Expected shape {expected_shape} but got {full_shard.shape}"
-            )
-            assert full_shard.dtype == expected_dtype, (
-                f"Dtype mismatch for key {k}. Expected dtype {expected_dtype} but got {full_shard.dtype}"
-            )
-            assert str(full_shard.device) == expected_device, (
-                f"Device mismatch for key {k}. Expected device {expected_device} but got {full_shard.device}"
-            )
-            assert torch.allclose(v, full_shard), f"Value mismatch for key {k}. Tensors are not numerically close"
-
-    # Compare the values, shapes, dtype, and device of the in-memory and on-disk optimizer state
-    for k, v in optimizer_state_dict.items():
-        if isinstance(v, torch.distributed.tensor.DTensor):
-            v = v.to_local()
-        assert k in restored_optim_dict, f"Key {k} not found in restored optimizer state"
-        assert isinstance(
-            restored_optim_dict[k],
-            torch.Tensor,
-        ), f"Value for key {k} is not a tensor"
-
-        # Get expected shape, dtype, device from expected_optim_keys
-        expected_shape, expected_dtype, expected_device = expected_optim_keys[k]
-
-        if restored_optim_dict[k].size():
-            curr_shard = torch.split(
-                restored_optim_dict[k],
-                restored_optim_dict[k].shape[0] // 2,
-            )[torch.distributed.get_rank()]
-        else:
-            # this can be the parameter step which is a scalar Tensor
-            curr_shard = restored_optim_dict[k]
-        assert list(curr_shard.shape) == expected_shape, (
-            f"Shape mismatch for key {k}. Expected shape {expected_shape} but got {curr_shard.shape}"
-        )
-        assert curr_shard.dtype == expected_dtype, (
-            f"Dtype mismatch for key {k}. Expected dtype {expected_dtype} but got {curr_shard.dtype}"
-        )
-        assert str(curr_shard.device) == expected_device, (
-            f"Device mismatch for key {k}. Expected device {expected_device} but got {curr_shard.device}"
-        )
-        try:
-            assert torch.allclose(v, curr_shard), f"Value mismatch for key {k}. Tensors are not numerically close"
-        except Exception as e:
-            if 'moe' in k and 'step' in k:
-                pass
+            if restored_optim_dict[k].size():
+                curr_shard = torch.split(
+                    restored_optim_dict[k],
+                    restored_optim_dict[k].shape[0] // 2,
+                )[torch.distributed.get_rank()]
             else:
-                raise e
+                # this can be the parameter step which is a scalar Tensor
+                curr_shard = restored_optim_dict[k]
+            assert list(curr_shard.shape) == expected_shape, (
+                f"Shape mismatch for key {k}. Expected shape {expected_shape} but got {curr_shard.shape}"
+            )
+            assert curr_shard.dtype == expected_dtype, (
+                f"Dtype mismatch for key {k}. Expected dtype {expected_dtype} but got {curr_shard.dtype}"
+            )
+            assert str(curr_shard.device) == expected_device, (
+                f"Device mismatch for key {k}. Expected device {expected_device} but got {curr_shard.device}"
+            )
+            try:
+                assert torch.allclose(v, curr_shard), f"Value mismatch for key {k}. Tensors are not numerically close"
+            except Exception as e:
+                if 'moe' in k and 'step' in k:
+                    pass
+                else:
+                    raise e
 
-    # finally check if the adapters loaded into the PEFT module are the same as the model we have trained
-    if torch.distributed.get_rank() == 0:
-        base = AutoModelForCausalLM.from_pretrained(cfg.model.pretrained_model_name_or_path)
-        peft_model = PeftModel.from_pretrained(
-            base, Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model"
-        ).to(trainer.model_parts[0].dtype)
+        # finally check if the adapters loaded into the PEFT module are the same as the model we have trained
+        if torch.distributed.get_rank() == 0:
+            device = next(trainer.model_parts[0].parameters()).device
+            base = AutoModelForCausalLM.from_pretrained(cfg.model.pretrained_model_name_or_path).to(
+                device=device, dtype=trainer.model_parts[0].dtype
+            )
+            peft_model = PeftModel.from_pretrained(
+                base, Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model",
+                autocast_adapter_dtype=False,
+            )
 
-        for source_key, source_param in model_state_dict.items():
-            # source key example: 'base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight'
-            for peft_model_key, peft_model_param in peft_model.named_parameters():
-                if "lora" in peft_model_key and source_key.rsplit(".", 1)[0] in peft_model_key:
-                    assert torch.allclose(source_param, peft_model_param), (
-                        "Parameter values are different when they should be the same"
-                    )
-    torch.distributed.barrier()
+            for source_key, source_param in model_state_dict.items():
+                # source key example: 'base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight'
+                for peft_model_key, peft_model_param in peft_model.named_parameters():
+                    if "lora" in peft_model_key and source_key.rsplit(".", 1)[0] in peft_model_key:
+                        print('peft_model_key: ', peft_model_key, ' -> ', source_key, source_param.device,
+                        source_param.dtype, ' peft ', peft_model_param.device, peft_model_param.dtype)
+                        assert torch.allclose(source_param, peft_model_param.cpu()), (
+                            "Parameter values are different when they should be the same"
+                        )
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
-    if torch.distributed.get_rank() == 0:
-        # delete the checkpoint directory
-        if Path(trainer.checkpointer.config.checkpoint_dir).exists():
-            shutil.rmtree(Path(trainer.checkpointer.config.checkpoint_dir))
-    torch.distributed.barrier()
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            if Path(trainer.checkpointer.config.checkpoint_dir).exists():
+                shutil.rmtree(Path(trainer.checkpointer.config.checkpoint_dir))
 
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
-def test_hf_peft_dora_checkpoint():
+@pytest.mark.parametrize(
+    "force_hf",
+    [
+        pytest.param(True, id="force_hf"),
+        pytest.param(False, id="no_force_hf"),
+    ],
+)
+def test_hf_peft_dora_checkpoint(force_hf):
     """
-    Tests DoRA finetune 
+    Tests DoRA finetune
     """
     default_cfg_path = Path(__file__).parents[3] / "examples" / "llm_finetune" / "llama3_2" / "llama3_2_1b_hellaswag_peft.yaml"
     cfg = parse_args_and_load_config(default_cfg_path)
+    # Limit training to the minimum steps needed for a checkpoint
+    cfg.model.force_hf = force_hf
+    cfg.step_scheduler.max_steps = 10
+    cfg.step_scheduler.ckpt_every_steps = 10
 
     # Enable DoRA
     cfg.peft.use_dora = True
     cfg.peft.use_triton = False
 
-    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-    trainer.setup()
-    trainer.run_train_validation_loop()
+    try:
+        trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+        trainer.setup()
+        trainer.run_train_validation_loop()
 
-    model_state_dict = ModelState(
-        trainer.model_parts,
-        trainer.checkpointer.config.is_peft,
-    ).state_dict()
+        model_state_dict = ModelState(
+            trainer.model_parts,
+            trainer.checkpointer.config.is_peft,
+        ).state_dict()
 
-    # Find the checkpoint (step count depends on config)
-    ckpt_dir = Path(trainer.checkpointer.config.checkpoint_dir)
-    ckpt_subdirs = sorted([d for d in ckpt_dir.iterdir() if d.is_dir() and "epoch" in d.name])
-    assert len(ckpt_subdirs) > 0, "No checkpoint found"
-    checkpoint_path = ckpt_subdirs[-1] / "model"
+        # Find the checkpoint (step count depends on config)
+        ckpt_dir = Path(trainer.checkpointer.config.checkpoint_dir)
+        ckpt_subdirs = sorted([d for d in ckpt_dir.iterdir() if d.is_dir() and "epoch" in d.name])
+        assert len(ckpt_subdirs) > 0, "No checkpoint found"
+        checkpoint_path = ckpt_subdirs[-1] / "model"
 
-    assert checkpoint_path.exists()
-    assert (checkpoint_path / "adapter_model.safetensors").exists()
-    assert (checkpoint_path / "adapter_config.json").exists()
+        assert checkpoint_path.exists()
+        assert (checkpoint_path / "adapter_model.safetensors").exists()
+        assert (checkpoint_path / "adapter_config.json").exists()
 
-    # Verify DoRA flag is saved
-    restored_config = json.load(open(checkpoint_path / "adapter_config.json"))
-    assert restored_config["use_dora"] is True
+        # Verify DoRA flag is saved
+        restored_config = json.load(open(checkpoint_path / "adapter_config.json"))
+        assert restored_config["use_dora"] is True
 
-    # Verify DoRA magnitude vectors are saved
-    restored_model_dict = load_safetensors(checkpoint_path / "adapter_model.safetensors")
-    dora_keys = [k for k in restored_model_dict.keys() if "lora_magnitude" in k]
-    assert len(dora_keys) > 0, "DoRA magnitude vectors should be present"
+        # Verify DoRA magnitude vectors are saved for every LoRA target module
+        restored_model_dict = load_safetensors(checkpoint_path / "adapter_model.safetensors")
+        dora_keys = [k for k in restored_model_dict.keys() if "lora_magnitude" in k]
+        assert len(dora_keys) > 0, "DoRA magnitude vectors should be present"
 
-    # Verify adapter loads with HF PEFT
-    if torch.distributed.get_rank() == 0:
-        base = AutoModelForCausalLM.from_pretrained(cfg.model.pretrained_model_name_or_path)
-        peft_model = PeftModel.from_pretrained(base, checkpoint_path).to(trainer.model_parts[0].dtype)
+        # Every module that has lora_A should also have a magnitude vector
+        lora_a_modules = {k.rsplit(".lora_A.", 1)[0] for k in restored_model_dict if ".lora_A." in k}
+        dora_modules = {k.rsplit(".lora_magnitude", 1)[0] for k in restored_model_dict if "lora_magnitude" in k}
+        missing = lora_a_modules - dora_modules
+        assert not missing, f"DoRA magnitude vectors missing for modules: {sorted(missing)}"
 
-        # Verify DoRA magnitude vectors exist in loaded model
-        peft_dora_modules = [
-            name for name, mod in peft_model.named_modules()
-            if hasattr(mod, "lora_magnitude_vector") and len(mod.lora_magnitude_vector) > 0
-        ]
-        assert len(peft_dora_modules) > 0, "DoRA should be active in HF PEFT model"
+        # Verify adapter loads with HF PEFT (treat missing keys as errors)
+        if torch.distributed.get_rank() == 0:
+            import warnings
+            device = next(trainer.model_parts[0].parameters()).device
+            base = AutoModelForCausalLM.from_pretrained(cfg.model.pretrained_model_name_or_path).to(
+                device=device, dtype=trainer.model_parts[0].dtype
+            )
+            with warnings.catch_warnings(record=True) as caught_warnings:
+                warnings.simplefilter("always")
+                peft_model = PeftModel.from_pretrained(
+                    base, checkpoint_path, autocast_adapter_dtype=False
+                )
+            missing_key_warnings = [
+                w for w in caught_warnings
+                if "missing adapter keys" in str(w.message).lower()
+            ]
+            assert not missing_key_warnings, (
+                f"HF PEFT reported missing adapter keys:\n{missing_key_warnings[0].message}"
+            )
 
-        # Verify LoRA params match
-        for source_key, source_param in model_state_dict.items():
-            if "lora_A" not in source_key and "lora_B" not in source_key:
-                continue
-            for peft_key, peft_param in peft_model.named_parameters():
-                if "lora" in peft_key and source_key.rsplit(".", 1)[0] in peft_key:
-                    assert torch.allclose(source_param, peft_param), f"Mismatch for {source_key}"
+            # Verify DoRA magnitude vectors exist in loaded model
+            peft_dora_modules = [
+                name for name, mod in peft_model.named_modules()
+                if hasattr(mod, "lora_magnitude_vector") and len(mod.lora_magnitude_vector) > 0
+            ]
+            assert len(peft_dora_modules) > 0, "DoRA should be active in HF PEFT model"
 
-        # Verify forward pass works
-        peft_model.eval()
-        test_input = torch.randint(0, base.config.vocab_size, (1, 10)).to(peft_model.device)
-        with torch.no_grad():
-            output = peft_model(test_input)
-            assert output.logits is not None
+            # Verify LoRA params match
+            for source_key, source_param in model_state_dict.items():
+                if "lora_A" not in source_key and "lora_B" not in source_key:
+                    continue
+                for peft_key, peft_param in peft_model.named_parameters():
+                    if "lora" in peft_key and source_key.rsplit(".", 1)[0] in peft_key:
+                        # base is in gpu, but model_state_dict (from ckpt) is in cpu
+                        assert torch.allclose(source_param.cpu(), peft_param.cpu()), f"Mismatch for {source_key}"
 
-    torch.distributed.barrier()
+            # Verify forward pass works
+            peft_model.eval()
+            test_input = torch.randint(0, base.config.vocab_size, (1, 10)).to(peft_model.device)
+            with torch.no_grad():
+                output = peft_model(test_input)
+                assert output.logits is not None
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
-    if torch.distributed.get_rank() == 0:
-        if Path(trainer.checkpointer.config.checkpoint_dir).exists():
-            shutil.rmtree(Path(trainer.checkpointer.config.checkpoint_dir))
-    torch.distributed.barrier()
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            if Path(trainer.checkpointer.config.checkpoint_dir).exists():
+                shutil.rmtree(Path(trainer.checkpointer.config.checkpoint_dir))
+
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
 
 def _rename_keys(d: dict, prepend: str):

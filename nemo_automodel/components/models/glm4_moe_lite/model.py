@@ -17,6 +17,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     initialize_linear_module,
@@ -204,7 +205,7 @@ class Glm4MoeLiteModel(nn.Module):
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class Glm4MoeLiteForCausalLM(nn.Module, MoEFSDPSyncMixin):
+class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     @classmethod
     def from_config(
         cls,

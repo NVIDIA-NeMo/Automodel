@@ -174,7 +174,9 @@ no-build-isolation-package = [
 ]
 constraint-dependencies = [
     "aiohttp>=3.13.3", # Address CVE GHSA-6mq8-rvhq-8wgg
-    "jaraco-context>=6.1.0", #Address CVE GHSA-58pv-8j8x-9vj2
+    "cryptography>=46.0.5", # Address CVE GHSA-r6ph-v2qm-q3c2
+    "jaraco-context>=6.1.0", # Address CVE GHSA-58pv-8j8x-9vj2
+    "pillow>=12.1.1", # Address CVE GHSA-cfh3-3jmp-rvhc
     "protobuf>=6.33.5", # Address CVE GHSA-7gcm-g887-7qv7
     "pyasn1>=0.6.2", # Address CVE GHSA-63vm-454h-vhhq
     "starlette>=0.49.1", # Address CVE GHSA-7f5h-v6xp-fcq8
@@ -187,7 +189,7 @@ prerelease = "allow"
 [tool.uv.sources]
 deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "e3908bf5bd0cc6265bcb225d15cd8c996d4759ef" }
 cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
-liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "49e63538e64b00780e424e34bc4f193dcfeba75c" }
+liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" }
 torch = [
   { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
   { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },

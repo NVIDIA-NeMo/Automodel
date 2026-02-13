@@ -14,7 +14,7 @@
 
 
 # To run this recipe, please use the following command:
-# uv run examples/llm_finetune/finetune.py --config examples/llm_finetune/qwen/qwen2_5_7b_instruct_chat.yaml
+# uv run recipes/llm_finetune/finetune.py --config recipes/llm_finetune/qwen/qwen2_5_7b_instruct_chat.yaml
 
 
 step_scheduler:
@@ -52,12 +52,11 @@ checkpoint:
   save_consolidated: false
 
 distributed:
+  strategy: fsdp2
   dp_size: none
   tp_size: 1
   cp_size: 1
 
-distributed_config:
-  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false
 
 peft:

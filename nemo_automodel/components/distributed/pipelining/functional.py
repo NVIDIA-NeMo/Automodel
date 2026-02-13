@@ -230,6 +230,62 @@ def calculate_virtual_stages(
     return num_virtual_stages, stages_per_rank
 
 
+def _precompute_stage_shapes(
+    stages: list[PipelineStage],
+    model_config,
+    microbatch_size: int,
+    seq_len: int,
+) -> None:
+    """Precompute input/output meta tensors for each pipeline stage to bypass serial shape inference.
+
+    By default, PipelineStage performs shape inference at runtime via a serial P2P chain:
+    stage 0 → send → stage 1 → send → ... → stage N-1.  This is O(N) in the number of
+    pipeline stages and becomes a bottleneck for large world sizes.
+
+    This function sets ``inputs_meta`` and ``_outputs_meta`` on each stage *before* the
+    first ``step()`` call, so that ``_shape_inference`` is never invoked and the serial
+    chain is completely eliminated.
+
+    Args:
+        stages: The local pipeline stages (already parallelized).
+        model_config: The HuggingFace model config (``model.config``).
+        microbatch_size: Microbatch size used by the pipeline schedule.
+        seq_len: Sequence length of the input data.
+    """
+    hidden_size = model_config.hidden_size
+    vocab_size = model_config.vocab_size
+
+    for stage in stages:
+        # Infer the computation dtype from the stage's parameters
+        try:
+            model_dtype = next(stage.submod.parameters()).dtype
+        except StopIteration:
+            model_dtype = torch.bfloat16
+
+        # --- inputs_meta ---
+        if stage.is_first:
+            # First stage receives input_ids: [mb, seq_len] int64
+            stage.inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
+        else:
+            # Non-first stages receive hidden_states: [mb, seq_len, hidden_size]
+            stage.inputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
+
+        # --- outputs_meta ---
+        has_lm_head = hasattr(stage.submod, "lm_head") and stage.submod.lm_head is not None
+        if has_lm_head:
+            # Last stage with lm_head produces logits: [mb, seq_len, vocab_size]
+            outputs_meta = (torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=model_dtype),)
+        else:
+            # Intermediate stages produce hidden_states: [mb, seq_len, hidden_size]
+            outputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
+        stage._configure_outputs_meta(outputs_meta)
+
+    logger.info(
+        f"Precomputed pipeline stage shapes (seq_len={seq_len}, microbatch_size={microbatch_size}) — "
+        f"serial shape inference bypassed"
+    )
+
+
 def split_model_into_stages(
     model: torch.nn.Module,
     pp_mesh: DeviceMesh,
@@ -530,6 +586,7 @@ def pipeline_model(
     scale_grads: bool = False,
     round_to_pp_multiple: str | None = None,
     patch_stage_backward_maybe_with_nosync: bool = False,
+    seq_len: int | None = None,
 ) -> tuple[_PipelineSchedule, list[torch.nn.Module], bool, bool, list[PipelineStage]]:
     """HF-specific pipeline model splitting."""
     pp_size = world_mesh[pp_axis_name].size()
@@ -564,6 +621,11 @@ def pipeline_model(
             )
             model_parts[i] = m
             stages[i].submod = m
+
+    # Precompute stage shapes to bypass serial P2P shape inference.
+    # This must happen *after* parallelization so that dtypes are final.
+    if seq_len is not None:
+        _precompute_stage_shapes(stages, model.config, microbatch_size, seq_len)
 
     # Build pipeline schedule
     pp_schedule = build_pipeline_schedule(

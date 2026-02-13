@@ -29,11 +29,11 @@ from nemo_automodel.components._peft.lora_kernel import (
 from nemo_automodel.components._peft.lora_moe import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components._peft.module_matcher import ModuleMatcher
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP
-from nemo_automodel.shared.import_utils import safe_import
+from nemo_automodel.shared.import_utils import safe_import, safe_import_te
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
-HAS_TE, transformer_engine = safe_import("transformer_engine")
+HAS_TE, transformer_engine = safe_import_te()
 
 logger = logging.getLogger(__name__)
 
@@ -196,7 +196,7 @@ class LinearLoRA(nn.Linear):
         if obj.use_dora:
             # initialize DoRA magnitude vector to ||W|| (row-wise L2 norm).
             with torch.no_grad():
-                weight_norm = torch.linalg.norm(obj.weight.data, dim=1).to(dtype)
+                weight_norm = torch.linalg.norm(obj.weight.data, dim=1).to(dtype=dtype, device=device)
             obj.lora_magnitude = nn.Parameter(weight_norm, requires_grad=True)
 
     def _dora_weight_norm(self) -> torch.Tensor:
@@ -464,6 +464,7 @@ def apply_lora_to_linear_modules(
     model: nn.Module,
     peft_config: PeftConfig,
     quantization_config=None,
+    skip_freeze: bool = False,
 ) -> int:
     """
     Replace selected nn.Linear layers with LinearLoRA layers (in-place).
@@ -472,6 +473,7 @@ def apply_lora_to_linear_modules(
         model: The model to apply LoRA to.
         peft_config: PEFT configuration for LoRA parameters.
         quantization_config: Optional separate QLoRA quantization configuration.
+        skip_freeze: If True, skip the global parameter freeze (caller will handle it later).
 
     Returns:
         Number of modules that were modified with LoRA.
@@ -480,8 +482,9 @@ def apply_lora_to_linear_modules(
         target_modules accepts wildcard fragments, e.g. ["q_proj", "k_proj", ".*fc.*"].
     """
     # Freeze base model parameters
-    for w in model.parameters():
-        w.requires_grad_(False)
+    if not skip_freeze:
+        for w in model.parameters():
+            w.requires_grad_(False)
 
     is_causal_lm = False
     try:

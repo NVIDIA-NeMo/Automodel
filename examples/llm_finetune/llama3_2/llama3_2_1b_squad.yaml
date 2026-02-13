@@ -14,7 +14,7 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
 
@@ -50,12 +50,10 @@ clip_grad_norm:
   max_norm: 1.0
 
 distributed:
+  strategy: fsdp2
   dp_size: none
   tp_size: 1
   cp_size: 1
-
-distributed_config:
-  _target_: nemo_automodel.components.distributed.config.FSDP2Config
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

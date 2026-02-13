@@ -14,15 +14,17 @@
 
 """Infrastructure instantiation and application.
 
-MeshContext, distributed manager instantiation, sharding, PEFT/quantization
-application, and checkpoint loading utilities.  These free functions operate
-on an already-instantiated ``nn.Module`` and have no coupling to the
+Distributed manager instantiation, sharding, PEFT/quantization application,
+and checkpoint loading utilities.  These free functions operate on an
+already-instantiated ``nn.Module`` and have no coupling to the
 ``_BaseNeMoAutoModelClass`` hierarchy.
+
+``MeshContext`` (from ``mesh``) is the single source of truth
+for device meshes, parallelism sizes, and axis names.
 """
 
 import logging
 from contextlib import nullcontext
-from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -44,6 +46,7 @@ from nemo_automodel.components.distributed.ddp import DDPManager
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
+from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
@@ -65,99 +68,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class MeshContext:
-    """Centralized container for device meshes, parallelism sizes, and axis names.
-
-    Holds references to the actual ``DeviceMesh`` objects alongside the derived
-    sizes and axis names.  This is the single source of truth that replaces
-    scattered ``device_mesh`` / ``moe_mesh`` parameters and inline
-    ``"dim_name" in mesh.mesh_dim_names`` checks throughout the codebase.
-
-    Note(@akoumpa): this class is used to store the device meshes, parallelism sizes, and axis names.
-    i don't move it to a components yet, because devicemesh may support more features in the future.
-    """
-
-    # Raw mesh references (Optional -- None when running single-GPU)
-    device_mesh: Optional["DeviceMesh"] = field(default=None, repr=False)
-    moe_mesh: Optional["DeviceMesh"] = field(default=None, repr=False)
-
-    # Derived sizes
-    tp_size: int = 1
-    pp_size: int = 1
-    cp_size: int = 1
-    dp_size: int = 1
-    dp_replicate_size: int = 1
-    ep_size: int = 1
-
-    # Axis names for parallelization
-    dp_axis_names: tuple = ("dp_shard_cp",)
-    cp_axis_name: Optional[str] = None
-    tp_axis_name: Optional[str] = None
-    ep_axis_name: Optional[str] = None
-    ep_shard_axis_names: Optional[tuple] = None
-
-    @classmethod
-    def from_meshes(cls, device_mesh: "DeviceMesh", moe_mesh: Optional["DeviceMesh"] = None) -> "MeshContext":
-        """Build MeshContext by inspecting device mesh dimension names."""
-        if device_mesh is None:
-            return cls()
-
-        dim_names = device_mesh.mesh_dim_names
-        kw: dict = {"device_mesh": device_mesh, "moe_mesh": moe_mesh}
-
-        if "tp" in dim_names:
-            kw["tp_size"] = device_mesh["tp"].size()
-            kw["tp_axis_name"] = "tp"
-        if "pp" in dim_names:
-            kw["pp_size"] = device_mesh["pp"].size()
-        if "cp" in dim_names:
-            kw["cp_size"] = device_mesh["cp"].size()
-            kw["cp_axis_name"] = "cp"
-        if "dp" in dim_names:
-            kw["dp_size"] = device_mesh["dp"].size()
-        if "dp_replicate" in dim_names:
-            kw["dp_replicate_size"] = device_mesh["dp_replicate"].size()
-
-        # DP axis names
-        if "dp_replicate" in dim_names and "dp_shard_cp" in dim_names:
-            kw["dp_axis_names"] = ("dp_replicate", "dp_shard_cp")
-        else:
-            kw["dp_axis_names"] = ("dp_shard_cp",)
-
-        # EP from moe_mesh
-        if moe_mesh is not None:
-            moe_dim_names = moe_mesh.mesh_dim_names
-            if "ep" in moe_dim_names:
-                kw["ep_size"] = moe_mesh["ep"].size()
-                kw["ep_axis_name"] = "ep"
-            if "ep_shard" in moe_dim_names:
-                kw["ep_shard_axis_names"] = ("ep_shard",)
-
-        return cls(**kw)
-
-    def pipeline_axis_kwargs(self) -> dict:
-        """Return axis name kwargs suitable for ``AutoPipeline`` or ``parallelize_model``."""
-        return {
-            "pp_axis_name": "pp",
-            "dp_axis_names": self.dp_axis_names,
-            "cp_axis_name": self.cp_axis_name,
-            "tp_axis_name": self.tp_axis_name,
-            "ep_axis_name": self.ep_axis_name,
-            "ep_shard_axis_names": self.ep_shard_axis_names,
-        }
-
-    def parallelize_axis_kwargs(self) -> dict:
-        """Return axis name kwargs for ``parallelize_fn`` (EP/FSDP, no ``pp_axis_name``)."""
-        return {
-            "dp_axis_names": self.dp_axis_names,
-            "cp_axis_name": self.cp_axis_name,
-            "tp_axis_name": self.tp_axis_name,
-            "ep_axis_name": self.ep_axis_name,
-            "ep_shard_axis_names": self.ep_shard_axis_names,
-        }
-
-
 #  PEFT / quantization helpers
 def _apply_peft_and_lower_precision(
     model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
@@ -170,7 +80,8 @@ def _apply_peft_and_lower_precision(
             logger.info("Enabling PEFT with Pipeline Parallelism")
             logger.info("Disabling Triton with Pipeline Parallelism Enabled.")
             peft_config.use_triton = False
-        apply_lora_to_linear_modules(model, peft_config, quantization_config=quantization_config)
+        # Skip freeze here - will do global freeze after checkpoint loading
+        apply_lora_to_linear_modules(model, peft_config, quantization_config=quantization_config, skip_freeze=True)
 
     # FP8
     if fp8_config is not None:
@@ -206,15 +117,8 @@ def _shard_pp(autopipeline, model, loss_fn, parallelize_fn):
     return model
 
 
-def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh):
-    """Apply EP + FSDP sharding (non-PP path).
-
-    Args:
-        model: The model to shard.
-        model_wrapper: Distributed manager instance.
-        parallelize_fn: MoE parallelizer (EP path) or None.
-        mesh: MeshContext holding meshes and axis names.
-    """
+def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh: MeshContext):
+    """Apply EP + FSDP sharding (non-PP path)."""
     if parallelize_fn is not None and get_world_size_safe() > 1:
         parallelize_fn(
             model,
@@ -297,17 +201,8 @@ def _instantiate_pipeline(
 def _instantiate_qat(
     config: Optional[QATConfig],
 ) -> Optional[Union["Int4WeightOnlyQATQuantizer", "Int8DynActInt4WeightQATQuantizer"]]:
-    """Instantiate QAT quantizer from config.
-
-    Args:
-        config: QAT config. If None, returns None.
-
-    Returns:
-        QAT quantizer instance, or None if QAT is not enabled.
-    """
     if config is None:
         return None
-
     return config.create_quantizer()
 
 
@@ -343,6 +238,7 @@ def instantiate_infrastructure(
     pipeline_config: Optional[PipelineConfig] = None,
     qat_config: Optional[QATConfig] = None,
     moe_config: Optional[MoEParallelizerConfig] = None,
+    activation_checkpointing: bool = False,
     device: Optional[torch.device] = None,
     mesh: Optional[MeshContext] = None,
     # Deprecated -- prefer passing ``mesh`` directly
@@ -362,6 +258,8 @@ def instantiate_infrastructure(
         pipeline_config: Pipeline parallelism config.
         qat_config: Quantization-aware training config.
         moe_config: MoE parallelizer config (for expert parallel models).
+        activation_checkpointing: Enable activation checkpointing for transformer blocks.
+            Defaults to False.
         device: Target device for model.
         mesh: MeshContext holding device meshes, sizes, and axis names.
             If None, built from the legacy ``device_mesh`` / ``moe_mesh`` params.
@@ -382,22 +280,19 @@ def instantiate_infrastructure(
 
     ep_size = mesh.ep_size if mesh.ep_size > 1 else ep_size
 
-    # Instantiate distributed manager
     model_wrapper = _instantiate_distributed(distributed_config, mesh)
-
-    # Instantiate pipeline
     autopipeline = _instantiate_pipeline(pipeline_config, mesh, device)
 
-    # Build parallelize_fn for EP or PP
     parallelize_fn = None
     if ep_size > 1:
         from nemo_automodel.components.moe.parallelizer import parallelize_model
 
-        parallelize_fn = partial(parallelize_model, **moe_config.to_dict())
+        parallelize_fn = partial(
+            parallelize_model, activation_checkpointing=activation_checkpointing, **moe_config.to_dict()
+        )
     elif autopipeline is not None and model_wrapper is not None:
         parallelize_fn = partial(parallelize_for_pp, model_wrapper=model_wrapper)
 
-    # Instantiate QAT quantizer
     qat_quantizer = _instantiate_qat(qat_config)
 
     return model_wrapper, autopipeline, parallelize_fn, qat_quantizer
@@ -551,6 +446,15 @@ def apply_model_infrastructure(
                 lora_a_init,
                 load_base_model=load_base_model,
             )
+
+    # Freeze parameters after checkpoint loading and parallelization
+    # This catches params created during parallelization (e.g., GroupedExpertsTE in init_token_dispatcher)
+    if peft_config is not None:
+        models_to_freeze = model.parts if hasattr(model, "parts") else [model]
+        for mp in models_to_freeze:
+            for name, param in mp.named_parameters():
+                if "lora_" not in name and param.requires_grad:
+                    param.requires_grad_(False)
 
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
