@@ -29,11 +29,11 @@ from nemo_automodel.components._peft.lora_kernel import (
 from nemo_automodel.components._peft.lora_moe import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components._peft.module_matcher import ModuleMatcher
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP
-from nemo_automodel.shared.import_utils import safe_import
+from nemo_automodel.shared.import_utils import safe_import, safe_import_te
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
-HAS_TE, transformer_engine = safe_import("transformer_engine")
+HAS_TE, transformer_engine = safe_import_te()
 
 logger = logging.getLogger(__name__)
 
