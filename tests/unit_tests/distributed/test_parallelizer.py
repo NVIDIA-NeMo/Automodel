@@ -34,6 +34,7 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGener
 
 # Import the function under test
 from nemo_automodel.components.distributed.parallelizer import (
+    _get_parallel_plan,
     fsdp2_strategy_parallelize,
     megatron_fsdp_strategy_parallelize,
     import_class_from_path,
@@ -881,4 +882,50 @@ class TestUnshardFsdp2Model:
 
             # Verify reshard was still called despite the exception
             assert test_fsdp_module.reshard_called is True
+
+
+class TestGetParallelPlanClassNameFallback:
+    """Test that _get_parallel_plan matches by class name when identity check fails."""
+
+    def test_identity_match(self):
+        """Exact class object in PARALLELIZE_FUNCTIONS is found."""
+        sentinel_plan = {"layer": ColwiseParallel()}
+        model = MockModel()
+
+        with patch(
+            "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
+            {type(model): lambda m, sp: sentinel_plan},
+        ):
+            plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
+        assert plan is sentinel_plan
+
+    def test_class_name_fallback(self):
+        """A different class object with the same __name__ still matches."""
+        sentinel_plan = {"layer": ColwiseParallel()}
+
+        # Create a *different* class with the same name as MockModel
+        DuplicateMockModel = type("MockModel", (nn.Module,), {"forward": lambda self, x: x})
+
+        model = MockModel()
+        model.__class__ = DuplicateMockModel  # model's type is the duplicate
+
+        with patch(
+            "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
+            {MockModel: lambda m, sp: sentinel_plan},  # keyed by the original
+        ):
+            plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
+        assert plan is sentinel_plan
+
+    def test_no_match_falls_through_to_default(self):
+        """Completely unknown class name falls through to the default plan."""
+        model = MockModel()
+        model.__class__ = type("UnknownModel", (nn.Module,), {"forward": lambda self, x: x})
+
+        with patch(
+            "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
+            {MockModel: lambda m, sp: {"x": ColwiseParallel()}},
+        ):
+            plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
+        # Should get the default Llama3-style plan (has q_proj, k_proj, etc.)
+        assert "model.layers.*.self_attn.q_proj" in plan
 
