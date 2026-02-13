@@ -88,13 +88,14 @@ def build_model(
     cfg_freeze,
     cfg_peft,
     seed,
-    freeze_embeddings=True,
     cfg_fp8=None,
     cfg_compile=None,
     device_mesh=None,
     moe_mesh=None,
     distributed_config=None,
     pipeline_config=None,
+    cfg_moe=None,
+    activation_checkpointing=False,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model for VLM.
 
@@ -111,6 +112,20 @@ def build_model(
             "pipeline_config": pipeline_config,
             "freeze_config": cfg_freeze.to_dict() if cfg_freeze is not None else None,
         }
+
+        if cfg_moe is not None:
+            from nemo_automodel.components.moe.config import MoEParallelizerConfig
+
+            if isinstance(cfg_moe, MoEParallelizerConfig):
+                kwargs["moe_config"] = cfg_moe
+            else:
+                moe_dict = cfg_moe.to_dict() if hasattr(cfg_moe, "to_dict") else dict(cfg_moe)
+                # activation_checkpointing is handled separately; strip config keys
+                moe_dict.pop("activation_checkpointing", None)
+                moe_dict.pop("_target_", None)
+                kwargs["moe_config"] = MoEParallelizerConfig(**moe_dict)
+            kwargs["activation_checkpointing"] = activation_checkpointing
+
         if cfg_fp8 is not None:
             fp8_config = build_fp8_config(cfg_fp8)
             kwargs["fp8_config"] = fp8_config
@@ -556,6 +571,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             moe_mesh=self.moe_mesh,
             distributed_config=self.distributed_config,
             pipeline_config=self.pipeline_config,
+            cfg_moe=self.dist_setup.moe_config,
+            activation_checkpointing=self.dist_setup.activation_checkpointing,
         )
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 

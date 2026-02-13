@@ -158,6 +158,28 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
             snapshot_download(pretrained_model_name_or_path)
 
 
+def _ensure_pad_token_id(config) -> None:
+    """Ensure ``pad_token_id`` exists on *config* and all nested sub-configs.
+
+    Transformers v5 removed ``pad_token_id`` from ``PretrainedConfig``, but
+    many HF modelling files still access it (e.g. for ``padding_idx``).  This
+    helper patches the attribute to ``None`` wherever it is missing so that
+    downstream code does not crash with an ``AttributeError``.
+
+    For multimodal models the text sub-config (``text_config``,
+    ``language_config``, etc.) may also need the fix, so we recurse into any
+    attribute that looks like a config object (has a ``to_dict`` method).
+    """
+    if not hasattr(config, "pad_token_id"):
+        config.pad_token_id = None
+    # Recurse into sub-configs (e.g. text_config, vision_config, …)
+    for attr_name in list(vars(config)):
+        sub = getattr(config, attr_name, None)
+        if sub is not None and sub is not config and hasattr(sub, "to_dict"):
+            if not hasattr(sub, "pad_token_id"):
+                sub.pad_token_id = None
+
+
 def _init_model(
     cls,
     pretrained_model_name_or_path_or_config,
@@ -178,6 +200,8 @@ def _init_model(
     pretrained_model_name_or_path = (
         pretrained_model_name_or_path_or_config if is_pretrained_init else getattr(hf_config, "name_or_path")
     )
+    # for models still access config.pad_token_id after v5 removes it in PretrainedConfig
+    _ensure_pad_token_id(hf_config)
 
     # 1. if force_hf is True, use HF model class wrapped with mixin
     if force_hf:
