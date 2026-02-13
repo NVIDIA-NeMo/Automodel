@@ -178,12 +178,16 @@ def _init_model(
     pretrained_model_name_or_path = (
         pretrained_model_name_or_path_or_config if is_pretrained_init else getattr(hf_config, "name_or_path")
     )
+    # for models still access config.pad_token_id after v5 removes it in PretrainedConfig
+    if not hasattr(hf_config, "pad_token_id"):
+        hf_config.pad_token_id = None
 
     # 1. if force_hf is True, use HF model class wrapped with mixin
     if force_hf:
         if quantization_config is not None:
             kwargs["quantization_config"] = quantization_config
         if is_pretrained_init:
+            kwargs["config"] = hf_config
             model = cls._from_pretrained_parent_class(
                 pretrained_model_name_or_path,
                 *model_args,
@@ -234,6 +238,9 @@ def _init_model(
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
     if is_pretrained_init:
+        # Forward the (possibly patched) config so from_pretrained doesn't
+        # reload a fresh copy that would lack the pad_token_id fix above.
+        kwargs["config"] = hf_config
         model = cls._from_pretrained_parent_class(
             pretrained_model_name_or_path,
             *model_args,
