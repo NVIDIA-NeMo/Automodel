@@ -482,14 +482,17 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
                 device=device, dtype=trainer.model_parts[0].dtype
             )
             peft_model = PeftModel.from_pretrained(
-                base, Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model"
+                base, Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model",
+                autocast_adapter_dtype=False,
             )
 
             for source_key, source_param in model_state_dict.items():
                 # source key example: 'base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight'
                 for peft_model_key, peft_model_param in peft_model.named_parameters():
                     if "lora" in peft_model_key and source_key.rsplit(".", 1)[0] in peft_model_key:
-                        assert torch.allclose(source_param, peft_model_param), (
+                        print('peft_model_key: ', peft_model_key, ' -> ', source_key, source_param.device,
+                        source_param.dtype, ' peft ', peft_model_param.device, peft_model_param.dtype)
+                        assert torch.allclose(source_param, peft_model_param.cpu()), (
                             "Parameter values are different when they should be the same"
                         )
     finally:
