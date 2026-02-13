@@ -31,6 +31,19 @@ except ImportError:
 import torch
 
 _buffer = None
+_nvshmem_available = None
+
+
+def _is_nvshmem_available() -> bool:
+    """Check if DeepEP was compiled with NVSHMEM support.
+
+    Uses is_sm90_compiled() as proxy — DeepEP's build enforces that
+    NVSHMEM is disabled when SM90 features are disabled.
+    """
+    global _nvshmem_available
+    if _nvshmem_available is None:
+        _nvshmem_available = Buffer.is_sm90_compiled()
+    return _nvshmem_available
 
 
 def get_hidden_bytes(x: torch.Tensor) -> int:
@@ -57,13 +70,22 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
     """
     global _buffer
     num_nvl_bytes, num_rdma_bytes = 0, 0
+    nvshmem = _is_nvshmem_available()
     for config in (
         Buffer.get_dispatch_config(group.size()),
         Buffer.get_combine_config(group.size()),
     ):
-        # Split long line for PEP8 compliance
         num_nvl_bytes = max(config.get_nvl_buffer_size_hint(hidden_bytes, group.size()), num_nvl_bytes)
-        num_rdma_bytes = max(config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes)
+        if nvshmem:
+            num_rdma_bytes = max(config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes)
+
+    if not nvshmem and group.size() > 8:
+        raise RuntimeError(
+            f"DeepEP was compiled without NVSHMEM support (SM90 features disabled), "
+            f"but expert parallelism group size {group.size()} > 8 requires internode "
+            f"RDMA communication. Recompile DeepEP with NVSHMEM or reduce ep_size to "
+            f"fit within a single node (max 8 GPUs)."
+        )
 
     # Allocate buffer if not existed or not enough buffer
     # NOTES: the adaptive routing configuration of the network **must be off**
