@@ -49,7 +49,7 @@ dist_env:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: MiniMaxAI/MiniMax-M2.1
+  pretrained_model_name_or_path: MiniMaxAI/MiniMax-M2.5
   trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
@@ -57,8 +57,8 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
+    experts: torch_mm
     dispatcher: deepep
-    experts: gmm
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
