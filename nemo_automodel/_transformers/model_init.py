@@ -187,6 +187,7 @@ def _init_model(
         if quantization_config is not None:
             kwargs["quantization_config"] = quantization_config
         if is_pretrained_init:
+            # Forward the patched config
             kwargs["config"] = hf_config
             model = cls._from_pretrained_parent_class(
                 pretrained_model_name_or_path,
@@ -238,8 +239,7 @@ def _init_model(
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
     if is_pretrained_init:
-        # Forward the (possibly patched) config so from_pretrained doesn't
-        # reload a fresh copy that would lack the pad_token_id fix above.
+        # Forward the patched config
         kwargs["config"] = hf_config
         model = cls._from_pretrained_parent_class(
             pretrained_model_name_or_path,
