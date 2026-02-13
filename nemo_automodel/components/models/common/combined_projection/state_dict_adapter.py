@@ -24,11 +24,33 @@ Works with any transformer model (Llama, Qwen2, etc.) that uses these projection
 
 import logging
 import re
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
+
+from nemo_automodel.components.checkpoint.state_dict_adapter import (
+    LazyHFStateDict,
+    LazyNativeStateDict,
+)
+
 logger = logging.getLogger(__name__)
+
+# Layer key pattern: optional "model." prefix, then "layers.{i}.self_attn.(q|k|v)_proj.{suffix}" or "layers.{i}.mlp.(gate|up)_proj.{suffix}"
+_LAYER_QKV_HF_RE = re.compile(
+    r"^(model\.)?layers\.(\d+)\.self_attn\.(q|k|v)_proj\.(weight|bias)$"
+)
+_LAYER_GATE_UP_HF_RE = re.compile(
+    r"^(model\.)?layers\.(\d+)\.mlp\.(gate|up)_proj\.(weight|bias)$"
+)
+_LAYER_QKV_NATIVE_RE = re.compile(
+    r"^(model\.)?layers\.(\d+)\.self_attn\.qkv_proj\.(weight|bias)$"
+)
+_LAYER_GATE_UP_NATIVE_RE = re.compile(
+    r"^(model\.)?layers\.(\d+)\.mlp\.gate_up_proj\.(weight|bias)$"
+)
 
 
 class CombinedProjectionStateDictAdapter:
@@ -74,6 +96,111 @@ class CombinedProjectionStateDictAdapter:
         self.q_size = self.num_attention_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 
+    def _prefix(self, layer_idx: int) -> str:
+        base = "layers.{}".format(layer_idx)
+        return "model." + base if self._uses_model_prefix else base
+
+    def get_hf_keys_for_native_key(self, native_key: str) -> Optional[list[str]]:
+        """Return HF key list for this native key, or None for passthrough."""
+        m = _LAYER_QKV_NATIVE_RE.match(native_key)
+        if m:
+            self._uses_model_prefix = m.group(1) is not None
+            pre, layer_idx, suffix = m.group(1) or "", int(m.group(2)), m.group(3)
+            prefix = self._prefix(layer_idx)
+            return [
+                f"{prefix}.self_attn.q_proj.{suffix}",
+                f"{prefix}.self_attn.k_proj.{suffix}",
+                f"{prefix}.self_attn.v_proj.{suffix}",
+            ]
+        m = _LAYER_GATE_UP_NATIVE_RE.match(native_key)
+        if m:
+            layer_idx, suffix = int(m.group(2)), m.group(3)
+            prefix = self._prefix(layer_idx)
+            return [
+                f"{prefix}.mlp.gate_proj.{suffix}",
+                f"{prefix}.mlp.up_proj.{suffix}",
+            ]
+        return None
+
+    def get_native_key_for_hf_key(self, hf_key: str) -> Optional[str]:
+        """Return native key for this HF key, or None for passthrough."""
+        if not isinstance(hf_key, str):
+            return None
+        m = _LAYER_QKV_HF_RE.match(hf_key)
+        if m:
+            self._uses_model_prefix = m.group(1) is not None
+            layer_idx, suffix = int(m.group(2)), m.group(4)
+            return f"{self._prefix(layer_idx)}.self_attn.qkv_proj.{suffix}"
+        m = _LAYER_GATE_UP_HF_RE.match(hf_key)
+        if m:
+            self._uses_model_prefix = m.group(1) is not None
+            layer_idx, suffix = int(m.group(2)), m.group(4)
+            return f"{self._prefix(layer_idx)}.mlp.gate_up_proj.{suffix}"
+        return None
+
+    def get_tensor_for_hf_key(self, native_fqn: str, tensor: torch.Tensor, hf_key: str) -> torch.Tensor:
+        """Return the view/slice of the native tensor for the given HF key."""
+        m = _LAYER_QKV_NATIVE_RE.match(native_fqn)
+        if m:
+            layer_idx, suffix = int(m.group(2)), m.group(3)
+            prefix = self._prefix(layer_idx)
+            proj = hf_key.split(".self_attn.")[-1].split(".")[0]  # q_proj, k_proj, v_proj
+            total = self.q_size + 2 * self.kv_size
+            actual = tensor.shape[0]
+            local_q = (self.q_size * actual) // total
+            local_kv = (self.kv_size * actual) // total
+            if proj == "q_proj":
+                return tensor.narrow(0, 0, local_q)
+            if proj == "k_proj":
+                return tensor.narrow(0, local_q, local_kv)
+            if proj == "v_proj":
+                return tensor.narrow(0, local_q + local_kv, local_kv)
+            raise KeyError(hf_key)
+        m = _LAYER_GATE_UP_NATIVE_RE.match(native_fqn)
+        if m:
+            proj = hf_key.split(".mlp.")[-1].split(".")[0]
+            mid = tensor.shape[0] // 2
+            if proj == "gate_proj":
+                return tensor.narrow(0, 0, mid)
+            if proj == "up_proj":
+                return tensor.narrow(0, mid, mid)
+            raise KeyError(hf_key)
+        return tensor
+
+    def get_merged_tensor_for_native_key(
+        self,
+        native_key: str,
+        hf_state_dict: dict[str, Any],
+        device_mesh: Optional["DeviceMesh"] = None,
+    ) -> Optional[torch.Tensor]:
+        """Merge HF tensors for this native key on demand (JIT). Returns None for passthrough."""
+        m = _LAYER_QKV_NATIVE_RE.match(native_key)
+        if m:
+            layer_idx, suffix = int(m.group(2)), m.group(3)
+            prefix = self._prefix(layer_idx)
+            qk = f"{prefix}.self_attn.q_proj.{suffix}"
+            kk = f"{prefix}.self_attn.k_proj.{suffix}"
+            vk = f"{prefix}.self_attn.v_proj.{suffix}"
+            if qk not in hf_state_dict or kk not in hf_state_dict or vk not in hf_state_dict:
+                return None
+            return torch.cat(
+                [hf_state_dict[qk], hf_state_dict[kk], hf_state_dict[vk]],
+                dim=0,
+            )
+        m = _LAYER_GATE_UP_NATIVE_RE.match(native_key)
+        if m:
+            self._uses_model_prefix = m.group(1) is not None
+            layer_idx, suffix = int(m.group(2)), m.group(3)
+            prefix = self._prefix(layer_idx)
+            gk = f"{prefix}.mlp.gate_proj.{suffix}"
+            uk = f"{prefix}.mlp.up_proj.{suffix}"
+            if gk not in hf_state_dict or uk not in hf_state_dict:
+                return None
+            return torch.cat([hf_state_dict[gk], hf_state_dict[uk]], dim=0)
+        if native_key in hf_state_dict:
+            return hf_state_dict[native_key]
+        return None
+
     def from_hf(self, hf_state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
         """Convert HuggingFace state dict to combined-projection format.
 
@@ -95,9 +222,25 @@ class CombinedProjectionStateDictAdapter:
             State dict in combined-projection format
         """
         inplace = bool(kwargs.get("inplace", False))
+        device_mesh = kwargs.get("device_mesh")
+        if inplace:
+            # Lazy/JIT: merge on key access to keep peak memory within baseline + margin.
+            for key in hf_state_dict.keys():
+                if "layers" in key:
+                    self._uses_model_prefix = key.startswith("model.")
+                    break
+            if isinstance(hf_state_dict, LazyHFStateDict):
+                return LazyNativeStateDict(
+                    hf_state_dict,
+                    self,
+                    device_mesh=device_mesh,
+                    native_backing=hf_state_dict._state_dict,
+                )
+            return LazyNativeStateDict(hf_state_dict, self, device_mesh=device_mesh)
+
         # If the caller needs to preserve the original HF dict (common in tests),
         # operate on a shallow copy. This duplicates only the Python dict, not tensors.
-        state_dict: dict[str, Any] = hf_state_dict if inplace else dict(hf_state_dict)
+        state_dict: dict[str, Any] = dict(hf_state_dict)
 
         # Determine if model prefix is used
         for key in state_dict.keys():
@@ -171,7 +314,7 @@ class CombinedProjectionStateDictAdapter:
 
         # Recombine any split projection LoRA/DoRA keys back to combined format.
         # This is the reverse of _split_remaining_combined_projection_keys in to_hf().
-        self._recombine_split_projection_keys(custom_state_dict)
+        self._recombine_split_projection_keys(state_dict)
 
         # Handle tied weights: if lm_head.weight is missing but embed_tokens exists, tie them
         # This is common in Qwen2 and Llama where lm_head shares weights with embeddings
@@ -206,12 +349,9 @@ class CombinedProjectionStateDictAdapter:
         """
         inplace = bool(kwargs.get("inplace", False))
         if inplace:
-            # Mutate the input dict in-place to reduce peak memory in conversion paths
-            # (e.g., checkpoint saving) by dropping the combined tensors as soon as
-            # the split tensors are created.
-            hf_state_dict = state_dict
-        else:
-            hf_state_dict = {}
+            # Lazy/JIT: convert on key access so only one tensor (view) is materialized at a time.
+            return LazyHFStateDict(state_dict, self)
+        hf_state_dict = {}
         processed_keys = set()
 
         # Determine if model prefix is used

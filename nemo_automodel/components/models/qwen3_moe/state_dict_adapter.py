@@ -18,7 +18,11 @@ from typing import Any, Optional
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint.state_dict_adapter import (
+    LazyHFStateDict,
+    LazyNativeStateDict,
+    StateDictAdapter,
+)
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
@@ -56,34 +60,16 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
         inplace = bool(kwargs.get("inplace", False))
-        hf_state_dict = {}
         if inplace:
-            # Iterate keys only so we don't keep references to all tensors in a list.
-            for fqn in list(state_dict.keys()):
-                tensor = state_dict.get(fqn, None)
-                if tensor is None:
-                    continue
-                converted_tensors = self.convert_single_tensor_to_hf(
-                    fqn, tensor, exclude_key_regex=exclude_key_regex, quantization=quantization, **kwargs
-                )
-                for key, value in converted_tensors:
-                    hf_state_dict[key] = value
-
-                # If this key was converted/renamed/dropped, remove it from the input dict to
-                # allow earlier freeing of large tensors during conversion.
-                keep_original = (
-                    len(converted_tensors) == 1 and converted_tensors[0][0] == fqn and converted_tensors[0][1] is tensor
-                )
-                if not keep_original:
-                    state_dict.pop(fqn, None)
-        else:
-            for fqn, tensor in state_dict.items():
-                converted_tensors = self.convert_single_tensor_to_hf(
-                    fqn, tensor, exclude_key_regex=exclude_key_regex, quantization=quantization, **kwargs
-                )
-                for key, value in converted_tensors:
-                    hf_state_dict[key] = value
-
+            # Lazy/JIT: convert on key access so only one tensor (view) is materialized at a time.
+            return LazyHFStateDict(state_dict, self)
+        hf_state_dict = {}
+        for fqn, tensor in state_dict.items():
+            converted_tensors = self.convert_single_tensor_to_hf(
+                fqn, tensor, exclude_key_regex=exclude_key_regex, quantization=quantization, **kwargs
+            )
+            for key, value in converted_tensors:
+                hf_state_dict[key] = value
         return hf_state_dict
 
     def from_hf(
@@ -98,7 +84,16 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
             if ".mlp.experts." in key and key.endswith(".weight"):
                 self._uses_model_prefix = key.startswith("model.")
                 break
-        return self._from_hf_w_merged_experts(hf_state_dict, device_mesh, inplace=inplace)
+        if inplace:
+            from nemo_automodel.components.checkpoint.state_dict_adapter import LazyHFStateDict
+            if isinstance(hf_state_dict, LazyHFStateDict):
+                # Round-trip: return native tensors from the backing dict (zero copy, peak = 1x).
+                return LazyNativeStateDict(
+                    hf_state_dict, self, device_mesh, native_backing=hf_state_dict._state_dict
+                )
+            # Lazy/JIT: merge on key access one native key at a time to limit peak memory.
+            return LazyNativeStateDict(hf_state_dict, self, device_mesh)
+        return self._from_hf_w_merged_experts(hf_state_dict, device_mesh, inplace=False)
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         """Convert a single tensor from native format to HuggingFace format.

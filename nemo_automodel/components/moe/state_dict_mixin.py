@@ -62,6 +62,45 @@ class MoESplitExpertsStateDictMixin:
         """Path segment for experts (e.g., 'mlp.experts' or 'mixer.experts'). Override in subclass."""
         return "mlp.experts"
 
+    def _get_expert_hf_key_pattern(self) -> re.Pattern[str]:
+        """Single regex for HF expert keys; used by bulk conversion and lazy key mapping."""
+        return re.compile(
+            rf"(?P<prefix>(?:model\.)?(?:language_model\.)?)layers\.(?P<layer_num>\d+)\.{re.escape(self._expert_path_segment)}\.(?P<expert_id>\d+)\.(?P<proj_type>gate_proj|up_proj|down_proj)\.weight"
+        )
+
+    def _parse_native_expert_key(self, fqn: str) -> Optional[tuple[str, str]]:
+        """If fqn is an expert merged key, return (layer_num, key_type) where key_type in ('gate_and_up_projs', 'down_projs'). Else None."""
+        seg = self._expert_path_segment
+        if f".{seg}.gate_and_up_projs" in fqn and fqn.endswith(".gate_and_up_projs"):
+            m = re.search(r"layers\.(\d+)", fqn)
+            return (m.group(1), "gate_and_up_projs") if m else None
+        if f".{seg}.down_projs" in fqn and fqn.endswith(".down_projs"):
+            m = re.search(r"layers\.(\d+)", fqn)
+            return (m.group(1), "down_projs") if m else None
+        return None
+
+    def _build_hf_key(self, layer_num: str, expert_id: int, proj_type: str, prefix: Optional[str] = None) -> str:
+        """Build one HF expert key. proj_type in ('gate_proj', 'up_proj', 'down_proj').
+        If prefix is None, uses self._hf_prefix (for to_hf); else uses prefix (for from_hf lookups).
+        """
+        p = self._hf_prefix if prefix is None else prefix
+        return f"{p}layers.{layer_num}.{self._expert_path_segment}.{expert_id}.{proj_type}.weight"
+
+    def _build_native_key(self, prefix: str, layer_num: str, proj_type: str) -> str:
+        """Build native merged key. proj_type in ('gate_and_up_projs', 'down_projs')."""
+        return f"{prefix}layers.{layer_num}.{self._expert_path_segment}.{proj_type}"
+
+    def _parse_hf_expert_key(self, hf_key: str) -> Optional[tuple[str, str, int, str]]:
+        """If hf_key is an expert HF key, return (prefix, layer_num, expert_id, proj_type). Else None."""
+        m = self._get_expert_hf_key_pattern().match(hf_key)
+        if m is None:
+            return None
+        prefix = m.group("prefix") or ""
+        layer_num = m.group("layer_num")
+        expert_id = int(m.group("expert_id"))
+        proj_type = m.group("proj_type")
+        return (prefix, layer_num, expert_id, proj_type)
+
     def _validate_expert_availability(
         self,
         hf_state_dict: dict[str, Any],
@@ -266,13 +305,7 @@ class MoESplitExpertsStateDictMixin:
         state_dict: dict[str, Any] = {}
         expert_weights_by_layer: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
 
-        # Handle both formats:
-        # - model.layers.{L}.{expert_segment}.{E}.gate_proj.weight (with model prefix)
-        # - language_model.layers.{L}.{expert_segment}.{E}.gate_proj.weight (with language_model prefix)
-        # - layers.{L}.{expert_segment}.{E}.gate_proj.weight (without model prefix)
-        expert_pattern = re.compile(
-            rf"(?P<prefix>(?:model\.)?(?:language_model\.)?)layers\.(\d+)\.{re.escape(expert_segment)}\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
-        )
+        expert_pattern = self._get_expert_hf_key_pattern()
 
         if inplace:
             # Iterate keys only (not items) so we don't keep references to all tensors in a list.
@@ -288,8 +321,9 @@ class MoESplitExpertsStateDictMixin:
                         continue
 
                     prefix = m.group("prefix") or ""
-                    layer_num, expert_num, which = m.group(2), m.group(3), m.group(4)
-                    expert_num = int(expert_num)
+                    layer_num = m.group("layer_num")
+                    expert_num = int(m.group("expert_id"))
+                    which = m.group("proj_type")
 
                     if not should_load_expert_for_rank(expert_num, device_mesh, n_experts):
                         del value
@@ -299,9 +333,9 @@ class MoESplitExpertsStateDictMixin:
                         expert_weights_by_layer[layer_num] = {}
 
                     if which in ["gate_proj", "up_proj"]:
-                        native_key = f"{prefix}layers.{layer_num}.{expert_segment}.gate_and_up_projs"
+                        native_key = self._build_native_key(prefix, layer_num, "gate_and_up_projs")
                     else:  # down_proj
-                        native_key = f"{prefix}layers.{layer_num}.{expert_segment}.down_projs"
+                        native_key = self._build_native_key(prefix, layer_num, "down_projs")
 
                     if native_key not in expert_weights_by_layer[layer_num]:
                         expert_weights_by_layer[layer_num][native_key] = {}
@@ -392,6 +426,7 @@ class MoESplitExpertsStateDictMixin:
 
             return state_dict
 
+        expert_pattern = self._get_expert_hf_key_pattern()
         for key, value in hf_state_dict.items():
             if f".{expert_segment}." in key and key.endswith(".weight"):
                 m = expert_pattern.match(key)
@@ -400,8 +435,9 @@ class MoESplitExpertsStateDictMixin:
                     continue
 
                 prefix = m.group("prefix") or ""
-                layer_num, expert_num, which = m.group(2), m.group(3), m.group(4)
-                expert_num = int(expert_num)
+                layer_num = m.group("layer_num")
+                expert_num = int(m.group("expert_id"))
+                which = m.group("proj_type")
 
                 if not should_load_expert_for_rank(expert_num, device_mesh, n_experts):
                     del value
@@ -411,9 +447,9 @@ class MoESplitExpertsStateDictMixin:
                     expert_weights_by_layer[layer_num] = {}
 
                 if which in ["gate_proj", "up_proj"]:
-                    native_key = f"{prefix}layers.{layer_num}.{expert_segment}.gate_and_up_projs"
+                    native_key = self._build_native_key(prefix, layer_num, "gate_and_up_projs")
                 else:  # down_proj
-                    native_key = f"{prefix}layers.{layer_num}.{expert_segment}.down_projs"
+                    native_key = self._build_native_key(prefix, layer_num, "down_projs")
 
                 if native_key not in expert_weights_by_layer[layer_num]:
                     expert_weights_by_layer[layer_num][native_key] = {}
@@ -517,12 +553,12 @@ class MoESplitExpertsStateDictMixin:
         """
         n_experts = self.moe_config.n_routed_experts
         inter_dim = self.moe_config.moe_inter_dim
-        prefix = self._hf_prefix
-        expert_segment = self._expert_path_segment
+        parsed = self._parse_native_expert_key(fqn)
+        if parsed is None:
+            return None
+        layer_num, key_type = parsed
 
-        if f".{expert_segment}.gate_and_up_projs" in fqn and fqn.endswith(".gate_and_up_projs"):
-            layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
-
+        if key_type == "gate_and_up_projs":
             from nemo_automodel.components.moe.state_dict_utils import (
                 is_dtensor,
                 validate_dtensor_expert_sharding,
@@ -536,25 +572,16 @@ class MoESplitExpertsStateDictMixin:
             for i, w in enumerate(splits):
                 expert_id = self._last_expert_ids[i]
                 if self._is_gated_moe:
-                    # Gated: split into gate_proj and up_proj
-                    w_gate = w[:, :inter_dim].transpose(0, 1).contiguous()
-                    w_up = w[:, inter_dim:].transpose(0, 1).contiguous()
-                    result.append((f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.gate_proj.weight", w_gate))
-                    result.append((f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.up_proj.weight", w_up))
+                    w_gate = w[:, :inter_dim].transpose(0, 1)
+                    w_up = w[:, inter_dim:].transpose(0, 1)
+                    result.append((self._build_hf_key(layer_num, expert_id, "gate_proj"), w_gate))
+                    result.append((self._build_hf_key(layer_num, expert_id, "up_proj"), w_up))
                 else:
-                    # Non-gated: only up_proj (tensor is [dim, inter_dim], not [dim, 2*inter_dim])
-                    w_up = w.transpose(0, 1).contiguous()
-                    result.append((f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.up_proj.weight", w_up))
+                    w_up = w.transpose(0, 1)
+                    result.append((self._build_hf_key(layer_num, expert_id, "up_proj"), w_up))
             return result
 
-        elif (
-            f".{expert_segment}.down_projs" in fqn
-            and fqn.endswith(".down_projs")
-            and tensor.ndim == 3
-            and tensor.shape[1] == inter_dim
-        ):
-            layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
-
+        if key_type == "down_projs" and tensor.ndim == 3 and tensor.shape[1] == inter_dim:
             from nemo_automodel.components.moe.state_dict_utils import (
                 is_dtensor,
                 validate_dtensor_expert_sharding,
@@ -567,12 +594,210 @@ class MoESplitExpertsStateDictMixin:
             result = []
             for i, w in enumerate(splits):
                 expert_id = self._last_expert_ids[i]
-                result.append(
-                    (
-                        f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.down_proj.weight",
-                        w.transpose(0, 1).contiguous(),
-                    )
-                )
+                result.append((self._build_hf_key(layer_num, expert_id, "down_proj"), w.transpose(0, 1)))
             return result
+
+        return None
+
+    # --- Lazy / JIT conversion: key mapping and single-key tensor access ---
+
+    def get_hf_keys_for_native_key(self, fqn: str) -> Optional[list[str]]:
+        """Return the list of HF key names for this native key, without converting tensors.
+        Returns None if this key is not an expert merged key (passthrough).
+        """
+        parsed = self._parse_native_expert_key(fqn)
+        if parsed is None:
+            return None
+        layer_num, key_type = parsed
+        n_experts = self.moe_config.n_routed_experts
+        keys = []
+        if key_type == "gate_and_up_projs":
+            for e in range(n_experts):
+                if self._is_gated_moe:
+                    keys.append(self._build_hf_key(layer_num, e, "gate_proj"))
+                    keys.append(self._build_hf_key(layer_num, e, "up_proj"))
+                else:
+                    keys.append(self._build_hf_key(layer_num, e, "up_proj"))
+        else:  # down_projs
+            for e in range(n_experts):
+                keys.append(self._build_hf_key(layer_num, e, "down_proj"))
+        return keys
+
+    def get_native_key_for_hf_key(self, hf_key: str) -> Optional[str]:
+        """Return the native key that produces this HF key, or None if passthrough."""
+        if not isinstance(hf_key, str):
+            return None
+        parsed = self._parse_hf_expert_key(hf_key)
+        if parsed is None:
+            return None
+        prefix, layer_num, _, proj_type = parsed
+        if proj_type in ("gate_proj", "up_proj"):
+            return self._build_native_key(prefix, layer_num, "gate_and_up_projs")
+        return self._build_native_key(prefix, layer_num, "down_projs")
+
+    def get_tensor_for_hf_key(self, native_fqn: str, tensor: torch.Tensor, hf_key: str) -> torch.Tensor:
+        """Return the single tensor (view) for this HF key. native_fqn must be the native key for hf_key."""
+        parsed = self._parse_hf_expert_key(hf_key)
+        if parsed is None:
+            raise KeyError(hf_key)
+        _, layer_num, expert_id, proj_type = parsed
+        native_parsed = self._parse_native_expert_key(native_fqn)
+        if native_parsed is None:
+            raise KeyError(hf_key)
+        _, key_type = native_parsed
+        inter_dim = self.moe_config.moe_inter_dim
+        w = tensor[expert_id]
+
+        if key_type == "gate_and_up_projs":
+            if self._is_gated_moe:
+                if proj_type == "gate_proj":
+                    return w[:, :inter_dim].transpose(0, 1)
+                if proj_type == "up_proj":
+                    return w[:, inter_dim:].transpose(0, 1)
+            else:
+                return w.transpose(0, 1)
+        if key_type == "down_projs":
+            return w.transpose(0, 1)
+        raise KeyError(hf_key)
+
+    def _get_prefix_from_hf_expert_keys(self, hf_state_dict: dict[str, Any]) -> str:
+        """Infer HF key prefix from any expert key in the dict. Uses shared pattern."""
+        for k in hf_state_dict:
+            parsed = self._parse_hf_expert_key(k)
+            if parsed is not None:
+                return parsed[0]  # prefix
+        return ""
+
+    def get_merged_tensor_for_native_key(
+        self,
+        native_key: str,
+        hf_state_dict: dict[str, Any],
+        device_mesh: Optional["DeviceMesh"] = None,
+    ) -> Optional[Any]:
+        """Pop HF keys that form this native key from hf_state_dict, merge incrementally, return the native tensor.
+        Returns None if native_key is not an expert merged key (caller should pass through).
+        Merges one expert at a time to keep peak memory ~1x.
+        """
+        parsed = self._parse_native_expert_key(native_key)
+        if parsed is None:
+            return None
+        layer_num, key_type = parsed
+        n_experts = self.moe_config.n_routed_experts
+        is_gated = self._is_gated_moe
+
+        if device_mesh is not None:
+            start_expert, end_expert = get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
+            expected_experts = list(range(start_expert, end_expert))
+        else:
+            expected_experts = list(range(n_experts))
+
+        rank = None
+        if device_mesh is not None:
+            rank = (
+                get_submesh(device_mesh, ("ep",)).get_rank()
+                if "ep" in device_mesh.mesh_dim_names
+                else device_mesh.get_rank()
+            )
+        prefix = self._get_prefix_from_hf_expert_keys(hf_state_dict)
+
+        if key_type == "gate_and_up_projs":
+            dim = self.moe_config.dim
+            inter_dim = self.moe_config.moe_inter_dim
+            if is_gated:
+                out_shape = (len(expected_experts), dim, 2 * inter_dim)
+                full_size = len(expected_experts) * dim * (2 * inter_dim)
+            else:
+                out_shape = (len(expected_experts), dim, inter_dim)
+                full_size = len(expected_experts) * dim * inter_dim
+            first_expert_id = sorted(expected_experts)[0]
+            gate_key = self._build_hf_key(layer_num, first_expert_id, "gate_proj", prefix=prefix)
+            up_key = self._build_hf_key(layer_num, first_expert_id, "up_proj", prefix=prefix)
+            if is_gated and gate_key in hf_state_dict and up_key in hf_state_dict and device_mesh is None:
+                first_t = hf_state_dict.pop(gate_key)
+                if is_dtensor(first_t):
+                    first_t = first_t.to_local()
+                st = first_t.untyped_storage()
+                offset = first_t.storage_offset()
+                # Round-trip: HF tensors are views of the original native tensor; storage spans full buffer.
+                if st.size() >= full_size + offset:
+                    strides = (dim * (2 * inter_dim), 2 * inter_dim, 1) if is_gated else (dim * inter_dim, inter_dim, 1)
+                    out = torch.as_strided(first_t, out_shape, strides, offset).to(self.dtype)
+                    for expert_id in sorted(expected_experts):
+                        for k in (
+                            self._build_hf_key(layer_num, expert_id, "gate_proj", prefix=prefix),
+                            self._build_hf_key(layer_num, expert_id, "up_proj", prefix=prefix),
+                        ):
+                            if k in hf_state_dict:
+                                del hf_state_dict[k]
+                    return out
+                hf_state_dict[gate_key] = first_t
+            device = hf_state_dict[up_key].device
+            stacked = torch.empty(out_shape, device=device, dtype=self.dtype)
+            for idx, expert_id in enumerate(sorted(expected_experts)):
+                gate_key = self._build_hf_key(layer_num, expert_id, "gate_proj", prefix=prefix)
+                up_key = self._build_hf_key(layer_num, expert_id, "up_proj", prefix=prefix)
+                if not is_gated:
+                    if gate_key in hf_state_dict:
+                        del hf_state_dict[gate_key]
+                    if up_key not in hf_state_dict:
+                        return None
+                    up_weight = hf_state_dict.pop(up_key)
+                    if is_dtensor(up_weight):
+                        up_weight = up_weight.to_local()
+                    stacked[idx].copy_(up_weight.transpose(0, 1))
+                    del up_weight
+                    continue
+                if gate_key not in hf_state_dict or up_key not in hf_state_dict:
+                    return None
+                gate_weight = hf_state_dict.pop(gate_key)
+                up_weight = hf_state_dict.pop(up_key)
+                if is_dtensor(gate_weight):
+                    gate_weight = gate_weight.to_local()
+                if is_dtensor(up_weight):
+                    up_weight = up_weight.to_local()
+                gate_t = gate_weight.transpose(0, 1)
+                up_t = up_weight.transpose(0, 1)
+                stacked[idx, :, :inter_dim].copy_(gate_t)
+                stacked[idx, :, inter_dim:].copy_(up_t)
+                del gate_weight, up_weight, gate_t, up_t
+            out = create_dtensor_from_local(stacked, device_mesh, rank)
+            del stacked
+            return out
+
+        if key_type == "down_projs":
+            inter_dim = self.moe_config.moe_inter_dim
+            dim = self.moe_config.dim
+            down_shape = (len(expected_experts), inter_dim, dim)
+            full_size = len(expected_experts) * inter_dim * dim
+            first_down_key = self._build_hf_key(layer_num, sorted(expected_experts)[0], "down_proj", prefix=prefix)
+            if first_down_key not in hf_state_dict:
+                return None
+            if device_mesh is None:
+                first_down = hf_state_dict.pop(first_down_key)
+                if is_dtensor(first_down):
+                    first_down = first_down.to_local()
+                if first_down.untyped_storage().size() == full_size:
+                    strides = (inter_dim * dim, dim, 1)
+                    out = torch.as_strided(first_down, down_shape, strides, 0).to(self.dtype)
+                    for expert_id in sorted(expected_experts):
+                        k = self._build_hf_key(layer_num, expert_id, "down_proj", prefix=prefix)
+                        if k in hf_state_dict:
+                            del hf_state_dict[k]
+                    return out
+                hf_state_dict[first_down_key] = first_down
+            device = hf_state_dict[first_down_key].device
+            stacked = torch.empty(down_shape, device=device, dtype=self.dtype)
+            for idx, expert_id in enumerate(sorted(expected_experts)):
+                down_key = self._build_hf_key(layer_num, expert_id, "down_proj", prefix=prefix)
+                if down_key not in hf_state_dict:
+                    return None
+                down_weight = hf_state_dict.pop(down_key)
+                if is_dtensor(down_weight):
+                    down_weight = down_weight.to_local()
+                stacked[idx].copy_(down_weight.transpose(0, 1))
+                del down_weight
+            out = create_dtensor_from_local(stacked, device_mesh, rank)
+            del stacked
+            return out
 
         return None
