@@ -78,21 +78,31 @@ def _add_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX, skip_keys: list
 
 def _rename_dora_keys_to_hf(sd: dict[str, Any]) -> None:
     """
-    Rename DoRA magnitude keys to match HF PEFT's expected format in-place.
+    Rename DoRA magnitude keys to match HF PEFT's saved checkpoint format in-place.
+
+    HF PEFT's ``get_peft_model_state_dict`` strips the adapter name and the
+    ``.weight`` suffix from ``lora_magnitude_vector.<adapter>.<weight>`` so the
+    round-trip format on disk is simply ``<module>.lora_magnitude_vector``.
+    When loading, ``set_peft_model_state_dict`` re-inserts the adapter name
+    and the ``.weight`` suffix automatically, so we must NOT include them here.
     """
     for k in list(sd.keys()):
         if k.endswith(".lora_magnitude"):
-            sd[k[: -len(".lora_magnitude")] + ".lora_magnitude_vector.default.weight"] = sd.pop(k)
+            sd[k[: -len(".lora_magnitude")] + ".lora_magnitude_vector"] = sd.pop(k)
 
 
 def _rename_dora_keys_from_hf(sd: dict[str, Any]) -> None:
     """
     Reverse of _rename_dora_keys_to_hf: convert HF PEFT key format back to internal names.
+
+    Handles both the current on-disk format (``<module>.lora_magnitude_vector``)
+    and the legacy format that included ``.default.weight`` for robustness.
     """
-    suffix = ".lora_magnitude_vector.default.weight"
     for k in list(sd.keys()):
-        if k.endswith(suffix):
-            sd[k[: -len(suffix)] + ".lora_magnitude"] = sd.pop(k)
+        if k.endswith(".lora_magnitude_vector.default.weight"):
+            sd[k[: -len(".lora_magnitude_vector.default.weight")] + ".lora_magnitude"] = sd.pop(k)
+        elif k.endswith(".lora_magnitude_vector"):
+            sd[k[: -len(".lora_magnitude_vector")] + ".lora_magnitude"] = sd.pop(k)
 
 
 def _get_lm_head_weight_and_name(model: torch.nn.Module) -> Optional[tuple[torch.Tensor, str]]:

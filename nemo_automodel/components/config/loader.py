@@ -592,6 +592,10 @@ class ConfigNode:
             # Dicts (shouldn't normally appear because we wrap into ConfigNode, but handle defensively)
             if isinstance(value, dict):
                 return {k: _convert(k, v) for k, v in value.items()}
+            # Prefer original YAML string for _target_ / *_fn when use_orig_values is set
+            orig_strings = getattr(self, "_original_strings", {})
+            if use_orig_values and key in orig_strings:
+                return orig_strings[key]
             # Convert targets/functions to dotted path strings
             is_target_like = key == "_target_" or (isinstance(key, str) and key.endswith("_fn")) or key == "collate_fn"
             try:
@@ -609,8 +613,12 @@ class ConfigNode:
             # Primitive – already typed via translate_value/_wrap
             return value
 
-        # Walk live attributes to preserve translated scalars
-        out = {k: _convert(k, v) for k, v in self.__dict__.items() if k not in ("raise_on_missing_attr", "_raw_config")}
+        # Walk live attributes; exclude internal keys so they never appear in YAML output
+        out = {
+            k: _convert(k, v)
+            for k, v in self.__dict__.items()
+            if k not in ("raise_on_missing_attr", "_raw_config", "_original_strings")
+        }
         if resolve_env:
             out = resolve_yaml_env_vars(out)
         if redact_sensitive:
@@ -787,6 +795,26 @@ class ConfigNode:
                 else:
                     return False
         return current != self
+
+
+def config_to_yaml_str(cfg_obj, *, use_orig_values: bool = True):
+    """
+    Convert a config object to a YAML string suitable for logging/printing.
+
+    Uses original placeholder strings (e.g. `${VAR}`) and original _target_/*_fn
+    strings when use_orig_values is True; never includes internal keys like
+    _original_strings. If cfg_obj is a ConfigNode, uses to_yaml_dict(); otherwise
+    falls back to to_dict() or a plain dict.
+    """
+    if cfg_obj is None:
+        return ""
+    if hasattr(cfg_obj, "to_yaml_dict"):
+        cfg_dict = cfg_obj.to_yaml_dict(use_orig_values=use_orig_values)
+    elif hasattr(cfg_obj, "to_dict"):
+        cfg_dict = cfg_obj.to_dict()
+    else:
+        cfg_dict = dict(cfg_obj)
+    return yaml.safe_dump(cfg_dict, sort_keys=False, default_flow_style=False).strip()
 
 
 def load_yaml_config(path):

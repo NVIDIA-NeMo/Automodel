@@ -16,6 +16,7 @@ import logging
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
@@ -25,6 +26,18 @@ from nemo_automodel.components.distributed.parallelizer import (
 )
 
 logger = logging.getLogger(__name__)
+
+try:
+    from megatron_fsdp import MegatronFSDP
+    from megatron_fsdp.fully_shard import fully_shard_optimizer as megatron_fsdp_fully_shard_optimizer
+
+    HAS_MEGATRON_FSDP = True
+except (ImportError, FileNotFoundError):
+    # raise FileNotFoundError(
+    # E   FileNotFoundError: Could not find shared object file for Transformer Engine torch lib.
+    MegatronFSDP = None
+    megatron_fsdp_fully_shard_optimizer = None
+    HAS_MEGATRON_FSDP = False
 
 
 class MegatronFSDPManager:
@@ -148,3 +161,16 @@ class MegatronFSDPManager:
         )
 
         return model, optimizer
+
+
+def fully_shard_optimizer(
+    model: nn.Module, optimizer: torch.optim.Optimizer, preproc_state_dict_for_dcp_ckpt: bool = True
+) -> torch.optim.Optimizer:
+    """ """
+    if not isinstance(model, MegatronFSDP):
+        return optimizer
+    if not HAS_MEGATRON_FSDP:
+        raise ImportError(
+            "MegatronFSDP is not installed, please visit https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/distributed/fsdp/src for more information"
+        )
+    return megatron_fsdp_fully_shard_optimizer(optimizer)

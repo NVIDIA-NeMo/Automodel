@@ -18,9 +18,15 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0"
 
+# Propagate -s flag if PYTEST_PROPAGATE_S is set
+PYTEST_S_FLAG=""
+if [ "${PYTEST_PROPAGATE_S:-}" = "1" ]; then
+    PYTEST_S_FLAG="-s"
+fi
+
 TRANSFORMERS_OFFLINE=1 python \
 -m coverage run --data-file=/workspace/.coverage --source=/workspace \
--m pytest tests/functional_tests/training/test_qlora_tiny.py \
+-m pytest $PYTEST_S_FLAG tests/functional_tests/training/test_qlora_tiny.py \
     --config tests/functional_tests/hf_peft/qlora_tiny_squad.yaml \
     --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l \
     --dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
@@ -37,7 +43,7 @@ TRANSFORMERS_OFFLINE=1 python \
 # Now, rerun command with max_steps=4 (previous used 3)
 TRANSFORMERS_OFFLINE=1 python \
 -m coverage run --append --data-file=/workspace/.coverage --source=/workspace \
--m pytest tests/functional_tests/training/test_qlora_tiny.py \
+-m pytest $PYTEST_S_FLAG tests/functional_tests/training/test_qlora_tiny.py \
     --config tests/functional_tests/hf_peft/qlora_tiny_squad.yaml \
     --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l \
     --dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \

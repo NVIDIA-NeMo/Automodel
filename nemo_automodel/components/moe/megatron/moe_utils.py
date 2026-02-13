@@ -18,16 +18,15 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-try:
+from nemo_automodel.shared.import_utils import safe_import_te
+
+HAS_TE, transformer_engine = safe_import_te()
+if HAS_TE:
     from transformer_engine.pytorch import (
         moe_permute,
         moe_permute_with_probs,
         moe_unpermute,
     )
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
 
 
 def permute(
@@ -64,13 +63,13 @@ def permute(
         sorted_indices (torch.Tensor): The tensor of a mapping table for sorted indices used to unpermute the tokens.
     """
     if fused and probs is None:
-        if not HAVE_TE or moe_permute is None:
+        if not HAS_TE or moe_permute is None:
             raise ValueError("moe_permute is not available. Please install TE >= 2.1.0.")
         permuted_input, sorted_indices = moe_permute(tokens, routing_map, num_out_tokens=num_out_tokens)
         return permuted_input, None, sorted_indices
 
     if fused and probs is not None:
-        if not HAVE_TE or moe_permute_with_probs is None:
+        if not HAS_TE or moe_permute_with_probs is None:
             raise ValueError("moe_permute_with_probs is not available. Please install TE >= 2.1.0.")
         return moe_permute_with_probs(tokens, probs, routing_map, num_out_tokens=num_out_tokens)
 
@@ -148,7 +147,7 @@ def unpermute(
         torch.Tensor: The tokens restored to their original order.
     """
     if fused:
-        if not HAVE_TE or moe_unpermute is None:
+        if not HAS_TE or moe_unpermute is None:
             raise ValueError("moe_unpermute is not available. Please install TE >= 2.1.0.")
         return moe_unpermute(
             permuted_tokens,
