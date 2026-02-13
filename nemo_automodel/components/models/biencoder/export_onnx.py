@@ -37,7 +37,6 @@ import argparse
 import logging
 import os
 from pathlib import Path
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -251,28 +250,33 @@ def verify_onnx(onnx_path: str, tokenizer) -> None:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Export a HuggingFace biencoder/embedding model to ONNX."
-    )
+    parser = argparse.ArgumentParser(description="Export a HuggingFace biencoder/embedding model to ONNX.")
     parser.add_argument(
-        "--model-path", type=str, required=True,
+        "--model-path",
+        type=str,
+        required=True,
         help="Path to the HuggingFace model directory.",
     )
     parser.add_argument(
-        "--output-dir", type=str, required=True,
+        "--output-dir",
+        type=str,
+        required=True,
         help="Directory for ONNX model and tokenizer output.",
     )
-    parser.add_argument("--pooling", type=str, default="avg", choices=["avg", "cls", "last"],
-                        help="Pooling strategy (default: avg).")
-    parser.add_argument("--normalize", action="store_true", default=True,
-                        help="L2-normalise embeddings (default: True).")
-    parser.add_argument("--no-normalize", action="store_false", dest="normalize",
-                        help="Disable L2 normalisation.")
+    parser.add_argument(
+        "--pooling", type=str, default="avg", choices=["avg", "cls", "last"], help="Pooling strategy (default: avg)."
+    )
+    parser.add_argument(
+        "--normalize", action="store_true", default=True, help="L2-normalise embeddings (default: True)."
+    )
+    parser.add_argument("--no-normalize", action="store_false", dest="normalize", help="Disable L2 normalisation.")
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version (default: 17).")
-    parser.add_argument("--dtype", type=str, default="fp32", choices=["fp32", "fp16"],
-                        help="Export precision (default: fp32).")
-    parser.add_argument("--no-verify", action="store_true", default=False,
-                        help="Skip onnxruntime verification after export.")
+    parser.add_argument(
+        "--dtype", type=str, default="fp32", choices=["fp32", "fp16"], help="Export precision (default: fp32)."
+    )
+    parser.add_argument(
+        "--no-verify", action="store_true", default=False, help="Skip onnxruntime verification after export."
+    )
     return parser.parse_args()
 
 
