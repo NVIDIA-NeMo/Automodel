@@ -316,7 +316,7 @@ class TestQwen3NextStateDictAdapter:
 
         with patch.object(adapter, "_from_hf_w_merged_experts") as mock_merge:
             # The mock should receive the state dict with shared_expert mapped to shared_experts
-            def check_and_return(mapped_state, device_mesh=None):
+            def check_and_return(mapped_state, device_mesh=None, **kwargs):
                 # Verify that shared_expert was mapped to shared_experts
                 assert "model.layers.0.mlp.shared_experts.gate_proj.weight" in mapped_state
                 assert "model.layers.0.mlp.shared_experts.up_proj.weight" in mapped_state
@@ -374,7 +374,7 @@ class TestQwen3NextStateDictAdapter:
 
         with patch.object(adapter, "_from_hf_w_merged_experts") as mock_merge:
             # Just return the input state dict to test mapping only
-            mock_merge.side_effect = lambda x, device_mesh=None: dict(x)
+            mock_merge.side_effect = lambda x, device_mesh=None, **kwargs: dict(x)
 
             out = adapter.from_hf(hf_state)
 
