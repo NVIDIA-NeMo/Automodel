@@ -77,8 +77,8 @@ checkpoint:
   save_consolidated: false
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-  dp_size: none
+  strategy: fsdp2
+  dp_size: null
   tp_size: 1
   cp_size: 1
   pp_size: 1

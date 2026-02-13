@@ -389,7 +389,7 @@ dataset:
 
 # Distributed training
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   dp_size: null
   tp_size: 1
   cp_size: 1

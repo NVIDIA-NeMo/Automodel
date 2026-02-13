@@ -606,8 +606,8 @@ You can easily add pipeline parallelism to any existing training configuration t
 Add pipeline parallelism to an existing config using command-line arguments:
 
 ```bash
-uv run torchrun --nproc_per_node=2 examples/llm/finetune.py \
-    --config examples/llm/llama_3_2_1b_squad.yaml \
+uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py \
+    --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --distributed.strategy fsdp2 \
     --distributed.pp_size 2 \
     --distributed.pipeline.pp_schedule 1f1b \
@@ -634,7 +634,6 @@ distributed:
   pp_size: 4  # Enable 4-way pipeline parallelism
   sequence_parallel: false
   pipeline:
-    _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
     pp_schedule: 1f1b
     pp_microbatch_size: 1
     # pp_batch_size is automatically inferred from dataloader.batch_size
@@ -687,7 +686,6 @@ distributed:
   pp_size: 2          # 2-way pipeline parallelism
   sequence_parallel: false
   pipeline:
-    _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
     pp_schedule: 1f1b
     pp_microbatch_size: 1
     # pp_batch_size is automatically inferred from dataloader.batch_size

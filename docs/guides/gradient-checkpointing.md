@@ -13,19 +13,25 @@ Example (snippet):
 # examples/llm_finetune/llama_3_2_1b_my_finetune.yaml
 ...
 
-# FSDP-2
+# FSDP2 (use strategy name; optional parallelism sizes)
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   activation_checkpointing: true
+  # dp_size: null
+  # tp_size: 1
+  # cp_size: 1
   ...
 ```
 
 ### Configure Programmatically
 ```python
+from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 
-fsdp2_manager = FSDP2Manager(activation_checkpointing=True)
-model = fsdp2_manager.parallelize(model)
+config = FSDP2Config(activation_checkpointing=True)
+# device_mesh is created elsewhere (e.g. by the recipe via setup_distributed)
+manager = FSDP2Manager(config, device_mesh=device_mesh, moe_mesh=moe_mesh)
+model = manager.parallelize(model)
 ```
 
 ## Combine with Linear-Cut Cross-Entropy (LC-CE)
