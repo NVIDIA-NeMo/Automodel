@@ -11,8 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import importlib
+import sys
 import os
 import sys
+import types
 from pathlib import Path
 from shutil import rmtree
 
@@ -23,6 +26,28 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+# ---------------------------------------------------------------------------
+# Shim: ``transformers.initialization`` was added in transformers >=4.48.
+# Older versions keep ``no_init_weights`` in ``transformers.modeling_utils``.
+# Provide a thin compatibility module so that
+# ``from transformers.initialization import no_init_weights`` works regardless
+# of the installed version.
+# ---------------------------------------------------------------------------
+if "transformers.initialization" not in sys.modules:
+    try:
+        importlib.import_module("transformers.initialization")
+    except ModuleNotFoundError:
+        from transformers.modeling_utils import no_init_weights
+
+        _compat = types.ModuleType("transformers.initialization")
+        _compat.no_init_weights = no_init_weights
+        sys.modules["transformers.initialization"] = _compat
+
+# Ensure tests import the in-repo sources (not an installed site-packages copy).
+# This is important when `nemo_automodel` is also installed in the environment.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 
 def pytest_addoption(parser):

@@ -275,7 +275,7 @@ class Checkpointer:
         """
         optimizer_path = os.path.join(weights_path, "optim")
         _ensure_dirs(optimizer_path)
-        optimizer_state = OptimizerState(model, optimizer, scheduler)
+        optimizer_state = OptimizerState(model, optimizer, scheduler, is_peft=self.config.is_peft)
         state_dict = optimizer_state.state_dict()
         self._optim_ctx.future = self._do_save(state_dict, optimizer_path)
 
@@ -291,7 +291,7 @@ class Checkpointer:
             weights_path: Base directory for checkpoints.
             scheduler: Optional LR scheduler to populate.
         """
-        optimizer_state = OptimizerState(model, optimizer, scheduler)
+        optimizer_state = OptimizerState(model, optimizer, scheduler, is_peft=self.config.is_peft)
         state_dict = optimizer_state.state_dict()
         self._do_load(state_dict, os.path.join(weights_path, "optim"))
         optimizer_state.load_state_dict(state_dict)
@@ -344,7 +344,12 @@ class Checkpointer:
 
         # Standard loading path
         state_dict = model_state.state_dict()
-        storage_reader = self._get_storage_reader(model_path, key_mapping, is_init_step=is_init_step)
+        # When the model has a state_dict_adapter, it handles all key transformations
+        # (to_hf/from_hf). Passing key_mapping to the storage reader would double-transform
+        # keys: the storage reader renames checkpoint keys in metadata, and then to_hf also
+        # renames model keys, producing a mismatch in the DCP planner.
+        reader_key_mapping = None if has_state_dict_adapter else key_mapping
+        storage_reader = self._get_storage_reader(model_path, reader_key_mapping, is_init_step=is_init_step)
 
         state_dict = _maybe_adapt_state_dict_to_hf(
             model_state.model[0],
@@ -426,6 +431,8 @@ class Checkpointer:
                 is_init_step=True,
                 key_mapping=key_mapping,
             )
+
+        _reinit_rope_buffers(model, device)
 
         is_tied_lm_head = is_tied_word_embeddings(model)
         self.config.original_model_root_dir = root_dir
@@ -835,6 +842,29 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
                 module.init_lora_weights(peft_init_method)
             except Exception as e:
                 logging.warning(f"Failed to initialize weights for PEFT adapter `{module.__class__.__name__}`: {e}")
+
+
+def _reinit_rope_buffers(model: nn.Module, device: torch.device) -> None:
+    """
+    Recompute non-persistent RoPE ``inv_freq`` buffers for Nemotron-NAS models.
+    Args:
+        model: Model to reinitialize RoPE buffers for.
+        device: Device to create the new buffers on.
+    """
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    if model_type not in ("nemotron-nas",):
+        return
+
+    for name, module in model.named_modules():
+        if hasattr(module, "rope_init_fn") and hasattr(module, "inv_freq") and hasattr(module, "rope_kwargs"):
+            try:
+                inv_freq, _ = module.rope_init_fn(module.config, device, **module.rope_kwargs)
+                module.inv_freq = inv_freq
+                if hasattr(module, "original_inv_freq"):
+                    module.original_inv_freq = inv_freq.clone()
+                logging.debug(f"Reinitialized RoPE inv_freq for {name} on device {device}")
+            except Exception as e:
+                logging.warning(f"Failed to reinitialize RoPE inv_freq for {name}: {e}")
 
 
 def _apply(module, fn, recurse=True) -> nn.Module:

@@ -27,6 +27,7 @@ from nemo_automodel.components.distributed.pipelining.functional import (
     split_model_into_stages,
     build_pipeline_schedule,
     pipeline_model,
+    _precompute_stage_shapes,
 )
 
 
@@ -704,3 +705,207 @@ class TestPipelineModel:
         mock_parallelize_fn.assert_called_once()
         call_kwargs = mock_parallelize_fn.call_args[1]
         assert call_kwargs['dp_axis_names'] == ("dp",)
+
+
+class TestPrecomputeStageShapes:
+    """Test _precompute_stage_shapes function."""
+
+    def _make_stage(self, is_first, is_last, has_lm_head, param_dtype=torch.bfloat16):
+        """Create a mock stage that mimics PipelineStage attributes."""
+        stage = Mock()
+        stage.is_first = is_first
+        stage.is_last = is_last
+        stage.inputs_meta = None
+        stage._outputs_meta = None
+
+        # Build a minimal submod with parameters of the right dtype
+        submod = Mock()
+        param = torch.empty(1, dtype=param_dtype)
+        submod.parameters.return_value = iter([param])
+        if has_lm_head:
+            submod.lm_head = Mock()
+        else:
+            submod.lm_head = None
+        stage.submod = submod
+        return stage
+
+    def _make_config(self, hidden_size=64, vocab_size=128):
+        import types
+        return types.SimpleNamespace(hidden_size=hidden_size, vocab_size=vocab_size)
+
+    def test_first_stage_shapes(self):
+        """First stage input should be [mb, seq_len] int64, output [mb, seq_len, hidden]."""
+        stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
+        config = self._make_config(hidden_size=64, vocab_size=128)
+
+        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
+
+        # inputs_meta: input_ids [mb, seq_len] long
+        stage_inputs = stage.inputs_meta
+        assert len(stage_inputs) == 1
+        assert stage_inputs[0].shape == (2, 16)
+        assert stage_inputs[0].dtype == torch.long
+
+        # outputs_meta: hidden_states [mb, seq_len, hidden]
+        out_call = stage._configure_outputs_meta.call_args[0][0]
+        assert len(out_call) == 1
+        assert out_call[0].shape == (2, 16, 64)
+        assert out_call[0].dtype == torch.bfloat16
+
+    def test_middle_stage_shapes(self):
+        """Middle stage input/output should be [mb, seq_len, hidden]."""
+        stage = self._make_stage(is_first=False, is_last=False, has_lm_head=False)
+        config = self._make_config(hidden_size=64, vocab_size=128)
+
+        _precompute_stage_shapes([stage], config, microbatch_size=4, seq_len=32)
+
+        # inputs_meta: hidden_states [mb, seq_len, hidden]
+        assert stage.inputs_meta[0].shape == (4, 32, 64)
+        assert stage.inputs_meta[0].dtype == torch.bfloat16
+
+        # outputs_meta: hidden_states [mb, seq_len, hidden]
+        out_call = stage._configure_outputs_meta.call_args[0][0]
+        assert out_call[0].shape == (4, 32, 64)
+
+    def test_last_stage_with_lm_head(self):
+        """Last stage with lm_head should output [mb, seq_len, vocab_size]."""
+        stage = self._make_stage(is_first=False, is_last=True, has_lm_head=True)
+        config = self._make_config(hidden_size=64, vocab_size=128)
+
+        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
+
+        # inputs_meta: hidden_states
+        assert stage.inputs_meta[0].shape == (2, 16, 64)
+
+        # outputs_meta: logits [mb, seq_len, vocab_size]
+        out_call = stage._configure_outputs_meta.call_args[0][0]
+        assert out_call[0].shape == (2, 16, 128)
+        assert out_call[0].dtype == torch.bfloat16
+
+    def test_last_stage_without_lm_head(self):
+        """Last stage without lm_head should output [mb, seq_len, hidden]."""
+        stage = self._make_stage(is_first=False, is_last=True, has_lm_head=False)
+        config = self._make_config(hidden_size=64, vocab_size=128)
+
+        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
+
+        out_call = stage._configure_outputs_meta.call_args[0][0]
+        assert out_call[0].shape == (2, 16, 64)
+
+    def test_multi_stage_pipeline(self):
+        """Test with 3 stages (first, middle, last with lm_head)."""
+        stages = [
+            self._make_stage(is_first=True, is_last=False, has_lm_head=False),
+            self._make_stage(is_first=False, is_last=False, has_lm_head=False),
+            self._make_stage(is_first=False, is_last=True, has_lm_head=True),
+        ]
+        config = self._make_config(hidden_size=128, vocab_size=256)
+
+        _precompute_stage_shapes(stages, config, microbatch_size=1, seq_len=64)
+
+        # Stage 0: input_ids → hidden_states
+        assert stages[0].inputs_meta[0].shape == (1, 64)
+        assert stages[0].inputs_meta[0].dtype == torch.long
+
+        # Stage 1: hidden_states → hidden_states
+        assert stages[1].inputs_meta[0].shape == (1, 64, 128)
+        assert stages[1].inputs_meta[0].dtype == torch.bfloat16
+
+        # Stage 2: hidden_states → logits
+        assert stages[2].inputs_meta[0].shape == (1, 64, 128)
+        out_call = stages[2]._configure_outputs_meta.call_args[0][0]
+        assert out_call[0].shape == (1, 64, 256)
+
+    def test_dtype_inference_from_params(self):
+        """Test that model dtype is inferred from stage parameters."""
+        stage = self._make_stage(is_first=False, is_last=False, has_lm_head=False, param_dtype=torch.float16)
+        config = self._make_config(hidden_size=64, vocab_size=128)
+
+        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
+
+        assert stage.inputs_meta[0].dtype == torch.float16
+
+    def test_all_meta_device(self):
+        """All precomputed tensors should be on meta device."""
+        stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
+        config = self._make_config()
+
+        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
+
+        assert stage.inputs_meta[0].device.type == "meta"
+        out_call = stage._configure_outputs_meta.call_args[0][0]
+        assert out_call[0].device.type == "meta"
+
+    @patch('nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages')
+    @patch('nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule')
+    def test_pipeline_model_with_seq_len(self, mock_build_schedule, mock_split_stages):
+        """Test that pipeline_model calls _precompute_stage_shapes when seq_len is provided."""
+        mock_world_mesh = MagicMock()
+        mock_pp_mesh = Mock()
+        mock_pp_mesh.size.return_value = 2
+        mock_world_mesh.__getitem__.return_value = mock_pp_mesh
+
+        mock_model = Mock()
+        mock_model.config = self._make_config(hidden_size=64, vocab_size=128)
+
+        mock_stage1 = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
+        mock_stage2 = self._make_stage(is_first=False, is_last=True, has_lm_head=True)
+        mock_split_stages.return_value = ([mock_stage1, mock_stage2], [Mock(), Mock()])
+        mock_build_schedule.return_value = Mock()
+
+        pipeline_model(
+            model=mock_model,
+            world_mesh=mock_world_mesh,
+            moe_mesh=Mock(),
+            pp_axis_name="pp",
+            dp_axis_names=("dp",),
+            layers_per_stage=4,
+            pipeline_parallel_schedule_csv=None,
+            pipeline_parallel_schedule="PipelineScheduleSingle",
+            microbatch_size=2,
+            local_batch_size=8,
+            device=torch.device("cuda:0"),
+            seq_len=16,
+        )
+
+        # Verify shapes were precomputed
+        assert mock_stage1.inputs_meta is not None
+        assert mock_stage1.inputs_meta[0].shape == (2, 16)  # input_ids for first stage
+        assert mock_stage2.inputs_meta is not None
+        assert mock_stage2.inputs_meta[0].shape == (2, 16, 64)  # hidden_states
+
+    @patch('nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages')
+    @patch('nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule')
+    def test_pipeline_model_without_seq_len(self, mock_build_schedule, mock_split_stages):
+        """Test that pipeline_model skips precomputation when seq_len is None."""
+        mock_world_mesh = MagicMock()
+        mock_pp_mesh = Mock()
+        mock_pp_mesh.size.return_value = 2
+        mock_world_mesh.__getitem__.return_value = mock_pp_mesh
+
+        mock_stage = Mock()
+        mock_stage.is_first = True
+        mock_stage.is_last = True
+        mock_stage.inputs_meta = None
+        mock_stage.submod = Mock()
+
+        mock_split_stages.return_value = ([mock_stage], [Mock()])
+        mock_build_schedule.return_value = Mock()
+
+        pipeline_model(
+            model=Mock(),
+            world_mesh=mock_world_mesh,
+            moe_mesh=Mock(),
+            pp_axis_name="pp",
+            dp_axis_names=("dp",),
+            layers_per_stage=4,
+            pipeline_parallel_schedule_csv=None,
+            pipeline_parallel_schedule="PipelineScheduleSingle",
+            microbatch_size=2,
+            local_batch_size=8,
+            device=torch.device("cuda:0"),
+            # seq_len not provided — should skip precomputation
+        )
+
+        # inputs_meta should remain None (serial shape inference at runtime)
+        assert mock_stage.inputs_meta is None

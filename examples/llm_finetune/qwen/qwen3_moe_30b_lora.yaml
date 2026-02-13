@@ -25,7 +25,7 @@ rng:
   ranked: true
 
 model:
-  _target_: nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM.from_pretrained
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
   trust_remote_code: true
   torch_dtype: bfloat16
@@ -34,7 +34,8 @@ model:
     attn: te
     linear: torch
     rms_norm: te
-    enable_deepep: true
+    experts: te
+    dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -51,16 +52,11 @@ checkpoint:
   checkpoint_dir: checkpoints/qwen3_moe_lora
   model_save_format: safetensors
 
-parallelizer:
-  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
-  activation_checkpointing: true
-
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  dp_replicate_size: 1
   ep_size: 8
 
 loss_fn:

@@ -31,7 +31,6 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, Che
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
-from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricLoggerDist, MetricsSample
@@ -41,6 +40,7 @@ from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
+from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -323,13 +323,15 @@ class TrainBiencoderRecipe(BaseRecipe):
         # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
-        self.device_mesh = None
-        self.moe_mesh = None
-        self.model_wrapper = None
-        if "distributed" in self.cfg:
-            self.model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
-            self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
-            self.moe_mesh = getattr(self.model_wrapper, "moe_mesh", None)
+        self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+        self.distributed_config = self.dist_setup.strategy_config
+        self.device_mesh = self.dist_setup.device_mesh
+        self.moe_mesh = self.dist_setup.moe_mesh
+        self.pp_enabled = self.dist_setup.pp_enabled
+        self.pipeline_config = self.dist_setup.pipeline_config
+
+        if self.pp_enabled:
+            raise NotImplementedError("Biencoder does not support pipeline parallelism")
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -339,55 +341,6 @@ class TrainBiencoderRecipe(BaseRecipe):
         # Log experiment details on main rank
         self._log_experiment_details()
         self._log_library_versions()
-
-        self.pp_enabled: bool = (
-            True if hasattr(self.model_wrapper, "pp_size") and self.model_wrapper.pp_size > 1 else False
-        )
-        autopipeline_cfg = self.cfg.get("autopipeline", None)
-        if self.pp_enabled:
-            pp_batch_size = self.cfg.step_scheduler.local_batch_size
-            pp_microbatch_size = self.cfg.autopipeline.pp_microbatch_size
-            assert pp_batch_size // self.cfg.autopipeline.pp_microbatch_size >= self.model_wrapper.pp_size, (
-                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {self.cfg.autopipeline.pp_microbatch_size} must be greater than or equal to pp_size {self.model_wrapper.pp_size}"
-            )
-
-            assert autopipeline_cfg is not None, (
-                "AutoPipeline configuration is required when pipeline parallelism is enabled"
-            )
-            assert not isinstance(self.model_wrapper, MegatronFSDPManager), (
-                "MegatronFSDPManager is not supported when pipeline parallelism is enabled"
-            )
-            # Create AutoPipeline from config
-            autopipeline = autopipeline_cfg.instantiate(
-                world_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                pp_axis_name="pp",
-                dp_axis_names=(
-                    ("dp_replicate", "dp_shard_cp")
-                    if "dp_replicate" in self.device_mesh.mesh_dim_names
-                    and "dp_shard_cp" in self.device_mesh.mesh_dim_names
-                    else ("dp_shard_cp",)
-                ),
-                cp_axis_name="cp" if "cp" in self.device_mesh.mesh_dim_names else None,
-                tp_axis_name="tp" if "tp" in self.device_mesh.mesh_dim_names else None,
-                ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
-                ep_shard_axis_names=(
-                    ("ep_shard",) if self.moe_mesh is not None and "ep_shard" in self.moe_mesh.mesh_dim_names else None
-                ),
-                pp_batch_size=pp_batch_size,
-                pp_microbatch_size=pp_microbatch_size,
-                patch_stage_backward_maybe_with_nosync=self.cfg.get("model.backend.enable_fsdp_optimizations", False),
-                device=torch.cuda.current_device(),
-            )
-            assert isinstance(autopipeline, AutoPipeline), (
-                f"autopipeline {autopipeline.__class__} is not an instance of AutoPipeline"
-            )
-            logger.warning(
-                "Pipeline parallelism is enabled for biencoder training. "
-                "Note that biencoder models typically do not benefit from PP and this is experimental."
-            )
-        else:
-            autopipeline = None
 
         # Build components
         self.peft_config = None
@@ -413,51 +366,71 @@ class TrainBiencoderRecipe(BaseRecipe):
 
         # Build biencoder model
         logger.info("Building biencoder model...")
-        if self.pp_enabled:
-            raise NotImplementedError(
-                "Pipeline parallelism is not yet supported for biencoder models. "
-                "Please disable pipeline parallelism in the distributed config."
-            )
 
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
             model = self.cfg.model.instantiate()
 
             # Apply PEFT (LoRA) if configured
             if self.peft_config is not None:
-                tp_size = self.cfg.get("distributed.tp_size", 1)
-                if tp_size > 1:
-                    logger.info("Disabling Triton with TP ({})".format(tp_size))
-                    self.peft_config.use_triton = False
-                if autopipeline is not None:
-                    logger.info("Enabling PEFT with Pipeline Parallelism")
-                    logger.info("Disabling Triton with Pipeline Parallelism Enabled.")
+                if self.dist_setup.tp_size > 1:
+                    logger.info("Disabling Triton with TP ({})".format(self.dist_setup.tp_size))
                     self.peft_config.use_triton = False
 
                 logger.info("Applying LoRA to biencoder model")
                 apply_lora_to_linear_modules(model, self.peft_config, quantization_config=None)
 
-        # Apply parallelism wrapper if needed
-        if self.model_wrapper is not None:
-            model = self.model_wrapper.parallelize(model)
+        # Apply parallelism wrapper if needed (FSDP/DDP)
+        if self.distributed_config is not None:
+            from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
+            from nemo_automodel.components.distributed.ddp import DDPManager
+            from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+
+            if isinstance(self.distributed_config, FSDP2Config):
+                manager = FSDP2Manager(self.distributed_config, device_mesh=self.device_mesh, moe_mesh=self.moe_mesh)
+            elif isinstance(self.distributed_config, MegatronFSDPConfig):
+                manager = MegatronFSDPManager(self.distributed_config, device_mesh=self.device_mesh)
+            elif isinstance(self.distributed_config, DDPConfig):
+                manager = DDPManager(self.distributed_config)
+            else:
+                raise ValueError(f"Unknown distributed config type: {type(self.distributed_config)}")
+
+            result = manager.parallelize(model)
+            model = result[0] if isinstance(result, tuple) else result
 
         # Ensure the model is on the correct device
         model = model.to(self.dist_env.device)
 
         # Setup model_parts for consistency with train_ft.py
-        if isinstance(model, AutoPipeline):
-            self.model_parts = model.parts
-            self.pp = model
-        else:
-            self.model_parts = [model]
-            self.pp = None
+        self.model_parts = [model]
+        self.pp = None
 
         self.checkpointer.config.model_state_dict_keys = ["model." + k for k in model.lm_q.state_dict().keys()]
 
         # Build optimizer
         logger.info("Building optimizer...")
-        trainable_params = list(filter(lambda x: x.requires_grad, self.model_parts[0].parameters()))
+        # Mimic common LLM training practice: apply weight decay only to non-bias/non-norm params.
+        decay_params = []
+        no_decay_params = []
+        for name, param in self.model_parts[0].named_parameters():
+            if not param.requires_grad:
+                continue
+            name_l = name.lower()
+            if name.endswith(".bias") or ("norm" in name_l):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        trainable_params = decay_params + no_decay_params
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
-        self.optimizer = [self.cfg.optimizer.instantiate(params=trainable_params)]
+
+        param_groups = []
+        if decay_params:
+            param_groups.append({"params": decay_params})
+        if no_decay_params:
+            param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+
+        logger.info("Optimizer param groups: decay=%d, no_decay=%d", len(decay_params), len(no_decay_params))
+        self.optimizer = [self.cfg.optimizer.instantiate(params=param_groups)]
 
         # Print trainable parameters after model has been moved to device
         trainable_params, total_params = print_trainable_parameters(self.model_parts[0])
@@ -579,7 +552,6 @@ class TrainBiencoderRecipe(BaseRecipe):
             k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
             for k, v in batch.items()
         }
-
         # Unpack query and passage inputs using the same logic as biencoder_trainer.py
         query, passage = _unpack_qp(batch)
 

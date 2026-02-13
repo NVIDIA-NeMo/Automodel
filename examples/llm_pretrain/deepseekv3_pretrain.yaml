@@ -40,11 +40,6 @@ rng:
   seed: 1111
   ranked: true
 
-parallelize_fn:
-  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
-  activation_checkpointing: false
-
-# Option 1 - shorthand builder w/ automatic optimized path
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
@@ -62,7 +57,8 @@ model:
 #     attn: te
 #     linear: te
 #     rms_norm: te
-#     enable_deepep: true
+#     experts: te
+#     dispatcher: deepep
 #     fake_balanced_gate: false
 #     enable_hf_state_dict_adapter: true
 #   moe_config:
@@ -77,14 +73,32 @@ checkpoint:
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   tp_size: 1
   cp_size: 1
   pp_size: 8
-  dp_replicate_size: 1
   dp_size: 16
   ep_size: 16
 
+  pipeline:
+    pp_microbatch_size: 1
+    pp_schedule: interleaved1f1b
+    scale_grads_in_schedule: False
+    round_virtual_stages_to_pp_multiple: down
+    patch_inner_model: False
+    patch_causal_lm_model: False
+    layers_per_stage: 2
+
+# Uncomment and configure for W&B logging
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_exp_name>
+#   save_dir: <your_wandb_save_dir>
+
+  moe:
+
+# Option 1 - shorthand builder w/ automatic optimized path
 loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
@@ -135,19 +149,3 @@ lr_scheduler:
   lr_warmup_steps: 500
   min_lr: 0.0
 
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.autopipeline.AutoPipeline
-  pp_microbatch_size: 1
-  pp_schedule: interleaved1f1b
-  scale_grads_in_schedule: False
-  round_virtual_stages_to_pp_multiple: down
-  patch_inner_model: False
-  patch_causal_lm_model: False
-  layers_per_stage: 2
-
-# Uncomment and configure for W&B logging
-# wandb:
-#   project: <your_wandb_project>
-#   entity: <your_wandb_entity>
-#   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir>

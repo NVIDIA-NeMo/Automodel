@@ -311,7 +311,7 @@ def test_biencoder_build_and_save(tmp_path, monkeypatch):
     # save with share_encoder=True and add_linear_pooler=True
     outdir = tmp_path / "save1"
     outdir.mkdir(parents=True, exist_ok=True)
-    model.save(str(outdir))
+    model.save_pretrained(str(outdir))
     assert any("save1" in p for p in model.lm_q.saved)
     assert os.path.exists(outdir / "pooler.pt")
 
@@ -324,7 +324,7 @@ def test_biencoder_build_and_save(tmp_path, monkeypatch):
         do_gradient_checkpointing=False,
     )
     outdir2 = tmp_path / "save2"
-    model2.save(str(outdir2))
+    model2.save_pretrained(str(outdir2))
     # separate subdirs created
     assert os.path.isdir(outdir2 / "query_model")
     assert os.path.isdir(outdir2 / "passage_model")
@@ -380,6 +380,36 @@ def test_sequence_classification_regression_multi_output(monkeypatch):
     out = inst(input_ids=input_ids, attention_mask=attn, labels=torch.zeros(bsz, 2))
     assert isinstance(out, SequenceClassifierOutputWithPast)
     assert out.loss is not None
+
+
+def test_biencoder_build_llama_bidirec_model_type_generic_path(tmp_path, monkeypatch):
+    """Regression test: model_type 'llama_bidirec' at a generic path without 'llama' in it.
+
+    When the customizer API downloads the model, the path is something like
+    /var/run/scratch/job/model which does not contain 'llama'. The build()
+    method must still recognise the model via config.json's model_type field.
+    """
+
+    class FakeBidirectionalModel(FakeLM):
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls(hidden=16)
+
+    monkeypatch.setattr(lbm, "LlamaBidirectionalModel", FakeBidirectionalModel)
+
+    # Create a model directory whose path has no 'llama' substring
+    model_dir = tmp_path / "scratch" / "job" / "model"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text(json.dumps({"model_type": "llama_bidirec"}))
+
+    model = lbm.BiencoderModel.build(
+        model_name_or_path=str(model_dir),
+        share_encoder=True,
+        pooling="avg",
+        l2_normalize=True,
+        t=0.5,
+    )
+    assert isinstance(model, lbm.BiencoderModel)
 
 
 def test_biencoder_build_hub_and_errors(tmp_path, monkeypatch):

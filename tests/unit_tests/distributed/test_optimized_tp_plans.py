@@ -369,8 +369,6 @@ class TestParallelizeFunctions:
         sequence_patterns = [
             "model.norm",
             "model.layers.*.input_layernorm",
-            "model.layers.*.self_attn.q_norm",
-            "model.layers.*.self_attn.k_norm",
             "model.layers.*.post_attention_layernorm",
         ]
 
@@ -387,9 +385,10 @@ class TestParallelizeFunctions:
 
         result = _parallelize_qwen(model, sequence_parallel=True)
 
-        # Should include Qwen3-specific patterns like q_norm and k_norm
-        assert "model.layers.*.self_attn.q_norm" in result
-        assert "model.layers.*.self_attn.k_norm" in result
+        # Qwen3 has q_norm/k_norm inside attention, but those should remain unwrapped.
+        # Wrapping them with SequenceParallel can incorrectly tag head-sharded activations as sequence-sharded.
+        assert "model.layers.*.self_attn.q_norm" not in result
+        assert "model.layers.*.self_attn.k_norm" not in result
 
 
 class TestParallelizeFunctionsMapping:

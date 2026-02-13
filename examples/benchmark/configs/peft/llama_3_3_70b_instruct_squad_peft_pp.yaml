@@ -32,15 +32,6 @@ model:
   torch_dtype: bf16
   trust_remote_code: true
 
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
-  pp_schedule: interleaved1f1b
-  pp_microbatch_size: 1
-  layers_per_stage: 4
-  scale_grads_in_schedule: false
-  round_virtual_stages_to_pp_multiple: up
-  dtype: bf16
-
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   match_all_linear: True
@@ -55,14 +46,22 @@ checkpoint:
   save_consolidated: false
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   dp_size: none
   tp_size: 4
   cp_size: 1
   pp_size: 2
+
   sequence_parallel: false
   activation_checkpointing: true
 
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 4
+    scale_grads_in_schedule: false
+    round_virtual_stages_to_pp_multiple: up
+    dtype: bf16
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

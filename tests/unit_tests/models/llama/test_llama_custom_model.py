@@ -13,60 +13,118 @@
 # limitations under the License.
 
 
-import os
-import tempfile
-
 import numpy as np
 import pytest
 import torch
-from transformers import AutoModelForCausalLM, LlamaConfig
+from transformers import AutoModelForCausalLM, LlamaConfig, set_seed
 
 from nemo_automodel import NeMoAutoModelForCausalLM
-from nemo_automodel.components.models.llama.model import LlamaForCausalLM
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
+
+set_seed(42)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
+# Tiny config with rope_type="default" (no rope_scaling)
+TINY_DEFAULT_ROPE_CONFIG = dict(
+    vocab_size=1024,
+    hidden_size=256,
+    intermediate_size=512,
+    num_hidden_layers=2,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    max_position_embeddings=128,
+    rms_norm_eps=1e-5,
+    tie_word_embeddings=True,
+)
 
-@pytest.fixture(scope="class")
-def tiny_llama_checkpoint():
-    """Create a tiny Llama model with random weights in a temporary directory."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Create a small config for fast testing
-        config = LlamaConfig(
-            vocab_size=1024,
-            hidden_size=256,
-            intermediate_size=512,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,  # GQA
-            max_position_embeddings=128,
-            rms_norm_eps=1e-6,
-            tie_word_embeddings=True,
-        )
+# Tiny config with rope_type="llama3" (Llama-3-style RoPE scaling)
+TINY_LLAMA3_ROPE_CONFIG = dict(
+    vocab_size=1024,
+    hidden_size=256,
+    intermediate_size=512,
+    num_hidden_layers=2,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    max_position_embeddings=256,
+    rms_norm_eps=1e-5,
+    tie_word_embeddings=True,
+    rope_theta=500000.0,
+    rope_scaling=dict(
+        rope_type="llama3",
+        factor=8.0,
+        low_freq_factor=1.0,
+        high_freq_factor=4.0,
+        original_max_position_embeddings=128,
+    ),
+)
 
-        # Save config
-        config.save_pretrained(tmpdir)
+ROPE_CONFIGS = {
+    "default": TINY_DEFAULT_ROPE_CONFIG,
+    "llama3": TINY_LLAMA3_ROPE_CONFIG,
+}
 
-        # Create model with random weights
-        model = AutoModelForCausalLM.from_config(config)
 
-        # Save model
-        model.save_pretrained(tmpdir)
+def _create_checkpoint(config_kwargs, tmpdir):
+    """Create a tiny HF Llama checkpoint in the given directory.
 
-        yield tmpdir
+    Args:
+        config_kwargs: Dict of LlamaConfig keyword arguments.
+        tmpdir: Directory (str or Path) to save the checkpoint into.
+
+    Returns:
+        str path to the checkpoint directory.
+    """
+    tmpdir = str(tmpdir)
+    config = LlamaConfig(**config_kwargs)
+    config.save_pretrained(tmpdir)
+    model = AutoModelForCausalLM.from_config(config)
+    for param in model.parameters():
+        # Reinitialize trivially constant parameters (e.g., norm weight=all 1s, bias=all 0s)
+        if param.data.unique().numel() == 1:
+            param.data.normal_(mean=0, std=0.1)
+    model.save_pretrained(tmpdir)
+    return tmpdir
 
 
 class TestLlamaModel:
-    def test_model_matches_hf_with_adapter_bidirectional(self, tiny_llama_checkpoint):
-        """Test bidirectional conversion between HF and custom models produces identical outputs."""
-        config = LlamaConfig.from_pretrained(tiny_llama_checkpoint)
+    @pytest.fixture(scope="class", autouse=True)
+    def _tiny_checkpoint(self, tmp_path_factory):
+        """Create a tiny HF Llama checkpoint shared across tests (auto-cleaned by pytest)."""
+        self.__class__.tiny_llama_checkpoint = _create_checkpoint(
+            TINY_DEFAULT_ROPE_CONFIG, tmp_path_factory.mktemp("llama_ckpt")
+        )
+
+    @pytest.mark.parametrize("rope_type", ["default", "llama3"])
+    @pytest.mark.parametrize("rms_norm", ["torch_fp32", "te"])
+    def test_model_matches_hf_with_adapter_bidirectional(self, rope_type, rms_norm, tmp_path):
+        """Test bidirectional conversion between HF and custom models produces identical outputs.
+
+        Parametrized over:
+          - rope_type: "default" (no scaling) or "llama3" (Llama-3-style smooth scaling)
+          - rms_norm: "torch_fp32" | "te"
+
+        torch_fp32: float32-upcast RMSNorm matching HF LlamaRMSNorm exactly -> tight tol.
+        te: Transformer Engine fused RMSNorm kernel -> relaxed tol.
+        """
+        # Set tolerances based on norm backend precision
+        # te: Transformer Engine fused kernel -> relaxed tolerance
+        # torch_fp32: matches HF exactly -> tight tolerance
+        tolerances = {
+            "te": dict(atol=1e-3, rtol=1e-3),
+            "torch_fp32": dict(atol=1e-7, rtol=1e-7),
+        }
+        tol = tolerances[rms_norm]
+
+        checkpoint = _create_checkpoint(ROPE_CONFIGS[rope_type], tmp_path)
+        config = LlamaConfig.from_pretrained(checkpoint)
         adapter = LlamaStateDictAdapter(config)
 
         # Load HF model
         llama_model_hf = (
             AutoModelForCausalLM.from_pretrained(
-                pretrained_model_name_or_path=tiny_llama_checkpoint,
+                pretrained_model_name_or_path=checkpoint,
                 attn_implementation="eager",
                 torch_dtype=torch.bfloat16,
             )
@@ -75,11 +133,13 @@ class TestLlamaModel:
         )  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
         llama_model_hf.eval()
 
-        # Build custom model
+        # Build custom model with specified norm backend
+        backend = BackendConfig(rms_norm=rms_norm)
         llama_model_custom = NeMoAutoModelForCausalLM.from_pretrained(
-            pretrained_model_name_or_path=tiny_llama_checkpoint,
+            pretrained_model_name_or_path=checkpoint,
             attn_implementation="eager",
             torch_dtype=torch.bfloat16,
+            backend=backend,
         ).to("cuda")
         llama_model_custom.eval()
 
@@ -94,7 +154,8 @@ class TestLlamaModel:
         hf_state_dict = llama_model_hf.state_dict()
         custom_state_dict_from_hf = adapter.from_hf(hf_state_dict)
         # Use nn.Module.load_state_dict directly to bypass mixin (testing adapter, not mixin)
-        torch.nn.Module.load_state_dict(llama_model_custom, custom_state_dict_from_hf, strict=True)
+        # Note: strict=False because HF checkpoints don't have TE's _extra_state keys
+        torch.nn.Module.load_state_dict(llama_model_custom, custom_state_dict_from_hf, strict=False)
 
         # Use nn.Module.state_dict directly to get native format (testing adapter, not mixin)
         s = adapter.to_hf(torch.nn.Module.state_dict(llama_model_custom))
@@ -121,9 +182,8 @@ class TestLlamaModel:
         np.testing.assert_allclose(
             output_hf.logits.float().cpu().numpy(),
             output_custom.logits.float().cpu().numpy(),
-            atol=1e-5,
-            rtol=1e-5,
-            err_msg="HF → Custom conversion outputs don't match",
+            err_msg=f"HF → Custom conversion outputs don't match with {rms_norm=} {rope_type=}",
+            **tol,
         )
 
         # Test reverse direction: Custom → HF
@@ -133,14 +193,13 @@ class TestLlamaModel:
 
         # Create new HF model and load converted state dict
         llama_model_hf_converted = (
-            AutoModelForCausalLM.from_pretrained(
-                tiny_llama_checkpoint, attn_implementation="eager", torch_dtype=torch.bfloat16
-            )
+            AutoModelForCausalLM.from_pretrained(checkpoint, attn_implementation="eager", torch_dtype=torch.bfloat16)
             .to("cuda")
             .to(torch.bfloat16)
         )  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
         llama_model_hf_converted.eval()
-        llama_model_hf_converted.load_state_dict(hf_state_dict_from_custom, strict=True)
+        # Note: strict=False because HF checkpoints don't have TE's _extra_state keys
+        llama_model_hf_converted.load_state_dict(hf_state_dict_from_custom, strict=False)
 
         # Compare Custom → HF outputs
         with torch.no_grad():
@@ -149,19 +208,18 @@ class TestLlamaModel:
         np.testing.assert_allclose(
             output_custom.logits.float().cpu().numpy(),
             output_hf_converted.logits.float().cpu().numpy(),
-            atol=1e-5,
-            rtol=1e-5,
             err_msg="Custom → HF conversion outputs don't match",
+            **tol,
         )
 
-    def test_state_dict_adapter_from_hf_combined_projections(self, tiny_llama_checkpoint):
+    def test_state_dict_adapter_from_hf_combined_projections(self):
         """Test converting HF state dict to custom format with combined QKV and gate_up projections."""
-        config = LlamaConfig.from_pretrained(tiny_llama_checkpoint)
+        config = LlamaConfig.from_pretrained(self.tiny_llama_checkpoint)
         adapter = LlamaStateDictAdapter(config)
 
         # Load HF model and get state dict
         llama_model_hf = AutoModelForCausalLM.from_pretrained(
-            tiny_llama_checkpoint, attn_implementation="eager", torch_dtype=torch.bfloat16
+            self.tiny_llama_checkpoint, attn_implementation="eager", torch_dtype=torch.bfloat16
         ).to(torch.bfloat16)  # need to manual cast to bfloat16 since HF initialize weights/buffers in float32 dtype
         hf_state_dict = llama_model_hf.state_dict()
 
@@ -179,11 +237,11 @@ class TestLlamaModel:
         assert "model.layers.0.self_attn.qkv_proj.weight" in custom_state_dict
         assert "model.layers.0.mlp.gate_up_proj.weight" in custom_state_dict
 
-    def test_state_dict_adapter_to_hf(self, tiny_llama_checkpoint):
+    def test_state_dict_adapter_to_hf(self):
         """Test converting custom model state dict back to HF format."""
         # Build custom model (which uses adapter internally to load from HF checkpoint)
         llama_model_custom = NeMoAutoModelForCausalLM.from_pretrained(
-            pretrained_model_name_or_path=tiny_llama_checkpoint,
+            pretrained_model_name_or_path=self.tiny_llama_checkpoint,
             attn_implementation="eager",
             torch_dtype=torch.bfloat16,
         )

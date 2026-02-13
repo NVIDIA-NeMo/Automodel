@@ -26,8 +26,8 @@ from nemo_automodel.components.models.common import (
 )
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
+from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -99,25 +99,32 @@ class NemotronV3Model(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
+        input_ids: torch.LongTensor | None = None,
         *,
         attention_mask: torch.Tensor | None = None,
         causal_mask_mapping: dict[str, torch.Tensor] | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Forward pass through the model.
 
         Args:
-            input_ids: Input token IDs [batch_size, seq_len]
+            input_ids: Input token IDs [batch_size, seq_len] (optional)
             attention_mask: 2D padding mask [batch_size, seq_len] (1=real, 0=padding)
             causal_mask_mapping: Dict with precomputed 4D causal masks for attention layers
+            inputs_embeds: Input embeddings [batch_size, seq_len, hidden_size] (optional)
             **kwargs: Additional arguments (ignored)
 
         Returns:
             Hidden states tensor [batch_size, seq_len, hidden_size]
         """
         # Get embeddings
-        hidden_states = self.embed_tokens(input_ids)
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("input_ids must be provided if inputs_embeds is not provided")
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = inputs_embeds
 
         # TODO: attention mask currently does not work. A default causal mask is applied.
 
@@ -244,7 +251,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
+        input_ids: torch.LongTensor | None = None,
         *,
         attention_mask: torch.Tensor | None = None,
         causal_mask_mapping: dict[str, torch.Tensor] | None = None,
@@ -253,7 +260,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """Forward pass with optional loss computation.
 
         Args:
-            input_ids: Input token IDs [batch_size, seq_len]
+            input_ids: Input token IDs [batch_size, seq_len] (optional)
             attention_mask: 2D padding mask [batch_size, seq_len]
             causal_mask_mapping: Dict with precomputed 4D causal masks
             **kwargs: Additional arguments

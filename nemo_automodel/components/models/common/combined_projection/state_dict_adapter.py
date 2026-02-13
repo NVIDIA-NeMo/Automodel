@@ -169,6 +169,10 @@ class CombinedProjectionStateDictAdapter:
                     state_dict.pop(up_bias_key, None)
                     del gate_bias, up_bias
 
+        # Recombine any split projection LoRA/DoRA keys back to combined format.
+        # This is the reverse of _split_remaining_combined_projection_keys in to_hf().
+        self._recombine_split_projection_keys(custom_state_dict)
+
         # Handle tied weights: if lm_head.weight is missing but embed_tokens exists, tie them
         # This is common in Qwen2 and Llama where lm_head shares weights with embeddings
         # Only do this if config specifies tie_word_embeddings=True
@@ -306,6 +310,12 @@ class CombinedProjectionStateDictAdapter:
                 if key not in processed_keys:
                     hf_state_dict[key] = value
 
+        # Split any remaining combined-projection keys (e.g., LoRA adapter weights).
+        # These may have different prefixes (like "base_model.model.") not caught
+        # by the layer-indexed loop above, or may be adapter-specific keys (lora_A,
+        # lora_B, lora_magnitude) that the layer loop doesn't handle.
+        self._split_remaining_combined_projection_keys(hf_state_dict)
+
         # Apply exclusion regex if provided
         if exclude_key_regex:
             if inplace:
@@ -316,3 +326,142 @@ class CombinedProjectionStateDictAdapter:
                 hf_state_dict = {k: v for k, v in hf_state_dict.items() if not re.match(exclude_key_regex, k)}
 
         return hf_state_dict
+
+    def _split_remaining_combined_projection_keys(self, hf_state_dict: dict[str, Any]) -> None:
+        """Split any remaining combined-projection keys in-place.
+
+        Handles LoRA adapter weights (lora_A, lora_B), DoRA magnitude vectors,
+        and any base weight/bias keys that weren't caught by the layer-indexed loop
+        (e.g., keys with a ``base_model.model.`` prefix from PEFT saving).
+
+        For keys containing ``.self_attn.qkv_proj.``:
+          - ``lora_A`` weights (input dimension) are duplicated to q/k/v projections.
+          - All other weights (lora_B, magnitude, weight, bias) are split along dim 0
+            using the Q/KV size ratio.
+
+        For keys containing ``.mlp.gate_up_proj.``:
+          - ``lora_A`` weights are duplicated to gate/up projections.
+          - All other weights are split in half along dim 0.
+
+        Args:
+            hf_state_dict: State dict to modify in-place.
+        """
+        combined_qkv_keys = [k for k in hf_state_dict if ".self_attn.qkv_proj." in k]
+        for key in combined_qkv_keys:
+            value = hf_state_dict.pop(key)
+            pre, suffix = key.split(".self_attn.qkv_proj.", 1)
+
+            if "lora_A" in suffix:
+                # Input-dimension LoRA weight: identical for all projections
+                hf_state_dict[f"{pre}.self_attn.q_proj.{suffix}"] = value
+                hf_state_dict[f"{pre}.self_attn.k_proj.{suffix}"] = value.clone()
+                hf_state_dict[f"{pre}.self_attn.v_proj.{suffix}"] = value.clone()
+            else:
+                # Output-dimension weight (lora_B, magnitude, base weight/bias): split
+                actual_size = value.shape[0]
+                total_size = self.q_size + 2 * self.kv_size
+                local_q_size = (self.q_size * actual_size) // total_size
+                local_kv_size = (self.kv_size * actual_size) // total_size
+
+                q_val, k_val, v_val = value.split([local_q_size, local_kv_size, local_kv_size], dim=0)
+                hf_state_dict[f"{pre}.self_attn.q_proj.{suffix}"] = q_val
+                hf_state_dict[f"{pre}.self_attn.k_proj.{suffix}"] = k_val
+                hf_state_dict[f"{pre}.self_attn.v_proj.{suffix}"] = v_val
+
+        combined_gate_up_keys = [k for k in hf_state_dict if ".mlp.gate_up_proj." in k]
+        for key in combined_gate_up_keys:
+            value = hf_state_dict.pop(key)
+            pre, suffix = key.split(".mlp.gate_up_proj.", 1)
+
+            if "lora_A" in suffix:
+                hf_state_dict[f"{pre}.mlp.gate_proj.{suffix}"] = value
+                hf_state_dict[f"{pre}.mlp.up_proj.{suffix}"] = value.clone()
+            else:
+                actual_size = value.shape[0]
+                local_intermediate_size = actual_size // 2
+
+                gate_val, up_val = value.split([local_intermediate_size, local_intermediate_size], dim=0)
+                hf_state_dict[f"{pre}.mlp.gate_proj.{suffix}"] = gate_val
+                hf_state_dict[f"{pre}.mlp.up_proj.{suffix}"] = up_val
+
+    def _recombine_split_projection_keys(self, state_dict: dict[str, Any]) -> None:
+        """Recombine split projection LoRA/DoRA keys back to combined format.
+
+        This is the reverse of ``_split_remaining_combined_projection_keys``.
+        It handles LoRA adapter weights and DoRA magnitude vectors that were
+        split for HF-PEFT compatibility during ``to_hf()`` and need to be
+        recombined when loading back into a model with combined projections.
+
+        For keys containing ``.self_attn.q_proj.<suffix>``:
+          - ``lora_A`` weights (which were duplicated during split) are
+            deduplicated — we take the ``q_proj`` version.
+          - All other weights (``lora_B``, magnitude, etc.) are concatenated
+            along dim 0 in Q, K, V order.
+
+        For keys containing ``.mlp.gate_proj.<suffix>``:
+          - ``lora_A`` weights are deduplicated — we take the ``gate_proj`` version.
+          - All other weights are concatenated along dim 0 in gate, up order.
+
+        Keys that end with ``.weight`` or ``.bias`` directly on the projection
+        (e.g., ``q_proj.weight``) are skipped because those are already handled
+        by the layer-indexed loop in ``from_hf``.
+
+        Args:
+            state_dict: State dict to modify in-place.
+        """
+        # --- QKV recombination ---
+        # Find q_proj keys that are NOT base weight/bias (already handled by layer loop)
+        q_keys = [
+            k
+            for k in list(state_dict.keys())
+            if ".self_attn.q_proj." in k
+            and not k.endswith(".self_attn.q_proj.weight")
+            and not k.endswith(".self_attn.q_proj.bias")
+        ]
+
+        for q_key in q_keys:
+            k_key = q_key.replace(".self_attn.q_proj.", ".self_attn.k_proj.")
+            v_key = q_key.replace(".self_attn.q_proj.", ".self_attn.v_proj.")
+
+            if k_key not in state_dict or v_key not in state_dict:
+                continue
+
+            combined_key = q_key.replace(".self_attn.q_proj.", ".self_attn.qkv_proj.")
+
+            q_val = state_dict.pop(q_key)
+            k_val = state_dict.pop(k_key)
+            v_val = state_dict.pop(v_key)
+
+            if "lora_A" in q_key:
+                # lora_A weights were duplicated during split — just take one
+                state_dict[combined_key] = q_val
+            else:
+                # lora_B, magnitude, etc. — concatenate along dim 0
+                state_dict[combined_key] = torch.cat([q_val, k_val, v_val], dim=0)
+
+        # --- gate_up recombination ---
+        gate_keys = [
+            k
+            for k in list(state_dict.keys())
+            if ".mlp.gate_proj." in k
+            and not k.endswith(".mlp.gate_proj.weight")
+            and not k.endswith(".mlp.gate_proj.bias")
+        ]
+
+        for gate_key in gate_keys:
+            up_key = gate_key.replace(".mlp.gate_proj.", ".mlp.up_proj.")
+
+            if up_key not in state_dict:
+                continue
+
+            combined_key = gate_key.replace(".mlp.gate_proj.", ".mlp.gate_up_proj.")
+
+            gate_val = state_dict.pop(gate_key)
+            up_val = state_dict.pop(up_key)
+
+            if "lora_A" in gate_key:
+                # lora_A weights were duplicated during split — just take one
+                state_dict[combined_key] = gate_val
+            else:
+                # lora_B, magnitude, etc. — concatenate along dim 0
+                state_dict[combined_key] = torch.cat([gate_val, up_val], dim=0)

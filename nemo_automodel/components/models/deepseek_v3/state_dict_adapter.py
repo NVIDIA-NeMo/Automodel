@@ -22,7 +22,7 @@ from transformers import DeepseekV3Config
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.moe.layers import MoEConfig
+from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 from nemo_automodel.components.moe.state_dict_utils import is_dtensor
 
@@ -160,7 +160,7 @@ class DeepSeekV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format.
-        Automatically detects format based on backend.enable_deepep configuration.
+        Automatically detects format based on backend.dispatcher configuration.
         """
         inplace = bool(kwargs.get("inplace", False))
         hf_state_dict = {}

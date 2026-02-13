@@ -21,6 +21,7 @@ import torch
 
 from nemo_automodel._transformers.auto_model import (
     _get_next_fallback_attn,
+    _init_model,
     _patch_attention,
     _get_mixin_wrapped_class,
     _apply_peft_and_lower_precision,
@@ -44,7 +45,7 @@ class TestPatchAttention:
         obj = DummyModule()
         original_forward = obj.forward
 
-        with patch("nemo_automodel._transformers.auto_model.sdpa_kernel") as mock_sdpa_kernel:
+        with patch("nemo_automodel._transformers.kernel_patches.sdpa_kernel") as mock_sdpa_kernel:
             result = _patch_attention(obj)
 
             assert result is obj
@@ -70,7 +71,7 @@ class TestPatchAttention:
         obj = DummyModule()
         custom_sdpa_method = [SDPBackend.FLASH_ATTENTION]
 
-        with patch("nemo_automodel._transformers.auto_model.sdpa_kernel") as mock_sdpa_kernel:
+        with patch("nemo_automodel._transformers.kernel_patches.sdpa_kernel") as mock_sdpa_kernel:
             result = _patch_attention(obj, custom_sdpa_method)
 
             assert result is obj
@@ -209,7 +210,7 @@ def prepare_env(monkeypatch, target_mod, *, has_liger=True, apply_ok=True):
 
 def test_patch_liger_kernel_success(monkeypatch):
     """Test _patch_liger_kernel successfully applies liger kernel when available."""
-    import nemo_automodel._transformers.auto_model as tgt
+    import nemo_automodel._transformers.kernel_patches as tgt
 
     apply_mock, attn_mock = prepare_env(monkeypatch, tgt, has_liger=True, apply_ok=True)
 
@@ -234,7 +235,7 @@ def test_liger_not_available(monkeypatch):
     Expect: return untouched model, _patch_attention still invoked,
             no exceptions thrown.
     """
-    import nemo_automodel._transformers.auto_model as tgt
+    import nemo_automodel._transformers.kernel_patches as tgt
 
     apply_mock, attn_mock = prepare_env(
         monkeypatch,
@@ -259,7 +260,7 @@ def test_liger_apply_failure_raises(monkeypatch):
     If _apply_liger_kernel_to_instance throws, _patch_liger_kernel must
     clean up and raise RuntimeError.
     """
-    import nemo_automodel._transformers.auto_model as tgt
+    import nemo_automodel._transformers.kernel_patches as tgt
 
     prepare_env(
         monkeypatch,
@@ -270,6 +271,35 @@ def test_liger_apply_failure_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Failed to patch model"):
         tgt._patch_liger_kernel(DummyModel())
+
+
+def test_patch_liger_kernel_skips_non_nn_module(monkeypatch, caplog):
+    """
+    When model is not an nn.Module (e.g., a lightweight mock), _patch_liger_kernel
+    should skip patching and return the model unchanged with a warning.
+    """
+    import nemo_automodel._transformers.kernel_patches as tgt
+
+    apply_mock, attn_mock = prepare_env(
+        monkeypatch,
+        tgt,
+        has_liger=True,
+        apply_ok=True,
+    )
+
+    # Create a non-nn.Module mock object
+    mock_model = MagicMock(spec=[])  # Empty spec means no nn.Module methods
+    mock_model.config = {}
+
+    with caplog.at_level(logging.WARNING):
+        result = tgt._patch_liger_kernel(mock_model)
+
+    # Should return the same mock unchanged
+    assert result is mock_model
+    # Liger kernel should NOT be applied
+    apply_mock.assert_not_called()
+    # Warning should be logged
+    assert "Skipping Liger Kernel patch for non-nn.Module model" in caplog.text
 
 
 # =============================================================================
@@ -318,7 +348,7 @@ class TestApplyPeftAndLowerPrecision:
         mock_peft_config.use_triton = True
 
         with (
-            patch("nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules") as mock_apply_lora,
+            patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules") as mock_apply_lora,
             caplog.at_level(logging.INFO),
         ):
             result = _apply_peft_and_lower_precision(
@@ -343,7 +373,7 @@ class TestApplyPeftAndLowerPrecision:
         mock_autopipeline = MagicMock()
 
         with (
-            patch("nemo_automodel._transformers.auto_model.apply_lora_to_linear_modules") as mock_apply_lora,
+            patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules") as mock_apply_lora,
             caplog.at_level(logging.INFO),
         ):
             result = _apply_peft_and_lower_precision(
@@ -364,7 +394,7 @@ class TestApplyPeftAndLowerPrecision:
         mock_model = MagicMock()
         mock_fp8_config = MagicMock()
 
-        with patch("nemo_automodel._transformers.auto_model.apply_fp8_to_model") as mock_apply_fp8:
+        with patch("nemo_automodel._transformers.infrastructure.apply_fp8_to_model") as mock_apply_fp8:
             mock_apply_fp8.return_value = mock_model
 
             result = _apply_peft_and_lower_precision(
@@ -471,3 +501,201 @@ class TestFilterKwargsForInit:
         result = _filter_kwargs_for_init(ModelWithVarKwargs, kwargs)
 
         assert result == kwargs
+
+
+# =============================================================================
+# Tests for NEED_SETUP_CACHE_CLASSES_MAPPING backward compatibility shim
+# =============================================================================
+
+
+class TestNeedSetupCacheClassesMapping:
+    """Test cases for the NEED_SETUP_CACHE_CLASSES_MAPPING backward compat shim."""
+
+    def test_shim_does_not_overwrite_existing_attribute(self):
+        """If NEED_SETUP_CACHE_CLASSES_MAPPING already exists, shim doesn't overwrite."""
+        import importlib
+        import transformers.generation.utils as gen_utils
+
+        sentinel = {"test": "sentinel_value"}
+        gen_utils.NEED_SETUP_CACHE_CLASSES_MAPPING = sentinel
+
+        # Re-import to trigger the shim code
+        import nemo_automodel._transformers.auto_model as mod
+        importlib.reload(mod)
+
+        # The sentinel should still be there (shim didn't overwrite)
+        assert gen_utils.NEED_SETUP_CACHE_CLASSES_MAPPING is sentinel
+
+        # Clean up
+        del gen_utils.NEED_SETUP_CACHE_CLASSES_MAPPING
+
+    def test_shim_creates_attribute_when_missing(self):
+        """If NEED_SETUP_CACHE_CLASSES_MAPPING is missing, shim creates it."""
+        import importlib
+        import transformers.generation.utils as gen_utils
+
+        # Remove the attribute if it exists
+        if hasattr(gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
+            delattr(gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING")
+
+        # Re-import to trigger the shim
+        import nemo_automodel._transformers.auto_model as mod
+        importlib.reload(mod)
+
+        assert hasattr(gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING")
+        mapping = gen_utils.NEED_SETUP_CACHE_CLASSES_MAPPING
+        assert "static" in mapping
+
+        # Clean up
+        del gen_utils.NEED_SETUP_CACHE_CLASSES_MAPPING
+
+
+# =============================================================================
+# Tests for _model_mapping KeyError fallback in _init_model
+# =============================================================================
+
+
+class TestModelMappingKeyErrorFallback:
+    """Test cases for _model_mapping KeyError fallback in _init_model."""
+
+    def _make_cls(self, model_mapping_dict):
+        """Create a mock cls with _model_mapping, parent class methods, etc."""
+        cls = MagicMock()
+        cls._model_mapping = model_mapping_dict
+        return cls
+
+    def test_force_hf_known_config_type(self):
+        """force_hf path: _model_mapping lookup succeeds, class gets wrapped with mixin."""
+
+        class FakeConfig:
+            name_or_path = "test-model"
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
+        fake_config = FakeConfig()
+        fake_model = FakeModel()
+
+        cls = self._make_cls({FakeConfig: FakeModel})
+        cls._from_config_parent_class = MagicMock(return_value=fake_model)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
+        ):
+            mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
+            is_custom, model = _init_model(
+                cls,
+                fake_config,  # Pass config object directly (not str) to skip pretrained path
+                attn_implementation="eager",
+                torch_dtype="auto",
+                quantization_config=None,
+                force_hf=True,
+            )
+
+        assert is_custom is False
+        mock_wrap.assert_called_once_with(FakeModel)
+
+    def test_force_hf_unknown_config_falls_back_to_type_model(self):
+        """force_hf path: KeyError in _model_mapping falls back to type(model)."""
+
+        class UnknownConfig:
+            name_or_path = "test-model"
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
+        fake_config = UnknownConfig()
+        fake_model = FakeModel()
+
+        # _model_mapping does NOT have UnknownConfig
+        cls = self._make_cls({})
+        cls._from_config_parent_class = MagicMock(return_value=fake_model)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
+        ):
+            mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
+            is_custom, model = _init_model(
+                cls,
+                fake_config,
+                attn_implementation="eager",
+                torch_dtype="auto",
+                quantization_config=None,
+                force_hf=True,
+            )
+
+        assert is_custom is False
+        # Fallback: type(model) = FakeModel
+        mock_wrap.assert_called_once_with(FakeModel)
+
+    def test_fallback_path_known_config_type(self):
+        """Fallback (non-force_hf, no custom model) path: _model_mapping succeeds."""
+
+        class FakeConfig:
+            name_or_path = "test-model"
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
+        fake_config = FakeConfig()
+        fake_model = FakeModel()
+
+        cls = self._make_cls({FakeConfig: FakeModel})
+        cls._from_config_parent_class = MagicMock(return_value=fake_model)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch("nemo_automodel._transformers.model_init.get_architectures", return_value=[]),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
+        ):
+            mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
+            is_custom, model = _init_model(
+                cls,
+                fake_config,
+                attn_implementation="eager",
+                torch_dtype="auto",
+                quantization_config=None,
+                force_hf=False,
+            )
+
+        assert is_custom is False
+        mock_wrap.assert_called_once_with(FakeModel)
+
+    def test_fallback_path_unknown_config_falls_back_to_type_model(self):
+        """Fallback path: KeyError in _model_mapping falls back to type(model)."""
+
+        class UnknownConfig:
+            name_or_path = "test-model"
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
+        fake_config = UnknownConfig()
+        fake_model = FakeModel()
+
+        cls = self._make_cls({})
+        cls._from_config_parent_class = MagicMock(return_value=fake_model)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch("nemo_automodel._transformers.model_init.get_architectures", return_value=[]),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
+        ):
+            mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
+            is_custom, model = _init_model(
+                cls,
+                fake_config,
+                attn_implementation="eager",
+                torch_dtype="auto",
+                quantization_config=None,
+                force_hf=False,
+            )
+
+        assert is_custom is False
+        mock_wrap.assert_called_once_with(FakeModel)

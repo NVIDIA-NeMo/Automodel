@@ -36,10 +36,27 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
         """
         tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
 
+        # Transformers >=5.0.0 defaults special_tokens_pattern to "cls_sep", which inserts
+        # cls_token_id / sep_token_id into input_ids via build_inputs_with_special_tokens.
+        # Moonlight's TikTokenTokenizer doesn't define CLS/SEP, so those IDs are None,
+        # resulting in None values in input_ids and a downstream ValueError in pad().
+        # Fix: when the pattern is "cls_sep" but the required tokens are missing, fall
+        # back to "none" so build_inputs_with_special_tokens passes through unchanged.
+        if getattr(tokenizer, "special_tokens_pattern", None) == "cls_sep" and (
+            getattr(tokenizer, "cls_token_id", None) is None or getattr(tokenizer, "sep_token_id", None) is None
+        ):
+            tokenizer.special_tokens_pattern = "none"
+
         if add_bos_token and getattr(tokenizer, "bos_token", None) is not None:
-            tokenizer.add_bos_token = add_bos_token
+            try:
+                tokenizer.add_bos_token = add_bos_token
+            except ValueError:
+                tokenizer._add_bos_token = add_bos_token
         if add_eos_token and getattr(tokenizer, "eos_token", None) is not None:
-            tokenizer.add_eos_token = add_eos_token
+            try:
+                tokenizer.add_eos_token = add_eos_token
+            except ValueError:
+                tokenizer._add_eos_token = add_eos_token
         # Keep the wrapper class name at runtime, but remember the original HF tokenizer class
         # so we can save an HF-compatible `tokenizer_class` in `save_pretrained()`.
         base_tokenizer_cls = type(tokenizer)

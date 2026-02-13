@@ -29,22 +29,20 @@ rng:
   seed: 1111
   ranked: true
 
-parallelizer:
-  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
-  activation_checkpointing: false
-
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
-  # Customize this backend for fine grained control
-  # backend:
-  #   _target_: nemo_automodel.components.models.common.BackendConfig
-  #   attn: sdpa
-  #   linear: te
-  #   rms_norm: te
-  #   enable_deepep: true
-  #   fake_balanced_gate: false
-  #   enable_hf_state_dict_adapter: true
+  #Customize this backend for fine grained control
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: te
+    rms_norm: te
+    rope_fusion: false
+    experts: te
+    enable_deepep: true
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
 
 
 checkpoint:
@@ -54,12 +52,12 @@ checkpoint:
   save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  dp_replicate_size: 1
   ep_size: 8
+
   sequence_parallel: false
 
 freeze_config:
