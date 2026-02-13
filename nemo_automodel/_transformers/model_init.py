@@ -25,7 +25,11 @@ from contextlib import contextmanager
 
 import torch
 from huggingface_hub import snapshot_download
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
+
+# For models that still accesses config.pad_token_id after v5 removes it in PretrainedConfig
+if not hasattr(PretrainedConfig, "pad_token_id"):
+    PretrainedConfig.pad_token_id = None
 
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry
@@ -178,17 +182,12 @@ def _init_model(
     pretrained_model_name_or_path = (
         pretrained_model_name_or_path_or_config if is_pretrained_init else getattr(hf_config, "name_or_path")
     )
-    # for models still access config.pad_token_id after v5 removes it in PretrainedConfig
-    if not hasattr(hf_config, "pad_token_id"):
-        hf_config.pad_token_id = None
 
     # 1. if force_hf is True, use HF model class wrapped with mixin
     if force_hf:
         if quantization_config is not None:
             kwargs["quantization_config"] = quantization_config
         if is_pretrained_init:
-            # Forward the patched config
-            kwargs["config"] = hf_config
             model = cls._from_pretrained_parent_class(
                 pretrained_model_name_or_path,
                 *model_args,
@@ -239,8 +238,6 @@ def _init_model(
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
     if is_pretrained_init:
-        # Forward the patched config
-        kwargs["config"] = hf_config
         model = cls._from_pretrained_parent_class(
             pretrained_model_name_or_path,
             *model_args,
