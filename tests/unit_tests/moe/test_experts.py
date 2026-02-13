@@ -25,6 +25,9 @@ SKIP_TE_TESTS = not (HAVE_TE and HAVE_CUDA)
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
+    _apply_bias,
+    _permute_tokens_for_grouped_mm,
+    _torch_mm_experts_fwd,
     get_expert_activation,
     get_expert_activation_for_deepep,
     is_gated_activation,
@@ -32,6 +35,7 @@ from nemo_automodel.components.moe.experts import (
     swiglu,
 )
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.models.common import BackendConfig
 
 
 @pytest.fixture
@@ -581,7 +585,7 @@ class TestGroupedExpertsDeepEP:
         value = torch.randn(4, 8)
         tokens_per_expert = torch.tensor([2, 2])
 
-        result = experts._apply_bias(value, bias=None, tokens_per_expert=tokens_per_expert)
+        result = _apply_bias(value, bias=None, tokens_per_expert=tokens_per_expert)
 
         torch.testing.assert_close(result, value)
 
@@ -593,7 +597,7 @@ class TestGroupedExpertsDeepEP:
         bias = [torch.randn(8), torch.randn(8)]
         tokens_per_expert = torch.tensor([2, 2])
 
-        result = experts._apply_bias(value, bias=bias, tokens_per_expert=tokens_per_expert)
+        result = _apply_bias(value, bias=bias, tokens_per_expert=tokens_per_expert)
 
         assert result.shape == value.shape
         assert result.dtype == value.dtype
@@ -612,7 +616,7 @@ class TestGroupedExpertsDeepEP:
         # But looking at the code, it seems like permuted_probs should be per-token, not per-feature
         permuted_probs = torch.randn(4, 8)  # 4 tokens, 8 features each to match bias shape
 
-        result = experts._apply_bias(
+        result = _apply_bias(
             value, bias=bias, tokens_per_expert=tokens_per_expert, permuted_probs=permuted_probs
         )
 
@@ -1619,3 +1623,360 @@ class TestGroupedExpertsTE:
             # After init_token_dispatcher, out_features should still be moe_inter_dim (not 2*)
             assert experts.gate_up_linear.out_features == config.moe_inter_dim
             assert experts.gate_up_linear.num_gemms == config.n_routed_experts // 2
+
+
+class TestPermuteTokensForGroupedMM:
+    """Test _permute_tokens_for_grouped_mm helper function."""
+
+    def test_basic_permutation(self, device):
+        """Test tokens are sorted by expert and outputs have correct shapes."""
+        n_local_experts = 4
+        num_tokens = 8
+        topk = 2
+        indices = torch.tensor(
+            [[0, 1], [2, 3], [0, 2], [1, 3], [0, 1], [2, 3], [0, 2], [1, 3]],
+            device=device,
+        )
+        weights = torch.rand(num_tokens, topk, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        sorted_ids, sorted_weights, tpe, offs = _permute_tokens_for_grouped_mm(
+            indices, weights, token_mask, n_local_experts, experts_start_idx=0
+        )
+
+        # All 16 slots should be assigned (8 tokens * topk=2, all local)
+        assert sorted_ids.shape[0] == num_tokens * topk
+        assert sorted_weights.shape == sorted_ids.shape
+        assert tpe.shape == (n_local_experts,)
+        assert offs.shape == (n_local_experts,)
+        assert offs.dtype == torch.int32
+        assert tpe.sum().item() == num_tokens * topk
+        # offs is cumulative sum
+        torch.testing.assert_close(offs, tpe.cumsum(0).to(torch.int32))
+
+    def test_expert_offset(self, device):
+        """Test that experts_start_idx correctly filters to local experts."""
+        # 8 experts total, local experts are 4..7
+        indices = torch.tensor([[0, 5], [3, 7], [4, 6]], device=device)
+        weights = torch.ones(3, 2, device=device)
+        token_mask = torch.ones(3, dtype=torch.bool, device=device)
+
+        sorted_ids, sorted_weights, tpe, offs = _permute_tokens_for_grouped_mm(
+            indices, weights, token_mask, n_local_experts=4, experts_start_idx=4
+        )
+
+        # Only experts 4,5,6,7 are local. Assignments: token0->5, token1->7, token2->4, token2->6
+        assert tpe.sum().item() == 4
+        assert tpe[0].item() == 1  # expert 4: token2
+        assert tpe[1].item() == 1  # expert 5: token0
+        assert tpe[2].item() == 1  # expert 6: token2
+        assert tpe[3].item() == 1  # expert 7: token1
+
+    def test_masked_tokens_excluded(self, device):
+        """Test that masked tokens are excluded from permutation."""
+        indices = torch.tensor([[0, 1], [0, 1], [0, 1], [0, 1]], device=device)
+        weights = torch.ones(4, 2, device=device)
+        token_mask = torch.tensor([True, True, False, False], device=device)
+
+        sorted_ids, sorted_weights, tpe, offs = _permute_tokens_for_grouped_mm(
+            indices, weights, token_mask, n_local_experts=2, experts_start_idx=0
+        )
+
+        # Only first 2 tokens are valid -> 4 assignments (2 tokens * topk=2)
+        assert tpe.sum().item() == 4
+
+    def test_no_local_tokens(self, device):
+        """Test when no tokens route to local experts."""
+        # Local experts 0..1, all indices go to experts 2,3
+        indices = torch.tensor([[2, 3], [2, 3]], device=device)
+        weights = torch.ones(2, 2, device=device)
+        token_mask = torch.ones(2, dtype=torch.bool, device=device)
+
+        sorted_ids, sorted_weights, tpe, offs = _permute_tokens_for_grouped_mm(
+            indices, weights, token_mask, n_local_experts=2, experts_start_idx=0
+        )
+
+        assert tpe.sum().item() == 0
+        assert sorted_ids.shape[0] == 0
+
+    def test_weights_preserved(self, device):
+        """Test that sorted weights correspond to the correct tokens."""
+        indices = torch.tensor([[1, 0]], device=device)  # token 0 -> expert 1 (slot0), expert 0 (slot1)
+        weights = torch.tensor([[0.7, 0.3]], device=device)
+        token_mask = torch.ones(1, dtype=torch.bool, device=device)
+
+        sorted_ids, sorted_weights, tpe, offs = _permute_tokens_for_grouped_mm(
+            indices, weights, token_mask, n_local_experts=2, experts_start_idx=0
+        )
+
+        # Sorted by expert: expert 0 first (weight 0.3), expert 1 second (weight 0.7)
+        assert tpe[0].item() == 1  # expert 0
+        assert tpe[1].item() == 1  # expert 1
+        torch.testing.assert_close(sorted_weights[0], torch.tensor(0.3, device=device))
+        torch.testing.assert_close(sorted_weights[1], torch.tensor(0.7, device=device))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for torch._grouped_mm")
+class TestTorchGroupedMM:
+    """Test GroupedExperts with torch._grouped_mm backend (use_torch_mm=True)."""
+
+    @pytest.fixture
+    def torch_mm_backend(self):
+        return BackendConfig(experts="torch_mm", dispatcher="torch")
+
+    @pytest.fixture
+    def torch_mm_config(self):
+        return MoEConfig(
+            n_routed_experts=4,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=False,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=64,
+            inter_dim=128,
+            moe_inter_dim=128,
+            norm_topk_prob=False,
+            router_bias=False,
+            expert_bias=False,
+            expert_activation="swiglu",
+            activation_alpha=1.702,
+            activation_limit=7.0,
+            dtype=torch.bfloat16,
+        )
+
+    @pytest.fixture
+    def torch_mm_config_with_bias(self, torch_mm_config):
+        torch_mm_config.expert_bias = True
+        return torch_mm_config
+
+    @staticmethod
+    def _unwrap_compiled(fn):
+        """Unwrap a torch.compile decorated function to its eager version."""
+        from functools import partial
+
+        if isinstance(fn, partial):
+            inner = TestTorchGroupedMM._unwrap_compiled(fn.func)
+            if inner is not fn.func:
+                return partial(inner, *fn.args, **fn.keywords)
+            return fn
+        if hasattr(fn, '_torchdynamo_orig_callable'):
+            return fn._torchdynamo_orig_callable
+        return fn
+
+    def _init_experts(self, config, backend, device):
+        """Create and initialize GroupedExperts on device."""
+        experts = GroupedExperts(config, backend=backend).to(device)
+        with torch.no_grad():
+            experts.gate_and_up_projs.normal_(0, 0.02)
+            experts.down_projs.normal_(0, 0.02)
+            if experts.expert_bias:
+                experts.gate_up_proj_bias.zero_()
+                experts.down_proj_bias.zero_()
+        # Use eager (non-compiled) activation functions to avoid recompilation issues in tests
+        experts.expert_activation = self._unwrap_compiled(experts.expert_activation)
+        if hasattr(experts, 'expert_activation_grouped'):
+            experts.expert_activation_grouped = self._unwrap_compiled(experts.expert_activation_grouped)
+        return experts
+
+    def test_init_sets_use_torch_mm(self, torch_mm_config, torch_mm_backend):
+        """Test that use_torch_mm flag is set correctly."""
+        experts = GroupedExperts(torch_mm_config, backend=torch_mm_backend)
+        assert experts.use_torch_mm is True
+        assert hasattr(experts, "expert_activation_grouped")
+
+    def test_init_without_backend_disables_torch_mm(self, torch_mm_config):
+        """Test that use_torch_mm is False without backend."""
+        experts = GroupedExperts(torch_mm_config)
+        assert experts.use_torch_mm is False
+        assert not hasattr(experts, "expert_activation_grouped")
+
+    def test_forward_shape(self, torch_mm_config, torch_mm_backend, device):
+        """Test grouped_mm forward produces correct output shape."""
+        experts = self._init_experts(torch_mm_config, torch_mm_backend, device)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, torch_mm_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, torch_mm_config.n_activated_experts, dtype=torch.bfloat16, device=device)
+        indices = torch.randint(0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device)
+
+        output = experts(x, token_mask, weights, indices)
+
+        assert output.shape == x.shape
+        assert output.device == device
+        assert not torch.isnan(output).any()
+
+    def test_forward_with_bias(self, torch_mm_config_with_bias, torch_mm_backend, device):
+        """Test grouped_mm forward with expert bias."""
+        experts = self._init_experts(torch_mm_config_with_bias, torch_mm_backend, device)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, torch_mm_config_with_bias.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, torch_mm_config_with_bias.n_activated_experts, dtype=torch.bfloat16, device=device)
+        indices = torch.randint(0, torch_mm_config_with_bias.n_routed_experts, (num_tokens, torch_mm_config_with_bias.n_activated_experts), device=device)
+
+        output = experts(x, token_mask, weights, indices)
+
+        assert output.shape == x.shape
+        assert not torch.isnan(output).any()
+
+    def test_forward_matches_loop_path(self, torch_mm_config, torch_mm_backend, device):
+        """Test that torch_mm and loop paths produce similar outputs."""
+        torch_mm_config.dtype = torch.float32
+
+        experts_mm = self._init_experts(torch_mm_config, torch_mm_backend, device)
+        experts_loop = GroupedExperts(torch_mm_config).to(device)
+        experts_loop.expert_activation = self._unwrap_compiled(experts_loop.expert_activation)
+        # Copy weights
+        with torch.no_grad():
+            experts_loop.gate_and_up_projs.copy_(experts_mm.gate_and_up_projs)
+            experts_loop.down_projs.copy_(experts_mm.down_projs)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, torch_mm_config.dim, dtype=torch.float32, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, torch_mm_config.n_activated_experts, dtype=torch.float32, device=device)
+        indices = torch.randint(0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device)
+
+        out_mm = experts_mm(x, token_mask, weights, indices)
+        out_loop = experts_loop(x, token_mask, weights, indices)
+
+        torch.testing.assert_close(out_mm, out_loop, rtol=1e-3, atol=1e-3)
+
+    def test_backward(self, torch_mm_config, torch_mm_backend, device):
+        """Test backward pass completes and produces gradients."""
+        torch_mm_config.dtype = torch.float32
+        experts = self._init_experts(torch_mm_config, torch_mm_backend, device)
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, torch_mm_config.dim, dtype=torch.float32, device=device, requires_grad=True)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, torch_mm_config.n_activated_experts, dtype=torch.float32, device=device)
+        indices = torch.randint(0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device)
+
+        output = experts(x, token_mask, weights, indices)
+        loss = output.sum()
+        loss.backward()
+
+        assert x.grad is not None
+        assert experts.gate_and_up_projs.grad is not None
+        assert experts.down_projs.grad is not None
+
+    def test_zero_active_experts(self, torch_mm_config, torch_mm_backend, device):
+        """Test grouped_mm path when no tokens route to any expert."""
+        torch_mm_config.dtype = torch.float32
+        experts = self._init_experts(torch_mm_config, torch_mm_backend, device)
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, torch_mm_config.dim, dtype=torch.float32, device=device, requires_grad=True)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, torch_mm_config.n_activated_experts, dtype=torch.float32, device=device)
+        # Route all tokens to non-existent experts
+        indices = torch.full(
+            (num_tokens, torch_mm_config.n_activated_experts),
+            fill_value=torch_mm_config.n_routed_experts + 100,
+            dtype=torch.long,
+            device=device,
+        )
+
+        output = experts(x, token_mask, weights, indices)
+
+        assert output.shape == x.shape
+        assert not torch.isnan(output).any()
+
+        # Backward should still work (dummy computation for gradient flow)
+        residual = x.mean(dim=-1, keepdim=True).expand_as(x)
+        (output + residual).sum().backward()
+        assert x.grad is not None
+
+    def test_partial_token_mask(self, torch_mm_config, torch_mm_backend, device):
+        """Test grouped_mm with partially masked tokens."""
+        experts = self._init_experts(torch_mm_config, torch_mm_backend, device)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, torch_mm_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.zeros(num_tokens, dtype=torch.bool, device=device)
+        token_mask[:num_tokens // 2] = True
+        weights = torch.rand(num_tokens, torch_mm_config.n_activated_experts, dtype=torch.bfloat16, device=device)
+        indices = torch.randint(0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device)
+
+        output = experts(x, token_mask, weights, indices)
+
+        assert output.shape == x.shape
+        assert not torch.isnan(output).any()
+
+    def test_relu2_activation(self, torch_mm_backend, device):
+        """Test grouped_mm with ReLU² (non-gated) activation."""
+        config = MoEConfig(
+            n_routed_experts=4,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=False,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=64,
+            inter_dim=128,
+            moe_inter_dim=128,
+            norm_topk_prob=False,
+            router_bias=False,
+            expert_bias=False,
+            expert_activation="relu2",
+            dtype=torch.bfloat16,
+        )
+        experts = self._init_experts(config, torch_mm_backend, device)
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, config.n_activated_experts, dtype=torch.bfloat16, device=device)
+        indices = torch.randint(0, config.n_routed_experts, (num_tokens, config.n_activated_experts), device=device)
+
+        output = experts(x, token_mask, weights, indices)
+
+        assert output.shape == x.shape
+        assert not torch.isnan(output).any()
+
+    def test_deepep_init_with_torch_mm(self, torch_mm_config, torch_mm_backend):
+        """Test GroupedExpertsDeepEP initializes with torch_mm backend."""
+        experts = GroupedExpertsDeepEP(torch_mm_config, backend=torch_mm_backend)
+        assert experts.use_torch_mm is True
+
+    def test_deepep_init_without_torch_mm(self, torch_mm_config):
+        """Test GroupedExpertsDeepEP defaults to gmm without torch_mm backend."""
+        experts = GroupedExpertsDeepEP(torch_mm_config)
+        assert experts.use_torch_mm is False
+
+
+class TestTorchMMExpertsFwd:
+    """Test _torch_mm_experts_fwd helper function."""
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for torch._grouped_mm")
+    def test_basic_forward(self, device):
+        """Test _torch_mm_experts_fwd produces correct shape output."""
+        n_experts = 2
+        dim = 32
+        inter_dim = 64
+        total_tokens = 6
+
+        hidden = torch.randn(total_tokens, dim, dtype=torch.bfloat16, device=device)
+        gate_up = torch.randn(n_experts, dim, inter_dim * 2, dtype=torch.bfloat16, device=device) * 0.02
+        down = torch.randn(n_experts, inter_dim, dim, dtype=torch.bfloat16, device=device) * 0.02
+        tpe = torch.tensor([3, 3], device=device)
+        probs = torch.rand(total_tokens, 1, dtype=torch.float32, device=device)
+
+        from nemo_automodel.components.moe.megatron.moe_utils import weighted_bias_swiglu_impl
+
+        output = _torch_mm_experts_fwd(hidden, gate_up, down, tpe, probs, weighted_bias_swiglu_impl)
+
+        assert output.shape == (total_tokens, dim)
+        assert not torch.isnan(output).any()
