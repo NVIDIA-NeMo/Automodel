@@ -32,16 +32,17 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
-  # Customize this backend for fine grained control
-  # backend:
-  #   _target_: nemo_automodel.components.models.common.BackendConfig
-  #   attn: sdpa
-  #   linear: te
-  #   rms_norm: te
-  #   experts: te
-  #   dispatcher: deepep
-  #   fake_balanced_gate: false
-  #   enable_hf_state_dict_adapter: true
+  #Customize this backend for fine grained control
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: te
+    rms_norm: te
+    rope_fusion: false
+    experts: te
+    enable_deepep: true
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
 
 
 checkpoint:

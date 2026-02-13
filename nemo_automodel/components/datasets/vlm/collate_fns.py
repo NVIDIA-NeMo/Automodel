@@ -308,6 +308,7 @@ def kimi_vl_collate_fn(
         "return_tensors": "pt",
         "padding": True,
         "truncation": True,
+        "add_special_tokens": False,
     }
     if max_length is not None:
         processor_kwargs["max_length"] = max_length

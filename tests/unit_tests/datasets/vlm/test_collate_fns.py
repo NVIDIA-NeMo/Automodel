@@ -523,6 +523,24 @@ def test_kimi_vl_collate_fn_extracts_images(collate_mod, monkeypatch):
     assert forward_call["images"] == ["test_image.jpg"]
 
 
+def test_kimi_vl_collate_fn_passes_add_special_tokens_false(collate_mod, monkeypatch):
+    """Test that kimi_vl_collate_fn passes add_special_tokens=False to processor."""
+    processor = DummyKimiVLProcessor()
+
+    labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
+    monkeypatch.setattr(
+        collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True
+    )
+
+    examples = [{"conversation": CONVERSATION}]
+    collate_mod.kimi_vl_collate_fn(examples, processor)
+
+    assert len(processor.forward_calls) == 1
+    forward_call = processor.forward_calls[0]
+    assert "add_special_tokens" in forward_call
+    assert forward_call["add_special_tokens"] is False
+
+
 def test_kimi_vl_collate_fn_multiple_examples(collate_mod, monkeypatch):
     """Test kimi_vl_collate_fn handles multiple examples."""
     processor = DummyKimiVLProcessor()
