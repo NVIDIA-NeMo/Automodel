@@ -25,7 +25,11 @@ from contextlib import contextmanager
 
 import torch
 from huggingface_hub import snapshot_download
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
+
+# For models that still accesses config.pad_token_id after v5 removes it in PretrainedConfig
+if not hasattr(PretrainedConfig, "pad_token_id"):
+    PretrainedConfig.pad_token_id = None
 
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry

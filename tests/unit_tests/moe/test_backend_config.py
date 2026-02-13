@@ -54,15 +54,15 @@ class TestBackendConfigExpertsDispatcherValidation:
     """Test BackendConfig validation for experts and dispatcher fields."""
 
     def test_te_experts_falls_back_to_torch(self):
-        """Test that BackendConfig falls back te experts to torch when dispatcher is not deepep."""
+        """Test that BackendConfig falls back te experts to torch_mm when dispatcher is not deepep."""
         config = BackendConfig(experts="te", dispatcher="torch")
-        assert config.experts == "torch"
+        assert config.experts == "torch_mm"
         assert config.dispatcher == "torch"
 
     def test_gmm_experts_falls_back_to_torch(self):
-        """Test that BackendConfig falls back gmm experts to torch when dispatcher is not deepep."""
+        """Test that BackendConfig falls back gmm experts to torch_mm when dispatcher is not deepep."""
         config = BackendConfig(experts="gmm", dispatcher="torch")
-        assert config.experts == "torch"
+        assert config.experts == "torch_mm"
         assert config.dispatcher == "torch"
 
     def test_te_experts_with_deepep_valid(self):
@@ -89,6 +89,38 @@ class TestBackendConfigExpertsDispatcherValidation:
         assert config.experts == "torch"
         assert config.dispatcher == "deepep"
 
+    def test_torch_mm_experts_with_torch_dispatcher_valid(self):
+        """Test that torch_mm experts with torch dispatcher is valid."""
+        config = BackendConfig(experts="torch_mm", dispatcher="torch")
+        assert config.experts == "torch_mm"
+        assert config.dispatcher == "torch"
+
+    def test_torch_mm_experts_with_deepep_dispatcher_valid(self):
+        """Test that torch_mm experts with deepep dispatcher is valid."""
+        config = BackendConfig(experts="torch_mm", dispatcher="deepep")
+        assert config.experts == "torch_mm"
+        assert config.dispatcher == "deepep"
+
+
+class TestBackendConfigFakeGateNoise:
+    """Test BackendConfig fake_gate_noise field."""
+
+    def test_fake_gate_noise_default(self):
+        """Test that fake_gate_noise defaults to 0.0."""
+        config = BackendConfig()
+        assert config.fake_gate_noise == 0.0
+
+    def test_fake_gate_noise_custom_value(self):
+        """Test that fake_gate_noise accepts a custom float value."""
+        config = BackendConfig(fake_gate_noise=0.5)
+        assert config.fake_gate_noise == 0.5
+
+    def test_fake_gate_noise_with_fake_balanced_gate(self):
+        """Test that fake_gate_noise can be set alongside fake_balanced_gate."""
+        config = BackendConfig(fake_balanced_gate=True, fake_gate_noise=0.3)
+        assert config.fake_balanced_gate is True
+        assert config.fake_gate_noise == 0.3
+
 
 class TestBackendConfigEnableDeepepDeprecation:
     """Test backwards compatibility for deprecated enable_deepep parameter."""
@@ -111,7 +143,8 @@ class TestBackendConfigEnableDeepepDeprecation:
             warnings.simplefilter("always")
             config = BackendConfig(enable_deepep=False)
             assert config.dispatcher == "torch"
-            assert config.experts == "torch"  # experts unchanged when enable_deepep=False
+            expected_experts = "torch_mm" if torch.cuda.is_available() else "torch"
+            assert config.experts == expected_experts  # experts unchanged when enable_deepep=False
             assert config.enable_deepep is None  # Should be cleared after conversion
             assert len(w) == 1
             assert issubclass(w[0].category, DeprecationWarning)
