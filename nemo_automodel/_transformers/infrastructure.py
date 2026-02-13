@@ -482,6 +482,13 @@ def apply_model_infrastructure(
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
         # Ensure model is on the correct device; AutoPipeline takes care of it internally
-        model.to(device)
+        try:
+            model.to(device)
+        except NotImplementedError as e:
+            if "Cannot copy out of meta tensor" in str(e):
+                logger.warning("model.to(device) failed (meta tensors); using model.to_empty(device=device) instead.")
+                model.to_empty(device=device)
+            else:
+                raise
 
     return model
