@@ -59,7 +59,6 @@ distributed:
   ep_size: 8
 
   sequence_parallel: false
-  activation_checkpointing: true
 
 freeze_config:
   freeze_embeddings: false
