@@ -18,9 +18,9 @@ from typing import List
 
 import torch.nn as nn
 
-from nemo_automodel.shared.import_utils import safe_import
+from nemo_automodel.shared.import_utils import safe_import_te
 
-HAS_TE, transformer_engine = safe_import("transformer_engine")
+HAS_TE, transformer_engine = safe_import_te()
 
 
 def _is_linear_module(module):

@@ -191,9 +191,12 @@ def test_peft_fused_qkv_checkpoint():
 
         if PeftModel is not None:
             # Build a base HF Llama model (same tiny config, random weights).
+            # Use the same device as the trainer so Liger/Triton kernels (e.g. RMS norm)
+            # get GPU tensors; they cannot run on CPU.
+            device = next(trainer.model_parts[0].parameters()).device
             hf_config = LlamaConfig(**TINY_LLAMA_CONFIG)
             base_model = AutoModelForCausalLM.from_config(hf_config)
-            base_model = base_model.to(dtype=trainer.model_parts[0].dtype)
+            base_model = base_model.to(device=device, dtype=trainer.model_parts[0].dtype)
 
             # Load the PEFT adapter
             peft_model = PeftModel.from_pretrained(base_model, str(model_dir))
@@ -206,9 +209,9 @@ def test_peft_fused_qkv_checkpoint():
             ]
             assert len(lora_modules) > 0, "Expected LoRA modules in PEFT model"
 
-            # Verify forward pass works
+            # Verify forward pass works (input must be on same device as model for Triton)
             peft_model.eval()
-            test_input = torch.randint(0, hf_config.vocab_size, (1, 16))
+            test_input = torch.randint(0, hf_config.vocab_size, (1, 16), device=device)
             with torch.no_grad():
                 output = peft_model(test_input)
                 assert output.logits is not None, "PEFT model forward pass failed"

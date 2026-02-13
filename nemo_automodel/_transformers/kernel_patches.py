@@ -19,6 +19,7 @@ These are stateless helpers used during model construction.
 """
 
 import functools
+import importlib.util
 import inspect
 import logging
 import types
@@ -28,7 +29,13 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from nemo_automodel.shared.import_utils import safe_import
 
-HAS_LIGER_KERNEL, liger_kernel_trf = safe_import("liger_kernel.transformers")
+# Check availability without fully importing (avoids CUDA init at import time).
+# The actual ``liger_kernel.transformers`` module is imported lazily inside
+# ``_patch_liger_kernel`` so that the import (which may trigger Triton JIT /
+# CUDA context creation) only happens *after* ``torch.cuda.set_device`` has
+# been called by the distributed init code.
+HAS_LIGER_KERNEL = importlib.util.find_spec("liger_kernel") is not None
+liger_kernel_trf = None  # lazily populated; tests may inject a stub here
 HAS_FA, _ = safe_import("flash_attn")
 DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if HAS_FA else "sdpa"
 
@@ -112,6 +119,14 @@ def _patch_liger_kernel(model):
         return model
 
     try:
+        # Lazy import: liger_kernel.transformers may trigger Triton JIT / CUDA
+        # init, so we must not import it until the correct CUDA device is set.
+        global liger_kernel_trf
+        if liger_kernel_trf is None:
+            import liger_kernel.transformers
+
+            liger_kernel_trf = liger_kernel.transformers
+
         liger_kernel_trf._apply_liger_kernel_to_instance(model=model)
         logger.info("Applied liger-kernel to model")
         return model
