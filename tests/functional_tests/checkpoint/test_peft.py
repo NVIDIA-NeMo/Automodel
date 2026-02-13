@@ -477,10 +477,13 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
 
         # finally check if the adapters loaded into the PEFT module are the same as the model we have trained
         if torch.distributed.get_rank() == 0:
-            base = AutoModelForCausalLM.from_pretrained(cfg.model.pretrained_model_name_or_path)
+            device = next(trainer.model_parts[0].parameters()).device
+            base = AutoModelForCausalLM.from_pretrained(cfg.model.pretrained_model_name_or_path).to(
+                device=device, dtype=trainer.model_parts[0].dtype
+            )
             peft_model = PeftModel.from_pretrained(
                 base, Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model"
-            ).to(trainer.model_parts[0].dtype)
+            )
 
             for source_key, source_param in model_state_dict.items():
                 # source key example: 'base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight'
@@ -560,10 +563,15 @@ def test_hf_peft_dora_checkpoint(force_hf):
         # Verify adapter loads with HF PEFT (treat missing keys as errors)
         if torch.distributed.get_rank() == 0:
             import warnings
-            base = AutoModelForCausalLM.from_pretrained(cfg.model.pretrained_model_name_or_path)
+            device = next(trainer.model_parts[0].parameters()).device
+            base = AutoModelForCausalLM.from_pretrained(cfg.model.pretrained_model_name_or_path).to(
+                device=device, dtype=trainer.model_parts[0].dtype
+            )
             with warnings.catch_warnings(record=True) as caught_warnings:
                 warnings.simplefilter("always")
-                peft_model = PeftModel.from_pretrained(base, checkpoint_path).to(trainer.model_parts[0].dtype)
+                peft_model = PeftModel.from_pretrained(
+                    base, checkpoint_path, autocast_adapter_dtype=False
+                )
             missing_key_warnings = [
                 w for w in caught_warnings
                 if "missing adapter keys" in str(w.message).lower()
@@ -585,7 +593,8 @@ def test_hf_peft_dora_checkpoint(force_hf):
                     continue
                 for peft_key, peft_param in peft_model.named_parameters():
                     if "lora" in peft_key and source_key.rsplit(".", 1)[0] in peft_key:
-                        assert torch.allclose(source_param, peft_param), f"Mismatch for {source_key}"
+                        # base is in gpu, but model_state_dict (from ckpt) is in cpu
+                        assert torch.allclose(source_param.cpu(), peft_param.cpu()), f"Mismatch for {source_key}"
 
             # Verify forward pass works
             peft_model.eval()
