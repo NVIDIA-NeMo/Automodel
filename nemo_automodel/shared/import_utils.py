@@ -374,6 +374,55 @@ def gpu_only_import_from(module, symbol, *, alt=None):
     )
 
 
+def safe_import_te():
+    """
+    Safely import Transformer Engine (TE). Returns (True, module) only if the
+    package and its PyTorch extension load successfully. Handles known failure
+    modes so callers get a consistent (False, placeholder) instead of crashes.
+
+    Known failure modes (handled by returning False and a placeholder):
+
+    1) ImportError when importing transformer_engine (torch is pulled in by TE's
+       pytorch/__init__.py), e.g. CUDA/runtime mismatch:
+       ImportError: .../libc10_cuda.so: undefined symbol: cudaGetDriverEntryPointByVersion, version libcudart.so.12
+
+    2) FileNotFoundError when TE loads its framework extension (e.g. in
+       transformer_engine.common.load_framework_extension("torch")):
+       FileNotFoundError: Could not find shared object file for Transformer Engine torch lib.
+
+    Returns:
+        Tuple[bool, Union[module, UnavailableMeta]]: (True, te_module) if import
+        and TE torch lib load succeeded; (False, placeholder) otherwise.
+    """
+    # 1) ImportError when doing "from transformer_engine import pytorch" -> torch is loaded -> fails with:
+    #    from torch._C import *
+    #    ImportError: /path/to/.venv/.../torch/lib/libc10_cuda.so: undefined symbol: cudaGetDriverEntryPointByVersion, version libcudart.so.12
+    # 2) FileNotFoundError when TE's load_framework_extension("torch") runs (e.g. in transformer_engine.pytorch):
+    #    raise FileNotFoundError(
+    #    FileNotFoundError: Could not find shared object file for Transformer Engine torch lib.
+    msg = "transformer_engine could not be imported (e.g. CUDA symbol mismatch or TE torch lib not found)."
+    try:
+        import transformer_engine as te
+    except ImportError:
+        logger.debug("safe_import_te: import transformer_engine failed (e.g. ImportError from torch)", exc_info=True)
+        return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
+    except FileNotFoundError:
+        logger.debug("safe_import_te: import transformer_engine failed (TE torch lib not found)", exc_info=True)
+        return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
+
+    try:
+        # Trigger loading of TE's PyTorch extension (where the .so is loaded).
+        import transformer_engine.pytorch  # noqa: F401
+    except ImportError:
+        logger.debug("safe_import_te: import transformer_engine.pytorch failed", exc_info=True)
+        return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
+    except FileNotFoundError:
+        logger.debug("safe_import_te: transformer_engine.pytorch failed (TE torch lib not found)", exc_info=True)
+        return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
+
+    return True, te
+
+
 def get_torch_version():
     """
     Return pytorch version with fallback if unavailable.
