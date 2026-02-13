@@ -403,9 +403,7 @@ def apply_model_infrastructure(
     no_pp = autopipeline is None
     no_tp = mesh.tp_size <= 1
     need_checkpoint_load = bool(pretrained_model_name_or_path and load_base_model)
-    load_before_shard = (
-        no_pp and no_tp and need_checkpoint_load and (peft_config is None)
-    )
+    load_before_shard = no_pp and no_tp and need_checkpoint_load and (peft_config is None)
 
     checkpoint_already_loaded = False
     if load_before_shard:

@@ -357,11 +357,7 @@ class Checkpointer:
         # load into new tensors so checkpoint dtypes (e.g. bf16) are preserved. If the model is
         # already sharded (DTensors), use set_model_state_dict with full_state_dict=True to
         # scatter into the sharded model (same as tensor-merging path).
-        if (
-            is_init_step
-            and len(model_state.model) == 1
-            and _is_safetensors_checkpoint(model_path)
-        ):
+        if is_init_step and len(model_state.model) == 1 and _is_safetensors_checkpoint(model_path):
             state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
             if state_dict_from_disk is not None:
                 state_dict_from_disk = _maybe_adapt_state_dict_from_hf(
