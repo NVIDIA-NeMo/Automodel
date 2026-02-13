@@ -42,7 +42,7 @@ except ImportError:
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 from nemo_automodel.components.checkpoint.checkpointing import save_config
-from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.config.loader import config_to_yaml_str, ConfigNode
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
@@ -560,32 +560,12 @@ class BaseRecipe:
                 logging.info(line)
         except Exception:
             logging.info(f"Experiment details: {details}")
-        # Config (print original placeholders for reproducibility)
+        # Config (print original placeholders for reproducibility; no internal keys like _original_strings)
         try:
             cfg_obj = getattr(self, "cfg", None)
-            # Prefer YAML-ready dict that converts callables/classes to dotted paths and preserves typed scalars
-            if hasattr(cfg_obj, "to_yaml_dict"):
-                cfg_dict = cfg_obj.to_yaml_dict(use_orig_values=True)
-            elif hasattr(cfg_obj, "to_dict"):
-                cfg_dict = cfg_obj.to_dict()
-            else:
-                cfg_dict = dict(cfg_obj) if cfg_obj is not None else {}
-
-            # If any leaf values carry `_orig_value`, prefer it for printing.
-            def _prefer_orig_values(x):
-                if hasattr(x, "_orig_value"):
-                    return getattr(x, "_orig_value")
-                if isinstance(x, dict):
-                    return {k: _prefer_orig_values(v) for k, v in x.items()}
-                if isinstance(x, list):
-                    return [_prefer_orig_values(v) for v in x]
-                return x
-
-            cfg_dict = _prefer_orig_values(cfg_dict)
-
-            # Print as clean YAML on stdout for easy copy/paste and readability
-            cfg_yaml = yaml.safe_dump(cfg_dict, sort_keys=False, default_flow_style=False).strip()
-            print(cfg_yaml, flush=True)
+            cfg_yaml = config_to_yaml_str(cfg_obj, use_orig_values=True)
+            if cfg_yaml:
+                print(cfg_yaml, flush=True)
         except Exception:
             logging.info("Recipe config: <unavailable>")
 
