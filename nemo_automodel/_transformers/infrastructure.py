@@ -393,12 +393,13 @@ def apply_model_infrastructure(
             model, mesh.tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
         )
 
-    # When no PP and no TP, load checkpoint first (unwrapped model) so weights and dtypes come from
-    # the checkpoint; then apply FSDP. Otherwise we shard first and load after.
+    # When no pipeline parallelism, load checkpoint first (unwrapped model) so weights and dtypes
+    # come from the checkpoint; then apply TP/EP/FSDP. parallelize_fn uses distribute_tensor() and
+    # preserves parameter data when sharding. Only with PP do we shard first and load after (each
+    # stage has different layers).
     no_pp = autopipeline is None
-    no_tp = mesh.tp_size <= 1
     need_checkpoint_load = bool(pretrained_model_name_or_path and load_base_model)
-    load_before_shard = no_pp and no_tp and need_checkpoint_load
+    load_before_shard = no_pp and need_checkpoint_load
 
     checkpoint_already_loaded = False
     if load_before_shard:
@@ -442,7 +443,7 @@ def apply_model_infrastructure(
         else:
             setattr(model, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
 
-    # Load the checkpoint if needed (meta path, or PP/TP path where we did not load before shard)
+    # Load the checkpoint if needed (meta path, or PP path where we did not load before shard)
     should_load_checkpoint = (
         need_checkpoint_load
         and not checkpoint_already_loaded
