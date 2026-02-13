@@ -97,7 +97,7 @@ class CombinedProjectionStateDictAdapter:
         m = _LAYER_QKV_NATIVE_RE.match(native_key)
         if m:
             self._uses_model_prefix = m.group(1) is not None
-            pre, layer_idx, suffix = m.group(1) or "", int(m.group(2)), m.group(3)
+            layer_idx, suffix = m.group(3)
             prefix = self._prefix(layer_idx)
             return [
                 f"{prefix}.self_attn.q_proj.{suffix}",
@@ -134,8 +134,6 @@ class CombinedProjectionStateDictAdapter:
         """Return the view/slice of the native tensor for the given HF key."""
         m = _LAYER_QKV_NATIVE_RE.match(native_fqn)
         if m:
-            layer_idx, suffix = int(m.group(2)), m.group(3)
-            prefix = self._prefix(layer_idx)
             proj = hf_key.split(".self_attn.")[-1].split(".")[0]  # q_proj, k_proj, v_proj
             total = self.q_size + 2 * self.kv_size
             actual = tensor.shape[0]
