@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from nemo_automodel.components.models.common.te_utils import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3MoeStateDictAdapter
 from nemo_automodel.components.moe.layers import MoEConfig
 
