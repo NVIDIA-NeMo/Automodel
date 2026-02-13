@@ -253,6 +253,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
         model = None  # Ensure 'model' is always bound for the except handler
+        is_custom_model = None
         try:
             with init_ctx:
                 is_custom_model, model = _init_model(
@@ -265,6 +266,29 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     *model_args,
                     **kwargs,
                 )
+        except NotImplementedError as e:
+            if "Cannot copy out of meta tensor" in str(e) and is_meta_device:
+                logger.warning(
+                    "Model init hit 'Cannot copy out of meta tensor' (e.g. HF buffer .to(device)); "
+                    "retrying without meta device.",
+                    flush=True,
+                )
+                del model
+                model = None
+                gc.collect()
+                is_meta_device = False
+                is_custom_model, model = _init_model(
+                    cls,
+                    pretrained_model_name_or_path_or_config,
+                    attn_implementation,
+                    torch_dtype,
+                    quantization_config,
+                    force_hf,
+                    *model_args,
+                    **kwargs,
+                )
+            else:
+                raise
         except ValueError as e:
             if "does not support" in str(e):
                 del model
