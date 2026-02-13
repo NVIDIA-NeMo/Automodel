@@ -105,6 +105,7 @@ from nemo_automodel._transformers.model_init import (  # noqa: E402, F401
     get_hf_config,
     get_is_hf_model,
     local_torch_dtype,
+    no_hf_meta_device,
 )
 
 if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
@@ -269,24 +270,24 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         except NotImplementedError as e:
             if "Cannot copy out of meta tensor" in str(e) and is_meta_device:
                 logger.warning(
-                    "Model init hit 'Cannot copy out of meta tensor' (e.g. HF buffer .to(device)); "
-                    "retrying without meta device.",
-                    flush=True,
+                    "Model init hit 'Cannot copy out of meta tensor' (e.g. buffer created with meta but "
+                    "called .to(device)); retrying without meta device.",
                 )
                 del model
                 model = None
                 gc.collect()
                 is_meta_device = False
-                is_custom_model, model = _init_model(
-                    cls,
-                    pretrained_model_name_or_path_or_config,
-                    attn_implementation,
-                    torch_dtype,
-                    quantization_config,
-                    force_hf,
-                    *model_args,
-                    **kwargs,
-                )
+                with ContextManagers([no_init_weights(), no_hf_meta_device()]):
+                    is_custom_model, model = _init_model(
+                        cls,
+                        pretrained_model_name_or_path_or_config,
+                        attn_implementation,
+                        torch_dtype,
+                        quantization_config,
+                        force_hf,
+                        *model_args,
+                        **kwargs,
+                    )
             else:
                 raise
         except ValueError as e:
