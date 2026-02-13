@@ -117,10 +117,11 @@ class LazyNativeStateDict:
         self._device_mesh = device_mesh
         self._native_backing = native_backing
         self._keys = None
-        if getattr(adapter, "_validate_expert_availability", None) is not None and getattr(adapter, "moe_config", None) is not None:
-            adapter._validate_expert_availability(
-                hf_state_dict, adapter.moe_config.n_routed_experts, device_mesh
-            )
+        if (
+            getattr(adapter, "_validate_expert_availability", None) is not None
+            and getattr(adapter, "moe_config", None) is not None
+        ):
+            adapter._validate_expert_availability(hf_state_dict, adapter.moe_config.n_routed_experts, device_mesh)
 
     def __iter__(self) -> Iterator[str]:
         return self.keys()

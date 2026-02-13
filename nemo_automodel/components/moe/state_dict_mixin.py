@@ -400,7 +400,9 @@ class MoESplitExpertsStateDictMixin:
 
                             ordered = []
                             for expert_id in expert_ids:
-                                down_weight = expert_weights_by_layer[layer_num][native_key][expert_id]  # [dim, inter_dim]
+                                down_weight = expert_weights_by_layer[layer_num][native_key][
+                                    expert_id
+                                ]  # [dim, inter_dim]
 
                                 # Extract local tensor if input is already a DTensor
                                 if is_dtensor(down_weight):

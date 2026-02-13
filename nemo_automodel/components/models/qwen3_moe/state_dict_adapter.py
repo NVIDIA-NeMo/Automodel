@@ -87,9 +87,7 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         if inplace:
             if isinstance(hf_state_dict, LazyHFStateDict):
                 # Round-trip: return native tensors from the backing dict (zero copy, peak = 1x).
-                return LazyNativeStateDict(
-                    hf_state_dict, self, device_mesh, native_backing=hf_state_dict._state_dict
-                )
+                return LazyNativeStateDict(hf_state_dict, self, device_mesh, native_backing=hf_state_dict._state_dict)
             # Lazy/JIT: merge on key access one native key at a time to limit peak memory.
             return LazyNativeStateDict(hf_state_dict, self, device_mesh)
         return self._from_hf_w_merged_experts(hf_state_dict, device_mesh, inplace=False)
