@@ -104,6 +104,64 @@ class TestNeMoAutoTokenizerFromPretrained:
             assert out["attention_mask"] == [[1, 1]]
             assert tok.encode("x") == [5, 6]
 
+    def test_add_bos_token_falls_back_on_value_error(self):
+        """When tokenizer.add_bos_token setter raises ValueError (e.g. transformers v5
+        read-only property), fall back to setting _add_bos_token directly."""
+
+        class _StrictBosTokenizer(_StubHFTokenizer):
+            """Tokenizer whose add_bos_token property raises on set."""
+            bos_token = "<s>"
+            eos_token = "</s>"
+
+            def __init__(self):
+                # Skip parent __init__ which would trigger the strict setter
+                self.bos_token_id = 101
+                self.eos_token_id = 102
+                self.add_eos_token = True
+
+            @property
+            def add_bos_token(self):
+                return getattr(self, "_add_bos_token", False)
+
+            @add_bos_token.setter
+            def add_bos_token(self, value):
+                raise ValueError("read-only in this tokenizer version")
+
+        stub = _StrictBosTokenizer()
+        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub), \
+             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()):
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            assert tok._add_bos_token is True
+
+    def test_add_eos_token_falls_back_on_value_error(self):
+        """When tokenizer.add_eos_token setter raises ValueError,
+        fall back to setting _add_eos_token directly."""
+
+        class _StrictEosTokenizer(_StubHFTokenizer):
+            """Tokenizer whose add_eos_token property raises on set."""
+            bos_token = "<s>"
+            eos_token = "</s>"
+
+            def __init__(self):
+                # Skip parent __init__ which would trigger the strict setter
+                self.bos_token_id = 101
+                self.eos_token_id = 102
+                self.add_bos_token = True
+
+            @property
+            def add_eos_token(self):
+                return getattr(self, "_add_eos_token", False)
+
+            @add_eos_token.setter
+            def add_eos_token(self, value):
+                raise ValueError("read-only in this tokenizer version")
+
+        stub = _StrictEosTokenizer()
+        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub), \
+             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()):
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            assert tok._add_eos_token is True
+
 
 class TestAddTokenHelper:
     def test_input_ids_single_sequence_no_duplicates(self):
