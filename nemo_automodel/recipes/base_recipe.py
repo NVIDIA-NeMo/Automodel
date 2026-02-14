@@ -817,6 +817,46 @@ def _extract_model_signature(cfg: dict) -> dict:
     return sig
 
 
+def _normalize_signature_value(v):
+    """
+    Normalize a signature value so that YAML round-trip and minor type differences
+    (e.g. int vs str, ConfigNode vs dict) do not cause false mismatches.
+    """
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v
+    if isinstance(v, str):
+        # YAML may round-trip numbers as strings; normalize so 32 and "32" match
+        try:
+            f = float(v)
+            return int(f) if f == int(f) else f
+        except (ValueError, TypeError):
+            return v
+    if isinstance(v, dict):
+        return {k: _normalize_signature_value(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_normalize_signature_value(x) for x in v]
+    # ConfigNode or other: try to treat as scalar for comparison
+    if hasattr(v, "_orig_value"):
+        return _normalize_signature_value(getattr(v, "_orig_value"))
+    return v
+
+
+def _signatures_match(cur_sig: dict, ckpt_sig: dict) -> bool:
+    """Compare two model signatures with normalization so YAML round-trip does not cause false mismatches."""
+    if set(cur_sig.keys()) != set(ckpt_sig.keys()):
+        return False
+    for k in cur_sig:
+        cur_v = _normalize_signature_value(cur_sig[k])
+        ckpt_v = _normalize_signature_value(ckpt_sig[k])
+        if cur_v != ckpt_v:
+            return False
+    return True
+
+
 def _is_checkpoint_model_config_compatible(current_cfg, ckpt_dir: str) -> tuple[bool, str]:
     """
     Compare the checkpoint's saved ``config.yaml`` model signature to the
@@ -853,6 +893,6 @@ def _is_checkpoint_model_config_compatible(current_cfg, ckpt_dir: str) -> tuple[
     if not ckpt_sig or not cur_sig:
         return True, "could not extract model signature (cannot validate)"
 
-    if ckpt_sig != cur_sig:
+    if not _signatures_match(cur_sig, ckpt_sig):
         return False, f"model signature mismatch (checkpoint={ckpt_sig}, current={cur_sig})"
     return True, "model signature matches"
