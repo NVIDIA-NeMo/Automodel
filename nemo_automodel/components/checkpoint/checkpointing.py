@@ -1026,32 +1026,40 @@ def _load_full_state_dict_into_model(
     # Pre-populate _extra_state keys with empty tensors for modules that have
     # extra state (e.g. Transformer Engine ops).  HF checkpoints (safetensors)
     # never contain _extra_state entries.  Without pre-population, PyTorch's
-    # set_model_state_dict merges the model's local state dict into the
-    # provided dict, inserting TE's _EXTRA_STATE sentinel objects for every
-    # missing _extra_state key.  If the merge creates a plain dict copy
-    # internally, the _TEExtraStateSanitizingDict.__setitem__ override is
-    # bypassed and the sentinel (which lacks .numel()) reaches TE's
-    # set_extra_state(), causing an AttributeError.  By ensuring the keys
-    # already exist with a valid empty tensor, the merge never inserts
-    # sentinels in the first place.
+    # set_model_state_dict builds a local_state_dict from the model via
+    # _iterate_valid_model_state, inserting _EXTRA_STATE() sentinel objects
+    # (bare Python objects with no .numel()) for every module with a custom
+    # get_extra_state.  These sentinels are merged into our state dict via
+    # state_dict.update(local_state_dict).  If the key already exists with a
+    # valid tensor, the sentinel overwrites it — but _broadcast_state_dict /
+    # _distribute_state_dict will have already replaced the sentinel in
+    # local_state_dict with the broadcast/distributed tensor, so the update
+    # is harmless.
+    #
+    # IMPORTANT: named_modules() returns paths that include wrapper prefixes
+    # like _checkpoint_wrapped_module, but PyTorch's _get_fqns() strips
+    # _CHECKPOINT_PREFIX from FQNs.  We must do the same so our keys match
+    # what _load_model_state_dict actually looks up.
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        _CHECKPOINT_PREFIX,
+    )
+
     for model in model_parts:
         for name, module in model.named_modules():
             if type(module).get_extra_state is not nn.Module.get_extra_state:
                 key = f"{name}._extra_state" if name else "_extra_state"
+                key = key.replace(_CHECKPOINT_PREFIX, "")
                 if key not in state_dict:
                     state_dict[key] = torch.tensor([], dtype=torch.uint8)
-
-    # Wrap so that when PyTorch merges local_state_dict into our dict, _extra_state
-    # non-tensors (TE's _EXTRA_STATE) are stored as empty tensors instead.
-    state_dict = _TEExtraStateSanitizingDict(state_dict)
 
     options = StateDictOptions(
         strict=False,
         full_state_dict=True,
         broadcast_from_rank0=True,
     )
-    func = partial(set_model_state_dict, model_state_dict=state_dict, options=options)
-    list(map(func, model_parts))
+
+    for part in model_parts:
+        set_model_state_dict(part, model_state_dict=state_dict, options=options)
 
 
 def _convert_checkpoint_with_transformers(
