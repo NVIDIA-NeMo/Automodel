@@ -287,7 +287,7 @@ Assuming the above `yaml` is saved in a file named `sft_guide.yaml` (or `peft_gu
 When NeMo AutoModel is installed on your system, it includes the `automodel` CLI program that you
 can use to run jobs, locally or on distributed environments.
 
-You can use PEFT recipes via the NeMo Run CLI (See [NeMo-Run 
+You can use PEFT recipes via the NeMo Run CLI (See the [NeMo Run 
 documentation](https://github.com/NVIDIA/NeMo-Run) for more details). LoRA are registered as factory classes, so you can specify `peft=<lora/none>`
 directly in the terminal. This provides a quick and easy way to launch
 training jobs when you do not need to override any configuration from
