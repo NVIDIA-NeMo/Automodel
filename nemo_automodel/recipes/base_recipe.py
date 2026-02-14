@@ -517,20 +517,26 @@ class BaseRecipe:
         cfg = getattr(self, "cfg", None)
         if cfg is not None:
             ok, reason = _is_checkpoint_model_config_compatible(cfg, ckpt_dir)
-            if not ok and is_rank_0:
+            if not ok:
                 if not restore_from:
-                    # Auto-detected: skip restore to avoid loading stale/incompatible checkpoints
-                    logging.warning(
-                        f"Auto-detected checkpoint at {ckpt_dir} is incompatible with current "
-                        f"model configuration: {reason}. Skipping restore."
-                    )
+                    # Auto-detected: skip restore to avoid loading stale/incompatible checkpoints.
+                    # The return must happen on ALL ranks; restricting it to rank 0 would
+                    # cause non-rank-0 processes to continue into collective load operations
+                    # (e.g. set_model_state_dict with broadcast_from_rank0) while rank 0 has
+                    # already exited, leading to a deadlock.
+                    if is_rank_0:
+                        logging.warning(
+                            f"Auto-detected checkpoint at {ckpt_dir} is incompatible with current "
+                            f"model configuration: {reason}. Skipping restore."
+                        )
                     return
                 else:
                     # Explicit restore_from: warn but honour the user's request
-                    logging.warning(
-                        f"Checkpoint at {ckpt_dir} may be incompatible with current model "
-                        f"configuration: {reason}. Proceeding with restore anyway."
-                    )
+                    if is_rank_0:
+                        logging.warning(
+                            f"Checkpoint at {ckpt_dir} may be incompatible with current model "
+                            f"configuration: {reason}. Proceeding with restore anyway."
+                        )
 
         if is_rank_0:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)
