@@ -59,6 +59,9 @@ distributed:
   pp_size: 1
   ep_size: 8
 
+  sequence_parallel: false
+  activation_checkpointing: true
+
   pipeline:
     pp_schedule: interleaved1f1b
     pp_microbatch_size: 4
