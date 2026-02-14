@@ -150,7 +150,7 @@ peft:
 
 
 # As mentioned earlier, we are using the SQuAD dataset. NeMo AutoModel provides the make_squad_dataset
-# function which formats and prepares the dataset (e.g., formatting). We are using the "train"
+# function which formats and prepares the dataset (e.g., formatting). We are using the "train" split.
 dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
