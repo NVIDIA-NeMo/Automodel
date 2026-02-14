@@ -467,6 +467,7 @@ class ConfigNode:
         # does not leak secrets (e.g., `${oc.env:HF_TOKEN}` remains in YAML output).
         config_kwargs = resolve_yaml_env_vars(config_kwargs)
 
+        import traceback
         try:
             return func(*args, **config_kwargs)
         except Exception as e:
@@ -486,7 +487,8 @@ class ConfigNode:
                 ),
                 file=sys.stderr,
             )
-            raise
+            print(traceback.format_exc())
+            raise e
 
     def _instantiate_value(self, v):
         """

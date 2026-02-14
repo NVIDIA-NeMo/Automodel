@@ -15,6 +15,7 @@
 import glob
 import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -191,6 +192,7 @@ class Checkpointer:
         if self.config.is_peft:
             self._addons.append(PeftAddon())
 
+    @torch.no_grad()
     def save_model(
         self,
         model: nn.Module,
@@ -272,6 +274,7 @@ class Checkpointer:
                 staging_dir=self.config.staging_dir,
             )
 
+    @torch.no_grad()
     def save_optimizer(
         self, optimizer: torch.optim.Optimizer, model: nn.Module, weights_path: str, scheduler: Optional[Any] = None
     ) -> None:
@@ -307,6 +310,7 @@ class Checkpointer:
         self._do_load(state_dict, os.path.join(weights_path, "optim"))
         optimizer_state.load_state_dict(state_dict)
 
+    @torch.no_grad()
     def load_model(
         self,
         model: nn.Module,
@@ -354,22 +358,39 @@ class Checkpointer:
                 return
 
         # When loading base model for a single model and the checkpoint is safetensors (not DCP),
-        # load into new tensors so checkpoint dtypes (e.g. bf16) are preserved. If the model is
-        # already sharded (DTensors), use set_model_state_dict with full_state_dict=True to
-        # scatter into the sharded model (same as tensor-merging path).
+        # load the full state dict on every rank and use set_model_state_dict with
+        # full_state_dict=True (no broadcast) so each rank independently slices its
+        # local DTensor shard.  This avoids NCCL collectives entirely, side-stepping
+        # the broadcast_from_rank0 hang where rank 0's synchronous CPU→GPU copies
+        # fall behind other ranks' async allocations.
         if is_init_step and len(model_state.model) == 1 and _is_safetensors_checkpoint(model_path):
+            t0 = time.monotonic()
             state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
+            t_disk = time.monotonic()
             if state_dict_from_disk is not None:
                 state_dict_from_disk = _maybe_adapt_state_dict_from_hf(
                     model_state.model[0], state_dict_from_disk, moe_mesh=self.moe_mesh
                 )
-                if _model_has_dtensors(model_state.model[0]):
-                    _load_full_state_dict_into_model(model_state.model, state_dict_from_disk)
-                else:
-                    model_state.load_state_dict(
-                        state_dict_from_disk, strict=not (len(model_state.model) > 1 or has_state_dict_adapter)
-                    )
-                return
+            else:
+                state_dict_from_disk = {}
+            total_bytes = sum(
+                t.nelement() * t.element_size()
+                for t in state_dict_from_disk.values()
+                if isinstance(t, torch.Tensor)
+            )
+            _load_full_state_dict_into_model(model_state.model, state_dict_from_disk)
+            t_end = time.monotonic()
+
+            disk_s = t_disk - t0
+            dist_s = t_end - t_disk
+            total_s = t_end - t0
+            gb = total_bytes / (1 << 30)
+            logging.info(
+                f"load_model: {gb:.2f} GB loaded in {total_s:.2f}s "
+                f"({gb / total_s:.2f} GB/s overall | "
+                f"disk read {disk_s:.2f}s, distribute {dist_s:.2f}s)"
+            )
+            return
 
         # Standard loading path (DCP copies into model's existing tensors; dtypes follow the model)
         state_dict = model_state.state_dict()
@@ -389,8 +410,15 @@ class Checkpointer:
 
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
 
-        state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
-        model_state.load_state_dict(state_dict, strict=not (len(model_state.model) > 1 or has_state_dict_adapter))
+        state_dict = _maybe_adapt_state_dict_from_hf(
+            model_state.model[0],
+            state_dict,
+            moe_mesh=self.moe_mesh
+        )
+        model_state.load_state_dict(
+            state_dict,
+            strict=not (len(model_state.model) > 1 or has_state_dict_adapter)
+        )
 
     def load_base_model(
         self,
@@ -989,22 +1017,6 @@ def _apply(module, fn, recurse=True) -> nn.Module:
     return module
 
 
-class _TEExtraStateSanitizingDict(dict):
-    """
-    Dict wrapper for the state dict passed to set_model_state_dict(..., full_state_dict=True).
-
-    PyTorch merges the model's local_state_dict into this dict (state_dict.update(local_state_dict)).
-    Transformer Engine's get_extra_state() returns a non-tensor (_EXTRA_STATE), but set_extra_state
-    expects a tensor. On __setitem__, we replace non-tensor _extra_state values with an empty tensor
-    so TE never sees _EXTRA_STATE. Checkpoint-origin _extra_state (tensors) is stored as-is.
-    """
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        if "_extra_state" in key and not isinstance(value, torch.Tensor):
-            value = torch.tensor([], dtype=torch.uint8)
-        super().__setitem__(key, value)
-
-
 def _load_full_state_dict_into_model(
     model_parts: list[nn.Module],
     state_dict: dict[str, torch.Tensor],
@@ -1012,30 +1024,33 @@ def _load_full_state_dict_into_model(
     """
     Load a full (non-sharded) state dict into a potentially FSDP-wrapped model.
 
-    Uses PyTorch's set_model_state_dict with full_state_dict=True to properly
-    shard the tensors when loading into DTensors.
+    Every rank must supply the **full** state dict.  PyTorch's
+    ``set_model_state_dict`` with ``full_state_dict=True`` (but **not**
+    ``broadcast_from_rank0``) calls ``_distribute_state_dict`` which lets
+    each rank independently slice its local DTensor shard from the full
+    tensor -- no NCCL collectives are needed.
+
+    We intentionally avoid ``broadcast_from_rank0=True`` because it
+    introduces an asymmetric workload: rank 0 does a synchronous CPU→GPU
+    copy (``.to(device)``) per tensor while other ranks only do
+    ``torch.empty`` (async allocation).  The non-src ranks race ahead
+    enqueuing hundreds of NCCL broadcasts that rank 0 cannot keep up with,
+    leading to a 60 s NCCL watchdog timeout.
+
+    After loading, floating-point parameters are converted to match the
+    checkpoint dtype.  PyTorch's ``set_model_state_dict`` uses *copy*
+    semantics (``assign=False``) for non-meta parameters, which preserves
+    the model's initialisation dtype instead of the checkpoint dtype.
+    The post-load fixup ensures the safetensors dtype (e.g. bf16) is
+    honoured.
 
     Args:
         model_parts: List of model parts (for pipeline parallelism)
-        state_dict: Full state dict with regular tensors
+        state_dict: Full state dict with regular tensors.  Must be
+            populated on **every** rank (not just rank 0).
     """
-    from functools import partial
-
     from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
-    # Pre-populate _extra_state keys with empty tensors for modules that have
-    # extra state (e.g. Transformer Engine ops).  HF checkpoints (safetensors)
-    # never contain _extra_state entries.  Without pre-population, PyTorch's
-    # set_model_state_dict builds a local_state_dict from the model via
-    # _iterate_valid_model_state, inserting _EXTRA_STATE() sentinel objects
-    # (bare Python objects with no .numel()) for every module with a custom
-    # get_extra_state.  These sentinels are merged into our state dict via
-    # state_dict.update(local_state_dict).  If the key already exists with a
-    # valid tensor, the sentinel overwrites it — but _broadcast_state_dict /
-    # _distribute_state_dict will have already replaced the sentinel in
-    # local_state_dict with the broadcast/distributed tensor, so the update
-    # is harmless.
-    #
     # IMPORTANT: named_modules() returns paths that include wrapper prefixes
     # like _checkpoint_wrapped_module, but PyTorch's _get_fqns() strips
     # _CHECKPOINT_PREFIX from FQNs.  We must do the same so our keys match
@@ -1052,14 +1067,17 @@ def _load_full_state_dict_into_model(
                 if key not in state_dict:
                     state_dict[key] = torch.tensor([], dtype=torch.uint8)
 
+    # full_state_dict=True WITHOUT broadcast_from_rank0: every rank already
+    # has the full checkpoint, so _distribute_state_dict slices each rank's
+    # local DTensor shard independently -- zero NCCL collectives.
     options = StateDictOptions(
         strict=False,
         full_state_dict=True,
-        broadcast_from_rank0=True,
     )
 
     for part in model_parts:
         set_model_state_dict(part, model_state_dict=state_dict, options=options)
+
 
 
 def _convert_checkpoint_with_transformers(
