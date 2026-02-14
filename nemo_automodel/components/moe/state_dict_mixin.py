@@ -574,12 +574,15 @@ class MoESplitExpertsStateDictMixin:
             for i, w in enumerate(splits):
                 expert_id = self._last_expert_ids[i]
                 if self._is_gated_moe:
-                    w_gate = w[:, :inter_dim].transpose(0, 1)
-                    w_up = w[:, inter_dim:].transpose(0, 1)
+                    # .contiguous() produces independent copies so the merged
+                    # tensor can be freed (important for inplace memory savings
+                    # and correct serialisation).
+                    w_gate = w[:, :inter_dim].transpose(0, 1).contiguous()
+                    w_up = w[:, inter_dim:].transpose(0, 1).contiguous()
                     result.append((self._build_hf_key(layer_num, expert_id, "gate_proj"), w_gate))
                     result.append((self._build_hf_key(layer_num, expert_id, "up_proj"), w_up))
                 else:
-                    w_up = w.transpose(0, 1)
+                    w_up = w.transpose(0, 1).contiguous()
                     result.append((self._build_hf_key(layer_num, expert_id, "up_proj"), w_up))
             return result
 
@@ -596,7 +599,7 @@ class MoESplitExpertsStateDictMixin:
             result = []
             for i, w in enumerate(splits):
                 expert_id = self._last_expert_ids[i]
-                result.append((self._build_hf_key(layer_num, expert_id, "down_proj"), w.transpose(0, 1)))
+                result.append((self._build_hf_key(layer_num, expert_id, "down_proj"), w.transpose(0, 1).contiguous()))
             return result
 
         return None

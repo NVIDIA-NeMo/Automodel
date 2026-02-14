@@ -530,6 +530,10 @@ class Checkpointer:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
         else:
+            # LazyHFStateDict (and similar wrappers) are read-only; DCP requires
+            # __setitem__ support, so materialise into a plain dict first.
+            if not isinstance(state_dict, dict):
+                state_dict = dict(state_dict.items())
             dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
         return state_dict
 

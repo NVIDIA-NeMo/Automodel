@@ -18,6 +18,7 @@ Lives in the models component so adapters (combined_projection, qwen3_moe, etc.)
 can use it without pulling in the checkpoint component.
 """
 
+import re as _re
 from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 if TYPE_CHECKING:
@@ -60,19 +61,33 @@ def get_native_keys_lazy(adapter: Any, hf_state_dict: dict[str, Any]) -> list[st
 
 
 class LazyHFStateDict:
-    """Dict-like wrapper that converts native -> HF on key access (JIT). Reduces peak GPU memory."""
+    """Dict-like wrapper that converts native -> HF on key access (JIT). Reduces peak GPU memory.
 
-    def __init__(self, state_dict: dict[str, Any], adapter: Any) -> None:
+    Args:
+        state_dict: Native model state dict.
+        adapter: State dict adapter with key-mapping helpers.
+        exclude_key_regex: Optional regex pattern. Keys matching this pattern are
+            excluded from iteration/containment (e.g. ``r".*_extra_state.*"``).
+    """
+
+    def __init__(self, state_dict: dict[str, Any], adapter: Any, exclude_key_regex: Optional[str] = None) -> None:
         self._state_dict = state_dict
         self._adapter = adapter
+        self._exclude_key_regex = exclude_key_regex
         self._keys: Optional[list[str]] = None
+
+    def _compute_keys(self) -> list[str]:
+        keys = get_hf_keys_lazy(self._adapter, self._state_dict)
+        if self._exclude_key_regex:
+            keys = [k for k in keys if not _re.match(self._exclude_key_regex, k)]
+        return keys
 
     def __iter__(self) -> Iterator[str]:
         return self.keys()
 
     def keys(self) -> Iterator[str]:
         if self._keys is None:
-            self._keys = get_hf_keys_lazy(self._adapter, self._state_dict)
+            self._keys = self._compute_keys()
         return iter(self._keys)
 
     def __getitem__(self, hf_key: str) -> Any:
@@ -87,12 +102,12 @@ class LazyHFStateDict:
 
     def __contains__(self, key: object) -> bool:
         if self._keys is None:
-            self._keys = get_hf_keys_lazy(self._adapter, self._state_dict)
+            self._keys = self._compute_keys()
         return key in self._keys
 
     def __len__(self) -> int:
         if self._keys is None:
-            self._keys = get_hf_keys_lazy(self._adapter, self._state_dict)
+            self._keys = self._compute_keys()
         return len(self._keys)
 
     def items(self) -> Iterator[tuple[str, Any]]:

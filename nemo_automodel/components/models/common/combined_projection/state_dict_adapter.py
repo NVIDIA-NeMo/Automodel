@@ -340,7 +340,7 @@ class CombinedProjectionStateDictAdapter:
         inplace = bool(kwargs.get("inplace", False))
         if inplace:
             # Lazy/JIT: convert on key access so only one tensor (view) is materialized at a time.
-            return LazyHFStateDict(state_dict, self)
+            return LazyHFStateDict(state_dict, self, exclude_key_regex=exclude_key_regex)
         hf_state_dict = {}
         processed_keys = set()
 
