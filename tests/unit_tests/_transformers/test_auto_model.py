@@ -89,7 +89,7 @@ class TestUtilityFunctions:
 
     def test_assert_same_signature_matching(self):
         """Test _assert_same_signature with matching signatures."""
-        from nemo_automodel._transformers.auto_model import _assert_same_signature
+        from nemo_automodel._transformers.kernel_patches import _assert_same_signature
 
         def func1(a, b, c=None):
             pass
@@ -102,7 +102,7 @@ class TestUtilityFunctions:
 
     def test_assert_same_signature_different(self):
         """Test _assert_same_signature with different signatures."""
-        from nemo_automodel._transformers.auto_model import _assert_same_signature
+        from nemo_automodel._transformers.kernel_patches import _assert_same_signature
 
         def func1(a, b, c=None):
             pass
