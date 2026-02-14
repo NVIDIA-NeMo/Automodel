@@ -384,9 +384,7 @@ class Checkpointer:
                 state_dict_from_disk = _apply_key_mapping(state_dict_from_disk, key_mapping)
 
             total_bytes = sum(
-                t.nelement() * t.element_size()
-                for t in state_dict_from_disk.values()
-                if isinstance(t, torch.Tensor)
+                t.nelement() * t.element_size() for t in state_dict_from_disk.values() if isinstance(t, torch.Tensor)
             )
             _load_full_state_dict_into_model(model_state.model, state_dict_from_disk)
             t_end = time.monotonic()
@@ -420,15 +418,8 @@ class Checkpointer:
 
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
 
-        state_dict = _maybe_adapt_state_dict_from_hf(
-            model_state.model[0],
-            state_dict,
-            moe_mesh=self.moe_mesh
-        )
-        model_state.load_state_dict(
-            state_dict,
-            strict=not (len(model_state.model) > 1 or has_state_dict_adapter)
-        )
+        state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
+        model_state.load_state_dict(state_dict, strict=not (len(model_state.model) > 1 or has_state_dict_adapter))
 
     def load_base_model(
         self,
@@ -1100,8 +1091,6 @@ def _load_full_state_dict_into_model(
         state_dict: Full state dict with regular tensors.  Must be
             populated on **every** rank (not just rank 0).
     """
-    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
-
     # IMPORTANT: named_modules() returns paths that include wrapper prefixes
     # like _checkpoint_wrapped_module, but PyTorch's _get_fqns() strips
     # _CHECKPOINT_PREFIX from FQNs.  We must do the same so our keys match
@@ -1109,6 +1098,7 @@ def _load_full_state_dict_into_model(
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
         _CHECKPOINT_PREFIX,
     )
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
     for model in model_parts:
         for name, module in model.named_modules():
@@ -1128,7 +1118,6 @@ def _load_full_state_dict_into_model(
 
     for part in model_parts:
         set_model_state_dict(part, model_state_dict=state_dict, options=options)
-
 
 
 def _convert_checkpoint_with_transformers(
