@@ -29,15 +29,18 @@ import transformer_engine.pytorch.ops.op as te_ops
 _original_set_extra_state = te_base.TransformerEngineBaseModule.set_extra_state
 _original_op_set_extra_state = te_ops.BasicOperation.set_extra_state
 
+
 def _safe_set_extra_state(self, state):
     if state is not None and "EXTRA_STATE" in str(type(state)):
         return
     return _original_set_extra_state(self, state)
 
+
 def _safe_op_set_extra_state(self, state):
     if state is not None and "EXTRA_STATE" in str(type(state)):
         return
     return _original_op_set_extra_state(self, state)
+
 
 te_base.TransformerEngineBaseModule.set_extra_state = _safe_set_extra_state
 te_ops.BasicOperation.set_extra_state = _safe_op_set_extra_state
@@ -241,7 +244,7 @@ class ModelState:
             _drop_outer_prefix(state_dict, "base_model.model.")
             # DoRA: reverse the HF PEFT key rename so DCP can match model params
             _rename_dora_keys_from_hf(state_dict)
-            
+
             options = StateDictOptions(strict=False, full_state_dict=True)
 
         # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
