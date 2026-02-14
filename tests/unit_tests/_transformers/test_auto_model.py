@@ -23,10 +23,10 @@ from nemo_automodel._transformers.auto_model import (
     _get_next_fallback_attn,
     _init_model,
     _patch_attention,
-    _apply_peft_and_lower_precision,
     _consume_config_overrides,
-    _filter_kwargs_for_init,
 )
+from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
+from nemo_automodel._transformers.model_init import _filter_kwargs_for_init
 from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
