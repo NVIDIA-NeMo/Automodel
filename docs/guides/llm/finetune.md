@@ -5,7 +5,7 @@
 As large language models (LLMs) become more powerful, adapting them to
 specific tasks through fine-tuning has become essential for achieving
 high accuracy and relevance. There are two ways to do so: 
-- **Supervised Fine-Tuning (SFT)** applies full-parameter update to the pretrained model. It is useful for tasks that require high precision although it requires more computational resources.
+- **Supervised Fine-Tuning (SFT)** applies full-parameter update to the pretrained model. It is useful for tasks that require high precision, although it requires more computational resources.
 - **PEFT**, specifically [Low-Rank Adapters (LoRA)](https://arxiv.org/abs/2106.09685), updates only a small subset of parameters while keeping the base model weights frozen. It is lightweight and reduces the number of trainable parameters, often to less than 1%, while achieving decent accuracy. 
 
 NeMo AutoModel simplifies the fine-tuning process by offering seamless
