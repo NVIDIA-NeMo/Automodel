@@ -468,6 +468,7 @@ class ConfigNode:
         config_kwargs = resolve_yaml_env_vars(config_kwargs)
 
         import traceback
+
         try:
             return func(*args, **config_kwargs)
         except Exception as e:
