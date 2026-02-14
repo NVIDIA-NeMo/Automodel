@@ -554,13 +554,7 @@ class Checkpointer:
         """
         # Both model and optimizer saving is done in this function
         is_model = True if "/model" in path else False
-        # PEFT adapter weights are small – load on every rank so all ranks
-        # have an identical, correct state dict.  The previous approach loaded
-        # only on rank 0 and relied on set_model_state_dict(broadcast_from_rank0=True)
-        # to distribute the values.  However, when the model was initialised on
-        # meta device the LoRA adapter DTensor shards on non-rank-0 contain
-        # uninitialised garbage, and the broadcast can silently fail to
-        # overwrite them, producing NaN during the next forward pass.
+        # PEFT loading is broadcasted from rank0 so it is a special case
         if self.config.is_peft and is_model and (not is_init_step):
             state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
         else:
