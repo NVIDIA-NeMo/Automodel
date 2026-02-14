@@ -37,7 +37,10 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   trust_remote_code: true
-  force_hf: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    rms_norm: torch
+    linear: torch
 
 # torch.compile configuration
 compile:
@@ -49,7 +52,7 @@ compile:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  exclude_modules: ["*.out_proj"]  # mamba layers use custom kernels that take in the out_proj.weight directly, thus lora doesn't work here.
   dim: 8
   alpha: 32
   use_triton: True
@@ -59,6 +62,7 @@ distributed:
   dp_size: none
   tp_size: 1
   cp_size: 1
+  ep_size: 4
 
   sequence_parallel: false
 
