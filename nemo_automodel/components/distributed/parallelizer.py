@@ -901,9 +901,11 @@ def _get_parallel_plan(
                 f"Error: {e}"
             )
 
-    elif model_cls in PARALLELIZE_FUNCTIONS:
+    elif model_cls in PARALLELIZE_FUNCTIONS or model_cls.__name__ in {k.__name__ for k in PARALLELIZE_FUNCTIONS}:
+        func = PARALLELIZE_FUNCTIONS.get(model_cls) or next(
+            f for k, f in PARALLELIZE_FUNCTIONS.items() if k.__name__ == model_cls.__name__
+        )
         try:
-            func = PARALLELIZE_FUNCTIONS[model_cls]
             model_parallel_plan = func(model, sequence_parallel)
             logger.info("Using optimized parallel plan.")
         except Exception as e:
