@@ -20,22 +20,22 @@ import os
 import shutil
 from pathlib import Path
 
-import datasets
-import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.distributed.tensor
 import torch.nn as nn
-import yaml
 from peft import PeftModel
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM
+import yaml
+import pytest
 
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction, calculate_loss
 
+import datasets
 datasets.disable_caching()
 
 def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
@@ -298,7 +298,6 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
                 trainer.model_parts,
                 trainer.optimizer,
                 trainer.lr_scheduler,
-                trainer.checkpointer.config.is_peft,
             ).state_dict()["optim"]
         )
 

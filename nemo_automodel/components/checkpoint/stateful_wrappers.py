@@ -86,11 +86,12 @@ def _has_expert_parallelism(model: torch.nn.Module) -> bool:
 
 
 def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
-    """Extract only trainable PEFT adapter weights, bypassing DCP for quantized models.
+    """Extract only trainable PEFT adapter weights, bypassing DCP.
 
     This function directly iterates over model parameters to collect trainable weights,
-    avoiding PyTorch DCP's state_dict traversal which fails on BitsAndBytes quantized
-    modules (Params4bit, Int8Params, etc.).
+    avoiding PyTorch DCP's state_dict traversal which fails on (1) BitsAndBytes quantized
+    modules (Params4bit, Int8Params, etc.) and (2) MoE models with expert parallelism
+    where expert weights are sharded across EP ranks.
     """
     state_dict = {}
     for name, param in model.named_parameters():
@@ -214,12 +215,12 @@ class ModelState:
         if self.is_init_step:
             return self._get_base_model_state_dict()
 
-        # For PEFT (LoRA/QLoRA/DoRA), only save trainable adapter weights. We bypass
-        # get_model_state_dict() because: (1) with quantized params (QLoRA) DCP fails
-        # traversing Params4bit; (2) with expert parallelism (MoE+EP) DCP expects
-        # full-model FQNs and raises KeyError when popping expert params that are
-        # sharded across ranks. Direct collection ensures we save only adapter weights,
-        # matching dense LLaMA/Qwen LoRA behavior and fixing MoE LoRA checkpointing.
+        # For PEFT models with quantized parameters or expert parallelism, bypass
+        # PyTorch DCP's get_model_state_dict() which fails when: (1) traversing
+        # quantized parameter types like Params4bit (QLoRA with BitsAndBytes); or
+        # (2) expert weights are sharded across EP ranks (MoE+EP), causing DCP to
+        # raise KeyError on expert-parallel FQNs. Instead, directly collect
+        # trainable PEFT adapter weights.
         if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
             model_state_dict = {k: v for sd in map(_get_peft_state_dict, self.model) for k, v in sd.items()}
         else:
@@ -357,10 +358,12 @@ class OptimizerState:
         Returns:
             dict: Dictionary containing the optimizer and scheduler state dicts with CPU offloading enabled.
         """
-        # For PEFT (LoRA/QLoRA/DoRA), bypass DCP's get_optimizer_state_dict() which
-        # builds a parameter-ID-to-FQN mapping from the full model and then fails
-        # (KeyError) when the optimizer only has state for trainable params and the
-        # model is sharded (e.g. MoE+EP). Use native optimizer state_dict instead.
+        # For PEFT models with quantized parameters or expert parallelism, bypass
+        # PyTorch DCP's get_optimizer_state_dict() which fails because DCP cannot
+        # build a consistent parameter-ID-to-FQN mapping when the model contains
+        # quantized frozen params (Params4bit/Int8Params) alongside trainable LoRA
+        # params, or when expert weights are sharded across EP ranks (MoE+EP) and
+        # the optimizer only tracks trainable params. Use native state_dict instead.
         if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
             optimizer_state_dict = self.optimizer[0].state_dict()
         else:
@@ -387,7 +390,7 @@ class OptimizerState:
         Args:
             state_dict (dict): State dictionary containing optimizer and scheduler states to load.
         """
-        # For PEFT, use native load to match the native save path.
+        # For PEFT + quantized or expert-parallel models, use native load to match the native save path.
         if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
             self.optimizer[0].load_state_dict(state_dict["optim"])
         else:
