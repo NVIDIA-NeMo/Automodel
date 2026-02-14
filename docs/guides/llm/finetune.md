@@ -59,7 +59,7 @@ the Hugging Face Hub that is supported as per [model coverage](https://github.co
 
 #### Access Gated Models
 
-Some Hugging Face model repositories are **gated**, you must explicitly request permission before you can download their files. If the model page shows a "Request access" or "Agree and access" button:
+Some Hugging Face model repositories are **gated**. Request permission before you download their files. If the model page shows a "Request access" or "Agree and access" button:
 
 1.  Log in with your Hugging Face account.
 2.  Click the button and accept the license terms.
