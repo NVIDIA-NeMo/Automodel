@@ -990,6 +990,22 @@ def _apply(module, fn, recurse=True) -> nn.Module:
     return module
 
 
+class _TEExtraStateSanitizingDict(dict):
+    """
+    Dict wrapper for the state dict passed to set_model_state_dict(..., full_state_dict=True).
+
+    PyTorch merges the model's local_state_dict into this dict (state_dict.update(local_state_dict)).
+    Transformer Engine's get_extra_state() returns a non-tensor (_EXTRA_STATE), but set_extra_state
+    expects a tensor. On __setitem__, we replace non-tensor _extra_state values with an empty tensor
+    so TE never sees _EXTRA_STATE. Checkpoint-origin _extra_state (tensors) is stored as-is.
+    """
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        if "_extra_state" in key and not isinstance(value, torch.Tensor):
+            value = torch.tensor([], dtype=torch.uint8)
+        super().__setitem__(key, value)
+
+
 def _load_full_state_dict_into_model(
     model_parts: list[nn.Module],
     state_dict: dict[str, torch.Tensor],
@@ -1008,14 +1024,15 @@ def _load_full_state_dict_into_model(
 
     from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
-    # Use full_state_dict=True to tell PyTorch this is a complete, non-sharded state dict
-    # It will properly shard the tensors to match the model's DTensor layout
+    # Wrap so that when PyTorch merges local_state_dict into our dict, _extra_state
+    # non-tensors (TE's _EXTRA_STATE) are stored as empty tensors instead.
+    state_dict = _TEExtraStateSanitizingDict(state_dict)
+
     options = StateDictOptions(
         strict=False,
-        full_state_dict=True,  # Key: indicates state_dict contains full (non-sharded) tensors
-        broadcast_from_rank0=True,  # Broadcast from rank 0 to other ranks
+        full_state_dict=True,
+        broadcast_from_rank0=True,
     )
-
     func = partial(set_model_state_dict, model_state_dict=state_dict, options=options)
     list(map(func, model_parts))
 
