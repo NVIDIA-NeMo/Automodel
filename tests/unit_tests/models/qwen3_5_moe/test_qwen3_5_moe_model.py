@@ -639,3 +639,328 @@ class TestQwen3_5MoeFromPretrainedAndModelClass:
 
     def test_modelclass_export_exists(self):
         assert ModelClass is Qwen3_5MoeForConditionalGeneration
+
+
+# ---------------------------------------------------------------------------
+# Qwen3_5MoeModel — VL vision/multimodal forward path
+# ---------------------------------------------------------------------------
+class TestQwen3_5MoeModelVLPath:
+    def test_forward_delegates_to_hf_vl_when_pixel_values_present(self, vl_config, backend_config, moe_config, device):
+        """When pixel_values and visual encoder exist, super().forward() handles VL logic."""
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+            Qwen3_5MoeModel as HFQwen3_5MoeModel,
+        )
+
+        model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        core = model.model
+        model_dtype = next(model.parameters()).dtype
+
+        batch, seq_len = 1, 4
+        input_ids = torch.randint(0, vl_config.text_config.vocab_size, (batch, seq_len), device=device)
+        pixel_values = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
+        image_grid_thw = torch.tensor([[1, 2, 2]], device=device)
+
+        mock_output = MagicMock()
+        mock_output.last_hidden_state = torch.randn(
+            batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=model_dtype
+        )
+
+        with patch.object(HFQwen3_5MoeModel, "forward", return_value=mock_output) as mock_hf_forward:
+            result = core.forward(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+            )
+
+        mock_hf_forward.assert_called_once()
+        kw = mock_hf_forward.call_args.kwargs
+        assert kw["pixel_values"] is pixel_values
+        assert kw["input_ids"] is None
+        assert kw["inputs_embeds"] is not None
+        assert result is mock_output
+
+
+# ---------------------------------------------------------------------------
+# PP VLM chunk retrieval — edge cases
+# ---------------------------------------------------------------------------
+class TestConditionalGenerationPPVLMChunkEdgeCases:
+    @staticmethod
+    def _run_forward_capturing_kwargs(model, input_ids, device):
+        """Run forward with mocked model.model.forward and return captured kwargs."""
+        model_dtype = next(model.parameters()).dtype
+        batch, seq_len = input_ids.shape
+        hidden_size = model.config.text_config.hidden_size
+        captured = {}
+
+        with patch.object(model.model, "forward") as mock_fwd:
+            out = MagicMock()
+            out.last_hidden_state = torch.randn(batch, seq_len, hidden_size, device=device, dtype=model_dtype)
+
+            def capture(*args, **kwargs):
+                captured.update(kwargs)
+                return out
+
+            mock_fwd.side_effect = capture
+            model.forward(input_ids=input_ids)
+
+        return captured
+
+    def test_forward_chunk_with_3d_grid_hws(self, vl_config, backend_config, moe_config, device):
+        """image_grid_hws with shape[-1]==3 is passed directly as image_grid_thw."""
+        model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        model_dtype = next(model.parameters()).dtype
+
+        pixel_chunk = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
+        grid_3d = torch.tensor([[1, 2, 2]], device=device)
+
+        model._vlm_pixel_values_chunks = [pixel_chunk]
+        model._vlm_image_grid_hws_chunks = [grid_3d]
+        model._vlm_chunk_idx = 0
+
+        input_ids = torch.tensor([[vl_config.image_token_id, 1, 2, 3]], device=device)
+        captured = self._run_forward_capturing_kwargs(model, input_ids, device)
+
+        torch.testing.assert_close(captured["image_grid_thw"], grid_3d)
+
+    def test_forward_chunk_with_none_grid_hws(self, vl_config, backend_config, moe_config, device):
+        """image_grid_hws is None — image_grid_thw should remain None."""
+        model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        model_dtype = next(model.parameters()).dtype
+
+        pixel_chunk = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
+
+        model._vlm_pixel_values_chunks = [pixel_chunk]
+        model._vlm_image_grid_hws_chunks = [None]
+        model._vlm_chunk_idx = 0
+
+        input_ids = torch.tensor([[vl_config.image_token_id, 1, 2, 3]], device=device)
+        captured = self._run_forward_capturing_kwargs(model, input_ids, device)
+
+        torch.testing.assert_close(captured["pixel_values"], pixel_chunk)
+        assert captured["image_grid_thw"] is None
+
+    def test_forward_chunk_with_empty_grid_hws(self, vl_config, backend_config, moe_config, device):
+        """image_grid_hws with numel()==0 — image_grid_thw should remain None."""
+        model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        model_dtype = next(model.parameters()).dtype
+
+        pixel_chunk = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
+        empty_grid = torch.zeros(0, 3, dtype=torch.long, device=device)
+
+        model._vlm_pixel_values_chunks = [pixel_chunk]
+        model._vlm_image_grid_hws_chunks = [empty_grid]
+        model._vlm_chunk_idx = 0
+
+        input_ids = torch.tensor([[vl_config.image_token_id, 1, 2, 3]], device=device)
+        captured = self._run_forward_capturing_kwargs(model, input_ids, device)
+
+        torch.testing.assert_close(captured["pixel_values"], pixel_chunk)
+        assert captured["image_grid_thw"] is None
+
+    def test_forward_no_media_tokens_skips_chunk_retrieval(self, vl_config, backend_config, moe_config, device):
+        """Input without image/vision_start tokens should not retrieve chunks."""
+        model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        model_dtype = next(model.parameters()).dtype
+
+        pixel_chunk = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
+
+        model._vlm_pixel_values_chunks = [pixel_chunk]
+        model._vlm_image_grid_hws_chunks = [torch.tensor([[2, 2]], device=device)]
+        model._vlm_chunk_idx = 0
+
+        # Token ID 0 should not match the special token IDs (typically > 150000)
+        input_ids = torch.zeros((1, 4), dtype=torch.long, device=device)
+        assert vl_config.image_token_id != 0 and vl_config.vision_start_token_id != 0
+
+        captured = self._run_forward_capturing_kwargs(model, input_ids, device)
+
+        assert model._vlm_chunk_idx == 0  # Not incremented
+        assert "pixel_values" not in captured
+
+    def test_forward_exhausted_chunks_skips_retrieval(self, vl_config, backend_config, moe_config, device):
+        """When chunk_idx >= len(chunks), no pixel_values should be injected."""
+        model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        model_dtype = next(model.parameters()).dtype
+
+        pixel_chunk = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
+
+        model._vlm_pixel_values_chunks = [pixel_chunk]
+        model._vlm_image_grid_hws_chunks = [torch.tensor([[2, 2]], device=device)]
+        model._vlm_chunk_idx = 1  # Already past the single chunk
+
+        input_ids = torch.tensor([[vl_config.image_token_id, 1, 2, 3]], device=device)
+        captured = self._run_forward_capturing_kwargs(model, input_ids, device)
+
+        assert model._vlm_chunk_idx == 1  # Not incremented
+        assert "pixel_values" not in captured
+
+    def test_forward_vision_start_token_triggers_chunk_retrieval(self, vl_config, backend_config, moe_config, device):
+        """vision_start_token_id (not just image_token_id) should trigger chunk retrieval."""
+        assert vl_config.vision_start_token_id is not None
+
+        model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        model_dtype = next(model.parameters()).dtype
+
+        pixel_chunk = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
+        grid_chunk = torch.tensor([[2, 2]], device=device)
+
+        model._vlm_pixel_values_chunks = [pixel_chunk]
+        model._vlm_image_grid_hws_chunks = [grid_chunk]
+        model._vlm_chunk_idx = 0
+
+        input_ids = torch.tensor([[vl_config.vision_start_token_id, 1, 2, 3]], device=device)
+        captured = self._run_forward_capturing_kwargs(model, input_ids, device)
+
+        torch.testing.assert_close(captured["pixel_values"], pixel_chunk)
+        assert model._vlm_chunk_idx == 1
+
+
+# ---------------------------------------------------------------------------
+# TextModelBackend.forward — inputs_embeds provided directly
+# ---------------------------------------------------------------------------
+class TestTextModelBackendInputsEmbedsPath:
+    def test_forward_uses_provided_inputs_embeds_skipping_embed_tokens(self, text_config, backend_config, moe_config, device):
+        """When inputs_embeds is provided, embed_tokens should not be called."""
+        model = Qwen3_5MoeTextModelBackend(text_config, backend=backend_config, moe_config=moe_config).to(device)
+
+        batch, seq_len = 2, 3
+        inputs_embeds = torch.randn(batch, seq_len, text_config.hidden_size, device=device)
+
+        cos = torch.zeros(3, batch, seq_len, text_config.head_dim * 2, device=device)
+        sin = torch.ones_like(cos)
+
+        for layer in model.layers.values():
+            layer.forward = MagicMock(side_effect=lambda x, **_: x)
+
+        with patch.object(model.rotary_emb, "forward", return_value=(cos, sin)):
+            # Pass input_ids=None — would crash if embed_tokens were called with None
+            output = model(input_ids=None, inputs_embeds=inputs_embeds)
+
+        assert isinstance(output, Qwen3_5MoeModelOutputWithPast)
+        assert output.last_hidden_state.shape == (batch, seq_len, text_config.hidden_size)
+
+
+# ---------------------------------------------------------------------------
+# TextModelBackend.forward — padding_mask derived from attention_mask
+# ---------------------------------------------------------------------------
+class TestTextModelBackendPaddingMaskDerivation:
+    def test_forward_derives_padding_mask_from_attention_mask(self, text_config, backend_config, moe_config, device):
+        """When padding_mask is None and attention_mask is given, padding_mask = ~attention_mask."""
+        model = Qwen3_5MoeTextModelBackend(text_config, backend=backend_config, moe_config=moe_config).to(device)
+
+        batch, seq_len = 2, 4
+        input_ids = torch.randint(0, text_config.vocab_size, (batch, seq_len), device=device)
+        attention_mask = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]], device=device)
+
+        cos = torch.zeros(3, batch, seq_len, text_config.head_dim * 2, device=device)
+        sin = torch.ones_like(cos)
+
+        captured = {}
+
+        def layer_forward(x, **kwargs):
+            captured["padding_mask"] = kwargs.get("padding_mask")
+            return x
+
+        for layer in model.layers.values():
+            layer.forward = MagicMock(side_effect=layer_forward)
+
+        with patch.object(model.rotary_emb, "forward", return_value=(cos, sin)):
+            model(input_ids=input_ids, attention_mask=attention_mask)
+
+        expected = attention_mask.bool().logical_not()
+        assert captured["padding_mask"] is not None
+        torch.testing.assert_close(captured["padding_mask"], expected)
+
+
+# ---------------------------------------------------------------------------
+# initialize_weights — TypeError fallback (init_weights without buffer_device)
+# ---------------------------------------------------------------------------
+class TestInitializeWeightsTypeErrorFallback:
+    def test_initialize_weights_retries_without_buffer_device_on_type_error(self, vl_config, backend_config, moe_config):
+        """When init_weights(buffer_device=...) raises TypeError, it retries without args."""
+        model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)
+
+        call_log = []
+
+        def init_that_rejects_kwargs(*args, **kwargs):
+            if kwargs:
+                call_log.append("rejected")
+                raise TypeError("unexpected keyword argument 'buffer_device'")
+            call_log.append("accepted")
+
+        with (
+            patch.object(model.model.language_model, "init_weights", side_effect=init_that_rejects_kwargs),
+            patch("torch.nn.init.trunc_normal_"),
+        ):
+            buffer_ctx = torch.cuda.device(torch.cuda.current_device())
+            model.initialize_weights(buffer_device=buffer_ctx, dtype=torch.float32)
+
+        assert call_log == ["rejected", "accepted"]
+
+
+# ---------------------------------------------------------------------------
+# initialize_weights — lm_head is None
+# ---------------------------------------------------------------------------
+class TestInitializeWeightsNoLmHead:
+    def test_initialize_weights_skips_lm_head_init_when_none(self, vl_config, backend_config, moe_config):
+        """When lm_head is None, trunc_normal_ should not be called for it."""
+        model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)
+        model.lm_head = None
+
+        with (
+            patch.object(model.model.language_model, "init_weights"),
+            patch("torch.nn.init.trunc_normal_") as mock_trunc,
+        ):
+            buffer_ctx = torch.cuda.device(torch.cuda.current_device())
+            model.initialize_weights(buffer_device=buffer_ctx, dtype=torch.float32)
+
+        mock_trunc.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# __init__ — default backend=None
+# ---------------------------------------------------------------------------
+class TestDefaultBackendCreation:
+    def test_init_creates_default_backend_when_none_provided(self, vl_config, moe_config):
+        """Passing no backend should create a default BackendConfig."""
+        model = Qwen3_5MoeForConditionalGeneration(vl_config, moe_config=moe_config)
+
+        assert model.backend is not None
+        assert isinstance(model.backend, BackendConfig)
+
+
+# ---------------------------------------------------------------------------
+# from_config classmethod — direct invocation
+# ---------------------------------------------------------------------------
+class TestFromConfigDirect:
+    def test_from_config_creates_model_directly(self, vl_config, moe_config, backend_config):
+        """from_config should create a model without going through from_pretrained."""
+        model = Qwen3_5MoeForConditionalGeneration.from_config(
+            vl_config, moe_config=moe_config, backend=backend_config
+        )
+
+        assert isinstance(model, Qwen3_5MoeForConditionalGeneration)
+        assert model.backend is backend_config
+
+
+# ---------------------------------------------------------------------------
+# Import guard — unavailability error paths
+# ---------------------------------------------------------------------------
+class TestImportGuardUnavailabilityPaths:
+    def test_from_pretrained_raises_when_hf_unavailable(self):
+        """from_pretrained should raise UnavailableError when transformers lacks qwen3_5_moe."""
+        import nemo_automodel.components.models.qwen3_5_moe.model as qwen35_mod
+        from nemo_automodel.shared.import_utils import UnavailableError
+
+        with patch.object(qwen35_mod, "_QWEN3_5_MOE_HF_AVAILABLE", False):
+            with pytest.raises(UnavailableError):
+                Qwen3_5MoeForConditionalGeneration.from_pretrained("some/path")
+
+    def test_init_raises_when_hf_unavailable(self, vl_config):
+        """__init__ should raise UnavailableError when transformers lacks qwen3_5_moe."""
+        import nemo_automodel.components.models.qwen3_5_moe.model as qwen35_mod
+        from nemo_automodel.shared.import_utils import UnavailableError
+
+        with patch.object(qwen35_mod, "_QWEN3_5_MOE_HF_AVAILABLE", False):
+            with pytest.raises(UnavailableError):
+                Qwen3_5MoeForConditionalGeneration(vl_config)
