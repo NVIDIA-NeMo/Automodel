@@ -383,7 +383,7 @@ The following is an example script using Hugging Face's Transformers library:
 ```python
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import PeftModel #for PEFT
+from peft import PeftModel # for PEFT
 
 #For SFT, Load finetuned checkpoint
 finetuned_ckpt_path = "checkpoints/epoch_0_step_10/model/consolidated"
