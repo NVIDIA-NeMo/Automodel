@@ -73,38 +73,24 @@ if TYPE_CHECKING:
 # that import NEED_SETUP_CACHE_CLASSES_MAPPING from transformers.generation.utils.
 import transformers.generation.utils as _gen_utils  # noqa: E402
 
-from nemo_automodel._transformers.infrastructure import (  # noqa: E402, F401
+from nemo_automodel._transformers.infrastructure import (
     MeshContext,
-    _apply_peft_and_lower_precision,
-    _shard_ep_fsdp,
-    _shard_pp,
     apply_model_infrastructure,
     instantiate_infrastructure,
-    parallelize_for_pp,
 )
-from nemo_automodel._transformers.kernel_patches import (  # noqa: E402, F401
+from nemo_automodel._transformers.kernel_patches import (
     DEFAULT_ATTN_IMPLEMENTATION,
-    HAS_FA,
-    HAS_LIGER_KERNEL,
     _apply_preload_overrides,
-    _assert_same_signature,
     _get_next_fallback_attn,
     _patch_attention,
     _patch_liger_kernel,
     _verify_sdpa_support,
 )
-from nemo_automodel._transformers.model_init import (  # noqa: E402, F401
+from nemo_automodel._transformers.model_init import (
     _consume_config_overrides,
-    _download_model_weights,
-    _filter_kwargs_for_init,
-    _get_init_param_names,
-    _get_mixin_wrapped_class,
     _init_model,
-    _is_config_compatible_with_custom_model,
-    get_architectures,
     get_hf_config,
     get_is_hf_model,
-    local_torch_dtype,
     no_hf_meta_device,
 )
 
