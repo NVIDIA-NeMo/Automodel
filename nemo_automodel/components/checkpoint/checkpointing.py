@@ -373,6 +373,16 @@ class Checkpointer:
                 )
             else:
                 state_dict_from_disk = {}
+
+            # Apply key_mapping (e.g. _checkpoint_conversion_mapping) so that
+            # HF checkpoint keys are renamed to match the model's parameter FQNs.
+            # Without this, VLM models like Gemma3ForConditionalGeneration whose
+            # checkpoint keys differ from their module hierarchy (e.g.
+            # "language_model.model.X" vs "model.language_model.X") would silently
+            # fail to load base weights when using strict=False.
+            if key_mapping and state_dict_from_disk:
+                state_dict_from_disk = _apply_key_mapping(state_dict_from_disk, key_mapping)
+
             total_bytes = sum(
                 t.nelement() * t.element_size()
                 for t in state_dict_from_disk.values()
@@ -442,6 +452,20 @@ class Checkpointer:
         """
         to_empty_parameters_only(model, device=device)
 
+        # to_empty_parameters_only only materializes parameters, not buffers.
+        # Buffers (e.g. RoPE inv_freq) may still be on meta device.  Move them
+        # to *device* with uninitialized storage so that the subsequent
+        # initialize_weights() call can overwrite them with proper values
+        # (HF's _init_weights recomputes non-persistent buffers from config).
+        # Without this, meta buffers would survive until a later model.to_empty()
+        # call, which fills them with recycled GPU memory — values that may
+        # differ between successive model builds in the same process.
+        for module in model.modules():
+            for key in list(module._buffers):
+                buf = module._buffers[key]
+                if buf is not None and buf.device.type == "meta":
+                    module._buffers[key] = torch.empty_like(buf, device=device)
+
         # HF models set _is_hf_initialized to True after initialization.
         # But because we initialize on meta device, these are erroneously set to True.
         # We need to set them to False and call initialize_weights to re-initialize the weights.
@@ -457,7 +481,7 @@ class Checkpointer:
         except:
             model_class = ""
         is_nemotron_v2 = model_class == "NemotronHForCausalLM" and not getattr(model.config, "n_routed_experts", None)
-        skip_initialize_weights = model_class in ["Gemma3ForConditionalGeneration"] or is_nemotron_v2
+        skip_initialize_weights = is_nemotron_v2
         if not skip_initialize_weights:
             for _, module in model.named_modules():
                 if hasattr(module, "_is_hf_initialized"):
@@ -1015,6 +1039,33 @@ def _apply(module, fn, recurse=True) -> nn.Module:
                 out_param.grad = grad_applied.requires_grad_(param_grad.requires_grad)
 
     return module
+
+
+def _apply_key_mapping(
+    state_dict: dict[str, torch.Tensor],
+    key_mapping: dict[str, str],
+) -> dict[str, torch.Tensor]:
+    """
+    Rename state-dict keys using regex-based ``key_mapping``.
+
+    This mirrors the renaming logic used by the DCP / HuggingFace storage
+    reader but operates directly on an in-memory state dict.  It is needed
+    when loading safetensors checkpoints outside of DCP so that HF checkpoint
+    keys (e.g. ``language_model.model.X``) are translated to the model's
+    parameter FQNs (e.g. ``model.language_model.X``).
+
+    Args:
+        state_dict: Original state dict whose keys may need renaming.
+        key_mapping: ``{regex_pattern: replacement}`` pairs applied in order.
+
+    Returns:
+        A new dict with renamed keys.
+    """
+    from nemo_automodel.components.checkpoint._backports.hf_storage import (
+        _get_key_renaming_mapping,
+    )
+
+    return {_get_key_renaming_mapping(k, key_mapping): v for k, v in state_dict.items()}
 
 
 def _load_full_state_dict_into_model(
