@@ -207,7 +207,7 @@ class ModelState:
         if self.is_peft:
             model_state_dict = {k: v for sd in map(_get_peft_state_dict, self.model) for k, v in sd.items()}
         else:
-            options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            options = None
             func = partial(get_model_state_dict, options=options)
             model_state_dict = {k: v for sd in map(func, self.model) for k, v in sd.items()}
 

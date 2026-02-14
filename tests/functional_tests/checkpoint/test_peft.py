@@ -298,6 +298,7 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
                 trainer.model_parts,
                 trainer.optimizer,
                 trainer.lr_scheduler,
+                trainer.checkpointer.config.is_peft,
             ).state_dict()["optim"]
         )
 
