@@ -16,8 +16,10 @@ from functools import partial
 from typing import Any, Optional
 
 import torch
-import transformer_engine.pytorch.module.base as te_base
-import transformer_engine.pytorch.ops.op as te_ops
+
+from nemo_automodel.shared.import_utils import safe_import_te
+
+HAS_TE, transformer_engine = safe_import_te()
 
 # The Conflict:
 # PyTorch DCP passes an _EXTRA_STATE sentinel for missing keys, but Transformer Engine (TE)
@@ -26,24 +28,25 @@ import transformer_engine.pytorch.ops.op as te_ops
 # The Fix (Monkeypatch):
 # Intercept set_extra_state calls. If the input is the _EXTRA_STATE sentinel, return early
 # (doing nothing) to safely ignore the missing state without crashing TE.
-_original_set_extra_state = te_base.TransformerEngineBaseModule.set_extra_state
-_original_op_set_extra_state = te_ops.BasicOperation.set_extra_state
+if HAS_TE:
+    import transformer_engine.pytorch.module.base as te_base
+    import transformer_engine.pytorch.ops.op as te_ops
 
+    _original_set_extra_state = te_base.TransformerEngineBaseModule.set_extra_state
+    _original_op_set_extra_state = te_ops.BasicOperation.set_extra_state
 
-def _safe_set_extra_state(self, state):
-    if state is not None and "EXTRA_STATE" in str(type(state)):
-        return
-    return _original_set_extra_state(self, state)
+    def _safe_set_extra_state(self, state):
+        if state is not None and "EXTRA_STATE" in str(type(state)):
+            return
+        return _original_set_extra_state(self, state)
 
+    def _safe_op_set_extra_state(self, state):
+        if state is not None and "EXTRA_STATE" in str(type(state)):
+            return
+        return _original_op_set_extra_state(self, state)
 
-def _safe_op_set_extra_state(self, state):
-    if state is not None and "EXTRA_STATE" in str(type(state)):
-        return
-    return _original_op_set_extra_state(self, state)
-
-
-te_base.TransformerEngineBaseModule.set_extra_state = _safe_set_extra_state
-te_ops.BasicOperation.set_extra_state = _safe_op_set_extra_state
+    te_base.TransformerEngineBaseModule.set_extra_state = _safe_set_extra_state
+    te_ops.BasicOperation.set_extra_state = _safe_op_set_extra_state
 
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
