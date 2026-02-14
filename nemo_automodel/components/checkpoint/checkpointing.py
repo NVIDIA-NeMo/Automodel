@@ -1024,6 +1024,24 @@ def _load_full_state_dict_into_model(
 
     from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
+    # Pre-populate _extra_state keys with empty tensors for modules that have
+    # extra state (e.g. Transformer Engine ops).  HF checkpoints (safetensors)
+    # never contain _extra_state entries.  Without pre-population, PyTorch's
+    # set_model_state_dict merges the model's local state dict into the
+    # provided dict, inserting TE's _EXTRA_STATE sentinel objects for every
+    # missing _extra_state key.  If the merge creates a plain dict copy
+    # internally, the _TEExtraStateSanitizingDict.__setitem__ override is
+    # bypassed and the sentinel (which lacks .numel()) reaches TE's
+    # set_extra_state(), causing an AttributeError.  By ensuring the keys
+    # already exist with a valid empty tensor, the merge never inserts
+    # sentinels in the first place.
+    for model in model_parts:
+        for name, module in model.named_modules():
+            if type(module).get_extra_state is not nn.Module.get_extra_state:
+                key = f"{name}._extra_state" if name else "_extra_state"
+                if key not in state_dict:
+                    state_dict[key] = torch.tensor([], dtype=torch.uint8)
+
     # Wrap so that when PyTorch merges local_state_dict into our dict, _extra_state
     # non-tensors (TE's _EXTRA_STATE) are stored as empty tensors instead.
     state_dict = _TEExtraStateSanitizingDict(state_dict)
