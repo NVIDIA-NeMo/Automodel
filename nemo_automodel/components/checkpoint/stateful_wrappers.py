@@ -75,6 +75,16 @@ def _has_quantized_params(model: torch.nn.Module) -> bool:
     return any(map(_is_quantized_module, model.modules()))
 
 
+def _has_expert_parallelism(model: torch.nn.Module) -> bool:
+    """Check if any MoE expert module in the model has expert parallelism enabled.
+
+    After EP initialization, expert modules (GroupedExpertsDeepEP, GroupedExpertsTE)
+    store ``ep_size`` on themselves. A value > 1 signals that expert weights are
+    sharded across EP ranks and DCP's state_dict APIs cannot handle them.
+    """
+    return any(getattr(m, "ep_size", 1) > 1 for m in model.modules())
+
+
 def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
     """Extract only trainable PEFT adapter weights, bypassing DCP for quantized models.
 
@@ -210,10 +220,13 @@ class ModelState:
         # full-model FQNs and raises KeyError when popping expert params that are
         # sharded across ranks. Direct collection ensures we save only adapter weights,
         # matching dense LLaMA/Qwen LoRA behavior and fixing MoE LoRA checkpointing.
-        if self.is_peft:
+        if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
             model_state_dict = {k: v for sd in map(_get_peft_state_dict, self.model) for k, v in sd.items()}
         else:
             options = None
+            if self.is_peft:
+                options = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=True)
+
             func = partial(get_model_state_dict, options=options)
             model_state_dict = {k: v for sd in map(func, self.model) for k, v in sd.items()}
 
@@ -248,7 +261,7 @@ class ModelState:
             # DoRA: reverse the HF PEFT key rename so DCP can match model params
             _rename_dora_keys_from_hf(state_dict)
 
-            options = StateDictOptions(strict=False, full_state_dict=True)
+            options = StateDictOptions(strict=False, broadcast_from_rank0=True, full_state_dict=True)
 
         # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
         # PyTorch will complain during load even with strict=False.
@@ -348,7 +361,7 @@ class OptimizerState:
         # builds a parameter-ID-to-FQN mapping from the full model and then fails
         # (KeyError) when the optimizer only has state for trainable params and the
         # model is sharded (e.g. MoE+EP). Use native optimizer state_dict instead.
-        if self.is_peft:
+        if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
             optimizer_state_dict = self.optimizer[0].state_dict()
         else:
             # this line automatically manages FSDP FQN's, as well as sets the default state dict type
@@ -375,7 +388,7 @@ class OptimizerState:
             state_dict (dict): State dictionary containing optimizer and scheduler states to load.
         """
         # For PEFT, use native load to match the native save path.
-        if self.is_peft:
+        if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
             self.optimizer[0].load_state_dict(state_dict["optim"])
         else:
             # sets our state dicts on the optimizer, now that we've loaded
