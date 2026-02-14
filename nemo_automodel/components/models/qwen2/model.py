@@ -401,7 +401,18 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
             print("[Qwen2ForCausalLM] Custom implementation with COMBINED QKV and gate_up projections")
             print(f"[Qwen2ForCausalLM] torch_dtype: {self.config.torch_dtype}")
 
-    @can_return_tuple
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
