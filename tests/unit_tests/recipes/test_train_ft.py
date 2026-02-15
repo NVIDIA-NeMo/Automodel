@@ -196,7 +196,7 @@ class DummyModelConfig:
 
 def test_peft_with_pipeline_parallelism_enabled(caplog):
     """Test that _apply_peft_and_lower_precision disables triton with PP."""
-    from nemo_automodel._transformers.auto_model import _apply_peft_and_lower_precision
+    from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
 
     cfg_peft = DummyPeftConfig()
     model = DummyModel()
@@ -256,7 +256,7 @@ def test_peft_without_pipeline_parallelism(caplog):
 
 def test_peft_with_tp_disables_triton(caplog):
     """Test that _apply_peft_and_lower_precision disables triton with TP."""
-    from nemo_automodel._transformers.auto_model import _apply_peft_and_lower_precision
+    from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
 
     cfg_peft = DummyPeftConfig()
     model = DummyModel()
