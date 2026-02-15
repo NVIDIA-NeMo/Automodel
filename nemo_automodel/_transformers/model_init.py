@@ -21,20 +21,65 @@ weights, applying config overrides, and instantiating the model.
 import inspect
 import logging
 import os
+import threading
 from contextlib import contextmanager
 
 import torch
 from huggingface_hub import snapshot_download
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
+from transformers.modeling_utils import PreTrainedModel
+
+# For models that still accesses config.pad_token_id after v5 removes it in PretrainedConfig
+if not hasattr(PretrainedConfig, "pad_token_id"):
+    PretrainedConfig.pad_token_id = None
 
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code
+from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code, skip_random_init
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
+
+# Thread-local: when True, HF's get_init_context must not add torch.device("meta")
+# so that model init runs on real device (used when retrying after "Cannot copy out of meta tensor").
+_hf_meta_device_disabled = threading.local()
+
+
+def _get_hf_meta_device_disabled():
+    return getattr(_hf_meta_device_disabled, "value", False)
+
+
+@contextmanager
+def no_hf_meta_device():
+    """Disable HuggingFace's meta device in get_init_context so model is built on real device."""
+    prev = _get_hf_meta_device_disabled()
+    _hf_meta_device_disabled.value = True
+    try:
+        yield
+    finally:
+        _hf_meta_device_disabled.value = prev
+
+
+def _filter_meta_device_from_init_context(contexts):
+    """Remove torch.device('meta') from HF init context list when we want real-device init."""
+    return [c for c in contexts if not (isinstance(c, torch.device) and getattr(c, "type", None) == "meta")]
+
+
+def _patched_get_init_context(cls, dtype, is_quantized, _is_ds_init_called):
+    """Wrapper around PreTrainedModel.get_init_context that strips meta device when requested."""
+    original = _patched_get_init_context.__wrapped__
+    contexts = original(cls, dtype, is_quantized, _is_ds_init_called)
+    if _get_hf_meta_device_disabled():
+        return _filter_meta_device_from_init_context(contexts)
+    return contexts
+
+
+# Bind original and install patch (classmethod-safe)
+_original_get_init_context = PreTrainedModel.get_init_context.__func__
+_patched_get_init_context.__wrapped__ = _original_get_init_context
+PreTrainedModel.get_init_context = classmethod(_patched_get_init_context)
 
 
 def _get_mixin_wrapped_class(model_class: type) -> type:
@@ -184,13 +229,14 @@ def _init_model(
         if quantization_config is not None:
             kwargs["quantization_config"] = quantization_config
         if is_pretrained_init:
-            model = cls._from_pretrained_parent_class(
-                pretrained_model_name_or_path,
-                *model_args,
-                torch_dtype=torch_dtype,
-                attn_implementation=attn_implementation,
-                **kwargs,
-            )
+            with skip_random_init():
+                model = cls._from_pretrained_parent_class(
+                    pretrained_model_name_or_path,
+                    *model_args,
+                    torch_dtype=torch_dtype,
+                    attn_implementation=attn_implementation,
+                    **kwargs,
+                )
         else:
             model = cls._from_config_parent_class(
                 hf_config,
@@ -234,13 +280,14 @@ def _init_model(
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
     if is_pretrained_init:
-        model = cls._from_pretrained_parent_class(
-            pretrained_model_name_or_path,
-            *model_args,
-            torch_dtype=torch_dtype,
-            attn_implementation=attn_implementation,
-            **kwargs,
-        )
+        with skip_random_init():
+            model = cls._from_pretrained_parent_class(
+                pretrained_model_name_or_path,
+                *model_args,
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_implementation,
+                **kwargs,
+            )
     else:
         model = cls._from_config_parent_class(
             hf_config,
