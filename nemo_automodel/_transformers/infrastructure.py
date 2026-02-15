@@ -159,10 +159,7 @@ def _initialize_weights_from_scratch(model: torch.nn.Module) -> None:
         model.initialize_weights()
         logger.info("Initialised weights from scratch (from_config meta-device path).")
     else:
-        logger.warning(
-            "Model does not have an initialize_weights method. "
-            "Parameters may contain uninitialised values."
-        )
+        logger.warning("Model does not have an initialize_weights method. Parameters may contain uninitialised values.")
 
 
 #  PEFT / quantization helpers
