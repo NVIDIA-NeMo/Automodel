@@ -19,6 +19,7 @@ can use it without pulling in the checkpoint component.
 """
 
 import re as _re
+from collections.abc import Mapping, MutableMapping
 from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 if TYPE_CHECKING:
@@ -60,7 +61,7 @@ def get_native_keys_lazy(adapter: Any, hf_state_dict: dict[str, Any]) -> list[st
     return out
 
 
-class LazyHFStateDict:
+class LazyHFStateDict(Mapping):
     """Dict-like wrapper that converts native -> HF on key access (JIT). Reduces peak GPU memory.
 
     Args:
@@ -110,14 +111,23 @@ class LazyHFStateDict:
             self._keys = self._compute_keys()
         return len(self._keys)
 
+    def values(self) -> Iterator[Any]:
+        for k in self.keys():
+            yield self[k]
+
     def items(self) -> Iterator[tuple[str, Any]]:
         for k in self.keys():
             yield k, self[k]
 
 
-class LazyNativeStateDict:
+class LazyNativeStateDict(MutableMapping):
     """Dict-like wrapper that converts HF -> native on key access (JIT). Merges incrementally to limit peak memory.
     When native_backing is set (round-trip from LazyHFStateDict), returns tensors from it directly (zero copy).
+
+    Supports in-place mutation (``__setitem__``, ``__delitem__``, ``pop``,
+    ``update``) via an overlay so that downstream code (e.g. key-renaming
+    helpers, ``_extra_state`` injection) can treat this object like a plain
+    ``dict`` without materialising the full lazy mapping.
     """
 
     def __init__(
@@ -131,22 +141,41 @@ class LazyNativeStateDict:
         self._adapter = adapter
         self._device_mesh = device_mesh
         self._native_backing = native_backing
-        self._keys = None
+        self._base_keys: Optional[list[str]] = None
+        # Overlay for mutation – avoids materialising the full lazy mapping.
+        self._overrides: dict[str, Any] = {}
+        self._deleted: set[str] = set()
         if (
             getattr(adapter, "_validate_expert_availability", None) is not None
             and getattr(adapter, "moe_config", None) is not None
         ):
             adapter._validate_expert_availability(hf_state_dict, adapter.moe_config.n_routed_experts, device_mesh)
 
+    # Internal helpers
+    def _get_base_keys(self) -> list[str]:
+        if self._base_keys is None:
+            self._base_keys = get_native_keys_lazy(self._adapter, self._hf_state_dict)
+        return self._base_keys
+
+    # Read API
     def __iter__(self) -> Iterator[str]:
         return self.keys()
 
     def keys(self) -> Iterator[str]:
-        if self._keys is None:
-            self._keys = get_native_keys_lazy(self._adapter, self._hf_state_dict)
-        return iter(self._keys)
+        seen: set[str] = set()
+        for k in self._get_base_keys():
+            if k not in self._deleted or k in self._overrides:
+                seen.add(k)
+                yield k
+        for k in self._overrides:
+            if k not in seen:
+                yield k
 
     def __getitem__(self, native_key: str) -> Any:
+        if native_key in self._overrides:
+            return self._overrides[native_key]
+        if native_key in self._deleted:
+            raise KeyError(native_key)
         if self._native_backing is not None and native_key in self._native_backing:
             return self._native_backing[native_key]
         get_merged = getattr(self._adapter, "get_merged_tensor_for_native_key", None)
@@ -156,15 +185,63 @@ class LazyNativeStateDict:
                 return merged
         return self._hf_state_dict[native_key]
 
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
     def __contains__(self, key: object) -> bool:
-        if self._keys is None:
-            self._keys = get_native_keys_lazy(self._adapter, self._hf_state_dict)
-        return key in self._keys
+        if key in self._overrides:
+            return True
+        if key in self._deleted:
+            return False
+        return key in self._get_base_keys()
 
     def __len__(self) -> int:
-        if self._keys is None:
-            self._keys = get_native_keys_lazy(self._adapter, self._hf_state_dict)
-        return len(self._keys)
+        base = set(self._get_base_keys())
+        return len((base - self._deleted) | set(self._overrides))
+
+    # Mutation API
+    def __setitem__(self, key: str, value: Any) -> None:
+        self._overrides[key] = value
+        self._deleted.discard(key)
+
+    def __delitem__(self, key: str) -> None:
+        if key not in self:
+            raise KeyError(key)
+        self._overrides.pop(key, None)
+        self._deleted.add(key)
+
+    def pop(self, key: str, *default: Any) -> Any:
+        try:
+            value = self[key]
+        except KeyError:
+            if default:
+                return default[0]
+            raise
+        self._overrides.pop(key, None)
+        self._deleted.add(key)
+        return value
+
+    def update(self, other: Any = None, **kwargs: Any) -> None:
+        if other is not None:
+            if hasattr(other, "items"):
+                for k, v in other.items():
+                    self[k] = v
+            elif hasattr(other, "keys"):
+                for k in other.keys():
+                    self[k] = other[k]
+            else:
+                for k, v in other:
+                    self[k] = v
+        for k, v in kwargs.items():
+            self[k] = v
+
+    # Iteration helpers
+    def values(self) -> Iterator[Any]:
+        for k in self.keys():
+            yield self[k]
 
     def items(self) -> Iterator[tuple[str, Any]]:
         for k in self.keys():
