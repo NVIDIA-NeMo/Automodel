@@ -5,47 +5,51 @@
 ```{toctree}
 :caption: Get Started
 :hidden:
-repository-structure.md
+guides/quickstart.md
 guides/installation.md
-guides/configuration.md
-guides/huggingface-api-compatibility.md
-launcher/local-workstation.md
-launcher/cluster.md
-```
-
-<!-- 
-environment/cluster.md
--->
-
-```{toctree}
-:caption: Announcements
-:hidden:
-Accelerating Large-Scale Mixture-of-Experts Training in PyTorch with NeMo Automodel <https://github.com/NVIDIA-NeMo/Automodel/discussions/777>
-Challenges in Enabling PyTorch Native Pipeline Parallelism for Hugging Face Transformer Models <https://github.com/NVIDIA-NeMo/Automodel/discussions/589>
-Google Gemma 3n: Efficient Multimodal Fine-tuning Made Simple <https://github.com/NVIDIA-NeMo/Automodel/discussions/494>
-Fine-tune Hugging Face Models Instantly with Day-0 Support with NVIDIA NeMo AutoModel <https://github.com/NVIDIA-NeMo/Automodel/discussions/477>
-
-```
-
-```{toctree}
-:caption: Performance
-:hidden:
-
+guides/choosing-model-and-method.md
+guides/is-training-right-for-me.md
 performance-summary.md
 ```
 
 ```{toctree}
-:caption: Recipes & E2E Examples
+:caption: Training
 :hidden:
 guides/overview.md
 guides/llm/finetune.md
-guides/llm/toolcalling.md
 guides/llm/pretraining.md
 guides/llm/nanogpt-pretraining.md
+guides/llm/knowledge-distillation.md
+guides/llm/toolcalling.md
 guides/llm/sequence-classification.md
 guides/omni/gemma3-3n.md
 guides/quantization-aware-training.md
-guides/llm/databricks.md
+guides/custom-model.md
+```
+
+```{toctree}
+:caption: Your Data
+:hidden:
+guides/dataset-overview.md
+guides/llm/dataset.md
+guides/llm/column-mapped-text-instruction-dataset.md
+guides/llm/column-mapped-text-instruction-iterable-dataset.md
+guides/llm/retrieval-dataset.md
+guides/vlm/dataset.md
+guides/chat-templates.md
+```
+
+```{toctree}
+:caption: Configuration & Scaling
+:hidden:
+guides/configuration.md
+guides/hyperparameters.md
+guides/checkpointing.md
+guides/gradient-checkpointing.md
+guides/pipelining.md
+guides/fp8-training.md
+launcher/local-workstation.md
+launcher/cluster.md
 ```
 
 ```{toctree}
@@ -57,26 +61,18 @@ model-coverage/vlm.md
 ```
 
 ```{toctree}
-:caption: Datasets
+:caption: Deploy
 :hidden:
-
-guides/dataset-overview.md
-guides/llm/dataset.md
-guides/llm/retrieval-dataset.md
-guides/llm/column-mapped-text-instruction-dataset.md
-guides/llm/column-mapped-text-instruction-iterable-dataset.md
-guides/vlm/dataset.md
+guides/deployment.md
 ```
 
 ```{toctree}
-:caption: Development
+:caption: Reference
 :hidden:
-guides/checkpointing.md
-guides/gradient-checkpointing.md
-guides/pipelining.md
-guides/llm/knowledge-distillation.md
-guides/fp8-training.md
+guides/huggingface-api-compatibility.md
 guides/mlflow-logging.md
-
+repository-structure.md
+guides/troubleshooting.md
+guides/llm/databricks.md
 apidocs/index.rst
 ```

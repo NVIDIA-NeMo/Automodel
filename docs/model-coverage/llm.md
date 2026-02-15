@@ -1,5 +1,14 @@
 # Large Language Models (LLMs)
 
+:::{tip}
+**VRAM Quick Reference (BF16):** ~2 GB per billion parameters for weights alone.
+- **1B model** -> ~2 GB (fits on any GPU)
+- **7-8B model** -> ~16 GB (single 24 GB GPU with LoRA)
+- **70B model** -> ~140 GB (needs multi-GPU with FSDP2 or `is_meta_device: true`)
+
+For **QLoRA (4-bit):** divide by ~4. A 7B model fits in ~4 GB. See [Choose a Model and Method](../guides/choosing-model-and-method.md) for detailed sizing guidance.
+:::
+
 ## Introduction
 Large Language Models (LLMs) power a variety of tasks such as dialogue systems, text classification, summarization, and more.
 NeMo AutoModel provides a simple interface for loading and fine-tuning LLMs hosted on the Hugging Face Hub.

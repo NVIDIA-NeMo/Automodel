@@ -1,6 +1,23 @@
 # Dataset Overview: LLM, VLM, and Retrieval Datasets in NeMo Automodel
 
-This page summarizes the datasets supported in NeMo Automodel for LLM, VLM, and retrieval/embedding (biencoder) training and shows how to plug in your own datasets using Python functions or the YAML `_target_` mechanism.
+:::{tip}
+**TL;DR** -- Use the table below to pick the right dataset class for your data format. Then see the linked guide for setup details.
+:::
+
+## Which Dataset Class Should I Use?
+
+| Your Data Format | Dataset Class | Guide |
+|-----------------|--------------|-------|
+| **JSONL instruction pairs** (`{"instruction": ..., "output": ...}`) | `ColumnMappedTextInstructionDataset` | [Column-Mapped Dataset](llm/column-mapped-text-instruction-dataset.md) |
+| **Multi-turn conversations** (chat format) | `ColumnMappedTextInstructionDataset` with chat template | [Chat Templates](chat-templates.md) |
+| **Completion / continuation** (prompt + gold ending) | `HellaSwag` pattern | See below |
+| **Streaming / very large datasets** | `ColumnMappedTextInstructionIterableDataset` | [Iterable Dataset](llm/column-mapped-text-instruction-iterable-dataset.md) |
+| **Image + text (VLM)** | `make_rdr_dataset` / `make_cord_v2_dataset` | [VLM Datasets](vlm/dataset.md) |
+| **Pretraining tokens** | `MegatronPretraining` or `NanogptDataset` | [Pretraining Guide](llm/pretraining.md) |
+| **Retrieval / bi-encoder** | `RetrievalDataset` | [Retrieval Dataset](llm/retrieval-dataset.md) |
+| **Question-answering** (SQuAD-style) | `SQuAD` | See below |
+
+---
 
 - See also: [LLM datasets](llm/dataset.md), [VLM datasets](vlm/dataset.md), and [Biencoder retrieval dataset](llm/retrieval-dataset.md) for deeper, task-specific guides.
 
