@@ -9,6 +9,7 @@ guides/quickstart.md
 guides/installation.md
 guides/choosing-model-and-method.md
 guides/is-training-right-for-me.md
+performance-summary.md
 ```
 
 ```{toctree}
@@ -57,12 +58,6 @@ launcher/cluster.md
 model-coverage/overview.md
 model-coverage/llm.md
 model-coverage/vlm.md
-```
-
-```{toctree}
-:caption: Performance
-:hidden:
-performance-summary.md
 ```
 
 ```{toctree}
