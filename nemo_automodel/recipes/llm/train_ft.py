@@ -25,8 +25,6 @@ import torch
 import torch.nn as nn
 import wandb
 from huggingface_hub import constants as hf_constants
-from megatron_fsdp import MegatronFSDP
-from megatron_fsdp.fully_shard import fully_shard_optimizer
 from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -54,6 +52,7 @@ from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import (
     initialize_distributed,
 )
+from nemo_automodel.components.distributed.megatron_fsdp import fully_shard_optimizer
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
@@ -182,7 +181,14 @@ def build_model(
         if cfg_qat is not None and cfg_qat.get("enabled", False):
             if cfg_peft is not None:
                 raise ValueError("QAT with PEFT is not currently supported")
-            kwargs["qat_config"] = cfg_qat.qat_config.instantiate()
+            qat_config_attr = getattr(cfg_qat, "qat_config", None)
+            if qat_config_attr is not None:
+                kwargs["qat_config"] = qat_config_attr.instantiate()
+            else:
+                # Fallback to legacy quantizer format for backward compatibility
+                quantizer_attr = getattr(cfg_qat, "quantizer", None)
+                if quantizer_attr is not None:
+                    kwargs["qat_config"] = quantizer_attr.instantiate()
 
         if cfg_moe is not None:
             from nemo_automodel.components.moe.config import MoEParallelizerConfig
@@ -295,12 +301,7 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
             tmp_optimizer = cfg_opt.instantiate(params=trainable_params)
         if isinstance(distributed_config, MegatronFSDPConfig) and torch.distributed.get_world_size() > 1:
             assert not has_dion_optimizer, "Dion optimizer does not support fully_shard_optimizer"
-            # Only call fully_shard_optimizer when the model was actually wrapped
-            # with MegatronFSDP. When dp_mesh.size()==1 the parallelizer skips
-            # MegatronFSDP wrapping and the parameters won't carry the required
-            # _megatron_fsdp_model attribute.
-            if isinstance(part, MegatronFSDP):
-                fully_shard_optimizer(tmp_optimizer)
+            tmp_optimizer = fully_shard_optimizer(part, tmp_optimizer)
         optimizer.append(tmp_optimizer)
 
     return optimizer

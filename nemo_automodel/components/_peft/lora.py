@@ -29,11 +29,11 @@ from nemo_automodel.components._peft.lora_kernel import (
 from nemo_automodel.components._peft.lora_moe import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components._peft.module_matcher import ModuleMatcher
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP
-from nemo_automodel.shared.import_utils import safe_import
+from nemo_automodel.shared.import_utils import safe_import, safe_import_te
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
-HAS_TE, transformer_engine = safe_import("transformer_engine")
+HAS_TE, transformer_engine = safe_import_te()
 
 logger = logging.getLogger(__name__)
 
@@ -196,7 +196,7 @@ class LinearLoRA(nn.Linear):
         if obj.use_dora:
             # initialize DoRA magnitude vector to ||W|| (row-wise L2 norm).
             with torch.no_grad():
-                weight_norm = torch.linalg.norm(obj.weight.data, dim=1).to(dtype)
+                weight_norm = torch.linalg.norm(obj.weight.data, dim=1).to(dtype=dtype, device=device)
             obj.lora_magnitude = nn.Parameter(weight_norm, requires_grad=True)
 
     def _dora_weight_norm(self) -> torch.Tensor:
@@ -610,4 +610,4 @@ class LoRATritonFunction(torch.autograd.Function):
 
         if reshape:
             d_x = d_x.view(bs, seq_len, d)
-        return d_x, d_lora_A.t(), d_lora_B, None, None, None
+        return d_x, d_lora_A.t(), d_lora_B, None, None

@@ -12,81 +12,91 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Benchmarking config for Qwen3 Moe 30B Torch
-
 seed: 1234
 
-benchmark:
-  warmup_steps: 10
-  peak_tflops: 989  # H100 peak TFLOPs
-  nsys_start: -1
-  nsys_end: -1
-  nsys_ranks: []
-  num_nodes: 1
-
 step_scheduler:
-  global_batch_size: 256
+  global_batch_size: 512
   local_batch_size: 4
   ckpt_every_steps: 1000
   val_every_steps: 1000
-  num_epochs: 1
-  max_steps: 30
+  num_epochs: 2
 
 distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 1
-  ep_size: 8
-
+  pp_size: 2
+  dp_replicate_size: 1
+  ep_size: 32
   sequence_parallel: false
-  activation_checkpointing: true
 
   pipeline:
     pp_schedule: interleaved1f1b
-    pp_microbatch_size: 2
+    pp_microbatch_size: 1
     round_virtual_stages_to_pp_multiple: down
     scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
     layers_per_stage: 2
 
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
 dist_env:
   backend: nccl
   timeout_minutes: 10
 
 model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
-  config:
-    _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: MiniMaxAI/MiniMax-M2.5
   trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: sdpa
-    linear: torch
-    rms_norm: torch
-    experts: torch
-    dispatcher: torch
-    fake_balanced_gate: true
-    enable_hf_state_dict_adapter: false
+    attn: te
+    linear: te
+    rms_norm: te
+    rope_fusion: true
+    experts: torch_mm
+    dispatcher: deepep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
 
 checkpoint:
   enabled: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
-  fp32_upcast: false
 
+# Data configuration from llama finetuning
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
-  seq_len: 4096
-  num_samples: 100000
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+
+packed_sequence:
+  packed_sequence_size: 0
 
 dataloader:
-  batch_size: null  # Dataset already yields batches
-  _target_: torch.utils.data.DataLoader
-  num_workers: 0
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 160
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 160
+  shuffle: true
+  drop_last: true
 
 optimizer:
   _target_: torch.optim.Adam
@@ -94,6 +104,5 @@ optimizer:
   - 0.9
   - 0.999
   eps: 1e-8
-  lr: 0.0001
+  lr: 1e-5
   weight_decay: 0
-

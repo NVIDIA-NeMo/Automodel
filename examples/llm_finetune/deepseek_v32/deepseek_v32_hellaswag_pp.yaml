@@ -34,6 +34,7 @@ distributed:
   ep_size: 64
 
   sequence_parallel: false
+  activation_checkpointing: true
 
   pipeline:
     pp_schedule: interleaved1f1b
@@ -71,7 +72,6 @@ model:
 
 checkpoint:
   enabled: false
-  load_base_model: true
   dequantize_base_checkpoint: true
 
 loss_fn:

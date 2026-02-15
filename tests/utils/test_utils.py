@@ -15,6 +15,7 @@
 import os
 import subprocess
 import signal
+import sys
 
 def run_test_script(folder, test_filename):
     dir_path = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -24,9 +25,16 @@ def run_test_script(folder, test_filename):
     # inheriting that cwd can make `pwd`/getcwd() block and the test appears to "hang".
     repo_root = os.path.dirname(dir_path)
     test_file_path = os.path.join(dir_path, 'functional_tests', folder, test_filename)
+    
+    # Check if -s flag was passed to pytest and propagate it to the bash script
+    env = os.environ.copy()
+    if '-s' in sys.argv or '--capture=no' in sys.argv:
+        env['PYTEST_PROPAGATE_S'] = '1'
+    
     p = subprocess.Popen(
         ["bash", test_file_path],
         cwd=repo_root,
+        env=env,
         preexec_fn=os.setsid          # On Unix: puts it in a new session/process group
     )
 
