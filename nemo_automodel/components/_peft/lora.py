@@ -610,4 +610,4 @@ class LoRATritonFunction(torch.autograd.Function):
 
         if reshape:
             d_x = d_x.view(bs, seq_len, d)
-        return d_x, d_lora_A.t(), d_lora_B, None, None, None
+        return d_x, d_lora_A.t(), d_lora_B, None, None

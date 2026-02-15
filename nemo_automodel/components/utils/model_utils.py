@@ -98,6 +98,23 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
     return total_params, trainable_params, local_sq_norm
 
 
+@contextmanager
+def skip_random_init():
+    """
+    Context manager to skip random weight initialization when loading pretrained models.
+    """
+    try:
+        mod = __import__("transformers.initialization", fromlist=["_init_weights"])
+    except ImportError:
+        mod = __import__("transformers.modeling_utils", fromlist=["_init_weights"])
+    prev = getattr(mod, "_init_weights", True)
+    mod._init_weights = False
+    try:
+        yield
+    finally:
+        mod._init_weights = prev
+
+
 def resolve_trust_remote_code(pretrained_model_name_or_path):
     """
     Whitelist NVIDIA models to allow remote code execution.

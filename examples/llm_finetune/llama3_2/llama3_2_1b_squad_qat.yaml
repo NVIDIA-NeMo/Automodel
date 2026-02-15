@@ -57,8 +57,9 @@ distributed:
 qat:
   fake_quant_after_n_steps: 1
   enabled: True
-  quantizer:
-    _target_: torchao.quantization.qat.Int8DynActInt4WeightQATQuantizer
+  qat_config:
+    _target_: nemo_automodel.components.quantization.qat.QATConfig
+    quantizer_type: int8_dynact_int4weight
     groupsize: 256
 
 loss_fn:
