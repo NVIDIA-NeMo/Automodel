@@ -478,6 +478,7 @@ def _parallelize_phi3(
         base_model_tp_plan,
     )
 
+
 # Create the model-specific parallel plan mapping
 PARALLELIZE_FUNCTIONS: Dict[type, Callable[..., Dict[str, ParallelStyle]]] = {
     Qwen2ForCausalLM: _parallelize_qwen,

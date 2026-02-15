@@ -887,8 +887,7 @@ def _get_parallel_plan(
         # "rowwise", "colwise_rep", etc.  Dicts built in Python may
         # already contain ParallelStyle instances — those are kept as-is.
         model_parallel_plan = {
-            k: translate_to_torch_parallel_style(v) if isinstance(v, str) else v
-            for k, v in tp_shard_plan.items()
+            k: translate_to_torch_parallel_style(v) if isinstance(v, str) else v for k, v in tp_shard_plan.items()
         }
         logger.info(f"Using parallel plan (dictionary). {model_parallel_plan}")
     elif tp_shard_plan is not None:
