@@ -73,38 +73,25 @@ if TYPE_CHECKING:
 # that import NEED_SETUP_CACHE_CLASSES_MAPPING from transformers.generation.utils.
 import transformers.generation.utils as _gen_utils  # noqa: E402
 
-from nemo_automodel._transformers.infrastructure import (  # noqa: E402, F401
+from nemo_automodel._transformers.infrastructure import (
     MeshContext,
-    _apply_peft_and_lower_precision,
-    _shard_ep_fsdp,
-    _shard_pp,
     apply_model_infrastructure,
     instantiate_infrastructure,
-    parallelize_for_pp,
 )
-from nemo_automodel._transformers.kernel_patches import (  # noqa: E402, F401
+from nemo_automodel._transformers.kernel_patches import (
     DEFAULT_ATTN_IMPLEMENTATION,
-    HAS_FA,
-    HAS_LIGER_KERNEL,
     _apply_preload_overrides,
-    _assert_same_signature,
     _get_next_fallback_attn,
     _patch_attention,
     _patch_liger_kernel,
     _verify_sdpa_support,
 )
-from nemo_automodel._transformers.model_init import (  # noqa: E402, F401
+from nemo_automodel._transformers.model_init import (
     _consume_config_overrides,
-    _download_model_weights,
-    _filter_kwargs_for_init,
-    _get_init_param_names,
-    _get_mixin_wrapped_class,
     _init_model,
-    _is_config_compatible_with_custom_model,
-    get_architectures,
     get_hf_config,
     get_is_hf_model,
-    local_torch_dtype,
+    no_hf_meta_device,
 )
 
 if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
@@ -253,6 +240,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
         model = None  # Ensure 'model' is always bound for the except handler
+        is_custom_model = None
         try:
             with init_ctx:
                 is_custom_model, model = _init_model(
@@ -265,6 +253,29 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     *model_args,
                     **kwargs,
                 )
+        except NotImplementedError as e:
+            if "Cannot copy out of meta tensor" in str(e) and is_meta_device:
+                logger.warning(
+                    "Model init hit 'Cannot copy out of meta tensor' (e.g. buffer created with meta but "
+                    "called .to(device)); retrying without meta device.",
+                )
+                del model
+                model = None
+                gc.collect()
+                is_meta_device = False
+                with ContextManagers([no_init_weights(), no_hf_meta_device()]):
+                    is_custom_model, model = _init_model(
+                        cls,
+                        pretrained_model_name_or_path_or_config,
+                        attn_implementation,
+                        torch_dtype,
+                        quantization_config,
+                        force_hf,
+                        *model_args,
+                        **kwargs,
+                    )
+            else:
+                raise
         except ValueError as e:
             if "does not support" in str(e):
                 del model

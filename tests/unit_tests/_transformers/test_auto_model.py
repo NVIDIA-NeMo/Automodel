@@ -23,11 +23,11 @@ from nemo_automodel._transformers.auto_model import (
     _get_next_fallback_attn,
     _init_model,
     _patch_attention,
-    _get_mixin_wrapped_class,
-    _apply_peft_and_lower_precision,
     _consume_config_overrides,
-    _filter_kwargs_for_init,
 )
+from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
+from nemo_automodel._transformers.model_init import _filter_kwargs_for_init
+from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
 
@@ -89,7 +89,7 @@ class TestUtilityFunctions:
 
     def test_assert_same_signature_matching(self):
         """Test _assert_same_signature with matching signatures."""
-        from nemo_automodel._transformers.auto_model import _assert_same_signature
+        from nemo_automodel._transformers.kernel_patches import _assert_same_signature
 
         def func1(a, b, c=None):
             pass
@@ -102,7 +102,7 @@ class TestUtilityFunctions:
 
     def test_assert_same_signature_different(self):
         """Test _assert_same_signature with different signatures."""
-        from nemo_automodel._transformers.auto_model import _assert_same_signature
+        from nemo_automodel._transformers.kernel_patches import _assert_same_signature
 
         def func1(a, b, c=None):
             pass

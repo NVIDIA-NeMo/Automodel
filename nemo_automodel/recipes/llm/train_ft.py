@@ -181,7 +181,14 @@ def build_model(
         if cfg_qat is not None and cfg_qat.get("enabled", False):
             if cfg_peft is not None:
                 raise ValueError("QAT with PEFT is not currently supported")
-            kwargs["qat_config"] = cfg_qat.qat_config.instantiate()
+            qat_config_attr = getattr(cfg_qat, "qat_config", None)
+            if qat_config_attr is not None:
+                kwargs["qat_config"] = qat_config_attr.instantiate()
+            else:
+                # Fallback to legacy quantizer format for backward compatibility
+                quantizer_attr = getattr(cfg_qat, "quantizer", None)
+                if quantizer_attr is not None:
+                    kwargs["qat_config"] = quantizer_attr.instantiate()
 
         if cfg_moe is not None:
             from nemo_automodel.components.moe.config import MoEParallelizerConfig
