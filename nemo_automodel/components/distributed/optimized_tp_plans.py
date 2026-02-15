@@ -21,6 +21,7 @@ including LLaMA, Qwen, Gemma3, and Ministral3 models.
 from typing import Callable, Dict, Union, cast
 
 import torch
+from torch import nn
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
@@ -40,6 +41,7 @@ from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
+from nemo_automodel.components.models.gpt2 import GPT2LMHeadModel
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
 from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
@@ -124,6 +126,82 @@ class VocabParallelEmbedding(RowwiseParallel):
                 mb.materialize_mask(mask)
 
         return RowwiseParallel._prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh)
+
+
+class FusedQKVColwiseParallel(ColwiseParallel):
+    """Column-wise parallelism for fused Q/K/V (or Q/KV) linear projections.
+
+    A fused QKV linear has weight shape ``(num_sections * hidden, hidden)``
+    whose output is the concatenation ``[Q | K | V]``.  Standard
+    ``ColwiseParallel`` shards the first dimension contiguously, which
+    crosses Q/K/V boundaries and mixes heads from different projections on
+    different TP ranks.
+
+    ``FusedQKVColwiseParallel`` instead splits the weight (and bias) into
+    ``num_sections`` equal blocks and shards **each block** independently
+    with ``Shard(0)``, then concatenates the local shards.  This ensures
+    every rank receives the correct head subset from every section.
+
+    The forward output is ``(B, T, num_sections * hidden/tp)`` with
+    per-section layout ``[Q_local | K_local | V_local]``.  The standard
+    reshape ``view(B, T, num_sections, -1, head_dim)`` followed by
+    ``unbind(dim=2)`` therefore produces correct local Q, K, V tensors.
+
+    YAML string: ``"fused_qkv_colwise"``
+
+    Note on checkpointing
+    ---------------------
+    Because the local shard concatenates non-contiguous slices of the
+    original weight, ``DTensor.full_tensor()`` will reconstruct a
+    **permuted** weight (heads interleaved across sections) rather than
+    the original ``[Q | K | V]`` layout.  Distributed-checkpoint
+    save/load at the **same** TP degree works correctly; cross-TP-degree
+    resharding requires a state-dict adapter that re-partitions the fused
+    QKV weight.
+
+    Args:
+        num_sections: Number of fused sections.  Default ``3`` for Q/K/V.
+    """
+
+    def __init__(self, *, num_sections: int = 3, **kwargs):
+        super().__init__(**kwargs)
+        self.num_sections = num_sections
+
+    # -- custom partition function ------------------------------------
+    def _partition_linear_fn(self, name, module, device_mesh):
+        from torch.distributed.tensor import distribute_tensor
+
+        ns = self.num_sections
+        for pname, param in list(module.named_parameters()):
+            if isinstance(param, DTensor):
+                continue  # already distributed
+
+            dim0 = param.shape[0]
+            if dim0 % ns != 0:
+                raise ValueError(
+                    f"FusedQKVColwiseParallel: parameter '{pname}' dim-0 "
+                    f"({dim0}) is not divisible by num_sections ({ns})."
+                )
+
+            # Split into sections, distribute each with Shard(0),
+            # concatenate the local shards.
+            sections = param.data.chunk(ns, dim=0)
+            local_parts = []
+            for sec in sections:
+                dt = distribute_tensor(sec, device_mesh, [Shard(0)])
+                local_parts.append(dt.to_local())
+
+            local_data = torch.cat(local_parts, dim=0)
+
+            dist_param = nn.Parameter(
+                DTensor.from_local(
+                    local_data,
+                    device_mesh,
+                    [Shard(0)],
+                    run_check=False,
+                )
+            )
+            module.register_parameter(pname, dist_param)
 
 
 class RotaryEmbedParallel(SequenceParallel):
@@ -400,7 +478,6 @@ def _parallelize_phi3(
         dict[str, ParallelStyle],
         base_model_tp_plan,
     )
-
 
 # Create the model-specific parallel plan mapping
 PARALLELIZE_FUNCTIONS: Dict[type, Callable[..., Dict[str, ParallelStyle]]] = {

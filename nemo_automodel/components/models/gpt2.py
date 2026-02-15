@@ -62,7 +62,14 @@ __all__ = ["build_gpt2_model"]
 
 
 class CausalSelfAttention(nn.Module):
-    """Multi-head self-attention with a causal mask."""
+    """Multi-head self-attention with a causal mask and fused QKV projection.
+
+    The fused ``qkv_proj`` produces ``3 * embed_dim`` outputs laid out as
+    ``[Q | K | V]``.  For tensor parallelism use
+    ``FusedQKVColwiseParallel`` (YAML string ``"fused_qkv_colwise"``)
+    which shards each section independently so that heads are never mixed
+    across TP ranks.
+    """
 
     def __init__(self, embed_dim: int, num_heads: int, attn_dropout: float = 0.0):
         super().__init__()
@@ -81,16 +88,19 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B, T, C)
         bsz, seq_len, _ = x.shape
 
-        # Project to QKV and reshape: (B, T, 3*C) → (B, n_head, T, head_dim)
-        qkv = self.qkv_proj(x).view(bsz, seq_len, 3, self.num_heads, self.head_dim)
+        # Project to QKV and reshape: (B, T, 3*C_local) → (B, T, 3, n_head_local, head_dim)
+        # Using -1 for the head count lets this work transparently under TP
+        # where the output dim is 3*embed_dim/tp_size and each section has
+        # embed_dim/tp_size features.
+        qkv = self.qkv_proj(x).view(bsz, seq_len, 3, -1, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
-        q, k, v = (t.transpose(1, 2) for t in (q, k, v))  # (B, n_head, T, head_dim)
+        q, k, v = (t.transpose(1, 2) for t in (q, k, v))  # (B, n_head_local, T, head_dim)
 
         # Use torch's optimized SDPA when available (PyTorch ≥2.0)
         if hasattr(F, "scaled_dot_product_attention"):
             attn_output = F.scaled_dot_product_attention(
                 q, k, v, dropout_p=self.attn_dropout, is_causal=True
-            )  # (B, n_head, T, head_dim)
+            )  # (B, n_head_local, T, head_dim)
         else:
             # Fallback implementation with an explicit causal mask
             scores = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
@@ -98,10 +108,11 @@ class CausalSelfAttention(nn.Module):
             scores = scores.masked_fill(~causal_mask, float("-inf"))
             attn_weights = F.softmax(scores, dim=-1)
             attn_weights = F.dropout(attn_weights, p=self.attn_dropout, training=self.training)
-            attn_output = attn_weights @ v  # (B, n_head, T, head_dim)
+            attn_output = attn_weights @ v  # (B, n_head_local, T, head_dim)
 
-        # Merge heads
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, self.embed_dim)
+        # Merge heads — use actual tensor size for the hidden dim so this
+        # works regardless of whether TP sharding is active.
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
         return self.out_proj(attn_output)
 
 
@@ -136,7 +147,7 @@ class TransformerBlock(nn.Module):
 
 
 class GPT2LMHeadModel(nn.Module):
-    """Minimal GPT-2 Causal-LM with tied input/output embeddings."""
+    """Minimal GPT-2 Causal-LM with optionally tied input/output embeddings."""
 
     def __init__(
         self,
@@ -147,6 +158,7 @@ class GPT2LMHeadModel(nn.Module):
         n_layer: int,
         n_head: int,
         dropout: float = 0.1,
+        tie_word_embeddings: bool = True,
     ) -> None:
         super().__init__()
 
@@ -157,9 +169,10 @@ class GPT2LMHeadModel(nn.Module):
         self.h = nn.ModuleList([TransformerBlock(n_embd, n_head, dropout) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd)
 
-        # Language model head (weights tied to token embedding matrix)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
-        self.lm_head.weight = self.wte.weight  # weight tying
+        self.tie_word_embeddings = tie_word_embeddings
+        if tie_word_embeddings:
+            self.lm_head.weight = self.wte.weight
 
         # Initialize parameters following GPT-2 scheme
         self._init_weights()
@@ -206,6 +219,7 @@ def build_gpt2_model(
     n_embd: int = 768,
     n_layer: int = 12,
     n_head: int = 12,
+    tie_word_embeddings: bool = True,
     bos_token_id: int = 50256,  # kept for API backward-compat (unused)
     eos_token_id: int = 50256,  # kept for API backward-compat (unused)
     attn_implementation: str = "flash_attention_2",  # retained but ignored
@@ -236,4 +250,5 @@ def build_gpt2_model(
         n_embd=n_embd,
         n_layer=n_layer,
         n_head=n_head,
+        tie_word_embeddings=tie_word_embeddings,
     )

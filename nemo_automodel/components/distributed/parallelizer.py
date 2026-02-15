@@ -632,6 +632,10 @@ def translate_to_torch_parallel_style(style: str):
         return RowwiseParallel(input_layouts=Replicate())
     elif style == "sequence_parallel":
         return SequenceParallel()
+    elif style == "fused_qkv_colwise":
+        from nemo_automodel.components.distributed.optimized_tp_plans import FusedQKVColwiseParallel
+
+        return FusedQKVColwiseParallel()
     else:
         raise ValueError(f"Unknown parallel style: {style}")
 
@@ -878,8 +882,15 @@ def _get_parallel_plan(
     model_cls = type(model)
 
     if isinstance(tp_shard_plan, dict):
-        model_parallel_plan = tp_shard_plan
-        logger.info(f"Using parallel plan (dictionary). {tp_shard_plan}")
+        # Translate string values (from YAML) to ParallelStyle objects.
+        # Dicts coming from YAML will have string values like "colwise",
+        # "rowwise", "colwise_rep", etc.  Dicts built in Python may
+        # already contain ParallelStyle instances — those are kept as-is.
+        model_parallel_plan = {
+            k: translate_to_torch_parallel_style(v) if isinstance(v, str) else v
+            for k, v in tp_shard_plan.items()
+        }
+        logger.info(f"Using parallel plan (dictionary). {model_parallel_plan}")
     elif tp_shard_plan is not None:
         try:
             plan_obj = import_class_from_path(tp_shard_plan)
@@ -890,6 +901,11 @@ def _get_parallel_plan(
             assert isinstance(model_parallel_plan, dict), (
                 f"Parallel plan must be a dictionary, got {type(model_parallel_plan)}"
             )
+            # Translate any string values in the imported plan.
+            model_parallel_plan = {
+                k: translate_to_torch_parallel_style(v) if isinstance(v, str) else v
+                for k, v in model_parallel_plan.items()
+            }
             logger.info(f"Using provided parallel plan (from path). {tp_shard_plan}")
         except Exception as e:
             raise ValueError(
