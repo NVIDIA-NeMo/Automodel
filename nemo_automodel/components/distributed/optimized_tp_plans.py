@@ -41,7 +41,6 @@ from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
-from nemo_automodel.components.models.gpt2 import GPT2LMHeadModel
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
 from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
