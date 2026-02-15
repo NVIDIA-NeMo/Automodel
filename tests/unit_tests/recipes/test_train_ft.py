@@ -1138,7 +1138,6 @@ def test_build_optimizer_disables_foreach_with_tp():
                         cfg_model=cfg_model,
                         cfg_peft=None,
                         seed=42,
-                        device_mesh=mock_mesh,
                     )
                     optimizer = build_optimizer(model, cfg_opt, None, mock_mesh)
 
