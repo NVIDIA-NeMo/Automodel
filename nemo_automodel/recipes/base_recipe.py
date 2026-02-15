@@ -517,20 +517,26 @@ class BaseRecipe:
         cfg = getattr(self, "cfg", None)
         if cfg is not None:
             ok, reason = _is_checkpoint_model_config_compatible(cfg, ckpt_dir)
-            if not ok and is_rank_0:
+            if not ok:
                 if not restore_from:
-                    # Auto-detected: skip restore to avoid loading stale/incompatible checkpoints
-                    logging.warning(
-                        f"Auto-detected checkpoint at {ckpt_dir} is incompatible with current "
-                        f"model configuration: {reason}. Skipping restore."
-                    )
+                    # Auto-detected: skip restore to avoid loading stale/incompatible checkpoints.
+                    # The return must happen on ALL ranks; restricting it to rank 0 would
+                    # cause non-rank-0 processes to continue into collective load operations
+                    # (e.g. set_model_state_dict with broadcast_from_rank0) while rank 0 has
+                    # already exited, leading to a deadlock.
+                    if is_rank_0:
+                        logging.warning(
+                            f"Auto-detected checkpoint at {ckpt_dir} is incompatible with current "
+                            f"model configuration: {reason}. Skipping restore."
+                        )
                     return
                 else:
                     # Explicit restore_from: warn but honour the user's request
-                    logging.warning(
-                        f"Checkpoint at {ckpt_dir} may be incompatible with current model "
-                        f"configuration: {reason}. Proceeding with restore anyway."
-                    )
+                    if is_rank_0:
+                        logging.warning(
+                            f"Checkpoint at {ckpt_dir} may be incompatible with current model "
+                            f"configuration: {reason}. Proceeding with restore anyway."
+                        )
 
         if is_rank_0:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)
@@ -797,6 +803,46 @@ def _extract_model_signature(cfg: dict) -> dict:
     return sig
 
 
+def _normalize_signature_value(v):
+    """
+    Normalize a signature value so that YAML round-trip and minor type differences
+    (e.g. int vs str, ConfigNode vs dict) do not cause false mismatches.
+    """
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v
+    if isinstance(v, str):
+        # YAML may round-trip numbers as strings; normalize so 32 and "32" match
+        try:
+            f = float(v)
+            return int(f) if f == int(f) else f
+        except (ValueError, TypeError):
+            return v
+    if isinstance(v, dict):
+        return {k: _normalize_signature_value(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_normalize_signature_value(x) for x in v]
+    # ConfigNode or other: try to treat as scalar for comparison
+    if hasattr(v, "_orig_value"):
+        return _normalize_signature_value(getattr(v, "_orig_value"))
+    return v
+
+
+def _signatures_match(cur_sig: dict, ckpt_sig: dict) -> bool:
+    """Compare two model signatures with normalization so YAML round-trip does not cause false mismatches."""
+    if set(cur_sig.keys()) != set(ckpt_sig.keys()):
+        return False
+    for k in cur_sig:
+        cur_v = _normalize_signature_value(cur_sig[k])
+        ckpt_v = _normalize_signature_value(ckpt_sig[k])
+        if cur_v != ckpt_v:
+            return False
+    return True
+
+
 def _is_checkpoint_model_config_compatible(current_cfg, ckpt_dir: str) -> tuple[bool, str]:
     """
     Compare the checkpoint's saved ``config.yaml`` model signature to the
@@ -833,6 +879,6 @@ def _is_checkpoint_model_config_compatible(current_cfg, ckpt_dir: str) -> tuple[
     if not ckpt_sig or not cur_sig:
         return True, "could not extract model signature (cannot validate)"
 
-    if ckpt_sig != cur_sig:
+    if not _signatures_match(cur_sig, ckpt_sig):
         return False, f"model signature mismatch (checkpoint={ckpt_sig}, current={cur_sig})"
     return True, "model signature matches"
