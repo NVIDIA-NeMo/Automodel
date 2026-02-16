@@ -59,10 +59,10 @@ model:
   trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: te
+    attn: sdpa
     linear: torch
-    rms_norm: te
-    experts: te
+    rms_norm: torch
+    experts: torch
     dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true

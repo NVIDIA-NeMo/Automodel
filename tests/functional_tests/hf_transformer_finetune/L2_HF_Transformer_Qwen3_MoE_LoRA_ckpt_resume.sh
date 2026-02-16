@@ -28,10 +28,7 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --config examples/llm_finetune/qwen/qwen3_moe_2layer_proxy_lora.yaml \
     --step_scheduler.max_steps 5 \
     --step_scheduler.ckpt_every_steps 5 \
-    --checkpoint.checkpoint_dir $CKPT_DIR \
-    --model.trust_remote_code true \
-    --model.config.backend.experts te \
-    --model.config.backend.dispatcher torch
+    --checkpoint.checkpoint_dir $CKPT_DIR
 
 # 2. Resume from checkpoint
 echo "Resuming training..."
@@ -39,9 +36,6 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     examples/llm_finetune/finetune.py \
     --config examples/llm_finetune/qwen/qwen3_moe_2layer_proxy_lora.yaml \
     --step_scheduler.max_steps 10 \
-    --checkpoint.checkpoint_dir $CKPT_DIR \
-    --model.trust_remote_code true \
-    --model.config.backend.experts te \
-    --model.config.backend.dispatcher torch
+    --checkpoint.checkpoint_dir $CKPT_DIR
 
 echo "Test passed!"
