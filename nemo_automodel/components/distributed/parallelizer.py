@@ -254,7 +254,22 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
         dp_mesh = device_mesh[dp_mesh_dim_names]
 
-        for layer in layers:
+        import os
+        if os.environ.get("RANK", "0") == "0":
+            logger.info(f"About to parallelize {len(layers)} layers, type of layers: {type(layers).__name__}")
+            # Handle both list and ModuleDict
+            if isinstance(layers, nn.ModuleDict):
+                layer_items = list(layers.items())[:3]
+                first_3_types = [(k, type(v).__name__) for k, v in layer_items]
+            else:
+                first_3_types = [type(layers[i]).__name__ for i in range(min(3, len(layers)))]
+            logger.info(f"First 3 layer types: {first_3_types}")
+
+        # When layers is a ModuleDict, iterate over values instead of keys
+        layer_iter = layers.values() if isinstance(layers, nn.ModuleDict) else layers
+        for idx, layer in enumerate(layer_iter):
+            if os.environ.get("RANK", "0") == "0" and idx < 3:
+                logger.info(f"Parallelizing layer {idx}, type: {type(layer).__name__}, has named_parameters: {hasattr(layer, 'named_parameters')}")
             parallelizer_utils.fully_shard_by_dtype(
                 layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy
             )
@@ -771,7 +786,26 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         ans = []
         for fqn in fqns:
             parts = fqn.split(".")
-            ans.append(reduce(getattr, parts, model))
+            module = reduce(getattr, parts, model)
+            # Debug logging
+            import os
+            if os.environ.get("RANK", "0") == "0":
+                logger.info(f"_reduce_attrs: fqn={fqn}, module type={type(module).__name__}, is ModuleList={isinstance(module, nn.ModuleList)}")
+            # If the result is a ModuleList or ModuleDict, unpack it
+            if isinstance(module, nn.ModuleList):
+                ans.extend(module)
+                if os.environ.get("RANK", "0") == "0":
+                    logger.info(f"_reduce_attrs: Unpacked ModuleList with {len(module)} elements")
+            elif isinstance(module, nn.ModuleDict):
+                ans.extend(module.values())
+                if os.environ.get("RANK", "0") == "0":
+                    logger.info(f"_reduce_attrs: Unpacked ModuleDict with {len(module)} elements")
+            else:
+                ans.append(module)
+                if os.environ.get("RANK", "0") == "0":
+                    logger.info(f"_reduce_attrs: Appended module directly")
+        if os.environ.get("RANK", "0") == "0":
+            logger.info(f"_reduce_attrs: Returning {len(ans)} modules, types: {[type(m).__name__ for m in ans[:3]]}")
         return ans
 
     VLM_MODEL_CLS_TO_LAYERS = {

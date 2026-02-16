@@ -127,7 +127,9 @@ def generate_hf_model_fqn_per_model_part(
 
         # First stage: add embeddings if requested
         if stage_idx == 0 and include_embeddings:
-            stage_modules.append(f"{fqn_prefix}embed_tokens")
+            # Use 'embeddings' for backbone models, 'embed_tokens' for model.* models
+            emb_name = "embeddings" if fqn_prefix == "backbone." else "embed_tokens"
+            stage_modules.append(f"{fqn_prefix}{emb_name}")
 
         # Add transformer layers for this stage
         for _ in range(stage_layer_count):
@@ -245,17 +247,25 @@ def split_model_into_stages(
     """
     pp_rank = pp_mesh.get_local_rank()
     pp_size = pp_mesh.size()
-    # Detect model structure
+    # Detect model structure - support both model.* and backbone.* patterns
     has_model_attr = hasattr(model, "model")
-    has_rotary_emb = hasattr(model.model, "rotary_emb") if has_model_attr else hasattr(model, "rotary_emb")
-    has_lm_head = hasattr(model, "lm_head")
+    has_backbone_attr = hasattr(model, "backbone")
 
     if has_model_attr:
-        # Models like LlamaForCausalLM have model.layers
-        num_layers = len(model.model.layers)
+        inner_model = model.model
+        fqn_prefix = "model."
+    elif has_backbone_attr:
+        inner_model = model.backbone
+        fqn_prefix = "backbone."
     else:
-        # Direct model access
-        num_layers = len(model.layers)
+        inner_model = model
+        fqn_prefix = ""
+
+    has_rotary_emb = hasattr(inner_model, "rotary_emb")
+    has_lm_head = hasattr(model, "lm_head")
+
+    # Get number of layers
+    num_layers = len(inner_model.layers)
 
     schedule_class = get_schedule_class(pp_schedule)
     is_single_stage_schedule = issubclass(schedule_class, PipelineScheduleSingle)
@@ -277,7 +287,7 @@ def split_model_into_stages(
             include_embeddings=True,
             include_lm_head=has_lm_head,
             include_rotary_emb=has_rotary_emb,
-            fqn_prefix="model." if has_model_attr else "",
+            fqn_prefix=fqn_prefix,
         )
 
     def _build_stage_from_modules(

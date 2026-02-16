@@ -14,12 +14,12 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 nemo_automodel/recipes/llm/benchmark.py --config examples/llm_finetune/nemotron/nemotron_nano_v3_squad_benchmark.yaml
+# torchrun --nproc-per-node=8 nemo_automodel/recipes/llm/benchmark.py --config examples/llm_finetune/nemotron/nemotron_nano_v3_pp_benchmark.yaml
 
 seed: 42
 
 benchmark:
-  warmup_steps: 5   
+  warmup_steps: 5
   peak_tflops: 989  # H100: 989, A100: 312
   nsys_start: -1    # Set to step number to profile (e.g., 10)
   nsys_end: -1      # Set to end step (e.g., 15)
@@ -28,7 +28,7 @@ benchmark:
 
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 4
+  local_batch_size: 16
   ckpt_every_steps: 1000
   val_every_steps: 1000  # will run every x number of gradient steps
   max_steps: 10
@@ -52,6 +52,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   torch_dtype: bf16
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  trust_remote_code: true
 
 # torch.compile configuration
 compile:
@@ -63,12 +64,11 @@ compile:
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-  dp_size: 8
+  dp_size: 1
   dp_replicate_size: 1 # dp_shard_size = dp_size / dp_replicate_size and dp_shard_size < dp_size. For DDP usecase, use DDPManager
   tp_size: 1
   cp_size: 1
-  # pp_size: 8
-  # use_hf_tp_plan: true
+  pp_size: 8  # Enable pipeline parallelism with 8 stages
   sequence_parallel: false
 
 loss_fn:
@@ -99,9 +99,3 @@ optimizer:
 lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
-
-# wandb:
-#   project: <your_wandb_project>
-#   entity: <your_wandb_entity>
-#   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 

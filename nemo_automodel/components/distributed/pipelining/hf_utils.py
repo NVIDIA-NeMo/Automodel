@@ -40,13 +40,27 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         causal_mask_mapping: Optional[dict] = None,
         **kwargs,
     ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
-        # Embeddings handling
+        # Embeddings handling - support both embed_tokens (standard transformers) and embeddings (Nemotron/Mamba)
         if inputs_embeds is None:
+            # Try multiple paths for embeddings to support different model structures
+            embed_module = None
+
+            # Path 1: Direct embed_tokens (standard transformers like Llama)
             if hasattr(self, "embed_tokens") and self.embed_tokens is not None:
+                embed_module = self.embed_tokens
+            # Path 2: Direct embeddings (some models)
+            elif hasattr(self, "embeddings") and self.embeddings is not None:
+                embed_module = self.embeddings
+            # Path 3: backbone.embeddings (Nemotron structure after PP splitting)
+            elif hasattr(self, "backbone") and hasattr(self.backbone, "embeddings") and self.backbone.embeddings is not None:
+                embed_module = self.backbone.embeddings
+
+            if embed_module is not None:
                 if input_ids is None:
                     raise ValueError("You must provide either input_ids or inputs_embeds")
-                inputs_embeds = self.embed_tokens(input_ids)
+                inputs_embeds = embed_module(input_ids)
             else:
+                # Fallback: if input_ids is already float tensor, treat as embeddings
                 if (
                     input_ids is not None
                     and isinstance(input_ids, torch.Tensor)
@@ -54,7 +68,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                 ):
                     inputs_embeds = input_ids
                 else:
-                    raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
+                    raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens or embeddings")
 
         if use_cache and past_key_values is None:
             from transformers.cache_utils import DynamicCache
