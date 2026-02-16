@@ -576,21 +576,7 @@ def _hybrid_model_flops(config, gbs, seq_len):
 
 
 def nemotronh_flops(config, gbs=1, seq_len=None):
-    """
-    Calculate FLOPs for Nemotron NanoV3 Mamba2 hybrid model.
-
-    Architecture: Hybrid model with Mamba2, MOE, and Attention layers
-    - Uses config.layers_block_type to count layer types accurately
-    - Accounts for: Mamba2 SSM operations, MOE routing, standard attention
-
-    Note: This is an approximation. Mamba2 state-space operations are complex,
-    and this formula may underestimate FLOPs by ~20-30% (leading to MFU >100%).
-    Refinement would require detailed analysis of:
-    - Mamba2 SSM scan algorithms
-    - Conv1d operation costs
-    - RMSNorm layers
-    - Gradient flow through MOE routing
-    """
+    """Calculate FLOPs for Nemotron NanoV3 Mamba2 hybrid model."""
     if seq_len is None:
         seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
 
@@ -621,17 +607,8 @@ def nemotronh_flops(config, gbs=1, seq_len=None):
     # in_proj outputs: z(4096) + x(4096) + B(1024) + C(1024) + dt(64) = 10304
     in_proj_dim = 2 * d_inner + 2 * mamba_num_groups * mamba_state_dim + mamba_num_heads
 
-    # SSM FLOPs calibration (from profiling analysis):
-    # - Detailed operation analysis: forward ops are 3.05× the simple 2×B×L×D×N formula
-    # - Includes: dt projection, A/B/C discretization, state updates, decay, output projection,
-    #   skip connections, RMSNorm, gating
-    # - Training convention: 3× multiplier (forward + backward)
-    # - Total: 6 × 3.05 = 18.3×
-    # - Empirical validation: measured 17.72× from single-layer profiling
-    #
-    # Note: Full-model MFU > 100% suggests other formula components (MOE, attention, vocab)
-    # may also need calibration, but SSM-specific profiling validates this 18× multiplier.
-    ssm_training_multiplier = 6 * 3.05  # ≈ 18.3, validated by profiling
+    # Empirical
+    ssm_training_multiplier = 16
 
     mamba_layer_flops = (
         6 * gbs * seq_len * hs * in_proj_dim  # in_proj: Linear(2688, 10304)
@@ -641,10 +618,10 @@ def nemotronh_flops(config, gbs=1, seq_len=None):
     mamba_flops = num_mamba_layers * mamba_layer_flops
 
     # MOE parameters
-    num_routed_experts = getattr(config, 'n_routed_experts', 128)
-    experts_per_tok = getattr(config, 'num_experts_per_tok', 6)
-    routed_intermediate = getattr(config, 'moe_intermediate_size', 1856)
-    shared_intermediate = getattr(config, 'moe_shared_expert_intermediate_size', 3712)
+    num_routed_experts = config.n_routed_experts
+    experts_per_tok = config.num_experts_per_tok
+    routed_intermediate = config.moe_intermediate_size
+    shared_intermediate = config.moe_shared_expert_intermediate_size
 
     # MOE layer FLOPs
     # Each MOE layer has: router + shared expert + routed experts
@@ -938,7 +915,7 @@ def get_flops_formula_for_hf_config(config: Any) -> Optional[Callable]:
         "MT5Config": transformer_flops,
         # Nemotron
         "NemotronConfig": nemotron_flops,
-        "NemotronHConfig": nemotronh_flops,
+        "NemotronHConfig": nemotron_flops,
         # General transformer fallback
         "OPTConfig": transformer_flops,
         "BloomConfig": transformer_flops,
