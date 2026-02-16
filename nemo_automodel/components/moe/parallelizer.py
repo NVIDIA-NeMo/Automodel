@@ -84,21 +84,35 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh):
 
     if hasattr(model, "model") and model.model is not None:
         _model = model.model
+        logger.info(f"[apply_ep] Resolved inner model via model.model ({type(_model).__name__})")
+    elif hasattr(model, "backbone") and model.backbone is not None:
+        _model = model.backbone
+        logger.info(f"[apply_ep] Resolved inner model via model.backbone ({type(_model).__name__})")
     else:
         _model = model
+        logger.info(f"[apply_ep] Using model directly as inner model ({type(_model).__name__})")
 
-    for _, block in _model.layers.named_children():
-        # Support both naming conventions: mlp (DeepSeek) and block_sparse_moe (Mixtral)
+    n_moe = 0
+    n_total = 0
+    for name, block in _model.layers.named_children():
+        n_total += 1
+        # Support naming conventions: mlp (DeepSeek), block_sparse_moe (Mixtral), mixer (NemotronH)
         moe_module = None
         if hasattr(block, 'mlp') and isinstance(block.mlp, MoE):
             moe_module = block.mlp
-            logger.info(f"[apply_ep] Found MoE via block.mlp")
+            logger.info(f"[apply_ep] Block {name}: found MoE via block.mlp ({type(block.mlp).__name__})")
         elif hasattr(block, 'block_sparse_moe') and hasattr(block.block_sparse_moe, 'moe_layer'):
             if isinstance(block.block_sparse_moe.moe_layer, MoE):
                 moe_module = block.block_sparse_moe.moe_layer
-                logger.info(f"[apply_ep] Found MoE via block.block_sparse_moe.moe_layer")
-        
+                logger.info(f"[apply_ep] Block {name}: found MoE via block.block_sparse_moe.moe_layer")
+        elif hasattr(block, 'mixer') and isinstance(block.mixer, MoE):
+            moe_module = block.mixer
+            logger.info(f"[apply_ep] Block {name}: found MoE via block.mixer ({type(block.mixer).__name__})")
+        else:
+            block_type = getattr(block, 'block_type', type(block).__name__)
+            logger.debug(f"[apply_ep] Block {name}: no MoE found (block_type={block_type})")
         if moe_module is not None:
+            n_moe += 1
             if ep_mesh.size() == 1:
                 # EP "init-only" mode: we still need DeepEP's token dispatcher and EP group,
                 # but we do not need to DTensor-shard parameters when the EP axis is size 1.
@@ -135,6 +149,8 @@ def apply_ac(model: nn.Module, ignore_router: bool = False, hidden_size: int = 7
 
     if hasattr(model, "model") and model.model is not None:
         _model = model.model
+    elif hasattr(model, "backbone") and model.backbone is not None:
+        _model = model.backbone
     else:
         _model = model
     for layer_id, block in _model.layers.named_children():
@@ -179,17 +195,26 @@ def apply_fsdp(
 
     if hasattr(model, "model") and model.model is not None:
         _model = model.model
+        logger.info(f"[apply_fsdp] Resolved inner model via model.model ({type(_model).__name__})")
+    elif hasattr(model, "backbone") and model.backbone is not None:
+        _model = model.backbone
+        logger.info(f"[apply_fsdp] Resolved inner model via model.backbone ({type(_model).__name__})")
     else:
         _model = model
+        logger.info(f"[apply_fsdp] Using model directly as inner model ({type(_model).__name__})")
 
-    for _, block in _model.layers.named_children():
-        # Support both naming conventions: mlp (DeepSeek) and block_sparse_moe (Mixtral)
+    n_moe_fsdp = 0
+    n_ignored = 0
+    for name, block in _model.layers.named_children():
+        # Supports naming conventions: mlp (DeepSeek), block_sparse_moe (Mixtral), mixer (Nemotron)
         moe_module = None
         if hasattr(block, 'mlp') and isinstance(block.mlp, MoE):
             moe_module = block.mlp
         elif hasattr(block, 'block_sparse_moe') and hasattr(block.block_sparse_moe, 'moe_layer'):
             if isinstance(block.block_sparse_moe.moe_layer, MoE):
                 moe_module = block.block_sparse_moe.moe_layer
+        elif hasattr(block, 'mixer') and isinstance(block.mixer, MoE):
+            moe_module = block.mixer
         
         if moe_module is not None and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
@@ -213,7 +238,13 @@ def apply_fsdp(
         fully_shard_default(block, ignored_params=ignored_params)
 
     if hasattr(_model, "embed_tokens") and _model.embed_tokens is not None:
+        logger.info(f"[apply_fsdp] FSDP wrapping embed_tokens")
         fully_shard_default(_model.embed_tokens)
+    elif hasattr(_model, "embeddings") and _model.embeddings is not None:
+        logger.info(f"[apply_fsdp] FSDP wrapping embeddings (NemotronH path)")
+        fully_shard_default(_model.embeddings)
+    else:
+        logger.warning(f"[apply_fsdp] No embeddings found (checked embed_tokens and embeddings)")
 
     lm_head = getattr(_model, "lm_head", None) or getattr(model, "lm_head", None)
     if lm_head is not None:
@@ -259,6 +290,8 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
 
     if hasattr(model, "model") and model.model is not None:
         _model = model.model
+    elif hasattr(model, "backbone") and model.backbone is not None:
+        _model = model.backbone
     else:
         _model = model
 
@@ -307,7 +340,14 @@ def parallelize_model(
     # DeepEP requires the EP process group / token dispatcher even in the non-sharded case.
     if ep_mesh is not None:
         if ep_mesh.size() > 1:
-            assert model.model.moe_config.n_routed_experts % ep_mesh.size() == 0, (
+            if hasattr(model, "model") and model.model is not None:
+                _model = model.model
+            elif hasattr(model, "backbone") and model.backbone is not None:
+                _model = model.backbone
+                logger.info("back bone acquired")
+            else:
+                _model = model
+            assert _model.moe_config.n_routed_experts % ep_mesh.size() == 0, (
             f"n_routed_experts {model.model.moe_config.n_routed_experts} must be divisible by "
             f"expert_parallel_degree {ep_mesh.size()}"
             )
