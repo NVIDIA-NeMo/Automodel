@@ -41,6 +41,7 @@ model:
     num_hidden_layers: 2
     num_attention_heads: 8
     num_key_value_heads: 4
+    head_dim: 128
     max_position_embeddings: 256
     hidden_act: silu
     rms_norm_eps: 1.0e-6
@@ -59,10 +60,10 @@ model:
   trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: sdpa
+    attn: te
     linear: torch
-    rms_norm: torch
-    experts: torch
+    rms_norm: te
+    experts: te
     dispatcher: torch
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
