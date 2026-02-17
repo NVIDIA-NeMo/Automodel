@@ -13,7 +13,7 @@
 # limitations under the License.
 
 step_scheduler:
-  global_batch_size: 16
+  global_batch_size: 8
   local_batch_size: 4
   ckpt_every_steps: 5
   val_every_steps: 1
@@ -65,7 +65,7 @@ model:
     rope_fusion: false  # failed in CI test
     experts: torch
     dispatcher: torch
-    fake_balanced_gate: false
+    fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
