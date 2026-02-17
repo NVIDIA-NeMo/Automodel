@@ -937,9 +937,7 @@ def _get_parallel_plan(
         # crosses Q/K/V boundaries; FusedColwiseParallel shards each
         # section independently so every TP rank gets the correct heads.
         try:
-            head_dim = getattr(
-                model.config, "head_dim", model.config.hidden_size // model.config.num_attention_heads
-            )
+            head_dim = getattr(model.config, "head_dim", model.config.hidden_size // model.config.num_attention_heads)
             q_size = model.config.num_attention_heads * head_dim
             kv_size = model.config.num_key_value_heads * head_dim
             qkv_style = FusedColwiseParallel(section_sizes=(q_size, kv_size, kv_size))
