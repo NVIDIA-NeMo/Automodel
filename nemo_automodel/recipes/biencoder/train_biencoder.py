@@ -367,8 +367,21 @@ class TrainBiencoderRecipe(BaseRecipe):
         # Build biencoder model
         logger.info("Building biencoder model...")
 
+        # Prepare quantization config if specified
+        quantization_config = None
+        if self.cfg.get("quantization", None) is not None:
+            logger.info("Model weight quantization enabled with BitsAndBytes")
+            from nemo_automodel.components.quantization.qlora import create_bnb_config
+
+            quantization_config = create_bnb_config(self.cfg.quantization)
+
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
-            model = self.cfg.model.instantiate()
+            # Pass quantization config to model instantiation
+            model_kwargs = {}
+            if quantization_config is not None:
+                model_kwargs["quantization_config"] = quantization_config
+
+            model = self.cfg.model.instantiate(**model_kwargs)
 
             # Apply PEFT (LoRA) if configured
             if self.peft_config is not None:
@@ -377,7 +390,7 @@ class TrainBiencoderRecipe(BaseRecipe):
                     self.peft_config.use_triton = False
 
                 logger.info("Applying LoRA to biencoder model")
-                apply_lora_to_linear_modules(model, self.peft_config, quantization_config=None)
+                apply_lora_to_linear_modules(model, self.peft_config, quantization_config=quantization_config)
 
         # Apply parallelism wrapper if needed (FSDP/DDP)
         if self.distributed_config is not None:
