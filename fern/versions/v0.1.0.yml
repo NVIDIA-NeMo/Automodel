@@ -1,0 +1,83 @@
+navigation:
+  - section: Home
+    contents:
+      - page: Welcome
+        path: ../v0.1.0/pages/index.mdx
+  - section: Get Started
+    contents:
+      - page: Repository Structure
+        path: ../v0.1.0/pages/repository-structure.mdx
+      - page: Installation
+        path: ../v0.1.0/pages/guides/installation.mdx
+      - page: Configuration
+        path: ../v0.1.0/pages/guides/configuration.mdx
+      - page: Hugging Face API Compatibility
+        path: ../v0.1.0/pages/guides/huggingface-api-compatibility.mdx
+      - page: Local Workstation
+        path: ../v0.1.0/pages/launcher/local-workstation.mdx
+      - page: Cluster
+        path: ../v0.1.0/pages/launcher/cluster.mdx
+  - section: Announcements
+    contents:
+      - page: Announcements
+        path: ../v0.1.0/pages/announcements.mdx
+  - section: Performance
+    contents:
+      - page: Performance Summary
+        path: ../v0.1.0/pages/performance-summary.mdx
+  - section: Recipes and E2E Examples
+    contents:
+      - page: Overview
+        path: ../v0.1.0/pages/guides/overview.mdx
+      - page: Fine-Tuning
+        path: ../v0.1.0/pages/guides/llm/finetune.mdx
+      - page: Tool Calling
+        path: ../v0.1.0/pages/guides/llm/toolcalling.mdx
+      - page: Pretraining
+        path: ../v0.1.0/pages/guides/llm/pretraining.mdx
+      - page: NanoGPT Pretraining
+        path: ../v0.1.0/pages/guides/llm/nanogpt-pretraining.mdx
+      - page: Sequence Classification
+        path: ../v0.1.0/pages/guides/llm/sequence-classification.mdx
+      - page: Gemma 3 3n
+        path: ../v0.1.0/pages/guides/omni/gemma3-3n.mdx
+      - page: Quantization-Aware Training
+        path: ../v0.1.0/pages/guides/quantization-aware-training.mdx
+      - page: Databricks
+        path: ../v0.1.0/pages/guides/llm/databricks.mdx
+  - section: Model Coverage
+    contents:
+      - page: Overview
+        path: ../v0.1.0/pages/model-coverage/overview.mdx
+      - page: LLM
+        path: ../v0.1.0/pages/model-coverage/llm.mdx
+      - page: VLM
+        path: ../v0.1.0/pages/model-coverage/vlm.mdx
+  - section: Datasets
+    contents:
+      - page: Dataset Overview
+        path: ../v0.1.0/pages/guides/dataset-overview.mdx
+      - page: LLM Dataset
+        path: ../v0.1.0/pages/guides/llm/dataset.mdx
+      - page: Retrieval Dataset
+        path: ../v0.1.0/pages/guides/llm/retrieval-dataset.mdx
+      - page: Column-Mapped Text Instruction Dataset
+        path: ../v0.1.0/pages/guides/llm/column-mapped-text-instruction-dataset.mdx
+      - page: Column-Mapped Text Instruction Iterable Dataset
+        path: ../v0.1.0/pages/guides/llm/column-mapped-text-instruction-iterable-dataset.mdx
+      - page: VLM Dataset
+        path: ../v0.1.0/pages/guides/vlm/dataset.mdx
+  - section: Development
+    contents:
+      - page: Checkpointing
+        path: ../v0.1.0/pages/guides/checkpointing.mdx
+      - page: Gradient Checkpointing
+        path: ../v0.1.0/pages/guides/gradient-checkpointing.mdx
+      - page: Pipelining
+        path: ../v0.1.0/pages/guides/pipelining.mdx
+      - page: Knowledge Distillation
+        path: ../v0.1.0/pages/guides/llm/knowledge-distillation.mdx
+      - page: FP8 Training
+        path: ../v0.1.0/pages/guides/fp8-training.mdx
+      - page: MLflow Logging
+        path: ../v0.1.0/pages/guides/mlflow-logging.mdx
