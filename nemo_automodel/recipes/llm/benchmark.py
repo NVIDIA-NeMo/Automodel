@@ -58,7 +58,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         self._bench_steps = cfg.step_scheduler.max_steps
 
         # Get seq_len from dataset config
-        self._bench_seq_len = cfg.dataset.seq_len
+        self._bench_seq_len = 2048
+        # USE FOR MIXTRAL
+        # self._bench_seq_len = cfg.dataset.seq_len
 
         # Infer vocab_size from model config and inject it into dataset config
         if hasattr(cfg, "dataset") and hasattr(cfg, "model"):
@@ -76,7 +78,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Inject batch_size from step_scheduler into dataset config
         if hasattr(cfg, "dataset") and hasattr(cfg, "step_scheduler"):
             local_batch_size = getattr(cfg.step_scheduler, "local_batch_size", 1)
-            cfg.dataset.batch_size = local_batch_size
+            # USE FOR MIXTRAL
+            # cfg.dataset.batch_size = local_batch_size
             if logger.isEnabledFor(logging.INFO):
                 logger.info(f"Using batch_size={local_batch_size} from step_scheduler.local_batch_size")
 
