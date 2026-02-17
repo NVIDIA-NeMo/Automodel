@@ -476,6 +476,9 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
     def get_input_embeddings(self):
         return self.decoder.get_input_embeddings()
 
+    def set_input_embeddings(self, value):
+        self.decoder.embed_tokens = value
+
     def forward(
         self,
         pixel_values: Optional[torch.FloatTensor] = None,
