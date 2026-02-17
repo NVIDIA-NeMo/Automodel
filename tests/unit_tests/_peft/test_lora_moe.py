@@ -22,8 +22,8 @@ except ImportError:
     grouped_gemm = None
 
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP
-from nemo_automodel.components._peft.lora_moe import GroupedExpertsLoRA, GroupedExpertsDeepEPLoRA
+from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
+from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA, GroupedExpertsDeepEPLoRA
 from nemo_automodel.components._peft.lora import patch_moe_module, apply_lora_to_linear_modules, PeftConfig
 
 
@@ -605,3 +605,316 @@ def test_deepep_lora_zero_tokens(moe_config, device):
     # Should handle zero tokens gracefully
     out = lora_module(x, token_mask, weights, indices)
     assert out.shape == (num_tokens, 16)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_patch_moe_module_rejects_te_experts(moe_config, device):
+    """Test that patch_moe_module raises NotImplementedError for GroupedExpertsTE."""
+    orig_experts = GroupedExpertsTE(moe_config).to(device)
+    with pytest.raises(NotImplementedError, match="LoRA is not supported for Transformer Engine"):
+        patch_moe_module(orig_experts, dim=4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_apply_lora_rejects_te_experts(moe_config, device):
+    """Test that apply_lora_to_linear_modules raises NotImplementedError for GroupedExpertsTE."""
+    class MockModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = GroupedExpertsTE(moe_config)
+
+    model = MockModel().to(device)
+    peft_config = PeftConfig(target_modules=["experts"], dim=4)
+
+    with pytest.raises(NotImplementedError, match="LoRA is not supported for Transformer Engine"):
+        apply_lora_to_linear_modules(model, peft_config)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_lora_relu2_non_gated_shapes(device):
+    """Test LoRA weight shapes for non-gated ReLU² activation (half the gate+up dim)."""
+    config = MoEConfig(
+        n_routed_experts=4,
+        n_shared_experts=0,
+        n_activated_experts=2,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=16,
+        inter_dim=32,
+        moe_inter_dim=32,
+        norm_topk_prob=False,
+        expert_activation="relu2",
+        dtype=torch.float32,
+    )
+
+    orig_experts = GroupedExperts(config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8).to(device)
+
+    # Non-gated: lora_gate_and_up_B should be [n_experts, lora_dim, moe_inter_dim] (not 2x)
+    assert lora_experts.lora_gate_and_up_B.shape == (4, 4, 32)
+    # Down A still uses moe_inter_dim
+    assert lora_experts.lora_down_A.shape == (4, 32, 4)
+
+    # Forward pass should work
+    num_tokens = 10
+    x = torch.randn(num_tokens, 16, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    weights = torch.rand(num_tokens, 2, device=device)
+    indices = torch.randint(0, 4, (num_tokens, 2), device=device)
+
+    out = lora_experts(x, token_mask, weights, indices)
+    assert out.shape == (num_tokens, 16)
+    assert not torch.isnan(out).any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_lora_copies_use_torch_mm_flag(moe_config, device):
+    """Test that use_torch_mm flag is copied from the original module."""
+    orig_experts = GroupedExperts(moe_config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+
+    # Default (no backend) -> use_torch_mm is False
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8)
+    assert lora_experts.use_torch_mm is False
+
+    # Simulate a module that had use_torch_mm=True
+    orig_experts.use_torch_mm = True
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8)
+    assert lora_experts.use_torch_mm is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_deepep_lora_copies_use_torch_mm_flag(moe_config, device):
+    """Test that use_torch_mm flag is copied from the original DeepEP module."""
+    orig_experts = GroupedExpertsDeepEP(moe_config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(device)
+
+    orig_experts.n_routed_experts = 4
+    orig_experts.ep_size = 1
+
+    # Default -> use_torch_mm is False
+    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4)
+    assert lora_module.use_torch_mm is False
+
+    # Simulate a module that had use_torch_mm=True
+    orig_experts.use_torch_mm = True
+    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4)
+    assert lora_module.use_torch_mm is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_deepep_lora_relu2_non_gated_shapes(device):
+    """Test DeepEP LoRA weight shapes for non-gated ReLU² activation."""
+    config = MoEConfig(
+        n_routed_experts=4,
+        n_shared_experts=0,
+        n_activated_experts=2,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=16,
+        inter_dim=32,
+        moe_inter_dim=32,
+        norm_topk_prob=False,
+        expert_activation="relu2",
+        dtype=torch.float32,
+    )
+
+    orig_experts = GroupedExpertsDeepEP(config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(device)
+
+    orig_experts.n_routed_experts = 4
+    orig_experts.ep_size = 1
+
+    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4, alpha=8)
+
+    # Non-gated: lora_gate_and_up_B should be [n_experts, lora_dim, moe_inter_dim] (not 2x)
+    assert lora_module.lora_gate_and_up_B.shape == (4, 4, 32)
+    assert lora_module.lora_down_A.shape == (4, 32, 4)
+
+
+# ---------- moe_rank_scaling tests ----------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_moe_rank_scaling_basic(moe_config, device):
+    """MoE experts get dim // n_activated_experts; Linear keeps full dim."""
+    class MockModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = GroupedExperts(moe_config)
+            self.linear = nn.Linear(16, 16)
+
+    model = MockModel().to(device)
+    with torch.no_grad():
+        model.experts.init_weights(buffer_device=device)
+
+    peft_config = PeftConfig(
+        target_modules=["experts", "linear"],
+        dim=16,
+        moe_rank_scaling=True,
+    )
+    count = apply_lora_to_linear_modules(model, peft_config)
+    assert count == 2
+
+    # MoE module should have rank = 16 // 2 = 8
+    assert isinstance(model.experts, GroupedExpertsLoRA)
+    assert model.experts.lora_dim == 8
+
+    # Linear module should keep full rank = 16
+    assert model.linear.dim == 16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_moe_rank_scaling_default_off(moe_config, device):
+    """With moe_rank_scaling=False (default), both get the full dim."""
+    class MockModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = GroupedExperts(moe_config)
+            self.linear = nn.Linear(16, 16)
+
+    model = MockModel().to(device)
+    with torch.no_grad():
+        model.experts.init_weights(buffer_device=device)
+
+    peft_config = PeftConfig(
+        target_modules=["experts", "linear"],
+        dim=16,
+    )
+    count = apply_lora_to_linear_modules(model, peft_config)
+    assert count == 2
+
+    # Both should keep full rank
+    assert model.experts.lora_dim == 16
+    assert model.linear.dim == 16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_moe_rank_scaling_floor_division_warning(device):
+    """When dim is not evenly divisible by n_activated_experts, log a warning and use floor division."""
+    config = MoEConfig(
+        n_routed_experts=4,
+        n_shared_experts=0,
+        n_activated_experts=3,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=16,
+        inter_dim=32,
+        moe_inter_dim=32,
+        norm_topk_prob=False,
+        expert_activation="swiglu",
+        dtype=torch.float32,
+    )
+
+    class MockModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = GroupedExperts(config)
+
+    model = MockModel().to(device)
+    with torch.no_grad():
+        model.experts.init_weights(buffer_device=device)
+
+    peft_config = PeftConfig(
+        target_modules=["experts"],
+        dim=16,
+        moe_rank_scaling=True,
+    )
+    import logging as _logging
+
+    with pytest.warns(None) as _:
+        # We check the logger instead of pytest.warns (logger.warning, not warnings.warn)
+        pass
+
+    with patch("nemo_automodel.components._peft.lora.logger") as mock_logger:
+        count = apply_lora_to_linear_modules(model, peft_config)
+        mock_logger.warning.assert_called_once()
+        assert "not evenly divisible" in mock_logger.warning.call_args[0][0]
+
+    assert count == 1
+    # 16 // 3 = 5
+    assert model.experts.lora_dim == 5
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_moe_rank_scaling_dim_too_small(moe_config, device):
+    """When dim < n_activated_experts, raise ValueError."""
+    class MockModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = GroupedExperts(moe_config)
+
+    model = MockModel().to(device)
+    with torch.no_grad():
+        model.experts.init_weights(buffer_device=device)
+
+    # moe_config has n_activated_experts=2, dim=1 -> 1 // 2 = 0 -> error
+    peft_config = PeftConfig(
+        target_modules=["experts"],
+        dim=1,
+        moe_rank_scaling=True,
+    )
+    with pytest.raises(ValueError, match="Increase dim to at least n_activated_experts"):
+        apply_lora_to_linear_modules(model, peft_config)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_moe_rank_scaling_output_equivalence(moe_config, device):
+    """With zero-init B, scaled-rank MoE LoRA should produce the same output as the original model."""
+    class MockModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = GroupedExperts(moe_config)
+            self.linear = nn.Linear(16, 16)
+
+        def forward(self, x, token_mask, weights, indices):
+            return self.experts(x, token_mask, weights, indices) + self.linear(x)
+
+    model = MockModel().to(device)
+    with torch.no_grad():
+        model.experts.init_weights(buffer_device=device)
+        nn.init.normal_(model.linear.weight)
+        nn.init.zeros_(model.linear.bias)
+
+    num_tokens = 10
+    x = torch.randn(num_tokens, 16, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    weights = torch.rand(num_tokens, 2, device=device)
+    indices = torch.randint(0, 4, (num_tokens, 2), device=device)
+
+    with torch.no_grad():
+        out_orig = model(x, token_mask, weights, indices)
+
+    peft_config = PeftConfig(
+        target_modules=["experts", "linear"],
+        dim=16,
+        moe_rank_scaling=True,
+    )
+    apply_lora_to_linear_modules(model, peft_config)
+    model = model.to(device)
+
+    with torch.no_grad():
+        out_lora = model(x, token_mask, weights, indices)
+
+    assert torch.allclose(out_orig, out_lora, atol=1e-6)
