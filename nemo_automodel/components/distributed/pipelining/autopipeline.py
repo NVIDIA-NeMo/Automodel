@@ -18,6 +18,7 @@ from typing import Callable, Literal, Optional
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.pipelining.schedules import _PipelineSchedule
 from torch.distributed.pipelining.stage import PipelineStage
@@ -69,8 +70,9 @@ class AutoPipeline:
         patch_inner_model: bool = True,
         patch_causal_lm_model: bool = True,
         patch_stage_backward_maybe_with_nosync: bool = False,
+        warmup_p2p_communicators: bool = False,
         # Runtime
-        device: Optional[torch.device] = None,
+        device: Optional[torch.device | int | str] = None,
         dtype: Optional[torch.dtype] = None,
         scale_grads_in_schedule: bool = False,
         # Shape inference optimization
@@ -103,7 +105,8 @@ class AutoPipeline:
         self.patch_inner_model = patch_inner_model
         self.patch_causal_lm_model = patch_causal_lm_model
         self.patch_stage_backward_maybe_with_nosync = patch_stage_backward_maybe_with_nosync
-        self._device: torch.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.warmup_p2p_communicators = warmup_p2p_communicators
+        self._device: torch.device = self._normalize_device(device)
         self.dtype = dtype
         self.scale_grads_in_schedule = scale_grads_in_schedule
         self.pp_seq_len = pp_seq_len
@@ -168,7 +171,60 @@ class AutoPipeline:
         self._info.model_parts = model_parts
         self._info.stages = stages
 
+        if self.warmup_p2p_communicators:
+            self._warmup_pp_p2p_communicators()
+
         return self
+
+    @staticmethod
+    def _normalize_device(device: Optional[torch.device | int | str]) -> torch.device:
+        if device is None:
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if isinstance(device, torch.device):
+            return device
+        if isinstance(device, int):
+            return torch.device("cuda", device)
+        return torch.device(device)
+
+    def _resolve_runtime_device(self) -> torch.device:
+        return self._device
+
+    def _warmup_pp_p2p_communicators(self) -> None:
+        if self.pp_mesh.size() <= 1:
+            return
+
+        try:
+            pp_group = self.pp_mesh.get_group()
+            pp_rank = dist.get_rank(pp_group)
+            pp_size = dist.get_world_size(pp_group)
+            pp_global_ranks = [int(r) for r in self.pp_mesh.mesh.reshape(-1).tolist()]
+
+            dev = self._resolve_runtime_device()
+            send_buf = torch.zeros(1, device=dev, dtype=torch.float32)
+            recv_buf = torch.empty(1, device=dev, dtype=torch.float32)
+
+            next_peer = pp_global_ranks[pp_rank + 1] if pp_rank + 1 < pp_size else None
+            prev_peer = pp_global_ranks[pp_rank - 1] if pp_rank > 0 else None
+
+            def _exchange(send_peer: Optional[int], recv_peer: Optional[int]) -> None:
+                ops: list[dist.P2POp] = []
+                if send_peer is not None:
+                    ops.append(dist.P2POp(dist.isend, send_buf, send_peer, group=pp_group))
+                if recv_peer is not None:
+                    ops.append(dist.P2POp(dist.irecv, recv_buf, recv_peer, group=pp_group))
+                if not ops:
+                    return
+                reqs = dist.batch_isend_irecv(ops)
+                for req in reqs:
+                    req.wait()
+
+            # Forward and backward direction exchanges pre-initialize both neighbor channels.
+            _exchange(next_peer, prev_peer)
+            _exchange(prev_peer, next_peer)
+            dist.barrier(group=pp_group)
+            logger.info("Completed PP P2P communicator warmup for pp_rank=%d/%d", pp_rank, pp_size)
+        except Exception as e:
+            logger.warning("PP P2P communicator warmup failed: %s", e)
 
     @property
     def info(self) -> PipelineInfo:

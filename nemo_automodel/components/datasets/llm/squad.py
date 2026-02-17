@@ -122,7 +122,15 @@ def make_squad_dataset(
     # therefore, pad_token can either [PAD] or [EOS]
     pad_token_id = _add_pad_token(tokenizer) or eos_token_id
 
-    if chat_template is None:
+    use_chat_template = chat_template is not None
+    if use_chat_template and bool(truncation) and isinstance(seq_length, int):
+        logging.info(
+            "SQuAD dataset: disabling chat template for fixed-length truncation "
+            "to ensure answer tokens remain supervised."
+        )
+        use_chat_template = False
+
+    if not use_chat_template:
         fmt_fn = lambda x: _formatting_prompts_func(
             x, tokenizer, eos_token_id, pad_token_id, seq_length, padding, truncation
         )
@@ -131,9 +139,26 @@ def make_squad_dataset(
             x, tokenizer, eos_token_id, pad_token_id, seq_length, padding, truncation
         )  # noqa: E731
 
-    # map the dataset
-    return dataset.map(
-        fmt_fn,
-        batched=False,
-        remove_columns=["id", "title", "context", "question", "answers"],
-    )
+    # For fixed-length SFT with truncation, keep the sequence tail so answer tokens
+    # survive context truncation (prompt is context+question, answer is appended last).
+    force_left_trunc = bool(truncation) and isinstance(seq_length, int)
+    original_trunc_side = getattr(tokenizer, "truncation_side", None)
+    if force_left_trunc and original_trunc_side != "left":
+        logging.info(
+            "SQuAD dataset: forcing tokenizer.truncation_side='left' for fixed-length truncation "
+            "to preserve answer supervision tokens."
+        )
+        tokenizer.truncation_side = "left"
+
+    try:
+        # map the dataset
+        mapped = dataset.map(
+            fmt_fn,
+            batched=False,
+            remove_columns=["id", "title", "context", "question", "answers"],
+        )
+    finally:
+        if force_left_trunc and original_trunc_side is not None:
+            tokenizer.truncation_side = original_trunc_side
+
+    return mapped

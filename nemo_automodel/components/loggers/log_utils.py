@@ -170,7 +170,7 @@ def _ensure_root_handler_with_formatter(formatter: logging.Formatter) -> None:
 
 def setup_logging(
     logging_level: int = logging.INFO,
-    filter_warning: bool = True,
+    filter_warning: bool = False,
     modules_to_filter: Optional[list[str]] = None,
     set_level_for_all_loggers: bool = False,
 ) -> None:
@@ -186,11 +186,17 @@ def setup_logging(
     2. `logging_level` argument
     3. Default: `logging.INFO`
 
+    Warning filtering can be explicitly controlled with env var
+    `NEMOAUTOMODEL_FILTER_WARNINGS` (`1` to enable, `0` to disable).
+
     Also configures a colorized formatter that includes the date/time.
     """
     env_logging_level = os.getenv("LOGGING_LEVEL", None)
     if env_logging_level is not None:
         logging_level = int(env_logging_level)
+    env_filter_warning = os.getenv("NEMOAUTOMODEL_FILTER_WARNINGS", None)
+    if env_filter_warning is not None:
+        filter_warning = env_filter_warning.strip().lower() in ("1", "true", "yes", "on")
 
     # Set levels on root and optionally all other known loggers first
     logging.getLogger().setLevel(logging_level)

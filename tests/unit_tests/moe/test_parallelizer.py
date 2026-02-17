@@ -694,6 +694,7 @@ class FakeWorldMesh:
 class FakeMoeMesh:
     def __init__(self, sizes_by_key):
         self._sizes = sizes_by_key
+        self.mesh_dim_names = {k for k in sizes_by_key.keys() if isinstance(k, str)}
 
     def __getitem__(self, key):
         return MeshView(self._sizes[key])
@@ -750,6 +751,41 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     assert ep_enabled is True
     assert ep_shard_enabled is True
     assert ep_shard_mesh_arg.size() == 2
+
+
+def test_parallelize_model_tolerates_ep_shard_axis_without_moe_mesh(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_fsdp_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
+
+    world_mesh = FakeWorldMesh({("dp",): 2, "tp": 1, "cp": 1}, mesh_dim_names=["dp", "tp", "cp"])
+
+    class Inner:
+        def __init__(self):
+            self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+
+    class Outer:
+        def __init__(self):
+            self.model = Inner()
+
+    model = Outer()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=None,
+        pp_enabled=False,
+        dp_axis_names=("dp",),
+        cp_axis_name=None,
+        tp_axis_name=None,
+        ep_axis_name=None,
+        ep_shard_axis_names=("ep_shard",),
+        activation_checkpointing=False,
+    )
+
+    _, kwargs = apply_fsdp_mock.call_args
+    assert kwargs["ep_shard_enabled"] is False
+    assert kwargs["ep_shard_mesh"] is None
 
 
 def test_parallelize_model_asserts_on_invalid_tp_cp_and_ep_divisibility(monkeypatch):

@@ -322,10 +322,15 @@ def parallelize_model(
     if activation_checkpointing:
         apply_ac(model, ignore_router=ignore_router_for_ac)
 
+    ep_shard_mesh = None
     if ep_shard_axis_names is not None:
-        ep_shard_mesh = moe_mesh[ep_shard_axis_names]
-    else:
-        ep_shard_mesh = None
+        if moe_mesh is None:
+            logger.warning(
+                "ep_shard_axis_names=%s provided but moe_mesh is None; skipping ep_shard mesh setup.",
+                ep_shard_axis_names,
+            )
+        else:
+            ep_shard_mesh = moe_mesh[ep_shard_axis_names]
 
     fsdp_enabled = dp_axis_names is not None and world_mesh[dp_axis_names].size() > 1
     fsdp_mesh = world_mesh[tuple(dp_axis_names)] if fsdp_enabled else None

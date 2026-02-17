@@ -217,6 +217,21 @@ class TestAutoPipelineValidation:
         assert ap.world_mesh == world_mesh
         assert ap.pp_mesh is not None
 
+    def test_device_normalizes_cuda_index(self):
+        world_mesh = FakeDeviceMesh()
+
+        ap = AutoPipeline(
+            world_mesh=world_mesh,
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=4,
+            device=0,
+        )
+
+        assert isinstance(ap.device, torch.device)
+        assert ap.device == torch.device("cuda", 0)
+
 
 # -----------------------------
 # Core build/materialize/step tests

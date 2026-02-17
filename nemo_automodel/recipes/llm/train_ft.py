@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import pathlib
 import time
 from contextlib import nullcontext
@@ -50,6 +51,7 @@ from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import (
+    apply_runtime_env_from_dist_cfg,
     initialize_distributed,
 )
 from nemo_automodel.components.distributed.megatron_fsdp import fully_shard_optimizer
@@ -558,17 +560,25 @@ def build_dataloader(
         if pp_enabled:
             from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
 
+            hf_model_config = None
+            is_nemotron_h = False
             try:
-                hf_model_config = AutoConfig.from_pretrained(
-                    _get_model_name(cfg_model), trust_remote_code=compute_trust_remote_code_from_model(cfg_model)
-                )
+                model_name = _get_model_name(cfg_model)
+                trust_remote_code = compute_trust_remote_code_from_model(cfg_model)
+                hf_model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+                is_nemotron_h = getattr(hf_model_config, "model_type", None) == "nemotron_h"
             except Exception:
                 logger.warning(
                     "Failed to load model config for causal mask precomputation. "
                     "Pipeline parallel mask precomputation will be skipped."
                 )
-            else:
-                if "collate_fn" in dl_kwargs:
+
+            if hf_model_config is not None:
+                if is_nemotron_h:
+                    logging.info(
+                        "PP enabled: skipping causal_mask_mapping precompute for NemotronH (unused in PP forward)"
+                    )
+                elif "collate_fn" in dl_kwargs:
                     # Case 1: PP enabled + collate_fn exists -> chain them
                     # base_collate_fn -> add_causal_masks_to_batch
                     base_collate_fn = dl_kwargs["collate_fn"]
@@ -829,6 +839,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Raises:
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
+        # Apply distributed/runtime env knobs from YAML before any CUDA API calls.
+        # This allows allocator/NCCL/EP/PP controls to be configured in YAML instead
+        # of requiring shell-level exports.
+        apply_runtime_env_from_dist_cfg(self.cfg.get("dist_env", {}))
         torch.cuda.reset_peak_memory_stats()
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
         # setups logging and adds the rankfilter to logging
@@ -973,6 +987,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 autonvtx.patch(model, name=model.__class__.__name__)
             self.model_parts = [model]
             self.pp = None
+        self._pp_rank_needs_attention_mask = True
+        self._pp_rank_needs_cache_position = True
+        self._pp_rank_needs_causal_mask_mapping = True
+        self._infer_pp_runtime_key_requirements()
 
         # Extract TE FP8 config from model backend (set after model construction)
         self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
@@ -1199,15 +1217,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
-        # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
-        batch = {
-            k: (
-                {dk: dv.to(self.dist_env.device, non_blocking=True) for dk, dv in v.items() if dv is not None}
-                if isinstance(v, dict)
-                else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
-            )
-            for k, v in batch.items()
-        }
+        # Stage-aware device transfer for PP to avoid moving unused tensors on every rank.
+        batch = self._move_batch_to_device(batch)
+        self._maybe_sync_batch_across_tp(batch)
         train_ctx, batch = make_cp_batch_and_ctx(
             self.device_mesh,
             batch,
@@ -1215,34 +1227,39 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
             num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
         )
-        labels = batch.pop("labels")
+        labels = batch.pop("labels", None)
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
             with train_ctx(), fp8_ctx:
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
+                    if labels is None:
+                        raise ValueError("PP last stage requires labels but labels were not found in batch.")
                     masked_labels = labels.clone()
                     targets = masked_labels
                 else:
                     targets = None
 
-                input_ids = batch.pop("input_ids")
-
-                # Filter out None values and empty dicts from batch to avoid PP chunking errors
+                input_ids = batch.pop("input_ids", None)
+                # Filter out None values and empty dicts from batch to avoid PP chunking errors.
                 batch_filtered = {
                     k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
                 }
 
                 if is_train:
-                    # Use step for training (forward + backward)
+                    # Use step for training (forward + backward).
                     if self.pp.info.has_first_stage:
+                        if input_ids is None:
+                            raise ValueError("PP first stage requires input_ids but input_ids were not found in batch.")
                         self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch_filtered)
                     else:
                         self.pp.info.schedule.step(target=targets, losses=losses, **batch_filtered)
                 else:
                     # Use eval for validation (forward only, no backward)
                     if self.pp.info.has_first_stage:
+                        if input_ids is None:
+                            raise ValueError("PP first stage requires input_ids but input_ids were not found in batch.")
                         self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch_filtered)
                     else:
                         self.pp.info.schedule.eval(target=targets, losses=losses, **batch_filtered)
@@ -1254,6 +1271,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             loss_buffer.append(local_loss.clone().detach())
         else:
+            if labels is None:
+                raise ValueError("Non-PP path requires labels but labels were not found in batch.")
             model = self.model_parts[0]
             sync_ctx = (
                 get_sync_ctx(
@@ -1286,6 +1305,135 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+
+    def _maybe_sync_batch_across_tp(self, batch: dict):
+        """Optionally synchronize batch tensors across TP ranks.
+
+        This is useful for iterable/mock datasets where each global rank can produce
+        different samples. Tensor-parallel ranks must consume identical tensors.
+        """
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return
+        if self.device_mesh is None:
+            return
+        if os.environ.get("NEMOTRONH_SYNC_TP_BATCH", "0").strip().lower() not in ("1", "true", "yes", "on"):
+            return
+
+        tp_group = self.device_mesh.get_group("tp")
+        if torch.distributed.get_world_size(tp_group) <= 1:
+            return
+
+        src_rank = torch.distributed.get_global_rank(tp_group, 0)
+
+        def _sync_value(value):
+            if isinstance(value, torch.Tensor):
+                torch.distributed.broadcast(value, src=src_rank, group=tp_group)
+            elif isinstance(value, dict):
+                for nested in value.values():
+                    _sync_value(nested)
+
+        for value in batch.values():
+            _sync_value(value)
+
+    def _move_value_to_device(self, value):
+        if isinstance(value, dict):
+            return {k: self._move_value_to_device(v) if v is not None else None for k, v in value.items()}
+        if isinstance(value, torch.Tensor):
+            return value.to(self.dist_env.device, non_blocking=True)
+        return value
+
+    def _infer_pp_runtime_key_requirements(self) -> None:
+        self._pp_rank_needs_attention_mask = True
+        self._pp_rank_needs_cache_position = True
+        self._pp_rank_needs_causal_mask_mapping = True
+        if not self.pp_enabled:
+            return
+        if not getattr(self, "model_parts", None):
+            return
+
+        attn_flags = []
+        cache_flags = []
+        causal_mask_map_flags = []
+        for mp in self.model_parts:
+            if hasattr(mp, "_nemo_pp_needs_attention_mask"):
+                attn_flags.append(bool(getattr(mp, "_nemo_pp_needs_attention_mask")))
+            if hasattr(mp, "_nemo_pp_needs_cache_position"):
+                cache_flags.append(bool(getattr(mp, "_nemo_pp_needs_cache_position")))
+            if hasattr(mp, "_nemo_pp_needs_causal_mask_mapping"):
+                causal_mask_map_flags.append(bool(getattr(mp, "_nemo_pp_needs_causal_mask_mapping")))
+
+        if attn_flags:
+            self._pp_rank_needs_attention_mask = any(attn_flags)
+        if cache_flags:
+            self._pp_rank_needs_cache_position = any(cache_flags)
+        if causal_mask_map_flags:
+            self._pp_rank_needs_causal_mask_mapping = any(causal_mask_map_flags)
+
+        logging.info(
+            "PP rank runtime requirements: attention_mask=%s cache_position=%s causal_mask_mapping=%s",
+            self._pp_rank_needs_attention_mask,
+            self._pp_rank_needs_cache_position,
+            self._pp_rank_needs_causal_mask_mapping,
+        )
+
+    def _pp_keys_to_move(self, batch: dict) -> set[str]:
+        # CP sharding currently assumes input_ids/labels are present in the local batch.
+        # Keep prior behavior when CP is active.
+        if self.cfg.get("distributed.cp_size", 1) > 1:
+            return set(batch.keys())
+
+        keys = set(batch.keys())
+        if not self.pp.info.has_first_stage:
+            keys.discard("input_ids")
+        if not self.pp.info.has_last_stage:
+            keys.discard("labels")
+        if not self._pp_rank_needs_attention_mask:
+            keys.discard("attention_mask")
+        if not self._pp_rank_needs_cache_position:
+            keys.discard("cache_position")
+            keys.discard("position_ids")
+        if not self._pp_rank_needs_causal_mask_mapping:
+            keys.discard("causal_mask_mapping")
+        return keys
+
+    def _move_batch_to_device(self, batch: dict) -> dict:
+        if not self.pp_enabled:
+            return {k: self._move_value_to_device(v) for k, v in batch.items()}
+
+        keys_to_move = self._pp_keys_to_move(batch)
+        stage_batch = {}
+        for k, v in batch.items():
+            # PP stages only need stage-local label/input ownership.
+            # Drop known stage-local-only keys to reduce kwargs payload.
+            if self.cfg.get("distributed.cp_size", 1) <= 1:
+                if k == "input_ids" and not self.pp.info.has_first_stage:
+                    continue
+                if k == "labels" and not self.pp.info.has_last_stage:
+                    continue
+                if k in {"attention_mask", "cache_position", "position_ids", "causal_mask_mapping"} and k not in keys_to_move:
+                    continue
+            stage_batch[k] = self._move_value_to_device(v) if k in keys_to_move else v
+        return stage_batch
+
+    def _broadcast_pp_last_stage_loss(self, loss: torch.Tensor) -> torch.Tensor:
+        if not self.pp_enabled or self.device_mesh is None:
+            return loss
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return loss
+
+        pp_group = self.device_mesh.get_group("pp")
+        pp_world = torch.distributed.get_world_size(pp_group)
+        if pp_world <= 1:
+            return loss
+
+        try:
+            src_rank = torch.distributed.get_global_rank(pp_group, pp_world - 1)
+            torch.distributed.broadcast(loss, src=src_rank, group=pp_group)
+        except Exception:
+            # Fallback to prior behavior if group-rank translation is unavailable.
+            src_rank = int(self.device_mesh.mesh.reshape(-1)[-1].item())
+            torch.distributed.broadcast(loss, src=src_rank)
+        return loss
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
@@ -1377,12 +1525,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.pp_enabled:
             reporting_loss = reporting_loss / num_label_tokens
             reporting_loss = reporting_loss.to(self.dist_env.device)
-            # Send loss to first rank if pp group rank is 0
-            src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
-            if self.dist_env.rank == src_rank:
-                torch.distributed.send(reporting_loss, dst=0)
-            elif self.dist_env.is_main:
-                torch.distributed.recv(reporting_loss, src=src_rank)
+            reporting_loss = self._broadcast_pp_last_stage_loss(reporting_loss)
 
         reporting_loss = reporting_loss.cpu().item()
         # fix reporting_loss, tps across ranks

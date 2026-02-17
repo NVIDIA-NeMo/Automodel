@@ -101,6 +101,7 @@ class FSDP2Manager:
         fsdp2_strategy_parallelize(
             model,
             device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
             mp_policy=self.mp_policy,
             tp_shard_plan=tp_shard_plan,
             offload_policy=self.offload_policy,
