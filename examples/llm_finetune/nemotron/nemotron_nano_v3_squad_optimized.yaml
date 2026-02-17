@@ -32,8 +32,8 @@ benchmark:
   num_nodes: 1
 
 step_scheduler:
-  global_batch_size: 32
-  local_batch_size: 16
+  global_batch_size: 16
+  local_batch_size: 2
   ckpt_every_steps: 1000
   val_every_steps: 1000  # will run every x number of gradient steps
   max_steps: 2
