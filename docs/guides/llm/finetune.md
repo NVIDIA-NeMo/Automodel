@@ -385,7 +385,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel # for PEFT
 
-#For SFT, Load finetuned checkpoint
+# For SFT, Load finetuned checkpoint
 finetuned_ckpt_path = "checkpoints/epoch_0_step_10/model/consolidated"
 tokenizer = AutoTokenizer.from_pretrained(finetuned_ckpt_path)
 model = AutoModelForCausalLM.from_pretrained(finetuned_ckpt_path)
