@@ -18,7 +18,7 @@ This module contains optimized tensor parallel plans for different model archite
 including LLaMA, Qwen, Gemma3, and Ministral3 models.
 """
 
-from typing import Callable, Dict, Union, cast
+from typing import Callable, Dict, Optional, Union, cast
 
 import torch
 from torch import nn
@@ -127,26 +127,30 @@ class VocabParallelEmbedding(RowwiseParallel):
         return RowwiseParallel._prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh)
 
 
-class FusedQKVColwiseParallel(ColwiseParallel):
+class FusedColwiseParallel(ColwiseParallel):
     """Column-wise parallelism for fused Q/K/V (or Q/KV) linear projections.
 
-    A fused QKV linear has weight shape ``(num_sections * hidden, hidden)``
-    whose output is the concatenation ``[Q | K | V]``.  Standard
-    ``ColwiseParallel`` shards the first dimension contiguously, which
-    crosses Q/K/V boundaries and mixes heads from different projections on
-    different TP ranks.
+    A fused QKV linear has weight whose output is the concatenation
+    ``[Q | K | V]``.  Standard ``ColwiseParallel`` shards the first
+    dimension contiguously, which crosses Q/K/V boundaries and mixes
+    heads from different projections on different TP ranks.
 
-    ``FusedQKVColwiseParallel`` instead splits the weight (and bias) into
-    ``num_sections`` equal blocks and shards **each block** independently
-    with ``Shard(0)``, then concatenates the local shards.  This ensures
-    every rank receives the correct head subset from every section.
+    ``FusedColwiseParallel`` instead splits the weight (and bias) into
+    sections and shards **each section** independently with ``Shard(0)``,
+    then concatenates the local shards.  This ensures every rank receives
+    the correct head subset from every section.
 
-    The forward output is ``(B, T, num_sections * hidden/tp)`` with
-    per-section layout ``[Q_local | K_local | V_local]``.  The standard
-    reshape ``view(B, T, num_sections, -1, head_dim)`` followed by
-    ``unbind(dim=2)`` therefore produces correct local Q, K, V tensors.
+    Sections can be either:
 
-    YAML string: ``"fused_qkv_colwise"``
+    - **Equal-sized** (default): specified via ``num_sections``
+      (e.g. ``num_sections=3`` for MHA where Q, K, V have the same size,
+      or ``num_sections=2`` for fused gate_up projections).
+    - **Variable-sized**: specified via ``section_sizes``
+      (e.g. ``section_sizes=(q_size, kv_size, kv_size)`` for GQA where Q
+      has more heads than K/V).  When provided, takes precedence over
+      ``num_sections``.
+
+    YAML string: ``"fused_colwise"``
 
     Note on checkpointing
     ---------------------
@@ -159,32 +163,53 @@ class FusedQKVColwiseParallel(ColwiseParallel):
     QKV weight.
 
     Args:
-        num_sections: Number of fused sections.  Default ``3`` for Q/K/V.
+        num_sections: Number of equal-sized fused sections.  Default ``3``
+            for Q/K/V.  Ignored when ``section_sizes`` is provided.
+        section_sizes: Explicit per-section sizes along dim-0.  Each
+            section must be independently divisible by the TP world size.
+            When provided, takes precedence over ``num_sections``.
     """
 
-    def __init__(self, *, num_sections: int = 3, **kwargs):
+    def __init__(
+        self,
+        *,
+        num_sections: int = 3,
+        section_sizes: Optional[tuple[int, ...]] = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.num_sections = num_sections
+        self.section_sizes = section_sizes
 
     # -- custom partition function ------------------------------------
     def _partition_linear_fn(self, name, module, device_mesh):
         from torch.distributed.tensor import distribute_tensor
 
-        ns = self.num_sections
         for pname, param in list(module.named_parameters()):
             if isinstance(param, DTensor):
                 continue  # already distributed
 
             dim0 = param.shape[0]
-            if dim0 % ns != 0:
-                raise ValueError(
-                    f"FusedQKVColwiseParallel: parameter '{pname}' dim-0 "
-                    f"({dim0}) is not divisible by num_sections ({ns})."
-                )
 
-            # Split into sections, distribute each with Shard(0),
-            # concatenate the local shards.
-            sections = param.data.chunk(ns, dim=0)
+            if self.section_sizes is not None:
+                if sum(self.section_sizes) != dim0:
+                    raise ValueError(
+                        f"FusedColwiseParallel: parameter '{pname}' dim-0 "
+                        f"({dim0}) does not match sum of section_sizes "
+                        f"({self.section_sizes}, sum={sum(self.section_sizes)})."
+                    )
+                sections = param.data.split(list(self.section_sizes), dim=0)
+            else:
+                ns = self.num_sections
+                if dim0 % ns != 0:
+                    raise ValueError(
+                        f"FusedColwiseParallel: parameter '{pname}' dim-0 "
+                        f"({dim0}) is not divisible by num_sections ({ns})."
+                    )
+                sections = param.data.chunk(ns, dim=0)
+
+            # Distribute each section with Shard(0), concatenate the
+            # local shards.
             local_parts = []
             for sec in sections:
                 dt = distribute_tensor(sec, device_mesh, [Shard(0)])
@@ -293,13 +318,22 @@ def _parallelize_llama(
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """Parallelizes a LlamaForCausalLM model across data and tensor parallel dimensions."""
+    # Compute per-section sizes for the fused QKV projection (GQA-aware).
+    # For GQA, Q has more heads than K/V so the sections are unequal;
+    # FusedColwiseParallel shards each section independently.
+    head_dim = getattr(model.config, "head_dim", model.config.hidden_size // model.config.num_attention_heads)
+    q_size = model.config.num_attention_heads * head_dim
+    kv_size = model.config.num_key_value_heads * head_dim
+
     base_model_tp_plan: dict[str, ParallelStyle] = {
         "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
         "model.layers.*.self_attn.q_proj": ColwiseParallel(),
         "model.layers.*.self_attn.k_proj": ColwiseParallel(),
         "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-        "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),  # Combined QKV projection
-        "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),  # Fused gate and up projection
+        "model.layers.*.self_attn.qkv_proj": FusedColwiseParallel(
+            section_sizes=(q_size, kv_size, kv_size),
+        ),
+        "model.layers.*.mlp.gate_up_proj": FusedColwiseParallel(num_sections=2),
         "model.layers.*.self_attn.o_proj": RowwiseParallel(),
         "model.layers.*.mlp.up_proj": ColwiseParallel(),
         "model.layers.*.mlp.gate_proj": ColwiseParallel(),
