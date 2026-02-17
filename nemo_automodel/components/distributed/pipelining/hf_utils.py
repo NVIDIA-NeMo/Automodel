@@ -70,12 +70,25 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         causal_mask_mapping: Optional[dict] = None,
         **kwargs,
     ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
+        first_layer = None
+        if hasattr(self, "layers") and self.layers is not None:
+            if hasattr(self.layers, "values"):
+                layer_values = list(self.layers.values())
+                first_layer = layer_values[0] if len(layer_values) > 0 else None
+            else:
+                first_layer = self.layers[0] if len(self.layers) > 0 else None
+        is_nemotron_h_like = first_layer is not None and hasattr(first_layer, "block_type")
+
         # Embeddings handling
         if inputs_embeds is None:
             if hasattr(self, "embed_tokens") and self.embed_tokens is not None:
                 if input_ids is None:
                     raise ValueError("You must provide either input_ids or inputs_embeds")
                 inputs_embeds = self.embed_tokens(input_ids)
+            elif hasattr(self, "embeddings") and self.embeddings is not None:
+                if input_ids is None:
+                    raise ValueError("You must provide either input_ids or inputs_embeds")
+                inputs_embeds = self.embeddings(input_ids)
             else:
                 if (
                     input_ids is not None
@@ -91,73 +104,109 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
 
             past_key_values = DynamicCache()
 
-        if cache_position is None:
+        # Stage-level hints (set by pipeline splitter) let us skip unused mask/position work.
+        pp_needs_attention_mask = bool(getattr(self, "_nemo_pp_needs_attention_mask", True))
+        pp_needs_cache_position = bool(getattr(self, "_nemo_pp_needs_cache_position", True))
+
+        if cache_position is None and (pp_needs_cache_position or use_cache):
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
 
-        if position_ids is None:
+        if position_ids is None and cache_position is not None:
             position_ids = cache_position.unsqueeze(0)
-
-        # Attention mask handling (compilation-friendly):
-        # causal_mask_mapping should be precomputed in data pipeline via default_collater
-        # If not provided, model will fail - this enforces clean separation
-        if causal_mask_mapping is None:
-            # If causal_mask_mapping is missing, fall back to on-the-fly computation.
-            # This is not recommended for compilation, as it introduces runtime overhead.
-            logger.warning(
-                "causal_mask_mapping not provided; computing it here. "
-                "This is slow and not recommended for compilation. "
-                "Precompute causal_mask_mapping in the data pipeline for best performance."
-            )
-            if not isinstance((causal_mask_mapping := attention_mask), dict):
-                from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
-
-                # Note: input_embeds is only used for shape and dtype, not values
-                # We could use a dummy tensor here, but inputs_embeds is already available
-                mask_kwargs = {
-                    "config": self.config,
-                    "input_embeds": inputs_embeds,
-                    "attention_mask": attention_mask,
-                    "cache_position": cache_position,
-                    "past_key_values": None,  # Training-only: no KV cache
-                    "position_ids": position_ids,
-                }
-                causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
-                if hasattr(self, "has_sliding_layers") and self.has_sliding_layers:
-                    causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
         hidden_states = inputs_embeds
 
-        # Rotary embeddings precomputation (shared across layers)
-        position_embeddings = None
-        rotary_emb = get_text_module(self).rotary_emb
-        if rotary_emb is not None:
-            position_embeddings = rotary_emb(hidden_states, position_ids)
-
-        if hasattr(self, "layers") and self.layers is not None:
-            # Works for dict-like or list-like containers
+        if is_nemotron_h_like:
+            # NemotronH layer blocks require cache_params and per-block masking logic.
+            causal_mask = None
+            mamba_mask = None
+            if pp_needs_attention_mask:
+                causal_mask = (
+                    self._update_causal_mask(attention_mask, inputs_embeds, cache_position)
+                    if hasattr(self, "_update_causal_mask")
+                    else attention_mask
+                )
+                mamba_mask = (
+                    self._update_mamba_mask(attention_mask, cache_position)
+                    if hasattr(self, "_update_mamba_mask")
+                    else attention_mask
+                )
             layer_iter = self.layers.values() if hasattr(self.layers, "values") else self.layers
-            for decoder_layer in layer_iter:
-                layer_attention_mask = causal_mask_mapping.get("full_attention")
-                if hasattr(decoder_layer, "attention_type"):
-                    layer_attention_mask = causal_mask_mapping.get(
-                        getattr(decoder_layer, "attention_type"), causal_mask_mapping.get("full_attention")
+            for mixer_block in layer_iter:
+                if mixer_block.block_type == "mamba":
+                    layer_mask = mamba_mask if pp_needs_attention_mask else None
+                elif mixer_block.block_type == "attention":
+                    layer_mask = causal_mask if pp_needs_attention_mask else None
+                else:
+                    layer_mask = None
+                hidden_states = mixer_block(
+                    hidden_states,
+                    cache_params=past_key_values,
+                    cache_position=cache_position if pp_needs_cache_position else None,
+                    attention_mask=layer_mask,
+                )
+        else:
+            # Attention mask handling (compilation-friendly):
+            # causal_mask_mapping should be precomputed in data pipeline via default_collater
+            # If not provided, model will fail - this enforces clean separation
+            if causal_mask_mapping is None:
+                # If causal_mask_mapping is missing, fall back to on-the-fly computation.
+                # This is not recommended for compilation, as it introduces runtime overhead.
+                logger.warning(
+                    "causal_mask_mapping not provided; computing it here. "
+                    "This is slow and not recommended for compilation. "
+                    "Precompute causal_mask_mapping in the data pipeline for best performance."
+                )
+                if not isinstance((causal_mask_mapping := attention_mask), dict):
+                    from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+
+                    # Note: input_embeds is only used for shape and dtype, not values
+                    # We could use a dummy tensor here, but inputs_embeds is already available
+                    mask_kwargs = {
+                        "config": self.config,
+                        "input_embeds": inputs_embeds,
+                        "attention_mask": attention_mask,
+                        "cache_position": cache_position,
+                        "past_key_values": None,  # Training-only: no KV cache
+                        "position_ids": position_ids,
+                    }
+                    causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
+                    if hasattr(self, "has_sliding_layers") and self.has_sliding_layers:
+                        causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+
+            # Rotary embeddings precomputation (shared across layers)
+            position_embeddings = None
+            rotary_emb = getattr(get_text_module(self), "rotary_emb", None)
+            if rotary_emb is not None:
+                position_embeddings = rotary_emb(hidden_states, position_ids)
+
+            if hasattr(self, "layers") and self.layers is not None:
+                # Works for dict-like or list-like containers
+                layer_iter = self.layers.values() if hasattr(self.layers, "values") else self.layers
+                for decoder_layer in layer_iter:
+                    layer_attention_mask = causal_mask_mapping.get("full_attention")
+                    if hasattr(decoder_layer, "attention_type"):
+                        layer_attention_mask = causal_mask_mapping.get(
+                            getattr(decoder_layer, "attention_type"), causal_mask_mapping.get("full_attention")
+                        )
+
+                    hidden_states = decoder_layer(
+                        hidden_states,
+                        attention_mask=layer_attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                        **kwargs,
                     )
 
-                hidden_states = decoder_layer(
-                    hidden_states,
-                    attention_mask=layer_attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **kwargs,
-                )
-
-        if hasattr(self, "norm") and self.norm is not None:
+        if hasattr(self, "norm_f") and self.norm_f is not None:
+            hidden_states = self.norm_f(hidden_states)
+        elif hasattr(self, "norm") and self.norm is not None:
             hidden_states = self.norm(hidden_states)
 
         if model_class_name == "PipelineStage":
@@ -213,6 +262,28 @@ def create_pipeline_forward_causal_lm() -> Callable:
             else:
                 hidden_states = outputs
                 outputs = None
+        elif hasattr(self, "backbone") and self.backbone is not None:
+            outputs = self.backbone(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                position_ids=position_ids,
+                cache_params=past_key_values,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+                cache_position=cache_position,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+            if isinstance(outputs, BaseModelOutputWithPast):
+                hidden_states = outputs.last_hidden_state
+            elif isinstance(outputs, tuple):
+                hidden_states = outputs[0]
+            elif hasattr(outputs, "last_hidden_state"):
+                hidden_states = outputs.last_hidden_state
+            else:
+                hidden_states = outputs
         else:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -241,6 +312,12 @@ def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm
     if hasattr(model, "model"):
         if patch_inner_model and getattr(model, "model", None) is not None:
             model.model.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), model.model)
+
+        if patch_causal_lm_model:
+            model.forward = types.MethodType(create_pipeline_forward_causal_lm(), model)
+    elif hasattr(model, "backbone"):
+        if patch_inner_model and getattr(model, "backbone", None) is not None:
+            model.backbone.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), model.backbone)
 
         if patch_causal_lm_model:
             model.forward = types.MethodType(create_pipeline_forward_causal_lm(), model)
