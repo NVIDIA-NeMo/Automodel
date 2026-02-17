@@ -82,7 +82,7 @@ dependencies = [
     "opencv-python-headless==4.10.0.84",
     "pybind11",
     "pyyaml",
-    "torch<=2.10.0",
+    "torch>=2.6.0,<=2.10.0",
     "torchdata",
     "transformers>=5.0.0",
     "wandb",
