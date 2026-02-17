@@ -220,8 +220,8 @@ jobs:
           - test-name: L2_HF_DCP
             test-folder: hf_dcp
             timeout: 40
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
-            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+            runner: self-hosted-nemo
+            test-data-path: "/mnt/datadrive/TestData"
           - test-name: L2_HF_PEFT
             test-folder: hf_peft
             timeout: 30
