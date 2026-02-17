@@ -48,7 +48,7 @@ peft:
   dropout: 0.0
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints/qwen3_moe_lora
   model_save_format: safetensors
 
