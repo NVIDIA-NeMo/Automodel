@@ -16,7 +16,7 @@ step_scheduler:
   global_batch_size: 8
   local_batch_size: 4
   ckpt_every_steps: 5
-  val_every_steps: 1
+  val_every_steps: 100
   num_epochs: 1
   max_steps: 10
 
@@ -97,6 +97,9 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: train
+  seq_length: 256
+  padding: max_length
+  truncation: true
   tokenizer:
     pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
 
@@ -110,6 +113,9 @@ validation_dataset:
   dataset_name: rajpurkar/squad
   split: validation
   limit_dataset_samples: 64
+  seq_length: 256
+  padding: max_length
+  truncation: true
   tokenizer:
     pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
 
