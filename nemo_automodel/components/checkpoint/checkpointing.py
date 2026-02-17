@@ -363,7 +363,12 @@ class Checkpointer:
         # local DTensor shard.  This avoids NCCL collectives entirely, side-stepping
         # the broadcast_from_rank0 hang where rank 0's synchronous CPU→GPU copies
         # fall behind other ranks' async allocations.
-        if is_init_step and len(model_state.model) == 1 and _is_safetensors_checkpoint(model_path):
+        if (
+            is_init_step
+            and len(model_state.model) == 1
+            and _is_safetensors_checkpoint(model_path)
+            and not _is_custom_model(model_state.model[0])
+        ):
             t0 = time.monotonic()
             state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
             t_disk = time.monotonic()
@@ -1279,6 +1284,11 @@ def _equally_divide_layers(num_shards: int, keys: list[str]) -> dict[str, int]:
 def _model_has_dtensors(module: nn.Module) -> bool:
     """True if any parameter is a DTensor (model is already sharded)."""
     return any(type(p).__name__ == "DTensor" for p in module.parameters())
+
+
+def _is_custom_model(module: nn.Module) -> bool:
+    """True if the model has a custom implementation in nemo_automodel/components/models/."""
+    return any((c.__module__ or "").startswith("nemo_automodel.components.models.") for c in type(module).__mro__)
 
 
 def _load_hf_checkpoint_preserving_dtype(model_path: str) -> Optional[dict[str, torch.Tensor]]:
