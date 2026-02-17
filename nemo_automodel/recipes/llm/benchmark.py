@@ -470,7 +470,8 @@ def main(config_path=None):
         )
 
     cfg = parse_args_and_load_config(config_path)
-    recipe = BenchmarkingRecipeForNextTokenPrediction(cfg)
+    # recipe = BenchmarkingRecipeForNextTokenPrediction(cfg)
+    recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     recipe.setup()
     recipe.run_benchmark()
 
