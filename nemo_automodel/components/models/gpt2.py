@@ -66,7 +66,7 @@ class CausalSelfAttention(nn.Module):
 
     The fused ``qkv_proj`` produces ``3 * embed_dim`` outputs laid out as
     ``[Q | K | V]``.  For tensor parallelism use
-    ``FusedQKVColwiseParallel`` (YAML string ``"fused_qkv_colwise"``)
+    ``FusedColwiseParallel`` (YAML string ``"fused_colwise"``)
     which shards each section independently so that heads are never mixed
     across TP ranks.
     """
