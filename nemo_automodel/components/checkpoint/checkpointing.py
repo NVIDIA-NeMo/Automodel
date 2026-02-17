@@ -635,7 +635,10 @@ class Checkpointer:
         # PEFT saving is done on rank0 so it is a special case
         if self.config.is_peft and is_model:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                save_file(state_dict, os.path.join(path, "adapter_model.safetensors"))
+                # Materialize lazy mappings (e.g. LazyHFStateDict) into a plain
+                # dict because safetensors.save_file only accepts dict.
+                sd = dict(state_dict) if not isinstance(state_dict, dict) else state_dict
+                save_file(sd, os.path.join(path, "adapter_model.safetensors"))
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
             return
