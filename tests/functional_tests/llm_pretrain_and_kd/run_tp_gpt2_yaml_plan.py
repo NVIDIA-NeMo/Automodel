@@ -23,7 +23,7 @@ YAML config file::
     distributed:
       tp_plan:
         "wte":                "rowwise_rep"
-        "h.*.attn.qkv_proj":  "fused_qkv_colwise"
+        "h.*.attn.qkv_proj":  "fused_colwise"
         "h.*.attn.out_proj":  "rowwise"
         "h.*.mlp.fc1":        "colwise"
         "h.*.mlp.fc2":        "rowwise"
@@ -69,7 +69,7 @@ from nemo_automodel.components.models.gpt2 import GPT2LMHeadModel
 # ---------------------------------------------------------------------------
 GPT2_YAML_PLAN: Dict[str, str] = {
     "wte": "rowwise_rep",
-    "h.*.attn.qkv_proj": "fused_qkv_colwise",
+    "h.*.attn.qkv_proj": "fused_colwise",
     "h.*.attn.out_proj": "rowwise",
     "h.*.mlp.fc1": "colwise",
     "h.*.mlp.fc2": "rowwise",
@@ -233,7 +233,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     #      distributed:
     #        tp_plan:
     #          "wte": "rowwise_rep"
-    #          "h.*.attn.qkv_proj": "fused_qkv_colwise"
+    #          "h.*.attn.qkv_proj": "fused_colwise"
     #          ...
     # ------------------------------------------------------------------
     tp_mesh = DeviceMesh(dt, torch.arange(world_size, device="cpu"), mesh_dim_names=("tp",))
