@@ -13,11 +13,12 @@
 # limitations under the License.
 
 step_scheduler:
-  global_batch_size: 16
+  global_batch_size: 8
   local_batch_size: 4
-  ckpt_every_steps: 1000
-  val_every_steps: 2
+  ckpt_every_steps: 5
+  val_every_steps: 100
   num_epochs: 1
+  max_steps: 10
 
 dist_env:
   backend: nccl
@@ -60,14 +61,23 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
     linear: torch
-    rms_norm: torch
+    rms_norm: te
+    rope_fusion: false  # failed in CI test
     experts: torch
     dispatcher: torch
     fake_balanced_gate: true
-    enable_hf_state_dict_adapter: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: ["*"]
+  dim: 32
+  alpha: 32
+  dropout: 0.0
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors
   save_consolidated: false
@@ -78,17 +88,7 @@ distributed:
   cp_size: 1
   pp_size: 1
   ep_size: 2
-
-  sequence_parallel: false
   activation_checkpointing: true
-
-  pipeline:
-    pp_schedule: interleaved1f1b
-    pp_microbatch_size: 1
-    round_virtual_stages_to_pp_multiple: up
-    scale_grads_in_schedule: false
-    patch_inner_model: false
-    patch_causal_lm_model: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -97,11 +97,11 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: train
+  seq_length: 256
+  padding: max_length
+  truncation: true
   tokenizer:
     pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
-
-packed_sequence:
-  packed_sequence_size: 0
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -113,6 +113,9 @@ validation_dataset:
   dataset_name: rajpurkar/squad
   split: validation
   limit_dataset_samples: 64
+  seq_length: 256
+  padding: max_length
+  truncation: true
   tokenizer:
     pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
 
@@ -122,10 +125,8 @@ validation_dataloader:
   batch_size: 4
 
 optimizer:
-  _target_: torch.optim.Adam
+  _target_: torch.optim.AdamW
+  lr: 1.0e-3
+  weight_decay: 0.01
   betas: [0.9, 0.95]
-  eps: 1e-7
-  lr: 5.0e-4
-  weight_decay: 0.0
-
-
+  eps: 1e-8
