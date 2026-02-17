@@ -262,6 +262,7 @@ omit = [
 line-length = 120
 exclude = [
    "tests/",
+   "fern/",
 ]
 
 [tool.ruff.format]
