@@ -158,6 +158,7 @@ try:
 
     FLASH_ATTN_AVAILABLE = True
 except ImportError:
+    flash_attn_varlen_func = None
     FLASH_ATTN_AVAILABLE = False
 
 

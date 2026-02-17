@@ -74,6 +74,7 @@ try:
 
     HAVE_CUT_CROSS_ENTROPY = True
 except ImportError:  # pragma: no cover
+    linear_cross_entropy = None  # pragma: no cover
     HAVE_CUT_CROSS_ENTROPY = False  # pragma: no cover
 
 
