@@ -1035,6 +1035,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Optionally resume
         self.load_checkpoint(restore_from)
+        torch.cuda.empty_cache()
 
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
