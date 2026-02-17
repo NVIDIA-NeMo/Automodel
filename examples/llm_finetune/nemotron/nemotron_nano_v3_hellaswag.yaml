@@ -14,9 +14,9 @@
 
 
 # To run this recipe, please use the following command. Replace --nproc-per-node=8 with the number of GPUs on your node:
-# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_v3_squad.yaml
+# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml
 # For multi-node, use the following:
-# torchrun --nproc-per-node=8 --nnodes=2 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_v3_squad.yaml
+# torchrun --nproc-per-node=8 --nnodes=2 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml
 
 
 step_scheduler:
