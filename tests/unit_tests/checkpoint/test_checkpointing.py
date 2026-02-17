@@ -16,7 +16,12 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from nemo_automodel.components.checkpoint.checkpointing import _equally_divide_layers, _reinit_rope_buffers
+from nemo_automodel.components.checkpoint.checkpointing import (
+    _equally_divide_layers,
+    _is_custom_model,
+    _model_has_dtensors,
+    _reinit_rope_buffers,
+)
 from nemo_automodel.components.checkpoint.stateful_wrappers import _get_lm_head_weight_and_name
 
 
@@ -236,3 +241,200 @@ class TestReinitRopeBuffers:
         with patch.object(model, "named_modules", return_value=[("", model), ("layers.0.rotary", rope)]):
             # Should not raise, just log a warning
             _reinit_rope_buffers(model, torch.device("cpu"))
+
+
+# =============================================================================
+# Tests for _is_custom_model
+# =============================================================================
+
+
+class TestIsCustomModel:
+    """Test cases for _is_custom_model detection of nemo_automodel custom implementations."""
+
+    def test_plain_nn_module_is_not_custom(self):
+        """Standard nn.Module is not a custom model."""
+        model = torch.nn.Module()
+        assert _is_custom_model(model) is False
+
+    def test_hf_linear_is_not_custom(self):
+        """Standard PyTorch modules are not custom models."""
+        model = torch.nn.Linear(4, 4)
+        assert _is_custom_model(model) is False
+
+    def test_module_from_custom_namespace_is_custom(self):
+        """A class whose __module__ starts with nemo_automodel.components.models. is custom."""
+        model = torch.nn.Module()
+        # Simulate a custom model by patching __module__ on the class's MRO
+        FakeCustom = type("FakeCustom", (torch.nn.Module,), {})
+        FakeCustom.__module__ = "nemo_automodel.components.models.deepseek_v3.model"
+        instance = FakeCustom()
+        assert _is_custom_model(instance) is True
+
+    def test_subclass_of_custom_model_is_custom(self):
+        """A subclass of a custom model class is also detected as custom."""
+        Base = type("Base", (torch.nn.Module,), {})
+        Base.__module__ = "nemo_automodel.components.models.kimivl.model"
+        Child = type("Child", (Base,), {})
+        Child.__module__ = "some_other_module"
+        instance = Child()
+        assert _is_custom_model(instance) is True
+
+    def test_none_module_attr_does_not_crash(self):
+        """Classes where __module__ is None don't cause an error."""
+        FakeClass = type("FakeClass", (torch.nn.Module,), {})
+        FakeClass.__module__ = None
+        instance = FakeClass()
+        # Should not raise; the (c.__module__ or "") guard handles None
+        assert _is_custom_model(instance) is False
+
+    def test_similar_but_wrong_namespace_is_not_custom(self):
+        """A class in a similar but different namespace is not custom."""
+        FakeClass = type("FakeClass", (torch.nn.Module,), {})
+        FakeClass.__module__ = "nemo_automodel.components.checkpoint.checkpointing"
+        instance = FakeClass()
+        assert _is_custom_model(instance) is False
+
+
+# =============================================================================
+# Tests for _model_has_dtensors
+# =============================================================================
+
+
+class TestModelHasDtensors:
+    """Test cases for _model_has_dtensors detection of DTensor parameters."""
+
+    def test_regular_model_has_no_dtensors(self):
+        """A standard model with regular parameters returns False."""
+        model = torch.nn.Linear(4, 4)
+        assert _model_has_dtensors(model) is False
+
+    def test_empty_model_has_no_dtensors(self):
+        """A model with no parameters returns False."""
+        model = torch.nn.Module()
+        assert _model_has_dtensors(model) is False
+
+    def test_model_with_dtensor_parameter_returns_true(self):
+        """A model with a DTensor parameter returns True."""
+        model = torch.nn.Module()
+        # Create a mock DTensor-like object whose type name is "DTensor"
+        DTensorLike = type("DTensor", (), {})
+        mock_param = DTensorLike()
+        with patch.object(model, "parameters", return_value=iter([mock_param])):
+            assert _model_has_dtensors(model) is True
+
+    def test_mixed_params_with_one_dtensor_returns_true(self):
+        """If at least one parameter is DTensor, returns True."""
+        model = torch.nn.Linear(4, 4)
+        DTensorLike = type("DTensor", (), {})
+        mock_dtensor = DTensorLike()
+        regular_param = torch.nn.Parameter(torch.randn(4))
+        with patch.object(model, "parameters", return_value=iter([regular_param, mock_dtensor])):
+            assert _model_has_dtensors(model) is True
+
+    def test_all_regular_params_returns_false(self):
+        """If all parameters are regular tensors, returns False."""
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
+        assert _model_has_dtensors(model) is False
+
+
+# =============================================================================
+# Tests for load_model: custom model uses DCP path, not the fast safetensors path
+# =============================================================================
+
+
+class TestLoadModelCustomModelGuard:
+    """Verify that custom models skip the fast safetensors path and use DCP instead.
+
+    The fast safetensors path loads the full state dict directly and uses
+    _load_full_state_dict_into_model, which bypasses the state_dict_adapter
+    conversion needed by custom MoE models. Custom models must use the
+    standard DCP path so that _maybe_adapt_state_dict_to_hf/from_hf handles
+    the HF <-> native key and tensor format conversion.
+    """
+
+    def _make_checkpointer(self):
+        """Create a minimally configured Checkpointer for testing."""
+        from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig, Checkpointer
+
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir="/tmp/test",
+            model_save_format="safetensors",
+            model_cache_dir="/tmp/cache",
+            model_repo_id="test/model",
+            save_consolidated=False,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
+    def test_non_custom_model_uses_fast_path(self, mock_load_full, mock_load_hf, mock_is_st):
+        """Non-custom (HF) models use the fast safetensors loading path."""
+        checkpointer = self._make_checkpointer()
+        model = torch.nn.Linear(4, 4)
+
+        mock_load_hf.return_value = {"weight": torch.randn(4, 4), "bias": torch.randn(4)}
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch.object(checkpointer, "_do_load") as mock_dcp_load,
+        ):
+            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
+
+        # Fast path should be used: _load_full_state_dict_into_model called
+        mock_load_full.assert_called_once()
+        # DCP path should NOT be used
+        mock_dcp_load.assert_not_called()
+
+    @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
+    def test_custom_model_skips_fast_path_uses_dcp(self, mock_load_full, mock_load_hf, mock_is_st):
+        """Custom models (nemo_automodel.components.models.*) must NOT use the fast path.
+
+        They must use the standard DCP path so that state_dict_adapter handles
+        the HF <-> native format conversion (e.g., merging individual MoE expert
+        weights into grouped tensors).
+        """
+        checkpointer = self._make_checkpointer()
+
+        # Create a model class in the custom namespace
+        CustomModel = type("CustomModel", (torch.nn.Module,), {})
+        CustomModel.__module__ = "nemo_automodel.components.models.kimivl.model"
+        model = CustomModel()
+        model.layer = torch.nn.Linear(4, 4)
+
+        # Sanity check: model is detected as custom
+        assert _is_custom_model(model) is True
+
+        mock_state_dict = {"layer.weight": torch.randn(4, 4), "layer.bias": torch.randn(4)}
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing.ModelState"
+            ) as MockModelState,
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                side_effect=lambda m, sd, **kw: sd,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_from_hf",
+                side_effect=lambda m, sd, **kw: sd,
+            ),
+            patch.object(checkpointer, "_do_load", return_value=mock_state_dict) as mock_dcp_load,
+            patch.object(checkpointer, "_get_storage_reader", return_value=None),
+        ):
+            mock_model_state = MockModelState.return_value
+            mock_model_state.model = [model]
+            mock_model_state.state_dict.return_value = mock_state_dict
+
+            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
+
+        # Fast path should NOT be used
+        mock_load_full.assert_not_called()
+        # DCP path should be used
+        mock_dcp_load.assert_called_once()
