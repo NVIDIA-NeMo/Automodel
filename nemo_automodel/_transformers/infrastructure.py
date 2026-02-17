@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
+from nemo_automodel._transformers.utils import _should_load_before_shard
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
@@ -400,10 +401,15 @@ def apply_model_infrastructure(
     # Skip load-before-shard for PEFT: base load into unwrapped PEFT then later adapter load
     # after shard can leave base/adapter out of sync (e.g. key/device mismatch). Use the
     # post-shard load path so base and adapter load in the same way as multi-GPU.
-    no_pp = autopipeline is None
-    no_tp = mesh.tp_size <= 1
     need_checkpoint_load = bool(pretrained_model_name_or_path and load_base_model)
-    load_before_shard = no_pp and no_tp and need_checkpoint_load and (peft_config is None)
+    load_before_shard = _should_load_before_shard(
+        autopipeline=autopipeline,
+        tp_size=mesh.tp_size,
+        ep_size=mesh.ep_size,
+        pretrained_model_name_or_path=pretrained_model_name_or_path,
+        load_base_model=load_base_model,
+        peft_config=peft_config,
+    )
 
     checkpoint_already_loaded = False
     if load_before_shard:
