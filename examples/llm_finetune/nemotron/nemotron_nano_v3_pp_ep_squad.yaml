@@ -1,0 +1,129 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Nemotron-Nano-v3 SQuAD SFT with PP+EP optimizations used in benchmarking:
+# - PP size 4 (interleaved1f1b)
+# - EP size 2 (DeepEP dispatcher)
+# - fixed-length SQuAD tokenization (seq_length=1024)
+#
+# Recommended launch (from Automodel/):
+# torchrun --nproc-per-node=8 --nnodes=1 \
+#   examples/llm_finetune/finetune.py \
+#   --config examples/llm_finetune/nemotron/nemotron_nano_v3_pp_ep_squad.yaml
+
+step_scheduler:
+  global_batch_size: 256
+  local_batch_size: 64
+  ckpt_every_steps: 1000
+  val_every_steps: 50
+  max_steps: 50
+
+# Caveats:
+# - External env vars take precedence over YAML values.
+# - These YAML->env mappings are currently applied in the train_ft recipe path.
+# - Avoid null values in dist_env.runtime_env (they would map to the string "None").
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+  # Runtime env settings expressed as YAML keys (applied before CUDA init).
+  torch_nccl_use_comm_nonblocking: true
+  pytorch_alloc_conf: "expandable_segments:True"
+  nemotronh_ep_use_deepep_dispatch: true
+  nemotronh_ep_require_deepep: true
+  nemotronh_ep_physical_partition: true
+  nemotronh_ep_sync_inactive_experts: true
+  nemotronh_ep_expert_reshard_after_forward: false
+  nemoautomodel_pp_skip_output_merge: true
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  use_liger_kernel: true
+
+autopipeline:
+  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
+  pp_schedule: interleaved1f1b
+  pp_microbatch_size: 8
+  round_virtual_stages_to_pp_multiple: up
+  scale_grads_in_schedule: false
+  patch_inner_model: true
+  patch_causal_lm_model: true
+  module_fqns_per_model_part:
+    - ["backbone.embeddings", "backbone.layers.0", "backbone.layers.1", "backbone.layers.2", "backbone.layers.3", "backbone.layers.4", "backbone.layers.5", "backbone.rotary_emb"]
+    - ["backbone.layers.6", "backbone.layers.7", "backbone.layers.8", "backbone.layers.9", "backbone.layers.10", "backbone.layers.11", "backbone.layers.12", "backbone.rotary_emb"]
+    - ["backbone.layers.13", "backbone.layers.14", "backbone.layers.15", "backbone.layers.16", "backbone.layers.17", "backbone.layers.18", "backbone.layers.19", "backbone.layers.20", "backbone.rotary_emb"]
+    - ["backbone.layers.21", "backbone.layers.22", "backbone.layers.23", "backbone.layers.24", "backbone.layers.25", "backbone.layers.26", "backbone.layers.27", "backbone.layers.28", "backbone.rotary_emb"]
+    - ["backbone.layers.29", "backbone.layers.30", "backbone.layers.31", "backbone.layers.32", "backbone.layers.33", "backbone.layers.34", "backbone.layers.35", "backbone.layers.36", "backbone.rotary_emb"]
+    - ["backbone.layers.37", "backbone.layers.38", "backbone.layers.39", "backbone.layers.40", "backbone.layers.41", "backbone.layers.42", "backbone.layers.43", "backbone.rotary_emb"]
+    - ["backbone.layers.44", "backbone.layers.45", "backbone.layers.46", "backbone.layers.47", "backbone.layers.48", "backbone.layers.49", "backbone.rotary_emb"]
+    - ["backbone.layers.50", "backbone.layers.51", "backbone.norm", "lm_head", "backbone.rotary_emb"]
+
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: true
+  backend: null
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/
+  model_save_format: torch_save
+  save_consolidated: false
+  load_base_model: true
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  dp_replicate_size: 1
+  tp_size: 1
+  cp_size: 1
+  pp_size: 4
+  ep_size: 2
+  sequence_parallel: false
+  activation_checkpointing: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+  seq_length: 1024
+  padding: max_length
+  truncation: true
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: validation
+  limit_dataset_samples: 64
+  seq_length: 1024
+  padding: max_length
+  truncation: true
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+optimizer:
+  _target_: torch.optim.SGD
+  lr: 5.0e-5
+  momentum: 0.9
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
