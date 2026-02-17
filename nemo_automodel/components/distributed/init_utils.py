@@ -14,12 +14,87 @@
 
 import atexit
 import datetime
+import logging
 import os
 import signal
 from dataclasses import dataclass
 
 import torch
 import torch.distributed
+
+logger = logging.getLogger(__name__)
+
+DIST_ENV_RUNTIME_ENV_MAP = {
+    "torch_nccl_use_comm_nonblocking": "TORCH_NCCL_USE_COMM_NONBLOCKING",
+    "pytorch_alloc_conf": "PYTORCH_ALLOC_CONF",
+    "nemotronh_ep_use_deepep_dispatch": "NEMOTRONH_EP_USE_DEEPEP_DISPATCH",
+    "nemotronh_ep_require_deepep": "NEMOTRONH_EP_REQUIRE_DEEPEP",
+    "nemotronh_ep_physical_partition": "NEMOTRONH_EP_PHYSICAL_PARTITION",
+    "nemotronh_ep_sync_inactive_experts": "NEMOTRONH_EP_SYNC_INACTIVE_EXPERTS",
+    "nemotronh_ep_expert_reshard_after_forward": "NEMOTRONH_EP_EXPERT_RESHARD_AFTER_FORWARD",
+    "nemoautomodel_pp_skip_output_merge": "NEMOAUTOMODEL_PP_SKIP_OUTPUT_MERGE",
+}
+
+
+def _cfg_get(cfg, key, default=None):
+    """Safely fetch a key from ConfigNode-like objects or dicts."""
+    if cfg is None:
+        return default
+    getter = getattr(cfg, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+def _to_env_str(value) -> str:
+    """Convert YAML-friendly values to env-var string format."""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return str(value)
+
+
+def apply_runtime_env_from_dist_cfg(cfg_dist_env) -> dict[str, str]:
+    """Apply runtime env overrides from `dist_env` config.
+
+    Supports two forms:
+    1. First-class dist_env keys in `DIST_ENV_RUNTIME_ENV_MAP`.
+    2. Optional passthrough map: `dist_env.runtime_env`.
+
+    Existing process env vars take precedence over config values.
+    """
+    overrides = {}
+
+    for cfg_key, env_key in DIST_ENV_RUNTIME_ENV_MAP.items():
+        value = _cfg_get(cfg_dist_env, cfg_key, None)
+        if value is not None:
+            overrides[env_key] = value
+
+    runtime_env = _cfg_get(cfg_dist_env, "runtime_env", None)
+    if runtime_env is not None:
+        runtime_env_dict = runtime_env.to_dict() if hasattr(runtime_env, "to_dict") else runtime_env
+        if not isinstance(runtime_env_dict, dict):
+            raise TypeError(
+                f"dist_env.runtime_env must be a dict-like mapping, but got {type(runtime_env_dict).__name__}"
+            )
+        overrides.update(runtime_env_dict)
+
+    applied = {}
+    for env_key, value in overrides.items():
+        env_value = _to_env_str(value)
+        existing = os.environ.get(env_key)
+        if existing is None:
+            os.environ[env_key] = env_value
+            applied[env_key] = env_value
+        elif existing != env_value:
+            logger.info(
+                "Keeping pre-set env %s=%s (ignoring config value %s)",
+                env_key,
+                existing,
+                env_value,
+            )
+    return applied
 
 
 def get_rank_safe() -> int:
