@@ -65,6 +65,10 @@ class TestStageIdsThisRank:
         with pytest.raises(AssertionError):
             stage_ids_this_rank(0, 4, 12, "v")  # 3 stages per rank
 
+    def test_invalid_style_raises(self):
+        with pytest.raises(ValueError, match="Unsupported pipeline schedule style"):
+            stage_ids_this_rank(0, 4, 8, "unknown")
+
 
 class TestGenerateHfModelFqnPerModelPart:
     """Test generate_hf_model_fqn_per_model_part function - no mocks needed."""
@@ -368,9 +372,13 @@ class TestSplitModelIntoStages:
             # Mock stage_ids_this_rank
             mock_stage_ids.return_value = (0,)
 
-            # Mock deepcopy to return a mock with proper structure
-            mock_copy = Mock()
-            mock_copy.named_children.return_value = []
+            # Mock deepcopy to return a lightweight object that only exposes
+            # the methods split_model_into_stages uses in this test.
+            class MockStageModel:
+                def named_children(self):
+                    return []
+
+            mock_copy = MockStageModel()
             mock_deepcopy.return_value = mock_copy
 
             stages, models = split_model_into_stages(
@@ -474,6 +482,7 @@ class TestBuildPipelineSchedule:
 
         # Mock stages
         mock_stage = Mock()
+        mock_stage.num_stages = 1
         stages = [mock_stage]
 
         # Mock loss function
@@ -507,7 +516,11 @@ class TestBuildPipelineSchedule:
         mock_get_schedule.return_value = MockScheduleMulti
 
         # Mock stages
-        stages = [Mock(), Mock()]
+        stage0 = Mock()
+        stage0.num_stages = 2
+        stage1 = Mock()
+        stage1.num_stages = 2
+        stages = [stage0, stage1]
 
         # Mock loss function
         loss_fn = Mock()
@@ -557,12 +570,14 @@ class TestBuildPipelineSchedule:
         # Patch _PipelineScheduleRuntime with our mock class
         with patch('nemo_automodel.components.distributed.pipelining.functional._PipelineScheduleRuntime', MockPipelineScheduleRuntime):
             # Call with CSV
+            stage = Mock()
+            stage.num_stages = 1
             schedule = build_pipeline_schedule(
                 pipeline_parallel_schedule_csv="/path/to/schedule.csv",
                 pipeline_parallel_schedule=None,
                 microbatch_size=2,
                 local_batch_size=8,
-                stages=[Mock()],
+                stages=[stage],
                 loss_fn=Mock(),
             )
 
@@ -581,6 +596,71 @@ class TestBuildPipelineSchedule:
                     stages=[Mock()],
                     loss_fn=Mock(),
                 )
+
+    @patch('nemo_automodel.components.distributed.pipelining.functional.get_schedule_class')
+    def test_skip_output_merge_patch_supported(self, mock_get_schedule, monkeypatch):
+        class MockScheduleSingle(PipelineScheduleSingle):
+            def __init__(self, *args, **kwargs):
+                self._stage = Mock()
+                self._stage.clear_runtime_states = Mock()
+                self._has_backward = False
+                self._n_microbatches = kwargs.get("n_microbatches", 0)
+                self._split_inputs = Mock(return_value=([], []))
+                self._step_microbatches_mock = Mock()
+
+            def _step_microbatches(self, *args, **kwargs):
+                return self._step_microbatches_mock(*args, **kwargs)
+
+            def step(self, *args, **kwargs):
+                return "original-step-output"
+
+        mock_get_schedule.return_value = MockScheduleSingle
+        monkeypatch.setenv("NEMOAUTOMODEL_PP_SKIP_OUTPUT_MERGE", "1")
+
+        stage = Mock()
+        stage.num_stages = 1
+        schedule = build_pipeline_schedule(
+            pipeline_parallel_schedule_csv=None,
+            pipeline_parallel_schedule="PipelineScheduleSingle",
+            microbatch_size=2,
+            local_batch_size=8,
+            stages=[stage],
+            loss_fn=Mock(),
+        )
+
+        assert hasattr(schedule, "_nemo_original_step")
+        assert schedule.step(losses=[]) is None
+        schedule._step_microbatches_mock.assert_called_once()
+
+    @patch('nemo_automodel.components.distributed.pipelining.functional.get_schedule_class')
+    def test_skip_output_merge_patch_incompatible_schedule(self, mock_get_schedule, monkeypatch):
+        class IncompatibleSchedule(PipelineScheduleSingle):
+            def __init__(self, *args, **kwargs):
+                # intentionally missing private attrs used by patch path
+                pass
+
+            def _step_microbatches(self, *args, **kwargs):
+                pass
+
+            def step(self, *args, **kwargs):
+                return "original"
+
+        mock_get_schedule.return_value = IncompatibleSchedule
+        monkeypatch.setenv("NEMOAUTOMODEL_PP_SKIP_OUTPUT_MERGE", "1")
+
+        stage = Mock()
+        stage.num_stages = 1
+        schedule = build_pipeline_schedule(
+            pipeline_parallel_schedule_csv=None,
+            pipeline_parallel_schedule="PipelineScheduleSingle",
+            microbatch_size=2,
+            local_batch_size=8,
+            stages=[stage],
+            loss_fn=Mock(),
+        )
+
+        assert not hasattr(schedule, "_nemo_original_step")
+        assert schedule.step() == "original"
 
 
 class TestPipelineModel:

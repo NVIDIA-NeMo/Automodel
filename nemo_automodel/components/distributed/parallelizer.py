@@ -14,6 +14,7 @@
 
 import importlib
 import logging
+import os
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from functools import lru_cache, reduce
@@ -40,7 +41,8 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
     parallelize_module,
 )
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
@@ -103,6 +105,7 @@ class ParallelizationStrategy(ABC):
         self,
         model: nn.Module,
         device_mesh: DeviceMesh,
+        moe_mesh: Optional[DeviceMesh] = None,
         mp_policy: Optional[MixedPrecisionPolicy] = None,
         offload_policy: Optional[OffloadPolicy] = None,
         sequence_parallel: bool = False,
@@ -111,6 +114,7 @@ class ParallelizationStrategy(ABC):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        ep_mesh_name: str = "ep",
     ) -> nn.Module:
         """Apply parallelization strategy to the model."""
         pass
@@ -123,6 +127,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         self,
         model: nn.Module,
         device_mesh: DeviceMesh,
+        moe_mesh: Optional[DeviceMesh] = None,
         mp_policy: Optional[MixedPrecisionPolicy] = None,
         offload_policy: Optional[OffloadPolicy] = None,
         sequence_parallel: bool = False,
@@ -131,8 +136,10 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        ep_mesh_name: str = "ep",
     ) -> nn.Module:
         """Apply the default parallelization flow."""
+        del moe_mesh, ep_mesh_name
         tp_mesh = device_mesh[tp_mesh_name]
 
         # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
@@ -220,6 +227,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         self,
         model: nn.Module,
         device_mesh: DeviceMesh,
+        moe_mesh: Optional[DeviceMesh] = None,
         mp_policy: Optional[MixedPrecisionPolicy] = None,
         offload_policy: Optional[OffloadPolicy] = None,
         sequence_parallel: bool = False,
@@ -228,43 +236,530 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        ep_mesh_name: str = "ep",
     ) -> nn.Module:
         """Apply NemotronH-specific parallelization."""
         assert not sequence_parallel, "Sequence parallelism is not supported for NemotronHForCausalLM"
         logger.info("Custom parallel plan is not supported for NemotronHForCausalLM. Using NemotronH-specific TP plan.")
 
-        layers: torch.nn.ModuleList = model.backbone.layers
+        layers = model.backbone.layers
+
+        def _iter_layers(container):
+            if hasattr(container, "values"):
+                return list(container.values())
+            return list(container)
+
+        ep_mesh = None
+        if moe_mesh is not None and hasattr(moe_mesh, "mesh_dim_names"):
+            if ep_mesh_name in moe_mesh.mesh_dim_names:
+                ep_mesh = moe_mesh[ep_mesh_name]
+        ep_shard_mesh = None
+        if moe_mesh is not None and hasattr(moe_mesh, "mesh_dim_names"):
+            if "ep_shard" in moe_mesh.mesh_dim_names:
+                ep_shard_mesh = moe_mesh["ep_shard"]
+
+        def _patch_nemotronh_moe_for_ep(moe_module: nn.Module, ep_device_mesh: DeviceMesh):
+            if getattr(moe_module, "_nemotron_ep_patched", False):
+                return
+            if not hasattr(moe_module, "experts"):
+                return
+
+            n_routed_experts = len(moe_module.experts)
+            ep_size = ep_device_mesh.size()
+            if ep_size <= 1:
+                return
+            if n_routed_experts % ep_size != 0:
+                raise ValueError(
+                    f"NemotronH n_routed_experts ({n_routed_experts}) must be divisible by ep_size ({ep_size})"
+                )
+
+            local_experts = n_routed_experts // ep_size
+            ep_rank = ep_device_mesh.get_local_rank()
+            local_start = ep_rank * local_experts
+            local_end = local_start + local_experts
+            local_expert_indices = list(range(local_start, local_end))
+            physical_partition = os.environ.get("NEMOTRONH_EP_PHYSICAL_PARTITION", "0").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            if physical_partition:
+                local_modules = [moe_module.experts[i] for i in local_expert_indices]
+                moe_module.experts = nn.ModuleList(local_modules)
+
+            moe_module._nemotron_ep_patched = True
+            moe_module._nemotron_ep_mesh = ep_device_mesh
+            moe_module._nemotron_ep_size = ep_size
+            moe_module._nemotron_ep_rank = ep_rank
+            moe_module._nemotron_ep_local_start = local_start
+            moe_module._nemotron_ep_local_end = local_end
+            moe_module._nemotron_ep_num_experts = n_routed_experts
+            moe_module._nemotron_ep_local_expert_indices = local_expert_indices
+            moe_module._nemotron_ep_physical_partition = physical_partition
+            moe_module._nemotron_ep_global_expert_indices = local_expert_indices
+            moe_module._nemotron_ep_global_to_local = {g: i for i, g in enumerate(local_expert_indices)}
+            moe_module._nemotron_ep_sync_inactive_experts = os.environ.get(
+                "NEMOTRONH_EP_SYNC_INACTIVE_EXPERTS", "1"
+            ).strip().lower() in ("1", "true", "yes", "on")
+
+            use_deepep_dispatch = os.environ.get("NEMOTRONH_EP_USE_DEEPEP_DISPATCH", "1").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            require_deepep_dispatch = os.environ.get("NEMOTRONH_EP_REQUIRE_DEEPEP", "0").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            if require_deepep_dispatch and not use_deepep_dispatch:
+                raise RuntimeError(
+                    "NEMOTRONH_EP_REQUIRE_DEEPEP=1 requires NEMOTRONH_EP_USE_DEEPEP_DISPATCH=1 for EP runs."
+                )
+            moe_module._nemotron_ep_dispatcher = None
+            if use_deepep_dispatch:
+                try:
+                    from nemo_automodel.components.moe.megatron.token_dispatcher import (
+                        MoEConfig as _NemotronHEPDispatchConfig,
+                    )
+                    from nemo_automodel.components.moe.megatron.token_dispatcher import (
+                        MoEFlexTokenDispatcher,
+                    )
+
+                    dispatcher_cfg = _NemotronHEPDispatchConfig(
+                        moe_router_topk=int(getattr(moe_module.gate, "top_k", 2)),
+                        num_moe_experts=n_routed_experts,
+                        moe_permute_fusion=True,
+                        moe_enable_deepep=True,
+                    )
+                    moe_module._nemotron_ep_dispatcher = MoEFlexTokenDispatcher(
+                        num_local_experts=local_experts,
+                        local_expert_indices=local_expert_indices,
+                        config=dispatcher_cfg,
+                        ep_group=ep_device_mesh.get_group(),
+                    )
+                    logger.info(
+                        "NemotronH EP using MoEFlexTokenDispatcher (DeepEP): ep_size=%s, ep_rank=%s",
+                        ep_size,
+                        ep_rank,
+                    )
+                except Exception as e:
+                    if require_deepep_dispatch:
+                        raise
+                    logger.warning(
+                        "NemotronH EP DeepEP dispatcher unavailable; falling back to DTensor gather/scatter path. Error: %s",
+                        e,
+                    )
+
+            def _moe_ep(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor):
+                dispatcher = getattr(self, "_nemotron_ep_dispatcher", None)
+                physical_partition_local = getattr(self, "_nemotron_ep_physical_partition", False)
+                local_ids = self._nemotron_ep_local_expert_indices
+                sync_inactive_local_experts = (
+                    getattr(self, "_nemotron_ep_sync_inactive_experts", True)
+                    and getattr(self, "_nemotron_ep_nested_fsdp_wrapped", False)
+                )
+
+                def _local_expert(local_i: int) -> nn.Module:
+                    return self.experts[local_i] if physical_partition_local else self.experts[local_ids[local_i]]
+
+                def _dummy_input(reference: torch.Tensor, expert_module: nn.Module) -> torch.Tensor:
+                    first_param = next(expert_module.parameters(), None)
+                    dtype = first_param.dtype if first_param is not None else reference.dtype
+                    return torch.zeros((1, reference.shape[-1]), device=reference.device, dtype=dtype)
+
+                if dispatcher is not None:
+                    num_local_tokens = hidden_states.size(0)
+                    permuted_hidden_states, tokens_per_expert, permuted_probs = dispatcher.token_permutation2(
+                        hidden_states=hidden_states,
+                        num_local_tokens=num_local_tokens,
+                        token_probs=topk_weights,
+                        token_indices=topk_indices,
+                    )
+
+                    # token_permutation2 guarantees that the concatenated expert
+                    # segments exactly cover permuted_hidden_states, so we can
+                    # avoid a full memset here.
+                    expert_outputs = torch.empty_like(permuted_hidden_states)
+                    permuted_probs = permuted_probs.unsqueeze(-1) if permuted_probs is not None else None
+
+                    tokens_per_expert = tokens_per_expert.detach()
+                    if tokens_per_expert.numel() != len(local_ids):
+                        raise RuntimeError(
+                            "NemotronH EP dispatcher metadata mismatch: "
+                            f"tokens_per_expert size={tokens_per_expert.numel()}, expected local experts={len(local_ids)}."
+                        )
+                    offsets = torch.cumsum(tokens_per_expert, dim=0) - tokens_per_expert
+                    any_active_local = False
+                    for local_i in range(len(local_ids)):
+                        count = int(tokens_per_expert[local_i].item())
+                        expert = _local_expert(local_i)
+                        if count > 0:
+                            start = int(offsets[local_i].item())
+                            end = start + count
+                            chunk = expert(permuted_hidden_states[start:end])
+                            if permuted_probs is not None:
+                                chunk = chunk * permuted_probs[start:end].to(chunk.dtype)
+                            expert_outputs[start:end] = chunk
+                            any_active_local = True
+                        elif sync_inactive_local_experts:
+                            expert_outputs = expert_outputs + expert(_dummy_input(permuted_hidden_states, expert)).sum() * 0.0
+
+                    if not any_active_local and not sync_inactive_local_experts:
+                        expert0 = _local_expert(0)
+                        expert_outputs = expert_outputs + expert0(_dummy_input(permuted_hidden_states, expert0)).sum() * 0.0
+
+                    out = dispatcher.token_unpermutation(expert_outputs)
+                    return out.type(hidden_states.dtype)
+
+                ep_mesh_local = self._nemotron_ep_mesh
+                ep_size_local = self._nemotron_ep_size
+                local_start_idx = self._nemotron_ep_local_start
+                local_end_idx = self._nemotron_ep_local_end
+                global_to_local_idx = getattr(self, "_nemotron_ep_global_to_local", None)
+
+                hidden_states_local = hidden_states
+                if ep_size_local > 1:
+                    # First gather only routing indices to cheaply determine whether this EP rank
+                    # has any routed tokens. If none are routed locally, skip hidden/weight gather.
+                    topk_indices = DTensor.from_local(
+                        topk_indices, device_mesh=ep_mesh_local, placements=[Shard(0)]
+                    ).full_tensor()
+                    local_mask = (topk_indices >= local_start_idx) & (topk_indices < local_end_idx)
+                    has_local_tokens = bool(torch.any(local_mask).item())
+
+                    if has_local_tokens:
+                        hidden_states = DTensor.from_local(
+                            hidden_states_local, device_mesh=ep_mesh_local, placements=[Shard(0)]
+                        ).full_tensor()
+                        topk_weights = DTensor.from_local(
+                            topk_weights, device_mesh=ep_mesh_local, placements=[Shard(0)]
+                        ).full_tensor()
+                        out = torch.zeros_like(hidden_states, dtype=topk_weights.dtype)
+                    else:
+                        global_tokens = topk_indices.shape[0]
+                        out = torch.zeros(
+                            (global_tokens, hidden_states_local.shape[-1]),
+                            device=hidden_states_local.device,
+                            dtype=topk_weights.dtype,
+                        )
+                        hidden_states = None
+                else:
+                    local_mask = (topk_indices >= local_start_idx) & (topk_indices < local_end_idx)
+                    out = torch.zeros_like(hidden_states, dtype=topk_weights.dtype)
+
+                # EP bottleneck fix: avoid full one-hot mask over [tokens, topk, num_experts].
+                # Instead, select only local expert assignments and process active experts.
+                token_indices, weight_indices = torch.where(local_mask)
+                routed_by_expert: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+                if token_indices.numel() > 0:
+                    routed_experts = topk_indices[token_indices, weight_indices]
+                    order = torch.argsort(routed_experts)
+                    token_indices = token_indices[order]
+                    weight_indices = weight_indices[order]
+                    routed_experts = routed_experts[order]
+                    unique_experts, counts = torch.unique_consecutive(routed_experts, return_counts=True)
+
+                    cursor = 0
+                    for expert_idx, count in zip(unique_experts.tolist(), counts.tolist()):
+                        sl = slice(cursor, cursor + count)
+                        routed_by_expert[int(expert_idx)] = (token_indices[sl], weight_indices[sl])
+                        cursor += count
+
+                any_active_local = False
+                for local_i, global_expert_idx in enumerate(local_ids):
+                    expert = _local_expert(local_i)
+                    routed = routed_by_expert.get(global_expert_idx)
+                    if routed is not None:
+                        tok_idx, w_idx = routed
+                        expert_input = hidden_states[tok_idx]
+                        expert_weights = topk_weights[tok_idx, w_idx]
+                        expert_output = expert(expert_input)
+                        out.index_add_(0, tok_idx, expert_output * expert_weights.unsqueeze(-1))
+                        any_active_local = True
+                    elif sync_inactive_local_experts:
+                        out = out + expert(_dummy_input(hidden_states_local, expert)).sum() * 0.0
+
+                if not any_active_local and not sync_inactive_local_experts:
+                    # Keep local expert parameters in the autograd graph to avoid
+                    # no-grad shards in uneven routing cases.
+                    expert0 = _local_expert(0)
+                    out = out + expert0(_dummy_input(hidden_states_local, expert0)).sum() * 0.0
+
+                if ep_size_local > 1:
+                    out = DTensor.from_local(out, device_mesh=ep_mesh_local, placements=[Partial()])
+                    out = out.redistribute(placements=[Shard(0)]).to_local()
+
+                return out.type(hidden_states_local.dtype)
+
+            moe_module.moe = _moe_ep.__get__(moe_module, type(moe_module))
+            logger.info(
+                "Enabled NemotronH EP for MoE module: ep_size=%s, ep_rank=%s, local_experts=[%s,%s), physical_partition=%s, sync_inactive_experts=%s",
+                ep_size,
+                ep_rank,
+                local_start,
+                local_end,
+                physical_partition,
+                moe_module._nemotron_ep_sync_inactive_experts,
+            )
+
+        if ep_mesh is not None and ep_mesh.size() > 1:
+            for layer in _iter_layers(model.backbone.layers):
+                if getattr(layer, "block_type", None) == "moe" and hasattr(layer, "mixer"):
+                    _patch_nemotronh_moe_for_ep(layer.mixer, ep_mesh)
+            logger.info("NemotronH EP mesh detected and applied: size=%s", ep_mesh.size())
+
         tp_mesh = device_mesh[tp_mesh_name]
         if tp_mesh.size() > 1:
-            model_tp_plan: dict[str, ParallelStyle] = {
-                "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
-            }
+            validate_tp_mesh(model, tp_mesh)
+            moe_tp_mode = os.environ.get("NEMOTRONH_MOE_TP_MODE", "shared").strip().lower()
+            valid_moe_tp_modes = {"off", "shared", "experts_up", "full"}
+            if moe_tp_mode not in valid_moe_tp_modes:
+                logger.warning(
+                    "Unknown NEMOTRONH_MOE_TP_MODE=%s. Falling back to 'shared'. Valid modes: %s",
+                    moe_tp_mode,
+                    sorted(valid_moe_tp_modes),
+                )
+                moe_tp_mode = "shared"
+            logger.info("NemotronH MoE TP mode: %s", moe_tp_mode)
+
+            shard_lm_head = os.environ.get("NEMOTRONH_TP_SHARD_LM_HEAD", "0").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            logger.info("NemotronH TP lm_head sharding: %s", shard_lm_head)
+
+            model_tp_plan: dict[str, ParallelStyle] = {}
+            if shard_lm_head:
+                model_tp_plan["lm_head"] = ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)
 
             mlp_tp_plan: dict[str, ParallelStyle] = {
                 "mixer.up_proj": ColwiseParallel(),
                 "mixer.down_proj": RowwiseParallel(),
             }
 
-            parallelize_module(model, tp_mesh, model_tp_plan)
+            moe_tp_plan: Optional[dict[str, ParallelStyle]]
+            if moe_tp_mode == "off":
+                moe_tp_plan = None
+            elif moe_tp_mode == "shared":
+                # Lite mode: shard only shared experts (single MLP per MoE block).
+                moe_tp_plan = {
+                    "mixer.shared_experts.up_proj": ColwiseParallel(),
+                    "mixer.shared_experts.down_proj": RowwiseParallel(),
+                }
+            elif moe_tp_mode == "experts_up":
+                # Shard expert up_proj only; force replicated output to keep
+                # unsharded down_proj shape-compatible.
+                moe_tp_plan = {
+                    "mixer.experts.*.up_proj": ColwiseParallel(output_layouts=Replicate()),
+                    "mixer.shared_experts.up_proj": ColwiseParallel(),
+                    "mixer.shared_experts.down_proj": RowwiseParallel(),
+                }
+            else:
+                # Full mode: shard routed experts and shared experts.
+                moe_tp_plan = {
+                    "mixer.experts.*.up_proj": ColwiseParallel(),
+                    "mixer.experts.*.down_proj": RowwiseParallel(),
+                    "mixer.shared_experts.up_proj": ColwiseParallel(),
+                    "mixer.shared_experts.down_proj": RowwiseParallel(),
+                }
 
-            for layer in model.backbone.layers:
+            attention_tp_plan: dict[str, ParallelStyle] = {
+                "mixer.q_proj": ColwiseParallel(),
+                "mixer.k_proj": ColwiseParallel(),
+                "mixer.v_proj": ColwiseParallel(),
+                "mixer.o_proj": RowwiseParallel(),
+            }
+
+            if model_tp_plan:
+                parallelize_module(model, tp_mesh, model_tp_plan)
+
+            for layer in _iter_layers(model.backbone.layers):
                 if layer.block_type == "mlp":
                     parallelize_module(layer, tp_mesh, mlp_tp_plan)
+                elif layer.block_type == "moe":
+                    if moe_tp_plan is not None:
+                        parallelize_module(layer, tp_mesh, moe_tp_plan)
+                elif layer.block_type == "attention":
+                    parallelize_module(layer, tp_mesh, attention_tp_plan)
+                    mixer = getattr(layer, "mixer", None)
+                    # NemotronH attention modules compute reshapes from Python-side
+                    # metadata (num_heads / num_key_value_heads / hidden_size).
+                    # After TP sharding q/k/v projections, these metadata must be
+                    # adjusted to per-rank values to keep view() shapes valid.
+                    if mixer is not None and not getattr(mixer, "_nemotron_tp_adjusted", False):
+                        tp_size = tp_mesh.size()
+                        if hasattr(mixer, "num_heads"):
+                            assert mixer.num_heads % tp_size == 0, (
+                                f"num_heads ({mixer.num_heads}) must be divisible by TP size ({tp_size})"
+                            )
+                            mixer.num_heads //= tp_size
+                        if hasattr(mixer, "num_key_value_heads"):
+                            assert mixer.num_key_value_heads % tp_size == 0, (
+                                f"num_key_value_heads ({mixer.num_key_value_heads}) "
+                                f"must be divisible by TP size ({tp_size})"
+                            )
+                            mixer.num_key_value_heads //= tp_size
+                        if hasattr(mixer, "hidden_size") and isinstance(mixer.hidden_size, int):
+                            assert mixer.hidden_size % tp_size == 0, (
+                                f"hidden_size ({mixer.hidden_size}) must be divisible by TP size ({tp_size})"
+                            )
+                            mixer.hidden_size //= tp_size
+                        if hasattr(mixer, "num_heads") and hasattr(mixer, "num_key_value_heads"):
+                            mixer.num_key_value_groups = mixer.num_heads // mixer.num_key_value_heads
+                        mixer._nemotron_tp_adjusted = True
+                elif layer.block_type == "mamba":
+                    # Keep Mamba projections unsharded for now.
+                    # NemotronH's fused mamba_ssm kernel assumes unsharded
+                    # projection layout; naive TP on in/out projections causes
+                    # runtime assertion failures in mamba_split_conv1d_scan_combined.
+                    continue
 
         if activation_checkpointing:
-            for i in range(len(layers)):
-                if layers[i].block_type == "mlp":
-                    layers[i] = checkpoint_wrapper(layers[i])
+            ckpt_block_types_env = os.environ.get(
+                "NEMOTRONH_AC_BLOCK_TYPES",
+                "mlp,mamba,moe,attention",
+            )
+            ckpt_block_types = {t.strip().lower() for t in ckpt_block_types_env.split(",") if t.strip()}
+            if not ckpt_block_types:
+                ckpt_block_types = {"mlp", "mamba", "moe", "attention"}
+            logger.info("NemotronH activation checkpoint block types: %s", sorted(ckpt_block_types))
 
-                if layers[i].block_type == "mamba":
-                    layers[i] = checkpoint_wrapper(layers[i])
+            if hasattr(layers, "items"):
+                for layer_name, layer in list(layers.items()):
+                    if layer.block_type in ckpt_block_types:
+                        layers[layer_name] = checkpoint_wrapper(layer)
+            else:
+                for i in range(len(layers)):
+                    if layers[i].block_type in ckpt_block_types:
+                        layers[i] = checkpoint_wrapper(layers[i])
 
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
         dp_mesh = device_mesh[dp_mesh_dim_names]
 
-        for layer in layers:
+        ep_wrap_experts = os.environ.get("NEMOTRONH_EP_WRAP_EXPERTS", "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        ep_wrap_shared_experts = os.environ.get("NEMOTRONH_EP_WRAP_SHARED_EXPERTS", "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        ep_expert_reshard_after_forward = os.environ.get(
+            "NEMOTRONH_EP_EXPERT_RESHARD_AFTER_FORWARD", "1"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        ep_physical_partition = os.environ.get("NEMOTRONH_EP_PHYSICAL_PARTITION", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if ep_physical_partition and not ep_wrap_experts:
+            logger.warning(
+                "NEMOTRONH_EP_PHYSICAL_PARTITION=1 but NEMOTRONH_EP_WRAP_EXPERTS=0. "
+                "This may trigger incorrect cross-EP expert synchronization."
+            )
+
+        memory_first = os.environ.get("NEMOTRONH_FSDP_MEMORY_FIRST", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if memory_first:
+            logger.info("NemotronH memory-first FSDP mode enabled (root reshard_after_forward=True).")
+
+        # EP optimization: when ep_size > 1, wrap experts at expert granularity
+        # before layer-level wrapping. This prevents one large MoE layer FSDP unit
+        # from eagerly pulling non-local expert params every iteration.
+        if ep_mesh is not None and ep_mesh.size() > 1 and ep_wrap_experts:
+            expert_wrap_mesh = dp_mesh
+            if ep_physical_partition:
+                if ep_shard_mesh is not None:
+                    expert_wrap_mesh = ep_shard_mesh
+                else:
+                    logger.warning(
+                        "NEMOTRONH_EP_PHYSICAL_PARTITION=1 but ep_shard mesh is unavailable; "
+                        "falling back to dp mesh for expert FSDP."
+                    )
+            wrapped_experts = 0
+            wrapped_shared_experts = 0
+            for layer in _iter_layers(layers):
+                if getattr(layer, "block_type", None) != "moe":
+                    continue
+                mixer = getattr(layer, "mixer", None)
+                if mixer is None or getattr(mixer, "_nemotron_ep_nested_fsdp_wrapped", False):
+                    continue
+
+                experts = getattr(mixer, "experts", None)
+                if experts is not None:
+                    for expert in experts:
+                        parallelizer_utils.fully_shard_by_dtype(
+                            expert,
+                            mesh=expert_wrap_mesh,
+                            mp_policy=mp_policy,
+                            offload_policy=offload_policy,
+                            reshard_after_forward=True if ep_expert_reshard_after_forward else None,
+                        )
+                        wrapped_experts += 1
+
+                shared_experts = getattr(mixer, "shared_experts", None)
+                if ep_wrap_shared_experts and isinstance(shared_experts, nn.Module):
+                    parallelizer_utils.fully_shard_by_dtype(
+                        shared_experts,
+                        mesh=dp_mesh,
+                        mp_policy=mp_policy,
+                        offload_policy=offload_policy,
+                        reshard_after_forward=True if ep_expert_reshard_after_forward else None,
+                    )
+                    wrapped_shared_experts += 1
+
+                mixer._nemotron_ep_nested_fsdp_wrapped = True
+
+            logger.info(
+                "NemotronH EP nested expert FSDP enabled: wrapped routed experts=%s, wrapped shared experts=%s, "
+                "reshard_after_forward=%s, expert_mesh_size=%s",
+                wrapped_experts,
+                wrapped_shared_experts,
+                ep_expert_reshard_after_forward,
+                expert_wrap_mesh.size(),
+            )
+
+        for layer in _iter_layers(layers):
+            ignored_params = None
+            if ep_mesh is not None and ep_mesh.size() > 1:
+                mixer = getattr(layer, "mixer", None)
+                if (
+                    getattr(layer, "block_type", None) == "moe"
+                    and mixer is not None
+                    and getattr(mixer, "_nemotron_ep_nested_fsdp_wrapped", False)
+                ):
+                    maybe_ignored = set()
+                    experts = getattr(mixer, "experts", None)
+                    if isinstance(experts, nn.Module):
+                        maybe_ignored.update(experts.parameters())
+                    shared_experts = getattr(mixer, "shared_experts", None)
+                    if ep_wrap_shared_experts and isinstance(shared_experts, nn.Module):
+                        maybe_ignored.update(shared_experts.parameters())
+                    if maybe_ignored:
+                        ignored_params = maybe_ignored
             parallelizer_utils.fully_shard_by_dtype(
-                layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy
+                layer,
+                mesh=dp_mesh,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+                # Explicit in memory-first mode. Default path keeps prior behavior.
+                reshard_after_forward=True if memory_first else None,
+                ignored_params=ignored_params,
             )
 
         # do not reshard after forward for root model
@@ -274,7 +769,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
             mesh=dp_mesh,
             mp_policy=mp_policy,
             offload_policy=offload_policy,
-            reshard_after_forward=False,
+            reshard_after_forward=True if memory_first else False,
         )
 
 
@@ -289,6 +784,7 @@ class WanParallelizationStrategy(ParallelizationStrategy):
         self,
         model: nn.Module,
         device_mesh: DeviceMesh,
+        moe_mesh: Optional[DeviceMesh] = None,
         mp_policy: Optional[MixedPrecisionPolicy] = None,
         offload_policy: Optional[OffloadPolicy] = None,
         sequence_parallel: bool = False,
@@ -297,8 +793,10 @@ class WanParallelizationStrategy(ParallelizationStrategy):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        ep_mesh_name: str = "ep",
     ) -> nn.Module:
         # Not using custom tp_shard_plan; apply Wan-specific plan
+        del moe_mesh, ep_mesh_name
         tp_mesh = device_mesh[tp_mesh_name]
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
         dp_mesh = device_mesh[dp_mesh_dim_names]
@@ -952,6 +1450,7 @@ def _get_parallel_plan(
 def fsdp2_strategy_parallelize(
     model,
     device_mesh: DeviceMesh,
+    moe_mesh: Optional[DeviceMesh] = None,
     mp_policy: Optional[MixedPrecisionPolicy] = None,
     offload_policy: Optional[OffloadPolicy] = None,
     sequence_parallel: bool = False,
@@ -960,6 +1459,7 @@ def fsdp2_strategy_parallelize(
     dp_replicate_mesh_name: str = "dp_replicate",
     dp_shard_cp_mesh_name: str = "dp_shard_cp",
     tp_mesh_name: str = "tp",
+    ep_mesh_name: str = "ep",
 ):
     """
     Apply parallelisms and activation checkpointing to the model.
@@ -1005,6 +1505,7 @@ def fsdp2_strategy_parallelize(
     return strategy.parallelize(
         model=model,
         device_mesh=device_mesh,
+        moe_mesh=moe_mesh,
         mp_policy=mp_policy,
         offload_policy=offload_policy,
         sequence_parallel=sequence_parallel,
@@ -1013,6 +1514,7 @@ def fsdp2_strategy_parallelize(
         dp_replicate_mesh_name=dp_replicate_mesh_name,
         dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
         tp_mesh_name=tp_mesh_name,
+        ep_mesh_name=ep_mesh_name,
     )
 
 

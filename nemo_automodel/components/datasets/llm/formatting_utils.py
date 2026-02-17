@@ -159,8 +159,23 @@ def format_prompt_completion(
         max_length=seq_length,
     )["input_ids"]
 
-    # Create assistant_masks: 0 for prompt tokens, 1 for answer tokens
-    assistant_masks = [0] * len_prompt_ids + [1] * (len(input_ids) - len_prompt_ids)
+    # Create assistant_masks: 0 for prompt tokens, 1 for answer tokens.
+    # Under truncation, the kept prompt length depends on truncation side.
+    if answer_only_loss_mask and truncation not in [None, "do_not_truncate", False]:
+        raw_ids = tokenizer(
+            full_text,
+            padding=False,
+            truncation=False,
+        )["input_ids"]
+        dropped_tokens = max(0, len(raw_ids) - len(input_ids))
+        trunc_side = getattr(tokenizer, "truncation_side", "right")
+        if trunc_side == "left":
+            len_prompt_ids = max(0, len_prompt_ids - dropped_tokens)
+        else:
+            len_prompt_ids = min(len_prompt_ids, len(input_ids))
+    else:
+        len_prompt_ids = min(len_prompt_ids, len(input_ids))
+    assistant_masks = [0] * len_prompt_ids + [1] * max(0, len(input_ids) - len_prompt_ids)
 
     return _package_tokenized_example(
         tokenizer=tokenizer,
