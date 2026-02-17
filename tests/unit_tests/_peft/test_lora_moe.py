@@ -21,6 +21,12 @@ try:
 except ImportError:
     grouped_gemm = None
 
+try:
+    import transformer_engine  # noqa: F401
+    HAS_TE = True
+except ImportError:
+    HAS_TE = False
+
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA, GroupedExpertsDeepEPLoRA
@@ -608,14 +614,18 @@ def test_deepep_lora_zero_tokens(moe_config, device):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TE, reason="Transformer Engine required")
 def test_patch_moe_module_rejects_te_experts(moe_config, device):
     """Test that patch_moe_module raises NotImplementedError for GroupedExpertsTE."""
-    orig_experts = GroupedExpertsTE(moe_config).to(device)
+    orig_experts = GroupedExpertsTE(moe_config)
+    orig_experts.init_weights(buffer_device=device)
+    orig_experts = orig_experts.to(device)
     with pytest.raises(NotImplementedError, match="LoRA is not supported for Transformer Engine"):
         patch_moe_module(orig_experts, dim=4)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TE, reason="Transformer Engine required")
 def test_apply_lora_rejects_te_experts(moe_config, device):
     """Test that apply_lora_to_linear_modules raises NotImplementedError for GroupedExpertsTE."""
     class MockModel(nn.Module):
@@ -623,7 +633,9 @@ def test_apply_lora_rejects_te_experts(moe_config, device):
             super().__init__()
             self.experts = GroupedExpertsTE(moe_config)
 
-    model = MockModel().to(device)
+    model = MockModel()
+    model.experts.init_weights(buffer_device=device)
+    model = model.to(device)
     peft_config = PeftConfig(target_modules=["experts"], dim=4)
 
     with pytest.raises(NotImplementedError, match="LoRA is not supported for Transformer Engine"):
@@ -841,11 +853,6 @@ def test_moe_rank_scaling_floor_division_warning(device):
         dim=16,
         moe_rank_scaling=True,
     )
-    import logging as _logging
-
-    with pytest.warns(None) as _:
-        # We check the logger instead of pytest.warns (logger.warning, not warnings.warn)
-        pass
 
     with patch("nemo_automodel.components._peft.lora.logger") as mock_logger:
         count = apply_lora_to_linear_modules(model, peft_config)
