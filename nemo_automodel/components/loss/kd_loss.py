@@ -69,14 +69,14 @@ class KDLoss(nn.Module):
             teacher_logits = teacher_logits.view(-1, teacher_logits.shape[-1])
         if labels.ndim > 1:
             labels = labels.view(-1)
-        
+
         if isinstance(teacher_logits, DTensor):
             teacher_logits = teacher_logits.full_tensor()
         if isinstance(student_logits, DTensor):
             student_logits = student_logits.full_tensor()
         if isinstance(labels, DTensor):
             labels = labels.full_tensor()
-        
+
         t_logits = teacher_logits[valid_mask]
         s_logits = student_logits[valid_mask]
         labels = labels[valid_mask]
