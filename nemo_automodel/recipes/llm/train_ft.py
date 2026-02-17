@@ -812,6 +812,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Args:
             cfg: Configuration dictionary/object for training.
         """
+        # Inject batch_size from step_scheduler into dataset config
+        # This ensures dataset yields batches that match pipeline expectations
+        if hasattr(cfg, "dataset") and hasattr(cfg, "step_scheduler"):
+            if hasattr(cfg.dataset, "batch_size"):
+                # Only auto-inject if batch_size is None or not set
+                current_batch_size = getattr(cfg.dataset, "batch_size", None)
+                if current_batch_size is None:
+                    local_batch_size = getattr(cfg.step_scheduler, "local_batch_size", 1)
+                    cfg.dataset.batch_size = local_batch_size
+                    logger.info(
+                        f"Auto-injected dataset.batch_size={local_batch_size} from step_scheduler.local_batch_size"
+                    )
+
         self.cfg = cfg
 
     # ------------------ build phase ------------------
@@ -994,6 +1007,26 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.pp_enabled,
             model=self.model_parts[0],
         )
+
+        # Validate dataloader batch size matches pipeline configuration
+        if self.pp_enabled and self.pp.info.has_first_stage:
+            # Sample one batch to verify its shape matches pipeline expectations
+            dl_iter = iter(self.dataloader)
+            sample = next(dl_iter)
+            actual_batch_size = sample["input_ids"].shape[0]
+            expected_batch_size = self.pipeline_config.pp_batch_size
+
+            if actual_batch_size != expected_batch_size:
+                raise ValueError(
+                    f"Dataloader yields batch_size={actual_batch_size} but pipeline expects "
+                    f"pp_batch_size={expected_batch_size} (from local_batch_size={self.cfg.step_scheduler.local_batch_size}). "
+                    f"Ensure the dataset is configured to yield batches of size local_batch_size. "
+                    f"For MockIterableDataset, set dataset.batch_size={expected_batch_size} in config."
+                )
+            logger.info(
+                f"Validated dataloader batch_size={actual_batch_size} matches pipeline pp_batch_size={expected_batch_size}"
+            )
+
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler
         self.step_scheduler = build_step_scheduler(

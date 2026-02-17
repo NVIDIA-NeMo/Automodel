@@ -75,6 +75,7 @@ dataset:
   vocab_size: 100
   seq_len: 4096
   num_samples: 1000000
+  batch_size: 8  # Must match step_scheduler.local_batch_size for pipeline parallelism
 
 dataloader:
   _target_: torch.utils.data.DataLoader
