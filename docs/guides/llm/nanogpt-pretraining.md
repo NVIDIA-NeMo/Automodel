@@ -23,7 +23,7 @@ For this guide, we will use a single machine equipped with 8xH100 NVIDIA GPUs.
 To run this guide on a single GPU, use the single-GPU command in the **Launch Training** section below and scale down the YAML (for example, reduce `step_scheduler.global_batch_size` / `local_batch_size`, and shrink the model using `model.n_layer` / `model.n_embd` / `model.n_head`). For more launch patterns, see [Run on Your Local Workstation](../../launcher/local-workstation.md).
 :::
 
-## Pre-Process the FineWeb Dataset
+## Preprocess the FineWeb Dataset
 
 ::::{warning}
 **File Size Limitation**: The `nanogpt_data_processor.py` script has a **4GB file size limit** (~2^32 bytes) due to 32-bit position tracking in the BOS index. This translates to:
