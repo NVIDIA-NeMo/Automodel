@@ -34,19 +34,6 @@ inputs:
     description: "Run tests on CPU only"
     required: false
     default: "false"
-  azure-client-id:
-    description: "Azure Client ID"
-    required: true
-  azure-tenant-id:
-    description: "Azure Tenant ID"
-    required: true
-  azure-subscription-id:
-    description: "Azure Subscription ID"
-    required: true
-  has-azure-credentials:
-    description: "Has Azure credentials"
-    required: false
-    default: "false"
   PAT:
     description: "GitHub Personal Access Token"
     required: true
@@ -67,27 +54,6 @@ runs:
       uses: actions/checkout@v2
       with:
         path: NeMo-Automodel
-
-    - name: Install Azure CLI
-      if: ${{ inputs.has-azure-credentials == 'true' }}
-      shell: bash
-      run: |
-        echo "::group::Install Azure CLI"
-        curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-        echo "::endgroup::"
-
-    - name: Azure Login
-      if: ${{ inputs.has-azure-credentials == 'true' }}
-      uses: azure/login@v2
-      with:
-        client-id: ${{ inputs.azure-client-id }}
-        tenant-id: ${{ inputs.azure-tenant-id }}
-        subscription-id: ${{ inputs.azure-subscription-id }}
-
-    - name: Azure ACR Login
-      shell: bash
-      run: |
-        az acr login --name nemoci
 
     - name: Install uuidgen
       shell: bash -x -e -u -o pipefail {0}

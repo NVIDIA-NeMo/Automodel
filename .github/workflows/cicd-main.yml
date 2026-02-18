@@ -30,7 +30,7 @@ permissions:
   contents: read
 
 env:
-  container-registry: nemoci.azurecr.io
+  container-registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
 
 jobs:
   pre-flight:
@@ -155,11 +155,7 @@ jobs:
       - name: main
         uses: ./.github/actions/build-container
         with:
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           dockerfile-path: "./docker/Dockerfile"
-          has-azure-credentials: "true"
           PAT: ${{ secrets.PAT }}
           repo-name: "Automodel"
 
@@ -195,10 +191,6 @@ jobs:
           timeout: ${{ matrix.timeout || 10 }}
           is-unit-test: "true"
           cpu-only: ${{ matrix.cpu-only || false }}
-          has-azure-credentials: "true"
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           container-image: ${{ env.container-registry }}/automodel:${{ github.sha }}
@@ -269,10 +261,6 @@ jobs:
           test-folder: ${{ matrix.test-folder }}
           timeout: ${{ matrix.timeout }}
           is_unit_test: "false"
-          has-azure-credentials: "true"
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ matrix.test-data-path }}
           container-image: ${{ env.container-registry }}/automodel:${{ github.sha }}
