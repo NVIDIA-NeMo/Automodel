@@ -35,7 +35,7 @@ Always use the `--max-tokens` flag to stay within these limits (e.g., `--max-tok
 For larger datasets, please see [pretraining.md](pretraining.md) which supports sharded preprocessing without these constraints.
 :::
 
-### Quick Intro to the FineWeb Dataset
+### Quick Introduction to the FineWeb Dataset
 The [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset consists of more than 18.5T tokens of cleaned and deduplicated English web data from [CommonCrawl](https://commoncrawl.org/). For this guide, we use the **`sample-10BT` subset** (10 billion tokens), from which we extract a smaller sample (e.g., 500M tokens) that fits within the preprocessing tool's limits.
 
 Briefly, FineWeb is built by extracting main text from CommonCrawl WARC HTML, keeping English pages via fastText language scoring, applying multiple quality filters (e.g., Gopher repetition/quality checks, C4-style rules, and custom heuristics for list-like or repeated/poorly formatted lines), and then MinHash-deduplicating each crawl independently (5-gram shingling with 14×8 hash functions). Basic PII normalization is applied (e.g., anonymizing emails and public IPs). The result is released per-crawl (and convenient sampled subsets), ready for high-throughput streaming.
