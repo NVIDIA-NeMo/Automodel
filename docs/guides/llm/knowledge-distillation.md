@@ -9,7 +9,7 @@ In particular, we will show how to distill a 3B (`meta-llama/Llama-3.2-3B`) mode
 
 Knowledge distillation (KD) transfers the *dark knowledge* of a high-capacity
 teacher model to a smaller student by minimizing the divergence between their
-predicted distributions.  The student learns from both the ground-truth labels
+predicted distributions. The student learns from both the ground-truth labels
 (Cross-Entropy loss, **CE**) and the soft targets of the teacher (Kullback-Leibler
 loss, **KD**):
 
