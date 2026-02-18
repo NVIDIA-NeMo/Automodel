@@ -61,6 +61,7 @@ runs:
       id: cache_from
       env:
         GH_TOKEN: ${{ github.token }}
+        REGISTRY: ${{ vars.ECR }}
       run: |
         LAST_PRS=$(gh api graphql \
           -F owner="NVIDIA-NeMo" \
@@ -75,7 +76,7 @@ runs:
                 }
               }
             }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
-            echo "type=registry,ref=${{ vars.ECR }}/${{ env.REPO_LOWER }}:$number-buildcache,mode=max"
+            echo "type=registry,ref=${{ env.ECR }}/${{ env.REPO_LOWER }}:$number-buildcache,mode=max"
           done)
 
         echo "LAST_PRS<<EOF" | tee -a $GITHUB_OUTPUT
@@ -87,6 +88,8 @@ runs:
 
     - name: Build and push
       uses: docker/build-push-action@v5
+      env:
+        REGISTRY: ${{ vars.ECR }}
       with:
         file: ${{ inputs.dockerfile-path }}
         push: true
@@ -95,14 +98,14 @@ runs:
           BASE_IMAGE=pytorch
           INSTALL_TE=True
         cache-from: |
-          type=registry,ref=${{ vars.ECR }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
-          type=registry,ref=${{ vars.ECR }}/${{ env.REPO_LOWER }}:main-buildcache,mode=max
+          type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+          type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}:main-buildcache,mode=max
           ${{ steps.cache_from.outputs.LAST_PRS }}
         cache-to: |
-          type=registry,ref=${{ vars.ECR }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+          type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
         no-cache: false
         tags: |
-          ${{ vars.ECR }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
-          ${{ vars.ECR }}/${{ env.REPO_LOWER }}:${{ github.sha }}
+          ${{ env.REGISTRY }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
+          ${{ env.REGISTRY }}/${{ env.REPO_LOWER }}:${{ github.sha }}
         secrets: |
           GH_TOKEN=${{ inputs.PAT }}
