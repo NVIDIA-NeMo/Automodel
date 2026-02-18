@@ -145,7 +145,7 @@ jobs:
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
       && !cancelled()
-    runs-on: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+    runs-on: ${{ needs.pre-flight.outputs.runner_prefix }}-cpu
     steps:
       - name: Checkout
         uses: actions/checkout@v4
