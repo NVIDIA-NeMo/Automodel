@@ -607,13 +607,12 @@ def nemotronh_flops(config, gbs=1, seq_len=None):
     # in_proj outputs: z(4096) + x(4096) + B(1024) + C(1024) + dt(64) = 10304
     in_proj_dim = 2 * d_inner + 2 * mamba_num_groups * mamba_state_dim + mamba_num_heads
 
-    # Empirical
-    ssm_training_multiplier = 16
-
     mamba_layer_flops = (
         6 * gbs * seq_len * hs * in_proj_dim  # in_proj: Linear(2688, 10304)
-        + ssm_training_multiplier * gbs * seq_len * d_inner * mamba_state_dim  # SSM scan operations
-        + 6 * gbs * seq_len * d_inner * hs  # out_proj: Linear(4096, 2688)
+        + 6 * gbs * seq_len * d_inner * hs   # out_proj: Linear(4096, 2688)
+        # SSM scan excluded: memory-bandwidth-bound op running on CUDA cores, not tensor cores.
+        # peak_tflops is a matmul (tensor core) reference; including SSM scan FLOPs with this
+        # denominator inflates MFU above 100%.
     )
     mamba_flops = num_mamba_layers * mamba_layer_flops
 
@@ -915,7 +914,7 @@ def get_flops_formula_for_hf_config(config: Any) -> Optional[Callable]:
         "MT5Config": transformer_flops,
         # Nemotron
         "NemotronConfig": nemotron_flops,
-        "NemotronHConfig": nemotron_flops,
+        "NemotronHConfig": nemotronh_flops,
         # General transformer fallback
         "OPTConfig": transformer_flops,
         "BloomConfig": transformer_flops,

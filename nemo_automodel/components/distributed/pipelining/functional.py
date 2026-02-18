@@ -350,6 +350,9 @@ def split_model_into_stages(
         # Process the model
         _process_module(stage_model)
 
+        # Allocate device storage (model is on meta device; weights loaded later by load_base_model)
+        stage_model.to_empty(device=device)
+
         # Create pipeline stage
         stage = PipelineStage(
             stage_model,

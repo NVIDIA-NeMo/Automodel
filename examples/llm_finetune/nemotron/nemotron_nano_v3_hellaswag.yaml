@@ -13,13 +13,17 @@
 # limitations under the License.
 
 
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 nemo_automodel/recipes/llm/benchmark.py --config examples/llm_finetune/nemotron/nemotron_nano_v3_pp_benchmark.yaml
+# To run this recipe, please use the following command. Replace --nproc-per-node=8 with the number of GPUs on your node:
+# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml
+# For multi-node, use the following:
+# torchrun --nproc-per-node=8 --nnodes=1 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml
 
-seed: 42
+
+checkpoint:
+  enabled: false
 
 benchmark:
-  warmup_steps: 5
+  warmup_steps: 5   
   peak_tflops: 989  # H100: 989, A100: 312
   nsys_start: -1    # Set to step number to profile (e.g., 10)
   nsys_end: -1      # Set to end step (e.g., 15)
@@ -27,8 +31,8 @@ benchmark:
   num_nodes: 1
 
 step_scheduler:
-  global_batch_size: 32
-  local_batch_size: 16
+  global_batch_size: 16
+  local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 1000  # will run every x number of gradient steps
   max_steps: 10
@@ -42,19 +46,12 @@ rng:
   seed: 1111
   ranked: true
 
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.autopipeline.AutoPipeline
-  pp_schedule: 1f1b
-  pp_microbatch_size: 2
-  scale_grads_in_schedule: false
-
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   torch_dtype: bf16
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   trust_remote_code: true
 
-# torch.compile configuration
 compile:
   enabled: false
   mode: "default"  # Options: "default", "reduce-overhead", "max-autotune"
@@ -64,30 +61,41 @@ compile:
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-  dp_size: 1
-  dp_replicate_size: 1 # dp_shard_size = dp_size / dp_replicate_size and dp_shard_size < dp_size. For DDP usecase, use DDPManager
+  dp_size: none
+  # dp_replicate_size: 1 # dp_shard_size = dp_size / dp_replicate_size and dp_shard_size < dp_size. For DDP usecase, use DDPManager
   tp_size: 1
   cp_size: 1
-  pp_size: 8  # Enable pipeline parallelism with 8 stages
+  ep_size: 8
+  # pp_size: 8
+  # use_hf_tp_plan: true
   sequence_parallel: false
+  defer_fsdp_grad_sync: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+
 packed_sequence:
   packed_sequence_size: 0
 
-# Use MockIterableDataset for benchmarking (faster, no I/O)
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
-  vocab_size: 131072
-  seq_len: 1024
-  num_samples: 1000000
-
 dataloader:
-  _target_: torch.utils.data.DataLoader
-  batch_size: null  # Dataset already yields batches
-  # Note: model_config will be auto-injected by train_ft.py for PP models
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: True
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 64
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
 
 optimizer:
   _target_: torch.optim.Adam
@@ -99,3 +107,9 @@ optimizer:
 lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
+
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_exp_name>
+#   save_dir: <your_wandb_save_dir> 

@@ -47,6 +47,28 @@ def _get_cp_stream() -> torch.cuda.Stream:
     return _CP_STREAM
 
 
+def _get_inner_model(model: nn.Module) -> nn.Module:
+    """Resolve the inner model body (handles model.model, model.backbone, or bare model)."""
+    if hasattr(model, "model") and model.model is not None:
+        return model.model
+    if hasattr(model, "backbone") and model.backbone is not None:
+        return model.backbone
+    return model
+
+
+def _get_moe_module(block: nn.Module):
+    """Extract the MoE module from a transformer block, supporting multiple architectures."""
+    if hasattr(block, 'mlp') and isinstance(block.mlp, MoE):
+        return block.mlp
+    if hasattr(block, 'block_sparse_moe') and hasattr(block.block_sparse_moe, 'moe_layer'):
+        if isinstance(block.block_sparse_moe.moe_layer, MoE):
+            return block.block_sparse_moe.moe_layer
+    # NemotronH: MoE is at block.mixer (NemotronHMOE), identified by block_type
+    if getattr(block, 'block_type', None) == 'moe' and hasattr(block, 'mixer'):
+        return block.mixer
+    return None
+
+
 class ExpertParallel(ParallelStyle):
     """
     ExpertParallel class is used to shard the MoE parameters on the EP mesh.
@@ -82,22 +104,10 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh):
     """Applies EP to MoE module."""
     assert ep_mesh.size() >= 1
 
-    if hasattr(model, "model") and model.model is not None:
-        _model = model.model
-    else:
-        _model = model
+    _model = _get_inner_model(model)
 
     for _, block in _model.layers.named_children():
-        # Support both naming conventions: mlp (DeepSeek) and block_sparse_moe (Mixtral)
-        moe_module = None
-        if hasattr(block, 'mlp') and isinstance(block.mlp, MoE):
-            moe_module = block.mlp
-            logger.info(f"[apply_ep] Found MoE via block.mlp")
-        elif hasattr(block, 'block_sparse_moe') and hasattr(block.block_sparse_moe, 'moe_layer'):
-            if isinstance(block.block_sparse_moe.moe_layer, MoE):
-                moe_module = block.block_sparse_moe.moe_layer
-                logger.info(f"[apply_ep] Found MoE via block.block_sparse_moe.moe_layer")
-        
+        moe_module = _get_moe_module(block)
         if moe_module is not None:
             if ep_mesh.size() == 1:
                 # EP "init-only" mode: we still need DeepEP's token dispatcher and EP group,
@@ -133,10 +143,7 @@ def apply_ac(model: nn.Module, ignore_router: bool = False, hidden_size: int = 7
     def selective_checkpointing_context_fn():
         return create_selective_checkpoint_contexts(_custom_policy)
 
-    if hasattr(model, "model") and model.model is not None:
-        _model = model.model
-    else:
-        _model = model
+    _model = _get_inner_model(model)
     for layer_id, block in _model.layers.named_children():
         if ignore_router:
             block = ptd_checkpoint_wrapper(
@@ -177,19 +184,10 @@ def apply_fsdp(
         offload_policy=offload_policy,
     )
 
-    if hasattr(model, "model") and model.model is not None:
-        _model = model.model
-    else:
-        _model = model
+    _model = _get_inner_model(model)
 
     for _, block in _model.layers.named_children():
-        # Support both naming conventions: mlp (DeepSeek) and block_sparse_moe (Mixtral)
-        moe_module = None
-        if hasattr(block, 'mlp') and isinstance(block.mlp, MoE):
-            moe_module = block.mlp
-        elif hasattr(block, 'block_sparse_moe') and hasattr(block.block_sparse_moe, 'moe_layer'):
-            if isinstance(block.block_sparse_moe.moe_layer, MoE):
-                moe_module = block.block_sparse_moe.moe_layer
+        moe_module = _get_moe_module(block)
         
         if moe_module is not None and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
@@ -212,8 +210,9 @@ def apply_fsdp(
 
         fully_shard_default(block, ignored_params=ignored_params)
 
-    if hasattr(_model, "embed_tokens") and _model.embed_tokens is not None:
-        fully_shard_default(_model.embed_tokens)
+    embed = getattr(_model, "embed_tokens", None) or getattr(_model, "embeddings", None)
+    if embed is not None:
+        fully_shard_default(embed)
 
     lm_head = getattr(_model, "lm_head", None) or getattr(model, "lm_head", None)
     if lm_head is not None:
@@ -257,10 +256,7 @@ def apply_fsdp(
 def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p2p"):
     from transformer_engine.pytorch.attention import DotProductAttention
 
-    if hasattr(model, "model") and model.model is not None:
-        _model = model.model
-    else:
-        _model = model
+    _model = _get_inner_model(model)
 
     for _, block in _model.layers.named_children():
         attn_module = block.self_attn.attn_module
@@ -307,8 +303,13 @@ def parallelize_model(
     # DeepEP requires the EP process group / token dispatcher even in the non-sharded case.
     if ep_mesh is not None:
         if ep_mesh.size() > 1:
-            assert model.model.moe_config.n_routed_experts % ep_mesh.size() == 0, (
-            f"n_routed_experts {model.model.moe_config.n_routed_experts} must be divisible by "
+            _inner_model = model.model if hasattr(model, "model") and model.model is not None else model.backbone
+            if hasattr(_inner_model, "moe_config"):
+                n_routed_experts = _inner_model.moe_config.n_routed_experts
+            else:
+                n_routed_experts = model.config.n_routed_experts
+            assert n_routed_experts % ep_mesh.size() == 0, (
+            f"n_routed_experts {n_routed_experts} must be divisible by "
             f"expert_parallel_degree {ep_mesh.size()}"
             )
         apply_ep(model, ep_mesh)
