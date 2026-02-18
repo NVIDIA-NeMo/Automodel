@@ -430,7 +430,7 @@ The following steps outline how to publish the fine-tuned checkpoint or PEFT ada
 pip3 install huggingface_hub
 ```
 
-2.  Log in to Hugging Face using your authentication token:
+2. Log in to Hugging Face using your authentication token:
 
 ```bash
 huggingface-cli login
