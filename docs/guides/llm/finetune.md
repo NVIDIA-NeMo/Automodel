@@ -420,7 +420,7 @@ seamless integration with the Hugging Face ecosystem.
 
 Using the Hugging Face Hub API, we can push the fine-tuned checkpoint or PEFT adapter to
 a repository, ensuring that others can easily load and use it with
-transformer's [AutoModelForCausalLM](https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForCausalLM) for fine-tuned checkpoint, and
+Transformer's [AutoModelForCausalLM](https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForCausalLM) for fine-tuned checkpoint, and
 [peft.AutoPeftModel](https://huggingface.co/docs/peft/package_reference/auto_class#peft.AutoPeftModel) for PEFT adapters.
 The following steps outline how to publish the fine-tuned checkpoint or PEFT adapter:
 
