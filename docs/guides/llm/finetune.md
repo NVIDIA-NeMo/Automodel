@@ -424,7 +424,7 @@ Transformer's [AutoModelForCausalLM](https://huggingface.co/docs/transformers/en
 [peft.AutoPeftModel](https://huggingface.co/docs/peft/package_reference/auto_class#peft.AutoPeftModel) for PEFT adapters.
 The following steps outline how to publish the fine-tuned checkpoint or PEFT adapter:
 
-1.  Install the Hugging Face Hub library (if not already installed):
+1. Install the Hugging Face Hub library (if not already installed):
 
 ```bash
 pip3 install huggingface_hub
