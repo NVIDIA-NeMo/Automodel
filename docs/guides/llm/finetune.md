@@ -516,7 +516,7 @@ The following script demonstrates how to use a fine-tuned checkpoint
 in vLLM, allowing seamless deployment and efficient inference:
 
 :::{note}
-Make sure vLLM is installed (pip install vllm, or use the environment that includes it).
+Make sure vLLM is installed (`pip install vllm`, or use the environment that includes it).
 :::
 
 
