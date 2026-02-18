@@ -40,7 +40,7 @@ The [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset con
 
 Briefly, FineWeb is built by extracting main text from CommonCrawl WARC HTML, keeping English pages using fastText language scoring, applying multiple quality filters (e.g., Gopher repetition/quality checks, C4-style rules, and custom heuristics for list-like or repeated/poorly formatted lines), and then MinHash-deduplicating each crawl independently (5-gram shingling with 14×8 hash functions). Basic PII normalization is applied (e.g., anonymizing emails and public IPs). The result is released per-crawl (and convenient sampled subsets), ready for high-throughput streaming.
 
-:::tip
+:::{tip}
 To train on more than 2B tokens from FineWeb, see [pretraining.md](pretraining.md) which uses Megatron Core's sharded dataset format without file size constraints.
 :::
 
