@@ -79,7 +79,7 @@ runs:
                 }
               }
             }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
-            echo "type=registry,ref=${{ env.ECR }}/${{ env.REPO_LOWER }}:$number-buildcache,mode=max"
+            echo "type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}:$number-buildcache,mode=max"
           done)
 
         echo "LAST_PRS<<EOF" | tee -a $GITHUB_OUTPUT
