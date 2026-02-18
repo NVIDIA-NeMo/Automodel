@@ -92,7 +92,7 @@ runs:
     - name: Build and push
       uses: docker/build-push-action@v5
       env:
-        REGISTRY: ${{ vars.ECR }}
+        REGISTRY: ${{ inputs.ECR }}
       with:
         file: ${{ inputs.dockerfile-path }}
         push: true
