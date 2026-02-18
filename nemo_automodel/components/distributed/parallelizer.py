@@ -637,7 +637,7 @@ def translate_to_torch_parallel_style(style: str):
     elif style == "sequence_parallel":
         return SequenceParallel()
     elif style == "fused_colwise":
-        from nemo_automodel.components.distributed.optimized_tp_plans import FusedColwiseParallel  # noqa: F811
+        from nemo_automodel.components.distributed.parallel_styles import FusedColwiseParallel  # noqa: F811
 
         return FusedColwiseParallel()
     else:
