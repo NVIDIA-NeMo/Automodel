@@ -19,7 +19,8 @@ For this guide, we will use a single machine equipped with 8xH100 NVIDIA GPUs.
 :::
 
 :::tip
-To run this guide on a single GPU, use the single-GPU command in the **Launch Training** section below and scale down the YAML (for example, reduce `step_scheduler.global_batch_size` / `local_batch_size`, and shrink the model via `model.n_layer` / `model.n_embd` / `model.n_head`). For more launch patterns, see [Run on Your Local Workstation](../../launcher/local-workstation.md).
+:::{tip}
+To run this guide on a single GPU, use the single-GPU command in the **Launch Training** section below and scale down the YAML (for example, reduce `step_scheduler.global_batch_size` / `local_batch_size`, and shrink the model using `model.n_layer` / `model.n_embd` / `model.n_head`). For more launch patterns, see [Run on Your Local Workstation](../../launcher/local-workstation.md).
 :::
 
 ## Pre-Process the FineWeb Dataset
