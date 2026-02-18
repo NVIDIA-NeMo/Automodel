@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
 import pytest
 import torch
 import torch.nn as nn
-from unittest.mock import patch, MagicMock
-from types import SimpleNamespace
-
-from contextlib import nullcontext
 
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.recipes.vlm.finetune import (
@@ -41,7 +41,6 @@ def test_get_model_name_prefers_pretrained_path():
     assert _get_model_name(_Cfg()) is None
 
 
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
 
 
@@ -401,6 +400,7 @@ def test_autoprocessor_success():
 def test_autoprocessor_exception_handling(caplog):
     """Test AutoProcessor exception handling and logging in build_dataloader."""
     import logging
+
     from nemo_automodel.recipes.vlm.finetune import build_dataloader
 
     with patch('transformers.AutoProcessor.from_pretrained') as mock_from_pretrained, \
@@ -434,6 +434,7 @@ def test_autoprocessor_exception_handling(caplog):
 def test_autoprocessor_with_processor_kwargs(caplog):
     """Test AutoProcessor exception handling when cfg_processor has no instantiate method."""
     import logging
+
     from nemo_automodel.recipes.vlm.finetune import build_dataloader
 
     # Simple processor config class without instantiate method
@@ -707,12 +708,11 @@ def test_vlm_build_optimizer_disables_foreach_with_tp():
 
 
 from nemo_automodel.recipes.vlm.finetune import (
-    build_step_scheduler,
-    build_lr_scheduler,
     build_checkpoint_config,
+    build_lr_scheduler,
+    build_step_scheduler,
     calculate_loss,
 )
-
 
 # -----------------------------------------------------------------------------
 # build_step_scheduler tests
@@ -1839,6 +1839,36 @@ def test_vlm_build_model_validates_nemo_auto_model_entry_points(entry_point):
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
         # Should not raise - entry point should be recognized
+        model = build_model(
+            cfg_model=cfg_model,
+            cfg_freeze=None,
+            cfg_peft=None,
+            seed=42,
+        )
+
+    assert model is not None
+
+
+@pytest.mark.parametrize("entry_point", ["from_config", "from_pretrained"])
+def test_vlm_build_model_accepts_multimodal_lm_entry_points(entry_point):
+    """Test that VLM build_model accepts NeMoAutoModelForMultimodalLM entry points."""
+    from nemo_automodel._transformers import NeMoAutoModelForMultimodalLM
+
+    target = getattr(NeMoAutoModelForMultimodalLM, entry_point)
+
+    class NeMoVLMModelConfig:
+        def __init__(self):
+            self._target_ = target
+
+        def instantiate(self, **kwargs):
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = NeMoVLMModelConfig()
+
+    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
