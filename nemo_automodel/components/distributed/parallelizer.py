@@ -254,7 +254,9 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
         dp_mesh = device_mesh[dp_mesh_dim_names]
 
-        for layer in layers:
+        # When layers is a ModuleDict, iterate over values instead of keys
+        layer_iter = layers.values() if isinstance(layers, nn.ModuleDict) else layers
+        for layer in layer_iter:
             parallelizer_utils.fully_shard_by_dtype(
                 layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy
             )
@@ -771,7 +773,14 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         ans = []
         for fqn in fqns:
             parts = fqn.split(".")
-            ans.append(reduce(getattr, parts, model))
+            module = reduce(getattr, parts, model)
+            # If the result is a ModuleList or ModuleDict, unpack it
+            if isinstance(module, nn.ModuleList):
+                ans.extend(module)
+            elif isinstance(module, nn.ModuleDict):
+                ans.extend(module.values())
+            else:
+                ans.append(module)
         return ans
 
     VLM_MODEL_CLS_TO_LAYERS = {

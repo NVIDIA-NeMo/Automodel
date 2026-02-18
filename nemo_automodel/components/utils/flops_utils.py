@@ -576,11 +576,80 @@ def _hybrid_model_flops(config, gbs, seq_len):
 
 
 def nemotronh_flops(config, gbs=1, seq_len=None):
-    """Model FLOPs for NemotronH"""
+    """Calculate FLOPs for Nemotron NanoV3 Mamba2 hybrid model."""
     if seq_len is None:
         seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
 
-    return _hybrid_model_flops(config, gbs, seq_len)
+    hs = config.hidden_size  # 2688
+    vocab_size = config.vocab_size  # 131072
+
+    # Count layer types from layers_block_type if available
+    if hasattr(config, 'layers_block_type'):
+        layer_types = config.layers_block_type
+        num_mamba_layers = sum(1 for t in layer_types if t == 'mamba')
+        num_moe_layers = sum(1 for t in layer_types if t == 'moe')
+        num_attn_layers = sum(1 for t in layer_types if t == 'attention')
+    else:
+        # Fallback: assume alternating M and E
+        num_layers = config.num_hidden_layers
+        num_mamba_layers = num_layers // 2
+        num_moe_layers = num_layers // 2
+        num_attn_layers = 0
+
+    # Mamba2 parameters
+    mamba_state_dim = getattr(config, 'ssm_state_size', 128)
+    mamba_head_dim = getattr(config, 'mamba_head_dim', 64)
+    mamba_num_groups = getattr(config, 'n_groups', 8)
+    mamba_num_heads = getattr(config, 'mamba_num_heads', 64)
+    d_inner = mamba_num_heads * mamba_head_dim  # 4096
+
+    # Mamba2 layer FLOPs
+    # in_proj outputs: z(4096) + x(4096) + B(1024) + C(1024) + dt(64) = 10304
+    in_proj_dim = 2 * d_inner + 2 * mamba_num_groups * mamba_state_dim + mamba_num_heads
+
+    mamba_layer_flops = (
+        6 * gbs * seq_len * hs * in_proj_dim  # in_proj: Linear(2688, 10304)
+        + 6 * gbs * seq_len * d_inner * hs   # out_proj: Linear(4096, 2688)
+        # SSM scan excluded: memory-bandwidth-bound op running on CUDA cores, not tensor cores.
+        # peak_tflops is a matmul (tensor core) reference; including SSM scan FLOPs with this
+        # denominator inflates MFU above 100%.
+    )
+    mamba_flops = num_mamba_layers * mamba_layer_flops
+
+    # MOE parameters
+    num_routed_experts = config.n_routed_experts
+    experts_per_tok = config.num_experts_per_tok
+    routed_intermediate = config.moe_intermediate_size
+    shared_intermediate = config.moe_shared_expert_intermediate_size
+
+    # MOE layer FLOPs
+    # Each MOE layer has: router + shared expert + routed experts
+    moe_layer_flops = (
+        6 * gbs * seq_len * hs * num_routed_experts  # Router: Linear(2688, 128)
+        # Shared expert (always computed): up_proj + gate_proj + down_proj
+        + 6 * gbs * seq_len * hs * shared_intermediate  # up_proj
+        + 6 * gbs * seq_len * hs * shared_intermediate  # gate_proj
+        + 6 * gbs * seq_len * shared_intermediate * hs  # down_proj
+        # Routed experts (6 selected per token): up_proj + gate_proj + down_proj
+        + 6 * gbs * seq_len * experts_per_tok * hs * routed_intermediate  # up_proj
+        + 6 * gbs * seq_len * experts_per_tok * hs * routed_intermediate  # gate_proj
+        + 6 * gbs * seq_len * experts_per_tok * routed_intermediate * hs  # down_proj
+    )
+    moe_flops = num_moe_layers * moe_layer_flops
+
+    # Attention layer FLOPs (standard transformer attention)
+    if num_attn_layers > 0:
+        attn_layer_flops = _non_mla_attn_layer_flops(config, gbs, seq_len)
+        attn_flops = num_attn_layers * attn_layer_flops
+    else:
+        attn_flops = 0
+
+    # Embedding and LM head FLOPs
+    vocab_flops = 6 * gbs * seq_len * hs * vocab_size
+
+    total_flops = mamba_flops + moe_flops + attn_flops + vocab_flops
+
+    return total_flops
 
 
 def attention_flops_calculator(
@@ -845,6 +914,7 @@ def get_flops_formula_for_hf_config(config: Any) -> Optional[Callable]:
         "MT5Config": transformer_flops,
         # Nemotron
         "NemotronConfig": nemotron_flops,
+        "NemotronHConfig": nemotronh_flops,
         # General transformer fallback
         "OPTConfig": transformer_flops,
         "BloomConfig": transformer_flops,

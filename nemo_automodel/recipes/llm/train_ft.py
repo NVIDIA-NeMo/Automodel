@@ -74,6 +74,7 @@ from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
     compile_model,
 )
+from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops_formula_for_hf_config
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     init_empty_weights,
@@ -592,7 +593,10 @@ def build_dataloader(
         if pp_enabled:
             from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
 
-            hf_model_config = AutoConfig.from_pretrained(_get_model_name(cfg_model))
+            hf_model_config = AutoConfig.from_pretrained(
+                _get_model_name(cfg_model),
+                trust_remote_code=cfg_model.get("trust_remote_code", False)
+            )
 
             if "collate_fn" in dl_kwargs:
                 # Case 1: PP enabled + collate_fn exists -> chain them
@@ -1109,6 +1113,20 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
 
+        # Benchmark config (optional): pre-compute tflops for MFU logging
+        self._bench_cfg = self.cfg.get("benchmark", None)
+        self._bench_tflops = None
+        if self._bench_cfg is not None:
+            try:
+                seq_len = self.cfg.get("dataset.seq_len", None)
+                global_batch_size = self.cfg.get("step_scheduler.global_batch_size", 1)
+                flops_formula = get_flops_formula_for_hf_config(self.model_parts[0].config)
+                flops = flops_formula(self.model_parts[0].config, gbs=global_batch_size, seq_len=seq_len)
+                self._bench_tflops = flops / (10**12)
+                logger.info(f"Benchmark: TFLOPs/step: {self._bench_tflops:.4f}")
+            except Exception as e:
+                logger.warning(f"Could not compute TFLOPs for MFU: {e}")
+
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
             return None, None, None
@@ -1164,17 +1182,39 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             mp.train()
         self.timestamp = time.perf_counter()
 
+        # nsys profiling config (from benchmark section)
+        _bench_cfg = getattr(self, "_bench_cfg", None)
+        _nsys_start = int(_bench_cfg.get("nsys_start", -1)) if _bench_cfg is not None else -1
+        _nsys_end = int(_bench_cfg.get("nsys_end", -1)) if _bench_cfg is not None else -1
+        _nsys_ranks = list(_bench_cfg.get("nsys_ranks", [])) if _bench_cfg is not None else []
+        _nsys_active = False
+
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
             # The step scheduler yields a list of batches with the following properties:
             # 1. len(batches) == grad_acc_steps
             # 2. len(batches[0]) == batch_size
             for batches in self.step_scheduler:
+                step = self.step_scheduler.step
+
+                # nsys profiling: start
+                if _nsys_start >= 0 and step == _nsys_start and self.dist_env.rank in _nsys_ranks:
+                    logger.info(f"Rank {self.dist_env.rank} | Starting nsys profiling at step {step}")
+                    torch.cuda.cudart().cudaProfilerStart()
+                    torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+                    _nsys_active = True
+
                 # If QAT delayed fake-quant is configured, enable after threshold
-                self._enable_qat_if_delayed(self.step_scheduler.step)
+                self._enable_qat_if_delayed(step)
                 train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
                 # log
                 self.log_train_metrics(train_log_data)
+
+                # nsys profiling: stop
+                if _nsys_active and _nsys_end >= 0 and step == _nsys_end and self.dist_env.rank in _nsys_ranks:
+                    logger.info(f"Rank {self.dist_env.rank} | Stopping nsys profiling at step {step}")
+                    torch.cuda.cudart().cudaProfilerStop()
+                    _nsys_active = False
 
                 # Run validation every val_every_steps
                 val_losses = {}
@@ -1190,7 +1230,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         mp.train()
 
                 # Save the checkpoint every ckpt_every_steps
-                if self.step_scheduler.is_ckpt_step:
+                if self.step_scheduler.is_ckpt_step and self.checkpointer.config.enabled:
                     self.save_checkpoint(
                         epoch,
                         self.step_scheduler.step,
@@ -1390,19 +1430,26 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         reporting_loss = reporting_loss.cpu().item()
         # fix reporting_loss, tps across ranks
 
+        metrics = {
+            "loss": reporting_loss,
+            "grad_norm": grad_norm,
+            "lr": self.optimizer[0].param_groups[0]["lr"],
+            "mem": torch.cuda.max_memory_allocated() / 1024**3,
+            "tps": tps,
+            "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
+            "num_tokens_per_step": num_tokens_in_batch,
+            "num_label_tokens": num_label_tokens,
+        }
+
+        if getattr(self, "_bench_tflops", None) is not None and getattr(self, "_bench_cfg", None) is not None:
+            peak_tflops = self._bench_cfg.get("peak_tflops", None)
+            if peak_tflops is not None:
+                metrics["mfu"] = calculate_mfu(self._bench_tflops, self.dist_env.world_size, time_delta, reference_mfu=peak_tflops)
+
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
-            metrics={
-                "loss": reporting_loss,
-                "grad_norm": grad_norm,
-                "lr": self.optimizer[0].param_groups[0]["lr"],
-                "mem": torch.cuda.max_memory_allocated() / 1024**3,
-                "tps": tps,
-                "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
-                "num_tokens_per_step": num_tokens_in_batch,
-                "num_label_tokens": num_label_tokens,
-            },
+            metrics=metrics,
         )
 
     @torch.no_grad()
@@ -1515,8 +1562,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # JSONL training log
         self.metric_logger_train.log(log_data)
+        mfu_str = " | mfu {:.2f}%".format(log_data.metrics["mfu"]) if "mfu" in log_data.metrics else ""
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
+            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}{}".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
@@ -1526,6 +1574,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 log_data.metrics["tps"],
                 log_data.metrics["tps_per_gpu"],
                 log_data.metrics["num_label_tokens"],
+                mfu_str,
             )
         )
         torch.cuda.reset_peak_memory_stats()

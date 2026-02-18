@@ -40,13 +40,27 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         causal_mask_mapping: Optional[dict] = None,
         **kwargs,
     ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
-        # Embeddings handling
+        # Embeddings handling - support both embed_tokens (standard transformers) and embeddings (Nemotron/Mamba)
         if inputs_embeds is None:
+            # Try multiple paths for embeddings to support different model structures
+            embed_module = None
+
+            # Path 1: Direct embed_tokens (standard transformers like Llama)
             if hasattr(self, "embed_tokens") and self.embed_tokens is not None:
+                embed_module = self.embed_tokens
+            # Path 2: Direct embeddings (some models)
+            elif hasattr(self, "embeddings") and self.embeddings is not None:
+                embed_module = self.embeddings
+            # Path 3: backbone.embeddings (Nemotron structure after PP splitting)
+            elif hasattr(self, "backbone") and hasattr(self.backbone, "embeddings") and self.backbone.embeddings is not None:
+                embed_module = self.backbone.embeddings
+
+            if embed_module is not None:
                 if input_ids is None:
                     raise ValueError("You must provide either input_ids or inputs_embeds")
-                inputs_embeds = self.embed_tokens(input_ids)
+                inputs_embeds = embed_module(input_ids)
             else:
+                # Fallback: if input_ids is already float tensor, treat as embeddings
                 if (
                     input_ids is not None
                     and isinstance(input_ids, torch.Tensor)
@@ -54,7 +68,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                 ):
                     inputs_embeds = input_ids
                 else:
-                    raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
+                    raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens or embeddings")
 
         if use_cache and past_key_values is None:
             from transformers.cache_utils import DynamicCache
@@ -115,16 +129,22 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                         getattr(decoder_layer, "attention_type"), causal_mask_mapping.get("full_attention")
                     )
 
-                hidden_states = decoder_layer(
-                    hidden_states,
-                    attention_mask=layer_attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **kwargs,
-                )
+                import inspect
+                layer_params = inspect.signature(decoder_layer.forward).parameters
+                _candidates = {
+                    "attention_mask": layer_attention_mask,
+                    "position_ids": position_ids,
+                    "past_key_value": past_key_values,
+                    "past_key_values": past_key_values,
+                    "use_cache": use_cache,
+                    "cache_position": cache_position,
+                    "position_embeddings": position_embeddings,
+                }
+                layer_kwargs = {k: v for k, v in _candidates.items() if k in layer_params}
+                for k, v in kwargs.items():
+                    if k in layer_params:
+                        layer_kwargs[k] = v
+                hidden_states = decoder_layer(hidden_states, **layer_kwargs)
 
         if hasattr(self, "norm") and self.norm is not None:
             hidden_states = self.norm(hidden_states)
@@ -164,8 +184,14 @@ def create_pipeline_forward_causal_lm() -> Callable:
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
+        inner_model = None
         if hasattr(self, "model") and self.model is not None:
-            outputs = self.model(
+            inner_model = self.model
+        elif hasattr(self, "backbone") and self.backbone is not None:
+            inner_model = self.backbone
+
+        if inner_model is not None:
+            outputs = inner_model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -210,6 +236,12 @@ def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm
     if hasattr(model, "model"):
         if patch_inner_model and getattr(model, "model", None) is not None:
             model.model.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), model.model)
+
+        if patch_causal_lm_model:
+            model.forward = types.MethodType(create_pipeline_forward_causal_lm(), model)
+    elif hasattr(model, "backbone"):
+        if patch_inner_model and getattr(model, "backbone", None) is not None:
+            model.backbone.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), model.backbone)
 
         if patch_causal_lm_model:
             model.forward = types.MethodType(create_pipeline_forward_causal_lm(), model)
