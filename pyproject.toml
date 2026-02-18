@@ -116,16 +116,17 @@ moe = [
     "deep_ep",
 ]
 vlm = [
-    "pillow",
-    "qwen-vl-utils[decord]; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
-    "qwen-omni-utils",
-    "timm<=1.0.22",
+    "albumentations"
     "backoff",
+    "mistral_common[opencv]>=1.9.0",
     "numpy",
     "numba",
+    "open-clip-torch",
+    "pillow",
+    "qwen-omni-utils",
+    "qwen-vl-utils[decord]; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "timm<=1.0.22",
     "torchcodec; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
-    "mistral_common[opencv]>=1.9.0",
-    "albumentations"
 ]
 all = [
     "nemo_automodel[cuda]",
