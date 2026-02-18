@@ -359,9 +359,9 @@ class TestNemotronHForCausalLM:
         batch_size, seq_len = 2, 8
         input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
 
-        logits = model(input_ids)
+        output = model(input_ids)
 
-        assert logits.shape == (batch_size, seq_len, config.vocab_size)
+        assert output.logits.shape == (batch_size, seq_len, config.vocab_size)
 
     def test_causal_lm_forward_float32_logits(self, config, backend):
         """Test that logits are computed in float32."""
@@ -373,9 +373,9 @@ class TestNemotronHForCausalLM:
         batch_size, seq_len = 2, 8
         input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
 
-        logits = model(input_ids)
+        output = model(input_ids)
 
-        assert logits.dtype == torch.float32
+        assert output.logits.dtype == torch.float32
 
     def test_causal_lm_forward_with_inputs_embeds(self, config, backend):
         """Test causal LM forward pass with inputs_embeds."""
@@ -387,10 +387,10 @@ class TestNemotronHForCausalLM:
         batch_size, seq_len = 2, 8
         inputs_embeds = torch.randn(batch_size, seq_len, config.hidden_size, dtype=torch.bfloat16)
 
-        logits = model(inputs_embeds=inputs_embeds)
+        output = model(inputs_embeds=inputs_embeds)
 
-        assert logits.shape == (batch_size, seq_len, config.vocab_size)
-        assert logits.dtype == torch.float32
+        assert output.logits.shape == (batch_size, seq_len, config.vocab_size)
+        assert output.logits.dtype == torch.float32
 
     def test_causal_lm_forward_no_input_ids_no_inputs_embeds_raises(self, config, backend):
         """Test that ValueError is raised when neither input_ids nor inputs_embeds is provided."""
@@ -437,6 +437,108 @@ class TestNemotronHForCausalLM:
         )
 
         assert ModelClass is NemotronHForCausalLM
+
+    def test_causal_lm_generation_mixin_in_mro(self, config, backend):
+        """Test that GenerationMixin is in the MRO."""
+        from transformers.generation import GenerationMixin
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        assert GenerationMixin in NemotronHForCausalLM.__mro__
+
+    def test_causal_lm_is_stateful(self, config, backend):
+        """Test that _is_stateful is True to prevent DynamicCache creation."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        assert NemotronHForCausalLM._is_stateful is True
+
+    def test_causal_lm_has_generation_config(self, config, backend):
+        """Test that model has generation_config set after __init__."""
+        from transformers.generation import GenerationConfig
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        model = NemotronHForCausalLM(config, backend=backend)
+
+        assert hasattr(model, "generation_config")
+        assert isinstance(model.generation_config, GenerationConfig)
+
+    def test_causal_lm_forward_returns_causal_lm_output(self, config, backend):
+        """Test that forward returns CausalLMOutputWithPast."""
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        model = NemotronHForCausalLM(config, backend=backend)
+        model = model.to(torch.bfloat16)
+
+        input_ids = torch.randint(0, config.vocab_size, (2, 8))
+        output = model(input_ids)
+
+        assert isinstance(output, CausalLMOutputWithPast)
+        assert output.past_key_values is None
+        assert output.loss is None
+
+    def test_causal_lm_forward_with_labels(self, config, backend):
+        """Test that forward computes loss when labels are provided."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        model = NemotronHForCausalLM(config, backend=backend)
+        model = model.to(torch.bfloat16)
+
+        batch_size, seq_len = 2, 8
+        input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+        labels = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+
+        output = model(input_ids, labels=labels)
+
+        assert output.loss is not None
+        assert output.loss.ndim == 0  # scalar loss
+
+    def test_causal_lm_prepare_inputs_for_generation(self, config, backend):
+        """Test prepare_inputs_for_generation returns full sequence."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        model = NemotronHForCausalLM(config, backend=backend)
+
+        batch_size, seq_len = 2, 6
+        input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+        attention_mask = torch.ones(batch_size, seq_len)
+
+        model_inputs = model.prepare_inputs_for_generation(
+            input_ids, attention_mask=attention_mask
+        )
+
+        # Full sequence is always forwarded (no cache slicing)
+        assert model_inputs["input_ids"].shape == (batch_size, seq_len)
+        assert (model_inputs["attention_mask"] == attention_mask).all()
+
+    def test_causal_lm_generate(self, config, backend):
+        """Test that .generate() produces token sequences of the requested length."""
+        from transformers import PretrainedConfig
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        # Wrap the mock config in a real PretrainedConfig so that GenerationMixin's
+        # _prepare_generation_config() can call _get_generation_parameters().
+        hf_config = PretrainedConfig(
+            is_encoder_decoder=False,
+            eos_token_id=1,
+            pad_token_id=0,
+        )
+        # Copy all mock attributes onto the HF config so the model is built correctly.
+        for attr, val in vars(config).items():
+            setattr(hf_config, attr, val)
+
+        model = NemotronHForCausalLM(hf_config, backend=backend)
+        model = model.to(torch.bfloat16)
+        model.eval()
+
+        batch_size, prompt_len = 1, 4
+        max_new_tokens = 3
+        input_ids = torch.randint(2, config.vocab_size, (batch_size, prompt_len))
+
+        output_ids = model.generate(input_ids, max_new_tokens=max_new_tokens, do_sample=False)
+
+        assert output_ids.shape[0] == batch_size
+        assert output_ids.shape[1] >= prompt_len
+        assert output_ids.shape[1] <= prompt_len + max_new_tokens
 
 
 class TestNemotronV3ModelWithMoE:

@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
 from transformers import AutoConfig
+from transformers.generation import GenerationConfig, GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -168,8 +170,19 @@ class NemotronV3Model(nn.Module):
             block.init_weights(buffer_device=buffer_device)
 
 
-class NemotronHForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
-    """NemotronV3 model with language modeling head."""
+class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoEFSDPSyncMixin):
+    """NemotronV3 model with language modeling head.
+
+    Supports ``.generate()`` from ``transformers.generation.GenerationMixin``.  Because the
+    hybrid Mamba2/Attention architecture does not use the standard ``DynamicCache``, KV-cache
+    acceleration is disabled (``_is_stateful = True``).  Every generation step re-processes
+    the full sequence, which is correct but O(n) per step rather than O(1).
+    """
+
+    # Prevent GenerationMixin from creating a DynamicCache: the hybrid Mamba2/Attention
+    # architecture uses its own recurrent state and cannot share an attention KV-cache.
+    _is_stateful: bool = True
+    main_input_name: str = "input_ids"
 
     @classmethod
     def from_config(
@@ -249,6 +262,14 @@ class NemotronHForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 dtype=dtype,
             )
 
+        # Required by GenerationMixin.generate()
+        self.generation_config = GenerationConfig()
+
+    @property
+    def device(self) -> torch.device:
+        """Return the device of the first model parameter (required by GenerationMixin)."""
+        return next(self.parameters()).device
+
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -263,35 +284,109 @@ class NemotronHForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def forward(
         self,
-        input_ids: torch.LongTensor | None = None,
-        *,
-        attention_mask: torch.Tensor | None = None,
-        causal_mask_mapping: dict[str, torch.Tensor] | None = None,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        causal_mask_mapping: Optional[dict[str, torch.Tensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        # KV-cache arguments accepted for API compatibility with GenerationMixin
+        # but not used (hybrid Mamba2/Attention architecture re-processes the full
+        # sequence on every generation step).
+        past_key_values: Optional[Any] = None,
+        use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Any,
-    ) -> torch.Tensor | dict[str, torch.Tensor]:
+    ) -> CausalLMOutputWithPast:
         """Forward pass with optional loss computation.
 
         Args:
             input_ids: Input token IDs [batch_size, seq_len] (optional)
             attention_mask: 2D padding mask [batch_size, seq_len]
             causal_mask_mapping: Dict with precomputed 4D causal masks
-            **kwargs: Additional arguments
+            inputs_embeds: Pre-computed input embeddings (optional)
+            labels: Token IDs for loss computation [batch_size, seq_len] (optional)
+            past_key_values: Unused – accepted for API compatibility with GenerationMixin.
+            use_cache: Unused – accepted for API compatibility with GenerationMixin.
+            cache_position: Unused – accepted for API compatibility with GenerationMixin.
+            position_ids: Unused – accepted for API compatibility with GenerationMixin.
+            logits_to_keep: If > 0, only compute logits for the last ``logits_to_keep``
+                token positions (avoids materialising the full logit matrix during generation).
+            **kwargs: Additional arguments forwarded to the base model.
 
         Returns:
-            logits tensor [batch_size, seq_len, vocab_size]
+            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast` with
+            ``logits`` (float32, ``[batch_size, seq_len, vocab_size]``), optional
+            ``loss``, and ``past_key_values=None``.
         """
         # Forward through base model
         hidden_states = self.model(
             input_ids,
             attention_mask=attention_mask,
             causal_mask_mapping=causal_mask_mapping,
+            inputs_embeds=inputs_embeds,
             **kwargs,
         )
 
-        # Compute logits (in float32 for numerical stability)
-        logits = self.lm_head(hidden_states).float()
+        # Optionally restrict logit computation to the last few positions.
+        # When logits_to_keep == 0 we compute all positions (training default).
+        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            logits = self.lm_head(hidden_states).float()
+        else:
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            logits = self.lm_head(hidden_states[:, slice_indices, :]).float()
 
-        return logits
+        loss = None
+        if labels is not None:
+            # Shift for next-token prediction
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            )
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=None,
+            hidden_states=None,
+            attentions=None,
+        )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        is_first_iteration: Optional[bool] = False,
+        **kwargs,
+    ) -> dict:
+        """Prepare model inputs for each generation step.
+
+        KV-cache is not supported for this hybrid Mamba2/Attention model, so the
+        full accumulated sequence is forwarded on every step.  This is correct but
+        not optimal – O(n) per step instead of O(1) with caching.
+
+        Args:
+            input_ids: Accumulated token ids [batch_size, current_seq_len].
+            attention_mask: Padding mask [batch_size, current_seq_len].
+            inputs_embeds: Pre-computed embeddings for the first step (optional).
+            is_first_iteration: True on the very first generation step.
+            **kwargs: Remaining model kwargs (cache-related kwargs are ignored).
+
+        Returns:
+            Dict of keyword arguments to pass to :meth:`forward`.
+        """
+        # On the first step, prefer inputs_embeds over input_ids when available.
+        if inputs_embeds is not None and is_first_iteration:
+            model_inputs = {"input_ids": None, "inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids, "inputs_embeds": None}
+
+        model_inputs["attention_mask"] = attention_mask
+        return model_inputs
 
     @torch.no_grad()
     def initialize_weights(
