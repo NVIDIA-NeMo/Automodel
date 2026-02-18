@@ -16,7 +16,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from nemo_automodel._transformers.utils import sliding_window_overwrite
+from nemo_automodel._transformers.utils import apply_qwen3_omni_config_patch, sliding_window_overwrite
 
 
 class TestSlidingWindowOverwrite:
@@ -165,3 +165,43 @@ class TestSlidingWindowOverwrite:
 
         # Should return empty dict when use_sliding_window is not exactly False
         assert result == {}
+
+
+class TestApplyQwen3OmniConfigPatch:
+    """Test cases for apply_qwen3_omni_config_patch function."""
+
+    def test_patch_sets_use_sliding_window_default(self):
+        """Verify the patch adds use_sliding_window=False to the config class."""
+        from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+            Qwen3OmniMoeTalkerCodePredictorConfig,
+        )
+
+        apply_qwen3_omni_config_patch()
+        assert hasattr(Qwen3OmniMoeTalkerCodePredictorConfig, "use_sliding_window")
+
+    def test_patch_is_idempotent(self):
+        """Calling the patch twice does not raise or change the value."""
+        from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+            Qwen3OmniMoeTalkerCodePredictorConfig,
+        )
+
+        apply_qwen3_omni_config_patch()
+        apply_qwen3_omni_config_patch()
+        assert Qwen3OmniMoeTalkerCodePredictorConfig.use_sliding_window is False
+
+    def test_patch_does_not_overwrite_existing_attribute(self):
+        """If the attribute already exists (e.g. fixed upstream), patch is a no-op."""
+        from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+            Qwen3OmniMoeTalkerCodePredictorConfig,
+        )
+
+        original = getattr(Qwen3OmniMoeTalkerCodePredictorConfig, "use_sliding_window", None)
+        Qwen3OmniMoeTalkerCodePredictorConfig.use_sliding_window = True
+        try:
+            apply_qwen3_omni_config_patch()
+            assert Qwen3OmniMoeTalkerCodePredictorConfig.use_sliding_window is True
+        finally:
+            if original is None:
+                del Qwen3OmniMoeTalkerCodePredictorConfig.use_sliding_window
+            else:
+                Qwen3OmniMoeTalkerCodePredictorConfig.use_sliding_window = original

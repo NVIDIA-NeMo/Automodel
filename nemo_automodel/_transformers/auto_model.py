@@ -39,6 +39,7 @@ from huggingface_hub import constants as hf_constants  # noqa: E402
 from transformers import (  # noqa: E402
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
+    AutoModelForMultimodalLM,
     AutoModelForSequenceClassification,
     AutoModelForTextToWaveform,
     PreTrainedModel,
@@ -635,6 +636,12 @@ class NeMoAutoModelForImageTextToText(_BaseNeMoAutoModelClass, AutoModelForImage
     >>> model = NeMoAutoModelForImageTextToText.from_pretrained(
     ...     "Qwen/Qwen2.5-VL-3B-Instruct", use_liger_kernel=False)                            # skip Liger
     """
+
+    pass
+
+
+class NeMoAutoModelForMultimodalLM(_BaseNeMoAutoModelClass, AutoModelForMultimodalLM):
+    """Drop-in replacement for ``transformers.AutoModelForMultimodalLM`` with custom-kernels."""
 
     pass
 

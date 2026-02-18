@@ -32,7 +32,7 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 from wandb import Settings
 
-from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+from nemo_automodel._transformers import NeMoAutoModelForImageTextToText, NeMoAutoModelForMultimodalLM
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -136,6 +136,8 @@ def build_model(
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
             NeMoAutoModelForImageTextToText.from_config,
             NeMoAutoModelForImageTextToText.from_pretrained,
+            NeMoAutoModelForMultimodalLM.from_config,
+            NeMoAutoModelForMultimodalLM.from_pretrained,
         )
 
         if is_nemo_auto_model:
