@@ -41,7 +41,7 @@ model:
     attn: te
     linear: te
     rms_norm: te
-    experts: torch_mm
+    experts: gmm
     dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
