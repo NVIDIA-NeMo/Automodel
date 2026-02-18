@@ -14,7 +14,7 @@ cd Automodel/
 pip install -e ".[all]"    # installs NeMo AutoModel + optional extras
 ```
 
-:::note
+:::{note}
 For this guide we will use a single machine equipped with 8xH100 NVIDIA GPUs.
 :::
 
