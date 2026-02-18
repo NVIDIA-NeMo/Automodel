@@ -760,6 +760,396 @@ def test_deepep_lora_relu2_non_gated_shapes(device):
     assert lora_module.lora_down_A.shape == (4, 32, 4)
 
 
+# ---------- torch_mm forward path tests ----------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_grouped_experts_lora_forward_torch_mm(moe_config, device):
+    """Test forward pass of GroupedExpertsLoRA using _forward_grouped_mm (use_torch_mm=True)."""
+    orig_experts = GroupedExperts(moe_config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+
+    # Force use_torch_mm so forward dispatches to _forward_grouped_mm
+    orig_experts.use_torch_mm = True
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8).to(device)
+    assert lora_experts.use_torch_mm is True
+
+    num_tokens = 10
+    x = torch.randn(num_tokens, 16, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    weights = torch.rand(num_tokens, 2, device=device)
+    indices = torch.randint(0, 4, (num_tokens, 2), device=device)
+
+    out = lora_experts(x, token_mask, weights, indices)
+    assert out.shape == (num_tokens, 16)
+    assert not torch.isnan(out).any()
+    assert not torch.isinf(out).any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_grouped_experts_lora_forward_torch_mm_equivalence(moe_config, device):
+    """With zero-init B, torch_mm path should match the loop path output."""
+    orig_experts = GroupedExperts(moe_config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+
+    # Create two LoRA wrappers: one with loop, one with torch_mm
+    lora_loop = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8).to(device)
+    lora_loop.use_torch_mm = False
+
+    lora_mm = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8).to(device)
+    lora_mm.use_torch_mm = True
+    # Copy LoRA weights so both are identical
+    with torch.no_grad():
+        lora_mm.lora_gate_and_up_A.copy_(lora_loop.lora_gate_and_up_A)
+        lora_mm.lora_gate_and_up_B.copy_(lora_loop.lora_gate_and_up_B)
+        lora_mm.lora_down_A.copy_(lora_loop.lora_down_A)
+        lora_mm.lora_down_B.copy_(lora_loop.lora_down_B)
+
+    num_tokens = 10
+    x = torch.randn(num_tokens, 16, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    weights = torch.rand(num_tokens, 2, device=device)
+    indices = torch.randint(0, 4, (num_tokens, 2), device=device)
+
+    with torch.no_grad():
+        out_loop = lora_loop(x, token_mask, weights, indices)
+        out_mm = lora_mm(x, token_mask, weights, indices)
+
+    assert torch.allclose(out_loop, out_mm, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_grouped_experts_lora_forward_torch_mm_zero_tokens(moe_config, device):
+    """Test _forward_grouped_mm dummy computation path when no tokens are routed."""
+    orig_experts = GroupedExperts(moe_config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+
+    orig_experts.use_torch_mm = True
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8).to(device)
+
+    num_tokens = 10
+    x = torch.randn(num_tokens, 16, device=device)
+    token_mask = torch.zeros(num_tokens, dtype=torch.bool, device=device)  # All masked
+    weights = torch.rand(num_tokens, 2, device=device)
+    indices = torch.randint(0, 4, (num_tokens, 2), device=device)
+
+    out = lora_experts(x, token_mask, weights, indices)
+    assert out.shape == (num_tokens, 16)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_grouped_experts_lora_forward_torch_mm_with_bias(device):
+    """Test _forward_grouped_mm path with expert_bias=True."""
+    config = MoEConfig(
+        n_routed_experts=4,
+        n_shared_experts=0,
+        n_activated_experts=2,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=16,
+        inter_dim=32,
+        moe_inter_dim=32,
+        norm_topk_prob=False,
+        expert_activation="swiglu",
+        dtype=torch.float32,
+        expert_bias=True,
+    )
+
+    orig_experts = GroupedExperts(config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+
+    orig_experts.use_torch_mm = True
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8).to(device)
+
+    num_tokens = 10
+    x = torch.randn(num_tokens, 16, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    weights = torch.rand(num_tokens, 2, device=device)
+    indices = torch.randint(0, 4, (num_tokens, 2), device=device)
+
+    out = lora_experts(x, token_mask, weights, indices)
+    assert out.shape == (num_tokens, 16)
+    assert not torch.isnan(out).any()
+
+
+@pytest.mark.skipif(
+    grouped_gemm is None or not torch.cuda.is_available(),
+    reason="Requires grouped_gemm and CUDA"
+)
+def test_deepep_lora_forward_torch_mm(moe_config, device):
+    """Test DeepEP LoRA forward with use_torch_mm=True via mock dispatcher."""
+    moe_config.n_routed_experts = 4
+    moe_config.dim = 16
+    moe_config.moe_inter_dim = 32
+    moe_config.dtype = torch.bfloat16
+
+    orig_experts = GroupedExpertsDeepEP(moe_config).to(device).to(torch.bfloat16)
+    with torch.no_grad():
+        orig_experts.init_weights(device)
+
+    orig_experts.n_routed_experts = 4
+    orig_experts.ep_size = 1
+    orig_experts.use_torch_mm = True
+
+    # lora_dim must be >= 8 for bf16 to satisfy torch._grouped_mm 16-byte stride alignment
+    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=8).to(device).to(torch.bfloat16)
+    assert lora_module.use_torch_mm is True
+
+    mock_dispatcher = MockDeepEPDispatcher()
+
+    num_tokens = 8
+    tokens_per_expert = torch.tensor([num_tokens, 0, 0, 0], dtype=torch.long, device="cpu")
+
+    dtype = torch.bfloat16
+    permuted_x = torch.randn(num_tokens, 16, device=device).to(dtype)
+    permuted_probs = torch.ones(num_tokens, device=device).to(dtype)
+
+    mock_dispatcher.token_permutation2 = MagicMock(
+        return_value=(permuted_x, tokens_per_expert, permuted_probs)
+    )
+    lora_module.token_dispatcher = mock_dispatcher
+
+    x = torch.randn(num_tokens, 16, device=device).to(dtype)
+    weights = torch.ones(num_tokens, 1, device=device).to(dtype)
+    indices = torch.zeros(num_tokens, 1, dtype=torch.long, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+    out = lora_module(x, token_mask, weights, indices)
+    assert out.shape == (num_tokens, 16)
+    assert not torch.isnan(out).any()
+
+
+@pytest.mark.skipif(
+    grouped_gemm is None or not torch.cuda.is_available(),
+    reason="Requires grouped_gemm and CUDA"
+)
+def test_deepep_lora_forward_torch_mm_equivalence(moe_config, device):
+    """With zero-init B, torch_mm and grouped_gemm paths should match for DeepEP LoRA."""
+    moe_config.n_routed_experts = 4
+    moe_config.dim = 16
+    moe_config.moe_inter_dim = 32
+    moe_config.dtype = torch.bfloat16
+
+    orig_experts = GroupedExpertsDeepEP(moe_config).to(device).to(torch.bfloat16)
+    with torch.no_grad():
+        orig_experts.init_weights(device)
+    orig_experts.n_routed_experts = 4
+    orig_experts.ep_size = 1
+
+    # lora_dim must be >= 8 for bf16 to satisfy torch._grouped_mm 16-byte stride alignment
+    # Create two modules: one using grouped_gemm, one using torch_mm
+    lora_gg = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=8).to(device).to(torch.bfloat16)
+    lora_gg.use_torch_mm = False
+
+    lora_mm = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=8).to(device).to(torch.bfloat16)
+    lora_mm.use_torch_mm = True
+
+    # Sync LoRA weights
+    with torch.no_grad():
+        lora_mm.lora_gate_and_up_A.copy_(lora_gg.lora_gate_and_up_A)
+        lora_mm.lora_gate_and_up_B.copy_(lora_gg.lora_gate_and_up_B)
+        lora_mm.lora_down_A.copy_(lora_gg.lora_down_A)
+        lora_mm.lora_down_B.copy_(lora_gg.lora_down_B)
+
+    num_tokens = 8
+    tokens_per_expert = torch.tensor([num_tokens, 0, 0, 0], dtype=torch.long, device="cpu")
+    dtype = torch.bfloat16
+    permuted_x = torch.randn(num_tokens, 16, device=device).to(dtype)
+    permuted_probs = torch.ones(num_tokens, device=device).to(dtype)
+
+    mock_dispatcher_gg = MockDeepEPDispatcher()
+    mock_dispatcher_gg.token_permutation2 = MagicMock(
+        return_value=(permuted_x, tokens_per_expert, permuted_probs)
+    )
+    mock_dispatcher_mm = MockDeepEPDispatcher()
+    mock_dispatcher_mm.token_permutation2 = MagicMock(
+        return_value=(permuted_x, tokens_per_expert, permuted_probs)
+    )
+    lora_gg.token_dispatcher = mock_dispatcher_gg
+    lora_mm.token_dispatcher = mock_dispatcher_mm
+
+    x = torch.randn(num_tokens, 16, device=device).to(dtype)
+    weights = torch.ones(num_tokens, 1, device=device).to(dtype)
+    indices = torch.zeros(num_tokens, 1, dtype=torch.long, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+    with torch.no_grad():
+        out_gg = lora_gg(x, token_mask, weights, indices)
+        out_mm = lora_mm(x, token_mask, weights, indices)
+
+    assert torch.allclose(out_gg, out_mm, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_lora_dtype_string(moe_config, device):
+    """Test that lora_dtype can be passed as a string."""
+    orig_experts = GroupedExperts(moe_config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+
+    if device.type == 'cuda' and torch.cuda.is_bf16_supported():
+        lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8, lora_dtype="bfloat16").to(device)
+        assert lora_experts.lora_gate_and_up_A.dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_deepep_lora_dtype_string(moe_config, device):
+    """Test that DeepEP LoRA lora_dtype can be passed as a string."""
+    orig_experts = GroupedExpertsDeepEP(moe_config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(device)
+    orig_experts.n_routed_experts = 4
+    orig_experts.ep_size = 1
+
+    if device.type == 'cuda' and torch.cuda.is_bf16_supported():
+        lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4, lora_dtype="bfloat16").to(device)
+        assert lora_module.lora_gate_and_up_A.dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_deepep_lora_kaiming_init(moe_config, device):
+    """Test Kaiming initialization for DeepEP LoRA weights."""
+    orig_experts = GroupedExpertsDeepEP(moe_config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(device)
+    orig_experts.n_routed_experts = 4
+    orig_experts.ep_size = 1
+
+    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4, alpha=8, lora_A_init_method="kaiming")
+
+    # B matrices zero-initialized
+    assert torch.allclose(lora_module.lora_gate_and_up_B, torch.zeros_like(lora_module.lora_gate_and_up_B))
+    assert torch.allclose(lora_module.lora_down_B, torch.zeros_like(lora_module.lora_down_B))
+
+    # A matrices not zero (kaiming initialized)
+    assert not torch.allclose(lora_module.lora_gate_and_up_A, torch.zeros_like(lora_module.lora_gate_and_up_A))
+    assert not torch.allclose(lora_module.lora_down_A, torch.zeros_like(lora_module.lora_down_A))
+
+
+@pytest.mark.skipif(
+    grouped_gemm is None or not torch.cuda.is_available(),
+    reason="Requires grouped_gemm and CUDA"
+)
+def test_deepep_lora_forward_torch_mm_with_bias(device):
+    """Test DeepEP LoRA forward with use_torch_mm=True and expert_bias=True."""
+    config = MoEConfig(
+        n_routed_experts=4,
+        n_shared_experts=0,
+        n_activated_experts=2,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=16,
+        inter_dim=32,
+        moe_inter_dim=32,
+        norm_topk_prob=False,
+        expert_activation="swiglu",
+        dtype=torch.bfloat16,
+        expert_bias=True,
+    )
+
+    orig_experts = GroupedExpertsDeepEP(config).to(device).to(torch.bfloat16)
+    with torch.no_grad():
+        orig_experts.init_weights(device)
+    orig_experts.n_routed_experts = 4
+    orig_experts.ep_size = 1
+    orig_experts.use_torch_mm = True
+
+    # lora_dim must be >= 8 for bf16 to satisfy torch._grouped_mm 16-byte stride alignment
+    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=8).to(device).to(torch.bfloat16)
+
+    mock_dispatcher = MockDeepEPDispatcher()
+    num_tokens = 8
+    tokens_per_expert = torch.tensor([num_tokens, 0, 0, 0], dtype=torch.long, device="cpu")
+    dtype = torch.bfloat16
+    permuted_x = torch.randn(num_tokens, 16, device=device).to(dtype)
+    permuted_probs = torch.ones(num_tokens, device=device).to(dtype)
+
+    mock_dispatcher.token_permutation2 = MagicMock(
+        return_value=(permuted_x, tokens_per_expert, permuted_probs)
+    )
+    lora_module.token_dispatcher = mock_dispatcher
+
+    x = torch.randn(num_tokens, 16, device=device).to(dtype)
+    weights = torch.ones(num_tokens, 1, device=device).to(dtype)
+    indices = torch.zeros(num_tokens, 1, dtype=torch.long, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+    out = lora_module(x, token_mask, weights, indices)
+    assert out.shape == (num_tokens, 16)
+    assert not torch.isnan(out).any()
+
+
+@pytest.mark.skipif(
+    grouped_gemm is None or not torch.cuda.is_available(),
+    reason="Requires grouped_gemm and CUDA"
+)
+def test_deepep_lora_forward_grouped_gemm_with_bias(device):
+    """Test DeepEP LoRA forward with use_torch_mm=False (grouped_gemm) and expert_bias=True."""
+    config = MoEConfig(
+        n_routed_experts=4,
+        n_shared_experts=0,
+        n_activated_experts=2,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=16,
+        inter_dim=32,
+        moe_inter_dim=32,
+        norm_topk_prob=False,
+        expert_activation="swiglu",
+        dtype=torch.bfloat16,
+        expert_bias=True,
+    )
+
+    orig_experts = GroupedExpertsDeepEP(config).to(device).to(torch.bfloat16)
+    with torch.no_grad():
+        orig_experts.init_weights(device)
+    orig_experts.n_routed_experts = 4
+    orig_experts.ep_size = 1
+    orig_experts.use_torch_mm = False
+
+    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4).to(device).to(torch.bfloat16)
+
+    mock_dispatcher = MockDeepEPDispatcher()
+    num_tokens = 8
+    tokens_per_expert = torch.tensor([num_tokens, 0, 0, 0], dtype=torch.long, device="cpu")
+    dtype = torch.bfloat16
+    permuted_x = torch.randn(num_tokens, 16, device=device).to(dtype)
+    permuted_probs = torch.ones(num_tokens, device=device).to(dtype)
+
+    mock_dispatcher.token_permutation2 = MagicMock(
+        return_value=(permuted_x, tokens_per_expert, permuted_probs)
+    )
+    lora_module.token_dispatcher = mock_dispatcher
+
+    x = torch.randn(num_tokens, 16, device=device).to(dtype)
+    weights = torch.ones(num_tokens, 1, device=device).to(dtype)
+    indices = torch.zeros(num_tokens, 1, dtype=torch.long, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+    out = lora_module(x, token_mask, weights, indices)
+    assert out.shape == (num_tokens, 16)
+    assert not torch.isnan(out).any()
+
+
 # ---------- moe_rank_scaling tests ----------
 
 
