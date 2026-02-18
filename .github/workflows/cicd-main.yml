@@ -29,9 +29,6 @@ permissions:
   id-token: write
   contents: read
 
-env:
-  container-registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
-
 jobs:
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.69.1
@@ -193,7 +190,7 @@ jobs:
           cpu-only: ${{ matrix.cpu-only || false }}
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
-          container-image: ${{ env.container-registry }}/automodel:${{ github.sha }}
+          container-image: ${{ vars.ECR }}/automodel:${{ github.sha }}
           runner: ${{ matrix.runner }}
 
   cicd-e2e-tests:
@@ -263,7 +260,7 @@ jobs:
           is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ matrix.test-data-path }}
-          container-image: ${{ env.container-registry }}/automodel:${{ github.sha }}
+          container-image: ${{ vars.ECR }}/automodel:${{ github.sha }}
           runner: ${{ matrix.runner }}
 
   Nemo_CICD_Test:

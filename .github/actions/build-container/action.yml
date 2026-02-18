@@ -25,9 +25,6 @@ inputs:
     description: "The name of the repo to build container"
     required: true
 
-env:
-  container-registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
-
 runs:
   using: "composite"
   steps:
@@ -78,7 +75,7 @@ runs:
                 }
               }
             }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
-            echo "type=registry,ref=${{ env.container-registry }}/${{ env.REPO_LOWER }}:$number-buildcache,mode=max"
+            echo "type=registry,ref=${{ vars.ECR }}/${{ env.REPO_LOWER }}:$number-buildcache,mode=max"
           done)
 
         echo "LAST_PRS<<EOF" | tee -a $GITHUB_OUTPUT
@@ -98,14 +95,14 @@ runs:
           BASE_IMAGE=pytorch
           INSTALL_TE=True
         cache-from: |
-          type=registry,ref=${{ env.container-registry }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
-          type=registry,ref=${{ env.container-registry }}/${{ env.REPO_LOWER }}:main-buildcache,mode=max
+          type=registry,ref=${{ vars.ECR }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+          type=registry,ref=${{ vars.ECR }}/${{ env.REPO_LOWER }}:main-buildcache,mode=max
           ${{ steps.cache_from.outputs.LAST_PRS }}
         cache-to: |
-          type=registry,ref=${{ env.container-registry }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+          type=registry,ref=${{ vars.ECR }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
         no-cache: false
         tags: |
-          ${{ env.container-registry }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
-          ${{ env.container-registry }}/${{ env.REPO_LOWER }}:${{ github.sha }}
+          ${{ vars.ECR }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
+          ${{ vars.ECR }}/${{ env.REPO_LOWER }}:${{ github.sha }}
         secrets: |
           GH_TOKEN=${{ inputs.PAT }}
