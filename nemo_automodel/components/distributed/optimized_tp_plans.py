@@ -41,6 +41,7 @@ from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
+from nemo_automodel.components.distributed.parallel_styles import FusedColwiseParallel  # noqa: F401
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
 from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
@@ -125,107 +126,6 @@ class VocabParallelEmbedding(RowwiseParallel):
                 mb.materialize_mask(mask)
 
         return RowwiseParallel._prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh)
-
-
-class FusedColwiseParallel(ColwiseParallel):
-    """Column-wise parallelism for fused Q/K/V (or Q/KV) linear projections.
-
-    A fused QKV linear has weight whose output is the concatenation
-    ``[Q | K | V]``.  Standard ``ColwiseParallel`` shards the first
-    dimension contiguously, which crosses Q/K/V boundaries and mixes
-    heads from different projections on different TP ranks.
-
-    ``FusedColwiseParallel`` instead splits the weight (and bias) into
-    sections and shards **each section** independently with ``Shard(0)``,
-    then concatenates the local shards.  This ensures every rank receives
-    the correct head subset from every section.
-
-    Sections can be either:
-
-    - **Equal-sized** (default): specified via ``num_sections``
-      (e.g. ``num_sections=3`` for MHA where Q, K, V have the same size,
-      or ``num_sections=2`` for fused gate_up projections).
-    - **Variable-sized**: specified via ``section_sizes``
-      (e.g. ``section_sizes=(q_size, kv_size, kv_size)`` for GQA where Q
-      has more heads than K/V).  When provided, takes precedence over
-      ``num_sections``.
-
-    YAML string: ``"fused_colwise"``
-
-    Note on checkpointing
-    ---------------------
-    Because the local shard concatenates non-contiguous slices of the
-    original weight, ``DTensor.full_tensor()`` will reconstruct a
-    **permuted** weight (heads interleaved across sections) rather than
-    the original ``[Q | K | V]`` layout.  Distributed-checkpoint
-    save/load at the **same** TP degree works correctly; cross-TP-degree
-    resharding requires a state-dict adapter that re-partitions the fused
-    QKV weight.
-
-    Args:
-        num_sections: Number of equal-sized fused sections.  Default ``3``
-            for Q/K/V.  Ignored when ``section_sizes`` is provided.
-        section_sizes: Explicit per-section sizes along dim-0.  Each
-            section must be independently divisible by the TP world size.
-            When provided, takes precedence over ``num_sections``.
-    """
-
-    def __init__(
-        self,
-        *,
-        num_sections: int = 3,
-        section_sizes: Optional[tuple[int, ...]] = None,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.num_sections = num_sections
-        self.section_sizes = section_sizes
-
-    # -- custom partition function ------------------------------------
-    def _partition_linear_fn(self, name, module, device_mesh):
-        from torch.distributed.tensor import distribute_tensor
-
-        for pname, param in list(module.named_parameters()):
-            if isinstance(param, DTensor):
-                continue  # already distributed
-
-            dim0 = param.shape[0]
-
-            if self.section_sizes is not None:
-                if sum(self.section_sizes) != dim0:
-                    raise ValueError(
-                        f"FusedColwiseParallel: parameter '{pname}' dim-0 "
-                        f"({dim0}) does not match sum of section_sizes "
-                        f"({self.section_sizes}, sum={sum(self.section_sizes)})."
-                    )
-                sections = param.data.split(list(self.section_sizes), dim=0)
-            else:
-                ns = self.num_sections
-                if dim0 % ns != 0:
-                    raise ValueError(
-                        f"FusedColwiseParallel: parameter '{pname}' dim-0 "
-                        f"({dim0}) is not divisible by num_sections ({ns})."
-                    )
-                sections = param.data.chunk(ns, dim=0)
-
-            # Distribute each section with Shard(0), concatenate the
-            # local shards.
-            local_parts = []
-            for sec in sections:
-                dt = distribute_tensor(sec, device_mesh, [Shard(0)])
-                local_parts.append(dt.to_local())
-
-            local_data = torch.cat(local_parts, dim=0)
-
-            dist_param = nn.Parameter(
-                DTensor.from_local(
-                    local_data,
-                    device_mesh,
-                    [Shard(0)],
-                    run_check=False,
-                )
-            )
-            module.register_parameter(pname, dist_param)
 
 
 class RotaryEmbedParallel(SequenceParallel):

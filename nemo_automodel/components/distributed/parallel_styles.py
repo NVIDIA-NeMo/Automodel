@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Optional
+
 import torch
 import torch.nn as nn
 from torch.distributed.tensor import (
@@ -35,6 +37,140 @@ def _distribute_param(_module, name, device_mesh, src_data_rank, placements):
     )
     assert dist_param.requires_grad == param.requires_grad
     _module.register_parameter(name, dist_param)
+
+
+class FusedColwiseParallel(ColwiseParallel):
+    """Column-wise parallelism for fused Q/K/V (or Q/KV) linear projections.
+
+    A fused QKV linear has weight whose output is the concatenation
+    ``[Q | K | V]``.  Standard ``ColwiseParallel`` shards the first
+    dimension contiguously, which crosses Q/K/V boundaries and mixes
+    heads from different projections on different TP ranks.
+
+    ``FusedColwiseParallel`` instead splits the weight (and bias) into
+    sections and shards **each section** independently with ``Shard(0)``,
+    then concatenates the local shards.  This ensures every rank receives
+    the correct head subset from every section.
+
+    Sections can be either:
+
+    - **Equal-sized** (default): specified via ``num_sections``
+      (e.g. ``num_sections=3`` for MHA where Q, K, V have the same size,
+      or ``num_sections=2`` for fused gate_up projections).
+    - **Variable-sized**: specified via ``section_sizes``
+      (e.g. ``section_sizes=(q_size, kv_size, kv_size)`` for GQA where Q
+      has more heads than K/V).  When provided, takes precedence over
+      ``num_sections``.
+
+    YAML string: ``"fused_colwise"``
+
+    Note on checkpointing
+    ---------------------
+    Because the local shard concatenates non-contiguous slices of the
+    original weight, ``DTensor.full_tensor()`` will reconstruct a
+    **permuted** weight (heads interleaved across sections) rather than
+    the original ``[Q | K | V]`` layout.  Distributed-checkpoint
+    save/load at the **same** TP degree works correctly; cross-TP-degree
+    resharding requires a state-dict adapter that re-partitions the fused
+    QKV weight.
+
+    Args:
+        num_sections: Number of equal-sized fused sections.  Default ``3``
+            for Q/K/V.  Ignored when ``section_sizes`` is provided.
+        section_sizes: Explicit per-section sizes along dim-0.  Each
+            section must be independently divisible by the TP world size.
+            When provided, takes precedence over ``num_sections``.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_sections: int = 3,
+        section_sizes: Optional[tuple[int, ...]] = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.num_sections = num_sections
+        self.section_sizes = section_sizes
+
+    @staticmethod
+    def _set_param(module, dotted_name, param):
+        """Register *param* on the correct (sub)module for *dotted_name*."""
+        parts = dotted_name.rsplit(".", 1)
+        if len(parts) == 1:
+            module.register_parameter(parts[0], param)
+        else:
+            submod = module.get_submodule(parts[0])
+            submod.register_parameter(parts[1], param)
+
+    def _partition_linear_fn(self, name, module, device_mesh):
+        for pname, param in list(module.named_parameters()):
+            if isinstance(param, DTensor):
+                continue  # already distributed
+
+            dim0 = param.shape[0]
+
+            # Check whether this parameter has the fused output dimension.
+            # Adapter parameters (e.g. LoRA lora_A) may have a different
+            # dim-0; fall back to plain Shard(0) for those.
+            if self.section_sizes is not None:
+                needs_fused_split = sum(self.section_sizes) == dim0
+            else:
+                needs_fused_split = dim0 % self.num_sections == 0
+
+            if not needs_fused_split:
+                dist_param = nn.Parameter(
+                    distribute_tensor(param.data, device_mesh, [Shard(0)])
+                )
+                self._set_param(module, pname, dist_param)
+                continue
+
+            if self.section_sizes is not None:
+                sections = param.data.split(list(self.section_sizes), dim=0)
+            else:
+                sections = param.data.chunk(self.num_sections, dim=0)
+
+            local_parts = []
+            for sec in sections:
+                dt = distribute_tensor(sec, device_mesh, [Shard(0)])
+                local_parts.append(dt.to_local())
+
+            local_data = torch.cat(local_parts, dim=0)
+
+            dist_param = nn.Parameter(
+                DTensor.from_local(
+                    local_data,
+                    device_mesh,
+                    [Shard(0)],
+                    run_check=False,
+                )
+            )
+            self._set_param(module, pname, dist_param)
+
+
+class FusedColwiseParallelLora(FusedColwiseParallel):
+    """LoRA-aware ``FusedColwiseParallel``.
+
+    The parent class already handles LoRA adapter parameters gracefully
+    (falls back to plain ``Shard(0)`` when dim-0 doesn't match the fused
+    output dimension).  This subclass adds a forward hook on ``lora_A``
+    that all-gathers its sharded output before it is projected by
+    ``lora_B``, mirroring the pattern used in ``ColwiseParallelLora``.
+    """
+
+    def _partition_linear_fn(self, name, module, device_mesh):
+        super()._partition_linear_fn(name, module, device_mesh)
+
+        def lora_a_output_hook(module, input, output):
+            if isinstance(output, DTensor):
+                if any(isinstance(p, Shard) for p in output.placements):
+                    output = output.redistribute(
+                        device_mesh=output.device_mesh, placements=[Replicate()]
+                    )
+            return output
+
+        if hasattr(module, "lora_A"):
+            module.lora_A.register_forward_hook(lora_a_output_hook)
 
 
 class ColwiseParallelLora(ColwiseParallel):
@@ -107,6 +243,7 @@ class SequenceParallelLora(SequenceParallel):
 def translate_to_lora(plan):
     CLS_MAP = {
         ColwiseParallel: ColwiseParallelLora,
+        FusedColwiseParallel: FusedColwiseParallelLora,
         RowwiseParallel: RowwiseParallelLora,
         SequenceParallel: SequenceParallelLora,
     }
