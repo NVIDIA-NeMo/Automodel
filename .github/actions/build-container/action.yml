@@ -24,6 +24,9 @@ inputs:
   repo-name:
     description: "The name of the repo to build container"
     required: true
+  registry:
+    description: "The registry to build container"
+    required: true
 
 runs:
   using: "composite"
@@ -61,7 +64,7 @@ runs:
       id: cache_from
       env:
         GH_TOKEN: ${{ github.token }}
-        REGISTRY: ${{ vars.ECR }}
+        REGISTRY: ${{ inputs.registry }}
       run: |
         LAST_PRS=$(gh api graphql \
           -F owner="NVIDIA-NeMo" \

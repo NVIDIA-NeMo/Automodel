@@ -155,6 +155,7 @@ jobs:
           dockerfile-path: "./docker/Dockerfile"
           PAT: ${{ secrets.PAT }}
           repo-name: "Automodel"
+          registry: ${{ vars.ECR }}
 
   cicd-unit-tests:
     strategy:
