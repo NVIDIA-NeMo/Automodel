@@ -25,7 +25,7 @@ To run this guide on a single GPU, use the single-GPU command in the **Launch Tr
 
 ## Preprocess the FineWeb Dataset
 
-::::{warning}
+:::{warning}
 **File Size Limitation**: The `nanogpt_data_processor.py` script has a **4GB file size limit** (~2^32 bytes) due to 32-bit position tracking in the BOS index. This translates to:
 - **~2 billion tokens** when using uint16 (vocabularies < 65,536 tokens, e.g., GPT-2)
 - **~1 billion tokens** when using uint32 (larger vocabularies)
