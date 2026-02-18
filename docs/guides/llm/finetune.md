@@ -436,7 +436,7 @@ pip3 install huggingface_hub
 huggingface-cli login
 ```
 
-3.  Upload the fine-tuned checkpoint using the
+3. Upload the fine-tuned checkpoint using the
     [huggingface_hub](https://github.com/huggingface/huggingface_hub) Python API:
 
 ```python
