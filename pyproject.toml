@@ -116,7 +116,7 @@ moe = [
     "deep_ep",
 ]
 vlm = [
-    "albumentations"
+    "albumentations",
     "backoff",
     "mistral_common[opencv]>=1.9.0",
     "numpy",
