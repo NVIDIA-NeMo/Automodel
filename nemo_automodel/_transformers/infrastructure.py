@@ -318,6 +318,7 @@ def apply_model_infrastructure(
     load_base_model=False,
     cache_dir=None,
     pretrained_model_name_or_path="",
+    use_dcp_for_base_model_load=False,
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -358,6 +359,7 @@ def apply_model_infrastructure(
         mesh = MeshContext()
 
     # Create a dummy checkpointer. We can pass in dummy values here since we are only loading the base weights.
+    # use_dcp_for_base_model_load (from recipe checkpoint config) uses DCP distributed read instead of per-rank full load.
     ckpt_config = CheckpointingConfig(
         enabled=True,
         checkpoint_dir="",
@@ -366,6 +368,7 @@ def apply_model_infrastructure(
         model_repo_id=pretrained_model_name_or_path,
         save_consolidated=True,
         is_peft=peft_config is not None,
+        use_dcp_for_base_model_load=use_dcp_for_base_model_load,
     )
     checkpointer = Checkpointer(
         ckpt_config,

@@ -148,6 +148,7 @@ def build_model(
     cfg_moe=None,
     activation_checkpointing=False,
     unfreeze_modules: list[str] | None = None,
+    checkpoint_config=None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model.
 
@@ -221,7 +222,11 @@ def build_model(
         )
 
         if is_nemo_auto_model:
-            # NeMoAutoModel handles infrastructure internally
+            # NeMoAutoModel handles infrastructure internally; pass base-load option so infra uses it.
+            if checkpoint_config is not None:
+                kwargs["use_dcp_for_base_model_load"] = getattr(
+                    checkpoint_config, "use_dcp_for_base_model_load", False
+                )
             model = cfg_model.instantiate(**kwargs)
         else:
             # For non-NemoAutoModel entry points (e.g., build_gpt2_model),
@@ -943,6 +948,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_qat=self.cfg.get("qat", None),
             cfg_moe=self.dist_setup.moe_config,
             activation_checkpointing=self.dist_setup.activation_checkpointing,
+            checkpoint_config=checkpoint_config,
         )
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 

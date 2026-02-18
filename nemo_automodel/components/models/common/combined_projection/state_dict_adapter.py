@@ -73,6 +73,41 @@ class CombinedProjectionStateDictAdapter:
         # Compute projection sizes
         self.q_size = self.num_attention_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
+        self.group_size = self.num_attention_heads // self.num_key_value_heads
+
+    def _interleave_qkv(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Interleave Q, K, V by KV-head groups for TP-correct ColwiseParallel sharding.
+
+        Layout: [Q_group_0 | K_0 | V_0 | Q_group_1 | K_1 | V_1 | ...]
+        where each group has (group_size * head_dim) Q rows, head_dim K rows, head_dim V rows.
+        """
+        rest = q.shape[1:]
+        q = q.view(self.num_key_value_heads, self.group_size * self.head_dim, *rest)
+        k = k.view(self.num_key_value_heads, self.head_dim, *rest)
+        v = v.view(self.num_key_value_heads, self.head_dim, *rest)
+        return torch.cat([q, k, v], dim=1).reshape(-1, *rest)
+
+    def _deinterleave_qkv(self, qkv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """De-interleave QKV from KV-head-grouped layout back to separate Q, K, V.
+
+        Works for both full (unsharded) and TP-sharded tensors — the group structure
+        is the same regardless of how many groups this rank holds.
+        """
+        rest = qkv.shape[1:]
+        group_width = (self.group_size + 2) * self.head_dim
+        qkv = qkv.view(-1, group_width, *rest)
+        q, k, v = qkv.split([self.group_size * self.head_dim, self.head_dim, self.head_dim], dim=1)
+        return q.reshape(-1, *rest), k.reshape(-1, *rest), v.reshape(-1, *rest)
+
+    def _interleave_gate_up(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        """Interleave gate and up row-by-row for TP-correct ColwiseParallel sharding."""
+        return torch.stack([gate, up], dim=1).reshape(-1, *gate.shape[1:])
+
+    def _deinterleave_gate_up(self, gate_up: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """De-interleave gate/up from row-interleaved layout."""
+        rest = gate_up.shape[1:]
+        gate_up = gate_up.view(-1, 2, *rest)
+        return gate_up[:, 0].contiguous(), gate_up[:, 1].contiguous()
 
     def from_hf(self, hf_state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
         """Convert HuggingFace state dict to combined-projection format.
@@ -110,8 +145,7 @@ class CombinedProjectionStateDictAdapter:
                 k_weight = hf_state_dict[k_weight_key]
                 v_weight = hf_state_dict[v_weight_key]
 
-                # Concatenate along output dimension
-                qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+                qkv_weight = self._interleave_qkv(q_weight, k_weight, v_weight)
                 custom_state_dict[f"{prefix}.self_attn.qkv_proj.weight"] = qkv_weight
                 processed_keys.update([q_weight_key, k_weight_key, v_weight_key])
 
@@ -121,8 +155,8 @@ class CombinedProjectionStateDictAdapter:
                     k_bias_key = f"{prefix}.self_attn.k_proj.bias"
                     v_bias_key = f"{prefix}.self_attn.v_proj.bias"
 
-                    qkv_bias = torch.cat(
-                        [hf_state_dict[q_bias_key], hf_state_dict[k_bias_key], hf_state_dict[v_bias_key]], dim=0
+                    qkv_bias = self._interleave_qkv(
+                        hf_state_dict[q_bias_key], hf_state_dict[k_bias_key], hf_state_dict[v_bias_key]
                     )
                     custom_state_dict[f"{prefix}.self_attn.qkv_proj.bias"] = qkv_bias
                     processed_keys.update([q_bias_key, k_bias_key, v_bias_key])
@@ -135,8 +169,7 @@ class CombinedProjectionStateDictAdapter:
                 gate_weight = hf_state_dict[gate_weight_key]
                 up_weight = hf_state_dict[up_weight_key]
 
-                # Concatenate along output dimension
-                gate_up_weight = torch.cat([gate_weight, up_weight], dim=0)
+                gate_up_weight = self._interleave_gate_up(gate_weight, up_weight)
                 custom_state_dict[f"{prefix}.mlp.gate_up_proj.weight"] = gate_up_weight
                 processed_keys.update([gate_weight_key, up_weight_key])
 
@@ -145,7 +178,9 @@ class CombinedProjectionStateDictAdapter:
                 if gate_bias_key in hf_state_dict:
                     up_bias_key = f"{prefix}.mlp.up_proj.bias"
 
-                    gate_up_bias = torch.cat([hf_state_dict[gate_bias_key], hf_state_dict[up_bias_key]], dim=0)
+                    gate_up_bias = self._interleave_gate_up(
+                        hf_state_dict[gate_bias_key], hf_state_dict[up_bias_key]
+                    )
                     custom_state_dict[f"{prefix}.mlp.gate_up_proj.bias"] = gate_up_bias
                     processed_keys.update([gate_bias_key, up_bias_key])
 
@@ -206,15 +241,7 @@ class CombinedProjectionStateDictAdapter:
             qkv_weight_key = f"{prefix}.self_attn.qkv_proj.weight"
 
             if qkv_weight_key in state_dict:
-                qkv_weight = state_dict[qkv_weight_key]
-
-                # Compute local split sizes based on actual tensor size (handles TP sharding)
-                qkv_actual_size = qkv_weight.shape[0]
-                total_size = self.q_size + 2 * self.kv_size
-                local_q_size = (self.q_size * qkv_actual_size) // total_size
-                local_kv_size = (self.kv_size * qkv_actual_size) // total_size
-
-                q_weight, k_weight, v_weight = qkv_weight.split([local_q_size, local_kv_size, local_kv_size], dim=0)
+                q_weight, k_weight, v_weight = self._deinterleave_qkv(state_dict[qkv_weight_key])
 
                 hf_state_dict[f"{prefix}.self_attn.q_proj.weight"] = q_weight
                 hf_state_dict[f"{prefix}.self_attn.k_proj.weight"] = k_weight
@@ -224,12 +251,7 @@ class CombinedProjectionStateDictAdapter:
                 # Handle biases if present
                 qkv_bias_key = f"{prefix}.self_attn.qkv_proj.bias"
                 if qkv_bias_key in state_dict:
-                    qkv_bias = state_dict[qkv_bias_key]
-                    qkv_bias_size = qkv_bias.shape[0]
-                    local_q_size = (self.q_size * qkv_bias_size) // total_size
-                    local_kv_size = (self.kv_size * qkv_bias_size) // total_size
-
-                    q_bias, k_bias, v_bias = qkv_bias.split([local_q_size, local_kv_size, local_kv_size], dim=0)
+                    q_bias, k_bias, v_bias = self._deinterleave_qkv(state_dict[qkv_bias_key])
 
                     hf_state_dict[f"{prefix}.self_attn.q_proj.bias"] = q_bias
                     hf_state_dict[f"{prefix}.self_attn.k_proj.bias"] = k_bias
@@ -240,13 +262,7 @@ class CombinedProjectionStateDictAdapter:
             gate_up_weight_key = f"{prefix}.mlp.gate_up_proj.weight"
 
             if gate_up_weight_key in state_dict:
-                gate_up_weight = state_dict[gate_up_weight_key]
-
-                # Compute local split sizes
-                gate_up_actual_size = gate_up_weight.shape[0]
-                local_intermediate_size = gate_up_actual_size // 2
-
-                gate_weight, up_weight = gate_up_weight.split([local_intermediate_size, local_intermediate_size], dim=0)
+                gate_weight, up_weight = self._deinterleave_gate_up(state_dict[gate_up_weight_key])
 
                 hf_state_dict[f"{prefix}.mlp.gate_proj.weight"] = gate_weight
                 hf_state_dict[f"{prefix}.mlp.up_proj.weight"] = up_weight
@@ -255,11 +271,7 @@ class CombinedProjectionStateDictAdapter:
                 # Handle biases if present
                 gate_up_bias_key = f"{prefix}.mlp.gate_up_proj.bias"
                 if gate_up_bias_key in state_dict:
-                    gate_up_bias = state_dict[gate_up_bias_key]
-                    gate_up_bias_size = gate_up_bias.shape[0]
-                    local_intermediate_size = gate_up_bias_size // 2
-
-                    gate_bias, up_bias = gate_up_bias.split([local_intermediate_size, local_intermediate_size], dim=0)
+                    gate_bias, up_bias = self._deinterleave_gate_up(state_dict[gate_up_bias_key])
 
                     hf_state_dict[f"{prefix}.mlp.gate_proj.bias"] = gate_bias
                     hf_state_dict[f"{prefix}.mlp.up_proj.bias"] = up_bias
@@ -312,13 +324,8 @@ class CombinedProjectionStateDictAdapter:
                 hf_state_dict[f"{pre}.self_attn.k_proj.{suffix}"] = value.clone()
                 hf_state_dict[f"{pre}.self_attn.v_proj.{suffix}"] = value.clone()
             else:
-                # Output-dimension weight (lora_B, magnitude, base weight/bias): split
-                actual_size = value.shape[0]
-                total_size = self.q_size + 2 * self.kv_size
-                local_q_size = (self.q_size * actual_size) // total_size
-                local_kv_size = (self.kv_size * actual_size) // total_size
-
-                q_val, k_val, v_val = value.split([local_q_size, local_kv_size, local_kv_size], dim=0)
+                # Output-dimension weight (lora_B, magnitude, base weight/bias): de-interleave
+                q_val, k_val, v_val = self._deinterleave_qkv(value)
                 hf_state_dict[f"{pre}.self_attn.q_proj.{suffix}"] = q_val
                 hf_state_dict[f"{pre}.self_attn.k_proj.{suffix}"] = k_val
                 hf_state_dict[f"{pre}.self_attn.v_proj.{suffix}"] = v_val
@@ -332,10 +339,8 @@ class CombinedProjectionStateDictAdapter:
                 hf_state_dict[f"{pre}.mlp.gate_proj.{suffix}"] = value
                 hf_state_dict[f"{pre}.mlp.up_proj.{suffix}"] = value.clone()
             else:
-                actual_size = value.shape[0]
-                local_intermediate_size = actual_size // 2
-
-                gate_val, up_val = value.split([local_intermediate_size, local_intermediate_size], dim=0)
+                # Output-dimension weight: de-interleave
+                gate_val, up_val = self._deinterleave_gate_up(value)
                 hf_state_dict[f"{pre}.mlp.gate_proj.{suffix}"] = gate_val
                 hf_state_dict[f"{pre}.mlp.up_proj.{suffix}"] = up_val
 
@@ -391,8 +396,8 @@ class CombinedProjectionStateDictAdapter:
                 # lora_A weights were duplicated during split — just take one
                 state_dict[combined_key] = q_val
             else:
-                # lora_B, magnitude, etc. — concatenate along dim 0
-                state_dict[combined_key] = torch.cat([q_val, k_val, v_val], dim=0)
+                # lora_B, magnitude, etc. — interleave by KV-head groups
+                state_dict[combined_key] = self._interleave_qkv(q_val, k_val, v_val)
 
         # --- gate_up recombination ---
         gate_keys = [
@@ -418,5 +423,5 @@ class CombinedProjectionStateDictAdapter:
                 # lora_A weights were duplicated during split — just take one
                 state_dict[combined_key] = gate_val
             else:
-                # lora_B, magnitude, etc. — concatenate along dim 0
-                state_dict[combined_key] = torch.cat([gate_val, up_val], dim=0)
+                # lora_B, magnitude, etc. — interleave row-by-row
+                state_dict[combined_key] = self._interleave_gate_up(gate_val, up_val)

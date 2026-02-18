@@ -122,6 +122,9 @@ class CheckpointingConfig:
     # This should be used for remote storage systems that don't support direct-append or non-sequential writes.
     staging_dir: str | None = None  # Optional directory for staging files during consolidation.
     # If provided, temp files will be created here instead of system temp. Useful when system temp has limited space.
+    # If True, load base model via DCP (distributed read) instead of "every rank loads full state dict".
+    # Can avoid slow sequential CPU load + distribute when many ranks each do a full ckpt read and CPU→GPU copy.
+    use_dcp_for_base_model_load: bool = False
 
     def __post_init__(self):
         """
@@ -348,6 +351,11 @@ class Checkpointer:
         # Check if this model requires tensor merging (e.g., Mixtral with grouped experts)
         model_type = getattr(getattr(model_state.model[0], "config", None), "model_type", None)
         has_state_dict_adapter = hasattr(model_state.model[0], "state_dict_adapter")
+        if is_init_step:
+            logging.info(
+                "load_model (is_init_step): use_dcp_for_base_model_load=%s",
+                getattr(self.config, "use_dcp_for_base_model_load", False),
+            )
 
         # For models that need tensor merging and don't have an adapter, try using transformers' conversion
         if is_init_step and model_type and requires_tensor_merging(model_type) and not has_state_dict_adapter:
@@ -363,11 +371,14 @@ class Checkpointer:
         # local DTensor shard.  This avoids NCCL collectives entirely, side-stepping
         # the broadcast_from_rank0 hang where rank 0's synchronous CPU→GPU copies
         # fall behind other ranks' async allocations.
+        # Set use_dcp_for_base_model_load=True to use DCP distributed load instead (each rank
+        # reads only its shards), which can avoid slow per-rank full read + CPU→GPU "distribute".
         if (
             is_init_step
             and len(model_state.model) == 1
             and _is_safetensors_checkpoint(model_path)
             and not _is_custom_model(model_state.model[0])
+            and not getattr(self.config, "use_dcp_for_base_model_load", False)
         ):
             t0 = time.monotonic()
             state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
@@ -406,6 +417,8 @@ class Checkpointer:
             return
 
         # Standard loading path (DCP copies into model's existing tensors; dtypes follow the model)
+        if is_init_step and getattr(self.config, "use_dcp_for_base_model_load", False):
+            logging.info("Loading base model via DCP (use_dcp_for_base_model_load=True); distributed read.")
         state_dict = model_state.state_dict()
         # When the model has a state_dict_adapter, it handles all key transformations
         # (to_hf/from_hf). Passing key_mapping to the storage reader would double-transform
