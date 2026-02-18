@@ -33,7 +33,7 @@ To run this guide on a single GPU, use the single-GPU command in the **Launch Tr
 Always use the `--max-tokens` flag to stay within these limits (e.g., `--max-tokens 2B` or `--max-tokens 1.5B`).
 
 For larger datasets, please see [pretraining.md](pretraining.md) which supports sharded preprocessing without these constraints.
-::::
+:::
 
 ### Quick Intro to the FineWeb Dataset
 The [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset consists of more than 18.5T tokens of cleaned and deduplicated English web data from [CommonCrawl](https://commoncrawl.org/). For this guide, we use the **`sample-10BT` subset** (10 billion tokens), from which we extract a smaller sample (e.g., 500M tokens) that fits within the preprocessing tool's limits.
