@@ -64,6 +64,14 @@ def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
     return overwrite_dict
 
 
+def apply_qwen3_omni_config_patch():
+    """Fix Qwen3OmniMoeTalkerCodePredictorConfig accessing use_sliding_window."""
+    from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTalkerCodePredictorConfig
+    if not hasattr(Qwen3OmniMoeTalkerCodePredictorConfig, "use_sliding_window"):
+        Qwen3OmniMoeTalkerCodePredictorConfig.use_sliding_window = False
+
+
+
 def apply_cache_compatibility_patches():
     """Apply compatibility patches for transformers cache utilities."""
     # Alias cache API for models expecting get_usable_length
