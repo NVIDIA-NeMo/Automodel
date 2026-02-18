@@ -178,9 +178,7 @@ class CombinedProjectionStateDictAdapter:
                 if gate_bias_key in hf_state_dict:
                     up_bias_key = f"{prefix}.mlp.up_proj.bias"
 
-                    gate_up_bias = self._interleave_gate_up(
-                        hf_state_dict[gate_bias_key], hf_state_dict[up_bias_key]
-                    )
+                    gate_up_bias = self._interleave_gate_up(hf_state_dict[gate_bias_key], hf_state_dict[up_bias_key])
                     custom_state_dict[f"{prefix}.mlp.gate_up_proj.bias"] = gate_up_bias
                     processed_keys.update([gate_bias_key, up_bias_key])
 

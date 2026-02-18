@@ -115,7 +115,5 @@ class CombinedQKVAttentionMixin:
 
         group_width = (self._num_kv_groups + 2) * self._head_dim
         qkv = qkv.unflatten(-1, (-1, group_width))
-        q, k, v = qkv.split(
-            [self._num_kv_groups * self._head_dim, self._head_dim, self._head_dim], dim=-1
-        )
+        q, k, v = qkv.split([self._num_kv_groups * self._head_dim, self._head_dim, self._head_dim], dim=-1)
         return q.flatten(-2), k.flatten(-2), v.flatten(-2)
