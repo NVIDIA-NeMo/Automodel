@@ -66,7 +66,6 @@ jobs:
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
     container:
       image: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-    environment: nemo-ci
     strategy:
       fail-fast: false
       matrix:
@@ -139,7 +138,6 @@ jobs:
     name: Pip - Python${{ matrix.python-version }}${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }} - AMD64/Linux - NGC CUDA
     container:
       image: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-    environment: nemo-ci
     needs: [pre-flight]
     if: |
       !(needs.pre-flight.outputs.docs_only == 'true'
@@ -196,7 +194,6 @@ jobs:
     if: |
       !(needs.pre-flight.outputs.docs_only == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
-    environment: nemo-ci
     strategy:
       fail-fast: false
       matrix:
