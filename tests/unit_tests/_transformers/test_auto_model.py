@@ -14,20 +14,19 @@
 
 import logging
 import types
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
 from nemo_automodel._transformers.auto_model import (
+    _consume_config_overrides,
     _get_next_fallback_attn,
     _init_model,
     _patch_attention,
-    _get_mixin_wrapped_class,
-    _apply_peft_and_lower_precision,
-    _consume_config_overrides,
-    _filter_kwargs_for_init,
 )
+from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
+from nemo_automodel._transformers.model_init import _filter_kwargs_for_init, _get_mixin_wrapped_class
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
 
@@ -89,7 +88,7 @@ class TestUtilityFunctions:
 
     def test_assert_same_signature_matching(self):
         """Test _assert_same_signature with matching signatures."""
-        from nemo_automodel._transformers.auto_model import _assert_same_signature
+        from nemo_automodel._transformers.kernel_patches import _assert_same_signature
 
         def func1(a, b, c=None):
             pass
@@ -102,7 +101,7 @@ class TestUtilityFunctions:
 
     def test_assert_same_signature_different(self):
         """Test _assert_same_signature with different signatures."""
-        from nemo_automodel._transformers.auto_model import _assert_same_signature
+        from nemo_automodel._transformers.kernel_patches import _assert_same_signature
 
         def func1(a, b, c=None):
             pass
@@ -514,6 +513,7 @@ class TestNeedSetupCacheClassesMapping:
     def test_shim_does_not_overwrite_existing_attribute(self):
         """If NEED_SETUP_CACHE_CLASSES_MAPPING already exists, shim doesn't overwrite."""
         import importlib
+
         import transformers.generation.utils as gen_utils
 
         sentinel = {"test": "sentinel_value"}
@@ -532,6 +532,7 @@ class TestNeedSetupCacheClassesMapping:
     def test_shim_creates_attribute_when_missing(self):
         """If NEED_SETUP_CACHE_CLASSES_MAPPING is missing, shim creates it."""
         import importlib
+
         import transformers.generation.utils as gen_utils
 
         # Remove the attribute if it exists
@@ -699,3 +700,41 @@ class TestModelMappingKeyErrorFallback:
 
         assert is_custom is False
         mock_wrap.assert_called_once_with(FakeModel)
+
+
+class TestNeMoAutoModelForMultimodalLM:
+    """Tests for the NeMoAutoModelForMultimodalLM class and its exports."""
+
+    def test_class_exists_and_inherits_correctly(self):
+        from transformers import AutoModelForMultimodalLM
+
+        from nemo_automodel._transformers.auto_model import NeMoAutoModelForMultimodalLM, _BaseNeMoAutoModelClass
+
+        assert issubclass(NeMoAutoModelForMultimodalLM, _BaseNeMoAutoModelClass)
+        assert issubclass(NeMoAutoModelForMultimodalLM, AutoModelForMultimodalLM)
+
+    def test_has_from_pretrained_and_from_config(self):
+        from nemo_automodel._transformers.auto_model import NeMoAutoModelForMultimodalLM
+
+        assert callable(NeMoAutoModelForMultimodalLM.from_pretrained)
+        assert callable(NeMoAutoModelForMultimodalLM.from_config)
+
+    def test_lazy_export_from_transformers_subpackage(self):
+        from nemo_automodel._transformers import NeMoAutoModelForMultimodalLM
+
+        assert NeMoAutoModelForMultimodalLM is not None
+
+    def test_lazy_export_from_top_level_package(self):
+        from nemo_automodel import NeMoAutoModelForMultimodalLM
+
+        assert NeMoAutoModelForMultimodalLM is not None
+
+    def test_top_level_dir_includes_multimodal(self):
+        import nemo_automodel
+
+        assert "NeMoAutoModelForMultimodalLM" in dir(nemo_automodel)
+
+    def test_transformers_subpackage_all_includes_multimodal(self):
+        import nemo_automodel._transformers as pkg
+
+        assert "NeMoAutoModelForMultimodalLM" in pkg.__all__

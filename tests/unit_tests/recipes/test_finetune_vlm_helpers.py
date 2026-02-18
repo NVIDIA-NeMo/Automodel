@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
 import pytest
 import torch
 import torch.nn as nn
-from unittest.mock import patch, MagicMock
-from types import SimpleNamespace
-
-from contextlib import nullcontext
 
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.recipes.vlm.finetune import (
@@ -41,7 +41,6 @@ def test_get_model_name_prefers_pretrained_path():
     assert _get_model_name(_Cfg()) is None
 
 
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
 
 
@@ -154,7 +153,7 @@ def test_build_model_passes_freeze_config():
 
     class FreezeConfig:
         def to_dict(self):
-            return {"freeze_embeddings": True, "freeze_language_model": False}
+            return {"freeze_language_model": False, "freeze_vision_tower": True}
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
         model = build_model(
@@ -166,7 +165,117 @@ def test_build_model_passes_freeze_config():
 
     # Verify freeze_config was passed to model instantiation
     assert "freeze_config" in captured_kwargs
-    assert captured_kwargs["freeze_config"] == {"freeze_embeddings": True, "freeze_language_model": False}
+    assert captured_kwargs["freeze_config"] == {"freeze_language_model": False, "freeze_vision_tower": True}
+
+
+def test_build_model_passes_moe_config_from_parallelizer_config():
+    """Test that cfg_moe as MoEParallelizerConfig is forwarded directly."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+    from nemo_automodel.components.moe.config import MoEParallelizerConfig
+
+    captured_kwargs = {}
+
+    class CapturingModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
+        def instantiate(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = CapturingModelConfig()
+    moe_cfg = MoEParallelizerConfig()
+
+    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+        build_model(
+            cfg_model=cfg_model,
+            cfg_freeze=None,
+            cfg_peft=None,
+            seed=123,
+            cfg_moe=moe_cfg,
+            activation_checkpointing=True,
+        )
+
+    assert "moe_config" in captured_kwargs
+    assert captured_kwargs["moe_config"] is moe_cfg
+    assert captured_kwargs["activation_checkpointing"] is True
+
+
+def test_build_model_passes_moe_config_from_dict_like():
+    """Test that cfg_moe with to_dict() is converted to MoEParallelizerConfig."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+    from nemo_automodel.components.moe.config import MoEParallelizerConfig
+
+    captured_kwargs = {}
+
+    class CapturingModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
+        def instantiate(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    class DictLikeMoeConfig:
+        def to_dict(self):
+            return {
+                "activation_checkpointing": True,  # should be stripped
+                "_target_": "some.target",  # should be stripped
+            }
+
+    cfg_model = CapturingModelConfig()
+
+    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+        build_model(
+            cfg_model=cfg_model,
+            cfg_freeze=None,
+            cfg_peft=None,
+            seed=123,
+            cfg_moe=DictLikeMoeConfig(),
+            activation_checkpointing=False,
+        )
+
+    assert "moe_config" in captured_kwargs
+    assert isinstance(captured_kwargs["moe_config"], MoEParallelizerConfig)
+    assert captured_kwargs["activation_checkpointing"] is False
+
+
+def test_build_model_no_moe_config_when_cfg_moe_is_none():
+    """Test that moe_config and activation_checkpointing are not in kwargs when cfg_moe is None."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
+    captured_kwargs = {}
+
+    class CapturingModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
+        def instantiate(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = CapturingModelConfig()
+
+    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+        build_model(
+            cfg_model=cfg_model,
+            cfg_freeze=None,
+            cfg_peft=None,
+            seed=123,
+            cfg_moe=None,
+        )
+
+    assert "moe_config" not in captured_kwargs
+    assert "activation_checkpointing" not in captured_kwargs
 
 
 # -----------------------------------------------------------------------------
@@ -291,6 +400,7 @@ def test_autoprocessor_success():
 def test_autoprocessor_exception_handling(caplog):
     """Test AutoProcessor exception handling and logging in build_dataloader."""
     import logging
+
     from nemo_automodel.recipes.vlm.finetune import build_dataloader
 
     with patch('transformers.AutoProcessor.from_pretrained') as mock_from_pretrained, \
@@ -324,6 +434,7 @@ def test_autoprocessor_exception_handling(caplog):
 def test_autoprocessor_with_processor_kwargs(caplog):
     """Test AutoProcessor exception handling when cfg_processor has no instantiate method."""
     import logging
+
     from nemo_automodel.recipes.vlm.finetune import build_dataloader
 
     # Simple processor config class without instantiate method
@@ -597,12 +708,11 @@ def test_vlm_build_optimizer_disables_foreach_with_tp():
 
 
 from nemo_automodel.recipes.vlm.finetune import (
-    build_step_scheduler,
-    build_lr_scheduler,
     build_checkpoint_config,
+    build_lr_scheduler,
+    build_step_scheduler,
     calculate_loss,
 )
-
 
 # -----------------------------------------------------------------------------
 # build_step_scheduler tests
@@ -1729,6 +1839,36 @@ def test_vlm_build_model_validates_nemo_auto_model_entry_points(entry_point):
 
     with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
         # Should not raise - entry point should be recognized
+        model = build_model(
+            cfg_model=cfg_model,
+            cfg_freeze=None,
+            cfg_peft=None,
+            seed=42,
+        )
+
+    assert model is not None
+
+
+@pytest.mark.parametrize("entry_point", ["from_config", "from_pretrained"])
+def test_vlm_build_model_accepts_multimodal_lm_entry_points(entry_point):
+    """Test that VLM build_model accepts NeMoAutoModelForMultimodalLM entry points."""
+    from nemo_automodel._transformers import NeMoAutoModelForMultimodalLM
+
+    target = getattr(NeMoAutoModelForMultimodalLM, entry_point)
+
+    class NeMoVLMModelConfig:
+        def __init__(self):
+            self._target_ = target
+
+        def instantiate(self, **kwargs):
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = NeMoVLMModelConfig()
+
+    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,

@@ -12,9 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Optional
 
 from transformers import AutoConfig
+
+
+def _should_load_before_shard(
+    *,
+    autopipeline: Optional[object],
+    tp_size: int,
+    ep_size: int,
+    pretrained_model_name_or_path: str,
+    load_base_model: bool,
+    peft_config: Optional[object],
+) -> bool:
+    """Decide whether to load the checkpoint before FSDP/TP/EP sharding.
+
+    Load-before-shard is only safe when running single-GPU (no PP, TP, or EP),
+    a checkpoint actually needs loading, and no PEFT adapter is involved.
+    With any model parallelism the post-shard load path must be used to avoid
+    NCCL collective mismatches or key/device inconsistencies.
+    """
+    no_pp = autopipeline is None
+    no_tp = tp_size <= 1
+    no_ep = ep_size <= 1
+    need_checkpoint_load = bool(pretrained_model_name_or_path and load_base_model)
+    return no_pp and no_tp and no_ep and need_checkpoint_load and (peft_config is None)
 
 
 def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
@@ -39,6 +62,14 @@ def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
         print(f"use_sliding_window=False in config - overriding sliding_window parameter to None: {overwrite_dict}")
 
     return overwrite_dict
+
+
+def apply_qwen3_omni_config_patch():
+    """Fix Qwen3OmniMoeTalkerCodePredictorConfig accessing use_sliding_window."""
+    from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTalkerCodePredictorConfig
+
+    if not hasattr(Qwen3OmniMoeTalkerCodePredictorConfig, "use_sliding_window"):
+        Qwen3OmniMoeTalkerCodePredictorConfig.use_sliding_window = False
 
 
 def apply_cache_compatibility_patches():

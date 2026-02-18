@@ -17,6 +17,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     initialize_linear_module,
@@ -204,7 +205,7 @@ class Glm4MoeLiteModel(nn.Module):
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class Glm4MoeLiteForCausalLM(nn.Module, MoEFSDPSyncMixin):
+class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     @classmethod
     def from_config(
         cls,
@@ -244,6 +245,18 @@ class Glm4MoeLiteForCausalLM(nn.Module, MoEFSDPSyncMixin):
             self.state_dict_adapter = Glm4MoeStateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
             )
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
 
     def forward(
         self,

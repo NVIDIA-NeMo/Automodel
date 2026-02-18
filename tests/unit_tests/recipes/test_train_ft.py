@@ -196,7 +196,7 @@ class DummyModelConfig:
 
 def test_peft_with_pipeline_parallelism_enabled(caplog):
     """Test that _apply_peft_and_lower_precision disables triton with PP."""
-    from nemo_automodel._transformers.auto_model import _apply_peft_and_lower_precision
+    from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
 
     cfg_peft = DummyPeftConfig()
     model = DummyModel()
@@ -230,7 +230,13 @@ def test_peft_without_pipeline_parallelism(caplog):
                 with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
                     with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
                         with patch('nemo_automodel._transformers.infrastructure._shard_ep_fsdp') as mock_shard:
-                            mock_shard.return_value = DummyModel()
+                            # Return a DummyModel with lora_dummy_param so freeze doesn't remove all trainable params
+                            sharded_model = DummyModel()
+                            sharded_model.register_parameter(
+                                "lora_dummy_param",
+                                nn.Parameter(torch.tensor(1.0, device=torch.device("cuda")), requires_grad=True)
+                            )
+                            mock_shard.return_value = sharded_model
                             with caplog.at_level(logging.INFO):
                                 # This should work fine without PP
                                 model = build_model(
@@ -250,7 +256,7 @@ def test_peft_without_pipeline_parallelism(caplog):
 
 def test_peft_with_tp_disables_triton(caplog):
     """Test that _apply_peft_and_lower_precision disables triton with TP."""
-    from nemo_automodel._transformers.auto_model import _apply_peft_and_lower_precision
+    from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
 
     cfg_peft = DummyPeftConfig()
     model = DummyModel()

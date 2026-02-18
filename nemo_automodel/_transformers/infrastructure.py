@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
+from nemo_automodel._transformers.utils import _should_load_before_shard
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
@@ -80,7 +81,8 @@ def _apply_peft_and_lower_precision(
             logger.info("Enabling PEFT with Pipeline Parallelism")
             logger.info("Disabling Triton with Pipeline Parallelism Enabled.")
             peft_config.use_triton = False
-        apply_lora_to_linear_modules(model, peft_config, quantization_config=quantization_config)
+        # Skip freeze here - will do global freeze after checkpoint loading
+        apply_lora_to_linear_modules(model, peft_config, quantization_config=quantization_config, skip_freeze=True)
 
     # FP8
     if fp8_config is not None:
@@ -392,6 +394,36 @@ def apply_model_infrastructure(
             model, mesh.tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
         )
 
+    # When no PP and no TP, load checkpoint first (unwrapped model) so weights and dtypes come from
+    # the checkpoint; then apply FSDP. With TP>1 we must shard first and load after so all ranks
+    # stay in sync (load-before-shard can cause NCCL collective mismatch). With PP we shard first
+    # (each stage has different layers).
+    # Skip load-before-shard for PEFT: base load into unwrapped PEFT then later adapter load
+    # after shard can leave base/adapter out of sync (e.g. key/device mismatch). Use the
+    # post-shard load path so base and adapter load in the same way as multi-GPU.
+    need_checkpoint_load = bool(pretrained_model_name_or_path and load_base_model)
+    load_before_shard = _should_load_before_shard(
+        autopipeline=autopipeline,
+        tp_size=mesh.tp_size,
+        ep_size=mesh.ep_size,
+        pretrained_model_name_or_path=pretrained_model_name_or_path,
+        load_base_model=load_base_model,
+        peft_config=peft_config,
+    )
+
+    checkpoint_already_loaded = False
+    if load_before_shard:
+        lora_a_init = getattr(peft_config, "lora_A_init", None)
+        checkpointer.load_base_model(
+            model,
+            device,
+            cache_dir,
+            pretrained_model_name_or_path,
+            lora_a_init,
+            load_base_model=load_base_model,
+        )
+        checkpoint_already_loaded = True
+
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
     pre_shard_hf_state_dict_keys = list(
         _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=dequantize_base_checkpoint).keys()
@@ -421,17 +453,20 @@ def apply_model_infrastructure(
         else:
             setattr(model, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
 
-    # Load the checkpoint if needed and return
-    # Weights need to be loaded for meta device models:
-    # 1. Single GPU custom models (no parallelization but still need weights)
-    # 2. When parallelize_fn was used (which will internally apply FSDP2/EP sharding)
-    # 3. When FSDP2Manager.parallelize was used (but not MegatronFSDP which handles weights internally)
-    should_load_checkpoint = is_meta_device and any(
-        [
-            get_world_size_safe() == 1,
-            parallelize_fn is not None and get_world_size_safe() > 1,
-            callable(getattr(model_wrapper, "parallelize", None)),
-        ]
+    # Load the checkpoint if needed (meta path, or PP/TP path where we did not load before shard)
+    should_load_checkpoint = (
+        need_checkpoint_load
+        and not checkpoint_already_loaded
+        and (
+            is_meta_device
+            and any(
+                [
+                    get_world_size_safe() == 1,
+                    parallelize_fn is not None and get_world_size_safe() > 1,
+                    callable(getattr(model_wrapper, "parallelize", None)),
+                ]
+            )
+        )
     )
     if should_load_checkpoint:
         models_to_load = model.parts if hasattr(model, "parts") else [model]
@@ -446,9 +481,25 @@ def apply_model_infrastructure(
                 load_base_model=load_base_model,
             )
 
+    # Freeze parameters after checkpoint loading and parallelization
+    # This catches params created during parallelization (e.g., GroupedExpertsTE in init_token_dispatcher)
+    if peft_config is not None:
+        models_to_freeze = model.parts if hasattr(model, "parts") else [model]
+        for mp in models_to_freeze:
+            for name, param in mp.named_parameters():
+                if "lora_" not in name and param.requires_grad:
+                    param.requires_grad_(False)
+
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
         # Ensure model is on the correct device; AutoPipeline takes care of it internally
-        model.to(device)
+        try:
+            model.to(device)
+        except NotImplementedError as e:
+            if "Cannot copy out of meta tensor" in str(e):
+                logger.warning("model.to(device) failed (meta tensors); using model.to_empty(device=device) instead.")
+                model.to_empty(device=device)
+            else:
+                raise
 
     return model

@@ -20,6 +20,7 @@ import importlib
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "NeMoAutoModelForCausalLM": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForCausalLM"),
     "NeMoAutoModelForImageTextToText": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForImageTextToText"),
+    "NeMoAutoModelForMultimodalLM": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForMultimodalLM"),
     "NeMoAutoModelForSequenceClassification": (
         "nemo_automodel._transformers.auto_model",
         "NeMoAutoModelForSequenceClassification",
@@ -32,6 +33,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
 __all__ = [
     "NeMoAutoModelForCausalLM",
     "NeMoAutoModelForImageTextToText",
+    "NeMoAutoModelForMultimodalLM",
     "NeMoAutoModelForSequenceClassification",
     "NeMoAutoModelForTextToWaveform",
     "NeMoAutoModelForBiencoder",
