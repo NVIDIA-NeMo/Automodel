@@ -25,6 +25,7 @@ step_scheduler:
   ckpt_every_steps: 200
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2
+  max_steps: 100
 
 dist_env:
   backend: nccl
@@ -38,7 +39,6 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3-8B
-  cache_dir: /nemo-rl/hf_cache/
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
@@ -82,7 +82,9 @@ packed_sequence:
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 320
   shuffle: true
 
 validation_dataset:
@@ -93,7 +95,9 @@ validation_dataset:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 320
 
 optimizer:
   _target_: torch.optim.Adam
