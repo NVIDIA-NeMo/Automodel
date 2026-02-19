@@ -237,7 +237,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
         self.use_hf_chat_template = use_hf_chat_template
 
     def __iter__(self) -> Iterator[Dict[str, List[int]]]:
-        raise ValueError("__iter__ is not supported in map mode.")
+        for idx in range(len(self)):
+            yield self[idx]
 
     def __len__(self) -> int:  # noqa: D401
         """
