@@ -109,7 +109,7 @@ def _parallelize_llama(
     kv_size = model.config.num_key_value_heads * head_dim
 
     base_model_tp_plan: dict[str, ParallelStyle] = {
-        "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
+        "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
         "model.layers.*.self_attn.q_proj": ColwiseParallel(),
         "model.layers.*.self_attn.k_proj": ColwiseParallel(),
         "model.layers.*.self_attn.v_proj": ColwiseParallel(),
