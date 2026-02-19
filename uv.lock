@@ -43,6 +43,7 @@ constraints = [
     { name = "cryptography", specifier = ">=46.0.5" },
     { name = "fonttools", specifier = ">=4.60.2" },
     { name = "jaraco-context", specifier = ">=6.1.0" },
+    { name = "mlflow", specifier = ">=3.10.0rc0" },
     { name = "pillow", specifier = ">=12.1.1" },
     { name = "protobuf", specifier = ">=6.33.5" },
     { name = "pyasn1", specifier = ">=0.6.2" },
