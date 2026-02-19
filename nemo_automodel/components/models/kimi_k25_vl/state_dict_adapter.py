@@ -230,8 +230,10 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                     is_dtensor = hasattr(value, "_local_tensor") or str(type(value).__name__) == "DTensor"
                     base = key[:-7] if key.endswith(".weight") else key
 
-                    local_tensor = value._local_tensor if is_dtensor and hasattr(value, "_local_tensor") else (
-                        value.to_local() if is_dtensor else value
+                    local_tensor = (
+                        value._local_tensor
+                        if is_dtensor and hasattr(value, "_local_tensor")
+                        else (value.to_local() if is_dtensor else value)
                     )
                     is_meta = local_tensor.is_meta
 
