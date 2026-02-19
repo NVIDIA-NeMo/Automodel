@@ -32,9 +32,7 @@ def _remap_system_role(conversation):
     """
     system_msgs = [m for m in conversation if isinstance(m, dict) and m.get("role") == "system"]
     if len(system_msgs) > 1:
-        raise ValueError(
-            "System role appeared in multiple messages. Only a single system message is supported."
-        )
+        raise ValueError("System role appeared in multiple messages. Only a single system message is supported.")
 
     system_content = system_msgs[0].get("content", "")
     remapped = []
@@ -107,9 +105,7 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
 
         system_msgs = [m for m in conversation if isinstance(m, dict) and m.get("role") == "system"]
         if len(system_msgs) > 1:
-            raise ValueError(
-                "System role appeared in multiple messages. Only a single system message is supported."
-            )
+            raise ValueError("System role appeared in multiple messages. Only a single system message is supported.")
 
         try:
             return super().apply_chat_template(conversation, *args, **kwargs)
