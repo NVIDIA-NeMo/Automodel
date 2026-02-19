@@ -429,7 +429,6 @@ class Checkpointer:
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
         model_state.load_state_dict(state_dict, strict=not (len(model_state.model) > 1 or has_state_dict_adapter))
 
-
     def load_base_model(
         self,
         model: torch.nn.Module,
@@ -494,19 +493,14 @@ class Checkpointer:
                 model.initialize_weights()
             else:
                 logging.warning(
-                    "Model does not have initialize_weights method. "
-                    "Requires custom initialization to be implemented."
+                    "Model does not have initialize_weights method. Requires custom initialization to be implemented."
                 )
 
         _init_peft_adapters(model, peft_init_method)
 
         if load_base_model:
             assert model_name is not None, "model_name is required when loading base model"
-            model_path = (
-                model_name
-                if os.path.exists(model_name)
-                else get_safetensors_index_path(root_dir, model_name)
-            )
+            model_path = model_name if os.path.exists(model_name) else get_safetensors_index_path(root_dir, model_name)
 
             if _is_safetensors_checkpoint(model_path):
                 adapter = getattr(model, "state_dict_adapter", None)
@@ -561,9 +555,12 @@ class Checkpointer:
             )
             gb = total_bytes / (1 << 30)
             logging.info(
-                "load_base_model: %.2f GB in %.2fs "
-                "(disk %.2fs, convert %.2fs, distribute %.2fs)",
-                gb, t_end - t0, t_disk - t0, t_convert - t_disk, t_end - t_convert,
+                "load_base_model: %.2f GB in %.2fs (disk %.2fs, convert %.2fs, distribute %.2fs)",
+                gb,
+                t_end - t0,
+                t_disk - t0,
+                t_convert - t_disk,
+                t_end - t_convert,
             )
 
     def _load_base_model_streaming(self, model: nn.Module, model_path: str) -> None:
@@ -635,14 +632,19 @@ class Checkpointer:
                 "load_base_model (streaming): %.2f GB in %.2fs "
                 "(schedule %.2fs, stream+broadcast %.2fs, "
                 "%d/%d params covered)",
-                gb, t_end - t0, t_schedule - t0, t_end - t_schedule,
-                n_scheduled, n_params,
+                gb,
+                t_end - t0,
+                t_schedule - t0,
+                t_end - t_schedule,
+                n_scheduled,
+                n_params,
             )
             if n_scheduled < n_params:
                 missing = sorted(set(param_map) - {e[0] for e in schedule})
                 logging.warning(
                     "Streaming loader did not cover %d parameters: %s",
-                    len(missing), missing[:10],
+                    len(missing),
+                    missing[:10],
                 )
 
     def maybe_wait_for_staging(self) -> None:
@@ -1416,9 +1418,7 @@ def _write_to_fsdp_param(
         for dim_idx, placement in enumerate(data.placements):
             if isinstance(placement, Shard):
                 mesh_dim_size = data.device_mesh.shape[dim_idx]
-                rank_in_dim = data.device_mesh.get_local_rank(
-                    data.device_mesh.mesh_dim_names[dim_idx]
-                )
+                rank_in_dim = data.device_mesh.get_local_rank(data.device_mesh.mesh_dim_names[dim_idx])
                 chunk_size = full.shape[placement.dim] // mesh_dim_size
                 full = full.narrow(placement.dim, rank_in_dim * chunk_size, chunk_size)
         local.copy_(full)

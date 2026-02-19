@@ -187,7 +187,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         """Rename NemotronV3 HF key from ``backbone.`` to ``model.`` prefix."""
         key = hf_key
         if key.startswith("backbone."):
-            key = "model." + key[len("backbone."):]
+            key = "model." + key[len("backbone.") :]
         if key == "model.norm_f.weight":
             key = "model.norm.weight"
         if key == "model.embeddings.weight":
