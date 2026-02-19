@@ -255,21 +255,22 @@ def build_dataloader(
     with ScopedRNG(seed=seed, ranked=True):
         processor = None
         processor_kwargs = {}
-        if cfg_processor is not None and hasattr(cfg_processor, "instantiate"):
-            processor = cfg_processor.instantiate()
-        elif cfg_processor is not None:
-            processor_kwargs = cfg_processor.to_dict()
-
-        # If no processor was instantiated, try AutoProcessor
-        if processor is None:
-            try:
-                processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
-            except Exception as e:
-                # Some models do not provide an AutoProcessor
-                processor = None
-                logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
 
         with FirstRankPerNode():
+            if cfg_processor is not None and hasattr(cfg_processor, "instantiate"):
+                processor = cfg_processor.instantiate()
+            elif cfg_processor is not None:
+                processor_kwargs = cfg_processor.to_dict()
+
+            # If no processor was instantiated, try AutoProcessor
+            if processor is None:
+                try:
+                    processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
+                except Exception as e:
+                    # Some models do not provide an AutoProcessor
+                    processor = None
+                    logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
+
             ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
 
         sampler = torch.utils.data.distributed.DistributedSampler(
