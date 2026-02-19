@@ -71,3 +71,14 @@ class StateDictAdapter(ABC):
             Returns a list because some native tensors may split into multiple HF tensors.
         """
         pass
+
+    def rename_hf_key(self, hf_key: str) -> str:
+        """Rename a single HF checkpoint key to the model's internal naming.
+
+        The streaming checkpoint loader calls this for every checkpoint key
+        before passing it to adapter merge methods.  Override in subclasses
+        that need custom key renaming (e.g., ``backbone.`` → ``model.``).
+
+        The default implementation returns the key unchanged.
+        """
+        return hf_key

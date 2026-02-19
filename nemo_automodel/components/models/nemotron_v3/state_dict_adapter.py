@@ -183,6 +183,17 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         # Then merge experts using the mixin method
         return self._from_hf_w_merged_experts(renamed_state_dict, device_mesh, inplace=inplace)
 
+    def rename_hf_key(self, hf_key: str) -> str:
+        """Rename NemotronV3 HF key from ``backbone.`` to ``model.`` prefix."""
+        key = hf_key
+        if key.startswith("backbone."):
+            key = "model." + key[len("backbone."):]
+        if key == "model.norm_f.weight":
+            key = "model.norm.weight"
+        if key == "model.embeddings.weight":
+            key = "model.embed_tokens.weight"
+        return key
+
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         """Convert a single tensor from internal format to HuggingFace format.
 
