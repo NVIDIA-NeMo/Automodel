@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -51,11 +51,25 @@ from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.training.rng import ScopedRNG
-from nemo_automodel.components.training.utils import ScopedModuleOffloading, count_tail_padding
+from nemo_automodel.components.training.utils import (
+    ScopedModuleOffloading,
+    count_tail_padding,
+    prepare_after_first_microbatch,
+    prepare_for_final_backward,
+    prepare_for_grad_accumulation,
+    scale_grads_and_clip_grad_norm,
+)
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
+    build_model,
     calculate_loss,
 )
+from nemo_automodel.recipes.llm.train_ft import (
+    _get_num_thd_chunks,
+    _uses_te_dot_product_attention,
+    _uses_thd_collater,
+)
+from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +138,79 @@ def _build_teacher_model(
         return teacher_model
 
 
+def _build_teacher_model_with_pp(
+    cfg_teacher,
+    seed: int,
+    has_packed_sequence: bool,
+    device_mesh,
+    moe_mesh,
+    distributed_config,
+    pipeline_config: PipelineConfig,
+    dist_setup,
+) -> Any:
+    """Build teacher model with same parallelization as student (TP/EP/SP/PP).
+
+    Teacher is built via build_model with pipeline_config so it is an AutoPipeline
+    when PP is enabled. No PEFT/FP8/QAT. Teacher is frozen and set to eval.
+    """
+    assert cfg_teacher is not None, "`teacher_model` section missing from YAML config"
+    logger.info("Instantiating teacher model (parallelized with TP/EP/SP/PP)")
+
+    # Copy pipeline config and use a capture loss_fn so we can read teacher logits after eval
+    teacher_pipeline_config = PipelineConfig(
+        pp_schedule=pipeline_config.pp_schedule,
+        pp_schedule_csv=pipeline_config.pp_schedule_csv,
+        pp_microbatch_size=pipeline_config.pp_microbatch_size,
+        pp_batch_size=pipeline_config.pp_batch_size,
+        layers_per_stage=pipeline_config.layers_per_stage,
+        round_virtual_stages_to_pp_multiple=pipeline_config.round_virtual_stages_to_pp_multiple,
+        module_fqns_per_model_part=pipeline_config.module_fqns_per_model_part,
+        patch_inner_model=pipeline_config.patch_inner_model,
+        patch_causal_lm_model=pipeline_config.patch_causal_lm_model,
+        patch_stage_backward_maybe_with_nosync=pipeline_config.patch_stage_backward_maybe_with_nosync,
+        dtype=pipeline_config.dtype,
+        scale_grads_in_schedule=pipeline_config.scale_grads_in_schedule,
+        loss_fn=None,  # Set below via closure
+    )
+
+    # Mutable container for teacher logits (set by capture fn when last stage runs)
+    teacher_logits_capture = [None]
+
+    def _teacher_capture_loss_fn(logits, target, **kwargs):
+        teacher_logits_capture[0] = logits.detach().clone()
+        return logits.new_tensor(0.0, dtype=logits.dtype)
+
+    teacher_pipeline_config.loss_fn = _teacher_capture_loss_fn
+
+    with ScopedRNG(seed=seed, ranked=True):
+        teacher_model = build_model(
+            cfg_teacher,
+            cfg_peft=None,
+            has_packed_sequence=has_packed_sequence,
+            seed=seed,
+            cfg_fp8=None,
+            cfg_compile=None,
+            cfg_quantization=None,
+            device_mesh=device_mesh,
+            moe_mesh=moe_mesh,
+            distributed_config=distributed_config,
+            pipeline_config=teacher_pipeline_config,
+            cfg_qat=None,
+            cfg_moe=dist_setup.moe_config,
+            activation_checkpointing=dist_setup.activation_checkpointing,
+        )
+
+    # Freeze teacher
+    for part in getattr(teacher_model, "parts", [teacher_model]):
+        part.eval()
+        for p in part.parameters():
+            p.requires_grad_(False)
+
+    # Attach capture ref so recipe can read teacher logits after eval
+    teacher_model._teacher_logits_capture = teacher_logits_capture
+    return teacher_model
+
+
 def _verify_tokenizer_compatibility(student_cfg, teacher_cfg, trust_remote_code=True):
     if student_cfg is None or teacher_cfg is None:
         raise ValueError("Student and teacher model configs are required")
@@ -153,21 +240,40 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
         # Let the parent class build *everything* for the student first
         super().setup()
-        if self.pp_enabled:
-            raise ValueError("Pipeline parallelism support will be added in the future for knowledge distillation")
 
         self._offload_teacher_model = self.cfg.get("offload_teacher_model", False)
         teacher_device = self.dist_env.device if not self._offload_teacher_model else "cpu"
 
-        self.teacher_model = _build_teacher_model(
-            cfg_teacher=self.cfg.get("teacher_model", None),
-            seed=self.cfg.get("seed", 42),
-            has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
-            device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
-            distributed_config=self.distributed_config,
-            device=teacher_device,
-        )
+        if self.pp_enabled:
+            # PP + FusedLinearCrossEntropy requires hidden_states at loss; pipeline last stage only has logits.
+            if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                raise ValueError(
+                    "Pipeline parallelism with KD requires a loss that uses only logits and labels "
+                    "(e.g. MaskedCrossEntropy). FusedLinearCrossEntropy is not supported for PP KD."
+                )
+            self.teacher_model = _build_teacher_model_with_pp(
+                cfg_teacher=self.cfg.get("teacher_model", None),
+                seed=self.cfg.get("seed", 42),
+                has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
+                device_mesh=self.device_mesh,
+                moe_mesh=self.moe_mesh,
+                distributed_config=self.distributed_config,
+                pipeline_config=self.pipeline_config,
+                dist_setup=self.dist_setup,
+            )
+            self.teacher_pp = self.teacher_model
+        else:
+            self.teacher_model = _build_teacher_model(
+                cfg_teacher=self.cfg.get("teacher_model", None),
+                seed=self.cfg.get("seed", 42),
+                has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
+                device_mesh=self.device_mesh,
+                moe_mesh=self.moe_mesh,
+                distributed_config=self.distributed_config,
+                device=teacher_device,
+            )
+            self.teacher_pp = None
+
         logger.info("Teacher Model: " + str(self.teacher_model))
         # KD
         self.kd_loss_fn = _build_kd_loss_fn(self.cfg.get("kd_loss_fn", None))
@@ -180,6 +286,45 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         self._kd_loss_buffer = []
         self._ce_loss_buffer = []
 
+        if self.pp_enabled:
+            schedule = self.pp.info.schedule
+            # Schedule objects use _loss_fn (e.g. ScheduleInterleaved1F1B), not loss_fn
+            self._original_pp_loss_fn = getattr(schedule, "_loss_fn", None)
+            schedule._loss_fn = self._make_pp_kd_loss_wrapper()
+
+    def _make_pp_kd_loss_wrapper(self):
+        """Return a callable used as the student pipeline loss_fn; reads _current_teacher_logits from self."""
+        recipe_ref = self
+
+        def pp_kd_loss_fn(logits, target, **kwargs):
+            teacher_logits = getattr(recipe_ref, "_current_teacher_logits", None)
+            num_label_tokens = getattr(recipe_ref, "_current_num_label_tokens", None)
+            if teacher_logits is None:
+                raise RuntimeError(
+                    "KD loss wrapper: _current_teacher_logits not set. "
+                    "Teacher pipeline eval must run before student step."
+                )
+            if recipe_ref.kd_ratio >= 1.0:
+                ce_loss = logits.new_tensor(0.0, dtype=logits.dtype)
+            else:
+                ce_loss = calculate_loss(
+                    recipe_ref.loss_fn,
+                    logits=logits,
+                    labels=target,
+                    num_label_tokens=num_label_tokens,
+                )
+            kd_loss = recipe_ref.kd_loss_fn(
+                logits,
+                teacher_logits,
+                target,
+                num_batch_labels=num_label_tokens,
+            )
+            recipe_ref._ce_loss_buffer.append(ce_loss.detach().clone())
+            recipe_ref._kd_loss_buffer.append(kd_loss.detach().clone())
+            return (1.0 - recipe_ref.kd_ratio) * ce_loss + recipe_ref.kd_ratio * kd_loss
+
+        return pp_kd_loss_fn
+
     #  Override the forward backward step to inject KD loss
     def _forward_backward_step(
         self,
@@ -191,6 +336,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         is_train: bool = True,
     ):
         """Override the forward backward step to include knowledge distillation loss."""
+        if self.pp_enabled:
+            raise RuntimeError(
+                "_forward_backward_step should not be called when pp_enabled; use _forward_backward_step_pp"
+            )
         batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
         labels = batch.pop("labels")
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
@@ -223,15 +372,18 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 student_out = model(**batch)
 
             student_logits = getattr(student_out, "logits", student_out)  # shape (B, S, V)
-            # Cross-entropy loss against true labels (same as parent)
-            ce_loss = calculate_loss(
-                self.loss_fn,
-                logits=student_logits,
-                labels=labels,
-                model=model,
-                hidden_states=student_out.hidden_states[-1] if "hidden_states" in student_out else None,
-                num_label_tokens=num_label_tokens,
-            )
+            # Cross-entropy loss against true labels (skip when kd_ratio >= 1.0)
+            if self.kd_ratio >= 1.0:
+                ce_loss = student_logits.new_tensor(0.0, dtype=student_logits.dtype)
+            else:
+                ce_loss = calculate_loss(
+                    self.loss_fn,
+                    logits=student_logits,
+                    labels=labels,
+                    model=model,
+                    hidden_states=student_out.hidden_states[-1] if "hidden_states" in student_out else None,
+                    num_label_tokens=num_label_tokens,
+                )
             # Reminder: kd_loss is normalized by num_label_tokens,
             # which typically is larger than the number of labels in this batch,
             # because it contains the total number of labels for all batches contained
@@ -249,6 +401,90 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             detached_local = local_loss.detach().clone()
             return detached_local, kd_loss.detach().clone(), ce_loss.detach().clone()
 
+    def _forward_backward_step_pp(
+        self,
+        idx,
+        batch,
+        *,
+        loss_buffer,
+        num_label_tokens,
+        num_batches,
+        is_train: bool = True,
+    ):
+        """PP path: runs 1T then 1F1B and appends to loss_buffer."""
+        batch = {
+            k: (
+                {dk: dv.to(self.dist_env.device, non_blocking=True) for dk, dv in v.items() if dv is not None}
+                if isinstance(v, dict)
+                else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
+            )
+            for k, v in batch.items()
+        }
+        train_ctx, batch = make_cp_batch_and_ctx(
+            self.device_mesh,
+            batch,
+            use_te=_uses_te_dot_product_attention(self.cfg.model)
+            and _uses_thd_collater(self.cfg.dataloader),
+            padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
+            num_chunks=_get_num_thd_chunks(True, self.cfg),
+        )
+        labels = batch.pop("labels")
+        input_ids = batch.pop("input_ids")
+        batch_filtered = {
+            k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
+        }
+
+        if self.pp.info.has_last_stage:
+            targets = labels.clone()
+        else:
+            targets = None
+
+        fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
+
+        with train_ctx(), fp8_ctx:
+            with torch.inference_mode():
+                teacher_losses = [] if self.teacher_pp.info.has_last_stage else None
+                if self.teacher_pp.info.has_first_stage:
+                    self.teacher_pp.info.schedule.eval(
+                        input_ids, target=targets, losses=teacher_losses, **batch_filtered
+                    )
+                else:
+                    self.teacher_pp.info.schedule.eval(
+                        target=targets, losses=teacher_losses, **batch_filtered
+                    )
+                capture = getattr(self.teacher_model, "_teacher_logits_capture", None)
+                if capture is not None and capture[0] is not None:
+                    self._current_teacher_logits = capture[0]
+                    capture[0] = None
+                else:
+                    self._current_teacher_logits = None
+                self._current_num_label_tokens = num_label_tokens
+
+            student_losses = [] if self.pp.info.has_last_stage else None
+            if is_train:
+                if self.pp.info.has_first_stage:
+                    self.pp.info.schedule.step(
+                        input_ids, target=targets, losses=student_losses, **batch_filtered
+                    )
+                else:
+                    self.pp.info.schedule.step(
+                        target=targets, losses=student_losses, **batch_filtered
+                    )
+            else:
+                if self.pp.info.has_first_stage:
+                    self.pp.info.schedule.eval(
+                        input_ids, target=targets, losses=student_losses, **batch_filtered
+                    )
+                else:
+                    self.pp.info.schedule.eval(
+                        target=targets, losses=student_losses, **batch_filtered
+                    )
+
+            if self.pp.info.has_last_stage:
+                loss_buffer.append(torch.sum(torch.stack(student_losses)).detach().clone())
+            else:
+                loss_buffer.append(torch.tensor(0.0, device=self.dist_env.device))
+
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
 
@@ -256,6 +492,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             batches: List of batches of training data.
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
+        if self.pp_enabled:
+            return self._run_train_optim_step_pp(batches, max_grad_norm)
 
         num_label_tokens = torch.tensor(
             sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
@@ -352,6 +590,171 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             },
         )
 
+    def _run_train_optim_step_pp(self, batches, max_grad_norm: Optional[float] = None):
+        """Execute a single training step when pipeline parallelism is enabled."""
+        num_label_tokens = torch.tensor(
+            sum((b["labels"] != -100).sum().item() for b in batches), dtype=torch.long
+        )
+        num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+        loss_buffer = []
+
+        num_tokens_in_batch = torch.tensor(
+            sum(b["labels"].numel() - count_tail_padding(b["labels"]) for b in batches),
+            dtype=torch.long,
+        )
+        num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
+        num_batches = len(batches)
+
+        prepare_for_grad_accumulation(self.model_parts, pp_enabled=True)
+
+        for i, batch in enumerate(batches):
+            if i == num_batches - 1:
+                prepare_for_final_backward(self.model_parts, pp_enabled=True)
+            self._forward_backward_step_pp(
+                i,
+                batch,
+                loss_buffer=loss_buffer,
+                num_label_tokens=num_label_tokens,
+                num_batches=num_batches,
+            )
+            if i == 0:
+                prepare_after_first_microbatch()
+
+        grad_norm = scale_grads_and_clip_grad_norm(
+            max_grad_norm,
+            self.model_parts,
+            norm_type=2.0,
+            pp_enabled=True,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+            pp_axis_name="pp",
+            foreach=True,
+            num_label_tokens=num_label_tokens,
+            dp_group_size=self._get_dp_group_size(include_cp=True),
+        )
+
+        self.checkpointer.maybe_wait_for_staging()
+        for opt in self.optimizer:
+            opt.step()
+            opt.zero_grad()
+
+        if hasattr(self.model_parts[0], "update_moe_gate_bias"):
+            for mp in self.model_parts:
+                mp.update_moe_gate_bias()
+
+        if self.lr_scheduler is not None:
+            for scheduler in self.lr_scheduler:
+                scheduler.step(1)
+
+        fp8_config = self.cfg.get("fp8", None)
+        if (
+            fp8_config is not None
+            and fp8_config.get("enabled", False)
+            and fp8_config.get("precompute_float8_dynamic_scale_for_fsdp", False)
+            and self.device_mesh is not None
+            and self.device_mesh["dp_shard"].size() > 1
+        ):
+            precompute_float8_dynamic_scale_for_fsdp(self.model_parts[0])
+
+        t = time.perf_counter()
+        time_delta = t - self.timestamp
+        self.timestamp = t
+        tps = num_tokens_in_batch / time_delta
+        reporting_loss = torch.sum(torch.stack(loss_buffer))
+        reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
+        reporting_loss = reporting_loss / num_label_tokens
+        reporting_loss = reporting_loss.to(self.dist_env.device)
+        src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
+        if self.dist_env.rank == src_rank:
+            torch.distributed.send(reporting_loss, dst=0)
+        elif self.dist_env.is_main:
+            torch.distributed.recv(reporting_loss, src=src_rank)
+        reporting_loss = reporting_loss.cpu().item()
+
+        # CE/KD buffers are only populated on the last pipeline stage (in the loss wrapper).
+        # Match train_ft: allreduce within DP group (last-stage ranks get sum, others get 0),
+        # then send from last stage to rank 0 for logging (same as reporting_loss).
+        ce_tensor = (
+            torch.stack(self._ce_loss_buffer).sum()
+            if self._ce_loss_buffer
+            else torch.tensor(0.0, device=self.dist_env.device)
+        )
+        kd_tensor = (
+            torch.stack(self._kd_loss_buffer).sum()
+            if self._kd_loss_buffer
+            else torch.tensor(0.0, device=self.dist_env.device)
+        )
+        ce_tensor = self._dp_allreduce(ce_tensor, include_cp=True)
+        kd_tensor = self._dp_allreduce(kd_tensor, include_cp=True)
+        ce_tensor = ce_tensor.to(self.dist_env.device)
+        kd_tensor = kd_tensor.to(self.dist_env.device)
+        if self.dist_env.rank == src_rank and not self.dist_env.is_main:
+            torch.distributed.send(ce_tensor, dst=0)
+            torch.distributed.send(kd_tensor, dst=0)
+        elif self.dist_env.is_main and self.dist_env.rank != src_rank:
+            torch.distributed.recv(ce_tensor, src=src_rank)
+            torch.distributed.recv(kd_tensor, src=src_rank)
+        ce_loss = ce_tensor.cpu().item()
+        kd_loss = kd_tensor.cpu().item()
+        self._ce_loss_buffer.clear()
+        self._kd_loss_buffer.clear()
+
+        if isinstance(grad_norm, torch.Tensor):
+            grad_norm = grad_norm.item()
+        grad_norm = float(grad_norm)
+
+        return MetricsSample(
+            step=self.step_scheduler.step,
+            epoch=self.step_scheduler.epoch,
+            metrics={
+                "loss": reporting_loss,
+                "ce_loss": ce_loss,
+                "kd_loss": kd_loss,
+                "grad_norm": grad_norm,
+                "lr": self.optimizer[0].param_groups[0]["lr"],
+                "mem": torch.cuda.max_memory_allocated() / 1024**3,
+                "tps": tps,
+                "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
+                "num_tokens_per_step": num_tokens_in_batch,
+                "num_label_tokens": num_label_tokens,
+                "kd_ratio": self.kd_ratio,
+                "temperature": getattr(self.kd_loss_fn, "temperature", float("nan")),
+            },
+        )
+
+    def run_train_validation_loop(self):
+        """Run training loop; skip validation when PP is enabled."""
+        if not self.pp_enabled:
+            return super().run_train_validation_loop()
+
+        # PP path: same as parent but skip validation block
+        for mp in self.model_parts:
+            mp.train()
+        self.timestamp = time.perf_counter()
+        for epoch in self.step_scheduler.epochs:
+            self.step_scheduler.set_epoch(epoch)
+            for batches in self.step_scheduler:
+                self._enable_qat_if_delayed(self.step_scheduler.step)
+                train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                self._collect_moe_load_balance()
+                self.log_train_metrics(train_log_data)
+                val_losses = {}
+                if self.step_scheduler.is_val_step:
+                    logger.warning("Validation is not supported for pipeline parallelism; skipping")
+                if self.step_scheduler.is_ckpt_step:
+                    self.save_checkpoint(
+                        epoch,
+                        self.step_scheduler.step,
+                        train_log_data.metrics["loss"],
+                        val_losses,
+                        best_metric_key=self.best_metric_key,
+                    )
+        self.metric_logger_train.close()
+        for v in self.metric_logger_valid.values():
+            v.close()
+        self.checkpointer.close()
+
     @torch.no_grad()
     def _run_validation_epoch(self, val_dataloader):
         """Run one pass over `self.val_dataloader`."""
@@ -413,18 +816,31 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             metric_logger.log(log_data)
 
         # assumes all model parts' optimizers have the same learning rate
-        logging.info(
-            "[val] {} | step {} | epoch {} | loss {:.4f} | ce_loss {:.4f} | kd_loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
-                val_name,
-                log_data.step,
-                log_data.epoch,
-                log_data.metrics["val_loss"],
-                log_data.metrics["ce_loss"],
-                log_data.metrics["kd_loss"],
-                log_data.metrics["lr"],
-                log_data.metrics["num_label_tokens"],
+        if self.kd_ratio >= 1.0:
+            logging.info(
+                "[val] {} | step {} | epoch {} | loss {:.4f} | kd_loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
+                    val_name,
+                    log_data.step,
+                    log_data.epoch,
+                    log_data.metrics["val_loss"],
+                    log_data.metrics["kd_loss"],
+                    log_data.metrics["lr"],
+                    log_data.metrics["num_label_tokens"],
+                )
             )
-        )
+        else:
+            logging.info(
+                "[val] {} | step {} | epoch {} | loss {:.4f} | ce_loss {:.4f} | kd_loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
+                    val_name,
+                    log_data.step,
+                    log_data.epoch,
+                    log_data.metrics["val_loss"],
+                    log_data.metrics["ce_loss"],
+                    log_data.metrics["kd_loss"],
+                    log_data.metrics["lr"],
+                    log_data.metrics["num_label_tokens"],
+                )
+            )
 
     def log_train_metrics(self, log_data) -> float:
         """Log metrics to wandb and other loggers.
@@ -450,21 +866,42 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             if wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=log_data.step)
 
-        logging.info(
-            "step {} | epoch {} | "
-            "loss {:.4f} | ce_loss {:.4f} | kd_loss {:.4f} | "
-            "lr {:.2e} | tps {:.2f} | kd_ratio {:.2f} | temperature {:.2f}".format(
-                log_data.step,
-                log_data.epoch,
-                log_data.metrics["loss"],
-                log_data.metrics["ce_loss"],
-                log_data.metrics["kd_loss"],
-                log_data.metrics["lr"],
-                log_data.metrics["tps"],
-                log_data.metrics["kd_ratio"],
-                log_data.metrics["temperature"],
+        # JSONL training log (always log for detailed local records)
+        self.metric_logger_train.log(log_data)
+
+        if self.kd_ratio >= 1.0:
+            logging.info(
+                "step {} | epoch {} | "
+                "loss {:.4f} | kd_loss {:.4f} | "
+                "lr {:.2e} | mem {:.2f} GiB | tps {:.2f} | kd_ratio {:.2f} | temperature {:.2f}".format(
+                    log_data.step,
+                    log_data.epoch,
+                    log_data.metrics["loss"],
+                    log_data.metrics["kd_loss"],
+                    log_data.metrics["lr"],
+                    log_data.metrics["mem"],
+                    log_data.metrics["tps"],
+                    log_data.metrics["kd_ratio"],
+                    log_data.metrics["temperature"],
+                )
             )
-        )
+        else:
+            logging.info(
+                "step {} | epoch {} | "
+                "loss {:.4f} | ce_loss {:.4f} | kd_loss {:.4f} | "
+                "lr {:.2e} | mem {:.2f} GiB | tps {:.2f} | kd_ratio {:.2f} | temperature {:.2f}".format(
+                    log_data.step,
+                    log_data.epoch,
+                    log_data.metrics["loss"],
+                    log_data.metrics["ce_loss"],
+                    log_data.metrics["kd_loss"],
+                    log_data.metrics["lr"],
+                    log_data.metrics["mem"],
+                    log_data.metrics["tps"],
+                    log_data.metrics["kd_ratio"],
+                    log_data.metrics["temperature"],
+                )
+            )
         torch.cuda.reset_peak_memory_stats()
 
 
