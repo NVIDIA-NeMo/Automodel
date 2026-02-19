@@ -89,6 +89,7 @@ dataloader:
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.kimi_k25_vl_collate_fn
     max_length: 1024
+  drop_last: true
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset

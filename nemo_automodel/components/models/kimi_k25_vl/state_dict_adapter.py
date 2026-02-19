@@ -135,9 +135,9 @@ def quantize_to_int4(
     scale_expanded = scale.unsqueeze(-1).expand_as(w_grouped)
     w_q = (w_grouped / scale_expanded).round().clamp(-8, 7)
 
-    # Convert signed [-8, 7] to unsigned [0, 15] for packing
+    # Convert signed [-8, 7] to unsigned [0, 15] using offset binary
     w_q = w_q.view(out_features, -1)[:, :in_features]
-    w_q = torch.where(w_q < 0, w_q + 16, w_q).to(torch.uint8)
+    w_q = (w_q + 8).to(torch.uint8)
 
     # Pack 8 INT4 values into each int32 along the in_features dimension
     # HF format: [out_features, in_features//8] - 2D packed tensor
@@ -151,8 +151,8 @@ def quantize_to_int4(
     for i in range(8):
         packed |= (w_q_grouped[:, :, i] & 0xF) << (i * 4)
 
-    weight_packed = packed.cpu()
-    weight_scale = scale.to(torch.float16).cpu()
+    weight_packed = packed
+    weight_scale = scale.to(torch.float16)
 
     return weight_packed, weight_scale, weight_shape
 
@@ -202,17 +202,9 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         quantization = True
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
 
-        # Key mapping: internal → HF format
-        # model.language_model.* → language_model.*
-        # model.vision_tower.* → vision_tower.*
-        # model.multi_modal_projector.* → mm_projector.*
         if fqn.startswith("model."):
             fqn = fqn[6:]
 
-        # MM Projector key conversion:
-        # multi_modal_projector.linear_1.* → mm_projector.proj.0.*
-        # multi_modal_projector.linear_2.* → mm_projector.proj.2.*
-        # multi_modal_projector.pre_norm.* → mm_projector.pre_norm.*
         if fqn.startswith("multi_modal_projector."):
             fqn = fqn.replace("multi_modal_projector.", "mm_projector.")
             fqn = fqn.replace(".linear_1.", ".proj.0.")
@@ -220,8 +212,6 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
 
         expert_result = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
         if expert_result is not None:
-            # Post-process mixin output: model.layers.* → language_model.model.layers.*
-            # The mixin generates keys with "model." prefix, but VLM needs "language_model.model." prefix
             result = [("language_model." + k, v) for k, v in expert_result]
         else:
             result = [(fqn, tensor)]
@@ -240,83 +230,33 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                     is_dtensor = hasattr(value, "_local_tensor") or str(type(value).__name__) == "DTensor"
                     base = key[:-7] if key.endswith(".weight") else key
 
-                    if is_dtensor:
-                        out_features, in_features = value.shape
+                    local_tensor = value._local_tensor if is_dtensor and hasattr(value, "_local_tensor") else (
+                        value.to_local() if is_dtensor else value
+                    )
+                    is_meta = local_tensor.is_meta
 
-                        # INT4 packing: 8 values per int32
-                        packed_in_features = in_features // 8
-                        # Scale shape: one scale per group (group_size=32)
+                    if is_meta:
+                        out_features, in_features = local_tensor.shape
                         group_size = 32
-                        num_groups = in_features // group_size
+                        packed = torch.empty(out_features, in_features // 8, dtype=torch.int32, device="meta")
+                        scale = torch.empty(out_features, in_features // group_size, dtype=torch.float16, device="meta")
+                        shape = torch.tensor([value.shape[0], value.shape[1]], dtype=torch.int64)
+                    else:
+                        packed, scale, shape = quantize_to_int4(local_tensor)
+                        packed = packed.to(local_tensor.device)
+                        scale = scale.to(local_tensor.device)
+                        shape = shape.to(local_tensor.device)
 
-                        local_tensor = value._local_tensor if hasattr(value, "_local_tensor") else value.to_local()
-                        local_out, local_in = local_tensor.shape
-                        local_packed_in = local_in // 8
-
+                    if is_dtensor and not is_meta:
                         placements = value.placements if hasattr(value, "placements") else [Shard(0)]
                         mesh = value.device_mesh if hasattr(value, "device_mesh") else device_mesh
-
                         if mesh is not None:
-                            # weight_packed: DTensor (DCP loads sharded data)
-                            packed_local = torch.empty(
-                                local_out, local_packed_in, dtype=torch.int32, device=local_tensor.device
-                            )
-                            packed_dtensor = DTensor.from_local(packed_local, mesh, placements)
+                            packed = DTensor.from_local(packed, mesh, placements)
+                            scale = DTensor.from_local(scale, mesh, placements)
 
-                            # weight_scale: DTensor with SAME sharding as weight_packed
-                            # This is critical for INT4 dequantization - scale is proportional to weight dim 1
-                            # .to_local() on both gives corresponding slices automatically
-                            local_num_groups = local_in // group_size
-                            scale_local = torch.empty(
-                                local_out, local_num_groups, dtype=torch.float16, device=local_tensor.device
-                            )
-                            scale_dtensor = DTensor.from_local(scale_local, mesh, placements)
-
-                            # weight_shape: Regular tensor (just metadata, replicated)
-                            weight_shape = torch.tensor(
-                                [out_features, in_features], dtype=torch.int64, device=local_tensor.device
-                            )
-
-                            quantized_result.append((f"{base}.weight_packed", packed_dtensor))
-                            quantized_result.append((f"{base}.weight_scale", scale_dtensor))
-                            quantized_result.append((f"{base}.weight_shape", weight_shape))
-                        else:
-                            quantized_result.append(
-                                (
-                                    f"{base}.weight_packed",
-                                    torch.empty(out_features, packed_in_features, dtype=torch.int32),
-                                )
-                            )
-                            quantized_result.append(
-                                (f"{base}.weight_scale", torch.empty(out_features, num_groups, dtype=torch.float16))
-                            )
-                            quantized_result.append(
-                                (f"{base}.weight_shape", torch.tensor([out_features, in_features], dtype=torch.int64))
-                            )
-                    else:
-                        out_features, in_features = value.shape
-                        packed_in_features = in_features // 8
-                        group_size = 32
-                        num_groups = in_features // group_size
-
-                        quantized_result.append(
-                            (
-                                f"{base}.weight_packed",
-                                torch.empty(out_features, packed_in_features, dtype=torch.int32, device=value.device),
-                            )
-                        )
-                        quantized_result.append(
-                            (
-                                f"{base}.weight_scale",
-                                torch.empty(out_features, num_groups, dtype=torch.float16, device=value.device),
-                            )
-                        )
-                        quantized_result.append(
-                            (
-                                f"{base}.weight_shape",
-                                torch.tensor([out_features, in_features], dtype=torch.int64, device=value.device),
-                            )
-                        )
+                    quantized_result.append((f"{base}.weight_packed", packed))
+                    quantized_result.append((f"{base}.weight_scale", scale))
+                    quantized_result.append((f"{base}.weight_shape", shape))
                 else:
                     quantized_result.append((key, value))
             return quantized_result
