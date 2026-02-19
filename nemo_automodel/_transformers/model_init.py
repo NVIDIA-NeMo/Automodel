@@ -33,6 +33,10 @@ from transformers.modeling_utils import PreTrainedModel
 if not hasattr(PretrainedConfig, "pad_token_id"):
     PretrainedConfig.pad_token_id = None
 
+from nemo_automodel._transformers.utils import apply_qwen3_omni_config_patch
+
+apply_qwen3_omni_config_patch()
+
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
