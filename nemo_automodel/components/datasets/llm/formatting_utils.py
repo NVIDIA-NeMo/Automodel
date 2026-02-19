@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 
 GENERATION_REGEX = re.compile(r"\{%-?\s+generation\s+-?%\}")
 
+
 @torch.no_grad()
 def _get_right_trailing_pad_mask(
     sequence: torch.Tensor,
