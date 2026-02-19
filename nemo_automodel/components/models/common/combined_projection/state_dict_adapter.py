@@ -82,9 +82,9 @@ class CombinedProjectionStateDictAdapter:
         where each group has (group_size * head_dim) Q rows, head_dim K rows, head_dim V rows.
         """
         rest = q.shape[1:]
-        q = q.view(self.num_key_value_heads, self.group_size * self.head_dim, *rest)
-        k = k.view(self.num_key_value_heads, self.head_dim, *rest)
-        v = v.view(self.num_key_value_heads, self.head_dim, *rest)
+        q = q.reshape(self.num_key_value_heads, self.group_size * self.head_dim, *rest)
+        k = k.reshape(self.num_key_value_heads, self.head_dim, *rest)
+        v = v.reshape(self.num_key_value_heads, self.head_dim, *rest)
         return torch.cat([q, k, v], dim=1).reshape(-1, *rest)
 
     def _deinterleave_qkv(self, qkv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -95,7 +95,7 @@ class CombinedProjectionStateDictAdapter:
         """
         rest = qkv.shape[1:]
         group_width = (self.group_size + 2) * self.head_dim
-        qkv = qkv.view(-1, group_width, *rest)
+        qkv = qkv.reshape(-1, group_width, *rest)
         q, k, v = qkv.split([self.group_size * self.head_dim, self.head_dim, self.head_dim], dim=1)
         return q.reshape(-1, *rest), k.reshape(-1, *rest), v.reshape(-1, *rest)
 
@@ -106,7 +106,7 @@ class CombinedProjectionStateDictAdapter:
     def _deinterleave_gate_up(self, gate_up: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """De-interleave gate/up from row-interleaved layout."""
         rest = gate_up.shape[1:]
-        gate_up = gate_up.view(-1, 2, *rest)
+        gate_up = gate_up.reshape(-1, 2, *rest)
         return gate_up[:, 0].contiguous(), gate_up[:, 1].contiguous()
 
     def from_hf(self, hf_state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:

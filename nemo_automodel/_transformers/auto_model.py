@@ -166,7 +166,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         fp8_config,
         compile_config,
         load_base_model,
-        use_dcp_for_base_model_load=False,
         **kwargs,
     ):
         """Shared model building logic for ``from_pretrained`` and ``from_config``.
@@ -214,7 +213,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 fp8_config=fp8_config,
                 compile_config=compile_config,
                 load_base_model=load_base_model,
-                use_dcp_for_base_model_load=use_dcp_for_base_model_load,
                 **retry_kwargs,
             )
 
@@ -332,7 +330,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             load_base_model=load_base_model,
             cache_dir=cache_dir,
             freeze_config=freeze_config,
-            use_dcp_for_base_model_load=use_dcp_for_base_model_load,
         )
 
         return model
@@ -360,7 +357,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         peft_config: Optional[dict] = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
-        use_dcp_for_base_model_load: bool = False,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -475,7 +471,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             fp8_config=fp8_config,
             compile_config=compile_config,
             load_base_model=True,
-            use_dcp_for_base_model_load=use_dcp_for_base_model_load,
             **kwargs,
         )
 

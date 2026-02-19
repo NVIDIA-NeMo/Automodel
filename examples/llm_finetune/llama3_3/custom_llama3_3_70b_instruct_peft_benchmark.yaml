@@ -44,7 +44,6 @@ checkpoint:
   checkpoint_dir: checkpoints/
   model_save_format: safetensors
   save_consolidated: false
-  use_dcp_for_base_model_load: true
 
 distributed:
   strategy: fsdp2
