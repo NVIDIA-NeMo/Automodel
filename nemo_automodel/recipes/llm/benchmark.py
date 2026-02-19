@@ -473,7 +473,8 @@ def main(config_path=None):
     # recipe = BenchmarkingRecipeForNextTokenPrediction(cfg)
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     recipe.setup()
-    recipe.run_benchmark()
+    # recipe.run_benchmark()
+    recipe.run_train_validation_loop()
 
 
 if __name__ == "__main__":
