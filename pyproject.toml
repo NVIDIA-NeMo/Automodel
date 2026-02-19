@@ -257,6 +257,8 @@ omit = [
     "nemo_automodel/_transformers/tokenization/tokenization_mistral_common.py",
     # requires databricks
     "nemo_automodel/components/datasets/llm/delta_lake_dataset.py",
+    # Weird file suddenly appearing in coverage
+    "_remote_module_non_scriptable",
 ]
 
 [tool.ruff]
