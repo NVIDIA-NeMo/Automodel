@@ -164,9 +164,7 @@ class FusedColwiseParallelLora(FusedColwiseParallel):
         def lora_a_output_hook(module, input, output):
             if isinstance(output, DTensor):
                 if any(isinstance(p, Shard) for p in output.placements):
-                    output = output.redistribute(
-                        device_mesh=output.device_mesh, placements=[Replicate()]
-                    )
+                    output = output.redistribute(device_mesh=output.device_mesh, placements=[Replicate()])
             return output
 
         if hasattr(module, "lora_A"):
