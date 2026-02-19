@@ -16,12 +16,54 @@ import logging
 import re
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
+import torch
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
 
 GENERATION_REGEX = re.compile(r"\{%-?\s+generation\s+-?%\}")
+
+@torch.no_grad()
+def _get_right_trailing_pad_mask(
+    sequence: torch.Tensor,
+    pad_token_id: int,
+    eos_token_id: int,
+) -> torch.Tensor:
+    """Boolean mask identifying right-trailing padding positions.
+
+    When *pad_token_id != eos_token_id*, it is simply ``sequence == pad_token_id``.
+
+    When the two IDs collide, a plain equality check would also match real EOS
+    tokens inside the content.  In that case the function locates the trailing
+    contiguous run of the shared token and treats all positions **after the
+    first one** in that run as padding.  The first token in the trailing run is
+    the real EOS and is kept unmasked so the model still learns to predict
+    end-of-sequence.
+
+    Args:
+        sequence: 1-D token id tensor.
+        pad_token_id: The token id used for padding.
+        eos_token_id: The token id used for end-of-sequence.  When equal to
+            *pad_token_id* the positional trailing-run logic is used.
+
+    Returns:
+        Boolean tensor (same shape as *sequence*) where ``True`` = padding.
+    """
+    if pad_token_id != eos_token_id:
+        return sequence == pad_token_id
+
+    mask = torch.zeros(sequence.shape, dtype=torch.bool, device=sequence.device)
+    non_pad_positions = (sequence != pad_token_id).nonzero(as_tuple=True)[0]
+    if non_pad_positions.numel() > 0:
+        last_content_idx = non_pad_positions[-1].item()
+        # last_content_idx + 1 → real EOS (keep), last_content_idx + 2 → padding
+        mask[last_content_idx + 2 :] = True
+    else:
+        # Entire sequence is the pad/eos token; keep the first as real EOS.
+        mask[1:] = True
+    return mask
 
 
 def _pad_to_seq_length(sample, pad_token_id, seq_length):
@@ -37,10 +79,23 @@ def _add_pad_token(tokenizer):
     pad_token_id = None
     if getattr(tokenizer, "pad_token_id", None) is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+        logger.warning(
+            "Tokenizer has no pad_token_id; falling back to eos_token_id (%s). "
+            "This may cause issues if downstream code masks padding by token ID.",
+            tokenizer.eos_token_id,
+        )
     else:
         pad_token_id = tokenizer.pad_token_id
     if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
         tokenizer.pad_token = tokenizer.eos_token
+    if getattr(tokenizer, "pad_token_id", None) == getattr(tokenizer, "eos_token_id", None):
+        logger.warning(
+            "pad_token_id (%s) == eos_token_id (%s) for tokenizer '%s'. "
+            "Ensure loss masking uses positional logic rather than token-ID comparison.",
+            tokenizer.pad_token_id,
+            tokenizer.eos_token_id,
+            getattr(tokenizer, "name_or_path", "unknown"),
+        )
     return pad_token_id
 
 
