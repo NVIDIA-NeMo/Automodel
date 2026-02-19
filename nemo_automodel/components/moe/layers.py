@@ -543,21 +543,30 @@ class MoE(nn.Module):
             self.gate = FakeBalancedGate(config, noise=backend.fake_gate_noise)
         else:
             self.gate = Gate(config, gate_precision=backend.gate_precision)
-        if backend.dispatcher == "deepep" and get_world_size_safe() == 1:
+        if backend.dispatcher in ("deepep", "hybridep") and get_world_size_safe() == 1:
             warnings.warn(
-                "DeepEP dispatcher is enabled in config, but world size is 1. "
-                "DeepEP requires multiple GPUs. Falling back to standard GroupedExperts.",
+                f"{backend.dispatcher} dispatcher is enabled in config, but world size is 1. "
+                f"{backend.dispatcher} requires multiple GPUs. Falling back to standard GroupedExperts.",
                 category=UserWarning,
                 stacklevel=2,
             )
             self.experts = GroupedExperts(config, backend=backend)
-        elif backend.dispatcher == "deepep":
-            # DeepEP dispatcher requires TE, GMM, or torch_mm experts (validated in BackendConfig)
+        elif backend.dispatcher in ("deepep", "hybridep"):
             if backend.experts in ("gmm", "torch_mm"):
-                self.experts = GroupedExpertsDeepEP(config, backend=backend)
+                self.experts = GroupedExpertsDeepEP(
+                    config,
+                    backend=backend,
+                    dispatcher_backend=backend.dispatcher,
+                    dispatcher_num_sms=backend.dispatcher_num_sms,
+                )
             else:
                 # experts == "te"
-                self.experts = GroupedExpertsTE(config, backend=backend)
+                self.experts = GroupedExpertsTE(
+                    config,
+                    backend=backend,
+                    dispatcher_backend=backend.dispatcher,
+                    dispatcher_num_sms=backend.dispatcher_num_sms,
+                )
         else:
             # Default to torch experts
             self.experts = GroupedExperts(config, backend=backend)
