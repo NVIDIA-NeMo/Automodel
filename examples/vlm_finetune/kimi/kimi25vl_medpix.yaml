@@ -48,7 +48,7 @@ distributed:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /your/path/to/kimi-K25-VL-weights
+  pretrained_model_name_or_path: moonshotai/Kimi-K2.5
   torch_dtype: bfloat16
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
@@ -63,7 +63,7 @@ model:
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: /your/path/to/kimi-K25-VL-weights
+  pretrained_model_name_or_path: moonshotai/Kimi-K2.5
   trust_remote_code: true
 
 checkpoint:
