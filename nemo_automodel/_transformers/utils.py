@@ -116,10 +116,6 @@ def _patch_special_tokens_pattern():
     append ``sep_token_id``.  Custom tokenizers (e.g. TikToken-based Kimi) that
     lack CLS/SEP tokens end up with ``None`` IDs in the sequence, crashing
     ``pad()``.
-
-    Changing the default to ``"none"`` restores the v4 behaviour where
-    ``build_inputs_with_special_tokens`` returns the token list unchanged unless
-    the tokenizer subclass explicitly overrides the method.
     """
     from transformers.tokenization_python import PreTrainedTokenizer
 
