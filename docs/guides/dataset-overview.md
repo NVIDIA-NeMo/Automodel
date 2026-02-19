@@ -1,6 +1,6 @@
-# Dataset Overview: LLM, VLM, ASR, and Retrieval Datasets in NeMo Automodel
+# Dataset Overview: LLM, VLM, ASR, and Retrieval Datasets in NeMo AutoModel
 
-This page summarizes the datasets supported in NeMo Automodel for LLM, VLM, ASR (Automatic Speech Recognition), and retrieval/embedding (biencoder) training and shows how to plug in your own datasets using Python functions or the YAML `_target_` mechanism.
+This page summarizes the datasets supported in NeMo AutoModel for LLM, VLM, ASR, and retrieval/embedding (biencoder) training. It also shows how to plug in your own datasets using Python functions or the YAML `_target_` mechanism.
 
 - See also: [LLM datasets](llm/dataset.md), [VLM datasets](vlm/dataset.md), [ASR datasets](asr/dataset.md), and [Biencoder retrieval dataset](llm/retrieval-dataset.md) for deeper, task-specific guides.
 

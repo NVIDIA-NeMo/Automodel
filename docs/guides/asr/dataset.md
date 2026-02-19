@@ -1,6 +1,6 @@
 # Integrate Your Own ASR Dataset
 
-This guide shows how to integrate audio datasets into NeMo Automodel for ASR (Automatic Speech Recognition) training. You'll learn about audio preprocessing, architecture-specific collate functions, and YAML configuration.
+This guide shows how to integrate audio datasets into NeMo AutoModel for Automatic Speech Recognition (ASR) training. You'll learn about audio preprocessing, architecture-specific collate functions, and YAML configuration.
 
 ## Quick Reference
 

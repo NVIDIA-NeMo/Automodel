@@ -1,6 +1,6 @@
 # Overview
 
-NeMo Automodel integrates with Hugging Face `transformers`. As a result, any LLM, VLM, or ASR model that can be instantiated through `transformers` can also be used via NeMo Automodel, subject to runtime, third-party software dependencies, and feature compatibility.
+NeMo AutoModel integrates with Hugging Face `transformers`. As a result, any LLM, VLM, or ASR model that can be instantiated through `transformers` can also be used via NeMo AutoModel, subject to runtime, third-party software dependencies, and feature compatibility.
 
 ## Version Compatibility and Day-0 Support
 

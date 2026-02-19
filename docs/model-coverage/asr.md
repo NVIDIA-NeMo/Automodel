@@ -10,7 +10,7 @@ To run ASR models with NeMo AutoModel, use NeMo container version [`25.11.00`](h
 
 ```bash
 
-   pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/AutoModel.git
+pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/Automodel.git
 ```
 
 For other installation options (e.g., uv) please see our [Installation Guide](../guides/installation.md).
