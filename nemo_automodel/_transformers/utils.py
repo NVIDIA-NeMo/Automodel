@@ -72,8 +72,69 @@ def apply_qwen3_omni_config_patch():
         Qwen3OmniMoeTalkerCodePredictorConfig.use_sliding_window = False
 
 
+def _patch_bytes_to_unicode():
+    """Re-export bytes_to_unicode on transformers.models.gpt2.tokenization_gpt2.
+
+    In transformers v5 this helper was removed from the GPT-2 tokenizer module,
+    but some custom tokenizers shipped with model weights (e.g. Kimi) still
+    import it from there via ``trust_remote_code``.  Monkey-patching it back
+    avoids an ImportError without modifying the transformers package.
+    """
+    import importlib
+
+    gpt2_tok = importlib.import_module("transformers.models.gpt2.tokenization_gpt2")
+    if hasattr(gpt2_tok, "bytes_to_unicode"):
+        return
+
+    from functools import lru_cache
+
+    @lru_cache()
+    def bytes_to_unicode():
+        bs = (
+            list(range(ord("!"), ord("~") + 1))
+            + list(range(ord("¡"), ord("¬") + 1))
+            + list(range(ord("®"), ord("ÿ") + 1))
+        )
+        cs = bs[:]
+        n = 0
+        for b in range(2**8):
+            if b not in bs:
+                bs.append(b)
+                cs.append(2**8 + n)
+                n += 1
+        cs = [chr(n) for n in cs]
+        return dict(zip(bs, cs))
+
+    gpt2_tok.bytes_to_unicode = bytes_to_unicode
+
+
+def _patch_special_tokens_pattern():
+    """Default ``special_tokens_pattern`` to ``"none"`` for PreTrainedTokenizer.
+
+    Transformers v5 introduced ``special_tokens_pattern`` (default ``"cls_sep"``)
+    which makes ``build_inputs_with_special_tokens`` prepend ``cls_token_id`` and
+    append ``sep_token_id``.  Custom tokenizers (e.g. TikToken-based Kimi) that
+    lack CLS/SEP tokens end up with ``None`` IDs in the sequence, crashing
+    ``pad()``.
+    """
+    from transformers.tokenization_python import PreTrainedTokenizer
+
+    _orig_init = PreTrainedTokenizer.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        kwargs.setdefault("special_tokens_pattern", "none")
+        return _orig_init(self, *args, **kwargs)
+
+    if not getattr(PreTrainedTokenizer.__init__, "_nemo_stp_patched", False):
+        PreTrainedTokenizer.__init__ = _patched_init
+        PreTrainedTokenizer.__init__._nemo_stp_patched = True  # type: ignore[attr-defined]
+
+
 def apply_cache_compatibility_patches():
     """Apply compatibility patches for transformers cache utilities."""
+    _patch_bytes_to_unicode()
+    _patch_special_tokens_pattern()
+
     # Alias cache API for models expecting get_usable_length
     from transformers.cache_utils import DynamicCache
 
