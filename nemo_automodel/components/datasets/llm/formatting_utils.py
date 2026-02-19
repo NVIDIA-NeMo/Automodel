@@ -75,10 +75,13 @@ def _pad_to_seq_length(sample, pad_token_id, seq_length):
     return sample + [pad_token_id] * n
 
 
+_warned_add_pad_token = set()
+
+
 def _add_pad_token(tokenizer):
     """Add pad token to tokenizer if not present."""
     pad_token_id = None
-    if getattr(tokenizer, "pad_token_id", None) is None:
+    if getattr(tokenizer, "pad_token_id", None) is None and not _warned_add_pad_token.add("no_pad_id"):
         tokenizer.pad_token_id = tokenizer.eos_token_id
         logger.warning(
             "Tokenizer has no pad_token_id; falling back to eos_token_id (%s). "
@@ -89,7 +92,11 @@ def _add_pad_token(tokenizer):
         pad_token_id = tokenizer.pad_token_id
     if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
         tokenizer.pad_token = tokenizer.eos_token
-    if getattr(tokenizer, "pad_token_id", None) == getattr(tokenizer, "eos_token_id", None):
+    if (
+        pad_token_id
+        and pad_token_id == getattr(tokenizer, "eos_token_id", None)
+        and not _warned_add_pad_token.add("pad_eq_eos")
+    ):
         logger.warning(
             "pad_token_id (%s) == eos_token_id (%s) for tokenizer '%s'. "
             "Ensure loss masking uses positional logic rather than token-ID comparison.",
