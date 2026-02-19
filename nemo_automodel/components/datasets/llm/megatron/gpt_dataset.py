@@ -28,6 +28,7 @@ import numpy
 import torch
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from nemo_automodel.components.datasets.llm.formatting_utils import _get_right_trailing_pad_mask
 from nemo_automodel.components.datasets.llm.megatron.indexed_dataset import IndexedDataset
 
 # taken and modified from https://github.com/NVIDIA/Megatron-LM/blob/5e798111e60f45e82c336ef7b89d8d793c93208f/megatron/core/datasets/gpt_dataset.py
@@ -302,6 +303,20 @@ class GPTDataset(torch.utils.data.Dataset):
         except Exception:
             self._pad_token_id = _PAD_TOKEN_ID
 
+        self._eos_token_id = getattr(self.config.tokenizer, "eos_token_id", None)
+        self._pad_eos_overlap = (
+            self._eos_token_id is not None
+            and self._pad_token_id is not None
+            and self._pad_token_id == self._eos_token_id
+        )
+        if self._pad_eos_overlap:
+            logger.warning(
+                "pad_token_id (%d) == eos_token_id (%d). "
+                "Trailing-padding detection will be used to avoid masking real EOS tokens in the loss.",
+                self._pad_token_id,
+                self._eos_token_id,
+            )
+
         (self.document_index, self.sample_index, self.shuffle_index) = self._build_document_sample_shuffle_indices()
 
     @staticmethod
@@ -400,12 +415,12 @@ class GPTDataset(torch.utils.data.Dataset):
             loss_mask = self.cached_loss_mask
             position_ids = self.cached_position_ids
 
-        # For padded sequences, mask the loss
-        loss_mask[labels == self._pad_token_id] = 0.0
+        tokens_pad_mask = _get_right_trailing_pad_mask(tokens, self._pad_token_id, self._eos_token_id)
+        labels_pad_mask = _get_right_trailing_pad_mask(labels, self._pad_token_id, self._eos_token_id)
 
-        # For padded sequences, ensure the embedding layer can map the token ID
-        tokens[tokens == self._pad_token_id] = 0
-        labels[labels == self._pad_token_id] = 0
+        loss_mask[labels_pad_mask] = 0.0
+        tokens[tokens_pad_mask] = 0
+        labels[labels_pad_mask] = 0
 
         # Batch padding sequence so we mask the loss
         if idx is None:
