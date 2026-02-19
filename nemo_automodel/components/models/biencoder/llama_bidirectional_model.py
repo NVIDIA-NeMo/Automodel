@@ -575,6 +575,11 @@ class BiencoderModel(nn.Module):
             )
 
         # Load model locally or from hub using selected model class
+        if os.path.isabs(model_name_or_path) and not os.path.isdir(model_name_or_path):
+            raise FileNotFoundError(
+                f"Local model directory not found: {model_name_or_path}. "
+                f"Provide a valid local path or a HuggingFace Hub repo ID."
+            )
         if os.path.isdir(model_name_or_path):
             if share_encoder:
                 lm_q = ModelClass.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)

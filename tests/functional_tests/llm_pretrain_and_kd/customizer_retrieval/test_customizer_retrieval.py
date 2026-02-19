@@ -44,7 +44,7 @@ _REPO_ROOT = _THIS_DIR.parents[3]  # Automodel6/
 
 BASE_MODEL_PATH = os.environ.get(
     "BASE_MODEL_PATH",
-    "/mnt/4tb/auto/Automodel6/ckpts/nvidia/llama-nemotron-embed-1b-v2",
+    "/home/TestData/automodel/llama-nemotron-embed-1b-v2",
 )
 CHECKPOINT_DIR = os.environ.get(
     "CHECKPOINT_DIR",
@@ -305,6 +305,7 @@ class TestCustomizerRetrieval:
         onnx_path = export_to_onnx(
             model_path=str(checkpoint_dir),
             output_dir=ONNX_OUTPUT_DIR,
+            tokenizer_path=BASE_MODEL_PATH,
             pooling="avg",
             normalize=True,
             opset=17,

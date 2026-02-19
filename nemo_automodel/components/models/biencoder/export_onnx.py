@@ -103,6 +103,7 @@ def export_to_onnx(
     model_path: str,
     output_dir: str,
     *,
+    tokenizer_path: str | None = None,
     pooling: str = "avg",
     normalize: bool = True,
     opset: int = 17,
@@ -112,16 +113,19 @@ def export_to_onnx(
     """Export a HuggingFace embedding model to ONNX.
 
     Args:
-        model_path:   Path to the HuggingFace model directory (must contain
-                      ``config.json`` and weight files).
-        output_dir:   Directory where ``model.onnx`` and ``tokenizer/`` will be
-                      written.
-        pooling:      Pooling strategy applied on top of transformer hidden
-                      states.  One of ``"avg"``, ``"cls"``, ``"last"``.
-        normalize:    If *True*, L2-normalise the pooled embeddings.
-        opset:        ONNX opset version (default 17).
-        export_dtype: Export precision — ``"fp32"`` or ``"fp16"``.
-        verify:       Run a quick onnxruntime round-trip after export.
+        model_path:      Path to the HuggingFace model directory (must contain
+                         ``config.json`` and weight files).
+        output_dir:      Directory where ``model.onnx`` and ``tokenizer/`` will
+                         be written.
+        tokenizer_path:  Path to load the tokenizer from.  Defaults to
+                         *model_path* when not specified.  Useful when the
+                         checkpoint directory does not contain tokenizer files.
+        pooling:         Pooling strategy applied on top of transformer hidden
+                         states.  One of ``"avg"``, ``"cls"``, ``"last"``.
+        normalize:       If *True*, L2-normalise the pooled embeddings.
+        opset:           ONNX opset version (default 17).
+        export_dtype:    Export precision — ``"fp32"`` or ``"fp16"``.
+        verify:          Run a quick onnxruntime round-trip after export.
 
     Returns:
         Absolute path to the exported ``model.onnx``.
@@ -130,11 +134,16 @@ def export_to_onnx(
     output_dir = str(Path(output_dir).resolve())
     os.makedirs(output_dir, exist_ok=True)
 
+    if tokenizer_path is None:
+        tokenizer_path = model_path
+    else:
+        tokenizer_path = str(Path(tokenizer_path).resolve())
+
     # ------------------------------------------------------------------
     # 1. Load tokenizer + base transformer
     # ------------------------------------------------------------------
-    logger.info("Loading tokenizer from %s", model_path)
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    logger.info("Loading tokenizer from %s", tokenizer_path)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
 
     logger.info("Loading model from %s", model_path)
     base_model = AutoModel.from_pretrained(model_path, trust_remote_code=True).eval()
@@ -264,6 +273,12 @@ def _parse_args() -> argparse.Namespace:
         help="Directory for ONNX model and tokenizer output.",
     )
     parser.add_argument(
+        "--tokenizer-path",
+        type=str,
+        default=None,
+        help="Path to load the tokenizer from (defaults to --model-path).",
+    )
+    parser.add_argument(
         "--pooling", type=str, default="avg", choices=["avg", "cls", "last"], help="Pooling strategy (default: avg)."
     )
     parser.add_argument(
@@ -286,6 +301,7 @@ def main():
     onnx_path = export_to_onnx(
         model_path=args.model_path,
         output_dir=args.output_dir,
+        tokenizer_path=args.tokenizer_path,
         pooling=args.pooling,
         normalize=args.normalize,
         opset=args.opset,
