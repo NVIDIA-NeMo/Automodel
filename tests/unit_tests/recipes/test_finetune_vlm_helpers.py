@@ -431,6 +431,54 @@ def test_autoprocessor_exception_handling(caplog):
 
 
 
+def test_autoprocessor_loads_inside_first_rank_per_node():
+    """Test that processor instantiation happens inside the FirstRankPerNode context."""
+    import logging
+
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    call_order = []
+
+    class TrackingFirstRankPerNode:
+        def __enter__(self):
+            call_order.append("enter_first_rank")
+            return self
+
+        def __exit__(self, *args):
+            call_order.append("exit_first_rank")
+            return False
+
+    def tracking_from_pretrained(*args, **kwargs):
+        call_order.append("autoprocessor")
+        return MagicMock()
+
+    with patch('nemo_automodel.recipes.vlm.finetune.FirstRankPerNode', TrackingFirstRankPerNode), \
+         patch('transformers.AutoProcessor.from_pretrained', side_effect=tracking_from_pretrained), \
+         patch('nemo_automodel.components.training.rng.StatefulRNG'), \
+         patch('torch.utils.data.distributed.DistributedSampler'), \
+         patch('nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS', {'NoneType': MagicMock()}):
+
+        cfg_ds = MagicMock()
+        cfg_ds.instantiate.return_value = []
+        cfg_ds.path_or_dataset = "test/dataset"
+
+        cfg_dl = MagicMock()
+        cfg_dl.get.return_value = None
+        cfg_dl.instantiate.return_value = MagicMock()
+
+        build_dataloader(cfg_ds, cfg_dl, "test/model", None, None, 123, 1)
+
+    assert "enter_first_rank" in call_order
+    assert "autoprocessor" in call_order
+    assert "exit_first_rank" in call_order
+    first_rank_idx = call_order.index("enter_first_rank")
+    processor_idx = call_order.index("autoprocessor")
+    exit_idx = call_order.index("exit_first_rank")
+    assert first_rank_idx < processor_idx < exit_idx, (
+        f"AutoProcessor must load inside FirstRankPerNode context, got order: {call_order}"
+    )
+
+
 def test_autoprocessor_with_processor_kwargs(caplog):
     """Test AutoProcessor exception handling when cfg_processor has no instantiate method."""
     import logging
