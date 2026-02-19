@@ -120,7 +120,7 @@ class FusedColwiseParallel(ColwiseParallel):
 
             if not needs_fused_split:
                 dist_param = nn.Parameter(
-                    distribute_tensor(param.data, device_mesh, [Shard(0)])
+                    distribute_tensor(param.data, device_mesh, [Shard(0)], src_data_rank=self.src_data_rank)
                 )
                 self._set_param(module, pname, dist_param)
                 continue
@@ -132,7 +132,7 @@ class FusedColwiseParallel(ColwiseParallel):
 
             local_parts = []
             for sec in sections:
-                dt = distribute_tensor(sec, device_mesh, [Shard(0)])
+                dt = distribute_tensor(sec, device_mesh, [Shard(0)], src_data_rank=self.src_data_rank)
                 local_parts.append(dt.to_local())
 
             local_data = torch.cat(local_parts, dim=0)
