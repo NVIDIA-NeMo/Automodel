@@ -13,12 +13,6 @@
 # limitations under the License.
 name: Release docs
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'docs/**'
-
   workflow_dispatch:
     inputs:
       dry-run:
