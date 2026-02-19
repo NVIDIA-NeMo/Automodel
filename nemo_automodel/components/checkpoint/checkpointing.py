@@ -589,6 +589,11 @@ class Checkpointer:
 
         weight_map = _read_safetensors_weight_map(model_path)
         param_map = _build_param_map(model)
+
+        if adapter is None:
+            model_key_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
+            adapter = _try_build_transformers_conversion_adapter(model, weight_map.keys(), model_key_mapping)
+
         schedule = _build_broadcast_schedule(adapter, weight_map, model)
 
         base_dir = model_path if os.path.isdir(model_path) else os.path.dirname(model_path)
@@ -1266,6 +1271,113 @@ def _load_full_state_dict_into_model(
 # ---------------------------------------------------------------------------
 # Streaming checkpoint loader helpers
 # ---------------------------------------------------------------------------
+
+
+class _HfTransformersConversionAdapter:
+    """Wraps transformers' conversion mapping as a streaming-compatible adapter.
+
+    For models without a native ``state_dict_adapter`` that still need tensor
+    merging (e.g. Mixtral individual experts -> grouped 3-D tensor), this class
+    provides the three methods that ``_build_broadcast_schedule`` and
+    ``_merge_group_on_gpu`` rely on:
+
+    * ``rename_hf_key``
+    * ``get_hf_keys_for_native_key``
+    * ``get_merged_tensor_for_native_key``
+
+    Construction only touches key names (from the safetensors header / index);
+    no tensor data is materialised, so memory overhead is negligible.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        ckpt_keys,
+        key_mapping: Optional[dict[str, str]] = None,
+    ):
+        from copy import deepcopy
+
+        from transformers.core_model_loading import WeightConverter, WeightRenaming, rename_source_key
+
+        from nemo_automodel.components.checkpoint.conversion_mapping import get_model_conversion_mapping
+
+        weight_mapping = get_model_conversion_mapping(model, key_mapping=key_mapping, add_legacy=True)
+        renamings = [e for e in weight_mapping if isinstance(e, WeightRenaming)]
+        converters = [e for e in weight_mapping if isinstance(e, WeightConverter)]
+        pattern_to_converter: dict[str, Any] = {k: c for c in converters for k in c.source_patterns}
+
+        self._ckpt_to_renamed: dict[str, str] = {}
+        self._ckpt_to_source_pattern: dict[str, Optional[str]] = {}
+        self._model_to_ckpt: dict[str, list[str]] = {}
+        self._converters: dict[str, Any] = {}
+        self._model = model
+        self._deepcopy = deepcopy
+
+        for ckpt_key in ckpt_keys:
+            renamed_key, source_pattern = rename_source_key(ckpt_key, renamings, converters)
+            self._ckpt_to_renamed[ckpt_key] = renamed_key
+            self._ckpt_to_source_pattern[ckpt_key] = source_pattern
+            self._model_to_ckpt.setdefault(renamed_key, []).append(ckpt_key)
+            if source_pattern is not None and renamed_key not in self._converters:
+                self._converters[renamed_key] = pattern_to_converter[source_pattern]
+
+    # -- interface consumed by _build_broadcast_schedule / _merge_group_on_gpu --
+
+    def rename_hf_key(self, ckpt_key: str) -> str:
+        renamed = self._ckpt_to_renamed.get(ckpt_key, ckpt_key)
+        # Converter groups map many ckpt keys to the *same* model key.
+        # Returning the ckpt key unchanged prevents collisions in group_sd.
+        if renamed in self._converters:
+            return ckpt_key
+        return renamed
+
+    def get_hf_keys_for_native_key(self, native_key: str) -> Optional[list[str]]:
+        ckpt_keys = self._model_to_ckpt.get(native_key)
+        return ckpt_keys if ckpt_keys else None
+
+    def get_merged_tensor_for_native_key(
+        self,
+        native_key: str,
+        group_sd: dict[str, torch.Tensor],
+        device_mesh=None,
+    ) -> Optional[torch.Tensor]:
+        converter_template = self._converters.get(native_key)
+        if converter_template is None:
+            return None
+
+        converter = self._deepcopy(converter_template)
+
+        # group_sd is keyed by checkpoint keys (rename_hf_key kept them intact
+        # for converter groups) so we can recover the source_pattern per key.
+        for ckpt_key, tensor in group_sd.items():
+            renamed = self._ckpt_to_renamed.get(ckpt_key, ckpt_key)
+            source_pattern = self._ckpt_to_source_pattern.get(ckpt_key)
+            converter.add_tensor(renamed, ckpt_key, source_pattern, tensor)
+
+        realized, _ = converter.convert(native_key, model=self._model, config=self._model.config)
+
+        if native_key in realized:
+            param = realized[native_key]
+            return param[0] if isinstance(param, list) else param
+
+        if len(realized) == 1:
+            param = next(iter(realized.values()))
+            return param[0] if isinstance(param, list) else param
+
+        return None
+
+
+def _try_build_transformers_conversion_adapter(
+    model: nn.Module,
+    ckpt_keys,
+    key_mapping: Optional[dict[str, str]] = None,
+) -> Optional[_HfTransformersConversionAdapter]:
+    """Create a ``_HfTransformersConversionAdapter``, returning *None* on failure."""
+    try:
+        return _HfTransformersConversionAdapter(model, ckpt_keys, key_mapping)
+    except Exception as e:
+        logging.warning("Could not build transformers conversion adapter: %s", e)
+        return None
 
 
 def _read_safetensors_weight_map(model_path: str) -> dict[str, str]:
