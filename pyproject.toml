@@ -185,7 +185,7 @@ constraint-dependencies = [
     "urllib3>=2.6.3", # Address CVE GHSA-gm62-xv2j-4w53
     "wheel>=0.46.2", # Address CVE GHSA-8rrh-rw8j-w5fx
     "fonttools>=4.60.2", # Address CVE-2025-66034
-    "mlflow>=3.10.0rc0",
+    "mlflow>=3.10.0rc0", # Address CVE
 ]
 prerelease = "allow"
 
