@@ -16,6 +16,7 @@ import pytest
 from jinja2.exceptions import TemplateError
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import NeMoAutoTokenizerWithBosEosEnforced
 
 GEMMA_TOKENIZER_PATH = "/home/TestData/automodel/tokenizers/gemma-2-9b-it"
 
@@ -51,7 +52,7 @@ def test_gemma_tokenizer_system_role_handling(force_hf, conversation_with_system
     tokenizer = NeMoAutoTokenizer.from_pretrained(GEMMA_TOKENIZER_PATH, force_hf=force_hf)
 
     if force_hf:
-        assert not isinstance(tokenizer, NeMoAutoTokenizer)
+        assert not isinstance(tokenizer, NeMoAutoTokenizerWithBosEosEnforced)
         # Raw HF tokenizer should raise TemplateError for system role
         with pytest.raises(TemplateError, match="System role not supported"):
             tokenizer.apply_chat_template(
@@ -60,16 +61,17 @@ def test_gemma_tokenizer_system_role_handling(force_hf, conversation_with_system
                 add_generation_prompt=True,
             )
     else:
-        assert isinstance(tokenizer, NeMoAutoTokenizer)
-        # NeMoAutoTokenizer should handle system role gracefully (maps to assistant, then drops)
+        assert isinstance(tokenizer, NeMoAutoTokenizerWithBosEosEnforced)
+        # NeMoAutoTokenizer should handle system role gracefully (maps to user, then drops)
         result = tokenizer.apply_chat_template(
             conversation_with_system_role,
             tokenize=True,
             add_generation_prompt=True,
         )
         assert result is not None
-        assert isinstance(result, list)
-        assert len(result) > 0
+        token_ids = result if isinstance(result, list) else result["input_ids"]
+        assert isinstance(token_ids, list)
+        assert len(token_ids) > 0
 
 @pytest.mark.parametrize("force_hf", [True, False])
 def test_gemma_tokenizer_system_role_handling_with_multiple_system_roles(force_hf, conversation_with_multiple_system_roles):
@@ -82,11 +84,11 @@ def test_gemma_tokenizer_system_role_handling_with_multiple_system_roles(force_h
     tokenizer = NeMoAutoTokenizer.from_pretrained(GEMMA_TOKENIZER_PATH, force_hf=force_hf)
 
     if force_hf:
-        assert not isinstance(tokenizer, NeMoAutoTokenizer)
+        assert not isinstance(tokenizer, NeMoAutoTokenizerWithBosEosEnforced)
         # Raw HF tokenizer should raise TemplateError for system role
         with pytest.raises(TemplateError, match="System role not supported"):
             tokenizer.apply_chat_template(conversation_with_multiple_system_roles, tokenize=True, add_generation_prompt=True)
     else:
-        assert isinstance(tokenizer, NeMoAutoTokenizer)
+        assert isinstance(tokenizer, NeMoAutoTokenizerWithBosEosEnforced)
         with pytest.raises(ValueError, match="System role appeared in multiple messages."):
             tokenizer.apply_chat_template(conversation_with_multiple_system_roles, tokenize=True, add_generation_prompt=True)
