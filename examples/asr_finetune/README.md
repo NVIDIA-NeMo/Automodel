@@ -1,6 +1,6 @@
 # ASR Fine-tuning Examples
 
-Examples for fine-tuning ASR (Automatic Speech Recognition) models with NeMo AutoModel.
+These examples show how to fine-tune Automatic Speech Recognition (ASR) models with NeMo AutoModel.
 
 ## Supported Models
 
