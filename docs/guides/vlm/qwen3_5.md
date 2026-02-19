@@ -2,7 +2,10 @@
 
 ## Introduction
 
-[Qwen/Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B) is the latest vision-language model in the Qwen series developed by Alibaba. Qwen3.5 is a major upgrade that unifies vision+language, boosts efficiency and multilingual coverage, delivering higher performance at lower latency/cost for developers and enterprises.
+[Qwen/Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B) is the latest vision-language model in the Qwen series developed by Alibaba. It’s a 397B-parameter (17B active) hybrid MoE model that uses a repeated layout of Gated DeltaNet and Gated Attention blocks, each paired with sparse MoE (512 experts; 10 routed + 1 shared active). Qwen3.5 is a major upgrade that unifies vision+language, boosts efficiency and multilingual coverage, delivering higher performance at lower latency/cost for developers and enterprises. Qwen3.5-397B-A17B shows competitive benchmark performance across knowledge, reasoning, coding, and agent tasks.
+<p align="center">
+  <img src="qwen3_5scores.png" alt="Qwen3.5 benchmark" width="500">
+</p>
 
 This guide walks you through fine-tuning Qwen3.5 on a medical Visual Question Answering task using NeMo Automodel. You will learn how to prepare the dataset, launch training on a Slurm cluster, and inspect the results.
 
@@ -54,5 +57,5 @@ srun --output=output.out \
 The training loss curves for Qwen3.5-VL fine-tuned on MedPix-VQA are shown below.
 
 <p align="center">
-  <img src="qwen3_5.png" alt="Qwen3.5-VL Training Loss Curve" width="400">
+  <img src="qwen3_5.png" alt="Qwen3.5-VL Training Loss Curve" width="500">
 </p>
