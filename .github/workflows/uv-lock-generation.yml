@@ -57,8 +57,7 @@ jobs:
         run: |
           set +e
           mv uv.lock uv_main.lock
-          mv docker/common/uv-pytorch.lock uv.lock
-          sed -i '/\[tool\.uv\]/r docker/common/uv-pytorch.toml' pyproject.toml
+          bash docker/common/update_pyproject_pytorch.sh "$GITHUB_WORKSPACE"
           uv lock --check
           EXIT_CODE=$?
           if [ $EXIT_CODE -eq 0 ]; then
