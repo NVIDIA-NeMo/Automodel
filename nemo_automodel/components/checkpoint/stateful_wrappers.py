@@ -101,6 +101,45 @@ def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
     return state_dict
 
 
+def _set_peft_state_dict(model: torch.nn.Module, state_dict: dict[str, Any]) -> None:
+    """Load trainable PEFT adapter weights into the model, bypassing DCP.
+
+    Mirrors _get_peft_state_dict: directly assigns saved tensors to model parameters
+    by name, handling DTensor re-sharding for EP-parallel weights. This avoids
+    DCP's set_model_state_dict() which raises KeyError on expert-parallel FQNs.
+    """
+    from torch.distributed.tensor import DTensor, Replicate
+
+    param_dict = dict(model.named_parameters())
+    loaded, skipped = 0, 0
+
+    for name, saved_tensor in state_dict.items():
+        if name not in param_dict:
+            skipped += 1
+            continue
+
+        param = param_dict[name]
+        if not param.requires_grad:
+            skipped += 1
+            continue
+
+        if isinstance(param.data, DTensor):
+            full_t = saved_tensor.to(param.data.to_local().device)
+            full_dt = DTensor.from_local(
+                full_t, device_mesh=param.data.device_mesh, placements=[Replicate()] * param.data.device_mesh.ndim
+            )
+            local_shard = full_dt.redistribute(placements=param.data.placements).to_local()
+            param.data.to_local().copy_(local_shard)
+        else:
+            param.data.copy_(saved_tensor.to(param.data.device))
+        loaded += 1
+
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+        import logging
+
+        logging.getLogger(__name__).info(f"_set_peft_state_dict: loaded {loaded} params, skipped {skipped} keys")
+
+
 def _drop_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX) -> None:
     """
     Remove the *first* occurrence of `prefix` on every key in-place.
@@ -261,7 +300,13 @@ class ModelState:
             _drop_outer_prefix(state_dict, "base_model.model.")
             # DoRA: reverse the HF PEFT key rename so DCP can match model params
             _rename_dora_keys_from_hf(state_dict)
-
+            # For EP models, DCP's set_model_state_dict silently skips EP-sharded
+            # LoRA params (strict=False hides the FQN mismatch caused by custom
+            # expert state_dict() keys like gate_up_linear.weight0). Bypass DCP.
+            if _has_expert_parallelism(self.model[0]):
+                for model_part in self.model:
+                    _set_peft_state_dict(model_part, state_dict)
+                return
             options = StateDictOptions(strict=False, broadcast_from_rank0=True, full_state_dict=True)
 
         # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
