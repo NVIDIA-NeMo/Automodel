@@ -7,7 +7,7 @@
   <img src="qwen3_5scores.png" alt="Qwen3.5 benchmark" width="500">
 </p>
 
-This guide walks you through fine-tuning Qwen3.5 on a medical Visual Question Answering task using NeMo Automodel. You will learn how to prepare the dataset, launch training on a Slurm cluster, and inspect the results.
+This guide walks you through fine-tuning Qwen3.5 on a medical Visual Question Answering task using NVIDIA NeMo Automodel. You will learn how to prepare the dataset, launch training on a Slurm cluster, and inspect the results.
 
 To set up your environment to run NeMo Automodel, follow the [installation guide](https://github.com/NVIDIA-NeMo/Automodel#-install-nemo-automodel).
 
