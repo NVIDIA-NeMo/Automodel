@@ -397,6 +397,9 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ) -> torch.Tensor:
+        # Reset num_permuted_tokens to None to avoid reusing cached state from a prior dispatch.
+        # This can happen in non-reentrant activation checkpointing mode.
+        self.num_permuted_tokens = None
         if self.token_probs.dtype != torch.float32:
             self.token_probs = self.token_probs.float()
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = hybrid_ep_dispatch(
