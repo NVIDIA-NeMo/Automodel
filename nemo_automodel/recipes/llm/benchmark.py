@@ -270,12 +270,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
             if self.pp_enabled:
                 reporting_loss = reporting_loss.to(self.dist_env.device)
-                # Send loss to first rank if pp group rank is 0
-                src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
-                if self.dist_env.rank == src_rank:
-                    torch.distributed.send(reporting_loss, dst=0)
-                elif self.dist_env.is_main:
-                    torch.distributed.recv(reporting_loss, src=src_rank)
+                reporting_loss = self._broadcast_pp_last_stage_loss(reporting_loss)
 
             reporting_loss = reporting_loss.cpu().item()
 
@@ -459,6 +454,10 @@ def main(config_path=None):
 
     Loads the configuration, sets up the recipe, and runs the benchmark.
     """
+    # Enable TF32 for better matmul/conv performance on Ampere+ GPUs (H100, A100)
+    torch.backends.cuda.matmul.fp32_precision = "tf32"
+    torch.backends.cudnn.conv.fp32_precision = "tf32"
+
     if config_path is None:
         # Default to moonlight_16b_torch.yaml in examples/benchmark/configs
         config_path = (

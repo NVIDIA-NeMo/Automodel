@@ -589,11 +589,44 @@ def _hybrid_model_flops(config, gbs, seq_len):
 
 
 def nemotronh_flops(config, gbs=1, seq_len=None):
-    """Model FLOPs for NemotronH"""
+    """Model FLOPs for NemotronH (hybrid Mamba + MoE + Attention)"""
     if seq_len is None:
         seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
 
-    return _hybrid_model_flops(config, gbs, seq_len)
+    hs = config.hidden_size
+    vocab_size = config.vocab_size
+
+    mamba_state_dim = getattr(config, "mamba_state_dim", None) or config.ssm_state_size
+    mamba_num_groups = getattr(config, "mamba_num_groups", None) or config.n_groups
+    mamba_head_dim = config.mamba_head_dim
+    nheads = config.mamba_num_heads if hasattr(config, "mamba_num_heads") and config.mamba_num_heads else 2 * hs // mamba_head_dim
+    d_in = nheads * mamba_head_dim
+
+    mamba_per_layer = (
+        (6 * gbs * seq_len * hs * (2 * d_in + 2 * mamba_num_groups * mamba_state_dim + nheads))
+        + (3 * 2 * gbs * seq_len * d_in * mamba_state_dim)
+        + (6 * gbs * seq_len * d_in * hs)
+    )
+
+    total_flops = 0
+    for block_type in config.layers_block_type:
+        if block_type == "mamba":
+            total_flops += mamba_per_layer
+        elif block_type == "attention":
+            total_flops += _non_mla_attn_layer_flops(config, gbs, seq_len)
+        elif block_type == "mlp":
+            total_flops += _nemotronh_mlp_layer_flops(config, gbs, seq_len)
+        elif block_type == "moe":
+            moe_intermediate = config.moe_intermediate_size
+            num_experts_per_tok = config.num_experts_per_tok
+            routed_flops = 6 * gbs * seq_len * hs * moe_intermediate * 2 * num_experts_per_tok
+            shared_intermediate = config.moe_shared_expert_intermediate_size
+            n_shared = config.n_shared_experts
+            shared_flops = 6 * gbs * seq_len * hs * shared_intermediate * 2 * n_shared
+            total_flops += routed_flops + shared_flops
+
+    total_flops += 6 * gbs * seq_len * hs * vocab_size
+    return total_flops
 
 
 def attention_flops_calculator(
