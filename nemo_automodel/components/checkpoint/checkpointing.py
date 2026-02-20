@@ -610,11 +610,7 @@ class Checkpointer:
         moe_mesh = mesh.moe_mesh if mesh is not None else None
 
         # --- EP configuration ---
-        ep_active = (
-            moe_mesh is not None
-            and "ep" in moe_mesh.mesh_dim_names
-            and moe_mesh["ep"].size() > 1
-        )
+        ep_active = moe_mesh is not None and "ep" in moe_mesh.mesh_dim_names and moe_mesh["ep"].size() > 1
         ep_mesh = moe_mesh["ep"] if ep_active else None
 
         # --- Shared-param broadcast group (non-PP sub-mesh) ---
@@ -666,7 +662,10 @@ class Checkpointer:
             if is_expert:
                 # --- Expert param: every rank reads its own local slice ---
                 local_keys = _filter_local_expert_keys(
-                    adapter, ckpt_hf_keys, ep_mesh, rename_fn,
+                    adapter,
+                    ckpt_hf_keys,
+                    ep_mesh,
+                    rename_fn,
                 )
                 group_sd: dict[str, torch.Tensor] = {}
                 keys_by_shard: dict[str, list[str]] = {}
