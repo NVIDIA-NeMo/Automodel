@@ -602,26 +602,25 @@ class Checkpointer:
         device_mesh = mesh.device_mesh if mesh is not None else None
         moe_mesh = mesh.moe_mesh if mesh is not None else None
 
+        ep_mesh: Optional[DeviceMesh] = None
+        if moe_mesh is not None:
+            ep_dims = [d for d in moe_mesh.mesh_dim_names if d != "pp"]
+            ep_mesh = moe_mesh[tuple(ep_dims)] if ep_dims else moe_mesh
+
         broadcast_pg = None
         needs_broadcast = False
         is_loader = True
         src_rank = 0
 
         if is_distributed:
-            pp_active = (
-                device_mesh is not None
-                and "pp" in device_mesh.mesh_dim_names
-                and device_mesh["pp"].size() > 1
-            )
+            pp_active = device_mesh is not None and "pp" in device_mesh.mesh_dim_names and device_mesh["pp"].size() > 1
             if pp_active:
                 non_pp_dims = [d for d in device_mesh.mesh_dim_names if d != "pp"]
                 if non_pp_dims:
                     if len(non_pp_dims) == 1:
                         non_pp_mesh = device_mesh[non_pp_dims[0]]
                     else:
-                        non_pp_mesh = device_mesh[tuple(non_pp_dims)]._flatten(
-                            "_ckpt_bcast"
-                        )
+                        non_pp_mesh = device_mesh[tuple(non_pp_dims)]._flatten("_ckpt_bcast")
                     if non_pp_mesh.size() > 1:
                         broadcast_pg = non_pp_mesh.get_group()
                         src_rank = non_pp_mesh.mesh.flatten()[0].item()
@@ -664,7 +663,7 @@ class Checkpointer:
                             model_key = rename_fn(ckpt_key) if rename_fn else ckpt_key
                             group_sd[model_key] = f.get_tensor(ckpt_key).to(device)
 
-                tensor = _merge_group_on_gpu(adapter, native_key, group_sd, device)
+                tensor = _merge_group_on_gpu(adapter, native_key, group_sd, device, ep_mesh=ep_mesh)
                 total_bytes += tensor.nelement() * tensor.element_size()
                 del group_sd
             else:
@@ -1523,6 +1522,7 @@ def _merge_group_on_gpu(
     native_key: str,
     group_sd: dict[str, torch.Tensor],
     device: torch.device,
+    ep_mesh: Optional[DeviceMesh] = None,
 ) -> torch.Tensor:
     """Merge a group of HF tensors into one native tensor on *device*.
 
@@ -1533,12 +1533,14 @@ def _merge_group_on_gpu(
     The keys in *group_sd* must use the adapter's internal naming (after
     ``rename_hf_key``), not the raw checkpoint names.
 
-    ``device_mesh=None`` is intentional: the caller broadcasts the **full**
-    (un-sharded) tensor so every rank can independently slice its local shard.
+    When *ep_mesh* is provided the adapter can produce only the local expert
+    slice, avoiding materialisation of the full expert stack.  When ``None``
+    the full (un-sharded) tensor is produced and every rank slices its own
+    shard via ``_write_to_fsdp_param``.
     """
     get_merged_fn = getattr(adapter, "get_merged_tensor_for_native_key", None)
     if get_merged_fn is not None and len(group_sd) > 1:
-        result = get_merged_fn(native_key, group_sd, device_mesh=None)
+        result = get_merged_fn(native_key, group_sd, device_mesh=ep_mesh)
         if result is not None:
             if result.device != device:
                 result = result.to(device)
