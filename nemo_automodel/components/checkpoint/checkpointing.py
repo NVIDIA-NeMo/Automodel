@@ -582,6 +582,13 @@ class Checkpointer:
         stage.  Without PP the behaviour is equivalent to a single-stage
         broadcast from global rank 0.
 
+        **Expert parallelism (EP > 1):**  Expert parameters are loaded
+        per-rank — every rank reads only its local expert slice from the
+        checkpoint files (no collective).  This avoids materialising the
+        full expert tensor on any single rank, which is critical for 500B+
+        MoE models.  Shared (non-expert) parameters continue to use the
+        broadcast path.
+
         For each logical parameter group (single tensor, QKV fusion, or
         expert stack) the loader rank:
 
@@ -602,11 +609,15 @@ class Checkpointer:
         device_mesh = mesh.device_mesh if mesh is not None else None
         moe_mesh = mesh.moe_mesh if mesh is not None else None
 
-        ep_mesh: Optional[DeviceMesh] = None
-        if moe_mesh is not None:
-            ep_dims = [d for d in moe_mesh.mesh_dim_names if d != "pp"]
-            ep_mesh = moe_mesh[tuple(ep_dims)] if ep_dims else moe_mesh
+        # --- EP configuration ---
+        ep_active = (
+            moe_mesh is not None
+            and "ep" in moe_mesh.mesh_dim_names
+            and moe_mesh["ep"].size() > 1
+        )
+        ep_mesh = moe_mesh["ep"] if ep_active else None
 
+        # --- Shared-param broadcast group (non-PP sub-mesh) ---
         broadcast_pg = None
         needs_broadcast = False
         is_loader = True
@@ -650,10 +661,16 @@ class Checkpointer:
         total_bytes = 0
 
         for native_key, ckpt_hf_keys, shape, dtype in schedule:
-            if is_loader:
+            is_expert = ep_active and _is_expert_param(adapter, native_key)
+
+            if is_expert:
+                # --- Expert param: every rank reads its own local slice ---
+                local_keys = _filter_local_expert_keys(
+                    adapter, ckpt_hf_keys, ep_mesh, rename_fn,
+                )
                 group_sd: dict[str, torch.Tensor] = {}
                 keys_by_shard: dict[str, list[str]] = {}
-                for ckpt_key in ckpt_hf_keys:
+                for ckpt_key in local_keys:
                     keys_by_shard.setdefault(weight_map[ckpt_key], []).append(ckpt_key)
 
                 for shard_file, shard_keys in keys_by_shard.items():
@@ -664,22 +681,46 @@ class Checkpointer:
                             group_sd[model_key] = f.get_tensor(ckpt_key).to(device)
 
                 tensor = _merge_group_on_gpu(adapter, native_key, group_sd, device, ep_mesh=ep_mesh)
+                if hasattr(tensor, "to_local"):
+                    tensor = tensor.to_local()
                 total_bytes += tensor.nelement() * tensor.element_size()
                 del group_sd
+
+                _write_to_fsdp_param(param_map, native_key, tensor, skip_ep=True)
             else:
-                tensor = torch.empty(shape, dtype=dtype, device=device)
+                # --- Shared param: per-PP-stage broadcast ---
+                if is_loader:
+                    group_sd = {}
+                    keys_by_shard = {}
+                    for ckpt_key in ckpt_hf_keys:
+                        keys_by_shard.setdefault(weight_map[ckpt_key], []).append(ckpt_key)
 
-            if needs_broadcast:
-                torch.distributed.broadcast(tensor, src=src_rank, group=broadcast_pg)
+                    for shard_file, shard_keys in keys_by_shard.items():
+                        sf_path = os.path.join(base_dir, shard_file)
+                        with safe_open(sf_path, framework="pt", device="cpu") as f:
+                            for ckpt_key in shard_keys:
+                                model_key = rename_fn(ckpt_key) if rename_fn else ckpt_key
+                                group_sd[model_key] = f.get_tensor(ckpt_key).to(device)
 
-            _write_to_fsdp_param(param_map, native_key, tensor)
+                    tensor = _merge_group_on_gpu(adapter, native_key, group_sd, device)
+                    total_bytes += tensor.nelement() * tensor.element_size()
+                    del group_sd
+                else:
+                    tensor = torch.empty(shape, dtype=dtype, device=device)
+
+                if needs_broadcast:
+                    torch.distributed.broadcast(tensor, src=src_rank, group=broadcast_pg)
+
+                _write_to_fsdp_param(param_map, native_key, tensor)
+
             del tensor
 
         t_end = time.monotonic()
-        if is_loader:
-            gb = total_bytes / (1 << 30)
-            n_params = len(param_map)
-            n_scheduled = len(schedule)
+        rank = torch.distributed.get_rank() if is_distributed else 0
+        gb = total_bytes / (1 << 30)
+        n_params = len(param_map)
+        n_scheduled = len(schedule)
+        if is_loader or (ep_active and rank == 0):
             logging.info(
                 "load_base_model (streaming): %.2f GB in %.2fs "
                 "(schedule %.2fs, stream+broadcast %.2fs, "
@@ -691,8 +732,9 @@ class Checkpointer:
                 n_scheduled,
                 n_params,
             )
-            if n_scheduled < n_params:
-                missing = sorted(set(param_map) - {e[0] for e in schedule})
+        if n_scheduled < n_params:
+            missing = sorted(set(param_map) - {e[0] for e in schedule})
+            if rank == 0:
                 logging.warning(
                     "Streaming loader did not cover %d parameters: %s",
                     len(missing),
@@ -1517,6 +1559,47 @@ def _build_broadcast_schedule(
     return schedule
 
 
+def _is_expert_param(adapter: Any, native_key: str) -> bool:
+    """Return True if *native_key* is a merged-expert parameter in the adapter."""
+    parse_fn = getattr(adapter, "_parse_native_expert_key", None)
+    return parse_fn is not None and parse_fn(native_key) is not None
+
+
+def _filter_local_expert_keys(
+    adapter: Any,
+    ckpt_hf_keys: list[str],
+    ep_mesh: DeviceMesh,
+    rename_fn: Any,
+) -> list[str]:
+    """Keep only the checkpoint keys whose expert-id falls in this EP rank's range.
+
+    Uses the adapter's ``_parse_hf_expert_key`` on the *renamed* key to
+    extract the expert-id, then retains only keys in the local range
+    determined by *ep_mesh*.  Non-expert keys pass through unchanged.
+    """
+    from nemo_automodel.components.moe.state_dict_utils import get_expert_range_for_rank_from_mesh
+
+    parse_fn = getattr(adapter, "_parse_hf_expert_key", None)
+    moe_config = getattr(adapter, "moe_config", None)
+    if parse_fn is None or moe_config is None:
+        return ckpt_hf_keys
+
+    n_experts = moe_config.n_routed_experts
+    start, end = get_expert_range_for_rank_from_mesh(ep_mesh, n_experts)
+    local_ids = set(range(start, end))
+
+    filtered = []
+    for k in ckpt_hf_keys:
+        renamed_k = rename_fn(k) if rename_fn else k
+        parsed = parse_fn(renamed_k)
+        if parsed is not None:
+            if parsed[2] in local_ids:
+                filtered.append(k)
+        else:
+            filtered.append(k)
+    return filtered
+
+
 def _merge_group_on_gpu(
     adapter: Any,
     native_key: str,
@@ -1533,10 +1616,10 @@ def _merge_group_on_gpu(
     The keys in *group_sd* must use the adapter's internal naming (after
     ``rename_hf_key``), not the raw checkpoint names.
 
-    When *ep_mesh* is provided the adapter can produce only the local expert
-    slice, avoiding materialisation of the full expert stack.  When ``None``
-    the full (un-sharded) tensor is produced and every rank slices its own
-    shard via ``_write_to_fsdp_param``.
+    When *ep_mesh* is ``None`` (shared params) the adapter produces the
+    **full** (un-sharded) tensor so every rank can independently slice its
+    local shard via ``_write_to_fsdp_param``.  When an EP mesh is supplied
+    (expert params) the adapter merges only the local expert range.
     """
     get_merged_fn = getattr(adapter, "get_merged_tensor_for_native_key", None)
     if get_merged_fn is not None and len(group_sd) > 1:
@@ -1559,12 +1642,17 @@ def _write_to_fsdp_param(
     param_map: dict[str, nn.Parameter],
     native_key: str,
     tensor: torch.Tensor,
+    skip_ep: bool = False,
 ) -> None:
-    """Write a full (un-sharded) broadcast tensor into an FSDP-wrapped parameter.
+    """Write a broadcast tensor into an FSDP-wrapped parameter.
 
     For DTensor parameters the function computes the local shard according to
     the parameter's placement and copies into the local storage.
     For regular tensors it copies directly.
+
+    When *skip_ep* is True, ``Shard`` placements on mesh dimensions named
+    ``"ep"`` are skipped — the tensor is already narrowed to the local
+    expert range and should not be narrowed again for the EP axis.
     """
     from torch.distributed.tensor import DTensor
     from torch.distributed.tensor.placement_types import Shard
@@ -1579,8 +1667,11 @@ def _write_to_fsdp_param(
         full = tensor
         for dim_idx, placement in enumerate(data.placements):
             if isinstance(placement, Shard):
+                dim_name = data.device_mesh.mesh_dim_names[dim_idx]
+                if skip_ep and dim_name == "ep":
+                    continue
                 mesh_dim_size = data.device_mesh.shape[dim_idx]
-                rank_in_dim = data.device_mesh.get_local_rank(data.device_mesh.mesh_dim_names[dim_idx])
+                rank_in_dim = data.device_mesh.get_local_rank(dim_name)
                 chunk_size = full.shape[placement.dim] // mesh_dim_size
                 full = full.narrow(placement.dim, rank_in_dim * chunk_size, chunk_size)
         local.copy_(full)
