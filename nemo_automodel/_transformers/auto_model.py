@@ -428,6 +428,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             distributed_config.tp_plan = tp_plan
 
         mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+        if mesh.ep_size > 1 and moe_config is None:
+            moe_config = MoEParallelizerConfig()
+            logger.warning("Auto-setting moe_config for expert parallelism.")
 
         model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
             distributed_config=distributed_config,

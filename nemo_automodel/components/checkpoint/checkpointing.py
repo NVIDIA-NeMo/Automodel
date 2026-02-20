@@ -59,6 +59,8 @@ if TYPE_CHECKING:
     from peft import PeftConfig
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+    from nemo_automodel.components.distributed.mesh import MeshContext
+
 
 def _is_geq_torch_2_9() -> bool:
     """
@@ -437,18 +439,19 @@ class Checkpointer:
         model_name: str | None,
         peft_init_method: str,
         load_base_model: bool = True,
+        mesh: Optional["MeshContext"] = None,
     ) -> None:
         """
         Load a model from the base Hugging Face checkpoint.
 
         The loading strategy depends on the checkpoint format:
 
-        **Safetensors checkpoints** (rank-0 broadcast path):
+        **Safetensors checkpoints** (streaming broadcast path):
             1. Materialize FSDP-sharded parameters on *device* (``to_empty_parameters_only``).
             2. Initialize buffers and weights.
-            3. Rank 0 reads the full state dict from safetensors, converts it
-               via the state-dict adapter (if any), and broadcasts to all
-               other ranks via ``set_model_state_dict(broadcast_from_rank0=True)``.
+            3. Per PP stage the local rank-0 reads tensors from safetensors
+               and broadcasts to its peers.  Without PP, global rank 0
+               broadcasts to all ranks.
 
         **Other checkpoints** (DCP path):
             Falls back to the existing ``load_model`` which uses
@@ -466,6 +469,8 @@ class Checkpointer:
             model_name: Name of the model or an absolute path to a snapshot.
             peft_init_method: Initialization method used for PEFT adapters.
             load_base_model: If True, restore from HF base checkpoint.
+            mesh: MeshContext holding device_mesh and moe_mesh.
+                Used to derive the per-stage broadcast group.
         """
         to_empty_parameters_only(model, device=device)
 
@@ -506,7 +511,7 @@ class Checkpointer:
                 adapter = getattr(model, "state_dict_adapter", None)
                 can_stream = adapter is None or hasattr(adapter, "get_merged_tensor_for_native_key")
                 if can_stream:
-                    self._load_base_model_streaming(model, model_path)
+                    self._load_base_model_streaming(model, model_path, mesh=mesh)
                 else:
                     self._load_base_model_broadcast(model, model_path)
             else:
@@ -563,15 +568,26 @@ class Checkpointer:
                 t_end - t_convert,
             )
 
-    def _load_base_model_streaming(self, model: nn.Module, model_path: str) -> None:
-        """Stream safetensors into an FSDP-sharded model via rank-0 broadcast.
+    def _load_base_model_streaming(
+        self,
+        model: nn.Module,
+        model_path: str,
+        mesh: Optional["MeshContext"] = None,
+    ) -> None:
+        """Stream safetensors into an FSDP-sharded model via per-stage broadcast.
 
-        Only rank 0 reads tensor data from disk.  For each logical parameter
-        group (single tensor, QKV fusion, or expert stack) rank 0:
+        With pipeline parallelism each PP stage broadcasts independently:
+        the stage-local rank-0 (first rank in the non-PP sub-mesh) reads
+        tensor data from disk and broadcasts to its peers within the same
+        stage.  Without PP the behaviour is equivalent to a single-stage
+        broadcast from global rank 0.
+
+        For each logical parameter group (single tensor, QKV fusion, or
+        expert stack) the loader rank:
 
         1. Loads the contributing HF tensors from safetensors to CPU.
         2. Moves them to GPU and merges (``cat`` / ``transpose`` + ``stack``).
-        3. Broadcasts the result to all ranks.
+        3. Broadcasts the result to all peers in the stage.
 
         Every rank then writes the received tensor into the pre-allocated
         FSDP DTensor parameter by computing its local shard.
@@ -581,9 +597,41 @@ class Checkpointer:
         from safetensors import safe_open
 
         is_distributed = torch.distributed.is_initialized()
-        rank = torch.distributed.get_rank() if is_distributed else 0
         device = torch.device("cuda", torch.cuda.current_device())
         adapter = getattr(model, "state_dict_adapter", None)
+        device_mesh = mesh.device_mesh if mesh is not None else None
+        moe_mesh = mesh.moe_mesh if mesh is not None else None
+
+        broadcast_pg = None
+        needs_broadcast = False
+        is_loader = True
+        src_rank = 0
+
+        if is_distributed:
+            pp_active = (
+                device_mesh is not None
+                and "pp" in device_mesh.mesh_dim_names
+                and device_mesh["pp"].size() > 1
+            )
+            if pp_active:
+                non_pp_dims = [d for d in device_mesh.mesh_dim_names if d != "pp"]
+                if non_pp_dims:
+                    if len(non_pp_dims) == 1:
+                        non_pp_mesh = device_mesh[non_pp_dims[0]]
+                    else:
+                        non_pp_mesh = device_mesh[tuple(non_pp_dims)]._flatten(
+                            "_ckpt_bcast"
+                        )
+                    if non_pp_mesh.size() > 1:
+                        broadcast_pg = non_pp_mesh.get_group()
+                        src_rank = non_pp_mesh.mesh.flatten()[0].item()
+                        is_loader = non_pp_mesh.get_local_rank() == 0
+                        needs_broadcast = True
+                # else: PP-only (no TP/DP) → each rank loads its own stage
+            else:
+                is_loader = torch.distributed.get_rank() == 0
+                src_rank = 0
+                needs_broadcast = torch.distributed.get_world_size() > 1
 
         t0 = time.monotonic()
 
@@ -603,7 +651,7 @@ class Checkpointer:
         total_bytes = 0
 
         for native_key, ckpt_hf_keys, shape, dtype in schedule:
-            if rank == 0:
+            if is_loader:
                 group_sd: dict[str, torch.Tensor] = {}
                 keys_by_shard: dict[str, list[str]] = {}
                 for ckpt_key in ckpt_hf_keys:
@@ -622,14 +670,14 @@ class Checkpointer:
             else:
                 tensor = torch.empty(shape, dtype=dtype, device=device)
 
-            if is_distributed:
-                torch.distributed.broadcast(tensor, src=0)
+            if needs_broadcast:
+                torch.distributed.broadcast(tensor, src=src_rank, group=broadcast_pg)
 
             _write_to_fsdp_param(param_map, native_key, tensor)
             del tensor
 
         t_end = time.monotonic()
-        if rank == 0:
+        if is_loader:
             gb = total_bytes / (1 << 30)
             n_params = len(param_map)
             n_scheduled = len(schedule)

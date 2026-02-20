@@ -425,6 +425,7 @@ def apply_model_infrastructure(
             pretrained_model_name_or_path,
             lora_a_init,
             load_base_model=load_base_model,
+            mesh=mesh,
         )
         checkpoint_already_loaded = True
 
@@ -495,6 +496,7 @@ def apply_model_infrastructure(
                 pretrained_model_name_or_path,
                 lora_a_init,
                 load_base_model=load_base_model,
+                mesh=mesh,
             )
 
     # Freeze parameters after checkpoint loading and parallelization
