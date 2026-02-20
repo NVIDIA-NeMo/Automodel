@@ -130,7 +130,10 @@ def _uses_thd_collater(cfg_dataloader):
 
 def _get_num_thd_chunks(pp_enabled, cfg):
     if pp_enabled:
-        return cfg.step_scheduler.local_batch_size // cfg.get("distributed.pipeline.pp_microbatch_size", 1)
+        pp_microbatch_size = cfg.get("distributed.pipeline.pp_microbatch_size", None)
+        if pp_microbatch_size is None:
+            pp_microbatch_size = cfg.get("autopipeline.pp_microbatch_size", 1)
+        return cfg.step_scheduler.local_batch_size // pp_microbatch_size
     return 1
 
 
@@ -335,6 +338,8 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
     if cfg_ckpt is not None:
         cfg_ckpt = cfg_ckpt.to_dict()
         cfg_ckpt.pop("restore_from", None)
+        # `load_base_model` belongs to model-loading flow, not checkpoint writer config.
+        cfg_ckpt.pop("load_base_model", None)
         ckpt_kwargs |= cfg_ckpt
     if ckpt_kwargs.get("is_peft", False) and ckpt_kwargs.get("model_save_format") == "torch_save":
         raise ValueError(
@@ -871,7 +876,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Pipeline runtime fields: override pp_batch_size and pp_microbatch_size
         if self.pp_enabled:
             pp_batch_size = self.cfg.step_scheduler.local_batch_size
-            pp_microbatch_size = self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
+            configured_pp_microbatch_size = (
+                self.pipeline_config.pp_microbatch_size
+                if self.pipeline_config is not None
+                else self.cfg.get("distributed.pipeline.pp_microbatch_size", None)
+            )
+            if configured_pp_microbatch_size is None:
+                configured_pp_microbatch_size = self.cfg.get("autopipeline.pp_microbatch_size", 1)
+            pp_microbatch_size = configured_pp_microbatch_size
 
             assert pp_batch_size // pp_microbatch_size >= self.dist_setup.pp_size, (
                 f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.dist_setup.pp_size}"
@@ -884,7 +896,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 and _uses_thd_collater(self.cfg.dataloader)
             ):
                 pp_microbatch_size = 1
-                pp_batch_size = pp_batch_size // self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
+                pp_batch_size = pp_batch_size // configured_pp_microbatch_size
                 logging.info(
                     f"Overriding pp_batch_size: {pp_batch_size}, pp_microbatch_size: {pp_microbatch_size} for THD"
                 )

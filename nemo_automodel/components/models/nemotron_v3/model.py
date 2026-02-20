@@ -160,12 +160,15 @@ class NemotronV3Model(nn.Module):
         """
         # Embedding weights: normal initialization
         with buffer_device:
-            nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=self.config.initializer_range)
-            self.norm.reset_parameters()
+            if self.embed_tokens is not None and getattr(self.embed_tokens, "weight", None) is not None:
+                nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=self.config.initializer_range)
+            if self.norm is not None and hasattr(self.norm, "reset_parameters"):
+                self.norm.reset_parameters()
 
         # Initialize all layers via delegation
         for block in self.layers.values():
-            block.init_weights(buffer_device=buffer_device)
+            if block is not None:
+                block.init_weights(buffer_device=buffer_device)
 
 
 class NemotronHForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
@@ -307,8 +310,10 @@ class NemotronHForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
         with buffer_device:
-            self.model.initialize_weights(buffer_device=buffer_device)
-            nn.init.normal_(self.lm_head.weight, mean=0.0, std=self.config.initializer_range)
+            if self.model is not None:
+                self.model.initialize_weights(buffer_device=buffer_device)
+            if self.lm_head is not None and getattr(self.lm_head, "weight", None) is not None:
+                nn.init.normal_(self.lm_head.weight, mean=0.0, std=self.config.initializer_range)
 
         self.to(dtype)
 

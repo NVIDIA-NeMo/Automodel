@@ -482,8 +482,94 @@ def split_model_into_stages(
     pp_rank = pp_mesh.get_local_rank()
     pp_size = pp_mesh.size()
     # Detect model structure
-    has_model_attr = hasattr(model, "model") and getattr(model, "model", None) is not None
-    has_backbone_attr = (not has_model_attr) and hasattr(model, "backbone") and getattr(model, "backbone", None) is not None
+    model_has_model_attr = hasattr(model, "model") and getattr(model, "model", None) is not None
+    model_has_backbone_attr = hasattr(model, "backbone") and getattr(model, "backbone", None) is not None
+
+    def _submodule_exists(module_root: nn.Module, module_fqn: str) -> bool:
+        if not module_fqn:
+            return True
+        try:
+            module_root.get_submodule(module_fqn)
+            return True
+        except Exception:
+            return False
+
+    def _normalize_stage_fqn_aliases(explicit_stages: list[list[str]]) -> list[list[str]]:
+        alias_suffixes = (
+            (".embeddings", ".embed_tokens"),
+            (".embed_tokens", ".embeddings"),
+            (".norm_f", ".norm"),
+            (".norm", ".norm_f"),
+        )
+        rewrites: list[tuple[str, str]] = []
+        normalized_stages: list[list[str]] = []
+        for stage_modules in explicit_stages:
+            normalized_stage: list[str] = []
+            for module_fqn in stage_modules:
+                normalized_fqn = module_fqn
+                if not _submodule_exists(model, normalized_fqn):
+                    for src_suffix, dst_suffix in alias_suffixes:
+                        if normalized_fqn.endswith(src_suffix):
+                            candidate = normalized_fqn[: -len(src_suffix)] + dst_suffix
+                            if _submodule_exists(model, candidate):
+                                rewrites.append((normalized_fqn, candidate))
+                                normalized_fqn = candidate
+                                break
+                normalized_stage.append(normalized_fqn)
+            normalized_stages.append(normalized_stage)
+
+        if rewrites:
+            # De-duplicate while preserving insertion order.
+            unique_rewrites = list(dict.fromkeys(rewrites))
+            logger.info(
+                "Rewriting pipeline stage FQN aliases for current model structure: %s",
+                ", ".join(f"{src}->{dst}" for src, dst in unique_rewrites),
+            )
+
+        return normalized_stages
+
+    # Normalize explicit stage FQNs to the model's actual root attribute.
+    if module_names_per_stage is not None:
+        uses_backbone_prefix = any(
+            module_fqn == "backbone" or module_fqn.startswith("backbone.")
+            for stage_modules in module_names_per_stage
+            for module_fqn in stage_modules
+        )
+        uses_model_prefix = any(
+            module_fqn == "model" or module_fqn.startswith("model.")
+            for stage_modules in module_names_per_stage
+            for module_fqn in stage_modules
+        )
+
+        if uses_backbone_prefix and not model_has_backbone_attr and model_has_model_attr:
+            logger.info("Rewriting pipeline stage FQNs from backbone.* to model.* for current model structure.")
+            module_names_per_stage = [
+                [
+                    ("model." + module_fqn[len("backbone.") :] if module_fqn.startswith("backbone.") else module_fqn)
+                    for module_fqn in stage_modules
+                ]
+                for stage_modules in module_names_per_stage
+            ]
+        elif uses_model_prefix and not model_has_model_attr and model_has_backbone_attr:
+            logger.info("Rewriting pipeline stage FQNs from model.* to backbone.* for current model structure.")
+            module_names_per_stage = [
+                [
+                    ("backbone." + module_fqn[len("model.") :] if module_fqn.startswith("model.") else module_fqn)
+                    for module_fqn in stage_modules
+                ]
+                for stage_modules in module_names_per_stage
+            ]
+
+        module_names_per_stage = _normalize_stage_fqn_aliases(module_names_per_stage)
+
+    prefer_backbone_attr = False
+    if module_names_per_stage is not None:
+        prefer_backbone_attr = any(
+            module_fqn.startswith("backbone.") for stage_modules in module_names_per_stage for module_fqn in stage_modules
+        )
+
+    has_backbone_attr = model_has_backbone_attr and (prefer_backbone_attr or not model_has_model_attr)
+    has_model_attr = model_has_model_attr and not has_backbone_attr
     if has_backbone_attr:
         text_model = model.backbone
         text_model_attr_name = ""

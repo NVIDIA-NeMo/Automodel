@@ -110,7 +110,9 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: validation
-  limit_dataset_samples: 64
+  # With dp=2 and local_batch_size=64, keep at least 128 samples so each DP rank
+  # gets a full local batch during validation (avoids PP microbatch shape mismatch).
+  limit_dataset_samples: 128
   seq_length: 1024
   padding: max_length
   truncation: true

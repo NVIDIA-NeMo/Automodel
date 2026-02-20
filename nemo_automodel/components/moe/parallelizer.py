@@ -47,6 +47,39 @@ def _get_cp_stream() -> torch.cuda.Stream:
     return _CP_STREAM
 
 
+def _resolve_text_layer_container(model: nn.Module) -> nn.Module:
+    """Return the module that owns transformer `layers` for block-wise iteration."""
+    if hasattr(model, "layers") and model.layers is not None:
+        return model
+
+    # Try common nested containers first.
+    for attr_name in ("backbone", "model", "language_model", "text_model", "text_decoder"):
+        if hasattr(model, attr_name):
+            nested = getattr(model, attr_name)
+            if nested is None:
+                continue
+            if hasattr(nested, "layers") and nested.layers is not None:
+                return nested
+            nested_text = get_text_module(nested)
+            if hasattr(nested_text, "layers") and nested_text.layers is not None:
+                return nested_text
+
+    # Fallback: search any nested submodule exposing `layers`.
+    for _, submod in model.named_modules():
+        if submod is model:
+            continue
+        if hasattr(submod, "layers") and submod.layers is not None:
+            return submod
+
+    child_names = list(model._modules.keys()) if hasattr(model, "_modules") else []
+    has_backbone = hasattr(model, "backbone") and getattr(model, "backbone") is not None
+    has_model_attr = hasattr(model, "model") and getattr(model, "model") is not None
+    raise AttributeError(
+        "Could not find a module with `layers` under "
+        f"{type(model).__name__} (children={child_names[:24]}, has_backbone={has_backbone}, has_model={has_model_attr})"
+    )
+
+
 class ExpertParallel(ParallelStyle):
     """
     ExpertParallel class is used to shard the MoE parameters on the EP mesh.
@@ -83,8 +116,9 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
         _model = model
     # Prefer nested text modules when present
     _model = get_text_module(_model)
+    _layer_container = _resolve_text_layer_container(_model)
 
-    for _, block in _model.layers.named_children():
+    for _, block in _layer_container.layers.named_children():
         moe_module = block.moe if hasattr(block, "moe") else block.mlp
         if isinstance(moe_module, MoE):
             # GroupedExpertsTEGroupedLinear uses TE's GroupedLinear which creates
@@ -145,7 +179,9 @@ def apply_ac(
         _model = model.model
     else:
         _model = model
-    for layer_id, block in _model.layers.named_children():
+    _model = get_text_module(_model)
+    _layer_container = _resolve_text_layer_container(_model)
+    for layer_id, block in _layer_container.layers.named_children():
         if ignore_router:
             block = ptd_checkpoint_wrapper(
                 block, preserve_rng_state=True, context_fn=selective_checkpointing_context_fn
@@ -153,7 +189,7 @@ def apply_ac(
         else:
             block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
 
-        _model.layers.register_module(layer_id, block)
+        _layer_container.layers.register_module(layer_id, block)
 
 
 def apply_fsdp(
@@ -193,8 +229,9 @@ def apply_fsdp(
         _model = model
     # handle VLM
     _model = get_text_module(_model)
+    _layer_container = _resolve_text_layer_container(_model)
 
-    for _, block in _model.layers.named_children():
+    for _, block in _layer_container.layers.named_children():
         moe_module = block.moe if hasattr(block, "moe") else block.mlp
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
@@ -217,8 +254,8 @@ def apply_fsdp(
 
         fully_shard_default(block, ignored_params=ignored_params)
 
-    if hasattr(_model, "embed_tokens") and _model.embed_tokens is not None:
-        fully_shard_default(_model.embed_tokens)
+    if hasattr(_layer_container, "embed_tokens") and _layer_container.embed_tokens is not None:
+        fully_shard_default(_layer_container.embed_tokens)
 
     lm_head = getattr(_model, "lm_head", None) or getattr(model, "lm_head", None)
     if lm_head is not None:
@@ -252,7 +289,7 @@ def apply_fsdp(
         else:
             logging.info("Skipping FSDP wrap for frozen visual tower")
 
-    fully_shard_default(_model)
+    fully_shard_default(_layer_container)
 
     # If model has a nested structure (outer model wrapping inner _model), wrap the outer model if requested
     if wrap_outer_model and model is not _model:
@@ -266,8 +303,10 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
         _model = model.model
     else:
         _model = model
+    _model = get_text_module(_model)
+    _layer_container = _resolve_text_layer_container(_model)
 
-    for _, block in _model.layers.named_children():
+    for _, block in _layer_container.layers.named_children():
         attn_module = block.self_attn.attn_module
         assert isinstance(attn_module, DotProductAttention), (
             "Context parallelism is only supported for TransformerEngine's DotProductAttention"
@@ -307,10 +346,24 @@ def parallelize_model(
 
     ep_enabled = ep_axis_name is not None and moe_mesh is not None and moe_mesh[ep_axis_name].size() > 1
     if ep_enabled:
-        assert model.model.moe_config.n_routed_experts % moe_mesh[ep_axis_name].size() == 0, (
-            f"n_routed_experts {model.model.moe_config.n_routed_experts} must be divisible by "
-            f"expert_parallel_degree {moe_mesh[ep_axis_name].size()}"
-        )
+        _model = model.model if hasattr(model, "model") and model.model is not None else model
+        _model = get_text_module(_model)
+        n_routed_experts = None
+        if hasattr(_model, "moe_config") and _model.moe_config is not None:
+            n_routed_experts = getattr(_model.moe_config, "n_routed_experts", None)
+        if n_routed_experts is None and hasattr(_model, "config"):
+            for attr in ("n_routed_experts", "moe_num_experts", "num_experts"):
+                if hasattr(_model.config, attr):
+                    n_routed_experts = getattr(_model.config, attr)
+                    break
+
+        if n_routed_experts is not None:
+            assert n_routed_experts % moe_mesh[ep_axis_name].size() == 0, (
+                f"n_routed_experts {n_routed_experts} must be divisible by "
+                f"expert_parallel_degree {moe_mesh[ep_axis_name].size()}"
+            )
+        else:
+            logger.warning("Could not infer n_routed_experts; skipping EP divisibility assertion.")
 
         apply_ep(model, moe_mesh[ep_axis_name], moe_mesh=moe_mesh)
 
