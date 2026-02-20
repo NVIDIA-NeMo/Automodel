@@ -33,7 +33,7 @@ For a complete guide and additional options please consult the AutoModel [Instal
 
 ## Key Features
 
-AutoPipeline provides enterprise-grade pipeline parallelism with the following features:
+AutoPipeline provides the following capabilities:
 
 - **Universal Hugging Face Support**: Works with any Hugging Face decoder-only causal language model including Llama, Qwen, Mistral, Gemma, and more
 - **PyTorch Native Integration**: Built on PyTorch's `torch.distributed.pipelining` for optimal performance
@@ -88,20 +88,20 @@ if __name__ == "__main__":
     print(ap.pretty_print_stages())
 ```
 
-### Running the Quick Start Example
+### Run the Quick Start Example
 
 Save the above code as `pipeline_example.py` and run with:
 
 ```bash
 # Run with 2 GPUs for 2 pipeline stages
-uv run torchrun --nproc_per_node=2 pipeline_example.py
+uv run torchrun --nproc-per-node=2 pipeline_example.py
 ```
 
 For a complete training example:
 
 ```bash
 # Run fine-tuning with 2-way pipeline parallelism using Llama 3.1 8B
-uv run torchrun --nproc_per_node=2 examples/llm/finetune.py \
+uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py \
     --config examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_pp.yaml
 ```
 
@@ -216,7 +216,7 @@ ap = AutoPipeline(
 ).build(model, loss_fn=loss_fn)
 ```
 
-## Understanding Model Splitting
+## Understand Model Splitting
 
 When AutoPipeline splits your model, it intelligently distributes components across pipeline stages. Here's how a typical model gets split:
 
@@ -276,7 +276,7 @@ Key observations:
 - **Rotary embeddings** are shared across all stages (for position encoding)
 - **Transformer layers** are evenly distributed
 
-## Using the Functional API for Custom Models
+## Use the Functional API for Custom Models
 
 While AutoPipeline is specifically designed as a high-level interface for Hugging Face models, the functional API in `nemo_automodel.components.distributed.pipelining.functional` provides more modular and accessible building blocks that can be used with any PyTorch model, including custom architectures. This separation allows for cleaner code organization where AutoPipeline handles Hugging Face-specific optimizations while the functional module remains model-agnostic.
 
@@ -284,7 +284,7 @@ While AutoPipeline is specifically designed as a high-level interface for Huggin
 
 The functional API provides several utilities for building custom pipeline parallel systems:
 
-#### 1. Stage ID Calculation
+#### Stage ID Calculation
 ```python
 from nemo_automodel.components.distributed.pipelining.functional import stage_ids_this_rank
 
@@ -298,7 +298,7 @@ stage_ids = stage_ids_this_rank(pp_rank=0, pp_size=4, num_stages=8, style="v")
 # Returns: (0, 7) - rank 0 gets stages 0 and 7
 ```
 
-#### 2. Module Name Generation
+#### Module Name Generation
 ```python
 from nemo_automodel.components.distributed.pipelining.functional import (
     generate_hf_model_fqn_per_model_part
@@ -315,7 +315,7 @@ module_names = generate_hf_model_fqn_per_model_part(
 )
 ```
 
-#### 3. Virtual Stage Calculation
+#### Virtual Stage Calculation
 ```python
 from nemo_automodel.components.distributed.pipelining.functional import calculate_virtual_stages
 
@@ -329,7 +329,7 @@ num_virtual_stages, stages_per_rank = calculate_virtual_stages(
 )
 ```
 
-#### 4. Pipeline Schedule Building
+#### Pipeline Schedule Build
 ```python
 from nemo_automodel.components.distributed.pipelining.functional import build_pipeline_schedule
 
@@ -552,7 +552,7 @@ ap = AutoPipeline(world_mesh=world_mesh).build(
 )
 ```
 
-## Monitoring and Debugging
+## Monitor and Debug
 
 AutoPipeline provides comprehensive tools for understanding your pipeline configuration:
 
@@ -597,7 +597,7 @@ ap.scale_grads_by_divisor(divisor=8)
 grad_norm = ap.clip_grad_norm(max_norm=1.0, norm_type=2.0)
 ```
 
-## Adding Pipeline Parallelism to Existing Configurations
+## Add Pipeline Parallelism to Existing Configurations
 
 You can easily add pipeline parallelism to any existing training configuration through command-line overrides or YAML modifications.
 
@@ -606,8 +606,8 @@ You can easily add pipeline parallelism to any existing training configuration t
 Add pipeline parallelism to an existing config using command-line arguments:
 
 ```bash
-uv run torchrun --nproc_per_node=2 examples/llm/finetune.py \
-    --config examples/llm/llama_3_2_1b_squad.yaml \
+uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py \
+    --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --distributed.strategy fsdp2 \
     --distributed.pp_size 2 \
     --distributed.pipeline.pp_schedule 1f1b \
@@ -634,7 +634,6 @@ distributed:
   pp_size: 4  # Enable 4-way pipeline parallelism
   sequence_parallel: false
   pipeline:
-    _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
     pp_schedule: 1f1b
     pp_microbatch_size: 1
     # pp_batch_size is automatically inferred from dataloader.batch_size
@@ -647,7 +646,7 @@ distributed:
 
 #### Pipeline + Data Parallelism (4 GPUs Total)
 ```bash
-uv run torchrun --nproc_per_node=4 examples/llm/finetune.py \
+uv run torchrun --nproc-per-node=4 examples/llm_finetune/finetune.py \
     --config your_config.yaml \
     --distributed.pp_size 2 \
     --distributed.dp_size 2 \
@@ -656,7 +655,7 @@ uv run torchrun --nproc_per_node=4 examples/llm/finetune.py \
 
 #### Pipeline + Tensor Parallelism (4 GPUs Total)
 ```bash
-uv run torchrun --nproc_per_node=4 examples/llm/finetune.py \
+uv run torchrun --nproc-per-node=4 examples/llm_finetune/finetune.py \
     --config your_config.yaml \
     --distributed.pp_size 2 \
     --distributed.tp_size 2 \
@@ -665,7 +664,7 @@ uv run torchrun --nproc_per_node=4 examples/llm/finetune.py \
 
 #### Full Hybrid: PP + DP + TP (8 GPUs Total)
 ```bash
-uv run torchrun --nproc_per_node=8 examples/llm/finetune.py \
+uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py \
     --config your_config.yaml \
     --distributed.pp_size 2 \
     --distributed.dp_size 2 \
@@ -673,7 +672,7 @@ uv run torchrun --nproc_per_node=8 examples/llm/finetune.py \
     --dataloader.batch_size 32
 ```
 
-## Integration with Training Recipes
+## Integrate with Training Recipes
 
 AutoPipeline seamlessly integrates with NeMo AutoModel's recipe system. Here's a complete example YAML configuration:
 
@@ -687,7 +686,6 @@ distributed:
   pp_size: 2          # 2-way pipeline parallelism
   sequence_parallel: false
   pipeline:
-    _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
     pp_schedule: 1f1b
     pp_microbatch_size: 1
     # pp_batch_size is automatically inferred from dataloader.batch_size
@@ -715,7 +713,7 @@ dataloader:
 Run training with:
 ```bash
 # Run with 2 GPUs for 2-way pipeline parallelism
-uv run torchrun --nproc_per_node=2 examples/llm/finetune.py --config config.yaml
+uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py --config config.yaml
 ```
 
 ## Troubleshooting

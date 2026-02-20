@@ -1,8 +1,8 @@
 # Fine-Tune Gemma 3 and Gemma 3n
 
-This document explains how to fine-tune Gemma 3 and Gemma 3n using NeMo Automodel. It outlines key operations, including initiating SFT and PEFT-LoRA runs and managing experiment configurations using YAML.
+This document explains how to fine-tune Gemma 3 and Gemma 3n using NeMo AutoModel. It outlines key operations, including initiating SFT and PEFT-LoRA runs and managing experiment configurations using YAML.
 
-To set up your environment to run NeMo Automodel, follow the [installation guide](https://github.com/NVIDIA-NeMo/Automodel#-install-nemo-automodel).
+To set up your environment to run NeMo AutoModel, follow the [Installation Guide](https://github.com/NVIDIA-NeMo/Automodel#-install-nemo-automodel).
 
 ## Data
 
@@ -17,13 +17,13 @@ The dataset consists of 20,500 examples with the following structure:
 
 ### Preprocess the Dataset
 
-NeMo Automodel provides built-in preprocessing for the MedPix-VQA dataset through the `make_medpix_vqa_dataset` function. Here's how the preprocessing works:
+NeMo AutoModel provides built-in preprocessing for the MedPix-VQA dataset through the `make_medpix_dataset` function. Here's how the preprocessing works:
 
 ```python
-from nemo_automodel.datasets.vlm.datasets import make_medpix_vqa_dataset
+from nemo_automodel.components.datasets.vlm.datasets import make_medpix_dataset
 
 # Load and preprocess the dataset
-dataset = make_medpix_vqa_dataset(
+dataset = make_medpix_dataset(
     path_or_dataset="mmoukouba/MedPix-VQA",
     split="train"
 )
@@ -54,7 +54,7 @@ conversation = [
 
 ### Use the Collate Functions
 
-NeMo Automodel provides specialized collate functions for different VLM processors. The collate function is responsible for batching examples and preparing them for model input.
+NeMo AutoModel provides specialized collate functions for different VLM processors. The collate function is responsible for batching examples and preparing them for model input.
 
 Both Gemma 3 and Gemma 3n models work seamlessly with the Hugging Face `AutoProcessor` and use the default collate function:
 
@@ -92,7 +92,7 @@ The default collate function:
 ### Preprocess Custom Datasets
 
 When using a custom dataset with a model whose Hugging Face `AutoProcessor` supports the `apply_chat_template` method, you'll need to convert your data into the Hugging Face message list format expected by the `apply_chat_template`.
-We provide [examples](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/datasets/vlm/datasets.py) demonstrating how to perform this conversion.
+We provide [examples](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/datasets.py) demonstrating how to perform this conversion.
 
 Some models, such as [Qwen2.5 VL](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct), have specific preprocessing requirements and require custom collate functions. For instance, Qwen2.5-VL uses the `qwen_vl_utils.process_vision_info` function to process images:
 
@@ -116,10 +116,10 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   batch_size: 1
   collate_fn:
-    _target_: nemo_automodel.datasets.vlm.collate_fns.qwen2_5_collate_fn
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.qwen2_5_collate_fn
 ```
 
-We provide [example custom collate functions](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/datasets/vlm/collate_fns.py) that you can use as references for your implementation.
+We provide [example custom collate functions](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/collate_fns.py) that you can use as references for your implementation.
 
 ## Run the Fine-Tune Script
 
@@ -127,9 +127,19 @@ The VLM fine-tuning functionality is provided through [`examples/vlm_finetune/fi
 
 ### Apply YAML-Based Configuration
 
-NeMo Automodel uses a flexible configuration system that combines YAML configuration files with command-line overrides. This allows you to maintain base configurations while easily experimenting with different parameters.
+NeMo AutoModel uses a flexible configuration system that combines YAML configuration files with command-line overrides. This allows you to maintain base configurations while easily experimenting with different parameters.
 
 The simplest way to run fine-tuning is with a YAML configuration file. We provide configs for both Gemma 3 and Gemma 3n.
+
+::::{note}
+These VLM recipes require the optional `vlm` dependency set. If you see `ImportError: qwen_vl_utils is not installed`, install VLM dependencies first:
+
+```bash
+uv sync --frozen --extra vlm
+```
+
+(If you're using pip: `pip3 install "nemo-automodel[vlm]"`.)
+::::
 
 #### Run Gemma 3 Fine-Tuning
 
@@ -176,7 +186,7 @@ uv run examples/vlm_finetune/finetune.py \
 
 ### Configure Model Freezing
 
-NeMo Automodel supports parameter freezing, allowing you to control which parts of a model remain trainable during fine-tuning. This is especially useful for VLMs, where you may want to preserve the pre-trained visual and audio encoders while adapting only the language model components.
+NeMo AutoModel supports parameter freezing, allowing you to control which parts of a model remain trainable during fine-tuning. This is especially useful for VLMs, where you may want to preserve the pre-trained visual and audio encoders while adapting only the language model components.
 
 With the freezing configuration, you can selectively freeze specific parts of the model to suit your training objectives:
 
@@ -188,9 +198,9 @@ freeze_config:
   freeze_language_model: false   # Allow language model adaptation
 ```
 
-### Run Parameter Efficient Fine-Tuning
+### Run Parameter-Efficient Fine-Tuning
 
-For memory-efficient training, you can use Low-Rank Adaptation (LoRA) instead of full fine-tuning. NeMo Automodel provides a dedicated PEFT recipe for Gemma 3:
+For memory-efficient training, you can use Low-Rank Adaptation (LoRA) instead of full fine-tuning. NeMo AutoModel provides a dedicated PEFT recipe for Gemma 3:
 
 To run PEFT with Gemma 3:
 
