@@ -15,8 +15,6 @@
 
 import argparse
 import glob
-import os
-import sys
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -26,7 +24,8 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, Che
 from nemo_automodel.components.datasets.llm import retrieval_dataset_inline as rdi
 from nemo_automodel.components.datasets.llm import RetrievalBiencoderCollator
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.models.biencoder import NeMoAutoModelBiencoder
+from nemo_automodel._transformers.auto_model import NeMoAutoModelForBiencoder
+from nemo_automodel.recipes.biencoder.train_biencoder import contrastive_scores_and_labels
 
 
 def _resolve_latest_checkpoint_dir(ckpt_root: Path) -> Path:
@@ -88,9 +87,14 @@ def _compute_pos_neg_diffs(
         passage = {k[len(d_prefix) :]: v for k, v in batch.items() if k.startswith(d_prefix)}
 
         with autocast_ctx:
-            out = model(query=query, passage=passage)
+            q_reps = model.encode(query, encoder="query")
+            p_reps = model.encode(passage, encoder="passage")
 
-        scores = out.scores  # [batch, n_passages]
+            # 2 passages per query: 1 positive + 1 negative
+            n_passages = 2
+            scores, _ = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
+
+        # [batch, n_passages]
         if scores is None or scores.shape[-1] < 2:
             raise RuntimeError(f"Unexpected scores shape: {None if scores is None else tuple(scores.shape)}")
         diff = (scores[:, 0] - scores[:, 1]).float().detach().cpu().numpy()
@@ -104,7 +108,7 @@ def _compute_pos_neg_diffs(
     return out
 
 
-def load_finetuned_model(model, ft_model_dir: Path) -> NeMoAutoModelBiencoder:
+def load_finetuned_model(model, ft_model_dir: Path):
     if not ft_model_dir.exists():
         raise FileNotFoundError(f"Expected finetuned model dir at {ft_model_dir}")
 
@@ -213,17 +217,14 @@ def main() -> int:
     model_dtype = torch.bfloat16
 
     # Build a single model instance, compute baseline diffs, then load finetuned weights and recompute.
-    model = NeMoAutoModelBiencoder.from_pretrained(
+    model = NeMoAutoModelForBiencoder.from_pretrained(
         pretrained_model_name_or_path=base_model_path,
         share_encoder=True,
         add_linear_pooler=False,
         out_dimension=768,
         do_gradient_checkpointing=False,
-        train_n_passages=2,
-        eval_negative_size=1,
         pooling="avg",
         l2_normalize=True,
-        t=0.02,
         use_liger_kernel=False,
         use_sdpa_patching=False,
         torch_dtype=model_dtype,

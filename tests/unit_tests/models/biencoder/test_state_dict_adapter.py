@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-from nemo_automodel.components.models.biencoder.state_dict_adapter import BiencoderStateDictAdapter
+from nemo_automodel.components.models.common.bidirectional import BiencoderStateDictAdapter
 
 
 class TestBiencoderStateDictAdapter:
