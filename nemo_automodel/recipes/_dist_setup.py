@@ -146,6 +146,20 @@ def setup_distributed(cfg: Any, world_size: int) -> MeshContext:
     from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
 
     cfg_dict = cfg.distributed.to_dict()
+
+    # Backward-compatible pipeline config source:
+    # older YAMLs place pipeline settings under top-level `autopipeline`
+    # instead of `distributed.pipeline`.
+    if cfg_dict.get("pipeline", None) is None:
+        autopipeline_cfg = cfg.get("autopipeline", None)
+        if autopipeline_cfg is not None:
+            pipeline_dict = autopipeline_cfg.to_dict() if hasattr(autopipeline_cfg, "to_dict") else autopipeline_cfg
+            if isinstance(pipeline_dict, dict):
+                pipeline_dict = dict(pipeline_dict)
+                for key in ("_target_", "_recursive_", "_convert_"):
+                    pipeline_dict.pop(key, None)
+                cfg_dict["pipeline"] = pipeline_dict
+
     parsed = parse_distributed_section(cfg_dict)
 
     device_mesh, moe_mesh = create_device_mesh(

@@ -77,6 +77,65 @@ def stage_ids_this_rank(pp_rank: int, pp_size: int, num_stages: int, style: str 
         assert stages_per_rank == 2, f"v schedules assume 2 stages per rank, got {stages_per_rank}"
         stage_v_pairs = list(zip(range(pp_size), range(num_stages - 1, pp_size - 1, -1)))
         return stage_v_pairs[pp_rank]
+    raise ValueError(f"Unsupported pipeline schedule style: {style}. Expected one of ['loop', 'v'].")
+
+
+def _is_truthy_env(var_name: str, default: str = "0") -> bool:
+    return os.environ.get(var_name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _enable_skip_output_merge_if_supported(schedule: _PipelineSchedule) -> bool:
+    """Patch schedule.step to skip output merge when schedule internals are compatible.
+
+    This avoids large transient output concatenations on the last PP stage, while
+    isolating reliance on private schedule internals to a single guarded path.
+    """
+    required_attrs = ("step", "_has_backward", "_split_inputs", "_step_microbatches", "_n_microbatches")
+    missing = [name for name in required_attrs if not hasattr(schedule, name)]
+    has_stage_attr = hasattr(schedule, "_stages") or hasattr(schedule, "_stage")
+    if missing or not has_stage_attr:
+        logger.warning(
+            "NEMOAUTOMODEL_PP_SKIP_OUTPUT_MERGE requested, but schedule class %s is incompatible "
+            "(missing attrs=%s, has_stage_attr=%s). Running without patch.",
+            schedule.__class__.__name__,
+            missing,
+            has_stage_attr,
+        )
+        return False
+
+    original_step = schedule.step
+
+    def _step_without_output_merge(self, *args, target=None, losses=None, **kwargs):
+        if self._has_backward and not torch.is_grad_enabled():
+            raise RuntimeError(
+                "step() requires gradients to be enabled for backward computation; "
+                "it should not be used under torch.no_grad() context. "
+                "Please call eval() instead."
+            )
+
+        if hasattr(self, "_stages"):
+            for stage in self._stages:
+                stage.has_backward = self._has_backward
+            for stage in self._stages:
+                stage.clear_runtime_states()
+        else:
+            self._stage.has_backward = self._has_backward
+            self._stage.clear_runtime_states()
+
+        args_split, kwargs_split = self._split_inputs(args, kwargs)
+        targets_split = list(torch.tensor_split(target, self._n_microbatches)) if target is not None else None
+        self._step_microbatches(args_split, kwargs_split, targets_split, losses)
+        return None
+
+    schedule.step = types.MethodType(_step_without_output_merge, schedule)
+    # Keep a handle for debugging/reversion if needed.
+    schedule._nemo_original_step = original_step
+    logger.info(
+        "Enabled NEMOAUTOMODEL_PP_SKIP_OUTPUT_MERGE=1: replacing schedule.step output-merge path "
+        "(class=%s).",
+        schedule.__class__.__name__,
+    )
+    return True
 
 
 def generate_hf_model_fqn_per_model_part(
@@ -89,6 +148,9 @@ def generate_hf_model_fqn_per_model_part(
     extra_module_fqns: Optional[list[str]] = None,
     fqn_prefix: str = "model.",
     lm_head_fqn: str = "lm_head",
+    embed_module_name: str = "embed_tokens",
+    layers_module_name: str = "layers",
+    norm_module_name: str = "norm",
 ) -> list[list[str]]:
     """
     Generates module names for each pipeline stage for HuggingFace models.
@@ -137,7 +199,7 @@ def generate_hf_model_fqn_per_model_part(
         # First stage: add embeddings and multimodal encoders if requested
         if stage_idx == 0:
             if include_embeddings:
-                stage_modules.append(f"{fqn_prefix}embed_tokens")
+                stage_modules.append(f"{fqn_prefix}{embed_module_name}")
             if include_multimodal_encoders:
                 stage_modules.extend([f"{fqn_prefix}{suffix}" for suffix in MULTIMODAL_SUFFIXES])
             if extra_module_fqns:
@@ -145,17 +207,121 @@ def generate_hf_model_fqn_per_model_part(
 
         # Add transformer layers for this stage
         for _ in range(stage_layer_count):
-            stage_modules.append(f"{fqn_prefix}layers.{current_layer}")
+            stage_modules.append(f"{fqn_prefix}{layers_module_name}.{current_layer}")
             current_layer += 1
 
         # Last stage: add norm and lm_head if requested
         if stage_idx == num_stages - 1:
-            stage_modules.append(f"{fqn_prefix}norm")
+            stage_modules.append(f"{fqn_prefix}{norm_module_name}")
             if include_lm_head:
                 stage_modules.append(lm_head_fqn)
 
         if include_rotary_emb:
             # Always include rotary_emb in all stages (it's needed for position embeddings)
+            stage_modules.append(f"{fqn_prefix}rotary_emb")
+
+        module_names_per_stage.append(stage_modules)
+
+    return module_names_per_stage
+
+
+def _parse_pp_block_weights() -> dict[str, float]:
+    """Parse optional PP block-weight overrides from env.
+
+    Format:
+      NEMOAUTOMODEL_PP_BLOCK_WEIGHTS="moe=3,attention=2,mamba=2,mlp=1"
+    """
+    defaults = {
+        "moe": 3.0,
+        "attention": 2.0,
+        "mamba": 2.0,
+        "mlp": 1.0,
+    }
+    raw = os.environ.get("NEMOAUTOMODEL_PP_BLOCK_WEIGHTS", "")
+    if not raw:
+        return defaults
+
+    parsed = dict(defaults)
+    for part in raw.split(","):
+        token = part.strip()
+        if not token or "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        key = key.strip().lower()
+        try:
+            parsed[key] = float(value.strip())
+        except ValueError:
+            logger.warning("Ignoring invalid PP block weight token: %s", token)
+    return parsed
+
+
+def generate_hf_model_fqn_per_model_part_weighted(
+    num_stages: int,
+    layer_weights: list[float],
+    include_embeddings: bool = True,
+    include_lm_head: bool = True,
+    include_rotary_emb: bool = True,
+    fqn_prefix: str = "model.",
+    embed_module_name: str = "embed_tokens",
+    layers_module_name: str = "layers",
+    norm_module_name: str = "norm",
+) -> list[list[str]]:
+    """Generate contiguous stage splits using per-layer weights.
+
+    This is useful for heterogeneous stacks (e.g., NemotronH mamba/attention/moe)
+    where equal layer-count partitioning can still be compute-imbalanced.
+    """
+    num_layers = len(layer_weights)
+    if num_stages < 1:
+        raise ValueError("Number of stages must be at least 1")
+    if num_stages > num_layers:
+        raise ValueError(f"Number of stages ({num_stages}) cannot exceed number of layers ({num_layers})")
+
+    # Keep positive weights to avoid degenerate zero-target splits.
+    weights = [max(float(w), 1.0e-6) for w in layer_weights]
+    total_weight = sum(weights)
+
+    module_names_per_stage = []
+    start = 0
+    remaining_weight = total_weight
+    for stage_idx in range(num_stages):
+        stage_modules = []
+
+        if stage_idx == 0 and include_embeddings:
+            stage_modules.append(f"{fqn_prefix}{embed_module_name}")
+
+        remaining_stages = num_stages - stage_idx
+        if stage_idx == num_stages - 1:
+            end = num_layers
+        else:
+            min_end = start + 1
+            max_end = num_layers - (remaining_stages - 1)
+            stage_target = remaining_weight / remaining_stages
+
+            best_end = min_end
+            best_diff = float("inf")
+            run = 0.0
+            for end_candidate in range(min_end, max_end + 1):
+                run += weights[end_candidate - 1]
+                diff = abs(run - stage_target)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_end = end_candidate
+            end = best_end
+
+        for layer_idx in range(start, end):
+            stage_modules.append(f"{fqn_prefix}{layers_module_name}.{layer_idx}")
+
+        stage_weight = sum(weights[start:end])
+        remaining_weight -= stage_weight
+        start = end
+
+        if stage_idx == num_stages - 1:
+            stage_modules.append(f"{fqn_prefix}{norm_module_name}")
+            if include_lm_head:
+                stage_modules.append("lm_head")
+
+        if include_rotary_emb:
             stage_modules.append(f"{fqn_prefix}rotary_emb")
 
         module_names_per_stage.append(stage_modules)
@@ -316,13 +482,111 @@ def split_model_into_stages(
     pp_rank = pp_mesh.get_local_rank()
     pp_size = pp_mesh.size()
     # Detect model structure
-    has_model_attr = hasattr(model, "model")
-    text_model = get_text_module(model.model if has_model_attr else model)
-    text_model_attr_name = ""
-    for attr_name in TEXT_MODULE_ATTRS:
-        if hasattr(model, attr_name) or hasattr(model.model, attr_name):
-            text_model_attr_name = attr_name
-            break
+    model_has_model_attr = hasattr(model, "model") and getattr(model, "model", None) is not None
+    model_has_backbone_attr = hasattr(model, "backbone") and getattr(model, "backbone", None) is not None
+
+    def _submodule_exists(module_root: nn.Module, module_fqn: str) -> bool:
+        if not module_fqn:
+            return True
+        try:
+            module_root.get_submodule(module_fqn)
+            return True
+        except Exception:
+            return False
+
+    def _normalize_stage_fqn_aliases(explicit_stages: list[list[str]]) -> list[list[str]]:
+        alias_suffixes = (
+            (".embeddings", ".embed_tokens"),
+            (".embed_tokens", ".embeddings"),
+            (".norm_f", ".norm"),
+            (".norm", ".norm_f"),
+        )
+        rewrites: list[tuple[str, str]] = []
+        normalized_stages: list[list[str]] = []
+        for stage_modules in explicit_stages:
+            normalized_stage: list[str] = []
+            for module_fqn in stage_modules:
+                normalized_fqn = module_fqn
+                if not _submodule_exists(model, normalized_fqn):
+                    for src_suffix, dst_suffix in alias_suffixes:
+                        if normalized_fqn.endswith(src_suffix):
+                            candidate = normalized_fqn[: -len(src_suffix)] + dst_suffix
+                            if _submodule_exists(model, candidate):
+                                rewrites.append((normalized_fqn, candidate))
+                                normalized_fqn = candidate
+                                break
+                normalized_stage.append(normalized_fqn)
+            normalized_stages.append(normalized_stage)
+
+        if rewrites:
+            # De-duplicate while preserving insertion order.
+            unique_rewrites = list(dict.fromkeys(rewrites))
+            logger.info(
+                "Rewriting pipeline stage FQN aliases for current model structure: %s",
+                ", ".join(f"{src}->{dst}" for src, dst in unique_rewrites),
+            )
+
+        return normalized_stages
+
+    # Normalize explicit stage FQNs to the model's actual root attribute.
+    if module_names_per_stage is not None:
+        uses_backbone_prefix = any(
+            module_fqn == "backbone" or module_fqn.startswith("backbone.")
+            for stage_modules in module_names_per_stage
+            for module_fqn in stage_modules
+        )
+        uses_model_prefix = any(
+            module_fqn == "model" or module_fqn.startswith("model.")
+            for stage_modules in module_names_per_stage
+            for module_fqn in stage_modules
+        )
+
+        if uses_backbone_prefix and not model_has_backbone_attr and model_has_model_attr:
+            logger.info("Rewriting pipeline stage FQNs from backbone.* to model.* for current model structure.")
+            module_names_per_stage = [
+                [
+                    ("model." + module_fqn[len("backbone.") :] if module_fqn.startswith("backbone.") else module_fqn)
+                    for module_fqn in stage_modules
+                ]
+                for stage_modules in module_names_per_stage
+            ]
+        elif uses_model_prefix and not model_has_model_attr and model_has_backbone_attr:
+            logger.info("Rewriting pipeline stage FQNs from model.* to backbone.* for current model structure.")
+            module_names_per_stage = [
+                [
+                    ("backbone." + module_fqn[len("model.") :] if module_fqn.startswith("model.") else module_fqn)
+                    for module_fqn in stage_modules
+                ]
+                for stage_modules in module_names_per_stage
+            ]
+
+        module_names_per_stage = _normalize_stage_fqn_aliases(module_names_per_stage)
+
+    prefer_backbone_attr = False
+    if module_names_per_stage is not None:
+        prefer_backbone_attr = any(
+            module_fqn.startswith("backbone.") for stage_modules in module_names_per_stage for module_fqn in stage_modules
+        )
+
+    has_backbone_attr = model_has_backbone_attr and (prefer_backbone_attr or not model_has_model_attr)
+    has_model_attr = model_has_model_attr and not has_backbone_attr
+    if has_backbone_attr:
+        text_model = model.backbone
+        text_model_attr_name = ""
+    elif has_model_attr:
+        text_model = get_text_module(model.model)
+        text_model_attr_name = ""
+        for attr_name in TEXT_MODULE_ATTRS:
+            if hasattr(model.model, attr_name):
+                text_model_attr_name = attr_name
+                break
+    else:
+        text_model = get_text_module(model)
+        text_model_attr_name = ""
+        for attr_name in TEXT_MODULE_ATTRS:
+            if hasattr(model, attr_name):
+                text_model_attr_name = attr_name
+                break
     has_rotary_emb = hasattr(text_model, "rotary_emb")
 
     # Check for lm_head in multiple locations:
@@ -331,12 +595,22 @@ def split_model_into_stages(
 
     text_model_has_model_attr = hasattr(text_model, "model")
 
-    if text_model_has_model_attr:
-        # Models like LlamaForCausalLM have model.layers
-        num_layers = len(text_model.model.layers)
+    if has_backbone_attr:
+        # NemotronH-like models expose decoder stack as backbone.layers.
+        num_layers = len(model.backbone.layers)
+        embed_module_name = "embeddings"
+        layers_module_name = "layers"
+        norm_module_name = "norm_f"
     else:
-        # Direct model access
-        num_layers = len(text_model.layers)
+        if text_model_has_model_attr:
+            # Models like LlamaForCausalLM have model.layers
+            num_layers = len(text_model.model.layers)
+        else:
+            # Direct model access
+            num_layers = len(text_model.layers)
+        embed_module_name = "embed_tokens"
+        layers_module_name = "layers"
+        norm_module_name = "norm"
 
     schedule_class = get_schedule_class(pp_schedule)
     is_single_stage_schedule = issubclass(schedule_class, PipelineScheduleSingle)
@@ -350,58 +624,141 @@ def split_model_into_stages(
         round_to_pp_multiple=round_to_pp_multiple,
     )
 
-    # Determine module prefix for text layers and where multimodal encoders live
-    base_prefix = "model." if has_model_attr else ""
-    layers_prefix = base_prefix
-    include_multimodal_encoders = True
-    extra_module_fqns = None
-
-    text_model_attr_prefix = text_model_attr_name + "." if text_model_attr_name else ""
-    layers_prefix = (
-        f"{base_prefix}{text_model_attr_prefix}model."
-        if text_model_has_model_attr
-        else f"{base_prefix}{text_model_attr_prefix}"
-    )
-
-    # If layers live under a nested language_model, keep multimodal encoders at the base prefix
-    if layers_prefix != base_prefix:
+    # Determine module prefix for text layers and where multimodal encoders live.
+    if has_backbone_attr:
+        base_prefix = ""
+        layers_prefix = "backbone."
         include_multimodal_encoders = False
-        extra_module_fqns = [f"{base_prefix}{suffix}" for suffix in MULTIMODAL_SUFFIXES]
-        if lm_head_on_top_level:
-            lm_head_fqn = "lm_head"
-        else:
-            lm_head_fqn = f"{base_prefix}{text_model_attr_name}.lm_head"
-    else:
+        extra_module_fqns = None
         lm_head_fqn = "lm_head"
+    else:
+        base_prefix = "model." if has_model_attr else ""
+        layers_prefix = base_prefix
+        include_multimodal_encoders = True
+        extra_module_fqns = None
+
+        text_model_attr_prefix = text_model_attr_name + "." if text_model_attr_name else ""
+        layers_prefix = (
+            f"{base_prefix}{text_model_attr_prefix}model."
+            if text_model_has_model_attr
+            else f"{base_prefix}{text_model_attr_prefix}"
+        )
+
+        # If layers live under a nested language_model, keep multimodal encoders at the base prefix
+        if layers_prefix != base_prefix:
+            include_multimodal_encoders = False
+            extra_module_fqns = [f"{base_prefix}{suffix}" for suffix in MULTIMODAL_SUFFIXES]
+            if lm_head_on_top_level:
+                lm_head_fqn = "lm_head"
+            else:
+                lm_head_fqn = f"{base_prefix}{text_model_attr_name}.lm_head"
+        else:
+            lm_head_fqn = "lm_head"
 
     # Auto-generate module split if not provided
     if module_names_per_stage is None:
-        module_names_per_stage = generate_hf_model_fqn_per_model_part(
-            num_stages=num_virtual_stages,
-            num_layers=num_layers,
-            include_embeddings=True,
-            include_lm_head=has_lm_head,
-            include_rotary_emb=has_rotary_emb,
-            include_multimodal_encoders=include_multimodal_encoders,
-            extra_module_fqns=extra_module_fqns,
-            fqn_prefix=layers_prefix,
-            lm_head_fqn=lm_head_fqn,
+        use_weighted_split = os.environ.get("NEMOAUTOMODEL_PP_USE_WEIGHTED_SPLIT", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
         )
+        weighted_layer_weights = None
+        if use_weighted_split:
+            if has_backbone_attr:
+                layers_obj = model.backbone.layers
+            elif has_model_attr:
+                layers_obj = text_model.model.layers if hasattr(text_model, "model") else text_model.layers
+            else:
+                layers_obj = text_model.model.layers if hasattr(text_model, "model") else text_model.layers
+            layers_iter = layers_obj.values() if hasattr(layers_obj, "values") else layers_obj
+            block_types = [getattr(layer, "block_type", None) for layer in layers_iter]
+            if all(bt is not None for bt in block_types):
+                weight_map = _parse_pp_block_weights()
+                weighted_layer_weights = [weight_map.get(str(bt).lower(), 1.0) for bt in block_types]
+                logger.info(
+                    "Using weighted PP split with block weights=%s for %s virtual stages.",
+                    weight_map,
+                    num_virtual_stages,
+                )
+            else:
+                logger.info(
+                    "Weighted PP split requested but block_type metadata is unavailable; falling back to equal-layer split."
+                )
 
-    def _build_stage_from_modules(
-        stage_idx: int, module_names: list[str], num_stages: int
-    ) -> tuple[PipelineStage, nn.Module]:
-        """Build a pipeline stage from specified module names."""
-        # Deep copy the model
-        stage_model = copy.deepcopy(model)
-        patch_hf_model_for_pp(
-            stage_model, patch_inner_model=patch_inner_model, patch_causal_lm_model=patch_causal_lm_model
-        )
-        # Create a set of modules to keep
-        modules_to_keep = set(module_names)
-        logger.info(
-            f"PP Rank {pp_rank}: Stage {stage_idx}: Keeping modules: {sorted(modules_to_keep, key=lambda x: x.split('.')[-1])}"
-        )
+        if weighted_layer_weights is not None:
+            module_names_per_stage = generate_hf_model_fqn_per_model_part_weighted(
+                num_stages=num_virtual_stages,
+                layer_weights=weighted_layer_weights,
+                include_embeddings=True,
+                include_lm_head=has_lm_head,
+                include_rotary_emb=has_rotary_emb,
+                fqn_prefix=layers_prefix,
+                embed_module_name=embed_module_name,
+                layers_module_name=layers_module_name,
+                norm_module_name=norm_module_name,
+            )
+            if include_multimodal_encoders:
+                module_names_per_stage[0].extend([f"{layers_prefix}{suffix}" for suffix in MULTIMODAL_SUFFIXES])
+            if extra_module_fqns:
+                module_names_per_stage[0].extend(extra_module_fqns)
+            if has_lm_head and lm_head_fqn != "lm_head":
+                module_names_per_stage[-1] = [
+                    lm_head_fqn if module_fqn == "lm_head" else module_fqn for module_fqn in module_names_per_stage[-1]
+                ]
+        else:
+            module_names_per_stage = generate_hf_model_fqn_per_model_part(
+                num_stages=num_virtual_stages,
+                num_layers=num_layers,
+                include_embeddings=True,
+                include_lm_head=has_lm_head,
+                include_rotary_emb=has_rotary_emb,
+                include_multimodal_encoders=include_multimodal_encoders,
+                extra_module_fqns=extra_module_fqns,
+                fqn_prefix=layers_prefix,
+                lm_head_fqn=lm_head_fqn,
+                embed_module_name=embed_module_name,
+                layers_module_name=layers_module_name,
+                norm_module_name=norm_module_name,
+            )
+
+    style = "v" if schedule_class == ScheduleZBVZeroBubble else "loop"
+    total_stages = len(module_names_per_stage)
+    assert total_stages % pp_size == 0, f"Total stages {total_stages} must be divisible by PP size {pp_size}"
+    local_stage_ids = list(stage_ids_this_rank(pp_rank, pp_size, total_stages, style=style))
+
+    patch_template_once = os.environ.get("NEMOAUTOMODEL_PP_PATCH_TEMPLATE_ONCE", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    desired_patch_cfg = (bool(patch_inner_model), bool(patch_causal_lm_model))
+    if patch_template_once and any(desired_patch_cfg):
+        current_patch_cfg = getattr(model, "_nemo_pp_forward_patch_cfg", None)
+        if current_patch_cfg != desired_patch_cfg:
+            patch_hf_model_for_pp(
+                model, patch_inner_model=patch_inner_model, patch_causal_lm_model=patch_causal_lm_model
+            )
+            model._nemo_pp_forward_patch_cfg = desired_patch_cfg
+
+    def _prune_model_to_modules(stage_model: nn.Module, modules_to_keep: set[str]) -> None:
+        def _direct_child_names(parent_fqn: str) -> set[str]:
+            """Return direct child names of parent_fqn that must be kept.
+
+            Example:
+              parent_fqn=backbone.layers
+              keep entry backbone.layers.3.mixer -> direct child "3"
+            """
+            prefix = f"{parent_fqn}."
+            children = set()
+            for kept in modules_to_keep:
+                if kept.startswith(prefix):
+                    suffix = kept[len(prefix) :]
+                    child = suffix.split(".", 1)[0]
+                    if child:
+                        children.add(child)
+            return children
 
         # Helper function to handle nested module removal
         def _process_module(parent_module, parent_name=""):
@@ -411,48 +768,131 @@ def split_model_into_stages(
                 if full_name in modules_to_keep:
                     continue
 
-                # Special handling for layers (ModuleList)
+                # Special handling for layers (ModuleList/ModuleDict)
                 if isinstance(module, (nn.ModuleDict, nn.ModuleList)):
-                    # Determine which layers to keep
-                    layers_to_keep = {
-                        name.split(".")[-1] for name in modules_to_keep if name.startswith(f"{full_name}.")
-                    }
-                    # Create new ModuleList with only kept layers
+                    layers_to_keep = _direct_child_names(full_name)
                     if layers_to_keep:
-                        # Keep only specified layers
                         if isinstance(module, nn.ModuleDict):
                             for layer_name in list(module.keys()):
                                 if layer_name not in layers_to_keep:
                                     del module[layer_name]
                         elif isinstance(module, nn.ModuleList):
-                            indices_to_keep = {int(idx) for idx in layers_to_keep if idx.isdigit()}
-                            new_layers = nn.ModuleDict(
-                                {str(i): layer for i, layer in enumerate(module) if i in indices_to_keep}
-                            )
-                            setattr(parent_module, name, new_layers)
+                            # Keep original layer ids in module names for checkpoint
+                            # compatibility. Reindexing a ModuleList to [0..N-1] would
+                            # change state_dict keys and break base-model load.
+                            selected = {
+                                str(i): module[i]
+                                for i in sorted(int(idx) for idx in layers_to_keep if idx.isdigit())
+                                if 0 <= i < len(module)
+                            }
+                            setattr(parent_module, name, nn.ModuleDict(selected))
                     else:
-                        # No layers from this structure needed, set to empty structure
                         if isinstance(module, nn.ModuleDict):
                             setattr(parent_module, name, nn.ModuleDict())
                         elif isinstance(module, nn.ModuleList):
                             setattr(parent_module, name, nn.ModuleDict())
 
-                # If this module is explicitly in modules_to_keep, keep it and all its children
-                # (don't recurse to avoid removing PEFT adapters like lora_A, lora_B)
-                elif full_name in modules_to_keep:
-                    # Keep this module and all its children intact
-                    pass
-
-                # Handle other modules
-                elif not any(kept_name.startswith(full_name + ".") for kept_name in modules_to_keep):
-                    # This module and its children are not needed
+                elif (
+                    full_name not in modules_to_keep
+                    and not any(kept_name.startswith(full_name + ".") for kept_name in modules_to_keep)
+                ):
                     setattr(parent_module, name, None)
-                else:
-                    # This module has descendants that need to be kept, recurse into it
+                elif full_name not in modules_to_keep:
                     _process_module(module, full_name)
 
-        # Process the model
         _process_module(stage_model)
+
+    def _annotate_stage_runtime_requirements(stage_model: nn.Module) -> None:
+        # Conservative defaults: move all runtime tensors unless we can prove a stage doesn't need them.
+        needs_attention_mask = True
+        needs_cache_position = True
+        needs_causal_mask_mapping = True
+
+        target = None
+        if hasattr(stage_model, "backbone") and getattr(stage_model, "backbone") is not None:
+            target = stage_model.backbone
+        elif hasattr(stage_model, "model") and getattr(stage_model, "model") is not None:
+            target = stage_model.model
+        elif hasattr(stage_model, "layers"):
+            target = stage_model
+
+        layers = getattr(target, "layers", None) if target is not None else None
+        if layers is not None:
+            try:
+                layer_iter = layers.values() if hasattr(layers, "values") else layers
+                block_types = [getattr(layer, "block_type", None) for layer in layer_iter if layer is not None]
+            except TypeError:
+                block_types = []
+            if block_types:
+                non_none_block_types = [bt for bt in block_types if bt is not None]
+                is_nemotron_h_stage = bool(non_none_block_types) and all(
+                    bt in {"mlp", "moe", "attention", "mamba"} for bt in non_none_block_types
+                )
+                # NemotronH-only signal: no attention/mamba blocks means these masks/positions are unused.
+                if is_nemotron_h_stage:
+                    if all(bt in ("mlp", "moe") for bt in non_none_block_types):
+                        needs_attention_mask = False
+                        needs_cache_position = False
+                    # NemotronH PP path computes masks internally from attention_mask.
+                    needs_causal_mask_mapping = False
+
+        stage_model._nemo_pp_needs_attention_mask = needs_attention_mask
+        stage_model._nemo_pp_needs_cache_position = needs_cache_position
+        stage_model._nemo_pp_needs_causal_mask_mapping = needs_causal_mask_mapping
+        if hasattr(stage_model, "backbone") and getattr(stage_model, "backbone") is not None:
+            stage_model.backbone._nemo_pp_needs_attention_mask = needs_attention_mask
+            stage_model.backbone._nemo_pp_needs_cache_position = needs_cache_position
+            stage_model.backbone._nemo_pp_needs_causal_mask_mapping = needs_causal_mask_mapping
+        if hasattr(stage_model, "model") and getattr(stage_model, "model") is not None:
+            stage_model.model._nemo_pp_needs_attention_mask = needs_attention_mask
+            stage_model.model._nemo_pp_needs_cache_position = needs_cache_position
+            stage_model.model._nemo_pp_needs_causal_mask_mapping = needs_causal_mask_mapping
+
+    build_from_local_union = os.environ.get("NEMOAUTOMODEL_PP_BUILD_FROM_LOCAL_UNION", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    rank_template_model = None
+    if build_from_local_union and local_stage_ids:
+        local_union_modules = set()
+        for sid in local_stage_ids:
+            local_union_modules.update(module_names_per_stage[sid])
+
+        rank_template_model = copy.deepcopy(model)
+        _prune_model_to_modules(rank_template_model, local_union_modules)
+        logger.info(
+            "PP Rank %s: built rank-local pruned template (local stages=%s, kept modules=%s)",
+            pp_rank,
+            len(local_stage_ids),
+            len(local_union_modules),
+        )
+
+    reuse_rank_template_inplace = rank_template_model is not None and len(local_stage_ids) == 1
+
+    def _build_stage_from_modules(
+        stage_idx: int, module_names: list[str], num_stages: int
+    ) -> tuple[PipelineStage, nn.Module]:
+        """Build a pipeline stage from specified module names."""
+        if reuse_rank_template_inplace:
+            stage_model = rank_template_model
+        else:
+            # Deep copy the model
+            stage_model = copy.deepcopy(rank_template_model if rank_template_model is not None else model)
+        if not patch_template_once and any(desired_patch_cfg):
+            patch_hf_model_for_pp(
+                stage_model, patch_inner_model=patch_inner_model, patch_causal_lm_model=patch_causal_lm_model
+            )
+        # Create a set of modules to keep
+        modules_to_keep = set(module_names)
+        logger.info(
+            f"PP Rank {pp_rank}: Stage {stage_idx}: Keeping modules: {sorted(modules_to_keep, key=lambda x: x.split('.')[-1])}"
+        )
+
+        # Process the model
+        _prune_model_to_modules(stage_model, modules_to_keep)
+        _annotate_stage_runtime_requirements(stage_model)
 
         # Create pipeline stage
         stage = PipelineStage(
@@ -465,16 +905,9 @@ def split_model_into_stages(
 
         return stage, stage_model
 
-    # Determine which stages this rank will handle
-    schedule_class = get_schedule_class(pp_schedule)
-    style = "v" if schedule_class == ScheduleZBVZeroBubble else "loop"
-
     stages = []
     models = []
-
-    total_stages = len(module_names_per_stage)
-    assert total_stages % pp_size == 0, f"Total stages {total_stages} must be divisible by PP size {pp_size}"
-    for stage_idx in stage_ids_this_rank(pp_rank, pp_size, total_stages, style=style):
+    for stage_idx in local_stage_ids:
         module_names = module_names_per_stage[stage_idx]
         stage, model_chunk = _build_stage_from_modules(
             stage_idx,
@@ -528,23 +961,52 @@ def build_pipeline_schedule(
             "Update the config arguments for either batch_size or pipeline_parallel_microbatch_size."
         )
 
-    # We expect that the number of local stages (`len(stages)`) is the same across all ranks
-    num_total_stages = len(stages)
-    if n_microbatches < num_total_stages:
-        logger.warning(
-            f"Number of microbatches ({n_microbatches}) is less than the total number "
-            f"of stages ({num_total_stages}) which may result in a bubble in the pipeline."
+    num_local_stages = len(stages)
+    num_total_stages = getattr(stages[0], "num_stages", num_local_stages) if num_local_stages > 0 else 0
+    allow_underfill = _is_truthy_env("NEMOAUTOMODEL_PP_ALLOW_UNDERFILL", "0")
+    strict_total_underfill = _is_truthy_env("NEMOAUTOMODEL_PP_STRICT_TOTAL_UNDERFILL", "0")
+
+    # Hard check: if local microbatches are fewer than local stage chunks, this rank is
+    # severely underfilled and usually not useful to run.
+    if n_microbatches < num_local_stages and not allow_underfill:
+        raise ValueError(
+            f"Pipeline underfill detected: n_microbatches={n_microbatches}, local_stage_chunks={num_local_stages}, "
+            f"total_stages={num_total_stages}, local_batch_size={local_batch_size}, microbatch_size={microbatch_size}. "
+            "Set NEMOAUTOMODEL_PP_ALLOW_UNDERFILL=1 to override this check for exploratory runs."
         )
 
+    # Soft check by default: compare against total virtual stages for bubble guidance.
+    # Some interleaved high-batch configs can still be useful with n_microbatches < total_stages.
+    if n_microbatches < num_total_stages:
+        underfill_msg = (
+            f"Pipeline underfill warning: n_microbatches={n_microbatches}, total_stages={num_total_stages}, "
+            f"local_stage_chunks={num_local_stages}, local_batch_size={local_batch_size}, "
+            f"microbatch_size={microbatch_size}. This can increase PP bubbles."
+        )
+        if strict_total_underfill and not allow_underfill:
+            raise ValueError(
+                underfill_msg
+                + " Set NEMOAUTOMODEL_PP_ALLOW_UNDERFILL=1 to override, "
+                + "or unset NEMOAUTOMODEL_PP_STRICT_TOTAL_UNDERFILL."
+            )
+        # Warnings may be globally filtered in some training setups; keep an INFO copy visible.
+        logger.warning("%s", underfill_msg)
+        logger.info("%s", underfill_msg)
+
+    # Runtime schedule can execute multi-stage local chunks when provided a list.
+    pass_stage_list = looped_schedule or (schedule_class == _PipelineScheduleRuntime and num_local_stages > 1)
+    schedule_input = stages if pass_stage_list else stages[0]
+
     schedule = schedule_class(
-        stages if looped_schedule else stages[0],
+        schedule_input,
         n_microbatches=n_microbatches,
         loss_fn=loss_fn,
         scale_grads=scale_grads,
     )
     logger.info(
         f"Using pipeline schedule {pipeline_parallel_schedule} "
-        f"with {n_microbatches} microbatches and {num_total_stages} stages."
+        f"with {n_microbatches} microbatches, {num_total_stages} total stages, "
+        f"and {num_local_stages} local stage chunks."
     )
 
     if pp_schedule_csv:
@@ -557,6 +1019,12 @@ def build_pipeline_schedule(
             "and _PipelineScheduleRuntime support csv schedules"
         )
         schedule._load_csv(pp_schedule_csv)
+
+    # Optional memory optimization for training/benchmark flows that never consume
+    # the return value of schedule.step(): skip concatenating last-stage microbatch
+    # outputs (e.g., full logits), which can create large transient allocations.
+    if _is_truthy_env("NEMOAUTOMODEL_PP_SKIP_OUTPUT_MERGE", "0"):
+        _enable_skip_output_merge_if_supported(schedule)
 
     return schedule
 
