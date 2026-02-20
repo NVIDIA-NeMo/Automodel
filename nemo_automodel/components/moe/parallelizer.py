@@ -285,6 +285,7 @@ def parallelize_model(
     world_mesh: DeviceMesh,
     moe_mesh: DeviceMesh | None,
     *,
+    pp_enabled: bool = False,
     dp_axis_names: tuple[str, ...],
     cp_axis_name: str | None = None,
     tp_axis_name: str | None = None,
