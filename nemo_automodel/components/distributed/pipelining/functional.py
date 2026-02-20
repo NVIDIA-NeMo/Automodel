@@ -482,8 +482,8 @@ def split_model_into_stages(
     pp_rank = pp_mesh.get_local_rank()
     pp_size = pp_mesh.size()
     # Detect model structure
-    has_model_attr = hasattr(model, "model") and model.model is not None
-    has_backbone_attr = hasattr(model, "backbone") and model.backbone is not None
+    has_model_attr = hasattr(model, "model") and getattr(model, "model", None) is not None
+    has_backbone_attr = (not has_model_attr) and hasattr(model, "backbone") and getattr(model, "backbone", None) is not None
     if has_backbone_attr:
         text_model = model.backbone
         text_model_attr_name = ""
@@ -732,8 +732,11 @@ def split_model_into_stages(
 
         layers = getattr(target, "layers", None) if target is not None else None
         if layers is not None:
-            layer_iter = layers.values() if hasattr(layers, "values") else layers
-            block_types = [getattr(layer, "block_type", None) for layer in layer_iter if layer is not None]
+            try:
+                layer_iter = layers.values() if hasattr(layers, "values") else layers
+                block_types = [getattr(layer, "block_type", None) for layer in layer_iter if layer is not None]
+            except TypeError:
+                block_types = []
             if block_types:
                 non_none_block_types = [bt for bt in block_types if bt is not None]
                 is_nemotron_h_stage = bool(non_none_block_types) and all(
