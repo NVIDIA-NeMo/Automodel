@@ -428,9 +428,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
         # Create cache on first call
         if past_key_values is None:
-            past_key_values = NemotronHybridCache(
-                self.config, batch_size, self.dtype, self.device
-            )
+            past_key_values = NemotronHybridCache(self.config, batch_size, self.dtype, self.device)
             # First call: cache_position covers the full prompt
             if cache_position is None:
                 cache_position = torch.arange(input_ids.shape[1], device=input_ids.device)
@@ -449,11 +447,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             model_inputs = {"input_ids": input_ids, "inputs_embeds": None}
 
         # Build causal mask for attention layers
-        query_len = input_ids.shape[1] if model_inputs["inputs_embeds"] is None else model_inputs["inputs_embeds"].shape[1]
-        kv_len = past_key_values.get_seq_length() + query_len
-        causal_mask = self._make_causal_mask(
-            query_len, kv_len, batch_size, self.dtype, self.device
+        query_len = (
+            input_ids.shape[1] if model_inputs["inputs_embeds"] is None else model_inputs["inputs_embeds"].shape[1]
         )
+        kv_len = past_key_values.get_seq_length() + query_len
+        causal_mask = self._make_causal_mask(query_len, kv_len, batch_size, self.dtype, self.device)
 
         model_inputs["causal_mask_mapping"] = {"full_attention": causal_mask}
         model_inputs["past_key_values"] = past_key_values

@@ -263,9 +263,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
 
             projected_states = self.in_proj(hidden_states)
             A = -torch.exp(self.A_log.float())
-            dt_limit_kwargs = (
-                {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
-            )
+            dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
 
             out = mamba_split_conv1d_scan_combined(
                 projected_states,
@@ -384,9 +382,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
         )
 
         A = -torch.exp(self.A_log.float())
-        dt_limit_kwargs = (
-            {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
-        )
+        dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
 
         # Chunk SSM scan
         scan_output, ssm_state = mamba_chunk_scan_combined(
