@@ -215,8 +215,8 @@ jobs:
           - test-name: L2_Pretrain_and_KD
             test-folder: llm_pretrain_and_kd
             timeout: 20
-            runner: self-hosted-nemo
-            test-data-path: "/mnt/datadrive/TestData"
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_DCP
             test-folder: hf_dcp
             timeout: 40

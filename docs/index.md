@@ -44,6 +44,7 @@ guides/llm/pretraining.md
 guides/llm/nanogpt-pretraining.md
 guides/llm/sequence-classification.md
 guides/omni/gemma3-3n.md
+guides/vlm/qwen3_5.md
 guides/quantization-aware-training.md
 guides/llm/databricks.md
 ```

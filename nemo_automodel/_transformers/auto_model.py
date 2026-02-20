@@ -40,6 +40,7 @@ from transformers import (  # noqa: E402
     AutoModelForCausalLM,
     AutoModelForCTC,
     AutoModelForImageTextToText,
+    AutoModelForMultimodalLM,
     AutoModelForSequenceClassification,
     AutoModelForSpeechSeq2Seq,
     AutoModelForTextToWaveform,
@@ -71,39 +72,36 @@ if TYPE_CHECKING:
     from nemo_automodel.components.utils.compile_utils import CompileConfig
 
 #  Re-exports from sibling modules (backward compatibility)
-from nemo_automodel._transformers.infrastructure import (  # noqa: E402, F401
+# Backward-compat shim for trust_remote_code models (e.g. DeciLM)
+# that import NEED_SETUP_CACHE_CLASSES_MAPPING from transformers.generation.utils.
+import transformers.generation.utils as _gen_utils  # noqa: E402
+
+from nemo_automodel._transformers.infrastructure import (
     MeshContext,
-    _apply_peft_and_lower_precision,
-    _shard_ep_fsdp,
-    _shard_pp,
     apply_model_infrastructure,
     instantiate_infrastructure,
-    parallelize_for_pp,
 )
-from nemo_automodel._transformers.kernel_patches import (  # noqa: E402, F401
+from nemo_automodel._transformers.kernel_patches import (
     DEFAULT_ATTN_IMPLEMENTATION,
-    HAS_FA,
-    HAS_LIGER_KERNEL,
     _apply_preload_overrides,
-    _assert_same_signature,
     _get_next_fallback_attn,
     _patch_attention,
     _patch_liger_kernel,
     _verify_sdpa_support,
 )
-from nemo_automodel._transformers.model_init import (  # noqa: E402, F401
+from nemo_automodel._transformers.model_init import (
     _consume_config_overrides,
-    _download_model_weights,
-    _filter_kwargs_for_init,
-    _get_init_param_names,
-    _get_mixin_wrapped_class,
     _init_model,
-    _is_config_compatible_with_custom_model,
-    get_architectures,
     get_hf_config,
     get_is_hf_model,
-    local_torch_dtype,
+    no_hf_meta_device,
 )
+
+if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
+    from transformers.cache_utils import StaticCache
+
+    _gen_utils.NEED_SETUP_CACHE_CLASSES_MAPPING = {"static": StaticCache}
+
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +243,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
         model = None  # Ensure 'model' is always bound for the except handler
+        is_custom_model = None
         try:
             with init_ctx:
                 is_custom_model, model = _init_model(
@@ -257,6 +256,29 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     *model_args,
                     **kwargs,
                 )
+        except NotImplementedError as e:
+            if "Cannot copy out of meta tensor" in str(e) and is_meta_device:
+                logger.warning(
+                    "Model init hit 'Cannot copy out of meta tensor' (e.g. buffer created with meta but "
+                    "called .to(device)); retrying without meta device.",
+                )
+                del model
+                model = None
+                gc.collect()
+                is_meta_device = False
+                with ContextManagers([no_init_weights(), no_hf_meta_device()]):
+                    is_custom_model, model = _init_model(
+                        cls,
+                        pretrained_model_name_or_path_or_config,
+                        attn_implementation,
+                        torch_dtype,
+                        quantization_config,
+                        force_hf,
+                        *model_args,
+                        **kwargs,
+                    )
+            else:
+                raise
         except ValueError as e:
             if "does not support" in str(e):
                 del model
@@ -334,6 +356,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         pipeline_config: Optional[PipelineConfig] = None,
         qat_config: Optional[QATConfig] = None,
         moe_config: Optional[MoEParallelizerConfig] = None,
+        activation_checkpointing: bool = False,
         peft_config: Optional[dict] = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
@@ -387,6 +410,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 configuration. Default: None.
             moe_config (MoEParallelizerConfig | None, optional): MoE parallelizer
                 configuration. Default: None.
+            activation_checkpointing (bool, default=False): Enable activation checkpointing
+                for transformer blocks to reduce memory usage. Default: False.
             peft_config (dict | None, optional): PEFT/LoRA configuration dictionary.
                 If provided, LoRA adapters will be applied to the model. Default: None.
             fp8_config (FP8Config | None, optional): FP8 quantization configuration.
@@ -411,6 +436,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             pipeline_config=pipeline_config,
             qat_config=qat_config,
             moe_config=moe_config,
+            activation_checkpointing=activation_checkpointing,
             device=torch.device("cuda", torch.cuda.current_device()),
             mesh=mesh,
         )
@@ -470,6 +496,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         pipeline_config: Optional[PipelineConfig] = None,
         qat_config: Optional[QATConfig] = None,
         moe_config: Optional[MoEParallelizerConfig] = None,
+        activation_checkpointing: bool = False,
         peft_config: Optional[dict] = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
@@ -503,6 +530,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 pipeline_config=pipeline_config,
                 qat_config=qat_config,
                 moe_config=moe_config,
+                activation_checkpointing=activation_checkpointing,
                 device=torch.device("cuda", torch.cuda.current_device()),
                 mesh=mesh,
             )
@@ -610,6 +638,12 @@ class NeMoAutoModelForImageTextToText(_BaseNeMoAutoModelClass, AutoModelForImage
     >>> model = NeMoAutoModelForImageTextToText.from_pretrained(
     ...     "Qwen/Qwen2.5-VL-3B-Instruct", use_liger_kernel=False)                            # skip Liger
     """
+
+    pass
+
+
+class NeMoAutoModelForMultimodalLM(_BaseNeMoAutoModelClass, AutoModelForMultimodalLM):
+    """Drop-in replacement for ``transformers.AutoModelForMultimodalLM`` with custom-kernels."""
 
     pass
 
