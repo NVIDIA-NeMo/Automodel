@@ -13,17 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Functional test: GPT-2 TP=2 logit parity using different TP plan paths
+# (registered, string-import / YAML, and dict).
+
 set -xeuo pipefail
 
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
-# Override if needed, e.g. KL_THRESHOLD=1e-5 bash ...
 KL_THRESHOLD="${KL_THRESHOLD:-1e-6}"
 
 torchrun --nproc_per_node=2 --nnodes=1 \
-    tests/functional_tests/llm_pretrain_and_kd/run_tp_output_parity_minified.py \
-    --models qwen3 qwen3_seq_cls ministral3 llama \
-    --sequence_parallel both \
+    tests/functional_tests/llm_pretrain_and_kd/run_tp_gpt2_yaml_plan.py \
     --kl_threshold "${KL_THRESHOLD}"
-

@@ -13,17 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Functional test: TP loss parity for models with custom (non-TP-plan) modules.
+#
+# Validates that _broadcast_replicated_params_across_tp correctly
+# synchronises replicated weights so that TP=2 loss == TP=1 loss.
+
 set -xeuo pipefail
 
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
-# Override if needed, e.g. KL_THRESHOLD=1e-5 bash ...
 KL_THRESHOLD="${KL_THRESHOLD:-1e-6}"
 
 torchrun --nproc_per_node=2 --nnodes=1 \
-    tests/functional_tests/llm_pretrain_and_kd/run_tp_output_parity_minified.py \
-    --models qwen3 qwen3_seq_cls ministral3 llama \
-    --sequence_parallel both \
+    tests/functional_tests/llm_pretrain_and_kd/run_tp_loss_parity_custom_module.py \
     --kl_threshold "${KL_THRESHOLD}"
-

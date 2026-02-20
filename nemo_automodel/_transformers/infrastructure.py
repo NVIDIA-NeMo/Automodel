@@ -29,6 +29,9 @@ from functools import partial
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
+import torch.distributed as dist
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Shard
 
 from nemo_automodel._transformers.utils import _should_load_before_shard
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
@@ -67,6 +70,97 @@ if TYPE_CHECKING:
     from torchao.quantization.qat.linear import Int4WeightOnlyQATQuantizer, Int8DynActInt4WeightQATQuantizer
 
 logger = logging.getLogger(__name__)
+
+
+#  TP weight-synchronisation helper
+@torch.no_grad()
+def _broadcast_replicated_params_across_tp(
+    model: torch.nn.Module,
+    device_mesh,
+    tp_mesh_name: str = "tp",
+) -> None:
+    """Broadcast non-TP-sharded parameters and buffers from TP rank 0.
+
+    When training from scratch with ``tp_size > 1``, each TP rank may
+    independently initialise replicated (non-sharded) parameters with a
+    different RNG state, producing divergent weights.  This function ensures
+    all TP ranks hold identical data for such parameters by broadcasting
+    from TP rank 0 within each TP group.
+
+    Parameters that carry a :class:`Shard` placement on the TP mesh dimension
+    are left untouched — each rank legitimately owns a different shard.
+
+    Args:
+        model: Model whose replicated parameters should be synchronised.
+        device_mesh: Full device mesh that contains a ``"tp"`` dimension.
+        tp_mesh_name: Name of the TP dimension in the device mesh.
+    """
+    if device_mesh is None:
+        return
+    if tp_mesh_name not in device_mesh.mesh_dim_names:
+        return
+
+    tp_mesh = device_mesh[tp_mesh_name]
+    if tp_mesh.size() <= 1:
+        return
+
+    tp_group = tp_mesh.get_group()
+    src_global_rank = dist.get_global_rank(tp_group, 0)
+
+    def _is_tp_sharded(tensor: torch.Tensor) -> bool:
+        """Return *True* if *tensor* is a DTensor with a Shard on the TP dim."""
+        if not isinstance(tensor, DTensor):
+            return False
+        mesh_names = getattr(tensor.device_mesh, "mesh_dim_names", ())
+        if tp_mesh_name not in mesh_names:
+            return False
+        tp_dim_idx = list(mesh_names).index(tp_mesh_name)
+        return isinstance(tensor.placements[tp_dim_idx], Shard)
+
+    def _bcast(tensor: torch.Tensor) -> None:
+        local = tensor.to_local() if isinstance(tensor, DTensor) else tensor.data
+        if local.is_meta:
+            return
+        dist.broadcast(local, src=src_global_rank, group=tp_group)
+
+    for _name, param in model.named_parameters():
+        if not _is_tp_sharded(param):
+            _bcast(param)
+
+    for _name, buf in model.named_buffers():
+        if buf is None:
+            continue
+        if not _is_tp_sharded(buf):
+            _bcast(buf)
+
+    logger.info("Synchronised replicated parameters across TP ranks.")
+
+
+#  From-scratch weight initialisation for meta-device models
+def _initialize_weights_from_scratch(model: torch.nn.Module) -> None:
+    """Initialise model weights when training from scratch on a meta-device model.
+
+    When ``from_config`` creates a model on the meta device (under
+    ``no_init_weights`` + ``init_empty_weights``), no real weight
+    initialisation happens.  After the model is materialised with
+    ``to_empty(device=…)``, the parameters contain uninitialised memory.
+
+    This helper mirrors the initialisation steps that
+    :meth:`Checkpointer.load_base_model` performs — resetting HF's
+    ``_is_hf_initialized`` flags and calling ``initialize_weights`` — so
+    that the model starts from valid random values instead of garbage.
+    """
+    # Reset the ``_is_hf_initialized`` flag that HF sets during __init__,
+    # which is erroneously ``True`` for meta-device models.
+    for _, module in model.named_modules():
+        if hasattr(module, "_is_hf_initialized"):
+            module._is_hf_initialized = False
+
+    if hasattr(model, "initialize_weights"):
+        model.initialize_weights()
+        logger.info("Initialised weights from scratch (from_config meta-device path).")
+    else:
+        logger.warning("Model does not have an initialize_weights method. Parameters may contain uninitialised values.")
 
 
 #  PEFT / quantization helpers
@@ -501,5 +595,27 @@ def apply_model_infrastructure(
                 model.to_empty(device=device)
             else:
                 raise
+
+    # When training from scratch on meta device (from_config path) without a
+    # pretrained checkpoint, the model has been materialised with
+    # to_empty()/to() but never had its weights properly initialised —
+    # load_base_model() (which calls initialize_weights) is only invoked
+    # when need_checkpoint_load is True.  Initialise now so training starts
+    # from valid random weights rather than uninitialised memory.
+    if is_meta_device and not need_checkpoint_load:
+        models_to_init = model.parts if hasattr(model, "parts") else [model]
+        for mp in models_to_init:
+            _initialize_weights_from_scratch(mp)
+
+    # Synchronise replicated (non-TP-sharded) parameters across TP ranks.
+    # When training from scratch or when custom modules are not covered by the
+    # pretrained checkpoint, each TP rank may initialise replicated parameters
+    # independently with a different RNG state, producing divergent weights.
+    # Broadcasting from TP rank 0 ensures all TP ranks start with identical
+    # values for these parameters.
+    if mesh.tp_size > 1:
+        models_to_sync = model.parts if hasattr(model, "parts") else [model]
+        for mp in models_to_sync:
+            _broadcast_replicated_params_across_tp(mp, mesh.device_mesh)
 
     return model

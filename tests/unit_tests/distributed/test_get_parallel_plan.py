@@ -68,15 +68,19 @@ def _set_global_model_cls(monkeypatch, cls):
 
 # 1. Custom plan provided directly as *dict*
 def test_custom_dict_plan(monkeypatch):
-    plan = {"foo": "bar"}
+    # Use non-string values so they pass through translate_to_torch_parallel_style unchanged.
+    _sentinel = object()
+    plan = {"foo": _sentinel}
     _set_global_model_cls(monkeypatch, _DummyModel)  # irrelevant but required
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False, tp_shard_plan=plan)
-    assert result is plan  # identity check
+    assert result == plan
 
 
 # 2. Custom plan via *import path*
 def test_custom_plan_imports_dict(monkeypatch):
-    plan = {"baz": "qux"}
+    # Use non-string values so they pass through translate_to_torch_parallel_style unchanged.
+    _sentinel = object()
+    plan = {"baz": _sentinel}
 
     # Fake import path resolution
     def _fake_import_class_from_path(path):  # noqa: D401
@@ -87,11 +91,13 @@ def test_custom_plan_imports_dict(monkeypatch):
     _set_global_model_cls(monkeypatch, _DummyModel)
 
     result = _get_parallel_plan(_DummyModel(), tp_shard_plan="some.module.PLAN")
-    assert result is plan
+    assert result == plan
 
 
 def test_custom_plan_imports_function(monkeypatch):
-    plan = {"alpha": "omega"}
+    # Use non-string values so they pass through translate_to_torch_parallel_style unchanged.
+    _sentinel = object()
+    plan = {"alpha": _sentinel}
 
     def _dummy_fn():
         return plan
@@ -103,7 +109,7 @@ def test_custom_plan_imports_function(monkeypatch):
     _set_global_model_cls(monkeypatch, _DummyModel)
 
     result = _get_parallel_plan(_DummyModel(), tp_shard_plan="some.module.func")
-    assert result is plan
+    assert result == plan
 
 
 def test_custom_plan_invalid_path(monkeypatch):
