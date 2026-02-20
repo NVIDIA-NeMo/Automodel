@@ -674,9 +674,7 @@ class Checkpointer:
 
         def _open_sf(shard_file: str):
             if shard_file not in sf_cache:
-                sf_cache[shard_file] = safe_open(
-                    os.path.join(base_dir, shard_file), framework="pt", device="cpu"
-                )
+                sf_cache[shard_file] = safe_open(os.path.join(base_dir, shard_file), framework="pt", device="cpu")
             return sf_cache[shard_file]
 
         def _release_sf(shard_file: str, n: int = 1):
