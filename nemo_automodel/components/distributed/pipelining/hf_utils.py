@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import inspect
 import types
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Constants for identifying text/language modules in multimodal models
-TEXT_MODULE_ATTRS = ("language_model", "text_model", "text_decoder")
+TEXT_MODULE_ATTRS = ("language_model", "text_model", "text_decoder", "backbone")
 MULTIMODAL_SUFFIXES = (
     "vision_tower",
     "visual",
@@ -127,7 +128,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                 causal_mask = (
                     self._update_causal_mask(attention_mask, inputs_embeds, cache_position)
                     if hasattr(self, "_update_causal_mask")
-                    else attention_mask
+                    else None
                 )
                 mamba_mask = (
                     self._update_mamba_mask(attention_mask, cache_position)
@@ -142,12 +143,29 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                     layer_mask = causal_mask if pp_needs_attention_mask else None
                 else:
                     layer_mask = None
-                hidden_states = mixer_block(
-                    hidden_states,
-                    cache_params=past_key_values,
-                    cache_position=cache_position if pp_needs_cache_position else None,
-                    attention_mask=layer_mask,
-                )
+                # Some NemotronH-like blocks (e.g., local NemotronV3Block) do not accept
+                # cache kwargs, while HF NemotronH blocks do. Use signature-aware dispatch.
+                signature_owner = getattr(mixer_block, "_checkpoint_wrapped_module", mixer_block)
+                supports_cache_params = getattr(signature_owner, "_nemo_pp_supports_cache_params", None)
+                supports_cache_position = getattr(signature_owner, "_nemo_pp_supports_cache_position", None)
+                if supports_cache_params is None or supports_cache_position is None:
+                    try:
+                        forward_params = inspect.signature(signature_owner.forward).parameters
+                        supports_cache_params = "cache_params" in forward_params
+                        supports_cache_position = "cache_position" in forward_params
+                    except (TypeError, ValueError):
+                        supports_cache_params = True
+                        supports_cache_position = True
+                    setattr(signature_owner, "_nemo_pp_supports_cache_params", supports_cache_params)
+                    setattr(signature_owner, "_nemo_pp_supports_cache_position", supports_cache_position)
+
+                block_kwargs = {"attention_mask": layer_mask}
+                if supports_cache_params:
+                    block_kwargs["cache_params"] = past_key_values
+                if supports_cache_position:
+                    block_kwargs["cache_position"] = cache_position if pp_needs_cache_position else None
+
+                hidden_states = mixer_block(hidden_states, **block_kwargs)
         else:
             # Attention mask handling (compilation-friendly):
             # causal_mask_mapping should be precomputed in data pipeline via default_collater

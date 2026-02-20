@@ -117,7 +117,10 @@ def _patch_special_tokens_pattern():
     lack CLS/SEP tokens end up with ``None`` IDs in the sequence, crashing
     ``pad()``.
     """
-    from transformers.tokenization_python import PreTrainedTokenizer
+    try:
+        from transformers.tokenization_python import PreTrainedTokenizer
+    except ModuleNotFoundError:  # transformers<5.x
+        from transformers.tokenization_utils import PreTrainedTokenizer
 
     _orig_init = PreTrainedTokenizer.__init__
 
