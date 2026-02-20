@@ -20,6 +20,10 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.state_dict_lazy import (
+    LazyHFStateDict,
+    LazyNativeStateDict,
+)
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 
@@ -55,6 +59,10 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     def to_hf(
         self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
+        inplace = bool(kwargs.get("inplace", False))
+        if inplace:
+            # Lazy/JIT: convert on key access so only one tensor (view) is materialized at a time.
+            return LazyHFStateDict(state_dict, self, exclude_key_regex=exclude_key_regex)
         hf_state_dict = {}
         for fqn, tensor in state_dict.items():
             converted_tensors = self.convert_single_tensor_to_hf(
@@ -62,7 +70,6 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
             )
             for key, value in converted_tensors:
                 hf_state_dict[key] = value
-
         return hf_state_dict
 
     def from_hf(
@@ -71,12 +78,19 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         device_mesh: Optional["DeviceMesh"] = None,
         **kwargs,
     ) -> dict[str, Any]:
+        inplace = bool(kwargs.get("inplace", False))
         # Detect whether HF checkpoints use the "model." prefix
         for key in hf_state_dict.keys():
             if ".mlp.experts." in key and key.endswith(".weight"):
                 self._uses_model_prefix = key.startswith("model.")
                 break
-        return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
+        if inplace:
+            if isinstance(hf_state_dict, LazyHFStateDict):
+                # Round-trip: return native tensors from the backing dict (zero copy, peak = 1x).
+                return LazyNativeStateDict(hf_state_dict, self, device_mesh, native_backing=hf_state_dict._state_dict)
+            # Lazy/JIT: merge on key access one native key at a time to limit peak memory.
+            return LazyNativeStateDict(hf_state_dict, self, device_mesh)
+        return self._from_hf_w_merged_experts(hf_state_dict, device_mesh, inplace=False)
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         """Convert a single tensor from native format to HuggingFace format.

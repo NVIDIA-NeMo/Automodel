@@ -81,6 +81,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         consolidated_output_path: Optional[str] = None,
         num_threads_consolidation: Optional[int] = None,
         staging_dir: Optional[str] = None,
+        sync_files: bool = True,
     ) -> None:
         """
         Initialize the huggingface writer pointing to path.
@@ -101,16 +102,21 @@ class _HuggingFaceStorageWriter(FsspecWriter):
             num_threads_consolidation: Number of threads to use for parallel processing of saving data to output files. If not provided, the default value is the number of output files.
             staging_dir: Optional directory for staging files during consolidation. If provided,
                         temp files will be created here instead of system temp.
+            sync_files: If True (default), fsync each shard file after writing.
+                        Set to False to skip fsync and rely on OS write-back,
+                        which is much faster on HDDs at the cost of crash safety.
         """
         if token is not None:
             super().__init__(
                 path=path,
                 token=token,
+                sync_files=sync_files,
                 serialization_format=SerializationFormat.SAFETENSORS,
             )
         else:
             super().__init__(
                 path=path,
+                sync_files=sync_files,
                 serialization_format=SerializationFormat.SAFETENSORS,
             )
         self._fqn_to_index_mapping: Optional[dict[str, int]] = fqn_to_index_mapping

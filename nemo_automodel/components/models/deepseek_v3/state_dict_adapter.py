@@ -162,13 +162,30 @@ class DeepSeekV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         """Convert from native model state dict to HuggingFace format.
         Automatically detects format based on backend.dispatcher configuration.
         """
+        inplace = bool(kwargs.get("inplace", False))
         hf_state_dict = {}
-        for fqn, tensor in state_dict.items():
-            converted_tensors = self.convert_single_tensor_to_hf(
-                fqn, tensor, exclude_key_regex=exclude_key_regex, quantization=quantization, **kwargs
-            )
-            for key, value in converted_tensors:
-                hf_state_dict[key] = value
+        if inplace:
+            for fqn in list(state_dict.keys()):
+                tensor = state_dict.get(fqn, None)
+                if tensor is None:
+                    continue
+                converted_tensors = self.convert_single_tensor_to_hf(
+                    fqn, tensor, exclude_key_regex=exclude_key_regex, quantization=quantization, **kwargs
+                )
+                for key, value in converted_tensors:
+                    hf_state_dict[key] = value
+                keep_original = (
+                    len(converted_tensors) == 1 and converted_tensors[0][0] == fqn and converted_tensors[0][1] is tensor
+                )
+                if not keep_original:
+                    state_dict.pop(fqn, None)
+        else:
+            for fqn, tensor in state_dict.items():
+                converted_tensors = self.convert_single_tensor_to_hf(
+                    fqn, tensor, exclude_key_regex=exclude_key_regex, quantization=quantization, **kwargs
+                )
+                for key, value in converted_tensors:
+                    hf_state_dict[key] = value
 
         return hf_state_dict
 
@@ -183,12 +200,13 @@ class DeepSeekV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         - Aggregate per-expert weights into grouped tensors
         - If device_mesh is provided, only load experts needed for the current rank
         """
+        inplace = bool(kwargs.get("inplace", False))
         for key in hf_state_dict.keys():
             if ".mlp.experts." in key and key.endswith(".weight"):
                 self._uses_model_prefix = key.startswith("model.")
 
         hf_state_dict = self._dequantize(hf_state_dict)
-        return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
+        return self._from_hf_w_merged_experts(hf_state_dict, device_mesh, inplace=inplace)
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         """Convert a single tensor from native format to HuggingFace format.

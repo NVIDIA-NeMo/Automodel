@@ -24,6 +24,7 @@ for device meshes, parallelism sizes, and axis names.
 """
 
 import logging
+import os
 from contextlib import nullcontext
 from functools import partial
 from typing import TYPE_CHECKING, Optional, Union
@@ -35,7 +36,10 @@ from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
+    _is_safetensors_checkpoint,
     _maybe_adapt_state_dict_to_hf,
+    cast_model_params_to_checkpoint_dtype,
+    get_safetensors_index_path,
 )
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
@@ -421,8 +425,21 @@ def apply_model_infrastructure(
             pretrained_model_name_or_path,
             lora_a_init,
             load_base_model=load_base_model,
+            mesh=mesh,
         )
         checkpoint_already_loaded = True
+
+    # When the checkpoint is in safetensors format, cast model parameters to
+    # the checkpoint dtype *before* FSDP sharding so that DTensors are created
+    # with the correct dtype.  For non-safetensors checkpoints this is a no-op.
+    if need_checkpoint_load and not checkpoint_already_loaded and is_meta_device:
+        _model_path = (
+            pretrained_model_name_or_path
+            if os.path.exists(pretrained_model_name_or_path)
+            else get_safetensors_index_path(cache_dir, pretrained_model_name_or_path)
+        )
+        if _model_path and _is_safetensors_checkpoint(_model_path):
+            cast_model_params_to_checkpoint_dtype(model, _model_path)
 
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
     pre_shard_hf_state_dict_keys = list(
@@ -479,6 +496,7 @@ def apply_model_infrastructure(
                 pretrained_model_name_or_path,
                 lora_a_init,
                 load_base_model=load_base_model,
+                mesh=mesh,
             )
 
     # Freeze parameters after checkpoint loading and parallelization

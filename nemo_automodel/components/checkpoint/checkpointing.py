@@ -13,9 +13,12 @@
 # limitations under the License.
 
 import glob
+import json
 import logging
 import os
+import struct
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -55,6 +58,8 @@ from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
 if TYPE_CHECKING:
     from peft import PeftConfig
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+    from nemo_automodel.components.distributed.mesh import MeshContext
 
 
 def _is_geq_torch_2_9() -> bool:
@@ -434,47 +439,54 @@ class Checkpointer:
         model_name: str | None,
         peft_init_method: str,
         load_base_model: bool = True,
+        mesh: Optional["MeshContext"] = None,
     ) -> None:
         """
-        Load a model from the base Hugging Face checkpoint in parallel.
+        Load a model from the base Hugging Face checkpoint.
+
+        The loading strategy depends on the checkpoint format:
+
+        **Safetensors checkpoints** (streaming broadcast path):
+            1. Materialize FSDP-sharded parameters on *device* (``to_empty_parameters_only``).
+            2. Initialize buffers and weights.
+            3. Per PP stage the local rank-0 reads tensors from safetensors
+               and broadcasts to its peers.  Without PP, global rank 0
+               broadcasts to all ranks.
+
+        **Other checkpoints** (DCP path):
+            Falls back to the existing ``load_model`` which uses
+            ``torch.distributed.checkpoint`` for distributed loading.
+
+        .. note::
+           ``cast_model_params_to_checkpoint_dtype`` should be called
+           **before** FSDP sharding so that the model parameters already carry
+           the correct dtype when FSDP creates DTensors.
 
         Args:
-            model: Model to load state into
-            device: Device to load model onto
-            root_dir: Root directory of the model cache or snapshots
-            model_name: Name of the model or an absolute path to a snapshot
-            peft_init_method: Initialization method used for PEFT adapters
-            load_base_model: If True, restore from HF base checkpoint
+            model: Model to load state into (may be FSDP-sharded).
+            device: Device to load model onto.
+            root_dir: Root directory of the model cache or snapshots.
+            model_name: Name of the model or an absolute path to a snapshot.
+            peft_init_method: Initialization method used for PEFT adapters.
+            load_base_model: If True, restore from HF base checkpoint.
+            mesh: MeshContext holding device_mesh and moe_mesh.
+                Used to derive the per-stage broadcast group.
         """
         to_empty_parameters_only(model, device=device)
 
-        # to_empty_parameters_only only materializes parameters, not buffers.
-        # Buffers (e.g. RoPE inv_freq) may still be on meta device.  Move them
-        # to *device* with uninitialized storage so that the subsequent
-        # initialize_weights() call can overwrite them with proper values
-        # (HF's _init_weights recomputes non-persistent buffers from config).
-        # Without this, meta buffers would survive until a later model.to_empty()
-        # call, which fills them with recycled GPU memory — values that may
-        # differ between successive model builds in the same process.
+        # Materialize meta buffers (e.g. RoPE inv_freq) so initialize_weights
+        # can overwrite them with proper values.
         for module in model.modules():
             for key in list(module._buffers):
                 buf = module._buffers[key]
                 if buf is not None and buf.device.type == "meta":
                     module._buffers[key] = torch.empty_like(buf, device=device)
 
-        # HF models set _is_hf_initialized to True after initialization.
-        # But because we initialize on meta device, these are erroneously set to True.
-        # We need to set them to False and call initialize_weights to re-initialize the weights.
-
-        # Some models cannot call initialize_weights when sharded with DTensors:
-        # - Gemma3ForConditionalGeneration: requires setting a row to zeros in the embedding matrix,
-        #   which is not supported for DTensors in the pinned torch version.
-        # - NemotronHForCausalLM: the HF remote code's _init_weights uses dt_bias.copy_()
-        #   which fails with DTensors. Note: v3 (MoE) has n_routed_experts and uses our custom
-        #   implementation which handles this correctly.
+        # Re-initialize weights.  Some models cannot call initialize_weights
+        # when sharded with DTensors so we guard accordingly.
         try:
             model_class = model.config.architectures[0]
-        except:
+        except Exception:
             model_class = ""
         is_nemotron_v2 = model_class == "NemotronHForCausalLM" and not getattr(model.config, "n_routed_experts", None)
         skip_initialize_weights = is_nemotron_v2
@@ -482,32 +494,31 @@ class Checkpointer:
             for _, module in model.named_modules():
                 if hasattr(module, "_is_hf_initialized"):
                     module._is_hf_initialized = False
-
-            # init model weights
             if hasattr(model, "initialize_weights"):
                 model.initialize_weights()
             else:
                 logging.warning(
-                    "Warning: Model does not have initialize_weights method. Requires custom initialization to be implemented."
+                    "Model does not have initialize_weights method. Requires custom initialization to be implemented."
                 )
 
-        # init peft adapters with the scaled weights
         _init_peft_adapters(model, peft_init_method)
 
         if load_base_model:
             assert model_name is not None, "model_name is required when loading base model"
-            # Get combined key mapping from model attribute and model-type specific conversions
-            model_type = getattr(getattr(model, "config", None), "model_type", None)
-            model_key_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
-            key_mapping = get_combined_key_mapping(model_type, model_key_mapping)
-            self.load_model(
-                model,
-                model_path=model_name
-                if os.path.exists(model_name)
-                else get_safetensors_index_path(root_dir, model_name),
-                is_init_step=True,
-                key_mapping=key_mapping,
-            )
+            model_path = model_name if os.path.exists(model_name) else get_safetensors_index_path(root_dir, model_name)
+
+            if _is_safetensors_checkpoint(model_path):
+                adapter = getattr(model, "state_dict_adapter", None)
+                can_stream = adapter is None or hasattr(adapter, "get_merged_tensor_for_native_key")
+                if can_stream:
+                    self._load_base_model_streaming(model, model_path, mesh=mesh)
+                else:
+                    self._load_base_model_broadcast(model, model_path)
+            else:
+                model_type = getattr(getattr(model, "config", None), "model_type", None)
+                model_key_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
+                key_mapping = get_combined_key_mapping(model_type, model_key_mapping)
+                self.load_model(model, model_path=model_path, is_init_step=True, key_mapping=key_mapping)
 
         _reinit_rope_buffers(model, device)
 
@@ -515,6 +526,248 @@ class Checkpointer:
         self.config.original_model_root_dir = root_dir
         if hasattr(model, "tie_weights") and is_tied_lm_head:
             model.tie_weights()
+
+    def _load_base_model_broadcast(self, model: nn.Module, model_path: str) -> None:
+        """Load safetensors checkpoint into an FSDP-sharded model.
+
+        Every rank reads the HF checkpoint from disk in parallel (fast on
+        local / shared storage) and converts through the state-dict adapter
+        using the ``moe_mesh`` so each rank only materialises *its own*
+        EP experts.  Then ``set_model_state_dict(full_state_dict=True)``
+        lets each rank independently slice its local DTensor shard -- no
+        NCCL collectives are needed.
+
+        This avoids the asymmetric-workload hang that occurs with
+        ``broadcast_from_rank0=True``: rank 0 would spend minutes doing
+        disk I/O + expert conversion while other ranks race ahead into
+        the broadcast collective and time out.
+        """
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+        t0 = time.monotonic()
+        state_dict = _load_hf_checkpoint_preserving_dtype(model_path) or {}
+        t_disk = time.monotonic()
+
+        state_dict = _maybe_adapt_state_dict_from_hf(model, state_dict, moe_mesh=self.moe_mesh)
+        t_convert = time.monotonic()
+
+        _load_full_state_dict_into_model([model], state_dict)
+        t_end = time.monotonic()
+
+        if rank == 0:
+            total_bytes = sum(
+                t.nelement() * t.element_size() for t in state_dict.values() if isinstance(t, torch.Tensor)
+            )
+            gb = total_bytes / (1 << 30)
+            logging.info(
+                "load_base_model: %.2f GB in %.2fs (disk %.2fs, convert %.2fs, distribute %.2fs)",
+                gb,
+                t_end - t0,
+                t_disk - t0,
+                t_convert - t_disk,
+                t_end - t_convert,
+            )
+
+    def _load_base_model_streaming(
+        self,
+        model: nn.Module,
+        model_path: str,
+        mesh: Optional["MeshContext"] = None,
+    ) -> None:
+        """Stream safetensors into an FSDP-sharded model via per-stage broadcast.
+
+        With pipeline parallelism each PP stage broadcasts independently:
+        the stage-local rank-0 (first rank in the non-PP sub-mesh) reads
+        tensor data from disk and broadcasts to its peers within the same
+        stage.  Without PP the behaviour is equivalent to a single-stage
+        broadcast from global rank 0.
+
+        **Expert parallelism (EP > 1):**  Expert parameters are loaded
+        per-rank — every rank reads only its local expert slice from the
+        checkpoint files (no collective).  This avoids materialising the
+        full expert tensor on any single rank, which is critical for 500B+
+        MoE models.  Shared (non-expert) parameters continue to use the
+        broadcast path.
+
+        For each logical parameter group (single tensor, QKV fusion, or
+        expert stack) the loader rank:
+
+        1. Loads the contributing HF tensors from safetensors to CPU.
+        2. Moves them to GPU and merges (``cat`` / ``transpose`` + ``stack``).
+        3. Broadcasts the result to all peers in the stage.
+
+        Every rank then writes the received tensor into the pre-allocated
+        FSDP DTensor parameter by computing its local shard.
+
+        Peak GPU memory is bounded to 1x model + one broadcast tensor.
+        """
+        from safetensors import safe_open
+
+        is_distributed = torch.distributed.is_initialized()
+        device = torch.device("cuda", torch.cuda.current_device())
+        adapter = getattr(model, "state_dict_adapter", None)
+        device_mesh = mesh.device_mesh if mesh is not None else None
+        moe_mesh = mesh.moe_mesh if mesh is not None else None
+
+        # EP configuration
+        ep_active = moe_mesh is not None and "ep" in moe_mesh.mesh_dim_names and moe_mesh["ep"].size() > 1
+        ep_mesh = moe_mesh["ep"] if ep_active else None
+
+        # Shared-param broadcast group (non-PP sub-mesh)
+        broadcast_pg = None
+        needs_broadcast = False
+        is_loader = True
+        src_rank = 0
+
+        if is_distributed:
+            pp_active = device_mesh is not None and "pp" in device_mesh.mesh_dim_names and device_mesh["pp"].size() > 1
+            if pp_active:
+                non_pp_dims = [d for d in device_mesh.mesh_dim_names if d != "pp"]
+                if non_pp_dims:
+                    if len(non_pp_dims) == 1:
+                        non_pp_mesh = device_mesh[non_pp_dims[0]]
+                    else:
+                        non_pp_mesh = device_mesh[tuple(non_pp_dims)]._flatten("_ckpt_bcast")
+                    if non_pp_mesh.size() > 1:
+                        broadcast_pg = non_pp_mesh.get_group()
+                        src_rank = non_pp_mesh.mesh.flatten()[0].item()
+                        is_loader = non_pp_mesh.get_local_rank() == 0
+                        needs_broadcast = True
+                # else: PP-only (no TP/DP) → each rank loads its own stage
+            else:
+                is_loader = torch.distributed.get_rank() == 0
+                src_rank = 0
+                needs_broadcast = torch.distributed.get_world_size() > 1
+
+        t0 = time.monotonic()
+
+        weight_map = _read_safetensors_weight_map(model_path)
+        param_map = _build_param_map(model)
+
+        if adapter is None:
+            model_key_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
+            adapter = _try_build_transformers_conversion_adapter(model, weight_map.keys(), model_key_mapping)
+
+        schedule = _build_broadcast_schedule(adapter, weight_map, model)
+
+        base_dir = model_path if os.path.isdir(model_path) else os.path.dirname(model_path)
+        rename_fn = getattr(adapter, "rename_hf_key", None)
+
+        t_schedule = time.monotonic()
+        total_bytes = 0
+
+        # Ref-counted shard cache: open each safetensors file at most once,
+        #    close it as soon as all reads from it are done.
+        shard_ref_counts: dict[str, int] = {}
+        for _nk, _hf_keys, _sh, _dt in schedule:
+            _is_exp = ep_active and _is_expert_param(adapter, _nk)
+            if _is_exp:
+                _eff_keys = _filter_local_expert_keys(adapter, _hf_keys, ep_mesh, rename_fn)
+            elif is_loader:
+                _eff_keys = _hf_keys
+            else:
+                _eff_keys = []
+            for _k in _eff_keys:
+                shard_ref_counts[weight_map[_k]] = shard_ref_counts.get(weight_map[_k], 0) + 1
+
+        sf_cache: dict[str, Any] = {}
+
+        def _open_sf(shard_file: str):
+            if shard_file not in sf_cache:
+                sf_cache[shard_file] = safe_open(os.path.join(base_dir, shard_file), framework="pt", device="cpu")
+            return sf_cache[shard_file]
+
+        def _release_sf(shard_file: str, n: int = 1):
+            shard_ref_counts[shard_file] -= n
+            if shard_ref_counts[shard_file] <= 0:
+                sf_cache.pop(shard_file, None)
+
+        try:
+            for native_key, ckpt_hf_keys, shape, dtype in schedule:
+                is_expert = ep_active and _is_expert_param(adapter, native_key)
+
+                if is_expert:
+                    # Expert param: every rank reads its own local slice
+                    local_keys = _filter_local_expert_keys(
+                        adapter,
+                        ckpt_hf_keys,
+                        ep_mesh,
+                        rename_fn,
+                    )
+                    group_sd: dict[str, torch.Tensor] = {}
+                    keys_by_shard: dict[str, list[str]] = {}
+                    for ckpt_key in local_keys:
+                        keys_by_shard.setdefault(weight_map[ckpt_key], []).append(ckpt_key)
+
+                    for shard_file, shard_keys in keys_by_shard.items():
+                        f = _open_sf(shard_file)
+                        for ckpt_key in shard_keys:
+                            model_key = rename_fn(ckpt_key) if rename_fn else ckpt_key
+                            group_sd[model_key] = f.get_tensor(ckpt_key).to(device)
+                        _release_sf(shard_file, len(shard_keys))
+
+                    tensor = _merge_group_on_gpu(adapter, native_key, group_sd, device, ep_mesh=ep_mesh)
+                    if hasattr(tensor, "to_local"):
+                        tensor = tensor.to_local()
+                    total_bytes += tensor.nelement() * tensor.element_size()
+                    del group_sd
+
+                    _write_to_fsdp_param(param_map, native_key, tensor, skip_ep=True)
+                else:
+                    # Shared param: per-PP-stage broadcast
+                    if is_loader:
+                        group_sd = {}
+                        keys_by_shard = {}
+                        for ckpt_key in ckpt_hf_keys:
+                            keys_by_shard.setdefault(weight_map[ckpt_key], []).append(ckpt_key)
+
+                        for shard_file, shard_keys in keys_by_shard.items():
+                            f = _open_sf(shard_file)
+                            for ckpt_key in shard_keys:
+                                model_key = rename_fn(ckpt_key) if rename_fn else ckpt_key
+                                group_sd[model_key] = f.get_tensor(ckpt_key).to(device)
+                            _release_sf(shard_file, len(shard_keys))
+
+                        tensor = _merge_group_on_gpu(adapter, native_key, group_sd, device)
+                        total_bytes += tensor.nelement() * tensor.element_size()
+                        del group_sd
+                    else:
+                        tensor = torch.empty(shape, dtype=dtype, device=device)
+
+                    if needs_broadcast:
+                        torch.distributed.broadcast(tensor, src=src_rank, group=broadcast_pg)
+
+                    _write_to_fsdp_param(param_map, native_key, tensor)
+
+                del tensor
+        finally:
+            sf_cache.clear()
+
+        t_end = time.monotonic()
+        rank = torch.distributed.get_rank() if is_distributed else 0
+        gb = total_bytes / (1 << 30)
+        n_params = len(param_map)
+        n_scheduled = len(schedule)
+        if is_loader or (ep_active and rank == 0):
+            logging.info(
+                "load_base_model (streaming): %.2f GB in %.2fs "
+                "(schedule %.2fs, stream+broadcast %.2fs, "
+                "%d/%d params covered)",
+                gb,
+                t_end - t0,
+                t_schedule - t0,
+                t_end - t_schedule,
+                n_scheduled,
+                n_params,
+            )
+        if n_scheduled < n_params:
+            missing = sorted(set(param_map) - {e[0] for e in schedule})
+            if rank == 0:
+                logging.warning(
+                    "Streaming loader did not cover %d parameters: %s",
+                    len(missing),
+                    missing[:10],
+                )
 
     def maybe_wait_for_staging(self) -> None:
         """
@@ -606,6 +859,10 @@ class Checkpointer:
         if self.config.is_peft and is_model and (not is_init_step):
             state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
         else:
+            # LazyHFStateDict (and similar wrappers) are read-only; DCP requires
+            # __setitem__ support, so materialise into a plain dict first.
+            if not isinstance(state_dict, dict):
+                state_dict = dict(state_dict.items())
             dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
         return state_dict
 
@@ -631,7 +888,10 @@ class Checkpointer:
         # PEFT saving is done on rank0 so it is a special case
         if self.config.is_peft and is_model:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                save_file(state_dict, os.path.join(path, "adapter_model.safetensors"))
+                # Materialize lazy mappings (e.g. LazyHFStateDict) into a plain
+                # dict because safetensors.save_file only accepts dict.
+                sd = dict(state_dict) if not isinstance(state_dict, dict) else state_dict
+                save_file(sd, os.path.join(path, "adapter_model.safetensors"))
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
             return
@@ -1125,6 +1385,328 @@ def _load_full_state_dict_into_model(
         set_model_state_dict(part, model_state_dict=state_dict, options=options)
 
 
+# ---------------------------------------------------------------------------
+# Streaming checkpoint loader helpers
+# ---------------------------------------------------------------------------
+
+
+class _HfTransformersConversionAdapter:
+    """Wraps transformers' conversion mapping as a streaming-compatible adapter.
+
+    For models without a native ``state_dict_adapter`` that still need tensor
+    merging (e.g. Mixtral individual experts -> grouped 3-D tensor), this class
+    provides the three methods that ``_build_broadcast_schedule`` and
+    ``_merge_group_on_gpu`` rely on:
+
+    * ``rename_hf_key``
+    * ``get_hf_keys_for_native_key``
+    * ``get_merged_tensor_for_native_key``
+
+    Construction only touches key names (from the safetensors header / index);
+    no tensor data is materialised, so memory overhead is negligible.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        ckpt_keys,
+        key_mapping: Optional[dict[str, str]] = None,
+    ):
+        from copy import deepcopy
+
+        from transformers.core_model_loading import WeightConverter, WeightRenaming, rename_source_key
+
+        from nemo_automodel.components.checkpoint.conversion_mapping import get_model_conversion_mapping
+
+        weight_mapping = get_model_conversion_mapping(model, key_mapping=key_mapping, add_legacy=True)
+        renamings = [e for e in weight_mapping if isinstance(e, WeightRenaming)]
+        converters = [e for e in weight_mapping if isinstance(e, WeightConverter)]
+        pattern_to_converter: dict[str, Any] = {k: c for c in converters for k in c.source_patterns}
+
+        self._ckpt_to_renamed: dict[str, str] = {}
+        self._ckpt_to_source_pattern: dict[str, Optional[str]] = {}
+        self._model_to_ckpt: dict[str, list[str]] = {}
+        self._converters: dict[str, Any] = {}
+        self._model = model
+        self._deepcopy = deepcopy
+
+        for ckpt_key in ckpt_keys:
+            renamed_key, source_pattern = rename_source_key(ckpt_key, renamings, converters)
+            self._ckpt_to_renamed[ckpt_key] = renamed_key
+            self._ckpt_to_source_pattern[ckpt_key] = source_pattern
+            self._model_to_ckpt.setdefault(renamed_key, []).append(ckpt_key)
+            if source_pattern is not None and renamed_key not in self._converters:
+                self._converters[renamed_key] = pattern_to_converter[source_pattern]
+
+    # -- interface consumed by _build_broadcast_schedule / _merge_group_on_gpu --
+
+    def rename_hf_key(self, ckpt_key: str) -> str:
+        renamed = self._ckpt_to_renamed.get(ckpt_key, ckpt_key)
+        # Converter groups map many ckpt keys to the *same* model key.
+        # Returning the ckpt key unchanged prevents collisions in group_sd.
+        if renamed in self._converters:
+            return ckpt_key
+        return renamed
+
+    def get_hf_keys_for_native_key(self, native_key: str) -> Optional[list[str]]:
+        ckpt_keys = self._model_to_ckpt.get(native_key)
+        return ckpt_keys if ckpt_keys else None
+
+    def get_merged_tensor_for_native_key(
+        self,
+        native_key: str,
+        group_sd: dict[str, torch.Tensor],
+        device_mesh=None,
+    ) -> Optional[torch.Tensor]:
+        converter_template = self._converters.get(native_key)
+        if converter_template is None:
+            return None
+
+        converter = self._deepcopy(converter_template)
+
+        # group_sd is keyed by checkpoint keys (rename_hf_key kept them intact
+        # for converter groups) so we can recover the source_pattern per key.
+        for ckpt_key, tensor in group_sd.items():
+            renamed = self._ckpt_to_renamed.get(ckpt_key, ckpt_key)
+            source_pattern = self._ckpt_to_source_pattern.get(ckpt_key)
+            converter.add_tensor(renamed, ckpt_key, source_pattern, tensor)
+
+        realized, _ = converter.convert(native_key, model=self._model, config=self._model.config)
+
+        if native_key in realized:
+            param = realized[native_key]
+            return param[0] if isinstance(param, list) else param
+
+        if len(realized) == 1:
+            param = next(iter(realized.values()))
+            return param[0] if isinstance(param, list) else param
+
+        return None
+
+
+def _try_build_transformers_conversion_adapter(
+    model: nn.Module,
+    ckpt_keys,
+    key_mapping: Optional[dict[str, str]] = None,
+) -> Optional[_HfTransformersConversionAdapter]:
+    """Create a ``_HfTransformersConversionAdapter``, returning *None* on failure."""
+    try:
+        return _HfTransformersConversionAdapter(model, ckpt_keys, key_mapping)
+    except Exception as e:
+        logging.warning("Could not build transformers conversion adapter: %s", e)
+        return None
+
+
+def _read_safetensors_weight_map(model_path: str) -> dict[str, str]:
+    """Build ``{hf_key: shard_filename}`` from safetensors checkpoint metadata.
+
+    Only reads the JSON index / headers -- no tensor data is loaded.
+    For a single-file checkpoint the filename is the file itself.
+    """
+    if os.path.isfile(model_path) and model_path.endswith(".safetensors"):
+        header = _read_safetensors_header(model_path)
+        basename = os.path.basename(model_path)
+        return {name: basename for name in header}
+
+    index_file = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.isfile(index_file):
+        with open(index_file) as f:
+            index = json.load(f)
+        return dict(index.get("weight_map", {}))
+
+    weight_map: dict[str, str] = {}
+    for sf_path in sorted(glob.glob(os.path.join(model_path, "*.safetensors"))):
+        basename = os.path.basename(sf_path)
+        for name in _read_safetensors_header(sf_path):
+            weight_map[name] = basename
+    return weight_map
+
+
+def _build_param_map(model: nn.Module) -> dict[str, nn.Parameter]:
+    """Build ``{clean_fqn: Parameter}`` stripping FSDP checkpoint wrapper prefixes."""
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import _CHECKPOINT_PREFIX
+
+    param_map: dict[str, nn.Parameter] = {}
+    for name, param in model.named_parameters():
+        param_map[name.replace(_CHECKPOINT_PREFIX, "")] = param
+    return param_map
+
+
+def _build_broadcast_schedule(
+    adapter: Any,
+    weight_map: dict[str, str],
+    model: nn.Module,
+) -> list[tuple[str, list[str], list[int], torch.dtype]]:
+    """Build a deterministic ordered broadcast schedule that all ranks agree on.
+
+    Returns a list of ``(native_key, [ckpt_hf_keys], output_shape, output_dtype)``
+    tuples.  The ``ckpt_hf_keys`` use the original checkpoint key names (needed
+    for loading from safetensors) while ``native_key`` uses model-internal names.
+
+    For adapters that merge multiple HF tensors into one native tensor (QKV
+    fusion, expert stacking) the ``ckpt_hf_keys`` list contains all contributing
+    checkpoint keys.  For passthrough parameters the list is a single element.
+    """
+    param_map = _build_param_map(model)
+    ckpt_keys_set = set(weight_map.keys())
+    scheduled_ckpt_keys: set[str] = set()
+    schedule: list[tuple[str, list[str], list[int], torch.dtype]] = []
+
+    rename_fn = getattr(adapter, "rename_hf_key", None)
+
+    model_to_ckpt: dict[str, list[str]] = {}
+    for ckpt_key in ckpt_keys_set:
+        model_key = rename_fn(ckpt_key) if rename_fn else ckpt_key
+        model_to_ckpt.setdefault(model_key, []).append(ckpt_key)
+
+    get_hf_keys_fn = getattr(adapter, "get_hf_keys_for_native_key", None)
+
+    for native_key, param in param_map.items():
+        shape = list(param.shape)
+        dtype = param.dtype
+
+        adapter_hf_keys: list[str] | None = None
+        if get_hf_keys_fn is not None:
+            adapter_hf_keys = get_hf_keys_fn(native_key)
+
+        if adapter_hf_keys is not None:
+            present = [k for k in adapter_hf_keys if k in ckpt_keys_set]
+            if present:
+                schedule.append((native_key, present, shape, dtype))
+                scheduled_ckpt_keys.update(present)
+                continue
+
+        if native_key in ckpt_keys_set:
+            schedule.append((native_key, [native_key], shape, dtype))
+            scheduled_ckpt_keys.add(native_key)
+        elif native_key in model_to_ckpt:
+            ckpt_keys = model_to_ckpt[native_key]
+            schedule.append((native_key, ckpt_keys, shape, dtype))
+            scheduled_ckpt_keys.update(ckpt_keys)
+
+    return schedule
+
+
+def _is_expert_param(adapter: Any, native_key: str) -> bool:
+    """Return True if *native_key* is a merged-expert parameter in the adapter."""
+    parse_fn = getattr(adapter, "_parse_native_expert_key", None)
+    return parse_fn is not None and parse_fn(native_key) is not None
+
+
+def _filter_local_expert_keys(
+    adapter: Any,
+    ckpt_hf_keys: list[str],
+    ep_mesh: DeviceMesh,
+    rename_fn: Any,
+) -> list[str]:
+    """Keep only the checkpoint keys whose expert-id falls in this EP rank's range.
+
+    Uses the adapter's ``_parse_hf_expert_key`` on the *renamed* key to
+    extract the expert-id, then retains only keys in the local range
+    determined by *ep_mesh*.  Non-expert keys pass through unchanged.
+    """
+    from nemo_automodel.components.moe.state_dict_utils import get_expert_range_for_rank_from_mesh
+
+    parse_fn = getattr(adapter, "_parse_hf_expert_key", None)
+    moe_config = getattr(adapter, "moe_config", None)
+    if parse_fn is None or moe_config is None:
+        return ckpt_hf_keys
+
+    n_experts = moe_config.n_routed_experts
+    start, end = get_expert_range_for_rank_from_mesh(ep_mesh, n_experts)
+    local_ids = set(range(start, end))
+
+    filtered = []
+    for k in ckpt_hf_keys:
+        renamed_k = rename_fn(k) if rename_fn else k
+        parsed = parse_fn(renamed_k)
+        if parsed is not None:
+            if parsed[2] in local_ids:
+                filtered.append(k)
+        else:
+            filtered.append(k)
+    return filtered
+
+
+def _merge_group_on_gpu(
+    adapter: Any,
+    native_key: str,
+    group_sd: dict[str, torch.Tensor],
+    device: torch.device,
+    ep_mesh: Optional[DeviceMesh] = None,
+) -> torch.Tensor:
+    """Merge a group of HF tensors into one native tensor on *device*.
+
+    Delegates to ``adapter.get_merged_tensor_for_native_key`` when the adapter
+    supports it (QKV cat, expert transpose+stack, etc.).  For passthrough keys
+    the single tensor is returned directly.
+
+    The keys in *group_sd* must use the adapter's internal naming (after
+    ``rename_hf_key``), not the raw checkpoint names.
+
+    When *ep_mesh* is ``None`` (shared params) the adapter produces the
+    **full** (un-sharded) tensor so every rank can independently slice its
+    local shard via ``_write_to_fsdp_param``.  When an EP mesh is supplied
+    (expert params) the adapter merges only the local expert range.
+    """
+    get_merged_fn = getattr(adapter, "get_merged_tensor_for_native_key", None)
+    if get_merged_fn is not None and len(group_sd) > 1:
+        result = get_merged_fn(native_key, group_sd, device_mesh=ep_mesh)
+        if result is not None:
+            if result.device != device:
+                result = result.to(device)
+            return result.contiguous()
+
+    if len(group_sd) == 1:
+        tensor = next(iter(group_sd.values()))
+        if tensor.device != device:
+            tensor = tensor.to(device)
+        return tensor.contiguous()
+
+    raise ValueError(f"No adapter merge for multi-key group {native_key}")
+
+
+def _write_to_fsdp_param(
+    param_map: dict[str, nn.Parameter],
+    native_key: str,
+    tensor: torch.Tensor,
+    skip_ep: bool = False,
+) -> None:
+    """Write a broadcast tensor into an FSDP-wrapped parameter.
+
+    For DTensor parameters the function computes the local shard according to
+    the parameter's placement and copies into the local storage.
+    For regular tensors it copies directly.
+
+    When *skip_ep* is True, ``Shard`` placements on mesh dimensions named
+    ``"ep"`` are skipped — the tensor is already narrowed to the local
+    expert range and should not be narrowed again for the EP axis.
+    """
+    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor.placement_types import Shard
+
+    param = param_map.get(native_key)
+    if param is None:
+        return
+
+    data = param.data
+    if isinstance(data, DTensor):
+        local = data.to_local()
+        full = tensor
+        for dim_idx, placement in enumerate(data.placements):
+            if isinstance(placement, Shard):
+                dim_name = data.device_mesh.mesh_dim_names[dim_idx]
+                if skip_ep and dim_name == "ep":
+                    continue
+                mesh_dim_size = data.device_mesh.shape[dim_idx]
+                rank_in_dim = data.device_mesh.get_local_rank(dim_name)
+                chunk_size = full.shape[placement.dim] // mesh_dim_size
+                full = full.narrow(placement.dim, rank_in_dim * chunk_size, chunk_size)
+        local.copy_(full)
+    else:
+        data.copy_(tensor)
+
+
 def _convert_checkpoint_with_transformers(
     model: nn.Module,
     model_path: str,
@@ -1246,7 +1828,11 @@ def _maybe_adapt_state_dict_to_hf(
     """
     adapter = getattr(model_part, "state_dict_adapter", None)
     if adapter:
-        return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
+        # Use inplace conversion where supported to reduce peak GPU memory during conversion
+        # (e.g., splitting grouped expert tensors can allocate large contiguous outputs).
+        return adapter.to_hf(
+            state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, inplace=True, **kwargs
+        )
     return state_dict
 
 
@@ -1332,5 +1918,130 @@ def _maybe_adapt_state_dict_from_hf(
     if adapter:
         ep_mesh_dims = [dim for dim in moe_mesh.mesh_dim_names if dim != "pp"] if moe_mesh is not None else []
         ep_mesh = moe_mesh[tuple(ep_mesh_dims)] if ep_mesh_dims else moe_mesh
-        return adapter.from_hf(state_dict, device_mesh=ep_mesh)
+        # Use inplace conversion where supported to reduce peak GPU memory during conversion
+        # (e.g., merging q/k/v -> qkv can otherwise keep both representations alive).
+        return adapter.from_hf(state_dict, device_mesh=ep_mesh, inplace=True)
     return state_dict
+
+
+# ---------------------------------------------------------------------------
+# Safetensors dtype-aware loading helpers
+# ---------------------------------------------------------------------------
+
+_SF_DTYPE_TO_TORCH: dict[str, torch.dtype] = {
+    "F64": torch.float64,
+    "F32": torch.float32,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "I64": torch.int64,
+    "I32": torch.int32,
+    "I16": torch.int16,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
+
+
+def _read_safetensors_header(filepath: str) -> dict[str, dict]:
+    """Read the JSON header from a single safetensors file without loading tensor data.
+
+    Returns ``{tensor_name: {"dtype": "BF16", "shape": [...], ...}}``
+    with the ``__metadata__`` key (file-level metadata) removed.
+    """
+    with open(filepath, "rb") as f:
+        header_size = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(header_size))
+    header.pop("__metadata__", None)
+    return header
+
+
+def _get_safetensors_dtype_map(model_path: str) -> dict[str, torch.dtype]:
+    """Build ``{tensor_name: torch.dtype}`` from safetensors checkpoint headers.
+
+    Only reads the first few kilobytes of each shard (the JSON header);
+    no tensor data is loaded.
+    """
+    dtype_map: dict[str, torch.dtype] = {}
+    if os.path.isfile(model_path) and model_path.endswith(".safetensors"):
+        for name, meta in _read_safetensors_header(model_path).items():
+            sf_dtype = meta.get("dtype")
+            if sf_dtype in _SF_DTYPE_TO_TORCH:
+                dtype_map[name] = _SF_DTYPE_TO_TORCH[sf_dtype]
+        return dtype_map
+
+    if not os.path.isdir(model_path):
+        return dtype_map
+
+    # Sharded checkpoint: iterate over all safetensors files
+    for sf_path in sorted(glob.glob(os.path.join(model_path, "*.safetensors"))):
+        for name, meta in _read_safetensors_header(sf_path).items():
+            sf_dtype = meta.get("dtype")
+            if sf_dtype in _SF_DTYPE_TO_TORCH:
+                dtype_map[name] = _SF_DTYPE_TO_TORCH[sf_dtype]
+    return dtype_map
+
+
+def _get_checkpoint_predominant_dtype(model_path: str) -> Optional[torch.dtype]:
+    """Return the most common floating-point dtype in a safetensors checkpoint.
+
+    Returns ``None`` when *model_path* is not a safetensors checkpoint or
+    contains no floating-point tensors.
+    """
+    if not _is_safetensors_checkpoint(model_path):
+        return None
+    dtype_map = _get_safetensors_dtype_map(model_path)
+    fp_dtypes = [dt for dt in dtype_map.values() if dt.is_floating_point]
+    if not fp_dtypes:
+        return None
+    return Counter(fp_dtypes).most_common(1)[0][0]
+
+
+def cast_model_params_to_checkpoint_dtype(model: nn.Module, model_path: str) -> None:
+    """Cast model floating-point parameters to match the safetensors checkpoint dtype.
+
+    This is intended to be called **before** FSDP sharding so that FSDP
+    creates DTensors with the correct dtype.  On meta-device models the
+    operation is essentially free (no data movement).
+
+    For non-safetensors checkpoints this is a no-op.
+    """
+    ckpt_dtype = _get_checkpoint_predominant_dtype(model_path)
+    if ckpt_dtype is None:
+        return
+    logging.info("Casting model params to checkpoint dtype %s before sharding", ckpt_dtype)
+    for name, param in model.named_parameters():
+        if param.is_floating_point() and param.dtype != ckpt_dtype:
+            param.data = param.data.to(dtype=ckpt_dtype)
+
+
+def _load_state_dict_broadcast_from_rank0(
+    model_parts: list[nn.Module],
+    state_dict: dict[str, torch.Tensor],
+) -> None:
+    """Load a full state dict via broadcast from rank 0.
+
+    Rank 0 must supply the complete state dict (in model-key format).
+    All other ranks should pass an empty dict.  PyTorch's
+    ``set_model_state_dict`` with ``broadcast_from_rank0=True`` handles
+    the per-tensor broadcast and DTensor shard slicing.
+    """
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        _CHECKPOINT_PREFIX,
+    )
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
+    for model in model_parts:
+        for name, module in model.named_modules():
+            if type(module).get_extra_state is not nn.Module.get_extra_state:
+                key = f"{name}._extra_state" if name else "_extra_state"
+                key = key.replace(_CHECKPOINT_PREFIX, "")
+                if key not in state_dict:
+                    state_dict[key] = torch.tensor([], dtype=torch.uint8)
+
+    options = StateDictOptions(
+        strict=False,
+        full_state_dict=True,
+        broadcast_from_rank0=True,
+    )
+    for part in model_parts:
+        set_model_state_dict(part, model_state_dict=state_dict, options=options)

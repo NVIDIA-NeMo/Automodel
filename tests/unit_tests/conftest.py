@@ -21,6 +21,11 @@ from shutil import rmtree
 
 import pytest
 
+# Ensure tests run against the local source tree even if a pip-installed
+# `nemo_automodel` exists in the environment.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 # ---------------------------------------------------------------------------
 # Shim: ``transformers.initialization`` was added in transformers >=4.48.
 # Older versions keep ``no_init_weights`` in ``transformers.modeling_utils``.

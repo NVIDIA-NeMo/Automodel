@@ -24,11 +24,25 @@ Works with any transformer model (Llama, Qwen2, etc.) that uses these projection
 
 import logging
 import re
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
+
+from nemo_automodel.components.models.common.state_dict_lazy import (
+    LazyHFStateDict,
+    LazyNativeStateDict,
+)
+
 logger = logging.getLogger(__name__)
+
+# Layer key pattern: optional "model." prefix, then "layers.{i}.self_attn.(q|k|v)_proj.{suffix}" or "layers.{i}.mlp.(gate|up)_proj.{suffix}"
+_LAYER_QKV_HF_RE = re.compile(r"^(model\.)?layers\.(\d+)\.self_attn\.(q|k|v)_proj\.(weight|bias)$")
+_LAYER_GATE_UP_HF_RE = re.compile(r"^(model\.)?layers\.(\d+)\.mlp\.(gate|up)_proj\.(weight|bias)$")
+_LAYER_QKV_NATIVE_RE = re.compile(r"^(model\.)?layers\.(\d+)\.self_attn\.qkv_proj\.(weight|bias)$")
+_LAYER_GATE_UP_NATIVE_RE = re.compile(r"^(model\.)?layers\.(\d+)\.mlp\.gate_up_proj\.(weight|bias)$")
 
 
 class CombinedProjectionStateDictAdapter:
@@ -74,6 +88,109 @@ class CombinedProjectionStateDictAdapter:
         self.q_size = self.num_attention_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 
+    def _prefix(self, layer_idx: int) -> str:
+        base = "layers.{}".format(layer_idx)
+        return "model." + base if self._uses_model_prefix else base
+
+    def get_hf_keys_for_native_key(self, native_key: str) -> Optional[list[str]]:
+        """Return HF key list for this native key, or None for passthrough."""
+        m = _LAYER_QKV_NATIVE_RE.match(native_key)
+        if m:
+            self._uses_model_prefix = m.group(1) is not None
+            layer_idx, suffix = int(m.group(2)), m.group(3)
+            prefix = self._prefix(layer_idx)
+            return [
+                f"{prefix}.self_attn.q_proj.{suffix}",
+                f"{prefix}.self_attn.k_proj.{suffix}",
+                f"{prefix}.self_attn.v_proj.{suffix}",
+            ]
+        m = _LAYER_GATE_UP_NATIVE_RE.match(native_key)
+        if m:
+            layer_idx, suffix = int(m.group(2)), m.group(3)
+            prefix = self._prefix(layer_idx)
+            return [
+                f"{prefix}.mlp.gate_proj.{suffix}",
+                f"{prefix}.mlp.up_proj.{suffix}",
+            ]
+        return None
+
+    def get_native_key_for_hf_key(self, hf_key: str) -> Optional[str]:
+        """Return native key for this HF key, or None for passthrough."""
+        if not isinstance(hf_key, str):
+            return None
+        m = _LAYER_QKV_HF_RE.match(hf_key)
+        if m:
+            self._uses_model_prefix = m.group(1) is not None
+            layer_idx, suffix = int(m.group(2)), m.group(4)
+            return f"{self._prefix(layer_idx)}.self_attn.qkv_proj.{suffix}"
+        m = _LAYER_GATE_UP_HF_RE.match(hf_key)
+        if m:
+            self._uses_model_prefix = m.group(1) is not None
+            layer_idx, suffix = int(m.group(2)), m.group(4)
+            return f"{self._prefix(layer_idx)}.mlp.gate_up_proj.{suffix}"
+        return None
+
+    def get_tensor_for_hf_key(self, native_fqn: str, tensor: torch.Tensor, hf_key: str) -> torch.Tensor:
+        """Return the view/slice of the native tensor for the given HF key."""
+        m = _LAYER_QKV_NATIVE_RE.match(native_fqn)
+        if m:
+            proj = hf_key.split(".self_attn.")[-1].split(".")[0]  # q_proj, k_proj, v_proj
+            total = self.q_size + 2 * self.kv_size
+            actual = tensor.shape[0]
+            local_q = (self.q_size * actual) // total
+            local_kv = (self.kv_size * actual) // total
+            if proj == "q_proj":
+                return tensor.narrow(0, 0, local_q)
+            if proj == "k_proj":
+                return tensor.narrow(0, local_q, local_kv)
+            if proj == "v_proj":
+                return tensor.narrow(0, local_q + local_kv, local_kv)
+            raise KeyError(hf_key)
+        m = _LAYER_GATE_UP_NATIVE_RE.match(native_fqn)
+        if m:
+            proj = hf_key.split(".mlp.")[-1].split(".")[0]
+            mid = tensor.shape[0] // 2
+            if proj == "gate_proj":
+                return tensor.narrow(0, 0, mid)
+            if proj == "up_proj":
+                return tensor.narrow(0, mid, mid)
+            raise KeyError(hf_key)
+        return tensor
+
+    def get_merged_tensor_for_native_key(
+        self,
+        native_key: str,
+        hf_state_dict: dict[str, Any],
+        device_mesh: Optional["DeviceMesh"] = None,
+    ) -> Optional[torch.Tensor]:
+        """Merge HF tensors for this native key on demand (JIT). Returns None for passthrough."""
+        m = _LAYER_QKV_NATIVE_RE.match(native_key)
+        if m:
+            layer_idx, suffix = int(m.group(2)), m.group(3)
+            prefix = self._prefix(layer_idx)
+            qk = f"{prefix}.self_attn.q_proj.{suffix}"
+            kk = f"{prefix}.self_attn.k_proj.{suffix}"
+            vk = f"{prefix}.self_attn.v_proj.{suffix}"
+            if qk not in hf_state_dict or kk not in hf_state_dict or vk not in hf_state_dict:
+                return None
+            return torch.cat(
+                [hf_state_dict[qk], hf_state_dict[kk], hf_state_dict[vk]],
+                dim=0,
+            )
+        m = _LAYER_GATE_UP_NATIVE_RE.match(native_key)
+        if m:
+            self._uses_model_prefix = m.group(1) is not None
+            layer_idx, suffix = int(m.group(2)), m.group(3)
+            prefix = self._prefix(layer_idx)
+            gk = f"{prefix}.mlp.gate_proj.{suffix}"
+            uk = f"{prefix}.mlp.up_proj.{suffix}"
+            if gk not in hf_state_dict or uk not in hf_state_dict:
+                return None
+            return torch.cat([hf_state_dict[gk], hf_state_dict[uk]], dim=0)
+        if native_key in hf_state_dict:
+            return hf_state_dict[native_key]
+        return None
+
     def from_hf(self, hf_state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
         """Convert HuggingFace state dict to combined-projection format.
 
@@ -81,82 +198,113 @@ class CombinedProjectionStateDictAdapter:
         Also handles tied weights (lm_head <-> embed_tokens) by copying embed_tokens
         to lm_head if lm_head is missing (common in HF Qwen2 and Llama checkpoints).
 
+        This method supports a memory-efficient mode:
+        - If ``inplace=True`` is passed, it will **mutate** the input dict and
+          eagerly ``pop()`` the source tensors (e.g., q/k/v) after merging them.
+          This reduces peak GPU memory during checkpoint loading because the
+          unmerged tensors can be freed earlier.
+
         Args:
             hf_state_dict: State dict from HuggingFace model
+            inplace: If True, mutate ``hf_state_dict`` in-place. Defaults to False.
 
         Returns:
             State dict in combined-projection format
         """
+        inplace = bool(kwargs.get("inplace", False))
+        device_mesh = kwargs.get("device_mesh")
+        if inplace:
+            # Lazy/JIT: merge on key access to keep peak memory within baseline + margin.
+            for key in hf_state_dict.keys():
+                if "layers" in key:
+                    self._uses_model_prefix = key.startswith("model.")
+                    break
+            if isinstance(hf_state_dict, LazyHFStateDict):
+                return LazyNativeStateDict(
+                    hf_state_dict,
+                    self,
+                    device_mesh=device_mesh,
+                    native_backing=hf_state_dict._state_dict,
+                )
+            return LazyNativeStateDict(hf_state_dict, self, device_mesh=device_mesh)
+
+        # If the caller needs to preserve the original HF dict (common in tests),
+        # operate on a shallow copy. This duplicates only the Python dict, not tensors.
+        state_dict: dict[str, Any] = dict(hf_state_dict)
+
         # Determine if model prefix is used
-        for key in hf_state_dict.keys():
+        for key in state_dict.keys():
             if "layers" in key:
                 self._uses_model_prefix = key.startswith("model.")
                 break
 
-        custom_state_dict = {}
-        processed_keys = set()
-
-        # Process each layer
+        # Process each layer and pop source tensors as soon as they've been merged.
         for layer_idx in range(self.num_layers):
             prefix = f"model.layers.{layer_idx}" if self._uses_model_prefix else f"layers.{layer_idx}"
 
             # Combine Q, K, V into qkv_proj
             q_weight_key = f"{prefix}.self_attn.q_proj.weight"
-            k_weight_key = f"{prefix}.self_attn.k_proj.weight"
-            v_weight_key = f"{prefix}.self_attn.v_proj.weight"
+            if q_weight_key in state_dict:
+                k_weight_key = f"{prefix}.self_attn.k_proj.weight"
+                v_weight_key = f"{prefix}.self_attn.v_proj.weight"
 
-            if q_weight_key in hf_state_dict:
-                q_weight = hf_state_dict[q_weight_key]
-                k_weight = hf_state_dict[k_weight_key]
-                v_weight = hf_state_dict[v_weight_key]
+                q_weight = state_dict[q_weight_key]
+                k_weight = state_dict[k_weight_key]
+                v_weight = state_dict[v_weight_key]
 
-                # Concatenate along output dimension
-                qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
-                custom_state_dict[f"{prefix}.self_attn.qkv_proj.weight"] = qkv_weight
-                processed_keys.update([q_weight_key, k_weight_key, v_weight_key])
+                state_dict[f"{prefix}.self_attn.qkv_proj.weight"] = torch.cat([q_weight, k_weight, v_weight], dim=0)
+
+                # Drop references ASAP to reduce peak memory in inplace mode.
+                state_dict.pop(q_weight_key, None)
+                state_dict.pop(k_weight_key, None)
+                state_dict.pop(v_weight_key, None)
+                del q_weight, k_weight, v_weight
 
                 # Handle biases if present
                 q_bias_key = f"{prefix}.self_attn.q_proj.bias"
-                if q_bias_key in hf_state_dict:
+                if q_bias_key in state_dict:
                     k_bias_key = f"{prefix}.self_attn.k_proj.bias"
                     v_bias_key = f"{prefix}.self_attn.v_proj.bias"
 
-                    qkv_bias = torch.cat(
-                        [hf_state_dict[q_bias_key], hf_state_dict[k_bias_key], hf_state_dict[v_bias_key]], dim=0
-                    )
-                    custom_state_dict[f"{prefix}.self_attn.qkv_proj.bias"] = qkv_bias
-                    processed_keys.update([q_bias_key, k_bias_key, v_bias_key])
+                    q_bias = state_dict[q_bias_key]
+                    k_bias = state_dict[k_bias_key]
+                    v_bias = state_dict[v_bias_key]
+                    state_dict[f"{prefix}.self_attn.qkv_proj.bias"] = torch.cat([q_bias, k_bias, v_bias], dim=0)
+
+                    state_dict.pop(q_bias_key, None)
+                    state_dict.pop(k_bias_key, None)
+                    state_dict.pop(v_bias_key, None)
+                    del q_bias, k_bias, v_bias
 
             # Combine gate and up into gate_up_proj
             gate_weight_key = f"{prefix}.mlp.gate_proj.weight"
-            up_weight_key = f"{prefix}.mlp.up_proj.weight"
+            if gate_weight_key in state_dict:
+                up_weight_key = f"{prefix}.mlp.up_proj.weight"
+                gate_weight = state_dict[gate_weight_key]
+                up_weight = state_dict[up_weight_key]
 
-            if gate_weight_key in hf_state_dict:
-                gate_weight = hf_state_dict[gate_weight_key]
-                up_weight = hf_state_dict[up_weight_key]
+                state_dict[f"{prefix}.mlp.gate_up_proj.weight"] = torch.cat([gate_weight, up_weight], dim=0)
 
-                # Concatenate along output dimension
-                gate_up_weight = torch.cat([gate_weight, up_weight], dim=0)
-                custom_state_dict[f"{prefix}.mlp.gate_up_proj.weight"] = gate_up_weight
-                processed_keys.update([gate_weight_key, up_weight_key])
+                state_dict.pop(gate_weight_key, None)
+                state_dict.pop(up_weight_key, None)
+                del gate_weight, up_weight
 
                 # Handle biases if present
                 gate_bias_key = f"{prefix}.mlp.gate_proj.bias"
-                if gate_bias_key in hf_state_dict:
+                if gate_bias_key in state_dict:
                     up_bias_key = f"{prefix}.mlp.up_proj.bias"
+                    gate_bias = state_dict[gate_bias_key]
+                    up_bias = state_dict[up_bias_key]
 
-                    gate_up_bias = torch.cat([hf_state_dict[gate_bias_key], hf_state_dict[up_bias_key]], dim=0)
-                    custom_state_dict[f"{prefix}.mlp.gate_up_proj.bias"] = gate_up_bias
-                    processed_keys.update([gate_bias_key, up_bias_key])
+                    state_dict[f"{prefix}.mlp.gate_up_proj.bias"] = torch.cat([gate_bias, up_bias], dim=0)
 
-        # Copy all other weights that weren't processed
-        for key, value in hf_state_dict.items():
-            if key not in processed_keys:
-                custom_state_dict[key] = value
+                    state_dict.pop(gate_bias_key, None)
+                    state_dict.pop(up_bias_key, None)
+                    del gate_bias, up_bias
 
         # Recombine any split projection LoRA/DoRA keys back to combined format.
         # This is the reverse of _split_remaining_combined_projection_keys in to_hf().
-        self._recombine_split_projection_keys(custom_state_dict)
+        self._recombine_split_projection_keys(state_dict)
 
         # Handle tied weights: if lm_head.weight is missing but embed_tokens exists, tie them
         # This is common in Qwen2 and Llama where lm_head shares weights with embeddings
@@ -165,11 +313,11 @@ class CombinedProjectionStateDictAdapter:
             embed_key = "model.embed_tokens.weight" if self._uses_model_prefix else "embed_tokens.weight"
             lm_head_key = "lm_head.weight"
 
-            if lm_head_key not in custom_state_dict and embed_key in custom_state_dict:
+            if lm_head_key not in state_dict and embed_key in state_dict:
                 logger.info(f"Tying lm_head.weight to {embed_key} (HuggingFace checkpoint has tied weights)")
-                custom_state_dict[lm_head_key] = custom_state_dict[embed_key]
+                state_dict[lm_head_key] = state_dict[embed_key]
 
-        return custom_state_dict
+        return state_dict
 
     def to_hf(
         self,
@@ -189,6 +337,10 @@ class CombinedProjectionStateDictAdapter:
         Returns:
             State dict in HuggingFace format
         """
+        inplace = bool(kwargs.get("inplace", False))
+        if inplace:
+            # Lazy/JIT: convert on key access so only one tensor (view) is materialized at a time.
+            return LazyHFStateDict(state_dict, self, exclude_key_regex=exclude_key_regex)
         hf_state_dict = {}
         processed_keys = set()
 
@@ -236,6 +388,15 @@ class CombinedProjectionStateDictAdapter:
                     hf_state_dict[f"{prefix}.self_attn.v_proj.bias"] = v_bias
                     processed_keys.add(qkv_bias_key)
 
+                if inplace:
+                    # Drop combined tensor keys eagerly to reduce peak memory.
+                    state_dict.pop(qkv_weight_key, None)
+                    state_dict.pop(qkv_bias_key, None)
+                    del qkv_weight, q_weight, k_weight, v_weight
+                    if qkv_bias_key in processed_keys:
+                        # Only delete locals if we actually created them
+                        del qkv_bias, q_bias, k_bias, v_bias
+
             # Split gate_up_proj into separate gate and up
             gate_up_weight_key = f"{prefix}.mlp.gate_up_proj.weight"
 
@@ -265,10 +426,19 @@ class CombinedProjectionStateDictAdapter:
                     hf_state_dict[f"{prefix}.mlp.up_proj.bias"] = up_bias
                     processed_keys.add(gate_up_bias_key)
 
-        # Copy all other weights that weren't processed
-        for key, value in state_dict.items():
-            if key not in processed_keys:
-                hf_state_dict[key] = value
+                if inplace:
+                    # Drop combined tensor keys eagerly to reduce peak memory.
+                    state_dict.pop(gate_up_weight_key, None)
+                    state_dict.pop(gate_up_bias_key, None)
+                    del gate_up_weight, gate_weight, up_weight
+                    if gate_up_bias_key in processed_keys:
+                        del gate_up_bias, gate_bias, up_bias
+
+        if not inplace:
+            # Copy all other weights that weren't processed
+            for key, value in state_dict.items():
+                if key not in processed_keys:
+                    hf_state_dict[key] = value
 
         # Split any remaining combined-projection keys (e.g., LoRA adapter weights).
         # These may have different prefixes (like "base_model.model.") not caught
@@ -278,7 +448,12 @@ class CombinedProjectionStateDictAdapter:
 
         # Apply exclusion regex if provided
         if exclude_key_regex:
-            hf_state_dict = {k: v for k, v in hf_state_dict.items() if not re.match(exclude_key_regex, k)}
+            if inplace:
+                for k in list(hf_state_dict.keys()):
+                    if re.match(exclude_key_regex, k):
+                        hf_state_dict.pop(k, None)
+            else:
+                hf_state_dict = {k: v for k, v in hf_state_dict.items() if not re.match(exclude_key_regex, k)}
 
         return hf_state_dict
 
