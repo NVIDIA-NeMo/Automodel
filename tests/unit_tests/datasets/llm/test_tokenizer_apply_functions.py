@@ -32,6 +32,7 @@ from nemo_automodel.components.datasets.llm.formatting_utils import (
     _add_pad_token,
     _pad_to_seq_length,
     _package_tokenized_example,
+    _warned_add_pad_token,
     format_prompt_completion,
     format_chat_template,
 )
@@ -359,6 +360,10 @@ class _StubTokPadEqualsEos:
 
 class TestAddPadToken:
     """Unit tests for _add_pad_token covering pad==eos scenarios."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_warn_state(self):
+        _warned_add_pad_token.clear()
 
     def test_no_pad_token_falls_back_to_eos(self):
         tok = _StubTokNoPad()
