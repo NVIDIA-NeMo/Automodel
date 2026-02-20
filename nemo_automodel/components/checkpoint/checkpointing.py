@@ -609,11 +609,11 @@ class Checkpointer:
         device_mesh = mesh.device_mesh if mesh is not None else None
         moe_mesh = mesh.moe_mesh if mesh is not None else None
 
-        # --- EP configuration ---
+        # EP configuration
         ep_active = moe_mesh is not None and "ep" in moe_mesh.mesh_dim_names and moe_mesh["ep"].size() > 1
         ep_mesh = moe_mesh["ep"] if ep_active else None
 
-        # --- Shared-param broadcast group (non-PP sub-mesh) ---
+        # Shared-param broadcast group (non-PP sub-mesh)
         broadcast_pg = None
         needs_broadcast = False
         is_loader = True
@@ -656,63 +656,94 @@ class Checkpointer:
         t_schedule = time.monotonic()
         total_bytes = 0
 
-        for native_key, ckpt_hf_keys, shape, dtype in schedule:
-            is_expert = ep_active and _is_expert_param(adapter, native_key)
-
-            if is_expert:
-                # --- Expert param: every rank reads its own local slice ---
-                local_keys = _filter_local_expert_keys(
-                    adapter,
-                    ckpt_hf_keys,
-                    ep_mesh,
-                    rename_fn,
-                )
-                group_sd: dict[str, torch.Tensor] = {}
-                keys_by_shard: dict[str, list[str]] = {}
-                for ckpt_key in local_keys:
-                    keys_by_shard.setdefault(weight_map[ckpt_key], []).append(ckpt_key)
-
-                for shard_file, shard_keys in keys_by_shard.items():
-                    sf_path = os.path.join(base_dir, shard_file)
-                    with safe_open(sf_path, framework="pt", device="cpu") as f:
-                        for ckpt_key in shard_keys:
-                            model_key = rename_fn(ckpt_key) if rename_fn else ckpt_key
-                            group_sd[model_key] = f.get_tensor(ckpt_key).to(device)
-
-                tensor = _merge_group_on_gpu(adapter, native_key, group_sd, device, ep_mesh=ep_mesh)
-                if hasattr(tensor, "to_local"):
-                    tensor = tensor.to_local()
-                total_bytes += tensor.nelement() * tensor.element_size()
-                del group_sd
-
-                _write_to_fsdp_param(param_map, native_key, tensor, skip_ep=True)
+        # Ref-counted shard cache: open each safetensors file at most once,
+        #    close it as soon as all reads from it are done.
+        shard_ref_counts: dict[str, int] = {}
+        for _nk, _hf_keys, _sh, _dt in schedule:
+            _is_exp = ep_active and _is_expert_param(adapter, _nk)
+            if _is_exp:
+                _eff_keys = _filter_local_expert_keys(adapter, _hf_keys, ep_mesh, rename_fn)
+            elif is_loader:
+                _eff_keys = _hf_keys
             else:
-                # --- Shared param: per-PP-stage broadcast ---
-                if is_loader:
-                    group_sd = {}
-                    keys_by_shard = {}
-                    for ckpt_key in ckpt_hf_keys:
+                _eff_keys = []
+            for _k in _eff_keys:
+                shard_ref_counts[weight_map[_k]] = shard_ref_counts.get(weight_map[_k], 0) + 1
+
+        sf_cache: dict[str, Any] = {}
+
+        def _open_sf(shard_file: str):
+            if shard_file not in sf_cache:
+                sf_cache[shard_file] = safe_open(
+                    os.path.join(base_dir, shard_file), framework="pt", device="cpu"
+                )
+            return sf_cache[shard_file]
+
+        def _release_sf(shard_file: str, n: int = 1):
+            shard_ref_counts[shard_file] -= n
+            if shard_ref_counts[shard_file] <= 0:
+                sf_cache.pop(shard_file, None)
+
+        try:
+            for native_key, ckpt_hf_keys, shape, dtype in schedule:
+                is_expert = ep_active and _is_expert_param(adapter, native_key)
+
+                if is_expert:
+                    # Expert param: every rank reads its own local slice
+                    local_keys = _filter_local_expert_keys(
+                        adapter,
+                        ckpt_hf_keys,
+                        ep_mesh,
+                        rename_fn,
+                    )
+                    group_sd: dict[str, torch.Tensor] = {}
+                    keys_by_shard: dict[str, list[str]] = {}
+                    for ckpt_key in local_keys:
                         keys_by_shard.setdefault(weight_map[ckpt_key], []).append(ckpt_key)
 
                     for shard_file, shard_keys in keys_by_shard.items():
-                        sf_path = os.path.join(base_dir, shard_file)
-                        with safe_open(sf_path, framework="pt", device="cpu") as f:
+                        f = _open_sf(shard_file)
+                        for ckpt_key in shard_keys:
+                            model_key = rename_fn(ckpt_key) if rename_fn else ckpt_key
+                            group_sd[model_key] = f.get_tensor(ckpt_key).to(device)
+                        _release_sf(shard_file, len(shard_keys))
+
+                    tensor = _merge_group_on_gpu(adapter, native_key, group_sd, device, ep_mesh=ep_mesh)
+                    if hasattr(tensor, "to_local"):
+                        tensor = tensor.to_local()
+                    total_bytes += tensor.nelement() * tensor.element_size()
+                    del group_sd
+
+                    _write_to_fsdp_param(param_map, native_key, tensor, skip_ep=True)
+                else:
+                    # Shared param: per-PP-stage broadcast
+                    if is_loader:
+                        group_sd = {}
+                        keys_by_shard = {}
+                        for ckpt_key in ckpt_hf_keys:
+                            keys_by_shard.setdefault(weight_map[ckpt_key], []).append(ckpt_key)
+
+                        for shard_file, shard_keys in keys_by_shard.items():
+                            f = _open_sf(shard_file)
                             for ckpt_key in shard_keys:
                                 model_key = rename_fn(ckpt_key) if rename_fn else ckpt_key
                                 group_sd[model_key] = f.get_tensor(ckpt_key).to(device)
+                            _release_sf(shard_file, len(shard_keys))
 
-                    tensor = _merge_group_on_gpu(adapter, native_key, group_sd, device)
-                    total_bytes += tensor.nelement() * tensor.element_size()
-                    del group_sd
-                else:
-                    tensor = torch.empty(shape, dtype=dtype, device=device)
+                        tensor = _merge_group_on_gpu(adapter, native_key, group_sd, device)
+                        total_bytes += tensor.nelement() * tensor.element_size()
+                        del group_sd
+                    else:
+                        tensor = torch.empty(shape, dtype=dtype, device=device)
 
-                if needs_broadcast:
-                    torch.distributed.broadcast(tensor, src=src_rank, group=broadcast_pg)
+                    if needs_broadcast:
+                        torch.distributed.broadcast(tensor, src=src_rank, group=broadcast_pg)
 
-                _write_to_fsdp_param(param_map, native_key, tensor)
+                    _write_to_fsdp_param(param_map, native_key, tensor)
 
-            del tensor
+                del tensor
+        finally:
+            sf_cache.clear()
 
         t_end = time.monotonic()
         rank = torch.distributed.get_rank() if is_distributed else 0
