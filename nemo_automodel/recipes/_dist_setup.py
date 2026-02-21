@@ -145,7 +145,7 @@ def setup_distributed(cfg: Any, world_size: int) -> MeshContext:
     """
     from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
 
-    cfg_dict = cfg.distributed.to_dict()
+    cfg_dict = cfg.distributed.to_dict() if not isinstance(cfg, dict) else cfg
     parsed = parse_distributed_section(cfg_dict)
 
     device_mesh, moe_mesh = create_device_mesh(
