@@ -14,11 +14,16 @@
 
 import pytest
 from jinja2.exceptions import TemplateError
-
+from pathlib import Path
+import os
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import NeMoAutoTokenizerWithBosEosEnforced
 
-GEMMA_TOKENIZER_PATH = "/home/TestData/automodel/tokenizers/gemma-2-9b-it"
+
+
+_TEST_DATA_DIR = os.environ.get("TEST_DATA_DIR", "/home/TestData/automodel")
+_TOKENIZER_BASE = Path(_TEST_DATA_DIR) / "tokenizers"
+GEMMA_TOKENIZER_PATH = _TOKENIZER_BASE / "gemma-2-9b-it"
 
 
 @pytest.fixture
@@ -49,7 +54,9 @@ def test_gemma_tokenizer_system_role_handling(force_hf, conversation_with_system
     - force_hf=True: Returns raw HF tokenizer which raises TemplateError on system role
     - force_hf=False: Returns NeMoAutoTokenizer wrapper which maps system->assistant
     """
-    tokenizer = NeMoAutoTokenizer.from_pretrained(GEMMA_TOKENIZER_PATH, force_hf=force_hf)
+    if not GEMMA_TOKENIZER_PATH.exists():
+        pytest.skip(f"Missing tokenizer data: {GEMMA_TOKENIZER_PATH}")
+    tokenizer = NeMoAutoTokenizer.from_pretrained(str(GEMMA_TOKENIZER_PATH), force_hf=force_hf)
 
     if force_hf:
         assert not isinstance(tokenizer, NeMoAutoTokenizerWithBosEosEnforced)
