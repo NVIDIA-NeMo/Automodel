@@ -63,16 +63,19 @@ def _simulate_getitem_masking(
     labels: torch.Tensor,
     pad_token_id: int,
     eos_token_id: int | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Re-implement the masking block from GPTDataset.__getitem__."""
-    loss_mask = torch.ones(tokens.shape[0], dtype=torch.float)
+    seq_len = tokens.shape[0]
+    loss_mask = torch.ones(seq_len, dtype=torch.float)
+    position_ids = torch.arange(seq_len, dtype=torch.long)
     tokens_pad_mask = _get_right_trailing_pad_mask(tokens, pad_token_id, eos_token_id)
     labels_pad_mask = _get_right_trailing_pad_mask(labels, pad_token_id, eos_token_id)
 
     loss_mask[labels_pad_mask] = 0.0
     tokens[tokens_pad_mask] = 0
     labels[labels_pad_mask] = 0
-    return tokens, labels, loss_mask
+    position_ids[tokens_pad_mask] = 0
+    return tokens, labels, loss_mask, position_ids
 
 
 def _build_shifted_pair(text_ids: list[int]):
@@ -84,7 +87,8 @@ def _build_shifted_pair(text_ids: list[int]):
 
 #  Parametrised fixture - one entry per tokenizer family
 
-_TOKENIZER_BASE = Path(os.environ["TEST_DATA_DIR"]) / "tokenizers"
+_TEST_DATA_DIR = os.environ.get("TEST_DATA_DIR", "/home/TestData/automodel")
+_TOKENIZER_BASE = Path(_TEST_DATA_DIR) / "tokenizers"
 
 TOKENIZER_MODELS = [
     pytest.param(str(_TOKENIZER_BASE / "Qwen2.5-0.5B"), id="qwen2.5"),
@@ -96,6 +100,9 @@ TOKENIZER_MODELS = [
 
 @pytest.fixture(params=TOKENIZER_MODELS)
 def tok(request):
+    path = Path(request.param)
+    if not path.exists():
+        pytest.skip(f"Missing tokenizer data: {path}")
     return NeMoAutoTokenizer.from_pretrained(request.param, trust_remote_code=True)
 
 
@@ -121,7 +128,7 @@ class TestPadEosOverlapFunctional:
         n_pad = 4
         text = content + [eos_id] + [pad_id] * n_pad + [pad_id]
         tokens, labels = _build_shifted_pair(text)
-        tokens_out, labels_out, loss_mask = _simulate_getitem_masking(
+        tokens_out, labels_out, loss_mask, position_ids = _simulate_getitem_masking(
             tokens.clone(), labels.clone(), pad_id, eos_id,
         )
 
@@ -141,6 +148,15 @@ class TestPadEosOverlapFunctional:
         for i in range(eos_token_idx + 1, len(tokens_out)):
             assert tokens_out[i].item() == 0, f"Padding token at {i} must be 0"
 
+        for i in range(eos_token_idx + 1, len(position_ids)):
+            assert position_ids[i].item() == 0, (
+                f"Padding position_id at {i} must be 0 (got {position_ids[i].item()})"
+            )
+        for i in range(eos_token_idx + 1):
+            assert position_ids[i].item() == i, (
+                f"Content position_id at {i} must equal {i}"
+            )
+
     def test_multi_doc_packed_with_padding(self, tok):
         """[doc1 … EOS doc2 … EOS  PAD PAD] - inter-doc EOS tokens preserved."""
         eos_id = tok.eos_token_id
@@ -151,7 +167,7 @@ class TestPadEosOverlapFunctional:
         n_pad = 3
         text = doc1 + [eos_id] + doc2 + [eos_id] + [pad_id] * n_pad + [pad_id]
         tokens, labels = _build_shifted_pair(text)
-        tokens_out, labels_out, loss_mask = _simulate_getitem_masking(
+        tokens_out, labels_out, loss_mask, position_ids = _simulate_getitem_masking(
             tokens.clone(), labels.clone(), pad_id, eos_id,
         )
 
@@ -172,6 +188,16 @@ class TestPadEosOverlapFunctional:
             "Doc2 EOS in tokens must not be replaced"
         )
 
+        last_content_token_idx = content_len - 1
+        for i in range(last_content_token_idx + 1):
+            assert position_ids[i].item() == i, (
+                f"Content position_id at {i} must equal {i}"
+            )
+        for i in range(last_content_token_idx + 1, len(position_ids)):
+            assert position_ids[i].item() == 0, (
+                f"Padding position_id at {i} must be 0"
+            )
+
     def test_no_padding(self, tok):
         """Sequence fills the length exactly - nothing should be masked."""
         eos_id = tok.eos_token_id
@@ -180,12 +206,16 @@ class TestPadEosOverlapFunctional:
         content = tok.encode("A complete sequence ending with EOS.", add_special_tokens=False)
         text = content + [eos_id]
         tokens, labels = _build_shifted_pair(text)
-        _, _, loss_mask = _simulate_getitem_masking(
+        _, _, loss_mask, position_ids = _simulate_getitem_masking(
             tokens.clone(), labels.clone(), pad_id, eos_id,
         )
 
         assert loss_mask.sum().item() == len(loss_mask), (
             "With no padding, every label must contribute to the loss"
+        )
+        expected_pos = list(range(len(position_ids)))
+        assert position_ids.tolist() == expected_pos, (
+            "With no padding, position_ids must be sequential"
         )
 
     def test_regression_old_vs_new_behaviour(self, tok):
@@ -227,13 +257,19 @@ class TestPadEosOverlapFunctional:
         n_pad = 50
         text = content + [eos_id] + [pad_id] * n_pad + [pad_id]
         tokens, labels = _build_shifted_pair(text)
-        tokens_out, _, loss_mask = _simulate_getitem_masking(
+        tokens_out, _, loss_mask, position_ids = _simulate_getitem_masking(
             tokens.clone(), labels.clone(), pad_id, eos_id,
         )
 
         assert loss_mask[: len(content)].sum().item() == len(content)
         assert loss_mask[len(content) :].sum().item() == 0.0
         assert tokens_out[len(content)].item() == eos_id
+
+        eos_token_idx = len(content)
+        for i in range(eos_token_idx + 1, len(position_ids)):
+            assert position_ids[i].item() == 0, (
+                f"Padding position_id at {i} must be 0"
+            )
 
 
 #  End-to-end: squad dataset → default_collater
