@@ -88,7 +88,9 @@ def test_gemma_tokenizer_system_role_handling_with_multiple_system_roles(force_h
     - force_hf=True: Returns raw HF tokenizer which raises TemplateError on system role
     - force_hf=False: Returns NeMoAutoTokenizer wrapper which maps system->assistant
     """
-    tokenizer = NeMoAutoTokenizer.from_pretrained(GEMMA_TOKENIZER_PATH, force_hf=force_hf)
+    if not GEMMA_TOKENIZER_PATH.exists():
+        pytest.skip(f"Missing tokenizer data: {GEMMA_TOKENIZER_PATH}")
+    tokenizer = NeMoAutoTokenizer.from_pretrained(str(GEMMA_TOKENIZER_PATH), force_hf=force_hf)
 
     if force_hf:
         assert not isinstance(tokenizer, NeMoAutoTokenizerWithBosEosEnforced)
