@@ -34,6 +34,8 @@ from __future__ import annotations
 import pytest
 import torch
 from datasets import Dataset
+from pathlib import Path
+import os
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 import nemo_automodel.components.datasets.llm.squad as squad_module
@@ -82,11 +84,13 @@ def _build_shifted_pair(text_ids: list[int]):
 
 #  Parametrised fixture - one entry per tokenizer family
 
+_TOKENIZER_BASE = Path(os.environ["TEST_DATA_DIR"]) / "tokenizers"
+
 TOKENIZER_MODELS = [
-    pytest.param("Qwen/Qwen2.5-0.5B", id="qwen2.5"),
-    pytest.param("meta-llama/Llama-3.2-1B", id="llama3.2"),
-    pytest.param("google/gemma-3-1b-pt", id="gemma3"),
-    pytest.param("mistralai/Mixtral-8x7B-v0.1", id="mixtral"),
+    pytest.param(str(_TOKENIZER_BASE / "Qwen2.5-0.5B"), id="qwen2.5"),
+    pytest.param(str(_TOKENIZER_BASE / "Llama-3.2-1B"), id="llama3.2"),
+    pytest.param(str(_TOKENIZER_BASE / "gemma-3-1b-pt"), id="gemma3"),
+    pytest.param(str(_TOKENIZER_BASE / "Mixtral-8x7B-v0.1"), id="mixtral"),
 ]
 
 
