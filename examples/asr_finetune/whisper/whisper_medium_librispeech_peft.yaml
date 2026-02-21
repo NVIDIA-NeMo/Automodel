@@ -1,0 +1,107 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Fine-tune Whisper Medium on LibriSpeech with PEFT (LoRA)
+# Memory-efficient training for larger model: ~40-60% memory reduction vs full finetuning
+# Example single GPU: uv run examples/asr_finetune/finetune.py --config examples/asr_finetune/whisper/whisper_medium_librispeech_peft.yaml
+# Example multi-GPU: uv run torchrun --nproc-per-node=8 examples/asr_finetune/finetune.py --config examples/asr_finetune/whisper/whisper_medium_librispeech_peft.yaml
+# Example with TP: uv run torchrun --nproc-per-node=8 examples/asr_finetune/finetune.py --config examples/asr_finetune/whisper/whisper_medium_librispeech_peft.yaml --distributed.tp_size 2
+
+step_scheduler:
+  global_batch_size: 64   # Increased from 32 (PEFT enables larger batches)
+  local_batch_size: 4     # Increased from 2 (memory savings from frozen base model)
+  ckpt_every_steps: 100
+  val_every_steps: 50
+  max_steps: 1000
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForSpeechSeq2Seq.from_pretrained
+  pretrained_model_name_or_path: openai/whisper-medium
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./asr_checkpoints/whisper_medium_librispeech_peft
+  model_save_format: safetensors  # PEFT checkpoints are SafeTensors format
+  save_consolidated: true         # Saves only adapter weights (~45MB vs ~1.5GB)
+
+# PEFT Configuration: LoRA adapters for attention layers
+# Higher rank (dim=32) for larger model capacity
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules:
+    - "*.q_proj"      # Query projection in attention (encoder + decoder)
+    - "*.k_proj"      # Key projection in attention
+    - "*.v_proj"      # Value projection in attention
+    - "*.o_proj"      # Output projection in attention
+  dim: 32             # Higher LoRA rank for larger model (16=balanced, 32=high-capacity)
+  alpha: 32           # Scaling factor (alpha/dim = 1.0 for high-rank setups)
+  dropout: 0.1        # Regularization for small datasets like LibriSpeech
+  use_triton: true    # Enable Triton kernels (auto-disabled with TP > 1)
+
+distributed:
+  dp_size: null       # Auto-calculated from available GPUs
+  tp_size: 1          # Set to 2 for tensor parallelism (requires 2+ GPUs)
+  cp_size: 1
+
+distributed_config:
+  _target_: nemo_automodel.components.distributed.config.FSDP2Config
+  sequence_parallel: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.asr.datasets.make_librispeech_dataset
+  path_or_dataset: librispeech_asr
+  split: train.100
+  streaming: false
+  limit_dataset_samples: 10000
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  pin_memory: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.asr.collate_fns.whisper_collate_fn
+    max_length: 448
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.asr.datasets.make_librispeech_dataset
+  path_or_dataset: librispeech_asr
+  split: validation
+  streaming: false
+  limit_dataset_samples: 1000
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 2
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.asr.collate_fns.whisper_collate_fn
+
+# PEFT typically uses 5-10x higher learning rate than full finetuning
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 5.0e-5          # Moderate LR for larger model with high-rank LoRA
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 5.0e-6      # Adjusted to match higher starting LR

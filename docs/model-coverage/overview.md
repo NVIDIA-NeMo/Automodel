@@ -1,6 +1,6 @@
 # Overview
 
-NeMo Automodel integrates with Hugging Face `transformers`. As a result, any LLM or VLM that can be instantiated through `transformers` can also be used via NeMo Automodel, subject to runtime, third-party software dependencies, and feature compatibility.
+NeMo AutoModel integrates with Hugging Face `transformers`. As a result, any LLM, VLM, or ASR model that can be instantiated through `transformers` can also be used via NeMo AutoModel, subject to runtime, third-party software dependencies, and feature compatibility.
 
 ## Version Compatibility and Day-0 Support
 
@@ -23,6 +23,8 @@ NeMo Automodel includes a custom model registry that allows teams to:
 |-------------------------------------|--------------------------|------------|-------------------------------------------|
 | `AutoModelForCausalLM`              | Text Generation (LLM)    | Supported  | See [`docs/model-coverage/llm.md`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm.md).         |
 | `AutoModelForImageTextToText`       | Image-Text-to-Text (VLM) | Supported  | See [`docs/model-coverage/vlm.md`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/vlm.md).         |
+| `AutoModelForCTC`                   | Speech-to-Text (ASR CTC) | Supported  | See [`docs/model-coverage/asr.md`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/asr.md).         |
+| `AutoModelForSpeechSeq2Seq`         | Speech-to-Text (ASR)     | Supported  | See [`docs/model-coverage/asr.md`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/asr.md).         |
 | `AutoModelForSequenceClassification`| Sequence Classification  | WIP        | Early support; interfaces may change.     |
 
 

@@ -24,12 +24,14 @@ _SUBMODULES = {"recipes", "shared", "components"}
 
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "NeMoAutoModelForCausalLM": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForCausalLM"),
+    "NeMoAutoModelForCTC": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForCTC"),
     "NeMoAutoModelForImageTextToText": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForImageTextToText"),
     "NeMoAutoModelForMultimodalLM": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForMultimodalLM"),
     "NeMoAutoModelForSequenceClassification": (
         "nemo_automodel._transformers.auto_model",
         "NeMoAutoModelForSequenceClassification",
     ),
+    "NeMoAutoModelForSpeechSeq2Seq": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForSpeechSeq2Seq"),
     "NeMoAutoModelForTextToWaveform": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForTextToWaveform"),
     "NeMoAutoTokenizer": ("nemo_automodel._transformers.auto_tokenizer", "NeMoAutoTokenizer"),
 }
