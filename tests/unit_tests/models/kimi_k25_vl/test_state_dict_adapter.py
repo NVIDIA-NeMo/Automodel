@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 import torch
@@ -1213,3 +1213,201 @@ class TestQuantGroupsPattern:
 
         assert len(complete_triplets) == 1
         assert complete_triplets[0][0] == "layer.5.experts.1.gate_proj.weight"
+
+
+# =============================================================================
+# Tests for quantize_to_int4 offset binary encoding (v5 fix)
+# =============================================================================
+
+
+class TestQuantizeOffsetBinary:
+    """Tests verifying the offset binary encoding (value + 8) in quantize_to_int4."""
+
+    def test_offset_binary_encoding_range(self):
+        """Verify packed nibbles are in [0, 15] using offset binary (value + 8)."""
+        out_features, in_features = 16, 64
+        group_size = 32
+
+        weight = torch.randn(out_features, in_features, dtype=torch.float32)
+        weight_packed, weight_scale, weight_shape = quantize_to_int4(weight, group_size=group_size)
+
+        shifts = torch.arange(8) * 4
+        unpacked = ((weight_packed.unsqueeze(-1) >> shifts) & 0xF)
+        unpacked_flat = unpacked.reshape(out_features, in_features)
+
+        assert unpacked_flat.min() >= 0
+        assert unpacked_flat.max() <= 15
+
+    def test_offset_binary_zero_maps_to_eight(self):
+        """A zero-valued weight should quantize to nibble value 8 (0 + 8)."""
+        out_features, in_features = 1, 8
+        group_size = 8
+
+        weight = torch.zeros(out_features, in_features, dtype=torch.float32)
+        weight_packed, weight_scale, _ = quantize_to_int4(weight, group_size=group_size)
+
+        shifts = torch.arange(8) * 4
+        unpacked = ((weight_packed.unsqueeze(-1) >> shifts) & 0xF)
+        unpacked_flat = unpacked.reshape(out_features, in_features)
+
+        assert (unpacked_flat == 8).all(), f"Expected all 8s for zero weights, got {unpacked_flat}"
+
+    def test_offset_binary_roundtrip_correctness(self):
+        """Quantize -> dequantize with offset binary should recover values accurately."""
+        out_features, in_features = 16, 64
+        group_size = 32
+
+        weight = torch.randn(out_features, in_features, dtype=torch.float32) * 0.5
+        weight_packed, weight_scale, weight_shape = quantize_to_int4(weight, group_size=group_size)
+        weight_recovered = dequantize_int4(weight_packed, weight_scale, weight_shape, group_size=group_size, device="cpu")
+
+        max_error = (weight_recovered.float() - weight).abs().max().item()
+        assert max_error < 1.0, f"Max quantization error {max_error} too large for offset binary"
+
+
+class TestQuantizeDevicePreservation:
+    """Tests that quantize_to_int4 preserves the input tensor's device (no .cpu() calls)."""
+
+    def test_output_stays_on_input_device_cpu(self):
+        """Output tensors should remain on CPU when input is CPU."""
+        weight = torch.randn(16, 64, dtype=torch.float32)
+        packed, scale, shape = quantize_to_int4(weight)
+
+        assert packed.device == weight.device
+        assert scale.device == weight.device
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_output_stays_on_input_device_cuda(self):
+        """Output tensors should remain on CUDA when input is CUDA."""
+        weight = torch.randn(16, 64, dtype=torch.float32, device="cuda")
+        packed, scale, shape = quantize_to_int4(weight)
+
+        assert packed.device == weight.device
+        assert scale.device == weight.device
+
+
+# =============================================================================
+# Tests for simplified convert_single_tensor_to_hf quantization paths
+# =============================================================================
+
+
+class TestConvertSingleTensorToHFQuantizationPaths:
+    """Tests for the refactored quantization logic in convert_single_tensor_to_hf.
+
+    Covers meta tensor, non-DTensor, and basic paths after the v5 simplification.
+    """
+
+    @pytest.fixture
+    def adapter(self):
+        config = KimiK25VLConfig()
+        moe_config = create_mock_moe_config()
+        backend = BackendConfig(linear="torch", rms_norm="torch", attn="sdpa")
+        return KimiK25VLStateDictAdapter(config, moe_config, backend, dtype=torch.bfloat16)
+
+    def test_quantization_non_dtensor_produces_packed_scale_shape(self, adapter):
+        """Regular (non-DTensor, non-meta) expert weight goes through quantize_to_int4."""
+        fqn = "model.language_model.model.layers.5.mlp.experts.0.gate_proj.weight"
+        tensor = torch.randn(2048, 7168)
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+
+        keys = [r[0] for r in result]
+        vals = {r[0]: r[1] for r in result}
+
+        packed_key = [k for k in keys if "weight_packed" in k]
+        scale_key = [k for k in keys if "weight_scale" in k]
+        shape_key = [k for k in keys if "weight_shape" in k]
+
+        assert len(packed_key) == 1
+        assert len(scale_key) == 1
+        assert len(shape_key) == 1
+
+        assert vals[packed_key[0]].dtype == torch.int32
+        assert vals[packed_key[0]].shape == (2048, 7168 // 8)
+        assert vals[scale_key[0]].dtype == torch.float16
+        assert vals[scale_key[0]].shape == (2048, 7168 // 32)
+        assert vals[shape_key[0]].tolist() == [2048, 7168]
+
+    def test_quantization_meta_tensor_produces_meta_placeholders(self, adapter):
+        """Meta tensors produce meta-device empty placeholders instead of real quantized data."""
+        fqn = "model.language_model.model.layers.5.mlp.experts.0.gate_proj.weight"
+        tensor = torch.empty(256, 64, device="meta")
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+
+        keys = [r[0] for r in result]
+        vals = {r[0]: r[1] for r in result}
+
+        packed_key = [k for k in keys if "weight_packed" in k][0]
+        scale_key = [k for k in keys if "weight_scale" in k][0]
+        shape_key = [k for k in keys if "weight_shape" in k][0]
+
+        assert vals[packed_key].device.type == "meta"
+        assert vals[packed_key].shape == (256, 64 // 8)
+        assert vals[packed_key].dtype == torch.int32
+
+        assert vals[scale_key].device.type == "meta"
+        assert vals[scale_key].shape == (256, 64 // 32)
+        assert vals[scale_key].dtype == torch.float16
+
+        assert vals[shape_key].tolist() == [256, 64]
+        assert vals[shape_key].device.type != "meta"  # shape is always concrete
+
+    def test_quantization_non_expert_key_is_not_quantized(self, adapter):
+        """Non-expert keys pass through without quantization even when quantization=True."""
+        fqn = "model.vision_tower.encoder.blocks.0.wqkv.weight"
+        tensor = torch.randn(3456, 1152)
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+
+        keys = [r[0] for r in result]
+        assert not any("weight_packed" in k for k in keys)
+        assert not any("weight_scale" in k for k in keys)
+        assert "vision_tower.encoder.blocks.0.wqkv.weight" in keys
+
+    def test_quantization_device_matches_input_tensor(self, adapter):
+        """Quantized output tensors should be on the same device as the input."""
+        fqn = "model.language_model.model.layers.5.mlp.experts.0.gate_proj.weight"
+        tensor = torch.randn(256, 64, device="cpu")
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
+        vals = {r[0]: r[1] for r in result}
+
+        for key, val in vals.items():
+            if "weight_packed" in key or "weight_scale" in key:
+                assert val.device == tensor.device, f"{key} device mismatch"
+
+    def test_quantization_dtensor_rewraps_with_dtensor_from_local(self, adapter):
+        """When input is a DTensor (non-meta), quantized results are re-wrapped via DTensor.from_local."""
+        fqn = "model.language_model.model.layers.5.mlp.experts.0.gate_proj.weight"
+
+        local_data = torch.randn(256, 64)
+        mock_mesh = MagicMock()
+        mock_placements = [MagicMock()]
+
+        mock_dtensor = MagicMock()
+        mock_dtensor._local_tensor = local_data
+        mock_dtensor.placements = mock_placements
+        mock_dtensor.device_mesh = mock_mesh
+        type(mock_dtensor).__name__ = "DTensor"
+
+        sentinel_packed = MagicMock(name="packed_dtensor")
+        sentinel_scale = MagicMock(name="scale_dtensor")
+
+        with patch(
+            "torch.distributed.tensor.DTensor"
+        ) as MockDTensor:
+            MockDTensor.from_local = MagicMock(side_effect=[sentinel_packed, sentinel_scale])
+
+            result = adapter.convert_single_tensor_to_hf(fqn, mock_dtensor, quantization=True)
+
+        vals = {r[0]: r[1] for r in result}
+        packed_key = [k for k in vals if "weight_packed" in k][0]
+        scale_key = [k for k in vals if "weight_scale" in k][0]
+
+        assert vals[packed_key] is sentinel_packed
+        assert vals[scale_key] is sentinel_scale
+        assert MockDTensor.from_local.call_count == 2
+
+        first_call_mesh = MockDTensor.from_local.call_args_list[0][0][1]
+        assert first_call_mesh is mock_mesh
