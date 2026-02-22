@@ -31,7 +31,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClass
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaForSequenceClassification, LlamaModel
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring
+from transformers.utils import TransformersKwargs
 
 try:
     from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
@@ -105,7 +105,6 @@ class LlamaBidirectionalModel(LlamaModel):
         return None
 
     @check_model_inputs
-    @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
