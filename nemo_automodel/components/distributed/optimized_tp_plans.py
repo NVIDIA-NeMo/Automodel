@@ -20,8 +20,6 @@ including LLaMA, Qwen, Gemma3, and Ministral3 models.
 
 from typing import Callable, Dict, Union, cast
 
-import torch
-from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     ParallelStyle,
@@ -40,128 +38,15 @@ from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
+from nemo_automodel.components.distributed.parallel_styles import (
+    FusedColwiseParallel,  # noqa: F401
+    RotaryEmbedParallel,
+    SequenceParallelAllGatherActivation,
+    VocabParallelEmbedding,
+)
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
 from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
-
-
-class SequenceParallelAllGatherActivation(SequenceParallel):
-    """SequenceParallel that all-gathers activations for sequence parallelism."""
-
-    @staticmethod
-    def _prepare_output_fn(use_local_output, mod, outputs, device_mesh):
-        """Prepare outputs by redistributing sharded DTensors to replicated placement."""
-        # If output is a DTensor with Shard placement, redistribute to Replicate
-        if isinstance(outputs, DTensor):
-            if any(isinstance(p, Shard) for p in outputs.placements):
-                # Redistribute to replicated placement (performs all-gather)
-                outputs = outputs.redistribute(device_mesh=device_mesh, placements=[Replicate()])
-        else:
-            raise ValueError(f"Expected output to be a DTensor, but got {type(outputs)}")
-
-        # Call the parent's prepare_output_fn to handle use_local_output
-        return SequenceParallel._prepare_output_fn(use_local_output, mod, outputs, device_mesh)
-
-
-class VocabParallelEmbedding(RowwiseParallel):
-    """``RowwiseParallel`` for ``nn.Embedding`` with a ``MaskPartial`` mask-buffer fixup.
-
-    Some PyTorch versions have a DTensor bug where the ``MaskPartial``
-    placement's ``mask_buffer`` is not populated during the embedding
-    dispatch, leading to::
-
-        AssertionError: assert self.mask_buffer.data is not None
-
-    This subclass works around the issue by:
-
-    1. Saving the *original* (un-adjusted) ``input_ids`` in a pre-hook.
-    2. Recomputing and populating the ``mask_buffer`` in the post-hook
-       when the DTensor dispatch failed to do so.
-
-    In PyTorch versions where the dispatch works correctly the mask buffer
-    is already populated and the fixup is a no-op.
-    """
-
-    @staticmethod
-    def _prepare_input_fn(input_layouts, desired_input_layouts, mod, inputs, device_mesh):
-        # Save the original input_ids (before DTensor index-adjustment)
-        # so we can recompute the mask in the output hook if needed.
-        input_tensor = inputs[0]
-        if isinstance(input_tensor, DTensor):
-            mod._vocab_parallel_saved_ids = input_tensor.to_local().clone()
-        else:
-            mod._vocab_parallel_saved_ids = input_tensor.clone()
-
-        return RowwiseParallel._prepare_input_fn(input_layouts, desired_input_layouts, mod, inputs, device_mesh)
-
-    @staticmethod
-    def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):
-        saved_ids = getattr(mod, "_vocab_parallel_saved_ids", None)
-        if saved_ids is not None:
-            delattr(mod, "_vocab_parallel_saved_ids")
-
-        # If the output is a DTensor whose MaskPartial placement has an
-        # empty mask_buffer, compute and materialise the mask so that the
-        # subsequent ``_reduce_value`` / ``_reduce_shard_value`` succeeds.
-        if isinstance(outputs, DTensor) and saved_ids is not None:
-            placement = outputs.placements[0]
-            mb = getattr(placement, "mask_buffer", None)
-            if mb is not None and getattr(mb, "data", ...) is None:
-                vocab_size = getattr(mod, "num_embeddings", None) or mod.weight.shape[0]
-                tp_size = device_mesh.size()
-                rank = device_mesh.get_local_rank()
-
-                chunk = vocab_size // tp_size
-                rem = vocab_size % tp_size
-                if rank < rem:
-                    local_size = chunk + 1
-                    local_off = rank * (chunk + 1)
-                else:
-                    local_size = chunk
-                    local_off = rem * (chunk + 1) + (rank - rem) * chunk
-
-                mask = (saved_ids < local_off) | (saved_ids >= local_off + local_size)
-                mb.materialize_mask(mask)
-
-        return RowwiseParallel._prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh)
-
-
-class RotaryEmbedParallel(SequenceParallel):
-    """Custom SequenceParallel class for Qwen2 / Gemma3 rotary embeddings because the input is a tuple."""
-
-    @staticmethod
-    def _prepare_input_fn(sequence_sharding, mod, inputs, device_mesh):
-        new_inputs = list(inputs)
-
-        if not isinstance(inputs[0], DTensor):
-            """Guard the metadata for Sequence Parallel here"""
-            try:
-                new_inputs[0] = DTensor.from_local(
-                    local_tensor=inputs[0],
-                    device_mesh=device_mesh,
-                    placements=sequence_sharding,
-                    run_check=True,
-                )
-            except ValueError as e:
-                raise ValueError(
-                    f"Failed to shard tensor for sequence parallelism. Local Shape is ({inputs[0].shape}) "
-                    f"at rank {torch.distributed.get_rank()}. Different TP ranks must have the same shape. "
-                    f"Original error: {str(e)}"
-                ) from e
-
-        if not isinstance(inputs[1], DTensor):
-            new_inputs[1] = DTensor.from_local(
-                local_tensor=inputs[1],
-                device_mesh=device_mesh,
-                placements=(Replicate(),),
-                run_check=False,
-            )
-
-        return type(inputs)(new_inputs)
-
-    @staticmethod
-    def _prepare_output_fn(use_local_output, mod, outputs, device_mesh):
-        return type(outputs)([o.to_local() if use_local_output else o for o in outputs])
 
 
 def _parallelize_gemma3(
@@ -216,13 +101,22 @@ def _parallelize_llama(
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """Parallelizes a LlamaForCausalLM model across data and tensor parallel dimensions."""
+    # Compute per-section sizes for the fused QKV projection (GQA-aware).
+    # For GQA, Q has more heads than K/V so the sections are unequal;
+    # FusedColwiseParallel shards each section independently.
+    head_dim = getattr(model.config, "head_dim", model.config.hidden_size // model.config.num_attention_heads)
+    q_size = model.config.num_attention_heads * head_dim
+    kv_size = model.config.num_key_value_heads * head_dim
+
     base_model_tp_plan: dict[str, ParallelStyle] = {
-        "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
+        "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
         "model.layers.*.self_attn.q_proj": ColwiseParallel(),
         "model.layers.*.self_attn.k_proj": ColwiseParallel(),
         "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-        "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),  # Combined QKV projection
-        "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),  # Fused gate and up projection
+        "model.layers.*.self_attn.qkv_proj": FusedColwiseParallel(
+            section_sizes=(q_size, kv_size, kv_size),
+        ),
+        "model.layers.*.mlp.gate_up_proj": FusedColwiseParallel(num_sections=2),
         "model.layers.*.self_attn.o_proj": RowwiseParallel(),
         "model.layers.*.mlp.up_proj": ColwiseParallel(),
         "model.layers.*.mlp.gate_proj": ColwiseParallel(),

@@ -76,7 +76,11 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 )
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
-from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS, VocabParallelEmbedding
+from nemo_automodel.components.distributed.optimized_tp_plans import (
+    PARALLELIZE_FUNCTIONS,
+    FusedColwiseParallel,
+    VocabParallelEmbedding,
+)
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
 
 # TODO(boxiangw): Change to MegatronFSDP once it got published
@@ -632,6 +636,10 @@ def translate_to_torch_parallel_style(style: str):
         return RowwiseParallel(input_layouts=Replicate())
     elif style == "sequence_parallel":
         return SequenceParallel()
+    elif style == "fused_colwise":
+        from nemo_automodel.components.distributed.parallel_styles import FusedColwiseParallel  # noqa: F811
+
+        return FusedColwiseParallel()
     else:
         raise ValueError(f"Unknown parallel style: {style}")
 
@@ -878,8 +886,14 @@ def _get_parallel_plan(
     model_cls = type(model)
 
     if isinstance(tp_shard_plan, dict):
-        model_parallel_plan = tp_shard_plan
-        logger.info(f"Using parallel plan (dictionary). {tp_shard_plan}")
+        # Translate string values (from YAML) to ParallelStyle objects.
+        # Dicts coming from YAML will have string values like "colwise",
+        # "rowwise", "colwise_rep", etc.  Dicts built in Python may
+        # already contain ParallelStyle instances — those are kept as-is.
+        model_parallel_plan = {
+            k: translate_to_torch_parallel_style(v) if isinstance(v, str) else v for k, v in tp_shard_plan.items()
+        }
+        logger.info(f"Using parallel plan (dictionary). {model_parallel_plan}")
     elif tp_shard_plan is not None:
         try:
             plan_obj = import_class_from_path(tp_shard_plan)
@@ -890,6 +904,11 @@ def _get_parallel_plan(
             assert isinstance(model_parallel_plan, dict), (
                 f"Parallel plan must be a dictionary, got {type(model_parallel_plan)}"
             )
+            # Translate any string values in the imported plan.
+            model_parallel_plan = {
+                k: translate_to_torch_parallel_style(v) if isinstance(v, str) else v
+                for k, v in model_parallel_plan.items()
+            }
             logger.info(f"Using provided parallel plan (from path). {tp_shard_plan}")
         except Exception as e:
             raise ValueError(
@@ -913,14 +932,26 @@ def _get_parallel_plan(
             model_parallel_plan = get_hf_tp_shard_plan(model)
 
     else:
+        # Compute per-section sizes for fused QKV projection (GQA-aware).
+        # Standard ColwiseParallel does a contiguous Shard(0) split that
+        # crosses Q/K/V boundaries; FusedColwiseParallel shards each
+        # section independently so every TP rank gets the correct heads.
+        try:
+            head_dim = getattr(model.config, "head_dim", model.config.hidden_size // model.config.num_attention_heads)
+            q_size = model.config.num_attention_heads * head_dim
+            kv_size = model.config.num_key_value_heads * head_dim
+            qkv_style = FusedColwiseParallel(section_sizes=(q_size, kv_size, kv_size))
+        except (AttributeError, TypeError, ZeroDivisionError):
+            qkv_style = ColwiseParallel()
+
         base_model_tp_plan = {
             "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
             "model.layers.*.self_attn.q_proj": ColwiseParallel(),
             "model.layers.*.self_attn.k_proj": ColwiseParallel(),
             "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),  # Combined QKV projection
+            "model.layers.*.self_attn.qkv_proj": qkv_style,
             "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-            "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),  # Fused gate and up projection
+            "model.layers.*.mlp.gate_up_proj": FusedColwiseParallel(num_sections=2),
             "model.layers.*.mlp.up_proj": ColwiseParallel(),
             "model.layers.*.mlp.gate_proj": ColwiseParallel(),
             "model.layers.*.mlp.down_proj": RowwiseParallel(),
