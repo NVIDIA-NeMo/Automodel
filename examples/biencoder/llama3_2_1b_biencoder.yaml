@@ -127,7 +127,7 @@ optimizer:
 
 # Learning rate scheduler
 lr_scheduler:
-  lr_warmup_steps: 50
+  lr_warmup_steps: 100
 
 checkpoint:
   enabled: true
