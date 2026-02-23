@@ -67,7 +67,6 @@ def test_from_pretrained_happy_path(monkeypatch):
     model = am.NeMoAutoModelBiencoder.from_pretrained(
         pretrained_model_name_or_path="some/path",
         share_encoder=True,
-        add_linear_pooler=False,
         out_dimension=None,
         do_gradient_checkpointing=True,
         pooling="avg",

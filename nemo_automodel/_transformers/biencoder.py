@@ -83,11 +83,9 @@ class BiencoderModel(nn.Module):
         self,
         lm_q: PreTrainedModel,
         lm_p: PreTrainedModel,
-        linear_pooler: nn.Module = None,
         pooling: str = "avg",
         l2_normalize: bool = True,
         share_encoder: bool = True,
-        add_linear_pooler: bool = False,
     ):
         super().__init__()
         self.lm_q = lm_q
@@ -95,8 +93,6 @@ class BiencoderModel(nn.Module):
         self.pooling = pooling
         self.l2_normalize = l2_normalize
         self.share_encoder = share_encoder
-        self.add_linear_pooler = add_linear_pooler
-        self.linear_pooler = linear_pooler if linear_pooler is not None else nn.Identity()
         self.config = self.lm_q.config
 
         # HuggingFace consolidated checkpoint compatibility
@@ -153,8 +149,6 @@ class BiencoderModel(nn.Module):
             attention_mask=input_dict["attention_mask"],
             pool_type=self.pooling,
         )
-        embeds = self.linear_pooler(embeds)
-
         if self.l2_normalize:
             embeds = F.normalize(embeds, dim=-1)
 
@@ -165,8 +159,6 @@ class BiencoderModel(nn.Module):
         cls,
         model_name_or_path: str,
         share_encoder: bool = True,
-        add_linear_pooler: bool = False,
-        out_dimension: int = 768,
         do_gradient_checkpointing: bool = False,
         pooling: str = "avg",
         l2_normalize: bool = True,
@@ -231,25 +223,12 @@ class BiencoderModel(nn.Module):
             if lm_p is not lm_q:
                 lm_p.gradient_checkpointing_enable()
 
-        if add_linear_pooler:
-            linear_pooler = nn.Linear(lm_q.config.hidden_size, out_dimension)
-
-            pooler_path = os.path.join(model_name_or_path, "pooler.pt")
-            if os.path.exists(pooler_path):
-                logger.info("Loading pooler weights from local files")
-                state_dict = torch.load(pooler_path, map_location="cpu")
-                linear_pooler.load_state_dict(state_dict)
-        else:
-            linear_pooler = nn.Identity()
-
         model = cls(
             lm_q=lm_q,
             lm_p=lm_p,
-            linear_pooler=linear_pooler,
             pooling=pooling,
             l2_normalize=l2_normalize,
             share_encoder=share_encoder,
-            add_linear_pooler=add_linear_pooler,
         )
         return model
 
@@ -268,10 +247,6 @@ class BiencoderModel(nn.Module):
                 tokenizer=kwargs.get("tokenizer", None),
             )
 
-            if self.add_linear_pooler:
-                pooler_path = os.path.join(save_directory, "pooler.pt")
-                logger.info(f"Saving linear pooler to {pooler_path}")
-                torch.save(self.linear_pooler.state_dict(), pooler_path)
             return
 
         logger.info(f"Saving BiencoderModel to {save_directory}")
@@ -283,8 +258,3 @@ class BiencoderModel(nn.Module):
             os.makedirs(os.path.join(save_directory, "passage_model"), exist_ok=True)
             self.lm_q.save_pretrained(os.path.join(save_directory, "query_model"))
             self.lm_p.save_pretrained(os.path.join(save_directory, "passage_model"))
-
-        if self.add_linear_pooler:
-            pooler_path = os.path.join(save_directory, "pooler.pt")
-            logger.info(f"Saving linear pooler to {pooler_path}")
-            torch.save(self.linear_pooler.state_dict(), pooler_path)

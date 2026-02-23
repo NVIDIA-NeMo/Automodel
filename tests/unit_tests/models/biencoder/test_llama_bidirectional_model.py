@@ -257,19 +257,9 @@ def test_biencoder_build_and_save(tmp_path, monkeypatch):
     model_dir.mkdir()
     (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
 
-    # build with share_encoder=True and add_linear_pooler True with pooler file present
-    pooler_path = model_dir / "pooler.pt"
-    # Create a correctly-shaped state dict for Linear(in=16, out=16)
-    state = {
-        "weight": torch.eye(16, dtype=torch.float32),
-        "bias": torch.zeros(16, dtype=torch.float32),
-    }
-    torch.save(state, pooler_path)
-
     model = BiencoderModel.build(
         model_name_or_path=str(model_dir),
         share_encoder=True,
-        add_linear_pooler=True,
         out_dimension=16,
         do_gradient_checkpointing=True,
         pooling="avg",
@@ -278,18 +268,15 @@ def test_biencoder_build_and_save(tmp_path, monkeypatch):
     assert isinstance(model, BiencoderModel)
     # gradient checkpointing enabled on lm_q (and lm_p is same object)
     assert getattr(model.lm_q, "_ckpt", False) is True
-    # save with share_encoder=True and add_linear_pooler=True
     outdir = tmp_path / "save1"
     outdir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(outdir))
     assert any("save1" in p for p in model.lm_q.saved)
-    assert os.path.exists(outdir / "pooler.pt")
 
-    # build with share_encoder=False and without pooler file
+    # build with share_encoder=False
     model2 = BiencoderModel.build(
         model_name_or_path=str(model_dir),
         share_encoder=False,
-        add_linear_pooler=False,
         out_dimension=16,
         do_gradient_checkpointing=False,
     )

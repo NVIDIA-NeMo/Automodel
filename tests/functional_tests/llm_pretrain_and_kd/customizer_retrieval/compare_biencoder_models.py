@@ -132,7 +132,7 @@ def load_finetuned_model(model, ft_model_dir: Path):
     # `BiencoderStateDictAdapter` converts biencoder keys to HF keys with a "model."
     # prefix, so we remap checkpoint keys at read time to match.
     key_mapping = {
-        r"^(?!(model\.|linear_pooler\.))": "model.",
+        r"^(?!model\.)": "model.",
     }
     checkpointer.load_model(model, model_path=str(ft_model_dir), key_mapping=key_mapping)
     checkpointer.close()
@@ -220,7 +220,6 @@ def main() -> int:
     model = NeMoAutoModelBiencoder.from_pretrained(
         pretrained_model_name_or_path=base_model_path,
         share_encoder=True,
-        add_linear_pooler=False,
         out_dimension=768,
         do_gradient_checkpointing=False,
         pooling="avg",

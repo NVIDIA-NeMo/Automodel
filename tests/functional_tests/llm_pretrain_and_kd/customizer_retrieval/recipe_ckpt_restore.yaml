@@ -20,7 +20,6 @@ model:
   _target_: nemo_automodel._transformers.auto_model.NeMoAutoModelBiencoder.from_pretrained
   pretrained_model_name_or_path: /home/TestData/automodel/llama-nemotron-embed-1b-v2/
   share_encoder: true
-  add_linear_pooler: false
   out_dimension: 768
   do_gradient_checkpointing: false
   pooling: avg

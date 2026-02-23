@@ -52,10 +52,6 @@ class BiencoderStateDictAdapter(StateDictAdapter):
             return peft_prefix + dst + key[len(peft_src) :]
         return None
 
-    @staticmethod
-    def _is_pooler_key(key: str, peft_prefix: str) -> bool:
-        return key.startswith("linear_pooler.") or key.startswith(peft_prefix + "linear_pooler.")
-
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
         """Convert biencoder state dict to HF format (lm_q -> model)."""
         hf_state_dict = {}
@@ -63,8 +59,6 @@ class BiencoderStateDictAdapter(StateDictAdapter):
             new_key = self._swap_key(key, "lm_q.", "model.", self._PEFT_PREFIX)
             if new_key is not None:
                 hf_state_dict[new_key] = value
-            elif self._is_pooler_key(key, self._PEFT_PREFIX):
-                hf_state_dict[key] = value
         return hf_state_dict
 
     def from_hf(
@@ -81,16 +75,12 @@ class BiencoderStateDictAdapter(StateDictAdapter):
                 p_key = self._swap_key(key, "model.", "lm_p.", self._PEFT_PREFIX)
                 biencoder_state_dict[q_key] = value
                 biencoder_state_dict[p_key] = value
-            elif self._is_pooler_key(key, self._PEFT_PREFIX):
-                biencoder_state_dict[key] = value
         return biencoder_state_dict
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         """Convert a single tensor from biencoder to HF format. Skips non-lm_q tensors."""
         if fqn.startswith("lm_q."):
             return [("model." + fqn[len("lm_q.") :], tensor)]
-        if fqn.startswith("linear_pooler."):
-            return [(fqn, tensor)]
         return []
 
 
