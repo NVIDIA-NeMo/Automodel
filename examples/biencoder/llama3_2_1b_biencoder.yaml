@@ -29,7 +29,6 @@ step_scheduler:
   ckpt_every_steps: 500
   val_every_steps: 500
   num_epochs: 1
-  max_steps: 10
 
 dist_env:
   backend: nccl
@@ -121,11 +120,11 @@ optimizer:
   weight_decay: 0.01
   adam_w_mode: true
   bias_correction: true
-  master_weights: false
+  master_weights: true
 
 # Learning rate scheduler
 lr_scheduler:
-  lr_warmup_steps: 5
+  lr_warmup_steps: 100
 
 checkpoint:
   enabled: true
