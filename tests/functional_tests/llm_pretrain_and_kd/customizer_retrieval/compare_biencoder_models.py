@@ -220,7 +220,6 @@ def main() -> int:
     model = NeMoAutoModelBiencoder.from_pretrained(
         pretrained_model_name_or_path=base_model_path,
         share_encoder=True,
-        out_dimension=768,
         do_gradient_checkpointing=False,
         pooling="avg",
         l2_normalize=True,

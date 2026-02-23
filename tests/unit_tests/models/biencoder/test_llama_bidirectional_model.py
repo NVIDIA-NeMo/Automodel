@@ -260,7 +260,6 @@ def test_biencoder_build_and_save(tmp_path, monkeypatch):
     model = BiencoderModel.build(
         model_name_or_path=str(model_dir),
         share_encoder=True,
-        out_dimension=16,
         do_gradient_checkpointing=True,
         pooling="avg",
         l2_normalize=True,
@@ -277,7 +276,6 @@ def test_biencoder_build_and_save(tmp_path, monkeypatch):
     model2 = BiencoderModel.build(
         model_name_or_path=str(model_dir),
         share_encoder=False,
-        out_dimension=16,
         do_gradient_checkpointing=False,
     )
     outdir2 = tmp_path / "save2"
