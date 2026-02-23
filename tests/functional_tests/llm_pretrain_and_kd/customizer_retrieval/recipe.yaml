@@ -17,7 +17,7 @@ step_scheduler:
   max_steps: 32
 
 model:
-  _target_: nemo_automodel._transformers.auto_model.NeMoAutoModelForBiencoder.from_pretrained
+  _target_: nemo_automodel._transformers.auto_model.NeMoAutoModelBiencoder.from_pretrained
   pretrained_model_name_or_path: /home/TestData/automodel/llama-nemotron-embed-1b-v2/
   share_encoder: true
   add_linear_pooler: false

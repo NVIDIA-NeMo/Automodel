@@ -35,7 +35,7 @@ dist_env:
   timeout_minutes: 1
 
 model:
-  _target_: nemo_automodel.NeMoAutoModelForBiencoder.from_pretrained
+  _target_: nemo_automodel.NeMoAutoModelBiencoder.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
   share_encoder: true
   add_linear_pooler: false
@@ -56,9 +56,9 @@ dataloader:
   dataset:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
     data_dir_list:
-      - retriever_models_research/training_datasets/nqsh_shuffled_50k.json
-      - retriever_models_research/training_datasets/miracl_train_es_llama3_1b_4m_512len.json
-      - retriever_models_research/training_datasets/mldr_en_perc95_small.json
+      - /adasif/retriever_models_research/training_datasets/nqsh_shuffled_50k.json
+      - /adasif/retriever_models_research/training_datasets/mldr_en_perc95_small.json
+      - /adasif/retriever_models_research/training_datasets/miracl_train_es_llama3_1b_4m_512len.json
     data_type: train
     train_n_passages: 5
     eval_negative_size: 4

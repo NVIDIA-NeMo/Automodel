@@ -24,7 +24,7 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, Che
 from nemo_automodel.components.datasets.llm import retrieval_dataset_inline as rdi
 from nemo_automodel.components.datasets.llm import RetrievalBiencoderCollator
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel._transformers.auto_model import NeMoAutoModelForBiencoder
+from nemo_automodel._transformers.auto_model import NeMoAutoModelBiencoder
 from nemo_automodel.recipes.biencoder.train_biencoder import contrastive_scores_and_labels
 
 
@@ -217,7 +217,7 @@ def main() -> int:
     model_dtype = torch.bfloat16
 
     # Build a single model instance, compute baseline diffs, then load finetuned weights and recompute.
-    model = NeMoAutoModelForBiencoder.from_pretrained(
+    model = NeMoAutoModelBiencoder.from_pretrained(
         pretrained_model_name_or_path=base_model_path,
         share_encoder=True,
         add_linear_pooler=False,

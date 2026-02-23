@@ -707,7 +707,7 @@ class NeMoAutoModelForTextToWaveform(_BaseNeMoAutoModelClass, AutoModelForTextTo
     pass
 
 
-class NeMoAutoModelForBiencoder:
+class NeMoAutoModelBiencoder:
     """NeMo AutoModel for biencoder/embedding tasks with full infrastructure support.
 
     This class provides a unified interface for loading biencoder models with
@@ -715,13 +715,13 @@ class NeMoAutoModelForBiencoder:
     It uses the BiencoderModel.build() method to create the model and then applies
     all infrastructure through apply_model_infrastructure().
 
-    Unlike the legacy NeMoAutoModelBiencoder, this class properly integrates with
-    the model registry and applies all kernel patching and infrastructure support.
+    This class properly integrates with the model registry and applies all
+    kernel patching and infrastructure support.
 
     Examples:
     --------
-    >>> model = NeMoAutoModelForBiencoder.from_pretrained("meta-llama/Llama-3.2-1B")
-    >>> model = NeMoAutoModelForBiencoder.from_pretrained(
+    >>> model = NeMoAutoModelBiencoder.from_pretrained("meta-llama/Llama-3.2-1B")
+    >>> model = NeMoAutoModelBiencoder.from_pretrained(
     ...     "meta-llama/Llama-3.2-1B",
     ...     distributed_config=FSDP2Config(),
     ... )
@@ -789,7 +789,7 @@ class NeMoAutoModelForBiencoder:
         """
         from nemo_automodel._transformers.biencoder import BiencoderModel
 
-        logger.info(f"Loading NeMoAutoModelForBiencoder from {pretrained_model_name_or_path}")
+        logger.info(f"Loading NeMoAutoModelBiencoder from {pretrained_model_name_or_path}")
 
         def _retry(**override):
             """Internal helper to re-enter this function with patched parameters."""
