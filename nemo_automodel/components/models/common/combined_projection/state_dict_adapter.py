@@ -75,14 +75,47 @@ class CombinedProjectionStateDictAdapter:
         self.kv_size = self.num_key_value_heads * self.head_dim
         self.group_size = self.num_attention_heads // self.num_key_value_heads
 
+    @staticmethod
+    def _gather_1d_if_needed(tensor: torch.Tensor, divisor: int) -> torch.Tensor:
+        """Gather a 1-D DTensor on dim 0 when the local shard isn't divisible by *divisor*.
+
+        FSDP2's ``shard_placement_fn`` only accepts ``Shard`` placements (not
+        ``Replicate``), so 1-D bias vectors of combined projections end up with
+        ``Shard(0)`` even though their interleaved layout may not divide evenly
+        across the FSDP shard count.  This helper gathers such biases to full
+        before reshape / split operations in the state-dict adapter.
+
+        Weights are handled by FSDP ``Shard(1)``, so they never need this.
+        """
+        if tensor.ndim != 1:
+            return tensor
+        try:
+            from torch.distributed.tensor import DTensor
+            from torch.distributed.tensor.placement_types import Replicate, Shard
+        except ImportError:
+            return tensor
+        if not isinstance(tensor, DTensor):
+            return tensor
+        if tensor.to_local().shape[0] % divisor == 0:
+            return tensor
+        new_placements = tuple(
+            Replicate() if isinstance(p, Shard) and p.dim == 0 else p
+            for p in tensor.placements
+        )
+        return tensor.redistribute(tensor.device_mesh, new_placements)
+
     def _interleave_qkv(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """Interleave Q, K, V by KV-head groups for TP-correct ColwiseParallel sharding.
 
         Layout: [Q_group_0 | K_0 | V_0 | Q_group_1 | K_1 | V_1 | ...]
         where each group has (group_size * head_dim) Q rows, head_dim K rows, head_dim V rows.
         """
+        q_group_width = self.group_size * self.head_dim
+        q = self._gather_1d_if_needed(q, q_group_width)
+        k = self._gather_1d_if_needed(k, self.head_dim)
+        v = self._gather_1d_if_needed(v, self.head_dim)
         rest = q.shape[1:]
-        q = q.reshape(self.num_key_value_heads, self.group_size * self.head_dim, *rest)
+        q = q.reshape(self.num_key_value_heads, q_group_width, *rest)
         k = k.reshape(self.num_key_value_heads, self.head_dim, *rest)
         v = v.reshape(self.num_key_value_heads, self.head_dim, *rest)
         return torch.cat([q, k, v], dim=1).reshape(-1, *rest)
@@ -90,11 +123,13 @@ class CombinedProjectionStateDictAdapter:
     def _deinterleave_qkv(self, qkv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """De-interleave QKV from KV-head-grouped layout back to separate Q, K, V.
 
-        Works for both full (unsharded) and TP-sharded tensors — the group structure
-        is the same regardless of how many groups this rank holds.
+        Works for full (unsharded), TP-sharded, and FSDP-sharded tensors.
+        When the tensor is a DTensor whose dim-0 local shard doesn't align with
+        the QKV group boundary, the tensor is gathered to full first.
         """
-        rest = qkv.shape[1:]
         group_width = (self.group_size + 2) * self.head_dim
+        qkv = self._gather_1d_if_needed(qkv, group_width)
+        rest = qkv.shape[1:]
         qkv = qkv.reshape(-1, group_width, *rest)
         q, k, v = qkv.split([self.group_size * self.head_dim, self.head_dim, self.head_dim], dim=1)
         return q.reshape(-1, *rest), k.reshape(-1, *rest), v.reshape(-1, *rest)
@@ -105,6 +140,7 @@ class CombinedProjectionStateDictAdapter:
 
     def _deinterleave_gate_up(self, gate_up: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """De-interleave gate/up from row-interleaved layout."""
+        gate_up = self._gather_1d_if_needed(gate_up, 2)
         rest = gate_up.shape[1:]
         gate_up = gate_up.reshape(-1, 2, *rest)
         return gate_up[:, 0].contiguous(), gate_up[:, 1].contiguous()
