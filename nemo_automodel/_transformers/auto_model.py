@@ -498,11 +498,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         peft_config: Optional[dict] = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
+        load_base_model: bool = False,
         **kwargs,
     ) -> PreTrainedModel:
         """
-        Instantiate a model from a ``transformers.PretrainedConfig`` (no pretrained
-        weights). Accepts the same infrastructure arguments as ``from_pretrained``.
+        Instantiate a model from a ``transformers.PretrainedConfig`` and optionally
+        load pretrained weights. Accepts the same infrastructure arguments as ``from_pretrained``.
 
         See ``from_pretrained`` for full parameter documentation.
 
@@ -513,6 +514,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 it will create a config internally using AutoConfig.
             torch_dtype (str | torch.dtype, default="auto"):
                 Data type for model parameters. If "auto", defaults to ``torch.bfloat16``.
+            load_base_model (bool, default=False): If ``True``, load pretrained
+                base model weights from the HuggingFace checkpoint after initialization.
         """
         if tp_plan is not None and distributed_config is not None:
             distributed_config.tp_plan = tp_plan
@@ -573,7 +576,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             peft_config=peft_config,
             fp8_config=fp8_config,
             compile_config=compile_config,
-            load_base_model=False,
+            load_base_model=load_base_model,
             **kwargs,
         )
 
