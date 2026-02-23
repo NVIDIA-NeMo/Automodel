@@ -81,7 +81,7 @@ def _get_logical_numel(param) -> int:
     packs multiple values per byte. We recover the logical count from
     the original shape stored in param.quant_state.
     """
-    if HAVE_BNB and isinstance(param, bnb.nn.Params4bit) and getattr(param, 'quant_state', None) is not None:
+    if HAVE_BNB and isinstance(param, bnb.nn.Params4bit) and getattr(param, "quant_state", None) is not None:
         return math.prod(param.quant_state.shape)
     return param.numel()
 
