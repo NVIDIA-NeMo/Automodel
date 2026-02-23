@@ -98,10 +98,7 @@ class CombinedProjectionStateDictAdapter:
             return tensor
         if tensor.to_local().shape[0] % divisor == 0:
             return tensor
-        new_placements = tuple(
-            Replicate() if isinstance(p, Shard) and p.dim == 0 else p
-            for p in tensor.placements
-        )
+        new_placements = tuple(Replicate() if isinstance(p, Shard) and p.dim == 0 else p for p in tensor.placements)
         return tensor.redistribute(tensor.device_mesh, new_placements)
 
     def _interleave_qkv(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
