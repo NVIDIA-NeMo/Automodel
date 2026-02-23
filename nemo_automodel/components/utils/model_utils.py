@@ -22,9 +22,10 @@ from nemo_automodel.shared.import_utils import safe_import
 HAVE_TORCHAO, torch_ao = safe_import("torchao")
 HAVE_BNB, bnb = safe_import("bitsandbytes")
 
+import math
+
 import torch
 import torch.nn as nn
-import math
 
 logger = logging.getLogger(__name__)
 
