@@ -122,7 +122,7 @@ def apply_ac(
             raise ValueError("hidden_size must be provided or model must have config.hidden_size attribute")
 
     if num_experts is None:
-        for attr in ["num_experts", "moe_num_experts", "n_routed_experts"]:
+        for attr in ["num_experts", "moe_num_experts", "n_routed_experts", "num_local_experts"]:
             if hasattr(model, "config") and hasattr(model.config, attr):
                 num_experts = getattr(model.config, attr)
                 break
