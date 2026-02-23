@@ -732,7 +732,6 @@ class NeMoAutoModelBiencoder:
         cls,
         pretrained_model_name_or_path: str,
         share_encoder: bool = True,
-        do_gradient_checkpointing: bool = False,
         pooling: str = "avg",
         l2_normalize: bool = True,
         attn_implementation: str = "flash_attention_2",
@@ -759,7 +758,6 @@ class NeMoAutoModelBiencoder:
         Args:
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
             share_encoder: Whether to share encoder weights between query and passage.
-            do_gradient_checkpointing: Whether to enable gradient checkpointing.
             pooling: Pooling strategy ('avg', 'cls', 'last', etc.).
             l2_normalize: Whether to L2 normalize embeddings.
             attn_implementation: Attention implementation to use (e.g.,
@@ -792,7 +790,6 @@ class NeMoAutoModelBiencoder:
             return cls.from_pretrained(
                 pretrained_model_name_or_path,
                 share_encoder=share_encoder,
-                do_gradient_checkpointing=do_gradient_checkpointing,
                 pooling=pooling,
                 l2_normalize=l2_normalize,
                 attn_implementation=attn_implementation,
@@ -836,7 +833,6 @@ class NeMoAutoModelBiencoder:
         model = BiencoderModel.build(
             model_name_or_path=pretrained_model_name_or_path,
             share_encoder=share_encoder,
-            do_gradient_checkpointing=do_gradient_checkpointing,
             pooling=pooling,
             l2_normalize=l2_normalize,
             attn_implementation=attn_implementation,

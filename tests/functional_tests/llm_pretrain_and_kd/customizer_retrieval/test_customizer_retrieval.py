@@ -93,7 +93,6 @@ def _build_eval_model(device: torch.device):
     return NeMoAutoModelBiencoder.from_pretrained(
         pretrained_model_name_or_path=BASE_MODEL_PATH,
         share_encoder=True,
-        do_gradient_checkpointing=False,
         pooling="avg",
         l2_normalize=True,
         use_liger_kernel=False,

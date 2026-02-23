@@ -159,7 +159,6 @@ class BiencoderModel(nn.Module):
         cls,
         model_name_or_path: str,
         share_encoder: bool = True,
-        do_gradient_checkpointing: bool = False,
         pooling: str = "avg",
         l2_normalize: bool = True,
         trust_remote_code: bool = False,
@@ -217,11 +216,6 @@ class BiencoderModel(nn.Module):
                 lm_p = lm_q
             else:
                 lm_p = copy.deepcopy(lm_q)
-
-        if do_gradient_checkpointing:
-            lm_q.gradient_checkpointing_enable()
-            if lm_p is not lm_q:
-                lm_p.gradient_checkpointing_enable()
 
         model = cls(
             lm_q=lm_q,

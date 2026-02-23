@@ -260,13 +260,10 @@ def test_biencoder_build_and_save(tmp_path, monkeypatch):
     model = BiencoderModel.build(
         model_name_or_path=str(model_dir),
         share_encoder=True,
-        do_gradient_checkpointing=True,
         pooling="avg",
         l2_normalize=True,
     )
     assert isinstance(model, BiencoderModel)
-    # gradient checkpointing enabled on lm_q (and lm_p is same object)
-    assert getattr(model.lm_q, "_ckpt", False) is True
     outdir = tmp_path / "save1"
     outdir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(outdir))
@@ -276,7 +273,6 @@ def test_biencoder_build_and_save(tmp_path, monkeypatch):
     model2 = BiencoderModel.build(
         model_name_or_path=str(model_dir),
         share_encoder=False,
-        do_gradient_checkpointing=False,
     )
     outdir2 = tmp_path / "save2"
     model2.save_pretrained(str(outdir2))
@@ -413,8 +409,8 @@ def test_biencoder_build_hub_and_errors(tmp_path, monkeypatch):
     monkeypatch.setattr(biencoder_module.AutoConfig, "from_pretrained", fake_auto_config_from_pretrained)
 
     # Hub path with share_encoder True
-    m1 = BiencoderModel.build(model_name_or_path="llama-tiny", share_encoder=True, do_gradient_checkpointing=True)
-    assert isinstance(m1, BiencoderModel) and getattr(m1.lm_q, "_ckpt", False) is True
-    # Hub path with share_encoder False and gradient ckpt enabled on both
-    m2 = BiencoderModel.build(model_name_or_path="llama-tiny", share_encoder=False, do_gradient_checkpointing=True)
+    m1 = BiencoderModel.build(model_name_or_path="llama-tiny", share_encoder=True)
+    assert isinstance(m1, BiencoderModel)
+    # Hub path with share_encoder False
+    m2 = BiencoderModel.build(model_name_or_path="llama-tiny", share_encoder=False)
     assert isinstance(m2, BiencoderModel)
