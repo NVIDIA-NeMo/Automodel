@@ -1,6 +1,11 @@
 [
     {
-        "version": "latest",
+        "version": "nightly",
+        "url": "https://docs.nvidia.com/nemo/automodel/nightly/"
+    },
+    {
+        "name": "0.3.0 (latest)",
+        "version": "0.3.0",
         "url": "https://docs.nvidia.com/nemo/automodel/latest/"
     },
     {
@@ -10,5 +15,5 @@
     {
         "version": "0.1.0",
         "url": "https://docs.nvidia.com/nemo/automodel/0.1.0/"
-    },
+    }
 ]
