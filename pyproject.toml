@@ -128,11 +128,16 @@ vlm = [
     "timm<=1.0.22",
     "torchcodec; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
 ]
+asr = [
+    "librosa",
+    "torchcodec; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+]
 all = [
     "nemo_automodel[cuda]",
     "nemo_automodel[delta-databricks]",
     "nemo_automodel[extra]",
     "nemo_automodel[vlm]",
+    "nemo_automodel[asr]",
 ]
 
 [project.urls]

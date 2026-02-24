@@ -1,8 +1,8 @@
-# Dataset Overview: LLM, VLM, and Retrieval Datasets in NeMo Automodel
+# Dataset Overview: LLM, VLM, ASR, and Retrieval Datasets in NeMo AutoModel
 
-This page summarizes the datasets supported in NeMo Automodel for LLM, VLM, and retrieval/embedding (biencoder) training and shows how to plug in your own datasets using Python functions or the YAML `_target_` mechanism.
+This page summarizes the datasets supported in NeMo AutoModel for LLM, VLM, ASR, and retrieval/embedding (biencoder) training. It also shows how to plug in your own datasets using Python functions or the YAML `_target_` mechanism.
 
-- See also: [LLM datasets](llm/dataset.md), [VLM datasets](vlm/dataset.md), and [Biencoder retrieval dataset](llm/retrieval-dataset.md) for deeper, task-specific guides.
+- See also: [LLM datasets](llm/dataset.md), [VLM datasets](vlm/dataset.md), [ASR datasets](asr/dataset.md), and [Biencoder retrieval dataset](llm/retrieval-dataset.md) for deeper, task-specific guides.
 
 - If a dataset you need is missing, please open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) with a short description and example schema so we can prioritize support.
 ---
@@ -482,6 +482,85 @@ dataloader:
 If you want answer-only loss masking, provide a model-appropriate `start_of_response_token` to the collate function.
 
 See [Gemma-3n](omni/gemma3-3n.md) and [VLM dataset](vlm/dataset.md) for end-to-end examples.
+
+---
+
+## ASR Datasets (Automatic Speech Recognition)
+
+ASR datasets contain audio recordings paired with text transcriptions for training speech recognition models. NeMo Automodel provides specialized dataset loaders and collate functions for different ASR architectures.
+
+### Built-in Dataset Makers
+
+#### LibriSpeech (Recommended)
+- Factory: `nemo_automodel.components.datasets.asr.datasets.make_librispeech_dataset`
+- Use case: English speech recognition with 1000 hours of audiobook recordings
+- Splits: train.100 (100h clean), train.clean.360, train.other.500, validation, test
+- HuggingFace ID: `librispeech_asr`
+- Example YAML:
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.asr.datasets.make_librispeech_dataset
+  path_or_dataset: librispeech_asr
+  split: train.100
+  streaming: false
+  limit_dataset_samples: 10000
+```
+
+#### Common Voice
+- Factory: `nemo_automodel.components.datasets.asr.datasets.make_common_voice_dataset`
+- Use case: Multilingual speech corpus with 100+ languages
+- HuggingFace ID: `mozilla-foundation/common_voice_17_0`
+
+:::{note}
+As of October 2025, Common Voice datasets must be downloaded from Mozilla Data Collective. Use LibriSpeech for readily available English ASR.
+:::
+
+#### Custom ASR Dataset
+- Factory: `nemo_automodel.components.datasets.asr.datasets.make_custom_asr_dataset`
+- Use case: Load any HuggingFace audio dataset with audio and text columns
+- Key args: `path_or_dataset`, `audio_column`, `text_column`, `split`
+- Example YAML:
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.asr.datasets.make_custom_asr_dataset
+  path_or_dataset: your-username/your-asr-dataset
+  audio_column: audio
+  text_column: transcription
+  split: train
+```
+
+### Dataset Structure
+
+ASR datasets return examples with:
+- **audio**: Audio array with sampling rate (typically 16kHz)
+- **text** or **sentence**: Text transcription
+
+### Collate Functions
+
+ASR models require architecture-specific collate functions for audio preprocessing:
+
+- **whisper_collate_fn**: For Whisper Seq2Seq models
+  - Target: `nemo_automodel.components.datasets.asr.collate_fns.whisper_collate_fn`
+  - Converts audio to 80-channel mel spectrograms
+  - Creates decoder_input_ids for teacher forcing
+  - Key args: `max_length` (default 448)
+
+- **parakeet_collate_fn**: For Parakeet CTC models
+  - Target: `nemo_automodel.components.datasets.asr.collate_fns.parakeet_collate_fn`
+  - Generates mel spectrograms for CTC training
+  - Creates attention masks for variable-length sequences
+
+Example YAML:
+```yaml
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  batch_size: 4
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.asr.collate_fns.whisper_collate_fn
+    max_length: 448
+```
+
+See [ASR dataset guide](asr/dataset.md) for detailed examples.
 
 ---
 

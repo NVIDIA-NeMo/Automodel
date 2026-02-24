@@ -39,7 +39,7 @@
 Overview
 ---
 
-Nemo AutoModel is a Pytorch DTensor‑native SPMD open-source training library under [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo), designed to streamline and scale training and finetuning for LLMs and VLMs. Designed for flexibility, reproducibility, and scale, NeMo AutoModel enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
+Nemo AutoModel is a Pytorch DTensor‑native SPMD open-source training library under [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo), designed to streamline and scale training and finetuning for LLMs, VLMs, and ASR models. Designed for flexibility, reproducibility, and scale, NeMo AutoModel enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
 <p align="center">
 <a href="https://github.com/NVIDIA-NeMo/Automodel"><picture>
     <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/refs/heads/main/docs/automodel_diagram.png">
@@ -95,6 +95,9 @@ What you can expect:
 - [VLM](#vlm-supervised-fine-tuning-sft)
   - [Supervised Fine-Tuning (SFT)](#vlm-supervised-fine-tuning-sft)
   - [Parameter-Efficient Fine-Tuning (PEFT)](#vlm-parameter-efficient-fine-tuning-peft)
+- [ASR](#asr-fine-tuning)
+  - [Fine-Tuning](#asr-fine-tuning)
+  - [Parameter-Efficient Fine-Tuning (PEFT)](#asr-parameter-efficient-fine-tuning-peft)
 - [Supported Models](#supported-models)
 - [Performance](#performance)
 - [Interoperability](#-interoperability)
@@ -119,6 +122,7 @@ What you can expect:
 - ✅ **FP8 and mixed precision** - FP8 support with torchao, requires torch.compile-supported models.
 - ✅ **DCP** - Distributed Checkpoint support with SafeTensors output.
 - ✅ **VLM**: Support for finetuning VLMs (e.g., Qwen2-VL, Gemma-3-VL). More families to be included in the future.
+- ✅ **ASR**: Support for finetuning ASR models (e.g., Whisper) with multimodal audio-text processing.
 - ✅ **Extended MoE support** - GPT-OSS, Qwen3 (Coder-480B-A35B, etc), Qwen-next.
 
 - 🔜 **Transformers v5 🤗** - Support for transformers v5 🤗 with device-mesh driven parallelism.
@@ -147,7 +151,7 @@ uv run python -c "import nemo_automodel; print('AutoModel ready')"
 
 
 ### Run a Recipe
-To run a NeMo AutoModel recipe, you need a recipe script (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/finetune.py), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/finetune.py)) and a YAML config file (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama/llama3_2_1b_squad.yaml), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml)):
+To run a NeMo AutoModel recipe, you need a recipe script (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/finetune.py), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/finetune.py), [ASR](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/asr_finetune/finetune.py)) and a YAML config file (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama/llama3_2_1b_squad.yaml), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml), [ASR](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/asr_finetune/whisper/whisper_small_librispeech.yaml)):
 ```
 # Command invocation format:
 uv run <recipe_script_path> --config <yaml_config_path>
@@ -157,6 +161,9 @@ uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config ex
 
 # VLM example: single GPU fine-tuning (Gemma-3-VL) with LoRA
 uv run examples/vlm_finetune/finetune.py --config examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml
+
+# ASR example: Whisper fine-tuning on LibriSpeech
+uv run examples/asr_finetune/finetune.py --config examples/asr_finetune/whisper/whisper_small_librispeech.yaml
 ```
 
 
@@ -285,6 +292,52 @@ uv run torchrun --nproc-per-node=8 \
 ```
 
 
+## ASR Fine-Tuning
+
+NeMo AutoModel supports fine-tuning Automatic Speech Recognition (ASR) models with the same SPMD principles as LLMs and VLMs. ASR models process audio inputs and generate text transcriptions, supporting multilingual speech recognition and translation tasks.
+
+### ASR Single GPU
+```bash
+# Fine-tune Whisper Small on LibriSpeech (1 GPU)
+uv run examples/asr_finetune/finetune.py \
+  --config examples/asr_finetune/whisper/whisper_small_librispeech.yaml
+```
+
+### ASR Multi-GPU
+```bash
+# Fine-tune Whisper Medium on LibriSpeech (8 GPUs with TP=2)
+uv run torchrun --nproc-per-node=8 \
+  examples/asr_finetune/finetune.py \
+  --config examples/asr_finetune/whisper/whisper_medium_librispeech.yaml
+```
+
+**Supported ASR Models:**
+- **Parakeet CTC** (NVIDIA): Fast CTC-based speech recognition with LoRA support
+  - Models: parakeet-ctc-0.6b, parakeet-ctc-1.1b
+- **Whisper** (OpenAI): Multilingual speech recognition and translation (99 languages) with LoRA support
+  - Models: whisper-tiny, small, medium, large-v3
+- **Datasets**: LibriSpeech (readily available), Common Voice (via Mozilla Data Collective), custom audio datasets
+
+See [ASR Fine-tuning Guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/asr_finetune/README.md) for more details, dataset information, and advanced configurations.
+
+
+## ASR Parameter-Efficient Fine-Tuning (PEFT)
+
+```bash
+# Whisper Small with LoRA (memory-efficient)
+uv run examples/asr_finetune/finetune.py \
+  --config examples/asr_finetune/whisper/whisper_small_librispeech_peft.yaml
+
+# Parakeet CTC with LoRA
+uv run examples/asr_finetune/finetune.py \
+  --config examples/asr_finetune/parakeet/parakeet_ctc_0.6b_librispeech_peft.yaml
+```
+
+**Benefits**: 40-60% memory reduction, 10-30x smaller checkpoints, faster training with higher learning rates.
+
+See [ASR Fine-tuning Guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/asr_finetune/README.md#parameter-efficient-fine-tuning-peft) for details.
+
+
 ## Supported Models
 NeMo AutoModel provides native support for a wide range of models available on the Hugging Face Hub, enabling efficient fine-tuning for various domains. Below is a small sample of ready‑to‑use families (train as‑is or swap any compatible 🤗 causal LM), you can specify nearly any LLM/VLM model available on 🤗 hub:
 
@@ -315,9 +368,13 @@ NeMo AutoModel provides native support for a wide range of models available on t
 | **LLM** | **Baichuan** | [`baichuan-inc/Baichuan2-7B-Chat`](https://huggingface.co/baichuan-inc/Baichuan2-7B-Chat) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_squad.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_squad_peft.yaml), [FP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_mock_fp8.yaml) |
 | **VLM** | **Gemma** | [`google/gemma-3-4b-it`](https://huggingface.co/google/gemma-3-4b-it) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml) |
 |  |  | [`google/gemma-3n-e4b-it`](https://huggingface.co/google/gemma-3n-e4b-it) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix_peft.yaml) |
+| **ASR** | **Parakeet** | [`nvidia/parakeet-ctc-0.6b`](https://huggingface.co/nvidia/parakeet-ctc-0.6b) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/asr_finetune/parakeet/parakeet_ctc_0.6b_librispeech.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/asr_finetune/parakeet/parakeet_ctc_0.6b_librispeech_peft.yaml) |
+|  |  | [`nvidia/parakeet-ctc-1.1b`](https://huggingface.co/nvidia/parakeet-ctc-1.1b) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/asr_finetune/parakeet/parakeet_ctc_1.1b_librispeech.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/asr_finetune/parakeet/parakeet_ctc_1.1b_librispeech_peft.yaml) |
+| **ASR** | **Whisper** | [`openai/whisper-small`](https://huggingface.co/openai/whisper-small) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/asr_finetune/whisper/whisper_small_librispeech.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/asr_finetune/whisper/whisper_small_librispeech_peft.yaml) |
+|  |  | [`openai/whisper-medium`](https://huggingface.co/openai/whisper-medium) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/asr_finetune/whisper/whisper_medium_librispeech.yaml), [PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/asr_finetune/whisper/whisper_medium_librispeech_peft.yaml) |
 
 > [!NOTE]
-> Check out more [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune) and [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune) examples. Any causal LM on Hugging Face Hub can be used with the base recipe template, just overwrite `--model.pretrained_model_name_or_path <model-id>` in the CLI or in the YAML config.
+> Check out more [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune), and [ASR](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/asr_finetune) examples. Any compatible model on Hugging Face Hub can be used with the base recipe template, just overwrite `--model.pretrained_model_name_or_path <model-id>` in the CLI or in the YAML config.
 
 
 ## Performance
