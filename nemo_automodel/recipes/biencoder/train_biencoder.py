@@ -179,7 +179,7 @@ class TrainBiencoderRecipe(BaseRecipe):
             self.cfg.get("checkpoint", None),
             self.cfg.get("model.cache_dir", None),
             self.cfg.model.pretrained_model_name_or_path,
-            is_peft=False,
+            is_peft=self.peft_config is not None,
         )
 
         if self.cfg.get("clip_grad_norm.max_norm", None) is not None:

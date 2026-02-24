@@ -127,14 +127,9 @@ def load_finetuned_model(model, ft_model_dir: Path):
         is_peft=False,
     )
     checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
-    # The biencoder recipe saves `LlamaBidirectionalModel` via HF `save_pretrained()`,
-    # which produces keys like "embed_tokens.weight" (no leading "model."). Our
-    # `BiencoderStateDictAdapter` converts biencoder keys to HF keys with a "model."
-    # prefix, so we remap checkpoint keys at read time to match.
-    key_mapping = {
-        r"^(?!model\.)": "model.",
-    }
-    checkpointer.load_model(model, model_path=str(ft_model_dir), key_mapping=key_mapping)
+
+    model_dir = ft_model_dir / "model"
+    checkpointer.load_model(model, model_path=str(model_dir))
     checkpointer.close()
     return model
 
@@ -146,6 +141,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("base_model_path", type=str, help="Path to base/pretrained HF model")
     parser.add_argument("checkpoint_root", type=str, help="Path to fine-tuned model directory")
     parser.add_argument("dataset_jsonl", type=str, help="Path to evaluation JSONL dataset")
+    parser.add_argument("trust_remote_code", type=bool, help="Trust remote code")
     parser.add_argument(
         "--max-length",
         type=int,
@@ -177,6 +173,7 @@ def main() -> int:
     max_length = args.max_length
     batch_size = args.batch_size
     use_bf16 = args.bf16
+    trust_remote_code = args.trust_remote_code
 
     # Initialize torch.distributed (DCP load requires a process group even in single-process mode).
     dist = initialize_distributed(backend="nccl", timeout_minutes=5)
@@ -185,7 +182,7 @@ def main() -> int:
     # Build tokenizer/collator/dataset.
     from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 
-    tokenizer = NeMoAutoTokenizer.from_pretrained(base_model_path)
+    tokenizer = NeMoAutoTokenizer.from_pretrained(base_model_path, trust_remote_code=trust_remote_code)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
@@ -225,6 +222,7 @@ def main() -> int:
         use_liger_kernel=False,
         use_sdpa_patching=False,
         torch_dtype=model_dtype,
+        trust_remote_code=trust_remote_code,
     ).to(device).eval()
 
     print(f"Config: max_length={max_length}, max_samples={max_samples}, batch_size={batch_size}, "
