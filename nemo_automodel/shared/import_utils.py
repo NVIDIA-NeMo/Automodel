@@ -19,7 +19,6 @@
 import importlib
 import logging
 import traceback
-from contextlib import contextmanager
 
 import torch
 from packaging.version import Version as PkgVersion
@@ -47,7 +46,6 @@ class UnavailableError(Exception):
     """
 
 
-@contextmanager
 def null_decorator(*args, **kwargs):
     """
     No-op decorator.
