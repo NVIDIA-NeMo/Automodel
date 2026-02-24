@@ -116,6 +116,38 @@ def test_add_corpus_duplicate_rules(tmp_path, monkeypatch):
         rd.add_corpus({"path": str(path2)}, corpus_dict)
 
 
+def test_load_datasets_resolves_relative_corpus_path(tmp_path, monkeypatch):
+    """Relative corpus paths should be resolved relative to the JSON file's directory."""
+    corpus_dir = tmp_path / "my_corpus"
+    corpus_dir.mkdir()
+    (corpus_dir / "merlin_metadata.json").write_text(json.dumps({"class": "TextQADataset", "corpus_id": "corpusA"}))
+
+    monkeypatch.setattr(
+        rd,
+        "load_dataset",
+        _mock_hf_load_dataset_returning([{"id": "p1", "text": "pos"}, {"id": "n1", "text": "neg"}]),
+    )
+
+    train_data = {
+        "corpus": [{"path": "my_corpus"}],
+        "data": [
+            {
+                "question_id": "q1",
+                "question": "Q?",
+                "corpus_id": "corpusA",
+                "pos_doc": [{"id": "p1"}],
+                "neg_doc": [{"id": "n1"}],
+            }
+        ],
+    }
+    train_file = tmp_path / "train.json"
+    train_file.write_text(json.dumps(train_data))
+
+    dataset, corpus_dict = rd.load_datasets(str(train_file))
+    assert len(dataset) == 1
+    assert corpus_dict["corpusA"].path == str(corpus_dir)
+
+
 def test_load_datasets_normalizes_and_errors(tmp_path, monkeypatch):
     corpus_dir = tmp_path / "corpusA"
     corpus_dir.mkdir()
