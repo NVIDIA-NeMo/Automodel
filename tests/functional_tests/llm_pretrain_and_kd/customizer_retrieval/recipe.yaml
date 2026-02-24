@@ -19,6 +19,7 @@ step_scheduler:
 model:
   _target_: nemo_automodel._transformers.auto_model.NeMoAutoModelBiencoder.from_pretrained
   pretrained_model_name_or_path: /home/TestData/automodel/llama-nemotron-embed-1b-v2/
+  trust_remote_code: true
   share_encoder: true
   pooling: avg
   l2_normalize: true
@@ -29,6 +30,7 @@ model:
 tokenizer:
   _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
   pretrained_model_name_or_path: /home/TestData/automodel/llama-nemotron-embed-1b-v2/
+  trust_remote_code: true
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
