@@ -44,6 +44,18 @@ Every workflow above supports all three scales -- just change how you launch.
 | **Multi-GPU** | `torchrun --nproc-per-node=N examples/llm_finetune/finetune.py -c config.yaml` | [Local Workstation](launcher/local-workstation.md) |
 | **Multi-Node** | Add a `slurm:` section to your YAML config, then `automodel finetune llm -c config.yaml` | [Cluster Deployment](launcher/cluster.md) |
 
+## Performance
+
+Training throughput on NVIDIA GPUs with optimized kernels for Hugging Face models.
+
+| Model | GPUs | TFLOPs/sec/GPU | Tokens/sec/GPU | Optimizations |
+|-------|-----:|---------------:|---------------:|---------------|
+| DeepSeek V3 671B | 256 | 250 | 1,002 | TE + DeepEP |
+| GPT-OSS 20B | 8 | 279 | 13,058 | TE + DeepEP + FlexAttn |
+| Qwen3 MoE 30B | 8 | 212 | 11,842 | TE + DeepEP |
+
+See the [full benchmark results](performance-summary.md) for configuration details and more models.
+
 ## Get Started
 
 ::::{grid} 1 2 2 2
@@ -132,9 +144,9 @@ Track experiments and metrics with MLflow integration.
 
 ::::
 
-## Deployment
+## Launch & Infrastructure
 
-Launch training on local workstations or multi-node clusters.
+Run training on local workstations or multi-node clusters.
 
 ::::{grid} 1 2 2 2
 :gutter: 1 1 1 2
@@ -147,27 +159,12 @@ Interactive single-node and multi-GPU training.
 {bdg-secondary}`torchrun` {bdg-secondary}`interactive`
 :::
 
-:::{grid-item-card} {octicon}`server;1.5em;sd-mr-1` Cluster Deployment
+:::{grid-item-card} {octicon}`server;1.5em;sd-mr-1` Cluster (SLURM)
 :link: launcher/cluster
 :link-type: doc
 Multi-node training with SLURM and the `automodel` CLI.
 +++
 {bdg-secondary}`slurm` {bdg-secondary}`multi-node`
-:::
-
-::::
-
-## Performance
-
-::::{grid} 1 2 2 2
-:gutter: 1 1 1 2
-
-:::{grid-item-card} {octicon}`rocket;1.5em;sd-mr-1` Performance Summary
-:link: performance-summary
-:link-type: doc
-Benchmark results for DeepSeek-V3, GPT-OSS, Qwen3 MoE, and more.
-+++
-{bdg-secondary}`benchmarks` {bdg-secondary}`tflops` {bdg-secondary}`tokens-per-sec`
 :::
 
 ::::
