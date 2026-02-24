@@ -237,7 +237,8 @@ class ColumnMappedTextInstructionDataset(Dataset):
         self.use_hf_chat_template = use_hf_chat_template
 
     def __iter__(self) -> Iterator[Dict[str, List[int]]]:
-        raise ValueError("__iter__ is not supported in map mode.")
+        for idx in range(len(self)):
+            yield self[idx]
 
     def __len__(self) -> int:  # noqa: D401
         """
@@ -258,13 +259,19 @@ class ColumnMappedTextInstructionDataset(Dataset):
         Returns:
             A dictionary with the mapped columns.
         """
-        row = self.dataset[idx]
-        mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
-        mapped = self._apply_tokenizer(mapped)
-        if not any(label != -100 for label in mapped["labels"]):
-            return self.__getitem__((idx + 1) % len(self.dataset))
-        assert _check_all_values_equal_length(mapped), "All values must be of the same length"
-        return mapped
+        n = len(self.dataset)
+        for _ in range(n):
+            row = self.dataset[idx]
+            mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
+            mapped = self._apply_tokenizer(mapped)
+            if any(label != -100 for label in mapped["labels"]):
+                assert _check_all_values_equal_length(mapped), "All values must be of the same length"
+                return mapped
+            idx = (idx + 1) % n
+        raise ValueError(
+            "All samples in the dataset produced labels that are entirely -100. "
+            "Check that the dataset and tokenizer configuration produce valid training targets."
+        )
 
     def _apply_tokenizer(self, sample: Dict[str, str]) -> Dict[str, List[int]]:
         """

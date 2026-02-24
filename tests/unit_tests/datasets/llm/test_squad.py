@@ -36,6 +36,8 @@ class DummyTokenizer:
         self._vocab = {"<eos>": 0, "<bos>": 1, start_of_turn: 2}
         self.eos_token_id = 0
         self.bos_token_id = 1
+        self.pad_token_id = None
+        self.pad_token = None
         # mimic HF tokenizer setting: add BOS when computing lengths/masks
         self.add_bos_token = True
         if with_chat_template:
