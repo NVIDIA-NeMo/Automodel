@@ -1591,6 +1591,104 @@ def test_apply_ac_prefers_num_experts_over_moe_num_experts(monkeypatch):
     assert captured_num_experts == 16
 
 
+def test_apply_ac_derives_num_experts_from_moe_config(monkeypatch):
+    """Test that apply_ac derives num_experts from model.model.moe_config.n_routed_experts."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    captured_num_experts = None
+
+    def fake_create_selective_checkpoint_contexts(policy_cb):
+        nonlocal captured_num_experts
+        torch_stub = sys.modules["torch"]
+        for ne in [8, 16, 32, 64]:
+            rhs = type("Mat", (), {"shape": (256, ne)})()
+            result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs)
+            if result == P.CheckpointPolicy.MUST_SAVE:
+                captured_num_experts = ne
+                break
+        return "CTX"
+
+    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+        if context_fn is not None:
+            context_fn()
+        return block
+
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
+
+    class Config:
+        hidden_size = 256
+
+    class MoeConfig:
+        n_routed_experts = 32
+
+    class Inner:
+        def __init__(self):
+            self.moe_config = MoeConfig()
+            self.layers = LayerContainer([DummyBlock()])
+
+    class Outer:
+        def __init__(self):
+            self.config = Config()
+            self.model = Inner()
+
+    model = Outer()
+
+    P.apply_ac(model, ignore_router=True)
+
+    assert captured_num_experts == 32
+
+
+def test_apply_ac_prefers_moe_config_over_config_attrs(monkeypatch):
+    """Test that apply_ac prefers moe_config.n_routed_experts over model.config attributes."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    captured_num_experts = None
+
+    def fake_create_selective_checkpoint_contexts(policy_cb):
+        nonlocal captured_num_experts
+        torch_stub = sys.modules["torch"]
+        for ne in [8, 16, 32, 64]:
+            rhs = type("Mat", (), {"shape": (256, ne)})()
+            result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs)
+            if result == P.CheckpointPolicy.MUST_SAVE:
+                captured_num_experts = ne
+                break
+        return "CTX"
+
+    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+        if context_fn is not None:
+            context_fn()
+        return block
+
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
+
+    class Config:
+        hidden_size = 256
+        num_experts = 64  # Should be ignored in favor of moe_config
+
+    class MoeConfig:
+        n_routed_experts = 32
+
+    class Inner:
+        def __init__(self):
+            self.moe_config = MoeConfig()
+            self.layers = LayerContainer([DummyBlock()])
+
+    class Outer:
+        def __init__(self):
+            self.config = Config()
+            self.model = Inner()
+
+    model = Outer()
+
+    P.apply_ac(model, ignore_router=True)
+
+    # moe_config should take priority over config.num_experts
+    assert captured_num_experts == 32
+
+
 def test_apply_fsdp_handles_block_with_moe_attribute(monkeypatch):
     """Test that apply_fsdp correctly handles blocks with 'moe' attribute (Step3p5 style)."""
     P = _import_parallelizer_with_stubs(monkeypatch)
