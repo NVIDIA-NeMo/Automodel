@@ -23,26 +23,47 @@ content_type: index
 
 # NeMo AutoModel Documentation
 
-GPU-accelerated PyTorch training for LLMs and VLMs with day-0 Hugging Face model support.
+## Introduction to NeMo AutoModel
+Learn about the AutoModel, how it works at a high-level, and the key features.
 
-## Training Workflows
+
+::::{grid} 1 2 2 2
+:gutter: 1 1 1 2
+
+:::{grid-item-card} {octicon}`book;1.5em;sd-mr-1` About NeMo AutoModel
+:link: repository-structure
+:link-type: doc
+Overview of NeMo AutoModel and its capabilities.
+:::
+
+:::{grid-item-card} {octicon}`book;1.5em;sd-mr-1` Key Features and Concepts
+:link: repository-structure
+:link-type: doc
+Discover the main features and concepts of NeMo Automodel
+:::
+
+:::{grid-item-card} {octicon}`hubot;1.5em;sd-mr-1` 🤗 Hugging Face Integration
+:link: guides/huggingface-api-compatibility
+:link-type: doc
+A `transformers`-compatible library with accelerated model implementations.
+:::
+
+:::{grid-item-card} {octicon}`checklist;1.5em;sd-mr-1` Model Coverage
+:link: model-coverage/overview
+:link-type: doc
+Built on `transformers` for day-0 model support and OOTB compatibility.
+:::
+
+::::
+
+## Quickstart
 
 Pick your modality and task to find the right guide.
 
-|            | SFT | PEFT (LoRA) | Pretrain | Knowledge Distillation | Tool Calling |
-|------------|-----|-------------|----------|------------------------|--------------|
-| **LLM**    | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/pretraining.md) | [Guide](guides/llm/knowledge-distillation.md) | [Guide](guides/llm/toolcalling.md) |
-| **VLM**    | [Guide](guides/overview.md) | [Guide](guides/omni/gemma3-3n.md) | -- | -- | -- |
-
-### How Do I Scale?
-
-Every workflow above supports all three scales -- just change how you launch.
-
-| Scale | Launch Method | Guide |
-|-------|---------------|-------|
-| **Single GPU** | `python examples/llm_finetune/finetune.py -c config.yaml` | [Local Workstation](launcher/local-workstation.md) |
-| **Multi-GPU** | `torchrun --nproc-per-node=N examples/llm_finetune/finetune.py -c config.yaml` | [Local Workstation](launcher/local-workstation.md) |
-| **Multi-Node** | Add a `slurm:` section to your YAML config, then `automodel finetune llm -c config.yaml` | [Cluster Deployment](launcher/cluster.md) |
+|            | SFT | PEFT (LoRA) | Tool Calling | QAT | Knowledge Distillation | Pretrain |
+|------------|-----|-------------|--------------|-----|------------------------|----------|
+| **LLM**    | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/toolcalling.md) | [Guide](guides/quantization-aware-training.md) | [Guide](guides/llm/knowledge-distillation.md) | [Guide](guides/llm/pretraining.md) |
+| **VLM**    | [Guide](guides/overview.md) | [Guide](guides/omni/gemma3-3n.md) | -- | -- | -- | -- |
 
 ## Performance
 
@@ -58,7 +79,9 @@ See the [full benchmark results](performance-summary.md) for configuration detai
 
 ## Get Started
 
-::::{grid} 1 2 2 2
+Install NeMo AutoModel and launch your first training job.
+
+::::{grid} 1 2 2 3
 :gutter: 1 1 1 2
 
 :::{grid-item-card} {octicon}`download;1.5em;sd-mr-1` Installation
@@ -73,23 +96,27 @@ Install via PyPI, Docker, or from source.
 YAML-driven recipes with CLI overrides.
 :::
 
-:::{grid-item-card} {octicon}`hubot;1.5em;sd-mr-1` Hugging Face Compatibility
-:link: guides/huggingface-api-compatibility
+:::{grid-item-card} {octicon}`device-desktop;1.5em;sd-mr-1` Local Workstation
+:link: launcher/local-workstation
 :link-type: doc
-Day-0 support for any model on the Hub.
+Run on a single GPU or multi-GPU with torchrun.
 :::
 
-:::{grid-item-card} {octicon}`checklist;1.5em;sd-mr-1` Model Coverage
-:link: model-coverage/overview
+:::{grid-item-card} {octicon}`server;1.5em;sd-mr-1` Cluster (SLURM)
+:link: launcher/cluster
 :link-type: doc
-Supported LLM and VLM families.
+Multi-node training with SLURM and the `automodel` CLI.
+:::
+
+:::{grid-item-card} {octicon}`database;1.5em;sd-mr-1` Datasets
+:link: guides/dataset-overview
+:link-type: doc
+Bring your own dataset for LLM, VLM, or retrieval training.
 :::
 
 ::::
 
 ## Advanced Topics
-
-Optimize training with advanced parallelism, precision, and checkpointing strategies.
 
 ::::{grid} 1 2 2 3
 :gutter: 1 1 1 2
@@ -105,9 +132,9 @@ Torch-native pipelining composable with FSDP2 and DTensor.
 :::{grid-item-card} {octicon}`zap;1.5em;sd-mr-1` FP8 Training
 :link: guides/fp8-training
 :link-type: doc
-Mixed-precision FP8 training with torchao for supported models.
+Mixed-precision FP8 training with torchao.
 +++
-{bdg-secondary}`fp8` {bdg-secondary}`mixed-precision`
+{bdg-secondary}`FP8` {bdg-secondary}`mixed-precision`
 :::
 
 :::{grid-item-card} {octicon}`database;1.5em;sd-mr-1` Checkpointing
@@ -115,7 +142,7 @@ Mixed-precision FP8 training with torchao for supported models.
 :link-type: doc
 Distributed checkpoints with SafeTensors output.
 +++
-{bdg-secondary}`dcp` {bdg-secondary}`safetensors`
+{bdg-secondary}`DCP` {bdg-secondary}`safetensors`
 :::
 
 :::{grid-item-card} {octicon}`shield-check;1.5em;sd-mr-1` Gradient Checkpointing
@@ -131,40 +158,34 @@ Trade compute for memory with activation checkpointing.
 :link-type: doc
 Train with quantization for deployment-ready models.
 +++
-{bdg-secondary}`qat`
+{bdg-secondary}`QAT`
 :::
 
-:::{grid-item-card} {octicon}`graph;1.5em;sd-mr-1` MLflow Logging
+:::{grid-item-card} {octicon}`graph;1.5em;sd-mr-1` Experiment Tracking
 :link: guides/mlflow-logging
 :link-type: doc
-Track experiments and metrics with MLflow integration.
+Track experiments and metrics with MLflow and Wandb.
 +++
-{bdg-secondary}`experiment-tracking`
+{bdg-secondary}`MLflow` {bdg-secondary}`Wandb`
 :::
 
 ::::
 
-## Launch & Infrastructure
-
-Run training on local workstations or multi-node clusters.
+## For Developers
 
 ::::{grid} 1 2 2 2
 :gutter: 1 1 1 2
 
-:::{grid-item-card} {octicon}`device-desktop;1.5em;sd-mr-1` Local Workstation
-:link: launcher/local-workstation
+:::{grid-item-card} {octicon}`file-directory;1.5em;sd-mr-1` Repo Internals
+:link: repository-structure
 :link-type: doc
-Interactive single-node and multi-GPU training.
-+++
-{bdg-secondary}`torchrun` {bdg-secondary}`interactive`
+Components, recipes, and CLI architecture.
 :::
 
-:::{grid-item-card} {octicon}`server;1.5em;sd-mr-1` Cluster (SLURM)
-:link: launcher/cluster
+:::{grid-item-card} {octicon}`code;1.5em;sd-mr-1` API Reference
+:link: apidocs/index
 :link-type: doc
-Multi-node training with SLURM and the `automodel` CLI.
-+++
-{bdg-secondary}`slurm` {bdg-secondary}`multi-node`
+Auto-generated Python API documentation.
 :::
 
 ::::
