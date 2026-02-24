@@ -107,7 +107,7 @@ docker run --gpus all -it --rm \
   nvcr.io/nvidia/nemo:25.07 /bin/bash -c "\
     cd /workspace/Automodel && \           # Enter the mounted repo
     pip install -e . && \                  # Install Automodel in editable mode
-    python3 examples/llm/finetune.py" # Run a usage example
+    python3 examples/llm_finetune/finetune.py" # Run a usage example
 ```
 :::{note}
 The above `docker` command uses the volume `-v` option to mount the local `Automodel` directory
