@@ -54,6 +54,7 @@ from nemo_automodel.components.distributed.config import (  # noqa: E402
 from nemo_automodel.components.distributed.ddp import DDPManager  # noqa: E402
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe  # noqa: E402
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager  # noqa: E402
+from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline  # noqa: E402, F401
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig  # noqa: E402
 from nemo_automodel.components.moe.config import MoEParallelizerConfig  # noqa: E402
 from nemo_automodel.components.quantization.qat import QATConfig  # noqa: E402
@@ -704,3 +705,177 @@ class NeMoAutoModelForTextToWaveform(_BaseNeMoAutoModelClass, AutoModelForTextTo
     """
 
     pass
+
+
+class NeMoAutoModelBiencoder:
+    """NeMo AutoModel for biencoder/embedding tasks with full infrastructure support.
+
+    This class provides a unified interface for loading biencoder models with
+    support for PEFT, FSDP, TP, CP, FP8, QAT, and other infrastructure features.
+    It uses the BiencoderModel.build() method to create the model and then applies
+    all infrastructure through apply_model_infrastructure().
+
+    This class properly integrates with the model registry and applies all
+    kernel patching and infrastructure support.
+
+    Examples:
+    --------
+    >>> model = NeMoAutoModelBiencoder.from_pretrained("meta-llama/Llama-3.2-1B")
+    >>> model = NeMoAutoModelBiencoder.from_pretrained(
+    ...     "meta-llama/Llama-3.2-1B",
+    ...     distributed_config=FSDP2Config(),
+    ... )
+    """
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        share_encoder: bool = True,
+        pooling: str = "avg",
+        l2_normalize: bool = True,
+        attn_implementation: str = "flash_attention_2",
+        use_liger_kernel: bool = True,
+        use_sdpa_patching: bool = True,
+        sdpa_method: Optional[List[SDPBackend]] = None,
+        torch_dtype="auto",
+        device_mesh: Optional["DeviceMesh"] = None,
+        moe_mesh: Optional["DeviceMesh"] = None,
+        tp_plan: Optional[dict] = None,
+        distributed_config: Optional[DistributedConfig] = None,
+        moe_config: Optional[MoEParallelizerConfig] = None,
+        compile_config: Optional["CompileConfig"] = None,
+        peft_config: Optional[dict] = None,
+        **kwargs,
+    ) -> PreTrainedModel:
+        """
+        Load a biencoder model from pretrained weights with full infrastructure support.
+
+        This method builds a biencoder using BiencoderModel.build(), applies kernel
+        patching, and then applies all infrastructure (FSDP, checkpointing, etc.)
+        through apply_model_infrastructure().
+
+        Args:
+            pretrained_model_name_or_path: Path to pretrained model or model identifier.
+            share_encoder: Whether to share encoder weights between query and passage.
+            pooling: Pooling strategy ('avg', 'cls', 'last', etc.).
+            l2_normalize: Whether to L2 normalize embeddings.
+            attn_implementation: Attention implementation to use (e.g.,
+                ``"flash_attention_2"``, ``"sdpa"``, ``"eager"``).
+                Defaults to ``"flash_attention_2"``.
+            use_liger_kernel: Whether to apply Liger kernel optimizations.
+            use_sdpa_patching: Whether to apply SDPA patching.
+            sdpa_method: SDPA backend methods to use.
+            torch_dtype: Data type passed to the underlying model initialization.
+            device_mesh: Pre-created device mesh for distributed training.
+            moe_mesh: Device mesh for expert parallelism (FSDP2 only).
+            tp_plan: Custom tensor parallel plan; overrides distributed_config.tp_plan.
+            distributed_config: Strategy-specific distributed training configuration.
+            moe_config: MoE parallelizer configuration.
+            compile_config: Configuration for torch.compile.
+            **kwargs: Additional arguments passed to BiencoderModel.build.
+
+        Returns:
+            BiencoderModel instance with loaded weights and all infrastructure applied.
+
+        Notes:
+            If kernel patching fails, the method retries with adjusted parameters.
+        """
+        from nemo_automodel._transformers.biencoder import BiencoderModel
+
+        logger.info(f"Loading NeMoAutoModelBiencoder from {pretrained_model_name_or_path}")
+
+        def _retry(**override):
+            """Internal helper to re-enter this function with patched parameters."""
+            return cls.from_pretrained(
+                pretrained_model_name_or_path,
+                share_encoder=share_encoder,
+                pooling=pooling,
+                l2_normalize=l2_normalize,
+                attn_implementation=attn_implementation,
+                use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
+                use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
+                sdpa_method=sdpa_method,
+                torch_dtype=torch_dtype,
+                device_mesh=device_mesh,
+                moe_mesh=moe_mesh,
+                tp_plan=tp_plan,
+                distributed_config=distributed_config,
+                moe_config=moe_config,
+                compile_config=compile_config,
+                peft_config=peft_config,
+                **kwargs,
+            )
+
+        kwargs = dict(kwargs)
+        kwargs.pop("tp_size", None)
+        kwargs.pop("cp_size", None)
+        kwargs.pop("has_packed_sequence", None)
+
+        if tp_plan is not None and distributed_config is not None:
+            distributed_config.tp_plan = tp_plan
+
+        mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+
+        model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
+            distributed_config=distributed_config,
+            pipeline_config=None,
+            qat_config=None,
+            moe_config=moe_config,
+            device=torch.device("cuda", torch.cuda.current_device()),
+            mesh=mesh,
+        )
+        loss_fn = None
+
+        is_meta_device = False
+        device = torch.cuda.current_device()
+
+        model = BiencoderModel.build(
+            model_name_or_path=pretrained_model_name_or_path,
+            share_encoder=share_encoder,
+            pooling=pooling,
+            l2_normalize=l2_normalize,
+            attn_implementation=attn_implementation,
+            **kwargs,
+        )
+
+        try:
+            if use_liger_kernel:
+                logger.info("Applying Liger kernel patching to biencoder")
+                model = _patch_liger_kernel(model)
+        except RuntimeError:
+            logger.warning("Retrying without Liger kernels.")
+            del model
+            gc.collect()
+            return _retry(use_liger_kernel=False)
+
+        try:
+            if use_sdpa_patching:
+                logger.info("Applying SDPA patching to biencoder")
+                model = _patch_attention(model, sdpa_method)  # noqa: F821
+        except Exception:
+            logger.warning("Retrying without SDPA patching.")
+            del model
+            gc.collect()
+            return _retry(use_sdpa_patching=False)
+
+        model = apply_model_infrastructure(
+            model=model,  # noqa: F821
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            is_meta_device=is_meta_device,
+            device=device,
+            model_wrapper=model_wrapper,
+            mesh=mesh,
+            peft_config=peft_config,
+            quantization_config=None,
+            fp8_config=None,
+            qat_quantizer=qat_quantizer,
+            loss_fn=loss_fn,
+            autopipeline=autopipeline,
+            parallelize_fn=parallelize_fn,
+            compile_config=compile_config,
+            load_base_model=False,  # BiencoderModel.build already loads weights
+            cache_dir=kwargs.get("cache_dir", hf_constants.HF_HUB_CACHE),
+        )
+
+        return model
