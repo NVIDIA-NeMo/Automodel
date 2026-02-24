@@ -18,7 +18,7 @@ from unittest.mock import patch
 from transformers.tokenization_utils_base import BatchEncoding
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
-from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import _add_token, _remap_system_role
+from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import _add_token
 
 
 class _StubHFTokenizer:
@@ -215,83 +215,3 @@ class TestAddTokenHelper:
         enc = BatchEncoding({"input_ids": "not-a-list"})
         with pytest.raises(ValueError):
             _add_token(enc, 101, 0, "input_ids")
-
-
-class TestRemapSystemRole:
-    """Unit tests for _remap_system_role."""
-
-    def test_merges_system_into_first_user(self):
-        conv = [
-            {"role": "system", "content": "You are helpful."},
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi!"},
-        ]
-        result = _remap_system_role(conv)
-        assert len(result) == 2
-        assert result[0]["role"] == "user"
-        assert result[0]["content"] == "You are helpful.\nHello"
-        assert result[1] == {"role": "assistant", "content": "Hi!"}
-
-    def test_system_removed_from_output(self):
-        conv = [
-            {"role": "system", "content": "Be concise."},
-            {"role": "user", "content": "Summarize"},
-        ]
-        result = _remap_system_role(conv)
-        assert all(m.get("role") != "system" for m in result)
-
-    def test_no_user_message_creates_one(self):
-        conv = [
-            {"role": "system", "content": "System prompt only."},
-            {"role": "assistant", "content": "OK"},
-        ]
-        result = _remap_system_role(conv)
-        assert result[0] == {"role": "user", "content": "System prompt only."}
-        assert result[1] == {"role": "assistant", "content": "OK"}
-
-    def test_multiple_system_messages_raises(self):
-        conv = [
-            {"role": "system", "content": "First"},
-            {"role": "user", "content": "Hi"},
-            {"role": "system", "content": "Second"},
-        ]
-        with pytest.raises(ValueError, match="System role appeared in multiple messages"):
-            _remap_system_role(conv)
-
-    def test_empty_system_content(self):
-        conv = [
-            {"role": "system", "content": ""},
-            {"role": "user", "content": "Question"},
-        ]
-        result = _remap_system_role(conv)
-        assert len(result) == 1
-        assert result[0]["role"] == "user"
-        assert result[0]["content"] == "\nQuestion"
-
-    def test_only_merges_first_user(self):
-        conv = [
-            {"role": "system", "content": "Sys"},
-            {"role": "user", "content": "First user"},
-            {"role": "assistant", "content": "Reply"},
-            {"role": "user", "content": "Second user"},
-        ]
-        result = _remap_system_role(conv)
-        assert len(result) == 3
-        assert result[0]["content"] == "Sys\nFirst user"
-        assert result[2]["content"] == "Second user"
-
-    def test_preserves_extra_keys_in_messages(self):
-        conv = [
-            {"role": "system", "content": "Sys"},
-            {"role": "user", "content": "Hi", "name": "alice"},
-        ]
-        result = _remap_system_role(conv)
-        assert result[0]["name"] == "alice"
-
-    def test_system_without_content_key(self):
-        conv = [
-            {"role": "system"},
-            {"role": "user", "content": "Hello"},
-        ]
-        result = _remap_system_role(conv)
-        assert result[0]["content"] == "\nHello"
