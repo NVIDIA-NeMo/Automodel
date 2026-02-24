@@ -62,18 +62,18 @@ Pick your modality and task to find the right guide.
 
 |            | SFT | PEFT (LoRA) | Tool Calling | QAT | Knowledge Distillation | Pretrain |
 |------------|-----|-------------|--------------|-----|------------------------|----------|
-| **LLM**    | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/toolcalling.md) | [Guide](guides/quantization-aware-training.md) | [Guide](guides/llm/knowledge-distillation.md) | [Guide](guides/llm/pretraining.md) |
+| **LLM**    | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/finetune.md#recipe-config) | [Guide](guides/llm/toolcalling.md) | [Guide](guides/quantization-aware-training.md) | [Guide](guides/llm/knowledge-distillation.md) | [Guide](guides/llm/pretraining.md) |
 | **VLM**    | [Guide](guides/overview.md) | [Guide](guides/omni/gemma3-3n.md) | -- | -- | -- | -- |
 
 ## Performance
 
-Benchmark throughput with optimized kernels.
+Training throughput on NVIDIA GPUs with optimized kernels for Hugging Face models.
 
 | Model | GPUs | TFLOPs/sec/GPU | Tokens/sec/GPU | Optimizations |
 |-------|-----:|---------------:|---------------:|---------------|
 | DeepSeek V3 671B | 256 | 250 | 1,002 | TE + DeepEP |
 | GPT-OSS 20B | 8 | 279 | 13,058 | TE + DeepEP + FlexAttn |
-| Qwen3 MoE 30B | 8 | 277 | 12,040 | TE + DeepEP |
+| Qwen3 MoE 30B | 8 | 212 | 11,842 | TE + DeepEP |
 
 See the [full benchmark results](performance-summary.md) for configuration details and more models.
 
@@ -117,6 +117,7 @@ Bring your own dataset for LLM, VLM, or retrieval training.
 ::::
 
 ## Advanced Topics
+Parallelism, precision, checkpointing strategies and experiment tracking.
 
 ::::{grid} 1 2 2 3
 :gutter: 1 1 1 2
