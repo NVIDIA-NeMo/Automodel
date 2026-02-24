@@ -248,7 +248,12 @@ def _build_minified_model(kind: ModelKind):
             attn_implementation="eager",
             dtype=torch.float32,
         )
-        return cfg, Qwen2ForCausalLM(cfg, backend=backend)
+        model = Qwen2ForCausalLM(cfg, backend=backend)
+        with torch.no_grad():
+            for _, module in model.named_modules():
+                if isinstance(module, torch.nn.Linear) and module.bias is not None:
+                    torch.nn.init.normal_(module.bias, mean=0.1, std=0.1)
+        return cfg, model
 
     raise ValueError(f"Unknown model kind: {kind}")
 

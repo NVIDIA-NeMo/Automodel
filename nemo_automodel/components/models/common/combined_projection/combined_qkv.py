@@ -24,11 +24,17 @@ from torch.distributed.tensor import DTensor
 
 
 def _assert_colwise_parallel(weight: torch.Tensor, name: str) -> None:
-    """Verify that a combined-projection weight uses ColwiseParallel (Shard(0)) if TP is active."""
+    """Verify that a combined-projection weight uses ColwiseParallel (Shard(0)) if TP is active.
+
+    Shard(dim=1) is expected from FSDP pre-sharding of combined projections and
+    is excluded from the check — it is temporary and undone by FSDP all-gather
+    before the actual matmul.
+    """
     if isinstance(weight, DTensor) and weight.placements:
         from torch.distributed.tensor.placement_types import Shard
 
-        if weight.placements[0] != Shard(0):
+        tp_shards = [p for p in weight.placements if isinstance(p, Shard) and p.dim != 1]
+        if tp_shards and not any(p.dim == 0 for p in tp_shards):
             raise ValueError(
                 f"{name} uses an interleaved layout that requires ColwiseParallel "
                 f"(Shard(0)) for correct TP sharding, but got placements={weight.placements}. "
