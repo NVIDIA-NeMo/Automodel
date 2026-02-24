@@ -202,6 +202,25 @@ def test_get_check_model_inputs_decorator():
     assert callable(decorator)
 
 
+def test_get_check_model_inputs_decorator_fallback_with_kwargs():
+    """
+    The ``null_decorator`` fallback (returned by ``get_check_model_inputs_decorator``
+    when transformers decorators are unavailable) must work as a plain ``@decorator``
+    on functions called with keyword arguments.
+
+    This guards against a bug where a ``@contextmanager``-wrapped fallback
+    produced a ``ContextDecorator`` whose ``__call__`` collided with model
+    forward kwargs like ``input_ids``.
+    """
+    decorator = si.null_decorator
+
+    @decorator
+    def dummy(x=None):
+        return x
+
+    assert dummy(x=42) == 42
+
+
 def test_null_decorator_as_direct_decorator():
     """
     ``null_decorator`` must be a valid no-op decorator in ``@decorator`` form.
