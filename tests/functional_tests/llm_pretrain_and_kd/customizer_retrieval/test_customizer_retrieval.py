@@ -207,7 +207,7 @@ def _load_finetuned_weights(model, checkpoint_dir: Path):
     )
     checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
     key_mapping = {r"^(?!(model\.|linear_pooler\.))": "model."}
-    checkpointer.load_model(model, model_path=str(checkpoint_dir), key_mapping=key_mapping)
+    checkpointer.load_model(model, model_path=str(checkpoint_dir / "model"), key_mapping=key_mapping)
     checkpointer.close()
     return model
 
@@ -295,15 +295,24 @@ class TestCustomizerRetrieval:
     # -- Test: ONNX export + verification -----------------------------------
 
     def test_onnx_export_and_verify(self, checkpoint_dir):
-        """Export the fine-tuned checkpoint to ONNX and verify the graph
+        """Export the fitests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/test_customizer_retrieval.pyne-tuned checkpoint to ONNX and verify the graph
         produces valid, finite, correctly-shaped embeddings."""
         import onnxruntime
         from transformers import AutoTokenizer
 
         from nemo_automodel.components.models.biencoder.export_onnx import export_to_onnx
 
+        # The recipe sets save_consolidated=true, so the checkpoint has a
+        # model/consolidated/ directory with standard HF-named safetensors
+        # that AutoModel.from_pretrained can load directly.
+        consolidated_dir = checkpoint_dir / "model" / "consolidated"
+        assert consolidated_dir.is_dir(), (
+            f"Consolidated checkpoint not found at {consolidated_dir}. "
+            "Ensure the recipe sets save_consolidated: true."
+        )
+
         onnx_path = export_to_onnx(
-            model_path=str(checkpoint_dir),
+            model_path=str(consolidated_dir),
             output_dir=ONNX_OUTPUT_DIR,
             tokenizer_path=BASE_MODEL_PATH,
             pooling="avg",
