@@ -86,11 +86,72 @@ def test_llama_bidirectional_model_init_and_mask():
     model = lbm.LlamaBidirectionalModel(cfg)
     # All layers should be non-causal
     assert all(getattr(layer.self_attn, "is_causal", True) is False for layer in model.layers)
-    # Causal mask update behavior
+    # None in → None out
+    assert model._update_causal_mask(None) is None
+    # Mask with padding → returns a 4D float mask (not None)
     mask = torch.tensor([[1, 1, 0]])
-    out_mask = model._update_causal_mask(mask)
-    assert out_mask is mask
-    assert model._update_causal_mask(torch.ones_like(mask)) is None
+    input_tensor = torch.randn(1, 3, 32)
+    out_mask = model._update_causal_mask(mask, input_tensor=input_tensor)
+    assert out_mask is not None and out_mask.dim() == 4
+    # All-ones mask → 4D mask of all zeros (semantically equivalent to None / no masking)
+    all_ones_out = model._update_causal_mask(torch.ones_like(mask), input_tensor=input_tensor)
+    assert all_ones_out is not None and (all_ones_out == 0.0).all()
+
+
+def test_update_causal_mask_equivalence_with_old_impl():
+    """The old _update_causal_mask used a data-dependent `(mask == 0).any()` branch
+    that is incompatible with torch.export / ONNX.  The new implementation delegates
+    to _prepare_4d_attention_mask.  This test checks semantic equivalence: the same
+    positions are masked/unmasked when the 4D output is applied as an additive bias
+    to attention scores."""
+
+    def old_update_causal_mask(attention_mask):
+        """Original implementation (pre-ONNX fix)."""
+        if attention_mask is not None and (attention_mask == 0.0).any():
+            return attention_mask
+        return None
+
+    cfg = lbm.LlamaBidirectionalConfig(
+        vocab_size=128, hidden_size=32, num_hidden_layers=1, num_attention_heads=1, intermediate_size=64, pad_token_id=0
+    )
+    model = lbm.LlamaBidirectionalModel(cfg)
+
+    # Case 1: None → both return None
+    assert old_update_causal_mask(None) is None
+    assert model._update_causal_mask(None) is None
+
+    # Case 2: all-ones mask (no padding) → old returns None, new returns 4D zeros
+    all_ones = torch.ones(2, 4, dtype=torch.long)
+    input_tensor = torch.randn(2, 4, 32)
+    assert old_update_causal_mask(all_ones) is None
+    new_out = model._update_causal_mask(all_ones, input_tensor=input_tensor)
+    assert new_out is not None and (new_out == 0.0).all(), "all-ones mask must produce all-zero 4D mask (no masking)"
+
+    # Case 3: mask with padding → same positions masked / unmasked
+    masks = [
+        torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]]),
+        torch.tensor([[1, 0, 1, 0]]),
+        torch.tensor([[0, 0, 0, 0]]),
+    ]
+    for mask_2d in masks:
+        bsz, seq_len = mask_2d.shape
+        inp = torch.randn(bsz, seq_len, 32)
+        old_out = old_update_causal_mask(mask_2d)
+        new_out = model._update_causal_mask(mask_2d, input_tensor=inp)
+
+        assert old_out is not None, "old impl should return mask when zeros present"
+        assert new_out is not None and new_out.shape == (bsz, 1, seq_len, seq_len)
+
+        for b in range(bsz):
+            for s in range(seq_len):
+                if mask_2d[b, s] == 1:
+                    assert (new_out[b, :, :, s] == 0.0).all(), (
+                        f"non-padded position [{b},{s}] must be attend-able (0.0)"
+                    )
+                else:
+                    assert (new_out[b, :, :, s] < -1e9).all(), (
+                        f"padded position [{b},{s}] must be masked (large negative)"
+                    )
 
 
 # --- Fakes for classification and biencoder tests ---
