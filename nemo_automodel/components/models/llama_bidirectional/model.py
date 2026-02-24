@@ -29,19 +29,10 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.models.llama.configuration_llama import LlamaConfig
+from transformers.masking_utils import create_bidirectional_mask
 from transformers.models.llama.modeling_llama import LlamaForSequenceClassification, LlamaModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
-
-# Check if native create_bidirectional_mask exists (transformers >= 5.0)
-try:
-    from transformers.masking_utils import create_bidirectional_mask
-
-    _HAS_NATIVE_BIDIRECTIONAL_MASK = True
-except ImportError:
-    from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask
-
-    _HAS_NATIVE_BIDIRECTIONAL_MASK = False
 
 try:
     from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
@@ -108,42 +99,6 @@ class LlamaBidirectionalModel(LlamaModel):
         for layer in self.layers:
             layer.self_attn.is_causal = False
 
-    def _create_bidirectional_mask(
-        self,
-        input_embeds: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        """Create a bidirectional attention mask suitable for the active attention implementation.
-
-        Args:
-            input_embeds: Input embeddings (batch_size, seq_len, hidden_size).
-            attention_mask: 2D padding mask (batch_size, seq_len) with 1 for real
-                tokens and 0 for padding, or None.
-
-        Returns:
-            A 4D float mask for sdpa/eager, a 2D mask for flash_attention_2,
-            or None when no masking is needed.
-        """
-        if attention_mask is None:
-            return None
-
-        if _HAS_NATIVE_BIDIRECTIONAL_MASK:
-            return create_bidirectional_mask(
-                config=self.config,
-                input_embeds=input_embeds,
-                attention_mask=attention_mask,
-            )
-
-        # Flash attention handles 2D masks internally; only pass mask if there
-        # are actually masked tokens (zeros), otherwise return None for efficiency.
-        if getattr(self.config, "_attn_implementation", None) == "flash_attention_2":
-            has_masked_tokens = (attention_mask == 0).any()
-            return attention_mask if has_masked_tokens else None
-
-        # For sdpa / eager: expand to 4D and cast to the model's compute dtype
-        # so that SDPA receives a float mask matching query dtype.
-        return _prepare_4d_attention_mask(attention_mask, input_embeds.dtype)
-
     @check_model_inputs
     def forward(
         self,
@@ -174,7 +129,11 @@ class LlamaBidirectionalModel(LlamaModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        bidirectional_mask = self._create_bidirectional_mask(inputs_embeds, attention_mask)
+        bidirectional_mask = create_bidirectional_mask(
+            config=self.config,
+            input_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
