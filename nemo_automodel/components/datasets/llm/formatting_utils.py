@@ -81,14 +81,15 @@ _warned_add_pad_token = set()
 def _add_pad_token(tokenizer):
     """Add pad token to tokenizer if not present."""
     pad_token_id = None
-    if getattr(tokenizer, "pad_token_id", None) is None and not "no_pad_id" in _warned_add_pad_token:
-        _warned_add_pad_token.add("no_pad_id")
+    if getattr(tokenizer, "pad_token_id", None) is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-        logger.warning(
-            "Tokenizer has no pad_token_id; falling back to eos_token_id (%s). "
-            "This may cause issues if downstream code masks padding by token ID.",
-            tokenizer.eos_token_id,
-        )
+        if not "no_pad_id" in _warned_add_pad_token:
+            _warned_add_pad_token.add("no_pad_id")
+            logger.warning(
+                "Tokenizer has no pad_token_id; falling back to eos_token_id (%s). "
+                "This may cause issues if downstream code masks padding by token ID.",
+                tokenizer.eos_token_id,
+            )
     else:
         pad_token_id = tokenizer.pad_token_id
     if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
