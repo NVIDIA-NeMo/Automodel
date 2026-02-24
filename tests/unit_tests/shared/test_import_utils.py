@@ -200,3 +200,26 @@ def test_get_check_model_inputs_decorator():
     """
     decorator = si.get_check_model_inputs_decorator()
     assert callable(decorator)
+
+
+def test_null_decorator_as_direct_decorator():
+    """
+    ``null_decorator`` must be a valid no-op decorator in ``@decorator`` form.
+    """
+    @si.null_decorator
+    def _identity(x):
+        return x
+
+    assert _identity(7) == 7
+
+
+def test_null_decorator_as_factory():
+    """
+    ``null_decorator`` must also work in ``@decorator()`` form.
+    """
+
+    @si.null_decorator()
+    def _identity(x):
+        return x
+
+    assert _identity(11) == 11
