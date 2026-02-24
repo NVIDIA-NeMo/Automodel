@@ -38,22 +38,6 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher, TokenDispatcherConfig
 
 # ── EP variable-length collective helpers ──
-_ep_collective_group_cache: dict[tuple[int, ...], dist.ProcessGroup] = {}
-
-
-def _get_or_create_ep_collective_group(ep_mesh: DeviceMesh) -> dist.ProcessGroup:
-    """Return a dedicated ProcessGroup for EP collectives.
-
-    Using a separate group from FSDP avoids cross-feature collective ordering
-    interference when EP and FSDP both communicate over world-size groups.
-    """
-    mesh_ranks = tuple(int(r) for r in ep_mesh.mesh.flatten().tolist())
-    cached = _ep_collective_group_cache.get(mesh_ranks)
-    if cached is not None:
-        return cached
-    pg = dist.new_group(ranks=list(mesh_ranks))
-    _ep_collective_group_cache[mesh_ranks] = pg
-    return pg
 
 
 class _AllGatherConcatVarlenFn(Function):
@@ -314,7 +298,7 @@ class GroupedExperts(nn.Module):
 
         # EP variable-length all-gather
         if ep_size > 1:
-            ep_group = _get_or_create_ep_collective_group(ep_mesh)
+            ep_group = ep_mesh.get_group()
             local_num_tokens = x.size(0)
 
             # Exchange per-rank token counts
