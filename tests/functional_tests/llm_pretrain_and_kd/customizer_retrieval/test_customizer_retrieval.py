@@ -98,6 +98,7 @@ def _build_eval_model(device: torch.device):
         use_liger_kernel=False,
         use_sdpa_patching=False,
         torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
     ).to(device).eval()
 
 
