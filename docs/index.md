@@ -29,10 +29,10 @@ GPU-accelerated PyTorch training for LLMs and VLMs with day-0 Hugging Face model
 
 Pick your modality and task to find the right guide.
 
-|            | SFT | PEFT (LoRA) | Pretrain | Knowledge Distillation |
-|------------|-----|-------------|----------|------------------------|
-| **LLM**    | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/pretraining.md) | [Guide](guides/llm/knowledge-distillation.md) |
-| **VLM**    | [Guide](guides/overview.md) | [Guide](guides/omni/gemma3-3n.md) | -- | -- |
+|            | SFT | PEFT (LoRA) | Pretrain | Knowledge Distillation | Tool Calling |
+|------------|-----|-------------|----------|------------------------|--------------|
+| **LLM**    | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/pretraining.md) | [Guide](guides/llm/knowledge-distillation.md) | [Guide](guides/llm/toolcalling.md) |
+| **VLM**    | [Guide](guides/overview.md) | [Guide](guides/omni/gemma3-3n.md) | -- | -- | -- |
 
 ### How Do I Scale?
 
@@ -209,6 +209,7 @@ performance-summary.md
 guides/overview.md
 guides/llm/finetune.md
 guides/llm/toolcalling.md
+guides/llm/knowledge-distillation.md
 guides/llm/pretraining.md
 guides/llm/nanogpt-pretraining.md
 guides/llm/sequence-classification.md
@@ -244,7 +245,6 @@ guides/vlm/dataset.md
 guides/checkpointing.md
 guides/gradient-checkpointing.md
 guides/pipelining.md
-guides/llm/knowledge-distillation.md
 guides/fp8-training.md
 guides/mlflow-logging.md
 
