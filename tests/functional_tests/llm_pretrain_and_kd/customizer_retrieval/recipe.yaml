@@ -1,5 +1,9 @@
 seed: 42
 
+train_n_passages: 2
+eval_negative_size: 1
+temperature: 1.0
+
 dist_env:
   backend: nccl
   timeout_minutes: 5
@@ -13,21 +17,12 @@ step_scheduler:
   max_steps: 32
 
 model:
-  _target_: nemo_automodel.components.models.biencoder.NeMoAutoModelBiencoder.from_pretrained
+  _target_: nemo_automodel._transformers.auto_model.NeMoAutoModelBiencoder.from_pretrained
   pretrained_model_name_or_path: /home/TestData/automodel/llama-nemotron-embed-1b-v2/
+  trust_remote_code: true
   share_encoder: true
-  add_linear_pooler: false
-  out_dimension: 768
-  do_gradient_checkpointing: false
-  train_n_passages: 2
-  eval_negative_size: 1
   pooling: avg
   l2_normalize: true
-  # t: 0.02 is the model's native inference temperature but the customizer's
-  # successful training does NOT scale scores before CE loss (scale=50 is
-  # commented out in HardNegativeRankingLoss).  Setting t=1.0 here disables
-  # temperature during training to match.  The eval script hardcodes t=0.02.
-  t: 1.0
   use_liger_kernel: false
   use_sdpa_patching: false
   torch_dtype: bfloat16
@@ -35,6 +30,7 @@ model:
 tokenizer:
   _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
   pretrained_model_name_or_path: /home/TestData/automodel/llama-nemotron-embed-1b-v2/
+  trust_remote_code: true
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

@@ -30,7 +30,6 @@ import os
 import shutil
 import subprocess
 import sys
-from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -88,24 +87,18 @@ def _run_training() -> Path:
 
 
 def _build_eval_model(device: torch.device):
-    """Build a NeMoAutoModelBiencoder for evaluation with the native inference
-    temperature (t=0.02)."""
-    from nemo_automodel.components.models.biencoder import NeMoAutoModelBiencoder
+    """Build a NeMoAutoModelBiencoder for evaluation."""
+    from nemo_automodel._transformers.auto_model import NeMoAutoModelBiencoder
 
     return NeMoAutoModelBiencoder.from_pretrained(
         pretrained_model_name_or_path=BASE_MODEL_PATH,
         share_encoder=True,
-        add_linear_pooler=False,
-        out_dimension=768,
-        do_gradient_checkpointing=False,
-        train_n_passages=2,
-        eval_negative_size=1,
         pooling="avg",
         l2_normalize=True,
-        t=EVAL_TEMPERATURE,
         use_liger_kernel=False,
         use_sdpa_patching=False,
         torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
     ).to(device).eval()
 
 
@@ -159,6 +152,8 @@ def _iter_batches(ds, batch_size: int, max_samples: int):
 @torch.no_grad()
 def _compute_pos_neg_diffs(model, collator, ds, device, batch_size, max_samples):
     """Compute per-sample (pos_score - neg_score) diffs."""
+    from nemo_automodel.recipes.biencoder.train_biencoder import contrastive_scores_and_labels
+
     model.eval()
     diffs: list[np.ndarray] = []
 
@@ -169,8 +164,14 @@ def _compute_pos_neg_diffs(model, collator, ds, device, batch_size, max_samples)
         query = {k[2:]: v for k, v in batch.items() if k.startswith("q_")}
         passage = {k[2:]: v for k, v in batch.items() if k.startswith("d_")}
 
-        out = model(query=query, passage=passage)
-        scores = out.scores  # [batch, n_passages]
+        q_reps = model.encode(query, encoder="query")
+        p_reps = model.encode(passage, encoder="passage")
+
+        # 2 passages per query: 1 positive + 1 negative
+        n_passages = 2
+        scores, _ = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
+
+        # [batch, n_passages]
         assert scores is not None and scores.shape[-1] >= 2, (
             f"Unexpected scores shape: {None if scores is None else tuple(scores.shape)}"
         )

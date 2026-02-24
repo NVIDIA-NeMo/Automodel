@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-from nemo_automodel.components.models.biencoder.state_dict_adapter import BiencoderStateDictAdapter
+from nemo_automodel.components.models.common.bidirectional import BiencoderStateDictAdapter
 
 
 class TestBiencoderStateDictAdapter:
@@ -81,22 +81,6 @@ class TestBiencoderStateDictAdapter:
         assert "model.layer1.weight" in hf_state_dict
         assert "model.layer1.bias" in hf_state_dict
 
-    def test_to_hf_includes_linear_pooler(self, adapter):
-        """Pooler weights should be retained during HF conversion."""
-        biencoder_state_dict = {
-            "lm_q.layer.weight": torch.randn(2, 2),
-            "linear_pooler.weight": torch.randn(4, 4),
-            "linear_pooler.bias": torch.randn(4),
-        }
-
-        hf_state_dict = adapter.to_hf(biencoder_state_dict)
-
-        assert "model.layer.weight" in hf_state_dict  # sanity for lm_q path
-        assert "linear_pooler.weight" in hf_state_dict
-        assert "linear_pooler.bias" in hf_state_dict
-        assert torch.equal(hf_state_dict["linear_pooler.weight"], biencoder_state_dict["linear_pooler.weight"])
-        assert torch.equal(hf_state_dict["linear_pooler.bias"], biencoder_state_dict["linear_pooler.bias"])
-
     def test_from_hf_basic(self, adapter):
         """Test basic conversion from HuggingFace to biencoder format."""
         hf_state_dict = {
@@ -118,23 +102,6 @@ class TestBiencoderStateDictAdapter:
         assert torch.equal(biencoder_state_dict["lm_p.layer1.weight"], hf_state_dict["model.layer1.weight"])
         assert torch.equal(biencoder_state_dict["lm_q.layer2.bias"], hf_state_dict["model.layer2.bias"])
         assert torch.equal(biencoder_state_dict["lm_p.layer2.bias"], hf_state_dict["model.layer2.bias"])
-
-    def test_from_hf_includes_linear_pooler(self, adapter):
-        """Pooler weights should be retained when converting from HF."""
-        hf_state_dict = {
-            "model.layer.weight": torch.randn(2, 2),
-            "linear_pooler.weight": torch.randn(4, 4),
-            "linear_pooler.bias": torch.randn(4),
-        }
-
-        biencoder_state_dict = adapter.from_hf(hf_state_dict)
-
-        assert "lm_q.layer.weight" in biencoder_state_dict
-        assert "lm_p.layer.weight" in biencoder_state_dict
-        assert "linear_pooler.weight" in biencoder_state_dict
-        assert "linear_pooler.bias" in biencoder_state_dict
-        assert torch.equal(biencoder_state_dict["linear_pooler.weight"], hf_state_dict["linear_pooler.weight"])
-        assert torch.equal(biencoder_state_dict["linear_pooler.bias"], hf_state_dict["linear_pooler.bias"])
 
     def test_from_hf_empty_state_dict(self, adapter):
         """Test conversion with empty state dict."""
@@ -185,15 +152,6 @@ class TestBiencoderStateDictAdapter:
         result = adapter.convert_single_tensor_to_hf("other.layer.weight", tensor)
 
         assert result == []
-
-    def test_convert_single_tensor_to_hf_linear_pooler(self, adapter):
-        """Test converting linear_pooler tensor (should be passed through)."""
-        tensor = torch.randn(4)
-        result = adapter.convert_single_tensor_to_hf("linear_pooler.bias", tensor)
-
-        assert len(result) == 1
-        assert result[0][0] == "linear_pooler.bias"
-        assert torch.equal(result[0][1], tensor)
 
     def test_convert_single_tensor_to_hf_with_kwargs(self, adapter):
         """Test that convert_single_tensor_to_hf accepts kwargs."""

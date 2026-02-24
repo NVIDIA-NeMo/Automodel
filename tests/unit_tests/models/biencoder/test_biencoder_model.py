@@ -11,17 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import types
 
 import pytest
 
-import nemo_automodel.components.models.biencoder.biencoder_model as bm
+import nemo_automodel._transformers.auto_model as am
+from nemo_automodel._transformers.biencoder import BiencoderModel
 
 
 class DummyModel:
     def __init__(self):
         self.config = {}
         self.marker = []
+
+
+class DummyMesh:
+    pass
+
+
+def _apply_common_mocks(monkeypatch):
+    """Mock CUDA-dependent infrastructure so tests run without a GPU."""
+    monkeypatch.setattr(am, "instantiate_infrastructure", lambda **kwargs: (None, None, None, None))
+    monkeypatch.setattr(am, "MeshContext", type("MeshContext", (), {"from_meshes": staticmethod(lambda *a, **k: DummyMesh())}))
+    monkeypatch.setattr(am.torch.cuda, "current_device", lambda: 0)
 
 
 def test_from_pretrained_happy_path(monkeypatch):
@@ -44,21 +55,20 @@ def test_from_pretrained_happy_path(monkeypatch):
         model.marker.append("sdpa")
         return model
 
-    monkeypatch.setattr(bm.BiencoderModel, "build", staticmethod(fake_build))
-    monkeypatch.setattr(bm, "_patch_liger_kernel", fake_liger)
-    monkeypatch.setattr(bm, "_patch_attention", fake_sdpa)
+    def fake_apply_infrastructure(model, **kwargs):
+        return model
 
-    model = bm.NeMoAutoModelBiencoder.from_pretrained(
+    _apply_common_mocks(monkeypatch)
+    monkeypatch.setattr(BiencoderModel, "build", staticmethod(fake_build))
+    monkeypatch.setattr(am, "_patch_liger_kernel", fake_liger)
+    monkeypatch.setattr(am, "_patch_attention", fake_sdpa)
+    monkeypatch.setattr(am, "apply_model_infrastructure", fake_apply_infrastructure)
+
+    model = am.NeMoAutoModelBiencoder.from_pretrained(
         pretrained_model_name_or_path="some/path",
         share_encoder=True,
-        add_linear_pooler=False,
-        out_dimension=None,
-        do_gradient_checkpointing=True,
-        train_n_passages=4,
-        eval_negative_size=2,
         pooling="avg",
         l2_normalize=True,
-        t=0.5,
         use_liger_kernel=True,
         use_sdpa_patching=True,
         sdpa_method=None,
@@ -67,13 +77,8 @@ def test_from_pretrained_happy_path(monkeypatch):
     assert isinstance(model, DummyModel)
     # Patches applied
     assert "liger" in model.marker and "sdpa" in model.marker
-    # Config annotated
-    assert "nemo_version" in model.config
     # Ensure HF kwargs injected + passthrough of parameters to build
     assert last_kwargs["attn_implementation"] == "flash_attention_2"
-    assert last_kwargs["train_n_passages"] == 4
-    assert last_kwargs["eval_negative_size"] == 2
-    assert last_kwargs["out_dimension"] == 768  # default when None
     assert last_kwargs["some_other_kwarg"] == "x"
 
 
@@ -92,11 +97,16 @@ def test_from_pretrained_retries_without_liger(monkeypatch):
         calls["sdpa"] += 1
         return model
 
-    monkeypatch.setattr(bm.BiencoderModel, "build", staticmethod(fake_build))
-    monkeypatch.setattr(bm, "_patch_liger_kernel", fake_liger)
-    monkeypatch.setattr(bm, "_patch_attention", fake_sdpa)
+    def fake_apply_infrastructure(model, **kwargs):
+        return model
 
-    model = bm.NeMoAutoModelBiencoder.from_pretrained("x", use_liger_kernel=True, use_sdpa_patching=True)
+    _apply_common_mocks(monkeypatch)
+    monkeypatch.setattr(BiencoderModel, "build", staticmethod(fake_build))
+    monkeypatch.setattr(am, "_patch_liger_kernel", fake_liger)
+    monkeypatch.setattr(am, "_patch_attention", fake_sdpa)
+    monkeypatch.setattr(am, "apply_model_infrastructure", fake_apply_infrastructure)
+
+    model = am.NeMoAutoModelBiencoder.from_pretrained("x", use_liger_kernel=True, use_sdpa_patching=True)
     assert isinstance(model, DummyModel)
     # First attempt calls liger once, then retries without it (so only 1 liger call)
     assert calls["liger"] == 1
@@ -121,11 +131,16 @@ def test_from_pretrained_retries_without_sdpa(monkeypatch):
         calls["sdpa"] += 1
         raise Exception("sdpa failed")
 
-    monkeypatch.setattr(bm.BiencoderModel, "build", staticmethod(fake_build))
-    monkeypatch.setattr(bm, "_patch_liger_kernel", fake_liger)
-    monkeypatch.setattr(bm, "_patch_attention", fake_sdpa)
+    def fake_apply_infrastructure(model, **kwargs):
+        return model
 
-    model = bm.NeMoAutoModelBiencoder.from_pretrained("x", use_liger_kernel=True, use_sdpa_patching=True)
+    _apply_common_mocks(monkeypatch)
+    monkeypatch.setattr(BiencoderModel, "build", staticmethod(fake_build))
+    monkeypatch.setattr(am, "_patch_liger_kernel", fake_liger)
+    monkeypatch.setattr(am, "_patch_attention", fake_sdpa)
+    monkeypatch.setattr(am, "apply_model_infrastructure", fake_apply_infrastructure)
+
+    model = am.NeMoAutoModelBiencoder.from_pretrained("x", use_liger_kernel=True, use_sdpa_patching=True)
     assert isinstance(model, DummyModel)
     # SDPA attempted once then retried without it (no second SDPA call)
     assert calls["sdpa"] == 1
@@ -134,5 +149,3 @@ def test_from_pretrained_retries_without_sdpa(monkeypatch):
     # Liger called only on the first attempt of each build; second attempt still calls liger
     # but since use_liger_kernel remains True for this path, ensure it was called twice.
     assert calls["liger"] == 2
-
-
