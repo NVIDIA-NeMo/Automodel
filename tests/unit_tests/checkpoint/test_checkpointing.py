@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from nemo_automodel.components.checkpoint.checkpointing import (
+    Checkpointer,
     _equally_divide_layers,
     _is_custom_model,
     _model_has_dtensors,
@@ -438,3 +441,129 @@ class TestLoadModelCustomModelGuard:
         mock_load_full.assert_not_called()
         # DCP path should be used
         mock_dcp_load.assert_called_once()
+
+
+# =============================================================================
+# Tests for Checkpointer.initialize_model_weights
+# =============================================================================
+
+
+class TestInitializeModelWeights:
+    """Test cases for Checkpointer.initialize_model_weights static method."""
+
+    def _make_meta_model(self):
+        """Create a simple model on meta device with an _is_hf_initialized flag."""
+        with torch.device("meta"):
+            model = torch.nn.Linear(4, 4)
+        model._is_hf_initialized = True
+        model.config = SimpleNamespace(architectures=["TestModel"])
+        return model
+
+    def test_materializes_parameters_to_device(self):
+        """Parameters should move from meta device to the target device."""
+        model = self._make_meta_model()
+        assert model.weight.device.type == "meta"
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        assert model.weight.device.type == "cpu"
+        assert model.bias.device.type == "cpu"
+
+    def test_materializes_meta_buffers(self):
+        """Meta-device buffers should be materialized to the target device."""
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(architectures=["TestModel"])
+        model.register_buffer("buf", torch.empty(3, device="meta"))
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        assert model.buf.device.type == "cpu"
+
+    def test_resets_is_hf_initialized(self):
+        """_is_hf_initialized should be set to False on all submodules."""
+        model = self._make_meta_model()
+        assert model._is_hf_initialized is True
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        for _, module in model.named_modules():
+            if hasattr(module, "_is_hf_initialized"):
+                assert module._is_hf_initialized is False
+
+    def test_calls_initialize_weights(self):
+        """model.initialize_weights() should be called when available."""
+        model = self._make_meta_model()
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_called_once()
+
+    def test_warns_when_no_initialize_weights_method(self):
+        """Should log a warning when model lacks initialize_weights."""
+        model = self._make_meta_model()
+        assert not hasattr(model, "initialize_weights")
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing.logging") as mock_logging:
+            Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+            mock_logging.warning.assert_called_once()
+
+    def test_skips_for_nemotron_v2(self):
+        """NemotronHForCausalLM v2 (no n_routed_experts) should skip init."""
+        model = self._make_meta_model()
+        model.config = SimpleNamespace(architectures=["NemotronHForCausalLM"])
+        model._is_hf_initialized = True
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_not_called()
+        assert model._is_hf_initialized is True
+
+    def test_does_not_skip_for_nemotron_v3_moe(self):
+        """NemotronHForCausalLM v3 (with n_routed_experts) should NOT be skipped."""
+        model = self._make_meta_model()
+        model.config = SimpleNamespace(architectures=["NemotronHForCausalLM"], n_routed_experts=8)
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_called_once()
+
+    def test_handles_missing_config_gracefully(self):
+        """Model without config.architectures should not raise."""
+        with torch.device("meta"):
+            model = torch.nn.Linear(4, 4)
+        model.config = SimpleNamespace()
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_called_once()
+
+    def test_peft_init_method_calls_init_peft_adapters(self):
+        """When peft_init_method is provided, _init_peft_adapters should be called."""
+        model = self._make_meta_model()
+        model.initialize_weights = MagicMock()
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing._init_peft_adapters") as mock_init_peft:
+            Checkpointer.initialize_model_weights(model, torch.device("cpu"), peft_init_method="xavier")
+
+        mock_init_peft.assert_called_once_with(model, "xavier")
+
+    def test_peft_init_method_none_skips_init_peft_adapters(self):
+        """When peft_init_method is None (default), _init_peft_adapters should NOT be called."""
+        model = self._make_meta_model()
+        model.initialize_weights = MagicMock()
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing._init_peft_adapters") as mock_init_peft:
+            Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        mock_init_peft.assert_not_called()
+
+    def test_load_base_model_does_not_accept_peft_init_method(self):
+        """load_base_model should not accept peft_init_method as a parameter."""
+        import inspect
+
+        sig = inspect.signature(Checkpointer.load_base_model)
+        assert "peft_init_method" not in sig.parameters
