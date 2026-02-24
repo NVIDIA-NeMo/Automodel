@@ -25,7 +25,7 @@ vLLM.
 
 <!-- In addition to this user guide, you can also explore our Quickstart,
 which features a [standalone python3
-recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py),
+recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py),
 offering hands-on demonstrations for quickly getting started with NeMo Automodel. -->
 
 ## Run SFT and PEFT with NeMo Automodel
@@ -307,10 +307,10 @@ where `finetune` is name the name of the recipe file (excluding the `.py` extens
 
 ### Invoke the Recipe Script Directly
 
-Alternatively, you can run the recipe [script](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py) directly using [torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html), as shown below.
+Alternatively, you can run the recipe [script](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py) directly using [torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html), as shown below.
 
 ``` bash
-torchrun --nproc-per-node=8 examples/llm/finetune.py --config sft_guide.yaml
+torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config sft_guide.yaml
 ```
 
 ### Sample Output
