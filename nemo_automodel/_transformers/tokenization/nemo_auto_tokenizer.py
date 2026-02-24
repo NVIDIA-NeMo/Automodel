@@ -12,42 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-
-from jinja2.exceptions import TemplateError
 from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import BatchEncoding
-
-logger = logging.getLogger(__name__)
-
-
-def _remap_system_role(conversation):
-    """Merge a single system message into the first user message.
-
-    If the template's Jinja raises ``TemplateError("System role not supported")``,
-    this helper folds the system content into the first ``user`` turn so the
-    template can render without error.
-
-    Raises ``ValueError`` when more than one system message is present (ambiguous).
-    """
-    system_msgs = [m for m in conversation if isinstance(m, dict) and m.get("role") == "system"]
-    if len(system_msgs) > 1:
-        raise ValueError("System role appeared in multiple messages. Only a single system message is supported.")
-
-    system_content = system_msgs[0].get("content", "")
-    remapped = []
-    merged = False
-    for m in conversation:
-        if isinstance(m, dict) and m.get("role") == "system":
-            continue
-        if not merged and isinstance(m, dict) and m.get("role") == "user":
-            remapped.append({**m, "content": f"{system_content}\n{m['content']}"})
-            merged = True
-        else:
-            remapped.append(m)
-    if not merged:
-        remapped.insert(0, {"role": "user", "content": system_content})
-    return remapped
 
 
 class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
@@ -97,24 +63,6 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
         tokenizer._base_class = base_tokenizer_cls
         tokenizer.__class__ = type(cls.__name__, (cls, base_tokenizer_cls), {})
         return tokenizer
-
-    def apply_chat_template(self, conversation, *args, **kwargs):
-        has_system = any(isinstance(m, dict) and m.get("role") == "system" for m in conversation)
-        if not has_system:
-            return super().apply_chat_template(conversation, *args, **kwargs)
-
-        system_msgs = [m for m in conversation if isinstance(m, dict) and m.get("role") == "system"]
-        if len(system_msgs) > 1:
-            raise ValueError("System role appeared in multiple messages. Only a single system message is supported.")
-
-        try:
-            return super().apply_chat_template(conversation, *args, **kwargs)
-        except TemplateError as e:
-            if "System role not supported" not in str(e):
-                raise
-        logger.debug("Chat template does not support system role; merging into first user message.")
-        remapped = _remap_system_role(conversation)
-        return super().apply_chat_template(remapped, *args, **kwargs)
 
     def __call__(self, *args, **kwargs):
         tokenized = super().__call__(*args, **kwargs)
