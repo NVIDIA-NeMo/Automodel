@@ -146,7 +146,8 @@ def apply_ac(
         model: The model to apply activation checkpointing to.
         ignore_router: If True, uses selective checkpointing that saves router outputs.
         hidden_size: Hidden dimension size. If None, derived from model.config.hidden_size.
-        num_experts: Number of routed experts. If None, derived from model.config.num_experts.
+        num_experts: Number of routed experts. If None, derived from moe_config.n_routed_experts
+            first, then falls back to model.config attributes.
     """
     # Derive hidden_size and num_experts from model.config if not provided
     if hidden_size is None:
@@ -156,12 +157,16 @@ def apply_ac(
             raise ValueError("hidden_size must be provided or model must have config.hidden_size attribute")
 
     if num_experts is None:
-        for attr in ["num_experts", "moe_num_experts", "n_routed_experts"]:
-            if hasattr(model, "config") and hasattr(model.config, attr):
-                num_experts = getattr(model.config, attr)
-                break
+        _inner = getattr(model, "model", model)
+        if hasattr(_inner, "moe_config") and hasattr(_inner.moe_config, "n_routed_experts"):
+            num_experts = _inner.moe_config.n_routed_experts
         else:
-            raise ValueError("num_experts must be provided or model must have config.num_experts attribute")
+            for attr in ["num_experts", "moe_num_experts", "n_routed_experts"]:
+                if hasattr(model, "config") and hasattr(model.config, attr):
+                    num_experts = getattr(model.config, attr)
+                    break
+            else:
+                raise ValueError("num_experts must be provided or model must have config.num_experts attribute")
 
     def _custom_policy(ctx, func, *args, **kwargs):
         if func == torch.ops.aten.mm.default:

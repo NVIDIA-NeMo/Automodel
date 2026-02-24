@@ -22,6 +22,8 @@ import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 
+from nemo_automodel.components.models.common.combined_projection.combined_qkv import _assert_colwise_parallel
+
 
 class CombinedGateUpMLP(nn.Module):
     """SwiGLU MLP with combined gate_up projection for efficiency.
@@ -60,12 +62,15 @@ class CombinedGateUpMLP(nn.Module):
         self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=mlp_bias)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
+        self._tp_checked = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with combined gate_up projection.
 
-        Handles tensor parallelism by dynamically computing split sizes
-        based on actual tensor dimensions.
+        The gate_up weight uses a row-interleaved layout:
+            [gate_0, up_0, gate_1, up_1, ...]
+        This ensures ColwiseParallel TP sharding gives each rank matching
+        gate/up pairs. We de-interleave via a local reshape.
 
         Args:
             x: Input tensor [batch, seq_len, hidden_size]
@@ -73,13 +78,14 @@ class CombinedGateUpMLP(nn.Module):
         Returns:
             Output tensor [batch, seq_len, hidden_size]
         """
-        # Project and split into gate and up
-        gate_up = self.gate_up_proj(x)
+        if not self._tp_checked:
+            _assert_colwise_parallel(self.gate_up_proj.weight, "gate_up_proj")
+            self._tp_checked = True
 
-        # Handle tensor parallelism: split based on actual tensor size
-        gate_up_size = gate_up.shape[-1]
-        local_intermediate_size = gate_up_size // 2
-        gate, up = gate_up.split([local_intermediate_size, local_intermediate_size], dim=-1)
+        gate_up = self.gate_up_proj(x)
+        gate_up = gate_up.unflatten(-1, (-1, 2))
+        gate = gate_up[..., 0]
+        up = gate_up[..., 1]
 
         # SwiGLU: down(act(gate) * up)
         return self.down_proj(self.act_fn(gate) * up)

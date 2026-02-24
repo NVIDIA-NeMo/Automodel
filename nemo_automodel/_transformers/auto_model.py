@@ -582,7 +582,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             peft_config=peft_config,
             fp8_config=fp8_config,
             compile_config=compile_config,
-            load_base_model=False,
+            load_base_model=kwargs.pop("load_base_model", False),
             **kwargs,
         )
 
