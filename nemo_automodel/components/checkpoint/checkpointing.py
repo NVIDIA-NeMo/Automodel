@@ -426,25 +426,21 @@ class Checkpointer:
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
         model_state.load_state_dict(state_dict, strict=not (len(model_state.model) > 1 or has_state_dict_adapter))
 
-    def load_base_model(
-        self,
-        model: torch.nn.Module,
-        device: torch.device,
-        root_dir: str,
-        model_name: str | None,
-        peft_init_method: str,
-        load_base_model: bool = True,
+    @staticmethod
+    def initialize_model_weights(
+        model: torch.nn.Module, device: torch.device, peft_init_method: str | None = None
     ) -> None:
         """
-        Load a model from the base Hugging Face checkpoint in parallel.
+        Materialize meta-device parameters and initialize model weights.
+
+        Moves empty parameter shells to the target device, resets HF initialization
+        flags, calls the model's weight initialization method, and initializes any
+        PEFT adapters.
 
         Args:
-            model: Model to load state into
-            device: Device to load model onto
-            root_dir: Root directory of the model cache or snapshots
-            model_name: Name of the model or an absolute path to a snapshot
-            peft_init_method: Initialization method used for PEFT adapters
-            load_base_model: If True, restore from HF base checkpoint
+            model: Model whose weights should be initialized.
+            device: Target device for materialized parameters.
+            peft_init_method: Initialization method for PEFT adapters (e.g. "xavier").
         """
         to_empty_parameters_only(model, device=device)
 
@@ -474,7 +470,7 @@ class Checkpointer:
         #   implementation which handles this correctly.
         try:
             model_class = model.config.architectures[0]
-        except:
+        except Exception:
             model_class = ""
         is_nemotron_v2 = model_class == "NemotronHForCausalLM" and not getattr(model.config, "n_routed_experts", None)
         skip_initialize_weights = is_nemotron_v2
@@ -483,7 +479,6 @@ class Checkpointer:
                 if hasattr(module, "_is_hf_initialized"):
                     module._is_hf_initialized = False
 
-            # init model weights
             if hasattr(model, "initialize_weights"):
                 model.initialize_weights()
             else:
@@ -491,9 +486,27 @@ class Checkpointer:
                     "Warning: Model does not have initialize_weights method. Requires custom initialization to be implemented."
                 )
 
-        # init peft adapters with the scaled weights
-        _init_peft_adapters(model, peft_init_method)
+        if peft_init_method is not None:
+            _init_peft_adapters(model, peft_init_method)
 
+    def load_base_model(
+        self,
+        model: torch.nn.Module,
+        device: torch.device,
+        root_dir: str,
+        model_name: str | None,
+        load_base_model: bool = True,
+    ) -> None:
+        """
+        Load a model from the base Hugging Face checkpoint in parallel.
+
+        Args:
+            model: Model to load state into
+            device: Device to load model onto
+            root_dir: Root directory of the model cache or snapshots
+            model_name: Name of the model or an absolute path to a snapshot
+            load_base_model: If True, restore from HF base checkpoint
+        """
         if load_base_model:
             assert model_name is not None, "model_name is required when loading base model"
             # Get combined key mapping from model attribute and model-type specific conversions
