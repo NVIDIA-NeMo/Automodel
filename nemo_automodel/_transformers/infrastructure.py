@@ -414,12 +414,12 @@ def apply_model_infrastructure(
     checkpoint_already_loaded = False
     if load_before_shard:
         lora_a_init = getattr(peft_config, "lora_A_init", None)
+        checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
         checkpointer.load_base_model(
             model,
             device,
             cache_dir,
             pretrained_model_name_or_path,
-            lora_a_init,
             load_base_model=load_base_model,
         )
         checkpoint_already_loaded = True
@@ -453,31 +453,37 @@ def apply_model_infrastructure(
         else:
             setattr(model, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
 
-    # Load the checkpoint if needed (meta path, or PP/TP path where we did not load before shard)
-    should_load_checkpoint = (
-        need_checkpoint_load
-        and not checkpoint_already_loaded
-        and (
-            is_meta_device
-            and any(
-                [
-                    get_world_size_safe() == 1,
-                    parallelize_fn is not None and get_world_size_safe() > 1,
-                    callable(getattr(model_wrapper, "parallelize", None)),
-                ]
-            )
+    # Materialize meta-device parameters and initialize weights after sharding.
+    # This is needed for both from_pretrained (before checkpoint loading overwrites)
+    # and from_config (where this is the only weight initialization).
+    # Skipped when load_before_shard already handled materialization + init.
+    need_post_shard_init = (
+        is_meta_device
+        and not load_before_shard
+        and any(
+            [
+                get_world_size_safe() == 1,
+                parallelize_fn is not None and get_world_size_safe() > 1,
+                callable(getattr(model_wrapper, "parallelize", None)),
+            ]
         )
     )
-    if should_load_checkpoint:
-        models_to_load = model.parts if hasattr(model, "parts") else [model]
+    if need_post_shard_init:
+        model_parts = model.parts if hasattr(model, "parts") else [model]
         lora_a_init = getattr(peft_config, "lora_A_init", None)
-        for mp in models_to_load:
+        for mp in model_parts:
+            checkpointer.initialize_model_weights(mp, device, peft_init_method=lora_a_init)
+
+    # Load the checkpoint if needed (meta path, or PP/TP path where we did not load before shard)
+    should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded and need_post_shard_init
+    if should_load_checkpoint:
+        model_parts = model.parts if hasattr(model, "parts") else [model]
+        for mp in model_parts:
             checkpointer.load_base_model(
                 mp,
                 device,
                 cache_dir,
                 pretrained_model_name_or_path,
-                lora_a_init,
                 load_base_model=load_base_model,
             )
 
