@@ -226,6 +226,43 @@ uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py --step_sche
 ...
 ```
 
+## Saving Checkpoints When Using Docker
+
+When training inside a Docker container (see [Installation Guide](installation.md)), any files written to the container's filesystem are lost when the container exits (especially with `--rm`). To keep your checkpoints, **bind-mount a host directory** to the checkpoint path before starting the container:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v /host/path/to/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:25.11.00
+```
+
+Inside the container, the default `checkpoint_dir: checkpoints/` in your YAML config will write to `/opt/Automodel/checkpoints`, which is now backed by the host directory `/host/path/to/checkpoints`. Your checkpoints will persist on the host after the container exits.
+
+You can also set a custom checkpoint directory via the YAML config or CLI override:
+```yaml
+checkpoint:
+  checkpoint_dir: /mnt/shared/my_checkpoints
+```
+```bash
+# Or via CLI override:
+automodel finetune llm -c config.yaml --checkpoint.checkpoint_dir /mnt/shared/my_checkpoints
+```
+
+When using a custom path, make sure the corresponding host directory is mounted into the container with `-v`.
+
+::: {tip}
+Mount additional host directories for datasets and the Hugging Face model cache to avoid re-downloading large models across container restarts:
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v /host/checkpoints:/opt/Automodel/checkpoints \
+  -v /host/datasets:/datasets \
+  -v /host/hf_cache:/root/.cache/huggingface \
+  nvcr.io/nvidia/nemo-automodel:25.11.00
+```
+:::
+
 ## Asynchronous Checkpointing
 
 NeMo Automodel can write checkpoints asynchronously to reduce training stalls caused by I/O. When enabled, checkpoint writes are scheduled in the background using PyTorch Distributed Checkpointing's async API while training continues.
