@@ -37,6 +37,7 @@ from transformers.modeling_outputs import (
     ModelOutput,
     SequenceClassifierOutputWithPast,
 )
+from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import (
     LlamaForSequenceClassification,
@@ -181,10 +182,14 @@ class LlamaBidirectionalModel(LlamaModel):
     def _update_causal_mask(
         self,
         attention_mask: torch.Tensor,
+        input_tensor: Optional[torch.Tensor] = None,
+        **kwargs,
     ):
-        if attention_mask is not None and (attention_mask == 0.0).any():
-            return attention_mask
-        return None
+        if attention_mask is None:
+            return None
+        dtype = input_tensor.dtype if input_tensor is not None else torch.float32
+        # use _prepare_4d_attention_mask to avoid the data-dependent .any() check (breaks torch.export / ONNX)
+        return _prepare_4d_attention_mask(attention_mask, dtype)
 
     @check_model_inputs
     @auto_docstring
@@ -217,7 +222,7 @@ class LlamaBidirectionalModel(LlamaModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(attention_mask=attention_mask)
+        causal_mask = self._update_causal_mask(attention_mask=attention_mask, input_tensor=inputs_embeds)
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
