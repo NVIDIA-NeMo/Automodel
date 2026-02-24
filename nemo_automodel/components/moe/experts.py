@@ -16,10 +16,13 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
+import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn_f
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor, Partial, Shard
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
 
@@ -33,6 +36,62 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
     weighted_bias_swiglu_impl,
 )
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher, TokenDispatcherConfig
+
+# ── EP variable-length collective helpers ──
+_ep_collective_group_cache: dict[tuple[int, ...], dist.ProcessGroup] = {}
+
+
+def _get_or_create_ep_collective_group(ep_mesh: DeviceMesh) -> dist.ProcessGroup:
+    """Return a dedicated ProcessGroup for EP collectives.
+
+    Using a separate group from FSDP avoids cross-feature collective ordering
+    interference when EP and FSDP both communicate over world-size groups.
+    """
+    mesh_ranks = tuple(int(r) for r in ep_mesh.mesh.flatten().tolist())
+    cached = _ep_collective_group_cache.get(mesh_ranks)
+    if cached is not None:
+        return cached
+    pg = dist.new_group(ranks=list(mesh_ranks))
+    _ep_collective_group_cache[mesh_ranks] = pg
+    return pg
+
+
+class _AllGatherConcatVarlenFn(Function):
+    """All-gather with variable local lengths and autograd-safe backward.
+
+    Backward uses all-reduce + local narrow instead of reduce-scatter to avoid
+    monitoredBarrier deadlocks observed with mixed FSDP/EP backward collective ordering.
+    """
+
+    @staticmethod
+    def forward(ctx, local_tensor: torch.Tensor, group: dist.ProcessGroup, gathered_lens: list[int], max_len: int):
+        local_len = local_tensor.size(0)
+        if local_len < max_len:
+            pad_shape = (max_len - local_len,) + tuple(local_tensor.shape[1:])
+            pad = torch.zeros(pad_shape, dtype=local_tensor.dtype, device=local_tensor.device)
+            local_padded = torch.cat([local_tensor, pad], dim=0)
+        else:
+            local_padded = local_tensor
+
+        world_size = len(gathered_lens)
+        gathered = [torch.empty_like(local_padded) for _ in range(world_size)]
+        dist.all_gather(gathered, local_padded, group=group)
+        gathered = [g[:n] for g, n in zip(gathered, gathered_lens)]
+
+        ctx.group = group
+        ctx.gathered_lens = gathered_lens
+        ctx.rank = dist.get_rank(group)
+        return torch.cat(gathered, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_full = grad_output.contiguous()
+        start = sum(ctx.gathered_lens[: ctx.rank])
+        local_len = ctx.gathered_lens[ctx.rank]
+        dist.all_reduce(grad_full, op=dist.ReduceOp.SUM, group=ctx.group)
+        grad_local = grad_full.narrow(0, start, local_len).contiguous()
+        return grad_local, None, None, None
+
 
 if TYPE_CHECKING:
     from transformer_engine.pytorch import GroupedLinear
@@ -253,18 +312,36 @@ class GroupedExperts(nn.Module):
         )
         down_projs = self.down_projs.to_local() if isinstance(self.down_projs, DTensor) else self.down_projs
 
-        # DTensor all-gather/reduce-scatter for expert parallelism
+        # EP variable-length all-gather
         if ep_size > 1:
-            # grad_placements=[Partial()] ensures backward does reduce-scatter
-            # (default Replicate would just slice, losing cross-rank gradient contributions)
-            x = DTensor.from_local(x, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
-                grad_placements=[Partial()]
-            )
-            weights = DTensor.from_local(weights.float(), device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
-                grad_placements=[Partial()]
-            )
-            indices = DTensor.from_local(indices, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
-            token_mask = DTensor.from_local(token_mask, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
+            ep_group = _get_or_create_ep_collective_group(ep_mesh)
+            local_num_tokens = x.size(0)
+
+            # Exchange per-rank token counts
+            local_len_t = torch.tensor([local_num_tokens], device=x.device, dtype=torch.int64)
+            gathered_len_t = [torch.zeros_like(local_len_t) for _ in range(ep_size)]
+            dist.all_gather(gathered_len_t, local_len_t, group=ep_group)
+            gathered_lens = [int(t.item()) for t in gathered_len_t]
+            max_len = max(gathered_lens)
+
+            def _all_gather_dim0_var(local_tensor: torch.Tensor, *, differentiable: bool) -> torch.Tensor:
+                if differentiable:
+                    return _AllGatherConcatVarlenFn.apply(local_tensor, ep_group, gathered_lens, max_len)
+                if max_len > local_tensor.size(0):
+                    pad_shape = (max_len - local_tensor.size(0),) + tuple(local_tensor.shape[1:])
+                    pad = torch.zeros(pad_shape, dtype=local_tensor.dtype, device=local_tensor.device)
+                    local_padded = torch.cat([local_tensor, pad], dim=0)
+                else:
+                    local_padded = local_tensor
+                gathered = [torch.empty_like(local_padded) for _ in range(ep_size)]
+                dist.all_gather(gathered, local_padded, group=ep_group)
+                gathered = [g[:n] for g, n in zip(gathered, gathered_lens)]
+                return torch.cat(gathered, dim=0)
+
+            x = _all_gather_dim0_var(x, differentiable=True)
+            weights = _all_gather_dim0_var(weights.float(), differentiable=False)
+            indices = _all_gather_dim0_var(indices, differentiable=False)
+            token_mask = _all_gather_dim0_var(token_mask, differentiable=False)
 
         n_local_experts = self.n_routed_experts // ep_size
         experts_start_idx = ep_rank * n_local_experts
@@ -294,9 +371,15 @@ class GroupedExperts(nn.Module):
                 experts_end_idx,
             )
 
+        # Gradient anchor
         if ep_size > 1:
-            y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
-            y = y.redistribute(placements=[Shard(0)]).to_local()
+            y = y + (x * 0.0)
+
+        # Variable-length reduce: all_reduce + narrow to original per-rank token boundaries
+        if ep_size > 1:
+            y = dist_nn_f.all_reduce(y, op=dist.ReduceOp.SUM, group=ep_group)
+            start = sum(gathered_lens[:ep_rank])
+            y = y.narrow(0, start, local_num_tokens).contiguous()
 
         return y.to(input_dtype)
 
