@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
 from transformers import AutoConfig
+from transformers.generation import GenerationConfig, GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -104,6 +106,8 @@ class NemotronV3Model(nn.Module):
         attention_mask: torch.Tensor | None = None,
         causal_mask_mapping: dict[str, torch.Tensor] | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        past_key_values=None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Forward pass through the model.
@@ -113,6 +117,8 @@ class NemotronV3Model(nn.Module):
             attention_mask: 2D padding mask [batch_size, seq_len] (1=real, 0=padding)
             causal_mask_mapping: Dict with precomputed 4D causal masks for attention layers
             inputs_embeds: Input embeddings [batch_size, seq_len, hidden_size] (optional)
+            past_key_values: Optional NemotronHybridCache for incremental decoding.
+            cache_position: Token position indices for cache updates.
             **kwargs: Additional arguments (ignored)
 
         Returns:
@@ -138,13 +144,18 @@ class NemotronV3Model(nn.Module):
                 # Attention layers use 4D causal mask
                 mask = causal_mask
             elif layer.block_type == "mamba":
-                # Mamba layers use 2D padding mask
-                mask = attention_mask
+                # Mamba layers use 2D padding mask during prefill, None during decode
+                mask = None if (past_key_values is not None and past_key_values.has_previous_state) else attention_mask
             else:
                 # MLP/MoE layers don't use mask
                 mask = None
 
-            hidden_states = layer(hidden_states, attention_mask=mask)
+            hidden_states = layer(
+                hidden_states,
+                attention_mask=mask,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+            )
 
         # Final norm
         hidden_states = self.norm(hidden_states)
@@ -168,8 +179,17 @@ class NemotronV3Model(nn.Module):
             block.init_weights(buffer_device=buffer_device)
 
 
-class NemotronHForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
-    """NemotronV3 model with language modeling head."""
+class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoEFSDPSyncMixin):
+    """NemotronV3 model with language modeling head.
+
+    Supports ``.generate()`` from ``transformers.generation.GenerationMixin`` with O(1)
+    per-step KV caching for attention layers and recurrent state caching for Mamba2 layers.
+    """
+
+    # Prevent GenerationMixin from creating a DynamicCache: the hybrid Mamba2/Attention
+    # architecture uses its own NemotronHybridCache.
+    _is_stateful: bool = True
+    main_input_name: str = "input_ids"
 
     @classmethod
     def from_config(
@@ -249,6 +269,19 @@ class NemotronHForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 dtype=dtype,
             )
 
+        # Required by GenerationMixin.generate()
+        self.generation_config = GenerationConfig()
+
+    @property
+    def device(self) -> torch.device:
+        """Return the device of the first model parameter (required by GenerationMixin)."""
+        return next(self.parameters()).device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Return the dtype of the first model parameter (used by cache construction)."""
+        return next(self.parameters()).dtype
+
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -263,35 +296,169 @@ class NemotronHForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def forward(
         self,
-        input_ids: torch.LongTensor | None = None,
-        *,
-        attention_mask: torch.Tensor | None = None,
-        causal_mask_mapping: dict[str, torch.Tensor] | None = None,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        causal_mask_mapping: Optional[dict[str, torch.Tensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Any] = None,
+        use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Any,
-    ) -> torch.Tensor | dict[str, torch.Tensor]:
+    ) -> CausalLMOutputWithPast:
         """Forward pass with optional loss computation.
 
         Args:
             input_ids: Input token IDs [batch_size, seq_len] (optional)
             attention_mask: 2D padding mask [batch_size, seq_len]
             causal_mask_mapping: Dict with precomputed 4D causal masks
-            **kwargs: Additional arguments
+            inputs_embeds: Pre-computed input embeddings (optional)
+            labels: Token IDs for loss computation [batch_size, seq_len] (optional)
+            past_key_values: Optional NemotronHybridCache for incremental decoding.
+            use_cache: Whether to return past_key_values for subsequent steps.
+            cache_position: Token position indices for cache updates.
+            position_ids: Unused – accepted for API compatibility with GenerationMixin.
+            logits_to_keep: If > 0, only compute logits for the last ``logits_to_keep``
+                token positions (avoids materialising the full logit matrix during generation).
+            **kwargs: Additional arguments forwarded to the base model.
 
         Returns:
-            logits tensor [batch_size, seq_len, vocab_size]
+            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast` with
+            ``logits`` (float32, ``[batch_size, seq_len, vocab_size]``), optional
+            ``loss``, and ``past_key_values``.
         """
         # Forward through base model
         hidden_states = self.model(
             input_ids,
             attention_mask=attention_mask,
             causal_mask_mapping=causal_mask_mapping,
+            inputs_embeds=inputs_embeds,
+            past_key_values=past_key_values,
+            cache_position=cache_position,
             **kwargs,
         )
 
-        # Compute logits (in float32 for numerical stability)
-        logits = self.lm_head(hidden_states).float()
+        # Mark cache as having state after the first forward pass (prefill done)
+        if past_key_values is not None:
+            past_key_values.has_previous_state = True
 
-        return logits
+        # Optionally restrict logit computation to the last few positions.
+        # When logits_to_keep == 0 we compute all positions (training default).
+        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+            logits = self.lm_head(hidden_states).float()
+        else:
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            logits = self.lm_head(hidden_states[:, slice_indices, :]).float()
+
+        loss = None
+        if labels is not None:
+            # Shift for next-token prediction
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            )
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=past_key_values if use_cache else None,
+            hidden_states=None,
+            attentions=None,
+        )
+
+    @staticmethod
+    def _make_causal_mask(
+        query_len: int,
+        kv_len: int,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Build a 4D SDPA-compatible causal mask.
+
+        Prefill (query_len == kv_len): standard lower-triangular causal mask.
+        Decode (query_len == 1): all-zeros row allowing attention to all cached positions.
+        """
+        if query_len == 1:
+            # Decode: attend to all positions
+            return torch.zeros(batch_size, 1, 1, kv_len, dtype=dtype, device=device)
+        # Prefill: lower-triangular causal mask
+        mask = torch.zeros(batch_size, 1, query_len, kv_len, dtype=dtype, device=device)
+        mask.masked_fill_(
+            torch.triu(torch.ones(query_len, kv_len, device=device), diagonal=1).bool(),
+            float("-inf"),
+        )
+        return mask
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[Any] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = True,
+        **kwargs,
+    ) -> dict:
+        """Prepare model inputs for each generation step.
+
+        On the first call (prefill), creates a :class:`NemotronHybridCache` and
+        forwards the full prompt.  On subsequent calls (decode), only the newly
+        generated token is forwarded.
+
+        Args:
+            input_ids: Accumulated token ids [batch_size, current_seq_len].
+            attention_mask: Padding mask [batch_size, current_seq_len].
+            inputs_embeds: Pre-computed embeddings for the first step (optional).
+            past_key_values: NemotronHybridCache from the previous step (None on first call).
+            cache_position: Token position indices.
+            use_cache: Whether to use caching (default True).
+            **kwargs: Remaining model kwargs.
+
+        Returns:
+            Dict of keyword arguments to pass to :meth:`forward`.
+        """
+        from nemo_automodel.components.models.nemotron_v3.cache import NemotronHybridCache
+
+        batch_size = input_ids.shape[0]
+
+        # Create cache on first call
+        if past_key_values is None:
+            past_key_values = NemotronHybridCache(self.config, batch_size, self.dtype, self.device)
+            # First call: cache_position covers the full prompt
+            if cache_position is None:
+                cache_position = torch.arange(input_ids.shape[1], device=input_ids.device)
+
+        # After prefill, send only the new token
+        if past_key_values.has_previous_state:
+            input_ids = input_ids[:, -1:]
+            if cache_position is None:
+                kv_len = past_key_values.get_seq_length()
+                cache_position = torch.tensor([kv_len], device=input_ids.device)
+
+        # On the first step, prefer inputs_embeds when available
+        if inputs_embeds is not None and not past_key_values.has_previous_state:
+            model_inputs = {"input_ids": None, "inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids, "inputs_embeds": None}
+
+        # Build causal mask for attention layers
+        query_len = (
+            input_ids.shape[1] if model_inputs["inputs_embeds"] is None else model_inputs["inputs_embeds"].shape[1]
+        )
+        kv_len = past_key_values.get_seq_length() + query_len
+        causal_mask = self._make_causal_mask(query_len, kv_len, batch_size, self.dtype, self.device)
+
+        model_inputs["causal_mask_mapping"] = {"full_attention": causal_mask}
+        model_inputs["past_key_values"] = past_key_values
+        model_inputs["cache_position"] = cache_position
+        model_inputs["use_cache"] = use_cache
+        model_inputs["attention_mask"] = attention_mask
+        return model_inputs
 
     @torch.no_grad()
     def initialize_weights(
