@@ -1,6 +1,6 @@
-# Install NeMo Automodel
+# Install NeMo AutoModel
 
-This guide explains how to install NeMo Automodel for LLM, VLM, and OMNI models on various platforms and environments. Depending on your use case, there are several ways to install it:
+This guide explains how to install NeMo AutoModel for LLM, VLM, and OMNI models on various platforms and environments. Depending on your use case, there are several ways to install it:
 
 | Method                  | Dev Mode | Use Case                                                          | Recommended For             |
 | ----------------------- | ---------|----------------------------------------------------------------- | ---------------------------- |
@@ -10,7 +10,7 @@ This guide explains how to install NeMo Automodel for LLM, VLM, and OMNI models 
 | 🧪 **Editable Install** | ✅ | Contribute to the codebase or make local modifications            | Contributors, researchers    |
 | 🐳 **Docker + Mount**   | ✅ | Use in isolated GPU environments, e.g., with NeMo container       | Multi-node deployments     |
 
-## Choosing Your Installation Method
+## Choose Your Installation Method
 
 Pick the installation method that matches your needs and platform.
 
@@ -98,12 +98,12 @@ GPU training on macOS is not supported. Use macOS for CPU-based experimentation 
 
 **Recommended: WSL2 + Docker**
 
-Run NeMo Automodel in WSL2 with Docker Desktop:
+Run NeMo AutoModel in WSL2 with Docker Desktop:
 
-1. Install WSL2 and Docker Desktop
-2. Use Docker container within WSL2 (follow Linux instructions)
+1. Install WSL2 and Docker Desktop.
+2. Use Docker container within WSL2 (follow Linux instructions).
 
-**Alternative: WSL2 + virtualenv**
+**Alternative: WSL2 and virtualenv**
 
 Install directly in WSL2 Ubuntu environment (follow Debian instructions).
 
@@ -141,7 +141,8 @@ Install directly in WSL2 Ubuntu environment (follow Debian instructions).
 
 ---
 ## Installation Options for Non-Developers
-This section explains the easiest installation options for non-developers, including using pip3 via PyPI or leveraging a preconfigured NVIDIA NeMo Docker container. Both methods offer quick access to the latest stable release of NeMo Automodel with all required dependencies.
+This section explains the easiest installation options for non-developers, including using pip3 via PyPI or leveraging a preconfigured NVIDIA NeMo Docker container. Both methods offer quick access to the latest stable release of NeMo AutoModel with all required dependencies.
+
 ### Install via PyPI (Recommended)
 
 For most users, the easiest way to get started is using `pip3`.
@@ -150,18 +151,18 @@ For most users, the easiest way to get started is using `pip3`.
 pip3 install nemo-automodel
 ```
 :::{tip}
-This installs the latest stable release of NeMo Automodel from PyPI.
+This installs the latest stable release of NeMo AutoModel from PyPI.
 
 To verify the install, run `python -c "import nemo_automodel; print(nemo_automodel.__version__)"`. See [nemo-automodel on PyPI](https://pypi.org/project/nemo-automodel/).
 :::
 
-### Install via NeMo Docker Container
-You can use NeMo Automodel with the NeMo Docker container. Pull the container by running:
+### Install with NeMo Docker Container
+You can use NeMo AutoModel with the NeMo Docker container. Pull the container by running:
 ```bash
 docker pull nvcr.io/nvidia/nemo-automodel:25.11.00
 ```
 :::{note}
-The above `docker` command uses the [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) container. Use the [most recent container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) version to ensure you get the latest version of Automodel and its dependencies like torch, transformers, etc.
+The above `docker` command uses the [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) container. Use the [most recent container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) version to ensure you get the latest version of AutoModel and its dependencies like PyTorch, Transformers, etc.
 :::
 
 Then you can enter the container using:
@@ -173,12 +174,15 @@ docker run --gpus all -it --rm \
 
 ---
 ## Installation Options for Developers
+## Installation Options for Developers
+
 This section provides installation options for developers, including pulling the latest source from GitHub, using editable mode, or mounting the repo inside a NeMo Docker container.
-### Install via GitHub (Source)
+### Install from GitHub (Source)
+
 
 If you want the **latest features** from the `main` branch or want to contribute:
 
-#### Option A - Use `pip` with git repo:
+#### Option A – Use `pip` With Git Repo
 ```bash
 pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git
 ```
@@ -186,7 +190,7 @@ pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git
 This installs the repo as a standard Python package (not editable).
 :::
 
-#### Option B - Use `uv` with git repo:
+#### Option B – Use `uv` With Git Repo
 ```bash
 uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
 ```
@@ -195,7 +199,10 @@ uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
 :::
 
 ### Install in Developer Mode (Editable Install)
+### Install in Developer Mode (Editable Install)
+
 To contribute or modify the code:
+
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
@@ -203,10 +210,12 @@ pip3 install -e .
 ```
 
 :::{note}
-This installs Automodel in editable mode, so changes to the code are immediately reflected in Python.
+This installs AutoModel in editable mode, so changes to the code are immediately reflected in Python.
 :::
 
 ### Mount the Repo into a NeMo Docker Container
+### Mount the Repo into a NeMo Docker Container
+
 To run `Automodel` inside a NeMo container while **mounting your local repo**, follow these steps:
 
 ```bash
@@ -247,4 +256,4 @@ pip3 install nemo-automodel[vlm]    # Install all VLM-related dependencies.
 | Editable install (dev mode) | `pip install -e .` after cloning                                |
 | Run without installing      | Use `PYTHONPATH=$(pwd)` to run scripts                          |
 | Use in Docker container     | Mount repo and `pip install -e .` inside container              |
-| Fast install (via `uv`)     | `uv pip install ...`                                            |
+| Fast install (using `uv`)     | `uv pip install ...`                                            |
