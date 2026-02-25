@@ -194,11 +194,6 @@ Auto-generated Python API documentation.
 
 ::::{toctree}
 :hidden:
-Home <self>
-::::
-
-::::{toctree}
-:hidden:
 :caption: Get Started
 guides/installation.md
 guides/configuration.md
@@ -216,9 +211,17 @@ announcements.md
 
 ::::{toctree}
 :hidden:
-:caption: Performance
-
+:caption: NeMo AutoModel Performance
 performance-summary.md
+::::
+
+::::{toctree}
+:hidden:
+:caption: Model Coverage
+model-coverage/overview.md
+model-coverage/llm.md
+model-coverage/vlm.md
+model-coverage/troubleshooting.md
 ::::
 
 ::::{toctree}
@@ -237,14 +240,6 @@ guides/quantization-aware-training.md
 guides/llm/databricks.md
 ::::
 
-::::{toctree}
-:hidden:
-:caption: Model Coverage
-model-coverage/overview.md
-model-coverage/llm.md
-model-coverage/vlm.md
-model-coverage/troubleshooting.md
-::::
 
 ::::{toctree}
 :hidden:
