@@ -32,7 +32,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClass
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaForSequenceClassification, LlamaModel
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring
+from transformers.utils import TransformersKwargs
 
 try:
     from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
@@ -52,7 +52,7 @@ class LlamaBidirectionalConfig(LlamaConfig):
     and pooling configurations.
     """
 
-    model_type = "llama_bidirec"
+    model_type = "LlamaBidirectionalModel"
 
     def __init__(
         self,
@@ -95,8 +95,6 @@ class LlamaBidirectionalModel(LlamaModel):
             config: Model configuration
         """
         super().__init__(config)
-        for layer in self.layers:
-            layer.self_attn.is_causal = False
 
     def _update_causal_mask(
         self,
@@ -114,7 +112,6 @@ class LlamaBidirectionalModel(LlamaModel):
         return _prepare_4d_attention_mask(attention_mask, dtype)
 
     @check_model_inputs
-    @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
