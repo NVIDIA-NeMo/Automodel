@@ -11,7 +11,7 @@ content_type: "concept"
 
 # About NeMo AutoModel
 
-NeMo AutoModel is a PyTorch DTensor-native SPMD open-source library under [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo). It provides **optimized model implementations** with a **Hugging Face-compatible API**, so any model on the Hub works out of the box with no checkpoint conversion. On top of that, it ships ready-made **recipes** for training and fine-tuning LLMs and VLMs at scale.
+NeMo AutoModel is a PyTorch DTensor-native SPMD (Single Program, Multiple Data) open-source library under [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo). It provides **optimized model implementations** with a **Hugging Face-compatible API**, so any model on the Hub works out of the box with no checkpoint conversion. On top of that, it ships ready-made **recipes** for training and fine-tuning LLMs and VLMs at scale.
 
 Because AutoModel exposes the same Autoclass interface as `transformers`, it can also be used as a **drop-in accelerated backend for other libraries** -- reinforcement learning frameworks, evaluation harnesses, or any codebase that loads Hugging Face models.
 
