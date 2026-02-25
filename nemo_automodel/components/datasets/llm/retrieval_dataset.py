@@ -278,34 +278,6 @@ def _list_hf_subsets(repo_id: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# ids_only resolution helpers (adapted from data_preparation.py)
-# ---------------------------------------------------------------------------
-
-
-def _get_mteb_lookup_dicts(source_config: dict):
-    """Load MTEB queries/corpus splits and build ``{q_i: text}`` / ``{d_i: text}`` dicts."""
-    mteb_queries = load_dataset(source_config["source_repo"], "queries", split="queries")
-    mteb_corpus = load_dataset(source_config["source_repo"], "corpus", split="corpus")
-    query_lookup = {f"q_{i}": text for i, text in enumerate(mteb_queries["text"])}
-    doc_lookup = {f"d_{i}": text for i, text in enumerate(mteb_corpus["text"])}
-    return query_lookup, doc_lookup
-
-
-def _get_column_lookup_dicts(source_config: dict):
-    """Load specified columns from an HF dataset and build lookup dicts."""
-    if "subset" in source_config:
-        data = load_dataset(source_config["source_repo"], source_config["subset"], split=source_config["split"])
-    else:
-        data = load_dataset(source_config["source_repo"], split=source_config["split"])
-    query_lookup = {f"q_{i}": text for i, text in enumerate(data[source_config["query_column"]])}
-    doc_lookup = {f"d_{i}": text for i, text in enumerate(data[source_config["document_column"]])}
-    return query_lookup, doc_lookup
-
-
-_IDS_ONLY_LOADERS = {"mteb": _get_mteb_lookup_dicts, "column": _get_column_lookup_dicts}
-
-
-# ---------------------------------------------------------------------------
 # Core HF subset loader
 # ---------------------------------------------------------------------------
 
@@ -324,44 +296,17 @@ def _load_hf_subset(repo_id: str, subset: str):
 
     corpus_id = metadata["corpus_id"]
 
-    # 2. If ids_only, build lookup dicts from the original source
-    query_lookup = None
-    doc_lookup = None
-    if metadata.get("ids_only", False):
-        config_path = hf_hub_download(
-            repo_id=repo_id,
-            filename=f"{subset}/source_config.json",
-            repo_type="dataset",
-        )
-        with open(config_path, "r") as f:
-            source_config = json.load(f)
-        loader_name = source_config["loader_config"]
-        if loader_name not in _IDS_ONLY_LOADERS:
-            raise ValueError(
-                f"Unsupported loader_config {loader_name!r}, expected one of {sorted(_IDS_ONLY_LOADERS)}"
-            )
-        loader = _IDS_ONLY_LOADERS[loader_name]
-        query_lookup, doc_lookup = loader(source_config)
-
-    # 3. Load corpus
+    # 2. Load corpus
     corpus_hf = load_dataset(repo_id, f"{subset}_corpus", split="train")
 
-    # 4. Resolve corpus text when ids_only
-    if doc_lookup is not None:
-        corpus_hf = corpus_hf.map(lambda ex: {"text": doc_lookup[ex["id"]]})
-
-    # 5. Build HFCorpusDataset + CorpusInfo
+    # 3. Build HFCorpusDataset + CorpusInfo
     hf_corpus = HFCorpusDataset(corpus_hf, path=f"hf://{repo_id}/{subset}")
     corpus_info = CorpusInfo(metadata, hf_corpus)
 
-    # 6. Load queries
+    # 4. Load queries
     queries_hf = load_dataset(repo_id, subset, split="train")
 
-    # 7. Resolve query text when ids_only
-    if query_lookup is not None:
-        queries_hf = queries_hf.map(lambda ex: {"question": query_lookup[ex["question"]]})
-
-    # 8. Normalize to the standard {question_id, question, corpus_id, pos_doc, neg_doc} shape
+    # 5. Normalize to the standard {question_id, question, corpus_id, pos_doc, neg_doc} shape
     _HF_REQUIRED_FIELDS = ["question", "pos_doc"]
     normalized_data = []
     for idx, item in enumerate(queries_hf):
