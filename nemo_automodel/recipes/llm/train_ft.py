@@ -558,26 +558,32 @@ def build_dataloader(
         if pp_enabled:
             from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
 
-            hf_model_config = AutoConfig.from_pretrained(
-                _get_model_name(cfg_model), trust_remote_code=compute_trust_remote_code_from_model(cfg_model)
-            )
-
-            if "collate_fn" in dl_kwargs:
-                # Case 1: PP enabled + collate_fn exists -> chain them
-                # base_collate_fn -> add_causal_masks_to_batch
-                base_collate_fn = dl_kwargs["collate_fn"]
-
-                def chained_collate_fn(batch, base_fn=base_collate_fn, config=hf_model_config):
-                    batch = base_fn(batch)  # Apply base collate (padding, batching, etc.)
-                    batch = add_causal_masks_to_batch(batch, model_config=config)  # Add masks
-                    return batch
-
-                dl_kwargs["collate_fn"] = chained_collate_fn
-            else:
-                # Case 2: PP enabled + no collate_fn -> only add masks
-                dl_kwargs["collate_fn"] = lambda batch, config=hf_model_config: add_causal_masks_to_batch(
-                    batch, model_config=config
+            try:
+                hf_model_config = AutoConfig.from_pretrained(
+                    _get_model_name(cfg_model), trust_remote_code=compute_trust_remote_code_from_model(cfg_model)
                 )
+            except Exception:
+                logger.warning(
+                    "Failed to load model config for causal mask precomputation. "
+                    "Pipeline parallel mask precomputation will be skipped."
+                )
+            else:
+                if "collate_fn" in dl_kwargs:
+                    # Case 1: PP enabled + collate_fn exists -> chain them
+                    # base_collate_fn -> add_causal_masks_to_batch
+                    base_collate_fn = dl_kwargs["collate_fn"]
+
+                    def chained_collate_fn(batch, base_fn=base_collate_fn, config=hf_model_config):
+                        batch = base_fn(batch)  # Apply base collate (padding, batching, etc.)
+                        batch = add_causal_masks_to_batch(batch, model_config=config)  # Add masks
+                        return batch
+
+                    dl_kwargs["collate_fn"] = chained_collate_fn
+                else:
+                    # Case 2: PP enabled + no collate_fn -> only add masks
+                    dl_kwargs["collate_fn"] = lambda batch, config=hf_model_config: add_causal_masks_to_batch(
+                        batch, model_config=config
+                    )
 
         try:
             import torch.multiprocessing as mp

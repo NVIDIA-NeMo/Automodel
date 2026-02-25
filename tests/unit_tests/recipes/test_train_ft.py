@@ -1171,6 +1171,160 @@ def test_build_model_and_optimizer_return_values():
 # Tests for _get_model_name helper
 # =============================================================================
 
+# =============================================================================
+# Tests for PP mask precomputation guard in build_dataloader
+# =============================================================================
+
+
+def test_build_dataloader_pp_autoconfig_failure_skips_mask_collate(caplog):
+    """When AutoConfig.from_pretrained raises, mask precomputation is skipped and a warning is logged."""
+    cfg_ds = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
+            "tokenizer": None,
+            "num_shards": 4,
+        }
+    )
+    cfg_dl = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
+            "num_workers": 0,
+        }
+    )
+    cfg_model = ConfigNode({"pretrained_model_name_or_path": "bad/model"})
+    cfg_ps = ConfigNode({})
+
+    with (
+        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", side_effect=OSError("not found")),
+        caplog.at_level(logging.WARNING),
+    ):
+        dl, tok = build_dataloader(
+            cfg_ds=cfg_ds,
+            cfg_dl=cfg_dl,
+            cfg_model=cfg_model,
+            cfg_ps=cfg_ps,
+            seed=123,
+            local_batch_size=2,
+            global_batch_size=4,
+            max_steps=None,
+            val_check_interval=None,
+            dp_rank=0,
+            dp_world_size=1,
+            pp_enabled=True,
+        )
+
+    assert "Failed to load model config for causal mask precomputation" in caplog.text
+    # collate_fn should NOT have been set since AutoConfig failed
+    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
+    captured = getattr(mod.dl_factory_capture, "captured")
+    assert "collate_fn" not in captured
+
+
+def test_build_dataloader_pp_autoconfig_success_sets_mask_collate():
+    """When AutoConfig.from_pretrained succeeds and no collate_fn exists, a mask-only collate is set."""
+    cfg_ds = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
+            "tokenizer": None,
+            "num_shards": 4,
+        }
+    )
+    cfg_dl = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
+            "num_workers": 0,
+        }
+    )
+    cfg_model = ConfigNode({"pretrained_model_name_or_path": "good/model"})
+    cfg_ps = ConfigNode({})
+
+    mock_config = MagicMock()
+    with (
+        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=mock_config),
+        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch", side_effect=lambda b, **kw: b),
+    ):
+        dl, tok = build_dataloader(
+            cfg_ds=cfg_ds,
+            cfg_dl=cfg_dl,
+            cfg_model=cfg_model,
+            cfg_ps=cfg_ps,
+            seed=123,
+            local_batch_size=2,
+            global_batch_size=4,
+            max_steps=None,
+            val_check_interval=None,
+            dp_rank=0,
+            dp_world_size=1,
+            pp_enabled=True,
+        )
+
+    # collate_fn should have been set (mask-only path)
+    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
+    captured = getattr(mod.dl_factory_capture, "captured")
+    assert "collate_fn" in captured
+    assert callable(captured["collate_fn"])
+
+
+def test_build_dataloader_pp_autoconfig_success_chains_existing_collate():
+    """When AutoConfig.from_pretrained succeeds and collate_fn exists, they are chained."""
+    call_order = []
+
+    def my_collate(batch):
+        call_order.append("base")
+        return batch
+
+    cfg_ds = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
+            "tokenizer": None,
+            "num_shards": 4,
+        }
+    )
+    cfg_dl = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
+            "num_workers": 0,
+            "collate_fn": my_collate,
+        }
+    )
+    cfg_model = ConfigNode({"pretrained_model_name_or_path": "good/model"})
+    cfg_ps = ConfigNode({})
+
+    mock_config = MagicMock()
+
+    def mock_add_masks(batch, model_config=None):
+        call_order.append("masks")
+        return batch
+
+    with (
+        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=mock_config),
+        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch", side_effect=mock_add_masks),
+    ):
+        dl, tok = build_dataloader(
+            cfg_ds=cfg_ds,
+            cfg_dl=cfg_dl,
+            cfg_model=cfg_model,
+            cfg_ps=cfg_ps,
+            seed=123,
+            local_batch_size=2,
+            global_batch_size=4,
+            max_steps=None,
+            val_check_interval=None,
+            dp_rank=0,
+            dp_world_size=1,
+            pp_enabled=True,
+        )
+
+    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
+    captured = getattr(mod.dl_factory_capture, "captured")
+    assert "collate_fn" in captured
+    chained_fn = captured["collate_fn"]
+
+    # Invoke the chained collate to verify ordering
+    chained_fn(["dummy_batch"])
+    assert call_order == ["base", "masks"]
+
+
 @pytest.mark.parametrize("cfg_attrs,expected", [
     # String config
     ({"config": "org/model-name"}, "org/model-name"),
