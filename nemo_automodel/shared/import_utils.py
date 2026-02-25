@@ -19,7 +19,6 @@
 import importlib
 import logging
 import traceback
-from contextlib import contextmanager
 
 import torch
 from packaging.version import Version as PkgVersion
@@ -47,7 +46,6 @@ class UnavailableError(Exception):
     """
 
 
-@contextmanager
 def null_decorator(*args, **kwargs):
     """
     No-op decorator.
@@ -499,6 +497,8 @@ def get_check_model_inputs_decorator():
 
     In transformers >= 4.57.3, check_model_inputs became a function that returns a decorator.
     In older versions, it was directly a decorator.
+    In transformers >= 5.2.0, check_model_inputs was removed and split into
+    ``merge_with_config_defaults`` and ``capture_outputs``.
 
     Returns:
         Decorator function to validate model inputs.
@@ -513,5 +513,19 @@ def get_check_model_inputs_decorator():
             # Old API: check_model_inputs is directly a decorator
             return check_model_inputs
     except ImportError:
-        # If transformers is not available, return a no-op decorator
-        return null_decorator
+        pass
+
+    # transformers >= 5.2.0: check_model_inputs was split into two decorators
+    try:
+        from transformers.utils.generic import merge_with_config_defaults
+        from transformers.utils.output_capturing import capture_outputs
+
+        def _combined_decorator(func):
+            return merge_with_config_defaults(capture_outputs(func))
+
+        return _combined_decorator
+    except ImportError:
+        pass
+
+    # No transformers decorator available — return a no-op decorator
+    return null_decorator
