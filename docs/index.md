@@ -74,7 +74,7 @@ Training throughput on NVIDIA GPUs with optimized kernels for Hugging Face model
 |-------|-----:|---------------:|---------------:|---------------|
 | DeepSeek V3 671B | 256 | 250 | 1,002 | TE + DeepEP |
 | GPT-OSS 20B | 8 | 279 | 13,058 | TE + DeepEP + FlexAttn |
-| Qwen3 MoE 30B | 8 | 212 | 11,842 | TE + DeepEP |
+| Qwen3 MoE 30B | 8 | 277 | 12,040 | TE + DeepEP |
 
 See the [full benchmark results](performance-summary.md) for configuration details and more models.
 
