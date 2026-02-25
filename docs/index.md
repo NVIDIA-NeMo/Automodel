@@ -22,6 +22,7 @@ content_type: index
 (automodel-home)=
 
 # NeMo AutoModel Documentation
+PyTorch SPMD (Single Program, Multiple Data) training for LLMs and VLMs with day-0 Hugging Face model support.
 
 ## Introduction to NeMo AutoModel
 Learn about NeMo AutoModel, how it works at a high-level, and the key features.
