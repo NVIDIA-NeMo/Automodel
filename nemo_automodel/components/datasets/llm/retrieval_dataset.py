@@ -296,23 +296,48 @@ def _load_hf_subset(repo_id: str, subset: str):
 
     corpus_id = metadata["corpus_id"]
 
+    if metadata.get("ids_only", False):
+        raise ValueError(
+            f"HF subset '{repo_id}/{subset}' has ids_only=true in its metadata, meaning "
+            f"document and query text must be resolved from an external source before use. "
+            f"This is not supported for direct HF loading. Either use a subset that contains "
+            f"inline text, or pre-process the dataset with data_preparation.py and load the "
+            f"resulting local JSON files via a file path instead."
+        )
+
     # 2. Load corpus
+    _CORPUS_REQUIRED_COLS = {"id", "text"}
     corpus_hf = load_dataset(repo_id, f"{subset}_corpus", split="train")
+
+    missing_cols = _CORPUS_REQUIRED_COLS - set(corpus_hf.column_names)
+    if missing_cols:
+        raise ValueError(
+            f"HF corpus dataset '{repo_id}/{subset}_corpus' does not match the expected schema. "
+            f"Required columns: {sorted(_CORPUS_REQUIRED_COLS)}, "
+            f"found columns: {sorted(corpus_hf.column_names)}. "
+            f"Missing: {sorted(missing_cols)}."
+        )
 
     # 3. Build HFCorpusDataset + CorpusInfo
     hf_corpus = HFCorpusDataset(corpus_hf, path=f"hf://{repo_id}/{subset}")
     corpus_info = CorpusInfo(metadata, hf_corpus)
 
     # 4. Load queries
+    _QUERY_REQUIRED_COLS = {"question", "pos_doc"}
     queries_hf = load_dataset(repo_id, subset, split="train")
 
+    missing_query_cols = _QUERY_REQUIRED_COLS - set(queries_hf.column_names)
+    if missing_query_cols:
+        raise ValueError(
+            f"HF query dataset '{repo_id}/{subset}' does not match the expected schema. "
+            f"Required columns: {sorted(_QUERY_REQUIRED_COLS)}, "
+            f"found columns: {sorted(queries_hf.column_names)}. "
+            f"Missing: {sorted(missing_query_cols)}."
+        )
+
     # 5. Normalize to the standard {question_id, question, corpus_id, pos_doc, neg_doc} shape
-    _HF_REQUIRED_FIELDS = ["question", "pos_doc"]
     normalized_data = []
     for idx, item in enumerate(queries_hf):
-        missing = [f for f in _HF_REQUIRED_FIELDS if f not in item]
-        if missing:
-            raise ValueError(f"HF subset {repo_id}/{subset} record {idx} missing required fields: {missing}")
         normalized_item = {
             "question_id": str(item.get("question_id", f"{subset}:{idx}")),
             "question": item["question"],
@@ -345,81 +370,30 @@ def _load_hf_subset(repo_id: str, subset: str):
     return normalized_data, corpus_info
 
 
-# ---------------------------------------------------------------------------
-# Public helpers for data_sources
-# ---------------------------------------------------------------------------
-
-
-def _normalize_data_source(entry):
-    """Normalize a data source entry to a dict with at minimum a ``source`` key."""
-    if isinstance(entry, str):
-        return {"source": entry}
-    elif isinstance(entry, dict):
-        if "source" not in entry:
-            raise ValueError(f"Data source dict must include a 'source' key, got keys: {list(entry.keys())}")
-        return entry
-    else:
-        raise TypeError(f"Data source entry must be a str or dict, got {type(entry).__name__}")
-
-
-def load_datasets_from_sources(data_sources: list, concatenate: bool = True):
-    """Load datasets from a list of data sources (``hf://`` URIs and/or local JSON paths).
-
-    Returns the same ``(dataset, corpus_dict)`` tuple as :func:`load_datasets`.
-    """
+def _load_hf_sources(hf_uris: List[str]):
+    """Load one or more ``hf://`` URIs and return ``(Dataset, corpus_dict)``."""
     hf_data: List[dict] = []
-    hf_corpus_dict: dict = {}
-    local_paths: List[str] = []
+    corpus_dict: dict = {}
 
-    for entry in data_sources:
-        entry = _normalize_data_source(entry)
-        source = entry["source"]
+    for uri in hf_uris:
+        repo_id, subset = _parse_hf_uri(uri)
+        subsets = [subset] if subset is not None else _list_hf_subsets(repo_id)
 
-        if source.startswith(_HF_PREFIX):
-            repo_id, subset = _parse_hf_uri(source)
-            subsets = [subset] if subset is not None else _list_hf_subsets(repo_id)
+        for sub in subsets:
+            logging.info(f"Loading HF subset: {repo_id}/{sub}")
+            data_list, corpus_info = _load_hf_subset(repo_id, sub)
+            hf_data.extend(data_list)
+            if corpus_info.corpus_id in corpus_dict:
+                existing = corpus_dict[corpus_info.corpus_id]
+                if existing.path != corpus_info.path:
+                    raise ValueError(
+                        f"Duplicate corpus_id '{corpus_info.corpus_id}' with different paths: "
+                        f"{existing.path} vs {corpus_info.path}"
+                    )
+            else:
+                corpus_dict[corpus_info.corpus_id] = corpus_info
 
-            for sub in subsets:
-                logging.info(f"Loading HF subset: {repo_id}/{sub}")
-                data_list, corpus_info = _load_hf_subset(repo_id, sub)
-                hf_data.extend(data_list)
-                if corpus_info.corpus_id in hf_corpus_dict:
-                    existing = hf_corpus_dict[corpus_info.corpus_id]
-                    if existing.path != corpus_info.path:
-                        raise ValueError(
-                            f"Duplicate corpus_id '{corpus_info.corpus_id}' with different paths: "
-                            f"{existing.path} vs {corpus_info.path}"
-                        )
-                else:
-                    hf_corpus_dict[corpus_info.corpus_id] = corpus_info
-        else:
-            local_paths.append(source)
-
-    datasets_list = []
-    corpus_dict = dict(hf_corpus_dict)
-
-    if hf_data:
-        datasets_list.append(Dataset.from_list(hf_data))
-
-    if local_paths:
-        local_dataset, local_corpus = load_datasets(local_paths, concatenate=True)
-        datasets_list.append(local_dataset)
-        for cid, cinfo in local_corpus.items():
-            if cid in corpus_dict and corpus_dict[cid].path != cinfo.path:
-                raise ValueError(
-                    f"Duplicate corpus_id '{cid}' with different paths: {corpus_dict[cid].path} vs {cinfo.path}"
-                )
-            corpus_dict[cid] = cinfo
-
-    if not datasets_list:
-        raise ValueError("No datasets loaded from data_sources")
-
-    if concatenate:
-        dataset = concatenate_datasets(datasets_list) if len(datasets_list) > 1 else datasets_list[0]
-    else:
-        dataset = datasets_list
-
-    return dataset, corpus_dict
+    return Dataset.from_list(hf_data), corpus_dict
 
 
 def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
@@ -543,7 +517,6 @@ def _create_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: b
 
 def make_retrieval_dataset(
     data_dir_list: Union[List[str], str] = None,
-    data_sources: Optional[List[Union[str, dict]]] = None,
     data_type: str = "train",
     train_n_passages: int = 5,
     eval_negative_size: int = 10,
@@ -556,14 +529,13 @@ def make_retrieval_dataset(
     """
     Load and return dataset in retrieval format for biencoder training.
 
-    This function loads data from JSON files or HuggingFace ``hf://`` URIs and
-    returns it ready for training.  Uses ``set_transform()`` for lazy evaluation —
-    tokenization is handled by the collator.
+    Entries in *data_dir_list* can be local JSON file paths **or** ``hf://`` URIs
+    pointing to a HuggingFace dataset repository (e.g.
+    ``hf://nvidia/embed-nemotron-dataset-v1/SciFact``).  Uses ``set_transform()``
+    for lazy evaluation — tokenization is handled by the collator.
 
     Args:
-        data_dir_list: Path(s) to JSON file(s) containing training data (legacy).
-        data_sources: List of ``hf://`` URIs or local paths (preferred).
-            Exactly one of *data_dir_list* or *data_sources* must be provided.
+        data_dir_list: Path(s) to JSON file(s) or ``hf://`` URIs.
         data_type: Type of data ("train" or "eval")
         train_n_passages: Number of passages for training (1 positive + n-1 negatives)
         eval_negative_size: Number of negative documents for evaluation
@@ -584,18 +556,35 @@ def make_retrieval_dataset(
         which is more efficient for batch padding and supports dynamic processing.
     """
 
-    if data_sources is not None and data_dir_list is not None:
-        raise ValueError("data_dir_list and data_sources are mutually exclusive; provide one, not both")
-    if data_sources is not None:
-        logging.info(f"Loading data from {len(data_sources)} source(s)")
-        dataset, corpus_dict = load_datasets_from_sources(data_sources)
-    elif data_dir_list is not None:
-        logging.info(
-            f"Loading data from {data_dir_list if isinstance(data_dir_list, str) else len(data_dir_list)} file(s)"
-        )
-        dataset, corpus_dict = load_datasets(data_dir_list, concatenate=True)
-    else:
-        raise ValueError("Either data_dir_list or data_sources must be provided")
+    if data_dir_list is None:
+        raise ValueError("data_dir_list is required")
+    if not isinstance(data_dir_list, list):
+        data_dir_list = [data_dir_list]
+
+    hf_uris = [p for p in data_dir_list if p.startswith(_HF_PREFIX)]
+    local_paths = [p for p in data_dir_list if not p.startswith(_HF_PREFIX)]
+
+    logging.info(f"Loading data from {len(data_dir_list)} source(s) ({len(hf_uris)} HF, {len(local_paths)} local)")
+
+    datasets_list = []
+    corpus_dict: dict = {}
+
+    if hf_uris:
+        hf_dataset, hf_corpus = _load_hf_sources(hf_uris)
+        datasets_list.append(hf_dataset)
+        corpus_dict.update(hf_corpus)
+
+    if local_paths:
+        local_dataset, local_corpus = load_datasets(local_paths, concatenate=True)
+        datasets_list.append(local_dataset)
+        for cid, cinfo in local_corpus.items():
+            if cid in corpus_dict and corpus_dict[cid].path != cinfo.path:
+                raise ValueError(
+                    f"Duplicate corpus_id '{cid}' with different paths: {corpus_dict[cid].path} vs {cinfo.path}"
+                )
+            corpus_dict[cid] = cinfo
+
+    dataset = concatenate_datasets(datasets_list) if len(datasets_list) > 1 else datasets_list[0]
 
     logging.info(f"Loaded dataset with {len(dataset)} examples")
 
@@ -629,10 +618,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Load and transform dataset to retrieval format")
     parser.add_argument(
-        "--data_dir_list", type=str, nargs="+", default=None, help="Path(s) to JSON file(s) containing training data"
-    )
-    parser.add_argument(
-        "--data_sources", type=str, nargs="+", default=None, help="Data source(s): hf:// URIs or local JSON paths"
+        "--data_dir_list",
+        type=str,
+        nargs="+",
+        required=True,
+        help="Path(s) to JSON file(s) or hf:// URIs",
     )
     parser.add_argument(
         "--data_type", type=str, default="train", choices=["train", "eval"], help="Type of data (train or eval)"
@@ -653,7 +643,6 @@ if __name__ == "__main__":
 
     dataset = make_retrieval_dataset(
         data_dir_list=args.data_dir_list,
-        data_sources=args.data_sources,
         data_type=args.data_type,
         train_n_passages=args.train_n_passages,
         eval_negative_size=args.eval_negative_size,

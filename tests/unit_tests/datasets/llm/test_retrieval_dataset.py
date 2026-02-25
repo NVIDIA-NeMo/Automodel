@@ -838,17 +838,6 @@ def test_parse_hf_uri():
         rd._parse_hf_uri("hf://nvidia")
 
 
-def test_normalize_data_source():
-    assert rd._normalize_data_source("hf://org/repo/sub") == {"source": "hf://org/repo/sub"}
-    assert rd._normalize_data_source({"source": "/local/path", "extra": 1}) == {"source": "/local/path", "extra": 1}
-
-    with pytest.raises(ValueError, match="'source' key"):
-        rd._normalize_data_source({"path": "/local/path"})
-
-    with pytest.raises(TypeError, match="str or dict"):
-        rd._normalize_data_source(123)
-
-
 def test_hf_corpus_dataset():
     hf_ds = Dataset.from_list([{"id": "d2", "text": "Doc 2"}, {"id": "d1", "text": "Doc 1"}])
     corpus = rd.HFCorpusDataset(hf_ds, path="hf://org/repo/sub")
@@ -923,8 +912,8 @@ def test_load_hf_subset(tmp_path, monkeypatch):
     assert corpus_info.get_document_by_id("p1")["text"] == "Positive"
 
 
-def test_make_retrieval_dataset_data_sources_hf(tmp_path, monkeypatch):
-    """End-to-end: make_retrieval_dataset with data_sources pointing to an HF URI."""
+def test_make_retrieval_dataset_hf_uri(tmp_path, monkeypatch):
+    """End-to-end: make_retrieval_dataset with an hf:// URI in data_dir_list."""
     meta_path = tmp_path / "dataset_metadata.json"
     meta_path.write_text(
         json.dumps({"corpus_id": "e2e_corpus", "class": "TextQADataset", "ids_only": False})
@@ -957,7 +946,7 @@ def test_make_retrieval_dataset_data_sources_hf(tmp_path, monkeypatch):
     monkeypatch.setattr(rd, "load_dataset", fake_load_dataset)
 
     ds = rd.make_retrieval_dataset(
-        data_sources=["hf://org/repo/SubA"],
+        data_dir_list=["hf://org/repo/SubA"],
         data_type="train",
         train_n_passages=3,
     )
@@ -985,6 +974,18 @@ def test_transform_func_empty_neg_doc_with_negatives_requested():
     # num_neg_docs=0 with empty neg_doc should still work fine
     out = rd._transform_func(examples, num_neg_docs=0, corpus_dict=corpus_dict)
     assert out["doc_text"][0] == ["pos"]
+
+
+def test_load_hf_subset_rejects_ids_only(tmp_path, monkeypatch):
+    """ids_only subsets should fail fast with a clear message."""
+    meta_path = tmp_path / "dataset_metadata.json"
+    meta_path.write_text(
+        json.dumps({"corpus_id": "c", "class": "TextQADataset", "ids_only": True})
+    )
+    monkeypatch.setattr(rd, "hf_hub_download", lambda **kw: str(meta_path))
+
+    with pytest.raises(ValueError, match="ids_only=true.*not supported for direct HF loading"):
+        rd._load_hf_subset("org/repo", "SciFact")
 
 
 def test_load_hf_subset_synthesizes_question_id(tmp_path, monkeypatch):
@@ -1056,19 +1057,13 @@ def test_make_retrieval_dataset_backwards_compat(tmp_path, monkeypatch):
     assert ex["question"] == "Q0"
 
 
-def test_make_retrieval_dataset_requires_source():
-    """Neither data_dir_list nor data_sources raises ValueError."""
-    with pytest.raises(ValueError, match="Either data_dir_list or data_sources"):
+def test_make_retrieval_dataset_requires_data_dir_list():
+    """Calling without data_dir_list raises ValueError."""
+    with pytest.raises(ValueError, match="data_dir_list is required"):
         rd.make_retrieval_dataset()
 
 
-def test_make_retrieval_dataset_rejects_both_inputs():
-    """Providing both data_dir_list and data_sources raises ValueError."""
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        rd.make_retrieval_dataset(data_dir_list=["a.json"], data_sources=["hf://org/repo/Sub"])
-
-
-def test_load_datasets_from_sources_corpus_id_collision_hf_local(tmp_path, monkeypatch):
+def test_make_retrieval_dataset_corpus_id_collision_hf_local(tmp_path, monkeypatch):
     """HF and local sources with same corpus_id but different paths must raise."""
     # Setup HF side
     meta_path = tmp_path / "dataset_metadata.json"
@@ -1112,8 +1107,10 @@ def test_load_datasets_from_sources_corpus_id_collision_hf_local(tmp_path, monke
     monkeypatch.setattr(rd, "load_dataset", fake_load_dataset)
 
     with pytest.raises(ValueError, match="Duplicate corpus_id.*shared_id.*different paths"):
-        rd.load_datasets_from_sources(
-            ["hf://org/repo/Sub", str(local_file)]
+        rd.make_retrieval_dataset(
+            data_dir_list=["hf://org/repo/Sub", str(local_file)],
+            data_type="train",
+            train_n_passages=2,
         )
 
 
