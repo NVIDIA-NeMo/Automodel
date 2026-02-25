@@ -53,6 +53,10 @@ By default, resolving targets is restricted:
 - Accessing private or dunder attributes is blocked by default.
 - Loading out-of-tree user code can be enabled with `NEMO_ENABLE_USER_MODULES=1` or by calling `set_enable_user_modules(True)`.
 
+### Distributed Section (Strategy-Based)
+
+The `distributed:` section is **not** instantiated via `_target_`. Recipes parse it with a fixed schema: use `strategy: fsdp2`, `strategy: ddp`, or `strategy: megatron_fsdp`, plus optional parallelism sizes (`dp_size`, `tp_size`, `pp_size`, etc.) and strategy-specific options. When pipeline parallelism is enabled (`pp_size > 1`), add a `pipeline:` subsection with options such as `pp_schedule`, `pp_microbatch_size`, and `layers_per_stage`. See the [Pipelining](pipelining.md) guide and recipe example configs for full examples.
+
 
 ## Interpolate Environment Variables in YAML
 

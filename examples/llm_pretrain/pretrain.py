@@ -24,7 +24,7 @@ def main(default_config_path="examples/llm_pretrain/nanogpt_pretrain.yaml"):
 
     ```bash
     torchrun --nproc-per-node <NGPU> examples/llm_pretrain/pretrain.py \
-        --config examples/llm/nanogpt_pretrain.yaml
+        --config examples/llm_pretrain/nanogpt_pretrain.yaml
     ```
     """
     cfg = parse_args_and_load_config(default_config_path)

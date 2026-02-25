@@ -264,9 +264,9 @@ checkpoint:
 
 # For distributed processing, we use FSDP2.
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-  dp_size: none
-  dp_replicate_size: 1 # dp_shard_size = dp_size / dp_replicate_size and dp_shard_size < dp_size. For DDP usecase, use DDPManager
+  strategy: fsdp2
+  dp_size: null
+  dp_replicate_size: null  # dp_shard_size = dp_size / dp_replicate_size when set. For DDP use strategy: ddp.
   tp_size: 1
   cp_size: 1
   sequence_parallel: false
@@ -368,9 +368,9 @@ cfg-path: examples/llm_pretrain/megatron_pretrain_gpt2.yaml
 2025-09-01 07:13:17 | INFO | root |     model_save_format: torch_save
 2025-09-01 07:13:17 | INFO | root |     save_consolidated: False
 2025-09-01 07:13:17 | INFO | root |   distributed:
-2025-09-01 07:13:17 | INFO | root |     _target_: <class 'nemo_automodel.components.distributed.fsdp2.FSDP2Manager'>
+2025-09-01 07:13:17 | INFO | root |     strategy: fsdp2
 2025-09-01 07:13:17 | INFO | root |     dp_size: None
-2025-09-01 07:13:17 | INFO | root |     dp_replicate_size: 1
+2025-09-01 07:13:17 | INFO | root |     dp_replicate_size: None
 2025-09-01 07:13:17 | INFO | root |     tp_size: 1
 2025-09-01 07:13:17 | INFO | root |     cp_size: 1
 2025-09-01 07:13:17 | INFO | root |     sequence_parallel: False
