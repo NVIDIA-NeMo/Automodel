@@ -106,6 +106,10 @@ class LlamaBidirectionalModel(LlamaModel):
     ):
         if attention_mask is None:
             return None
+        if getattr(self.config, "_attn_implementation", None) == "flash_attention_2":
+            # Flash Attention handles padding from the raw 2D mask;
+            # bidirectional attention is ensured by is_causal=False on all layers.
+            return attention_mask
         dtype = input_tensor.dtype if input_tensor is not None else torch.float32
         return _prepare_4d_attention_mask(attention_mask, dtype)
 
