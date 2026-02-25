@@ -27,9 +27,9 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.cache_utils import Cache, DynamicCache
+from transformers.masking_utils import create_bidirectional_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.models.llama.configuration_llama import LlamaConfig
-from transformers.masking_utils import create_bidirectional_mask
 from transformers.models.llama.modeling_llama import LlamaForSequenceClassification, LlamaModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
