@@ -13,9 +13,7 @@
 # limitations under the License.
 
 # Finetuning config for DeepSeek V3.2 on HellaSwag
-#
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm/finetune.py --config examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml
+# Replace /path/to/deepseek-v32 with the path to the DeepSeek V3.2 model
 
 seed: 1234
 
@@ -57,14 +55,16 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: nemo_automodel.components.models.deepseek_v32.config.DeepseekV32Config.from_pretrained
-    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3.2
+    pretrained_model_name_or_path: /path/to/deepseek-v32
+    name_or_path: /path/to/deepseek-v32
   trust_remote_code: true
+  load_base_model: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa # TE requires the latest cudnn version so disabling by default
     linear: te
     rms_norm: te
-    rope_fusion: true
+    rope_fusion: false
     enable_deepep: true
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
@@ -82,6 +82,9 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: /path/to/deepseek-v32
 
 packed_sequence:
   packed_sequence_size: 0
@@ -97,6 +100,9 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: /path/to/deepseek-v32
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
