@@ -15,8 +15,6 @@
 
 import argparse
 import glob
-import os
-import sys
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -26,7 +24,8 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, Che
 from nemo_automodel.components.datasets.llm import retrieval_dataset_inline as rdi
 from nemo_automodel.components.datasets.llm import RetrievalBiencoderCollator
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.models.biencoder import NeMoAutoModelBiencoder
+from nemo_automodel._transformers.auto_model import NeMoAutoModelBiencoder
+from nemo_automodel.recipes.biencoder.train_biencoder import contrastive_scores_and_labels
 
 
 def _resolve_latest_checkpoint_dir(ckpt_root: Path) -> Path:
@@ -88,9 +87,14 @@ def _compute_pos_neg_diffs(
         passage = {k[len(d_prefix) :]: v for k, v in batch.items() if k.startswith(d_prefix)}
 
         with autocast_ctx:
-            out = model(query=query, passage=passage)
+            q_reps = model.encode(query, encoder="query")
+            p_reps = model.encode(passage, encoder="passage")
 
-        scores = out.scores  # [batch, n_passages]
+            # 2 passages per query: 1 positive + 1 negative
+            n_passages = 2
+            scores, _ = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
+
+        # [batch, n_passages]
         if scores is None or scores.shape[-1] < 2:
             raise RuntimeError(f"Unexpected scores shape: {None if scores is None else tuple(scores.shape)}")
         diff = (scores[:, 0] - scores[:, 1]).float().detach().cpu().numpy()
@@ -104,7 +108,7 @@ def _compute_pos_neg_diffs(
     return out
 
 
-def load_finetuned_model(model, ft_model_dir: Path) -> NeMoAutoModelBiencoder:
+def load_finetuned_model(model, ft_model_dir: Path):
     if not ft_model_dir.exists():
         raise FileNotFoundError(f"Expected finetuned model dir at {ft_model_dir}")
 
@@ -123,14 +127,9 @@ def load_finetuned_model(model, ft_model_dir: Path) -> NeMoAutoModelBiencoder:
         is_peft=False,
     )
     checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
-    # The biencoder recipe saves `LlamaBidirectionalModel` via HF `save_pretrained()`,
-    # which produces keys like "embed_tokens.weight" (no leading "model."). Our
-    # `BiencoderStateDictAdapter` converts biencoder keys to HF keys with a "model."
-    # prefix, so we remap checkpoint keys at read time to match.
-    key_mapping = {
-        r"^(?!(model\.|linear_pooler\.))": "model.",
-    }
-    checkpointer.load_model(model, model_path=str(ft_model_dir), key_mapping=key_mapping)
+
+    model_dir = ft_model_dir / "model"
+    checkpointer.load_model(model, model_path=str(model_dir))
     checkpointer.close()
     return model
 
@@ -142,6 +141,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("base_model_path", type=str, help="Path to base/pretrained HF model")
     parser.add_argument("checkpoint_root", type=str, help="Path to fine-tuned model directory")
     parser.add_argument("dataset_jsonl", type=str, help="Path to evaluation JSONL dataset")
+    parser.add_argument("trust_remote_code", type=bool, help="Trust remote code")
     parser.add_argument(
         "--max-length",
         type=int,
@@ -173,6 +173,7 @@ def main() -> int:
     max_length = args.max_length
     batch_size = args.batch_size
     use_bf16 = args.bf16
+    trust_remote_code = args.trust_remote_code
 
     # Initialize torch.distributed (DCP load requires a process group even in single-process mode).
     dist = initialize_distributed(backend="nccl", timeout_minutes=5)
@@ -181,7 +182,7 @@ def main() -> int:
     # Build tokenizer/collator/dataset.
     from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 
-    tokenizer = NeMoAutoTokenizer.from_pretrained(base_model_path)
+    tokenizer = NeMoAutoTokenizer.from_pretrained(base_model_path, trust_remote_code=trust_remote_code)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
@@ -216,17 +217,12 @@ def main() -> int:
     model = NeMoAutoModelBiencoder.from_pretrained(
         pretrained_model_name_or_path=base_model_path,
         share_encoder=True,
-        add_linear_pooler=False,
-        out_dimension=768,
-        do_gradient_checkpointing=False,
-        train_n_passages=2,
-        eval_negative_size=1,
         pooling="avg",
         l2_normalize=True,
-        t=0.02,
         use_liger_kernel=False,
         use_sdpa_patching=False,
         torch_dtype=model_dtype,
+        trust_remote_code=trust_remote_code,
     ).to(device).eval()
 
     print(f"Config: max_length={max_length}, max_samples={max_samples}, batch_size={batch_size}, "
