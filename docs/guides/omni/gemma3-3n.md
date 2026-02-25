@@ -92,7 +92,7 @@ The default collate function:
 ### Preprocess Custom Datasets
 
 When using a custom dataset with a model whose Hugging Face `AutoProcessor` supports the `apply_chat_template` method, you'll need to convert your data into the Hugging Face message list format expected by the `apply_chat_template`.
-We provide [examples](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/datasets/vlm/datasets.py) demonstrating how to perform this conversion.
+We provide [examples](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/datasets.py) demonstrating how to perform this conversion.
 
 Some models, such as [Qwen2.5 VL](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct), have specific preprocessing requirements and require custom collate functions. For instance, Qwen2.5-VL uses the `qwen_vl_utils.process_vision_info` function to process images:
 
@@ -119,7 +119,7 @@ dataloader:
     _target_: nemo_automodel.datasets.vlm.collate_fns.qwen2_5_collate_fn
 ```
 
-We provide [example custom collate functions](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/datasets/vlm/collate_fns.py) that you can use as references for your implementation.
+We provide [example custom collate functions](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/collate_fns.py) that you can use as references for your implementation.
 
 ## Run the Fine-Tune Script
 
