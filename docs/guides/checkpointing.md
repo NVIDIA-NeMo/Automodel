@@ -233,11 +233,8 @@ When training inside a Docker container (see [Installation Guide](installation.m
 ```bash
 docker run --gpus all -it --rm \
   --shm-size=8g \
-  -v /host/path/to/checkpoints:/opt/Automodel/checkpoints \
+  -v "$(pwd)"/checkpoints:/opt/Automodel/checkpoints \
   nvcr.io/nvidia/nemo-automodel:25.11.00
-```
-
-Inside the container, the default `checkpoint_dir: checkpoints/` in your YAML config will write to `/opt/Automodel/checkpoints`, which is now backed by the host directory `/host/path/to/checkpoints`. Your checkpoints will persist on the host after the container exits.
 
 You can also set a custom checkpoint directory via the YAML config or CLI override:
 ```yaml
