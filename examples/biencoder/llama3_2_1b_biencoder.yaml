@@ -53,9 +53,7 @@ dataloader:
   dataset:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
     data_dir_list:
-      - /adasif/retriever_models_research/training_datasets/nqsh_shuffled_50k.json
-      - /adasif/retriever_models_research/training_datasets/mldr_en_perc95_small.json
-      - /adasif/retriever_models_research/training_datasets/miracl_train_es_llama3_1b_4m_512len.json
+      - hf://nvidia/embed-nemotron-dataset-v1/FEVER
     data_type: train
     train_n_passages: 5
     eval_negative_size: 4
