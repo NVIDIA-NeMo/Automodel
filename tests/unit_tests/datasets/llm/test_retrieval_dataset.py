@@ -810,6 +810,384 @@ def test_retrieval_dataset_cli_smoke(tmp_path, monkeypatch, capsys):
     assert "Dataset loading completed successfully" in capsys.readouterr().out
 
 
+# ---------------------------------------------------------------------------
+# HF dataset loading tests
+# ---------------------------------------------------------------------------
+
+
+def test_parse_hf_uri():
+    repo, subset = rd._parse_hf_uri("hf://nvidia/embed-nemotron-dataset-v1/FEVER")
+    assert repo == "nvidia/embed-nemotron-dataset-v1"
+    assert subset == "FEVER"
+
+    repo2, subset2 = rd._parse_hf_uri("hf://nvidia/embed-nemotron-dataset-v1")
+    assert repo2 == "nvidia/embed-nemotron-dataset-v1"
+    assert subset2 is None
+
+    # Trailing slash is tolerated
+    repo3, subset3 = rd._parse_hf_uri("hf://nvidia/embed-nemotron-dataset-v1/")
+    assert repo3 == "nvidia/embed-nemotron-dataset-v1"
+    assert subset3 is None
+
+    # Not an HF URI
+    with pytest.raises(ValueError, match="Not an HF URI"):
+        rd._parse_hf_uri("s3://bucket/key")
+
+    # Too few parts
+    with pytest.raises(ValueError, match="at least org/repo"):
+        rd._parse_hf_uri("hf://nvidia")
+
+
+def test_normalize_data_source():
+    assert rd._normalize_data_source("hf://org/repo/sub") == {"source": "hf://org/repo/sub"}
+    assert rd._normalize_data_source({"source": "/local/path", "extra": 1}) == {"source": "/local/path", "extra": 1}
+
+    with pytest.raises(ValueError, match="'source' key"):
+        rd._normalize_data_source({"path": "/local/path"})
+
+    with pytest.raises(TypeError, match="str or dict"):
+        rd._normalize_data_source(123)
+
+
+def test_hf_corpus_dataset():
+    hf_ds = Dataset.from_list([{"id": "d2", "text": "Doc 2"}, {"id": "d1", "text": "Doc 1"}])
+    corpus = rd.HFCorpusDataset(hf_ds, path="hf://org/repo/sub")
+
+    assert corpus.path == "hf://org/repo/sub"
+    assert corpus.get_all_ids() == ["d1", "d2"]
+
+    doc = corpus.get_document_by_id("d1")
+    assert doc["text"] == "Doc 1"
+    assert doc["image"] == ""
+    assert doc["nr_ocr"] == ""
+
+    doc2 = corpus.get_document_by_id("d2")
+    assert doc2["text"] == "Doc 2"
+
+
+def test_load_hf_subset(tmp_path, monkeypatch):
+    """Mock hf_hub_download and load_dataset to verify _load_hf_subset output."""
+    # Create metadata file (ids_only=false)
+    meta_path = tmp_path / "dataset_metadata.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "corpus_id": "test_corpus",
+                "class": "TextQADataset",
+                "ids_only": False,
+                "query_instruction": "find relevant passages",
+                "passage_instruction": "",
+            }
+        )
+    )
+
+    def fake_hf_hub_download(repo_id, filename, repo_type, **kw):
+        if filename.endswith("dataset_metadata.json"):
+            return str(meta_path)
+        raise FileNotFoundError(filename)
+
+    monkeypatch.setattr(rd, "hf_hub_download", fake_hf_hub_download)
+
+    # Corpus dataset has id + text columns
+    corpus_ds = Dataset.from_list([{"id": "p1", "text": "Positive"}, {"id": "n1", "text": "Negative"}])
+    # Query dataset
+    query_ds = Dataset.from_list(
+        [
+            {
+                "question_id": "q1",
+                "question": "What?",
+                "pos_doc": [{"id": "p1"}],
+                "neg_doc": [{"id": "n1"}],
+            }
+        ]
+    )
+
+    def fake_load_dataset(repo_id, config=None, split=None, **kw):
+        if config is not None and config.endswith("_corpus"):
+            return corpus_ds
+        return query_ds
+
+    monkeypatch.setattr(rd, "load_dataset", fake_load_dataset)
+
+    data_list, corpus_info = rd._load_hf_subset("org/repo", "SubsetA")
+
+    assert len(data_list) == 1
+    assert data_list[0]["question"] == "What?"
+    assert data_list[0]["corpus_id"] == "test_corpus"
+    assert data_list[0]["pos_doc"] == [{"id": "p1"}]
+    assert data_list[0]["neg_doc"] == [{"id": "n1"}]
+
+    assert corpus_info.corpus_id == "test_corpus"
+    assert corpus_info.path == "hf://org/repo/SubsetA"
+    assert corpus_info.query_instruction == "find relevant passages"
+    assert corpus_info.get_document_by_id("p1")["text"] == "Positive"
+
+
+def test_load_hf_subset_ids_only(tmp_path, monkeypatch):
+    """Verify that ids_only=true triggers lookup-dict resolution."""
+    meta_path = tmp_path / "dataset_metadata.json"
+    meta_path.write_text(
+        json.dumps({"corpus_id": "ids_corpus", "class": "TextQADataset", "ids_only": True})
+    )
+
+    config_path = tmp_path / "source_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "loader_config": "column",
+                "source_repo": "org/source",
+                "subset": "train",
+                "split": "train",
+                "query_column": "question",
+                "document_column": "answer",
+            }
+        )
+    )
+
+    def fake_hf_hub_download(repo_id, filename, repo_type, **kw):
+        if filename.endswith("dataset_metadata.json"):
+            return str(meta_path)
+        if filename.endswith("source_config.json"):
+            return str(config_path)
+        raise FileNotFoundError(filename)
+
+    monkeypatch.setattr(rd, "hf_hub_download", fake_hf_hub_download)
+
+    # Source dataset for column loader
+    source_ds = Dataset.from_list(
+        [
+            {"question": "Real question?", "answer": "Real answer."},
+            {"question": "Another Q?", "answer": "Another A."},
+        ]
+    )
+    # Corpus with id-only references
+    corpus_ds = Dataset.from_list([{"id": "d_0", "text": ""}, {"id": "d_1", "text": ""}])
+    # Queries with id-only references
+    query_ds = Dataset.from_list(
+        [
+            {
+                "question_id": "q1",
+                "question": "q_0",
+                "pos_doc": [{"id": "d_0"}],
+                "neg_doc": [{"id": "d_1"}],
+            }
+        ]
+    )
+
+    call_log = []
+
+    def fake_load_dataset(repo_id_or_path, config=None, split=None, **kw):
+        call_log.append((repo_id_or_path, config, split))
+        if repo_id_or_path == "org/source":
+            return source_ds
+        if config is not None and config.endswith("_corpus"):
+            return corpus_ds
+        return query_ds
+
+    monkeypatch.setattr(rd, "load_dataset", fake_load_dataset)
+
+    data_list, corpus_info = rd._load_hf_subset("org/repo", "MySubset")
+
+    # Verify text was resolved via lookup
+    assert data_list[0]["question"] == "Real question?"
+    doc = corpus_info.get_document_by_id("d_0")
+    assert doc["text"] == "Real answer."
+
+
+def test_make_retrieval_dataset_data_sources_hf(tmp_path, monkeypatch):
+    """End-to-end: make_retrieval_dataset with data_sources pointing to an HF URI."""
+    meta_path = tmp_path / "dataset_metadata.json"
+    meta_path.write_text(
+        json.dumps({"corpus_id": "e2e_corpus", "class": "TextQADataset", "ids_only": False})
+    )
+
+    def fake_hf_hub_download(repo_id, filename, repo_type, **kw):
+        return str(meta_path)
+
+    monkeypatch.setattr(rd, "hf_hub_download", fake_hf_hub_download)
+
+    corpus_ds = Dataset.from_list(
+        [{"id": "p", "text": "P"}, {"id": "n1", "text": "N1"}, {"id": "n2", "text": "N2"}]
+    )
+    query_ds = Dataset.from_list(
+        [
+            {
+                "question_id": "q1",
+                "question": "What?",
+                "pos_doc": [{"id": "p"}],
+                "neg_doc": [{"id": "n1"}, {"id": "n2"}],
+            }
+        ]
+    )
+
+    def fake_load_dataset(repo_id, config=None, split=None, **kw):
+        if config is not None and config.endswith("_corpus"):
+            return corpus_ds
+        return query_ds
+
+    monkeypatch.setattr(rd, "load_dataset", fake_load_dataset)
+
+    ds = rd.make_retrieval_dataset(
+        data_sources=["hf://org/repo/SubA"],
+        data_type="train",
+        train_n_passages=3,
+    )
+    assert len(ds) == 1
+    ex = ds[0]
+    assert ex["question"] == "What?"
+    assert len(ex["doc_text"]) == 3  # 1 pos + 2 neg
+    assert ex["doc_text"][0] == "P"
+
+
+def test_transform_func_empty_neg_doc_with_negatives_requested():
+    """Empty neg_doc + num_neg_docs > 0 must raise, not ZeroDivisionError."""
+    corpus_dict = {
+        "c": DummyCorpus({"p": {"text": "pos", "image": "", "nr_ocr": ""}}),
+    }
+    examples = {
+        "question": ["Q"],
+        "corpus_id": ["c"],
+        "pos_doc": [[{"id": "p"}]],
+        "neg_doc": [[]],
+    }
+    with pytest.raises(ValueError, match="neg_doc is empty"):
+        rd._transform_func(examples, num_neg_docs=2, corpus_dict=corpus_dict)
+
+    # num_neg_docs=0 with empty neg_doc should still work fine
+    out = rd._transform_func(examples, num_neg_docs=0, corpus_dict=corpus_dict)
+    assert out["doc_text"][0] == ["pos"]
+
+
+def test_load_hf_subset_synthesizes_question_id(tmp_path, monkeypatch):
+    """Records without question_id get deterministic IDs: {subset}:{row_idx}."""
+    meta_path = tmp_path / "dataset_metadata.json"
+    meta_path.write_text(
+        json.dumps({"corpus_id": "c", "class": "TextQADataset", "ids_only": False})
+    )
+    monkeypatch.setattr(rd, "hf_hub_download", lambda **kw: str(meta_path))
+
+    corpus_ds = Dataset.from_list([{"id": "p", "text": "P"}])
+    query_ds = Dataset.from_list(
+        [{"question": "Q?", "pos_doc": [{"id": "p"}], "neg_doc": [{"id": "p"}]}]
+    )
+
+    def fake_load_dataset(repo_id, config=None, split=None, **kw):
+        return corpus_ds if config is not None and config.endswith("_corpus") else query_ds
+
+    monkeypatch.setattr(rd, "load_dataset", fake_load_dataset)
+
+    data_list, _ = rd._load_hf_subset("org/repo", "MySub")
+    assert data_list[0]["question_id"] == "MySub:0"
+
+
+def test_load_hf_subset_allows_empty_neg_doc(tmp_path, monkeypatch):
+    """Empty neg_doc is allowed at load time (validated later at transform)."""
+    meta_path = tmp_path / "dataset_metadata.json"
+    meta_path.write_text(
+        json.dumps({"corpus_id": "c", "class": "TextQADataset", "ids_only": False})
+    )
+    monkeypatch.setattr(rd, "hf_hub_download", lambda **kw: str(meta_path))
+
+    corpus_ds = Dataset.from_list([{"id": "p", "text": "P"}])
+    query_ds = Dataset.from_list(
+        [{"question": "Q?", "pos_doc": [{"id": "p"}], "neg_doc": []}]
+    )
+
+    def fake_load_dataset(repo_id, config=None, split=None, **kw):
+        return corpus_ds if config is not None and config.endswith("_corpus") else query_ds
+
+    monkeypatch.setattr(rd, "load_dataset", fake_load_dataset)
+
+    data_list, _ = rd._load_hf_subset("org/repo", "Sub")
+    assert data_list[0]["neg_doc"] == []
+
+
+def test_make_retrieval_dataset_backwards_compat(tmp_path, monkeypatch):
+    """data_dir_list still works as before."""
+    corpus_dir = tmp_path / "corpusBC"
+    corpus_dir.mkdir()
+    (corpus_dir / "merlin_metadata.json").write_text(
+        json.dumps({"class": "TextQADataset", "corpus_id": "BC"})
+    )
+
+    monkeypatch.setattr(
+        rd,
+        "load_dataset",
+        _mock_hf_load_dataset_returning(
+            [{"id": "p", "text": "P"}, {"id": "n1", "text": "N1"}]
+        ),
+    )
+
+    train_file = _make_train_file(tmp_path, corpus_dir, data_len=1, corpus_id="BC")
+    ds = rd.make_retrieval_dataset(
+        data_dir_list=str(train_file), data_type="train", train_n_passages=2
+    )
+    assert len(ds) == 1
+    ex = ds[0]
+    assert ex["question"] == "Q0"
+
+
+def test_make_retrieval_dataset_requires_source():
+    """Neither data_dir_list nor data_sources raises ValueError."""
+    with pytest.raises(ValueError, match="Either data_dir_list or data_sources"):
+        rd.make_retrieval_dataset()
+
+
+def test_make_retrieval_dataset_rejects_both_inputs():
+    """Providing both data_dir_list and data_sources raises ValueError."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        rd.make_retrieval_dataset(data_dir_list=["a.json"], data_sources=["hf://org/repo/Sub"])
+
+
+def test_load_datasets_from_sources_corpus_id_collision_hf_local(tmp_path, monkeypatch):
+    """HF and local sources with same corpus_id but different paths must raise."""
+    # Setup HF side
+    meta_path = tmp_path / "dataset_metadata.json"
+    meta_path.write_text(
+        json.dumps({"corpus_id": "shared_id", "class": "TextQADataset", "ids_only": False})
+    )
+
+    def fake_hf_hub_download(repo_id, filename, repo_type, **kw):
+        return str(meta_path)
+
+    monkeypatch.setattr(rd, "hf_hub_download", fake_hf_hub_download)
+
+    corpus_ds = Dataset.from_list([{"id": "p", "text": "P"}, {"id": "n", "text": "N"}])
+    query_ds = Dataset.from_list(
+        [{"question_id": "q1", "question": "Q?", "pos_doc": [{"id": "p"}], "neg_doc": [{"id": "n"}]}]
+    )
+
+    # Setup local side with same corpus_id but different path
+    local_corpus_dir = tmp_path / "local_corpus"
+    local_corpus_dir.mkdir()
+    (local_corpus_dir / "merlin_metadata.json").write_text(
+        json.dumps({"class": "TextQADataset", "corpus_id": "shared_id"})
+    )
+    local_train = {
+        "corpus": [{"path": str(local_corpus_dir)}],
+        "data": [
+            {"question_id": "q2", "question": "Q2?", "corpus_id": "shared_id",
+             "pos_doc": [{"id": "p"}], "neg_doc": [{"id": "n"}]},
+        ],
+    }
+    local_file = tmp_path / "local.json"
+    local_file.write_text(json.dumps(local_train))
+
+    def fake_load_dataset(repo_id_or_path, config=None, split=None, **kw):
+        if isinstance(repo_id_or_path, str) and repo_id_or_path == str(local_corpus_dir):
+            return {"train": corpus_ds}
+        if config is not None and config.endswith("_corpus"):
+            return corpus_ds
+        return query_ds
+
+    monkeypatch.setattr(rd, "load_dataset", fake_load_dataset)
+
+    with pytest.raises(ValueError, match="Duplicate corpus_id.*shared_id.*different paths"):
+        rd.load_datasets_from_sources(
+            ["hf://org/repo/Sub", str(local_file)]
+        )
+
+
 def test_retrieval_dataset_inline_smoke(tmp_path):
     f = tmp_path / "inline.jsonl"
     f.write_text(json.dumps({"query": "Q", "pos_doc": "P", "neg_doc": ["N"]}))
