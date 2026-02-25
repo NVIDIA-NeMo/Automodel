@@ -197,6 +197,8 @@ Auto-generated Python API documentation.
 ::::{toctree}
 :hidden:
 :caption: Get Started
+about/index.md
+about/key-features.md
 guides/installation.md
 guides/configuration.md
 guides/huggingface-api-compatibility.md
