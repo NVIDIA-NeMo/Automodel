@@ -31,15 +31,15 @@ Learn about the AutoModel, how it works at a high-level, and the key features.
 :gutter: 1 1 1 2
 
 :::{grid-item-card} {octicon}`book;1.5em;sd-mr-1` About NeMo AutoModel
-:link: repository-structure
+:link: about/index
 :link-type: doc
 Overview of NeMo AutoModel and its capabilities.
 :::
 
-:::{grid-item-card} {octicon}`book;1.5em;sd-mr-1` Key Features and Concepts
-:link: repository-structure
+:::{grid-item-card} {octicon}`zap;1.5em;sd-mr-1` Key Features and Concepts
+:link: about/key-features
 :link-type: doc
-Discover the main features and concepts of NeMo Automodel
+Supported workflows, parallelism, recipes, components, and benchmarks.
 :::
 
 :::{grid-item-card} {octicon}`hubot;1.5em;sd-mr-1` 🤗 Hugging Face Integration
@@ -200,12 +200,12 @@ Home <self>
 ::::{toctree}
 :hidden:
 :caption: Get Started
-repository-structure.md
 guides/installation.md
 guides/configuration.md
 guides/huggingface-api-compatibility.md
 launcher/local-workstation.md
 launcher/cluster.md
+repository-structure.md
 ::::
 
 ::::{toctree}
@@ -246,6 +246,7 @@ guides/llm/databricks.md
 model-coverage/overview.md
 model-coverage/llm.md
 model-coverage/vlm.md
+model-coverage/troubleshooting.md
 ::::
 
 ::::{toctree}
