@@ -252,15 +252,7 @@ automodel finetune llm -c config.yaml --checkpoint.checkpoint_dir /mnt/shared/my
 When using a custom path, make sure the corresponding host directory is mounted into the container with `-v`.
 
 ::: {tip}
-Mount additional host directories for datasets and the Hugging Face model cache to avoid re-downloading large models across container restarts:
-```bash
-docker run --gpus all -it --rm \
-  --shm-size=8g \
-  -v /host/checkpoints:/opt/Automodel/checkpoints \
-  -v /host/datasets:/datasets \
-  -v /host/hf_cache:/root/.cache/huggingface \
-  nvcr.io/nvidia/nemo-automodel:25.11.00
-```
+Mount additional host directories for datasets and the Hugging Face model cache to avoid re-downloading large models across container restarts. See the [Installation Guide](installation.md) for a complete `docker run` example with all recommended mounts.
 :::
 
 ## Asynchronous Checkpointing
