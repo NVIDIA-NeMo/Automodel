@@ -66,8 +66,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             # Get vocab_size from model config
             if hasattr(cfg.model, "config") and hasattr(cfg.model.config, "pretrained_model_name_or_path"):
                 from transformers import AutoConfig
+                trust_remote_code = getattr(cfg.model.config, "trust_remote_code", False)
 
-                model_config = AutoConfig.from_pretrained(cfg.model.config.pretrained_model_name_or_path)
+                model_config = AutoConfig.from_pretrained(cfg.model.config.pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
                 vocab_size = model_config.vocab_size
                 # Inject vocab_size into dataset config
                 cfg.dataset.vocab_size = vocab_size
