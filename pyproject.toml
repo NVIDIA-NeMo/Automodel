@@ -75,11 +75,7 @@ classifiers = [
 ]
 dependencies = [
     "datasets>=4.0.0",
-    "diffusers",
-    "ftfy",
-    "imageio-ffmpeg",
     "megatron-fsdp>=0.2.3",
-    "opencv-python-headless==4.10.0.84",
     "pybind11",
     "pyyaml",
     "torch>=2.6.0,<=2.10.0",
@@ -91,6 +87,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+diffusion = [
+    "diffusers>=0.36.0",
+    "ftfy",
+    "imageio",
+    "imageio-ffmpeg",
+    "opencv-python-headless",
+]
 # nvidia-cudnn-cu12 pin: This is required for GPTOSS TE support + faster cudnn attention (only on Linux where CUDA is available)
 # "nvidia-cudnn-cu12>=9.18.0.0; sys_platform == 'linux'",
 # Flash-attn version should be selected to satisfy TE requirements
@@ -131,6 +134,7 @@ vlm = [
 all = [
     "nemo_automodel[cuda]",
     "nemo_automodel[delta-databricks]",
+    "nemo_automodel[diffusion]",
     "nemo_automodel[extra]",
     "nemo_automodel[vlm]",
 ]
@@ -323,6 +327,7 @@ modules = [
     "nemo_automodel.components.config",
     "nemo_automodel.components.datasets",
     "nemo_automodel.components.distributed",
+    "nemo_automodel.components.flow_matching",
     "nemo_automodel.components.launcher",
     "nemo_automodel.components.loggers",
     "nemo_automodel.components.loss",
