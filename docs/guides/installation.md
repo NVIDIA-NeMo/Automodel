@@ -25,8 +25,8 @@ This guide explains how to install NeMo AutoModel for LLM, VLM, and OMNI models 
 - **Network**: Stable internet connection for downloading models
 
 ## Installation Options for Non-Developers
-This section explains the easiest installation options for non-developers, including using pip3 via PyPI or leveraging a preconfigured NVIDIA NeMo Docker container. Both methods offer quick access to the latest stable release of NeMo AutoModel with all required dependencies.
-### Install via PyPI (Recommended)
+This section explains the easiest installation options for non-developers, including using pip3 from PyPI or leveraging a preconfigured NVIDIA NeMo Docker container. Both methods offer quick access to the latest stable release of NeMo AutoModel with all required dependencies.
+### Install from PyPI (Recommended)
 
 For most users, the easiest way to get started is using `pip3`.
 
@@ -59,7 +59,7 @@ This section provides installation options for developers, including pulling the
 
 If you want the **latest features** from the `main` branch or want to contribute:
 
-#### Option A - Use `pip` with git repo:
+#### Option A: Use `pip` with Git Repo
 ```bash
 pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git
 ```
@@ -67,7 +67,7 @@ pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git
 This installs the repo as a standard Python package (not editable).
 :::
 
-#### Option B - Use `uv` with git repo:
+#### Option B: Use `uv` with Git Repo
 ```bash
 uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
 ```
@@ -91,14 +91,14 @@ This installs AutoModel in editable mode, so changes to the code are immediately
 To run NeMo AutoModel inside a NeMo container while **mounting your local repo**, follow these steps:
 
 ```bash
-# Step 1: Clone the AutoModel repository
+# Step 1: Clone the AutoModel repository.
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
 
-# Step 2: Pull a compatible container image (replace the tag as needed)
+# Step 2: Pull a compatible container image (replace the tag as needed).
 docker pull nvcr.io/nvidia/nemo-automodel:25.11.00
 
-# Step 3: Run the container, mount the repo, and run a quick sanity check
+# Step 3: Run the container, mount the repo, and run a quick sanity check.
 docker run --gpus all -it --rm \
   --shm-size=8g \
   -v "$PWD":/workspace/Automodel \

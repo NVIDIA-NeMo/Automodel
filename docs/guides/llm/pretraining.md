@@ -1,4 +1,4 @@
-# Pretraining using Megatron Core Datasets with NeMo Automodel
+# Pretraining Megatron Core Datasets with NeMo AutoModel
 
 ## Introduction
 
@@ -6,7 +6,7 @@ Pretraining builds a base large language model (LLM) by training a randomly init
 
 Robust pretraining establishes a foundation of linguistic competence and world knowledge that scales with data, parameters, and compute. This base model then serves as the necessary starting point for later fine-tuning or domain-specific adaptation.
 
-NeMo Automodel provides an end-to-end recipe to run LLM pretraining with Hugging Face–native models and Megatron-Core style datasets.
+NeMo AutoModel provides an end-to-end recipe to run LLM pretraining with Hugging Face–native models and Megatron-Core style datasets.
 
 ## Model and Dataset Context
 
@@ -41,7 +41,7 @@ Here’s a glimpse of what the data looks like:
 For this guide, we use the FineWeb-Edu 10BT sample—a collection of approximately 10 billion tokens randomly drawn from the full FineWeb-Edu dataset. To prepare the data, run the following commands:
 
 ```bash
-# run this inside the Automodel directory
+# run this inside the AutoModel directory
 
 git clone https://github.com/facebookresearch/lingua.git
 cd lingua
@@ -110,9 +110,9 @@ fineweb_edu/
 ```
 
 ## Preprocess to a Megatron Core Dataset
-NeMo Automodel provides tooling to perform the task of tokenizing and saving in the Megatron Core dataset format. You can use it as follows:
+NeMo AutoModel provides tooling to perform the task of tokenizing and saving in the Megatron Core dataset format. You can use it as follows:
 
-```
+```bash
 uv run tools/preprocess_megatron_dataset.py --input "fineweb_edu/fineweb_edu_10bt/fineweb_edu_10bt.chunk.*.jsonl" --json-keys text --output-prefix processed_data --output-path fineweb_edu/megatron_gpt2/ --workers 8 --pretrained-model-name-or-path openai-community/gpt2 --append-eod
 ```
 
@@ -152,17 +152,17 @@ fineweb_edu/megatron_gpt2/
 1 directory, 28 files
 ```
 
-::::{tip}
+:::{tip}
 Replace `--workers` with the amount of CPU cores you'd like to use to tokenize in parallel.
-::::
+:::
 
 ## Use a Recipe for Pretraining
 
-This example demonstrates how to perform pretraining on a large language model using NVIDIA's NeMo Automodel library. We use the LLM [training recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py), specifically `TrainFinetuneRecipeForNextTokenPrediction`, which orchestrates the pretraining process — including loading, dataset preparation, optimizer setup, distributed training, checkpointing, and logging.
+This example demonstrates how to perform pretraining on a large language model using NVIDIA's NeMo AutoModel library. We use the LLM [training recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py), specifically `TrainFinetuneRecipeForNextTokenPrediction`, which orchestrates the pretraining process — including loading, dataset preparation, optimizer setup, distributed training, checkpointing, and logging.
 
 ### What is a Recipe?
 
-A recipe in NeMo Automodel is a **self-contained orchestration module** that wires together all
+A recipe in NeMo AutoModel is a **self-contained orchestration module** that wires together all
 components needed to perform a specific task (e.g., pretraining).
 Think of it as the equivalent of a Trainer class, but highly modular, stateful, and reproducible.
 
@@ -207,7 +207,7 @@ model:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: openai-community/gpt2
 
-# As mentioned earlier, we are using the FineWeb-Edu dataset. NeMo Automodel provides the MegatronPretraining
+# As mentioned earlier, we are using the FineWeb-Edu dataset. NeMo AutoModel provides the MegatronPretraining
 # class which prepares the dataset by loading, packing, and shuffling. We use the "train" split for
 # training.
 dataset:
@@ -306,9 +306,9 @@ lr_scheduler:
 #   save_dir: <your_wandb_save_dir>
 
 ```
-::::{tip}
+:::{tip}
 If you want to add weights to the dataset blends, you can do so by passing in a list. For example, `paths: ["30", "fineweb_edu/megatron_gpt2/processed_data_0_text_document", "70", "fineweb_edu/megatron_gpt2/processed_data_1_text_document"]`.
-::::
+:::
 
 ## Load Large Models
 In distributed training, the typical model-loading pipeline has each GPU load the entire model and then retain only the shard it needs. This approach becomes problematic when the model size exceeds the memory capacity of a single GPU. For instance, a 70B-parameter model requires about 140GB of memory for its parameters when using the BF16 data type (2 bytes per parameter). Since most widely used GPUs are limited to 80GB, the full model cannot be directly loaded onto a single device.
@@ -320,7 +320,7 @@ In these scenarios, you can pass `is_meta_device: true` in the model config. The
 
 Assuming you saved, or plan to use, the provided config at `examples/llm_pretrain/megatron_pretrain_gpt2.yaml`:
 
-``` bash
+```bash
 uv run torchrun --nproc-per-node=2 examples/llm_pretrain/pretrain.py --config examples/llm_pretrain/megatron_pretrain_gpt2.yaml
 ```
 
@@ -743,8 +743,8 @@ As training progresses, you should observe the model loss beginning to converge.
 
 :::{figure} ./gpt2_loss.png
 :name: gpt2-train-loss
-:alt: Example of GPT2 training convergence on FineWeb-Edu-10B
+:alt: Example of GPT-2 training convergence on FineWeb-Edu-10B
 :align: center
 
-Example of GPT2 training convergence on FineWeb-Edu-10B.
+Example of GPT-2 training convergence on FineWeb-Edu-10B.
 :::

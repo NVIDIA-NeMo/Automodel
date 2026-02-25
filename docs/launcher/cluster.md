@@ -1,4 +1,4 @@
-# Run on a Cluster (Slurm / Multi-node)
+# Run on a Cluster (Slurm/Multi-Node)
 
 In this guide, you will learn how to submit distributed training jobs on Slurm clusters (single- or multi-node). For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.md). For setup details, refer to our [Installation Guide](../guides/installation.md).
 
@@ -174,7 +174,7 @@ uv provides several advantages for development and experimentation:
 
 ## Run with Torchrun
 
-For cluster usage, prefer submitting via the CLI with `slurm` configuration. Direct `torchrun` is recommended for single-node development; see [Run on Your Local Workstation](./local-workstation.md).
+For cluster usage, prefer submitting using the CLI with `slurm` configuration. Direct `torchrun` is recommended for single-node development; see [Run on Your Local Workstation](./local-workstation.md).
 
 ### Standard PyTorch Multi-Node Example
 
@@ -197,7 +197,7 @@ torchrun \
 :::{note}
 - Set `NODE_RANK=0` on the master node (where `MASTER_ADDR` resolves), `NODE_RANK=1` on the second node, and so on.
 - Ensure `--nproc-per-node` matches the number of GPUs per node.
-- When launching under Slurm, prefer the CLI `slurm` configuration above or ensure equivalent rendezvous/env settings are provided via the scheduler.
+- When launching under Slurm, use the CLI `slurm` configuration described above, or ensure the scheduler provides equivalent rendezvous and environment settings.
 :::
 
 ## Customize Configuration Settings

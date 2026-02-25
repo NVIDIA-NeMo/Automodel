@@ -128,8 +128,8 @@ uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config ex
 
 FP8 requires specific conditions to be effective:
 - Input tensors must have dimensions divisible by 16 
-- Using compatible hardware (H100+)
-- Training with `torch.compile`
+- Use compatible hardware (H100+)
+- Train with `torch.compile`
 
 FP8 works best when the majority of GEMM operations are sufficiently large such that the speedup achieved by using FP8 tensor cores is greater than the overhead of dynamic quantization.
 

@@ -1,6 +1,6 @@
 # Function Calling with NeMo AutoModel using FunctionGemma
 
-This tutorial walks through fine-tuning [FunctionGemma](https://huggingface.co/google/functiongemma-270m-it), Google's 270m function-calling model with NeMo AutoModel on the xLAM function-calling dataset.
+This tutorial walks through fine-tuning [FunctionGemma](https://huggingface.co/google/functiongemma-270m-it), Google's 270M function-calling model, with NeMo AutoModel on the xLAM function-calling dataset.
 
 
 ## FunctionGemma Introduction
@@ -12,11 +12,11 @@ FunctionGemma is a lightweight, 270M-parameter variant built on the Gemma 3 arch
 
 ## Prerequisites
 - Install NeMo AutoModel and its extras: `pip install nemo-automodel`.
-- A FunctionGemma checkpoint available locally or via https://huggingface.co/google/functiongemma-270m-it.
+- A FunctionGemma checkpoint available locally or using <https://huggingface.co/google/functiongemma-270m-it>.
 - Small model footprint: can be fine-tuned on a single GPU; scale batch/sequence as needed.
 
 ## xLAM Dataset
-xLAM is a function-calling dataset containing user queries, tool schemas, and tool call traces. It covers diverse tools and arguments so models learn to emit structured tool calls.
+The xLAM function-calling dataset contains user queries, tool schemas, and tool call traces. It covers diverse tools and arguments so models learn to emit structured tool calls.
 - Dataset URL: https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k
 - Each sample provides:
   - `query`: the user request.

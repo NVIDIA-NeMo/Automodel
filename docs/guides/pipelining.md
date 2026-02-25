@@ -140,7 +140,7 @@ These two flags switch AutoPipeline to lightweight, pipeline-friendly `forward()
 
 - **`patch_inner_model`**: patches the *decoder module* (`model.model` for `...ForCausalLM`, otherwise the module itself) so each stage can run even after pruning.
   - **Stage 0** (has `embed_tokens`): takes token IDs and produces hidden states.
-  - **Middle stages** (no `embed_tokens`): take hidden states from the previous stage (via `inputs_embeds`, or a float tensor passed through `input_ids`) and produce hidden states.
+  - **Middle stages** (no `embed_tokens`): take hidden states from the previous stage (using `inputs_embeds`, or a float tensor passed through `input_ids`) and produce hidden states.
   - Handles sliced layer containers (e.g., `layers` becoming dict-like after stage pruning) and returns a **tensor** of hidden states so stages can be chained.
 
   For compilation/performance, this patched forward prefers a precomputed `causal_mask_mapping` dict (it will fall back to computing masks and warn if you don't provide it).

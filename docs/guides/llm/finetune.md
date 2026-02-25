@@ -131,7 +131,7 @@ The recipe ensures stateless, config-driven orchestration where core components 
 :::
 
 ### Recipe Config
-``` yaml
+```yaml
 # The model section is responsible for configuring the model we want to finetune.
 # Since we want to use the Llama 3 1B model, we pass `meta-llama/Llama-3.2-1B` to the
 # `pretrained_model_name_or_path` option.
@@ -385,7 +385,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel # for PEFT
 
-# For SFT, Load finetuned checkpoint
+# For SFT, load finetuned checkpoint
 finetuned_ckpt_path = "checkpoints/epoch_0_step_10/model/consolidated"
 tokenizer = AutoTokenizer.from_pretrained(finetuned_ckpt_path)
 model = AutoModelForCausalLM.from_pretrained(finetuned_ckpt_path)
@@ -468,41 +468,6 @@ peft_model = PeftModel.from_pretrained(model, "your-username/peft-adapter-name")
 By publishing the fine-tuned checkpoint or PEFT adapter to the Hugging Face Hub, we
 enable easy sharing, reproducibility, and integration with downstream
 applications.
-<!-- 
-## Evaluate with the LM Evaluation Harness
-
-After fine-tuning the pretrained model on a domain-specific dataset
-using NeMo AutoModel, the process generates one (or more) Hugging
-Face-native checkpoint(s). The checkpoint(s) is/are fully compatible
-with the Hugging Face ecosystem, allowing seamless integration with
-evaluation tools.
-
-To assess the performance of the fine-tuned model, we will use the [LM
-Evaluation
-Harness](https://github.com/EleutherAI/lm-evaluation-harness), a
-standardized framework for benchmarking language models. The finetuned
-checkpoint or PEFT adapters can be directly loaded into the evaluation pipeline without
-additional conversion.
-
-In the following setup, we utilize the LM Evaluation Harness to evaluate
-the fine-tuned model on HellaSwag, a benchmark designed to measure
-commonsense reasoning capabilities.
-
-```bash
-ckpt="/ft_checkpoints/llama3.2_1b"
-python3 -m lm_eval --model hf \
-    --model_args pretrained=$ckpt \
-    --tasks hellaswag \
-    --device cuda:0 \
-    --batch_size 8
-```
-
-This command will run lm_eval on hellaswag using the NeMo
-AutoModel fine-tuned checkpoint of [meta-llama/Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B).
-
-Before running this command, make sure you have specified the checkpoint
-path that you used during fine-tuning, we will use
-[/ft_checkpoints/llama3.2_1b]{.title-ref} as in the fine-tuning section. -->
 
 ## Export to vLLM
 

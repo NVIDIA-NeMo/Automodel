@@ -1,6 +1,6 @@
 # YAML Configuration and Environment Variable Interpolation
 
-NeMo Automodel recipes are configured with YAML. Under the hood, YAML is parsed into a `ConfigNode` which:
+NeMo AutoModel recipes are configured with YAML. Under the hood, YAML is parsed into a `ConfigNode` which:
 
 - Translates common scalar strings into typed Python values (e.g., `"10"` → `10`).
 - Resolves `_target_` (and `*_fn`) into Python callables/classes.
@@ -10,7 +10,7 @@ NeMo Automodel recipes are configured with YAML. Under the hood, YAML is parsed 
 
 ## Load Model and Dataset Configs
 
-Most recipes load the YAML via `nemo_automodel.components.config.loader.load_yaml_config()`, which returns a `ConfigNode`.
+Most recipes load the YAML using `nemo_automodel.components.config.loader.load_yaml_config()`, which returns a `ConfigNode`.
 
 Within a `ConfigNode`:
 
@@ -32,7 +32,7 @@ YAML-native types (like `step_size: 10` without quotes) are already typed by the
 
 ## Use `_target_` for Instantiation
 
-Any mapping containing a `_target_` key can be instantiated via `ConfigNode.instantiate()`:
+Any mapping containing a `_target_` key can be instantiated using `ConfigNode.instantiate()`:
 
 ```yaml
 model:
@@ -55,12 +55,12 @@ By default, resolving targets is restricted:
 
 ### Distributed Section (Strategy-Based)
 
-The `distributed:` section is **not** instantiated via `_target_`. Recipes parse it with a fixed schema: use `strategy: fsdp2`, `strategy: ddp`, or `strategy: megatron_fsdp`, plus optional parallelism sizes (`dp_size`, `tp_size`, `pp_size`, etc.) and strategy-specific options. When pipeline parallelism is enabled (`pp_size > 1`), add a `pipeline:` subsection with options such as `pp_schedule`, `pp_microbatch_size`, and `layers_per_stage`. See the [Pipelining](pipelining.md) guide and recipe example configs for full examples.
+The `distributed:` section is **not** instantiated using `_target_`. Recipes parse it with a fixed schema: use `strategy: fsdp2`, `strategy: ddp`, or `strategy: megatron_fsdp`, plus optional parallelism sizes (`dp_size`, `tp_size`, `pp_size`, etc.) and strategy-specific options. When pipeline parallelism is enabled (`pp_size > 1`), add a `pipeline:` subsection with options such as `pp_schedule`, `pp_microbatch_size`, and `layers_per_stage`. See the [Pipelining](pipelining.md) guide and recipe example configs for full examples.
 
 
 ## Interpolate Environment Variables in YAML
 
-NeMo Automodel supports env var interpolation inside YAML **string values**.
+NeMo AutoModel supports env var interpolation inside YAML **string values**.
 
 ### Supported Forms
 
@@ -79,7 +79,7 @@ NeMo Automodel supports env var interpolation inside YAML **string values**.
 
 - Interpolation happens when values are wrapped into a `ConfigNode`.
 - If a referenced env var is **missing** and **no default** is provided, config loading raises a `KeyError`.
-- Defaults are supported only for braced forms via the first comma: `${VAR,default_value}`.
+- Defaults are supported only for braced forms using the first comma: `${VAR,default_value}`.
 
 ### Example (Databricks Delta)
 
@@ -108,7 +108,7 @@ Printing a **leaf value** (for example, `print(cfg.dataset.delta_storage_options
 
 ## Configure Slurm (`automodel` CLI)
 
-The `automodel` CLI loads YAML via `yaml.safe_load()` and then extracts the `slurm:` section.
+The `automodel` CLI loads YAML using `yaml.safe_load()` and then extracts the `slurm:` section.
 Since the `slurm:` dict is not wrapped into a `ConfigNode`, **env placeholders are passed through as-is**. This lets you defer expansion to job runtime (and avoids embedding secrets into generated scripts).
 
 Example:

@@ -18,7 +18,6 @@ pip install -e ".[all]"    # installs NeMo AutoModel + optional extras
 For this guide, we will use a single machine equipped with 8xH100 NVIDIA GPUs.
 :::
 
-:::tip
 :::{tip}
 To run this guide on a single GPU, use the single-GPU command in the **Launch Training** section below and scale down the YAML (for example, reduce `step_scheduler.global_batch_size` / `local_batch_size`, and shrink the model using `model.n_layer` / `model.n_embd` / `model.n_head`). For more launch patterns, see [Run on Your Local Workstation](../../launcher/local-workstation.md).
 :::
@@ -44,7 +43,7 @@ Briefly, FineWeb is built by extracting main text from CommonCrawl WARC HTML, ke
 To train on more than 2B tokens from FineWeb, see [pretraining.md](pretraining.md) which uses Megatron Core's sharded dataset format without file size constraints.
 :::
 
-### Pre-Processing and Tokenization
+### Preprocessing and Tokenization
 
 For the purposes of this guide, we provide a data preprocessing tool at [`nanogpt_data_processor.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/nanogpt_data_processor.py) that streams datasets from the Hugging Face Hub, tokenizes using Hugging Face's `transformers.AutoTokenizer` (default: GPT-2), and writes the output in **memory-mapped binary shards** to files. During training, we use the [`NanogptDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/nanogpt_dataset.py) class that can stream efficiently at training time.
 
@@ -63,7 +62,7 @@ python tools/nanogpt_data_processor.py \
 #    dataset.bin (single binary file with all tokens)
 ```
 
-**How the preprocessor works:** The script streams data iteratively from the Hugging Face Hub (avoiding loading the entire dataset into memory), uses a multiprocessing pipeline with separate reader and writer processes, and parallelizes tokenization across multiple CPU cores using `ProcessPoolExecutor`. This design enables efficient processing of very large datasets while maintaining low memory overhead. By default, uses the `gpt2` tokenizer, but can support other tokenizers via `--tokenizer` option.
+**How the preprocessor works:** The script streams data iteratively from the Hugging Face Hub (avoiding loading the entire dataset into memory), uses a multiprocessing pipeline with separate reader and writer processes, and parallelizes tokenization across multiple CPU cores using `ProcessPoolExecutor`. This design enables efficient processing of very large datasets while maintaining low memory overhead. By default, uses the `gpt2` tokenizer, but can support other tokenizers using the `--tokenizer` option.
 
 Consider the following options:
 1. Adjust `--max-tokens` to control how many tokens to process (must stay within the 4GB file size limit mentioned above).
@@ -75,7 +74,7 @@ Consider the following options:
 
 NeMo AutoModel follows a simple but powerful flow for training:
 
-1. A Python recipe script (for example, [`examples/llm_pretrain/pretrain.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/pretrain.py)) serves as the entry point that wires up all training components based on a YAML configuration file. Any configuration option can be overridden via CLI arguments (e.g., `--model.name abc`).
+1. A Python recipe script (for example, [`examples/llm_pretrain/pretrain.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/pretrain.py)) serves as the entry point that wires up all training components based on a YAML configuration file. Any configuration option can be overridden using CLI arguments (e.g., `--model.name abc`).
 2. The YAML file describes each component of the training job (such as `model`, `dataset`, `optimizer`, `distributed`, `checkpoint`, and optional `wandb`).
 3. Each component is constructed from its `_target_`, which points to a Python callable (function or class constructor) to instantiate. The remaining keys in that YAML block become keyword arguments for that callable.
 
@@ -86,7 +85,7 @@ How `_target_` is resolved:
 
 Nested objects can also specify their own `_target_` (common when building Hugging Face `config` objects first and passing them into a `from_config` method). Any YAML key can be overridden at launch time from the CLI, making it easy to tweak hyperparameters without editing files.
 
-With this context, let’s define a model via `_target_`, then point the dataset at your preprocessed shards, and finally review the full YAML.
+With this context, let’s define a model using `_target_`, then point the dataset at your preprocessed shards, and finally review the full YAML.
 
 ## Define Your Own Model Architecture
 
@@ -192,7 +191,7 @@ class TransformerBlock(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
-# The GPT2 model definition
+# The GPT-2 model definition
 class GPT2LMHeadModel(nn.Module):
     """Minimal GPT-2 Causal-LM with tied input/output embeddings."""
 
@@ -312,7 +311,7 @@ This loads the file on disk and calls `build_gpt2_model(...)` with the remaining
 
 ### Import Path to a Callable (Function or Class)
 
-Instead of a file path, you can reference the callable via its import path:
+Instead of a file path, you can reference the callable using its import path:
 
 ```yaml
 # examples/llm_pretrain/nanogpt_pretrain.yaml
@@ -325,9 +324,9 @@ model:
   n_head: 12
 ```
 
-### Hugging Face Models via `from_config` Function
+### Hugging Face Models using `from_config` Function
 
-You can instantiate any Hugging Face causal LM with a config-first flow by targeting a `from_config` callable and providing a nested `config` node. The nested node is itself resolved via `_target_`, so you can compose Hugging Face configs directly in YAML.
+You can instantiate any Hugging Face causal LM with a config-first flow by targeting a `from_config` callable and providing a nested `config` node. The nested node is itself resolved using `_target_`, so you can compose Hugging Face configs directly in YAML.
 
 ```yaml
 model:
@@ -355,15 +354,16 @@ model:
     vocab_size: 50258
 ```
 
-Notes:
+:::{note}
 - The `model._target_` may reference an import path or a local Python file using the `path.py:object` form.
 - Any nested mapping that includes `_target_` (e.g., `config:`) is instantiated first and its result is passed upward. This is how the Hugging Face `from_config` pattern works.
 - You can keep using the same training recipe (optimizer, data, distributed settings); only the `model:` block changes.
+:::
 
 ## Inspect and Adjust the YAML Configuration
 
 [`examples/llm_pretrain/nanogpt_pretrain.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/nanogpt_pretrain.yaml) is a complete configuration that:
-* Defines a GPT-2 model via the `build_gpt2_model` shorthand (easy to scale up).
+* Defines a GPT-2 model using the `build_gpt2_model` shorthand (easy to scale up).
 * Points `file_pattern` at preprocessed binary data files (configure based on your preprocessing output).
 * Uses the new `NanogptDataset` with `seq_len=1024`.
 * Sets a vanilla `AdamW` optimizer with learning rate `2e-4`.
@@ -437,7 +437,7 @@ Checkpoints are written under `checkpoints/` by default as `safetensors` or `tor
 
 * **TPS** (tokens per second), **gradient norm**, and **loss** statistics print every optimization step.
 * Enable `wandb` in the YAML for dashboards (`wandb.project`, `wandb.entity`, etc.).
-* Periodic checkpoints can be loaded via `TrainFinetuneRecipeForNextTokenPrediction.load_checkpoint()`.
+* Periodic checkpoints can be loaded using `TrainFinetuneRecipeForNextTokenPrediction.load_checkpoint()`.
 
 Example W&B configuration:
 ```yaml
