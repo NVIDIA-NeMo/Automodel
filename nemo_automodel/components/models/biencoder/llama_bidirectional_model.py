@@ -32,12 +32,12 @@ from torch import Tensor
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers import PreTrainedModel
 from transformers.cache_utils import Cache, DynamicCache
+from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     ModelOutput,
     SequenceClassifierOutputWithPast,
 )
-from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import (
     LlamaForSequenceClassification,
