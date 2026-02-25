@@ -58,7 +58,7 @@ Built on `transformers` for day-0 model support and OOTB compatibility.
 
 ## Quickstart
 
-Pick your modality and task to find the right guide.
+Select a modality and task to find the right guide.
 
 |            | SFT | PEFT (LoRA) | Tool Calling | QAT | Knowledge Distillation | Pretrain |
 |------------|-----|-------------|--------------|-----|------------------------|----------|
