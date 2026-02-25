@@ -29,7 +29,7 @@ Usage (standalone):
         [--pooling avg] [--normalize] [--opset 17] [--dtype fp32]
 
 Usage (from Python):
-    from nemo_automodel.components.models.biencoder.export_onnx import export_to_onnx
+    from nemo_automodel.components.models.llama_bidirectional.export_onnx import export_to_onnx
     onnx_path = export_to_onnx("/path/to/hf_checkpoint", "/path/to/onnx_output")
 """
 

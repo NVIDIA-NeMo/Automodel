@@ -302,7 +302,7 @@ class TestCustomizerRetrieval:
         import onnxruntime
         from transformers import AutoTokenizer
 
-        from nemo_automodel.components.models.biencoder.export_onnx import export_to_onnx
+        from nemo_automodel.components.models.llama_bidirectional.export_onnx import export_to_onnx
 
         # The recipe sets save_consolidated=true, so the checkpoint has a
         # model/consolidated/ directory with standard HF-named safetensors
