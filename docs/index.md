@@ -24,7 +24,7 @@ content_type: index
 # NeMo AutoModel Documentation
 
 ## Introduction to NeMo AutoModel
-Learn about the AutoModel, how it works at a high-level, and the key features.
+Learn about NeMo AutoModel, how it works at a high-level, and the key features.
 
 
 ::::{grid} 1 2 2 2
