@@ -53,7 +53,7 @@ Then you can enter the container using:
 ```bash
 docker run --gpus all -it --rm \
   --shm-size=8g \
-  -v /path/to/your/checkpoints:/opt/Automodel/checkpoints \
+  -v "$(pwd)"/checkpoints:/opt/Automodel/checkpoints \
   nvcr.io/nvidia/nemo-automodel:25.11.00
 ```
 
