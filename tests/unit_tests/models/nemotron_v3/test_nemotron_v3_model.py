@@ -492,6 +492,67 @@ class TestNemotronHForCausalLM:
         assert output.loss is not None
         assert output.loss.ndim == 0  # scalar loss
 
+    def test_causal_lm_output_hidden_states(self, config, backend):
+        """Test output_hidden_states parameter controls hidden state return."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        model = NemotronHForCausalLM(config, backend=backend)
+        model = model.to(torch.bfloat16)
+
+        batch_size, seq_len = 2, 8
+        input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+
+        # Default: hidden_states should be None
+        output = model(input_ids)
+        assert output.hidden_states is None
+
+        # Enabled: returns a tuple with one tensor of correct shape/dtype
+        output = model(input_ids, output_hidden_states=True)
+        assert isinstance(output.hidden_states, tuple)
+        assert len(output.hidden_states) == 1
+        assert output.hidden_states[0].shape == (batch_size, seq_len, config.hidden_size)
+        assert output.hidden_states[0].dtype == torch.bfloat16
+
+        # return_dict accepted without error (API compatibility)
+        output = model(input_ids, output_hidden_states=True, return_dict=True)
+        assert output.hidden_states is not None
+
+    def test_causal_lm_hidden_states_config_and_override(self, config, backend):
+        """Test config.output_hidden_states and explicit parameter override."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config.output_hidden_states = True
+        model = NemotronHForCausalLM(config, backend=backend)
+        model = model.to(torch.bfloat16)
+
+        input_ids = torch.randint(0, config.vocab_size, (2, 8))
+
+        # Config enables hidden states when parameter is not passed
+        output = model(input_ids)
+        assert output.hidden_states is not None
+        assert isinstance(output.hidden_states, tuple)
+
+        # Explicit False overrides config
+        output = model(input_ids, output_hidden_states=False)
+        assert output.hidden_states is None
+
+    def test_causal_lm_hidden_states_with_labels(self, config, backend):
+        """Test hidden states returned alongside loss computation."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        model = NemotronHForCausalLM(config, backend=backend)
+        model = model.to(torch.bfloat16)
+
+        batch_size, seq_len = 2, 8
+        input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+        labels = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+
+        output = model(input_ids, labels=labels, output_hidden_states=True)
+        assert output.loss is not None
+        assert output.loss.ndim == 0
+        assert output.hidden_states is not None
+        assert output.hidden_states[0].shape == (batch_size, seq_len, config.hidden_size)
+
     def test_causal_lm_prepare_inputs_for_generation(self, config, backend):
         """Test prepare_inputs_for_generation returns full sequence."""
         from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
