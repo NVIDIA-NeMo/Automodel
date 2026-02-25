@@ -80,8 +80,11 @@ def _run_training(recipe_yaml: str, checkpoint_dir: str) -> Path:
     """Launch biencoder training as a subprocess and return the checkpoint dir."""
     cmd = [
         sys.executable,
-        "-m",
-        "nemo_automodel.recipes.biencoder.train_biencoder",
+        "-m", "coverage", "run",
+        "--data-file=/workspace/.coverage",
+        "--source=/workspace/",
+        "--parallel-mode",
+        "-m", "nemo_automodel.recipes.biencoder.train_biencoder",
         "--config",
         recipe_yaml,
     ]
