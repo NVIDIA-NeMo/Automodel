@@ -660,7 +660,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.step_scheduler.set_epoch(epoch)
             for batch_idx, batches in enumerate(self.step_scheduler):
                 log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                self._maybe_collect_garbage()
                 # log
                 self.log_train_metrics(log_data)
 
@@ -683,6 +682,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         val_loss,
                         best_metric_key=self.best_metric_key,
                     )
+                self._maybe_collect_garbage()
 
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()

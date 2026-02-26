@@ -185,7 +185,6 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             self.step_scheduler.set_epoch(epoch)
             for batches in self.step_scheduler:
                 train_log_data = self._run_train_optim_step(batches)
-                self._maybe_collect_garbage()
                 self.log_train_metrics(train_log_data)
 
                 val_loss = {}
@@ -204,6 +203,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                         val_loss,
                         best_metric_key=self.best_metric_key,
                     )
+                self._maybe_collect_garbage()
 
         self.metric_logger_train.close()
         self.metric_logger_valid.close()

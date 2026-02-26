@@ -291,7 +291,6 @@ class TrainBiencoderRecipe(BaseRecipe):
             # The step scheduler yields a list of batches for gradient accumulation
             for batches in self.step_scheduler:
                 train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                self._maybe_collect_garbage()
                 self.log_train_metrics(train_log_data)
 
                 val_loss = None
@@ -309,6 +308,7 @@ class TrainBiencoderRecipe(BaseRecipe):
                         train_loss=train_log_data.metrics["loss"],
                         val_loss=val_loss,
                     )
+                self._maybe_collect_garbage()
 
         self.metric_logger_train.close()
         self.metric_logger_valid.close()

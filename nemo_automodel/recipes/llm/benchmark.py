@@ -262,7 +262,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     for opt in self.optimizer:
                         opt.step()
                     logger.debug("Optimizer step")
-            self._maybe_collect_garbage()
 
             # Synchronize num_label_tokens across DP ranks
             num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
@@ -305,6 +304,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if i == nsys_end and rank in nsys_ranks:
                 logger.info(f"Rank {rank} | Stopping nsys profiling")
                 torch.cuda.cudart().cudaProfilerStop()
+
+            self._maybe_collect_garbage()
 
         # Final summary
         self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)

@@ -1158,7 +1158,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # If QAT delayed fake-quant is configured, enable after threshold
                 self._enable_qat_if_delayed(self.step_scheduler.step)
                 train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                self._maybe_collect_garbage()
                 # Collect MoE load balance metrics (all ranks participate in all-reduce)
                 self._collect_moe_load_balance()
                 # log
@@ -1183,6 +1182,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         val_losses,
                         best_metric_key=self.best_metric_key,
                     )
+                self._maybe_collect_garbage()
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():
