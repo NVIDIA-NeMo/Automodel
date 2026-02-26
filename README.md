@@ -20,7 +20,7 @@
 </div>
 
 ## 📣 News and Discussions
-- [02/16/2026][Qwen3.5](https://huggingface.co/Qwen/Qwen3.5-397B-A17B) We support finetuning for `Qwen/Qwen3.5-397B-A17B`. Checkout our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml)
+- [02/16/2026][Qwen3.5 MoE](https://huggingface.co/collections/Qwen/qwen35) We support finetuning for `Qwen/Qwen3.5-397B-A17B` ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml)) and `Qwen/Qwen3.5-35B-A3B` ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml))
 - [02/13/2026][MiniMax-M2.5](https://huggingface.co/MiniMaxAI/MiniMax-M2.5) We support finetuning for `MiniMaxAI/MiniMax-M2.5`. Checkout our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml)
 - [02/11/2026][GLM-4.7-Flash](https://huggingface.co/zai-org/GLM-4.7-Flash) We now support finetuning GLM-4.7-Flash. Checkout our [packed sequence recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_4.7_flash_te_packed_sequence.yaml)
 - [02/09/2026][MiniMax-M2](https://huggingface.co/MiniMaxAI/MiniMax-M2) We support finetuning for `MiniMaxAI/MiniMax-M2`. Checkout our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/5f63eb428bacf4146e9a5ae9949d58c5751df7b9/examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml)
