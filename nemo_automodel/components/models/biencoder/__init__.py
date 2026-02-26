@@ -19,6 +19,8 @@ This module contains biencoder architectures and bidirectional models
 optimized for information retrieval and semantic search tasks.
 """
 
+from transformers import AutoConfig, AutoModel
+
 from .biencoder_model import NeMoAutoModelBiencoder  # noqa: F401
 from .llama_bidirectional_model import (  # noqa: F401
     BiencoderModel,
@@ -27,6 +29,12 @@ from .llama_bidirectional_model import (  # noqa: F401
     LlamaBidirectionalForSequenceClassification,
     LlamaBidirectionalModel,
 )
+
+try:
+    AutoConfig.register("llama_bidirec", LlamaBidirectionalConfig)
+    AutoModel.register(LlamaBidirectionalConfig, LlamaBidirectionalModel)
+except ValueError:
+    pass
 
 __all__ = [
     "BiencoderModel",
