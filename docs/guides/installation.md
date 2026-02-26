@@ -169,8 +169,25 @@ Then you can enter the container using:
 ```bash
 docker run --gpus all -it --rm \
   --shm-size=8g \
+  -v "$(pwd)"/checkpoints:/opt/Automodel/checkpoints \
   nvcr.io/nvidia/nemo-automodel:25.11.00
 ```
+
+:::{important}
+**Persist your checkpoints.** By default, checkpoints are written to `checkpoints/` inside the container. Because `--rm` destroys the container on exit, any data stored only inside the container is lost. Always bind-mount a host directory for the checkpoint path (as shown with `-v` above) so that your trained weights survive after the container stops. You can also mount additional directories for datasets and Hugging Face cache:
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v /path/to/your/checkpoints:/opt/Automodel/checkpoints \
+  -v /path/to/your/datasets:/datasets \
+  -v /path/to/your/hf_cache:/root/.cache/huggingface \
+  nvcr.io/nvidia/nemo-automodel:25.11.00
+```
+:::
+
+:::{tip}
+**Models that require CUDA-specific packages (e.g., Nemotron).** Some model families—such as Nemotron Nano and Nemotron Flash—depend on packages like `mamba-ssm` and `causal-conv1d` that must be compiled against a matching CUDA toolkit. Installing these from source on a bare-metal host can be error-prone. The NeMo Automodel Docker container ships with these dependencies pre-built, so **using the container is the recommended approach** for fine-tuning Nemotron and other models with similar requirements.
+:::
 
 ---
 ## Installation Options for Developers

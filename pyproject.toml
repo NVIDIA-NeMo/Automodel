@@ -150,6 +150,7 @@ docs = [
     "sphinx-autobuild",    # For live doc serving while editing docs
     "sphinx-autodoc2",     # For documenting Python API
     "sphinx-copybutton",   # Adds a copy button for code blocks
+    "sphinx-design",       # For grid layout and card components
     "myst_parser",         # For our markdown docs
     "nvidia-sphinx-theme", # Our NVIDIA theme
 ]
