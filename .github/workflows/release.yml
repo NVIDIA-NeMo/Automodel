@@ -65,7 +65,7 @@ permissions:
 
 jobs:
   release:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@v0.73.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@v0.76.1
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       python-package: nemo_automodel
@@ -82,12 +82,4 @@ jobs:
       gh-release-use-changelog-builder: ${{ inputs.generate-changelog }}
       publish-docs: ${{ inputs.publish-docs }}
       docs-target-path: nemo/automodel
-    secrets:
-      TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
-      TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
-      SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
-      SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
-      PAT: ${{ secrets.PAT }}
-      SSH_KEY: ${{ secrets.SSH_KEY }}
-      SSH_PWD: ${{ secrets.SSH_PWD }}
-      BOT_KEY: ${{ secrets.BOT_KEY }}
+    secrets: inherit
