@@ -209,6 +209,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Main benchmarking loop
         for i in range(steps):
+            self.step_scheduler.step = i
             # Start nsys profiling if configured
             if i == nsys_start and rank in nsys_ranks:
                 logger.info(f"Rank {rank} | Starting nsys profiling")
@@ -303,6 +304,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if i == nsys_end and rank in nsys_ranks:
                 logger.info(f"Rank {rank} | Stopping nsys profiling")
                 torch.cuda.cudart().cudaProfilerStop()
+
+            self._maybe_collect_garbage()
 
         # Final summary
         self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)

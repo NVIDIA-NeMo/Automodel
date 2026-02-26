@@ -264,6 +264,7 @@ class TrainBiencoderRecipe(BaseRecipe):
             self._get_dp_group_size(),
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
         )
+        self._setup_garbage_collection(self.step_scheduler)
 
         self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
@@ -307,6 +308,7 @@ class TrainBiencoderRecipe(BaseRecipe):
                         train_loss=train_log_data.metrics["loss"],
                         val_loss=val_loss,
                     )
+                self._maybe_collect_garbage()
 
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
