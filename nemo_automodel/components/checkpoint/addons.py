@@ -275,7 +275,9 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
     # Detect MoE expert LoRA: adapter weights stored as nn.Parameter (not
     # nn.Module) so they don't appear in named_modules(). Scan parameters
     # and expand to per-expert HF projection names.
-    seen_expert_paths: set[str] = set()
+    # Track (expert_path, group) to avoid redundant work while still
+    # processing both "gate_and_up" and "down" groups independently.
+    seen_expert_groups: set[tuple[str, str]] = set()
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
@@ -284,13 +286,15 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
                 expert_path = name[: -len(f".{lora_suffix}")]
                 if expert_path.startswith("_orig_mod."):
                     expert_path = expert_path[len("_orig_mod.") :]
-                if expert_path in seen_expert_paths:
+
+                group = "gate_and_up" if "gate_and_up" in lora_suffix else "down"
+                if (expert_path, group) in seen_expert_groups:
                     break
-                seen_expert_paths.add(expert_path)
+                seen_expert_groups.add((expert_path, group))
 
                 n_experts = param.shape[0]
                 for expert_id in range(n_experts):
-                    if "gate_and_up" in lora_suffix:
+                    if group == "gate_and_up":
                         final_target_modules.add(f"{expert_path}.{expert_id}.gate_proj")
                         final_target_modules.add(f"{expert_path}.{expert_id}.up_proj")
                     else:
