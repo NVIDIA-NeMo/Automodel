@@ -1,4 +1,4 @@
-# NeMo Automodel Performance Summary
+# Performance Summary
 
 This document provides performance benchmarks for various large language models using NeMo Automodel with the PyTorch backend.
 
