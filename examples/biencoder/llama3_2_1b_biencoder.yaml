@@ -54,6 +54,7 @@ dataloader:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
     data_dir_list:
       - hf://nvidia/embed-nemotron-dataset-v1/FEVER
+      - hf://nvidia/embed-nemotron-dataset-v1/SyntheticClassificationData
     data_type: train
     train_n_passages: 5
     eval_negative_size: 4
