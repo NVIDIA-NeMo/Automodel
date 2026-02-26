@@ -166,9 +166,7 @@ def _install_torch_and_layers_stubs(monkeypatch):
     # algorithms._checkpoint.checkpoint_wrapper
     alg_stub = types.ModuleType("torch.distributed.algorithms")
     alg_cp_stub = types.ModuleType("torch.distributed.algorithms._checkpoint")
-    cpw_stub = types.ModuleType(
-        "torch.distributed.algorithms._checkpoint.checkpoint_wrapper"
-    )
+    cpw_stub = types.ModuleType("torch.distributed.algorithms._checkpoint.checkpoint_wrapper")
 
     def checkpoint_wrapper(*args, **kwargs):
         return args[0]
@@ -206,9 +204,7 @@ def _install_torch_and_layers_stubs(monkeypatch):
         return "CTX"
 
     utils_checkpoint_stub.CheckpointPolicy = CheckpointPolicy
-    utils_checkpoint_stub.create_selective_checkpoint_contexts = (
-        create_selective_checkpoint_contexts
-    )
+    utils_checkpoint_stub.create_selective_checkpoint_contexts = create_selective_checkpoint_contexts
 
     # ops.aten.mm.default sentinel
     aten = types.SimpleNamespace(mm=types.SimpleNamespace(default=object()))
@@ -241,13 +237,9 @@ def _install_torch_and_layers_stubs(monkeypatch):
         fsdp_fully_stub,
     )
     monkeypatch.setitem(sys.modules, "torch.distributed.tensor", tensor_stub)
-    monkeypatch.setitem(
-        sys.modules, "torch.distributed.tensor.parallel", tp_stub
-    )
+    monkeypatch.setitem(sys.modules, "torch.distributed.tensor.parallel", tp_stub)
     monkeypatch.setitem(sys.modules, "torch.distributed.algorithms", alg_stub)
-    monkeypatch.setitem(
-        sys.modules, "torch.distributed.algorithms._checkpoint", alg_cp_stub
-    )
+    monkeypatch.setitem(sys.modules, "torch.distributed.algorithms._checkpoint", alg_cp_stub)
     monkeypatch.setitem(
         sys.modules,
         "torch.distributed.algorithms._checkpoint.checkpoint_wrapper",
@@ -258,9 +250,7 @@ def _install_torch_and_layers_stubs(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch.utils.checkpoint", utils_checkpoint_stub)
 
     # Stub heavy layers import as well to avoid real dependencies
-    layers_stub = types.ModuleType(
-        "nemo_automodel.components.moe.layers"
-    )
+    layers_stub = types.ModuleType("nemo_automodel.components.moe.layers")
 
     class GroupedExpertsDeepEP:
         pass
@@ -270,23 +260,17 @@ def _install_torch_and_layers_stubs(monkeypatch):
 
     layers_stub.GroupedExpertsDeepEP = GroupedExpertsDeepEP
     layers_stub.MoE = MoE
-    monkeypatch.setitem(
-        sys.modules, "nemo_automodel.components.moe.layers", layers_stub
-    )
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.layers", layers_stub)
 
     # Stub experts module to avoid importing torch.nn.functional
-    experts_stub = types.ModuleType(
-        "nemo_automodel.components.moe.experts"
-    )
+    experts_stub = types.ModuleType("nemo_automodel.components.moe.experts")
 
     class GroupedExpertsTE:
         pass
 
     experts_stub.GroupedExpertsDeepEP = GroupedExpertsDeepEP
     experts_stub.GroupedExpertsTE = GroupedExpertsTE
-    monkeypatch.setitem(
-        sys.modules, "nemo_automodel.components.moe.experts", experts_stub
-    )
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.experts", experts_stub)
 
 
 def _import_parallelizer_with_stubs(monkeypatch):
@@ -326,9 +310,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
     shared_utils_stub.dtype_from_str = lambda val, default=None: default
     monkeypatch.setitem(sys.modules, "nemo_automodel.shared.utils", shared_utils_stub)
 
-    return importlib.import_module(
-        "nemo_automodel.components.moe.parallelizer"
-    )
+    return importlib.import_module("nemo_automodel.components.moe.parallelizer")
 
 
 def test_expert_parallel_apply_calls_distribute_module(monkeypatch):
@@ -355,6 +337,7 @@ def test_expert_parallel_apply_calls_distribute_module(monkeypatch):
 
 def test_expert_parallel_partition_fn_shards_and_dispatcher(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
+
     # make the target module also look like GroupedExpertsDeepEP
     class DummyGrouped(DummyExperts):
         def __init__(self):
@@ -848,7 +831,8 @@ def test_apply_fsdp_with_lm_head_precision_fp32(monkeypatch):
     assert mp_policy_mock.call_count >= 2  # default + lm_head
     # Find the call for lm_head's custom policy
     fp32_policy_calls = [
-        call for call in mp_policy_mock.call_args_list
+        call
+        for call in mp_policy_mock.call_args_list
         if call[1].get("param_dtype") == torch_stub.float32
         and call[1].get("reduce_dtype") == torch_stub.float32
         and call[1].get("output_dtype") == torch_stub.float32
@@ -965,7 +949,8 @@ def test_apply_fsdp_with_lm_head_precision_string_input(monkeypatch):
     assert mp_policy_mock.call_count >= 2  # default + lm_head
     # Find the call for lm_head's custom policy
     fp32_policy_calls = [
-        call for call in mp_policy_mock.call_args_list
+        call
+        for call in mp_policy_mock.call_args_list
         if call[1].get("param_dtype") == torch_stub.float32
         and call[1].get("reduce_dtype") == torch_stub.float32
         and call[1].get("output_dtype") == torch_stub.float32
@@ -1110,9 +1095,7 @@ def test_apply_fsdp_wrap_outer_model_no_nested_structure(monkeypatch):
     # Model should be wrapped exactly once (not twice)
     assert model_call is not None, "Model should be wrapped"
     # Count how many times model was passed as first arg
-    model_call_count = sum(
-        1 for args, _ in fully_shard_mock.call_args_list if args and args[0] is model
-    )
+    model_call_count = sum(1 for args, _ in fully_shard_mock.call_args_list if args and args[0] is model)
     assert model_call_count == 1, "Model should only be wrapped once when model == _model"
 
 
@@ -1767,3 +1750,69 @@ def test_apply_fsdp_uses_moe_for_ignored_params(monkeypatch):
     assert isinstance(ignored, set)
     moe_params = set(moe.experts.parameters())
     assert ignored == moe_params
+
+
+def test_parallelize_model_passes_mp_policy_to_apply_fsdp(monkeypatch):
+    """Test that parallelize_model forwards mp_policy to apply_fsdp."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_fsdp_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
+    monkeypatch.setattr(P, "apply_ep", MagicMock())
+    monkeypatch.setattr(P, "apply_ac", MagicMock())
+
+    world_mesh = FakeWorldMesh({("dp",): 2}, mesh_dim_names=["dp"])
+
+    class Inner:
+        def __init__(self):
+            self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+
+    class Outer:
+        def __init__(self):
+            self.model = Inner()
+
+    model = Outer()
+    sentinel_policy = object()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=None,
+        dp_axis_names=("dp",),
+        mp_policy=sentinel_policy,
+    )
+
+    apply_fsdp_mock.assert_called_once()
+    _, kwargs = apply_fsdp_mock.call_args
+    assert kwargs.get("mp_policy") is sentinel_policy
+
+
+def test_parallelize_model_mp_policy_defaults_to_none(monkeypatch):
+    """Test that parallelize_model defaults mp_policy to None when not provided."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_fsdp_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
+    monkeypatch.setattr(P, "apply_ep", MagicMock())
+    monkeypatch.setattr(P, "apply_ac", MagicMock())
+
+    world_mesh = FakeWorldMesh({("dp",): 2}, mesh_dim_names=["dp"])
+
+    class Inner:
+        def __init__(self):
+            self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+
+    class Outer:
+        def __init__(self):
+            self.model = Inner()
+
+    model = Outer()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=None,
+        dp_axis_names=("dp",),
+    )
+
+    apply_fsdp_mock.assert_called_once()
+    _, kwargs = apply_fsdp_mock.call_args
+    assert kwargs.get("mp_policy") is None
