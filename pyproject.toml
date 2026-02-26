@@ -158,7 +158,7 @@ linting = [
     "ruff~=0.9.0",
     "import-linter~=2.4",
 ]
-test = ["coverage", "pytest", "peft>=0.18.1", "onnxruntime-gpu"]
+test = ["coverage", "pytest", "peft>=0.18.1", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
 dev = ["cut-cross-entropy", "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')", "dion @ git+https://github.com/microsoft/dion.git; platform_machine == 'x86_64' and platform_system != 'Darwin'"]
 
 [tool.uv]
