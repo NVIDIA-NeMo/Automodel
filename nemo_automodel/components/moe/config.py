@@ -18,6 +18,7 @@ from dataclasses import dataclass, fields
 from typing import Any, Dict, Literal, Optional, Union
 
 import torch
+from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy
 
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -30,6 +31,7 @@ class MoEParallelizerConfig:
     reshard_after_forward: bool = False
     lm_head_precision: Optional[Union[str, torch.dtype]] = None
     wrap_outer_model: bool = True
+    mp_policy: Optional[MixedPrecisionPolicy] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {f.name: getattr(self, f.name) for f in fields(self)}
