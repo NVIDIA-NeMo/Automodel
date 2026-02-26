@@ -17,6 +17,7 @@ import types
 
 import pytest
 import torch
+from PIL import Image as PILImage
 
 
 CONVERSATION = [
@@ -32,6 +33,9 @@ class DummyTokenizer:
 
     def __call__(self, text, add_special_tokens=True, **kwargs):
         return {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
+
+    def convert_tokens_to_ids(self, token):
+        return None  # Return None to trigger default fallback
 
     def decode(self, token):
         if isinstance(token, torch.Tensor):
@@ -155,6 +159,42 @@ class DummyNemotronParseProcessor:
         return {"input_ids": input_ids, "attention_mask": attention_mask, "pixel_values": pixel_values}
 
 
+class DummyKimiVLProcessor:
+    """Dummy processor for KimiVL collate function tests."""
+
+    def __init__(self):
+        self.tokenizer = DummyTokenizer(pad_token_id=0)
+        self.chat_calls = []
+        self.forward_calls = []
+
+    def apply_chat_template(self, conversation, *, add_generation_prompt, tokenize, **kwargs):
+        assert add_generation_prompt is False
+        assert tokenize is False
+        self.chat_calls.append({"conversation": conversation, "kwargs": kwargs})
+        # Extract first text content from conversation
+        for item in conversation[0]["content"]:
+            if isinstance(item, dict) and item.get("type") == "text":
+                return "chat:" + item["text"]
+        return "chat:default"
+
+    def __call__(self, *, text, return_tensors, padding, truncation, **kwargs):
+        assert return_tensors == "pt"
+        assert padding is True or padding == "max_length"
+        assert truncation is True
+        self.forward_calls.append(
+            {
+                "text": list(text),
+                "return_tensors": return_tensors,
+                "padding": padding,
+                "truncation": truncation,
+                **kwargs,
+            }
+        )
+        batch_size = len(text)
+        input_ids = torch.arange(1, 6).unsqueeze(0).repeat(batch_size, 1)
+        return {"input_ids": input_ids}
+
+
 def test_build_labels_includes_stop_token(collate_mod, monkeypatch):
     """
     Ensure `build_labels` copies the trailing stop token when it matches the configured set.
@@ -168,6 +208,8 @@ def test_build_labels_includes_stop_token(collate_mod, monkeypatch):
             return {"input_ids": torch.tensor([[5, 6]])}
 
         def decode(self, token):
+            if isinstance(token, list):
+                token = token[0]
             if isinstance(token, torch.Tensor):
                 token = token.item()
             return "STOP" if token == 7 else str(token)
@@ -356,3 +398,791 @@ def test_import_error_when_qwen_utils_missing(collate_mod, fn_name, monkeypatch)
 
     with pytest.raises(ImportError):
         func([], None)
+
+
+def test_default_collate_fn_with_max_length(collate_mod, fake_qwen_utils, monkeypatch):
+    """Test that default_collate_fn passes max_length and sets padding to 'max_length'."""
+    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
+
+    captured_kwargs = {}
+
+    class MaxLengthProcessor:
+        tokenizer = DummyTokenizer()
+
+        def apply_chat_template(self, conv_list, **kwargs):
+            captured_kwargs.update(kwargs)
+            batch_size = len(conv_list)
+            input_ids = torch.arange(1, 5).unsqueeze(0).repeat(batch_size, 1)
+            pixel_values = torch.ones(batch_size, 3, 64, 64, dtype=torch.float32)
+            return {"input_ids": input_ids, "pixel_values": pixel_values}
+
+    processor = MaxLengthProcessor()
+    collate_mod.default_collate_fn(
+        [{"conversation": CONVERSATION}], processor, max_length=512
+    )
+
+    assert captured_kwargs.get("max_length") == 512
+    assert captured_kwargs.get("padding") == "max_length"
+
+
+def test_default_collate_fn_without_max_length(collate_mod, fake_qwen_utils, monkeypatch):
+    """Test that default_collate_fn uses padding=True when max_length is not provided."""
+    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
+
+    captured_kwargs = {}
+
+    class NoMaxLengthProcessor:
+        tokenizer = DummyTokenizer()
+
+        def apply_chat_template(self, conv_list, **kwargs):
+            captured_kwargs.update(kwargs)
+            batch_size = len(conv_list)
+            input_ids = torch.arange(1, 5).unsqueeze(0).repeat(batch_size, 1)
+            pixel_values = torch.ones(batch_size, 3, 64, 64, dtype=torch.float32)
+            return {"input_ids": input_ids, "pixel_values": pixel_values}
+
+    processor = NoMaxLengthProcessor()
+    collate_mod.default_collate_fn([{"conversation": CONVERSATION}], processor)
+
+    assert "max_length" not in captured_kwargs
+    assert captured_kwargs.get("padding") is True
+
+
+def test_kimi_vl_collate_fn_registered(collate_mod):
+    """Test that kimi_vl_collate_fn is registered in COLLATE_FNS."""
+    assert "KimiVLProcessor" in collate_mod.COLLATE_FNS
+    assert collate_mod.COLLATE_FNS["KimiVLProcessor"] is collate_mod.kimi_vl_collate_fn
+
+
+def test_kimi_vl_collate_fn_shapes(collate_mod, monkeypatch):
+    """Test kimi_vl_collate_fn produces correct output shapes."""
+    processor = DummyKimiVLProcessor()
+
+    # Stub build_labels to return deterministic labels
+    # The collate fn does labels[:, 1:] so we need 5 elements to get 4 after shift
+    labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        assert processor_arg is processor
+        return labels_stub
+
+    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+
+    examples = [{"conversation": CONVERSATION}]
+    batch = collate_mod.kimi_vl_collate_fn(examples, processor)
+
+    # Input starts at [1, 5], trimmed by [:, :-1] to [1, 4]
+    assert batch["input_ids"].shape == (1, 4)
+    # Labels start at [1, 5], shifted by [:, 1:] to [1, 4]
+    assert batch["labels"].shape == (1, 4)
+
+
+def test_kimi_vl_collate_fn_with_max_length(collate_mod, monkeypatch):
+    """Test kimi_vl_collate_fn passes max_length correctly."""
+    processor = DummyKimiVLProcessor()
+
+    labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
+    monkeypatch.setattr(
+        collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True
+    )
+
+    examples = [{"conversation": CONVERSATION}]
+    collate_mod.kimi_vl_collate_fn(examples, processor, max_length=2048)
+
+    assert len(processor.forward_calls) == 1
+    forward_call = processor.forward_calls[0]
+    assert forward_call["max_length"] == 2048
+    assert forward_call["padding"] == "max_length"
+
+
+def test_kimi_vl_collate_fn_extracts_images(collate_mod, monkeypatch):
+    """Test kimi_vl_collate_fn extracts images from conversation content."""
+    processor = DummyKimiVLProcessor()
+
+    labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
+    monkeypatch.setattr(
+        collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True
+    )
+
+    conversation_with_image = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": "test_image.jpg"},
+                {"type": "text", "text": "What is this?"},
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "text", "text": "A test image"}]},
+    ]
+
+    examples = [{"conversation": conversation_with_image}]
+    collate_mod.kimi_vl_collate_fn(examples, processor)
+
+    assert len(processor.forward_calls) == 1
+    forward_call = processor.forward_calls[0]
+    assert "images" in forward_call
+    assert forward_call["images"] == ["test_image.jpg"]
+
+
+def test_kimi_vl_collate_fn_passes_add_special_tokens_false(collate_mod, monkeypatch):
+    """Test that kimi_vl_collate_fn passes add_special_tokens=False to processor."""
+    processor = DummyKimiVLProcessor()
+
+    labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
+    monkeypatch.setattr(
+        collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True
+    )
+
+    examples = [{"conversation": CONVERSATION}]
+    collate_mod.kimi_vl_collate_fn(examples, processor)
+
+    assert len(processor.forward_calls) == 1
+    forward_call = processor.forward_calls[0]
+    assert "add_special_tokens" in forward_call
+    assert forward_call["add_special_tokens"] is False
+
+
+def test_kimi_vl_collate_fn_multiple_examples(collate_mod, monkeypatch):
+    """Test kimi_vl_collate_fn handles multiple examples."""
+    processor = DummyKimiVLProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size = input_ids.shape[0]
+        return torch.arange(1, 6).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+
+    examples = [{"conversation": CONVERSATION} for _ in range(3)]
+    batch = collate_mod.kimi_vl_collate_fn(examples, processor)
+
+    assert batch["input_ids"].shape[0] == 3
+    assert batch["labels"].shape[0] == 3
+    assert len(processor.chat_calls) == 3
+
+
+# =============================================================================
+# Tests for _decode_single_token
+# =============================================================================
+
+
+class TestDecodeSingleToken:
+    """Tests for _decode_single_token helper function."""
+
+    def test_decode_single_token_with_int(self, collate_mod):
+        """Test _decode_single_token with tokenizer accepting int."""
+
+        class IntTokenizer:
+            def decode(self, token_id):
+                return f"token_{token_id}"
+
+        result = collate_mod._decode_single_token(IntTokenizer(), 42)
+        assert result == "token_42"
+
+    def test_decode_single_token_with_list(self, collate_mod):
+        """Test _decode_single_token with tokenizer requiring list."""
+
+        class ListTokenizer:
+            def decode(self, token_ids):
+                if isinstance(token_ids, int):
+                    raise TypeError("Expected list")
+                return f"token_{token_ids[0]}"
+
+        result = collate_mod._decode_single_token(ListTokenizer(), 42)
+        assert result == "token_42"
+
+    def test_decode_single_token_with_tensor(self, collate_mod):
+        """Test _decode_single_token with tokenizer requiring tensor."""
+
+        class TensorTokenizer:
+            def decode(self, token_ids):
+                if isinstance(token_ids, int):
+                    raise TypeError("Expected tensor")
+                if isinstance(token_ids, list):
+                    raise TypeError("Expected tensor")
+                # Expects torch.Tensor
+                return f"token_{token_ids[0].item()}"
+
+        result = collate_mod._decode_single_token(TensorTokenizer(), 42)
+        assert result == "token_42"
+
+    def test_decode_single_token_fallback(self, collate_mod):
+        """Test _decode_single_token falls back to str when all methods fail."""
+
+        class FailingTokenizer:
+            def decode(self, token_ids):
+                raise RuntimeError("Cannot decode")
+
+        result = collate_mod._decode_single_token(FailingTokenizer(), 42)
+        assert result == "42"
+
+
+# =============================================================================
+# Tests for _expand_image_tokens
+# =============================================================================
+
+
+class TestExpandImageTokens:
+    """Tests for _expand_image_tokens function."""
+
+    def test_expand_image_tokens_basic(self, collate_mod):
+        """Test basic expansion of image placeholder tokens."""
+        # Input with 1 placeholder at position 2
+        media_token_id = 163605
+        input_ids = torch.tensor([1, 2, media_token_id, 3, 4])
+        attention_mask = torch.ones(5, dtype=torch.long)
+
+        # grid_thws: [1, 28, 28] -> (28//2) * (28//2) = 196 tokens
+        grid_thws = torch.tensor([[1, 28, 28]])
+
+        expanded_ids, expanded_mask = collate_mod._expand_image_tokens(
+            input_ids, attention_mask, grid_thws, media_token_id
+        )
+
+        # Original: 5 tokens, placeholder expanded to 196, so 5 - 1 + 196 = 200
+        assert expanded_ids.shape[0] == 200
+        assert expanded_mask.shape[0] == 200
+
+        # Check structure: [1, 2, media_token_id*196, 3, 4]
+        assert expanded_ids[0] == 1
+        assert expanded_ids[1] == 2
+        assert (expanded_ids[2:198] == media_token_id).all()
+        assert expanded_ids[198] == 3
+        assert expanded_ids[199] == 4
+
+    def test_expand_image_tokens_smaller_grid(self, collate_mod):
+        """Test expansion with smaller grid."""
+        media_token_id = 163605
+        input_ids = torch.tensor([1, media_token_id, 2])
+        attention_mask = torch.ones(3, dtype=torch.long)
+
+        # grid_thws: [1, 4, 4] -> (4//2) * (4//2) = 4 tokens
+        grid_thws = torch.tensor([[1, 4, 4]])
+
+        expanded_ids, expanded_mask = collate_mod._expand_image_tokens(
+            input_ids, attention_mask, grid_thws, media_token_id
+        )
+
+        # Original: 3 tokens, placeholder expanded to 4, so 3 - 1 + 4 = 6
+        assert expanded_ids.shape[0] == 6
+        assert expanded_mask.shape[0] == 6
+
+        assert expanded_ids[0] == 1
+        assert (expanded_ids[1:5] == media_token_id).all()
+        assert expanded_ids[5] == 2
+
+    def test_expand_image_tokens_no_placeholder(self, collate_mod):
+        """Test expansion when no placeholder exists."""
+        media_token_id = 163605
+        input_ids = torch.tensor([1, 2, 3, 4, 5])
+        attention_mask = torch.ones(5, dtype=torch.long)
+        grid_thws = torch.tensor([[1, 28, 28]])
+
+        expanded_ids, expanded_mask = collate_mod._expand_image_tokens(
+            input_ids, attention_mask, grid_thws, media_token_id
+        )
+
+        # No expansion should occur
+        assert torch.equal(expanded_ids, input_ids)
+        assert torch.equal(expanded_mask, attention_mask)
+
+    def test_expand_image_tokens_attention_mask_values(self, collate_mod):
+        """Test that expanded attention mask has correct values."""
+        media_token_id = 163605
+        input_ids = torch.tensor([1, media_token_id, 2])
+        attention_mask = torch.tensor([1, 1, 0], dtype=torch.long)  # Last token is padding
+
+        grid_thws = torch.tensor([[1, 4, 4]])  # 4 tokens
+
+        expanded_ids, expanded_mask = collate_mod._expand_image_tokens(
+            input_ids, attention_mask, grid_thws, media_token_id
+        )
+
+        # [1, 1111, 0] -> [1] + [1,1,1,1] + [0] = [1, 1, 1, 1, 1, 0]
+        assert expanded_mask[0] == 1
+        assert (expanded_mask[1:5] == 1).all()  # Image tokens should have attention
+        assert expanded_mask[5] == 0
+
+    def test_expand_image_tokens_custom_merge_kernel(self, collate_mod):
+        """Test expansion with custom merge kernel size."""
+        media_token_id = 163605
+        input_ids = torch.tensor([1, media_token_id, 2])
+        attention_mask = torch.ones(3, dtype=torch.long)
+
+        # grid_thws: [1, 8, 8] with merge (4, 4) -> (8//4) * (8//4) = 4 tokens
+        grid_thws = torch.tensor([[1, 8, 8]])
+
+        expanded_ids, expanded_mask = collate_mod._expand_image_tokens(
+            input_ids, attention_mask, grid_thws, media_token_id, merge_kernel_size=(4, 4)
+        )
+
+        # Original: 3 tokens, placeholder expanded to 4, so 3 - 1 + 4 = 6
+        assert expanded_ids.shape[0] == 6
+
+    def test_expand_image_tokens_preserves_dtype(self, collate_mod):
+        """Test that expansion preserves input tensor dtypes."""
+        media_token_id = 163605
+        input_ids = torch.tensor([1, media_token_id, 2], dtype=torch.int32)
+        attention_mask = torch.tensor([1, 1, 1], dtype=torch.int64)
+        grid_thws = torch.tensor([[1, 4, 4]])
+
+        expanded_ids, expanded_mask = collate_mod._expand_image_tokens(
+            input_ids, attention_mask, grid_thws, media_token_id
+        )
+
+        assert expanded_ids.dtype == torch.int32
+        assert expanded_mask.dtype == torch.int64
+
+
+# =============================================================================
+# Tests for kimi_k25_vl_collate_fn
+# =============================================================================
+
+
+class DummyKimiK25VLProcessor:
+    """Dummy processor for Kimi K2.5 VL collate function tests."""
+
+    def __init__(self):
+        self.tokenizer = DummyTokenizer(pad_token_id=0)
+        self.media_placeholder_token_id = 163605
+        self.chat_calls = []
+        self.forward_calls = []
+
+    def apply_chat_template(self, conversation, *, add_generation_prompt, tokenize, **kwargs):
+        assert add_generation_prompt is False
+        assert tokenize is False
+        self.chat_calls.append({"conversation": conversation, "kwargs": kwargs})
+        return "chat:processed"
+
+    def __call__(self, *, text, return_tensors, medias=None, **kwargs):
+        assert return_tensors == "pt"
+        self.forward_calls.append(
+            {"text": text, "return_tensors": return_tensors, "medias": medias, **kwargs}
+        )
+
+        # Simulate processor output with single placeholder
+        input_ids = torch.tensor([[1, 2, self.media_placeholder_token_id, 3, 4]])
+        attention_mask = torch.ones_like(input_ids)
+
+        result = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+
+        if medias:
+            result["pixel_values"] = torch.randn(1, 3, 14, 14)
+            result["grid_thws"] = torch.tensor([[1, 4, 4]])  # 4 image tokens
+
+        return result
+
+
+def test_kimi_k25_vl_collate_fn_registered(collate_mod):
+    """Test that kimi_k25_vl_collate_fn is registered in COLLATE_FNS."""
+    assert "KimiK25Processor" in collate_mod.COLLATE_FNS
+    assert collate_mod.COLLATE_FNS["KimiK25Processor"] is collate_mod.kimi_k25_vl_collate_fn
+
+
+def test_kimi_k25_vl_collate_fn_basic(collate_mod, monkeypatch):
+    """Test kimi_k25_vl_collate_fn basic functionality."""
+    processor = DummyKimiK25VLProcessor()
+
+    # Stub build_labels
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+    ]
+    examples = [{"conversation": conversation}]
+
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor)
+
+    assert "input_ids" in batch
+    assert "attention_mask" in batch
+    assert "labels" in batch
+
+
+def test_kimi_k25_vl_collate_fn_with_image(collate_mod, monkeypatch):
+    """Test kimi_k25_vl_collate_fn with image content."""
+    processor = DummyKimiK25VLProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+
+    conversation_with_image = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": "test.jpg"},
+                {"type": "text", "text": "What is this?"},
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "text", "text": "An image"}]},
+    ]
+
+    examples = [{"conversation": conversation_with_image}]
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor)
+
+    # Should have pixel_values and grid_thws from image processing
+    assert "pixel_values" in batch
+    assert "grid_thws" in batch
+    assert "image_grid_hws" in batch
+
+    # image_grid_hws should be [N, 2] (H, W only)
+    assert batch["image_grid_hws"].shape[-1] == 2
+
+
+def test_kimi_k25_vl_collate_fn_image_token_expansion(collate_mod, monkeypatch):
+    """Test that kimi_k25_vl_collate_fn expands image tokens correctly."""
+    processor = DummyKimiK25VLProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+
+    conversation_with_image = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": "test.jpg"},
+                {"type": "text", "text": "Describe"},
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "text", "text": "Description"}]},
+    ]
+
+    examples = [{"conversation": conversation_with_image}]
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor)
+
+    # With grid_thws [1, 4, 4], expansion yields 4 image tokens
+    # Original: [1, 2, placeholder, 3, 4] = 5 tokens
+    # Expanded: [1, 2, placeholder*4, 3, 4] = 8 tokens
+    # After :-1 shift: 7 tokens
+    assert batch["input_ids"].shape[1] == 7
+
+
+def test_kimi_k25_vl_collate_fn_with_max_length(collate_mod, monkeypatch):
+    """Test kimi_k25_vl_collate_fn with max_length padding."""
+    processor = DummyKimiK25VLProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+    ]
+    examples = [{"conversation": conversation}]
+
+    # Set max_length larger than natural sequence
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=100)
+
+    # After :-1 shift, should be max_length - 1 = 99
+    assert batch["input_ids"].shape[1] == 99
+
+
+def test_kimi_k25_vl_collate_fn_truncation(collate_mod, monkeypatch):
+    """Test kimi_k25_vl_collate_fn truncates when max_length is smaller."""
+    # Custom processor that produces longer sequences
+    class LongSequenceProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=0)
+            self.media_placeholder_token_id = 163605
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, **kwargs):
+            # Produce a 50-token sequence
+            input_ids = torch.arange(1, 51).unsqueeze(0)
+            attention_mask = torch.ones_like(input_ids)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    processor = LongSequenceProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+    ]
+    examples = [{"conversation": conversation}]
+
+    # Truncate to 20 tokens
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=20)
+
+    # After :-1 shift, should be 19
+    assert batch["input_ids"].shape[1] == 19
+
+
+def test_kimi_k25_vl_collate_fn_multiple_examples(collate_mod, monkeypatch):
+    """Test kimi_k25_vl_collate_fn handles multiple examples with padding."""
+    # Processor that produces variable length sequences
+    call_count = [0]
+
+    class VariableLengthProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=0)
+            self.media_placeholder_token_id = 163605
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, **kwargs):
+            call_count[0] += 1
+            # First call: 5 tokens, second call: 8 tokens
+            length = 5 if call_count[0] == 1 else 8
+            input_ids = torch.arange(1, length + 1).unsqueeze(0)
+            attention_mask = torch.ones_like(input_ids)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    processor = VariableLengthProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+    ]
+    examples = [{"conversation": conversation}, {"conversation": conversation}]
+
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor)
+
+    # Both should be padded to same length (max is 8, after :-1 shift = 7)
+    assert batch["input_ids"].shape == (2, 7)
+    assert batch["attention_mask"].shape == (2, 7)
+    assert batch["labels"].shape == (2, 7)
+
+
+def test_kimi_k25_vl_collate_fn_default_media_token_id(collate_mod, monkeypatch):
+    """Test kimi_k25_vl_collate_fn uses default media_token_id when not in processor."""
+
+    class ProcessorWithoutMediaToken:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=0)
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, **kwargs):
+            input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+            attention_mask = torch.ones_like(input_ids)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    processor = ProcessorWithoutMediaToken()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+    ]
+    examples = [{"conversation": conversation}]
+
+    # Should not raise, uses default 163605
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor)
+    assert "input_ids" in batch
+
+
+def test_kimi_k25_vl_collate_fn_labels_shifted(collate_mod, monkeypatch):
+    """Test that labels are shifted by [:, 1:]."""
+
+    class SimpleProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=0)
+            self.media_placeholder_token_id = 163605
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, **kwargs):
+            input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+            attention_mask = torch.ones_like(input_ids)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    processor = SimpleProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        # Return labels [10, 20, 30, 40, 50]
+        return torch.tensor([[10, 20, 30, 40, 50]])
+
+    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+    ]
+    examples = [{"conversation": conversation}]
+
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor)
+
+    # Labels should be shifted: [10, 20, 30, 40, 50][:, 1:] = [20, 30, 40, 50]
+    # Then input_ids[:, :-1] means labels also become [:, :-1] from the shape matching
+    # Final: [20, 30, 40]
+    assert batch["labels"].shape[1] == 4  # 5 - 1 = 4
+
+
+# =============================================================================
+# Tests for _ensure_rgb
+# =============================================================================
+
+
+class TestEnsureRgb:
+    """Tests for _ensure_rgb helper that converts PIL images to RGB."""
+
+    def test_rgba_image_converted_to_rgb(self, collate_mod):
+        img = PILImage.new("RGBA", (4, 4), (255, 0, 0, 128))
+        conversations = [[
+            {"role": "user", "content": [{"image": img}]},
+        ]]
+        collate_mod._ensure_rgb(conversations)
+        assert conversations[0][0]["content"][0]["image"].mode == "RGB"
+
+    def test_grayscale_image_converted_to_rgb(self, collate_mod):
+        img = PILImage.new("L", (4, 4), 128)
+        conversations = [[
+            {"role": "user", "content": [{"image": img}]},
+        ]]
+        collate_mod._ensure_rgb(conversations)
+        assert conversations[0][0]["content"][0]["image"].mode == "RGB"
+
+    def test_palette_image_converted_to_rgb(self, collate_mod):
+        img = PILImage.new("P", (4, 4))
+        conversations = [[
+            {"role": "user", "content": [{"image": img}]},
+        ]]
+        collate_mod._ensure_rgb(conversations)
+        assert conversations[0][0]["content"][0]["image"].mode == "RGB"
+
+    def test_rgb_image_unchanged(self, collate_mod):
+        img = PILImage.new("RGB", (4, 4), (255, 0, 0))
+        conversations = [[
+            {"role": "user", "content": [{"image": img}]},
+        ]]
+        collate_mod._ensure_rgb(conversations)
+        result = conversations[0][0]["content"][0]["image"]
+        assert result.mode == "RGB"
+
+    def test_no_images_passthrough(self, collate_mod):
+        conversations = [[
+            {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+        ]]
+        result = collate_mod._ensure_rgb(conversations)
+        assert result == conversations
+
+    def test_string_content_skipped(self, collate_mod):
+        conversations = [[
+            {"role": "assistant", "content": "plain string"},
+        ]]
+        result = collate_mod._ensure_rgb(conversations)
+        assert result[0][0]["content"] == "plain string"
+
+    def test_empty_conversations(self, collate_mod):
+        assert collate_mod._ensure_rgb([]) == []
+
+    def test_multiple_images_in_one_turn(self, collate_mod):
+        rgba = PILImage.new("RGBA", (4, 4))
+        gray = PILImage.new("L", (4, 4))
+        rgb = PILImage.new("RGB", (4, 4))
+        conversations = [[
+            {"role": "user", "content": [
+                {"image": rgba},
+                {"type": "text", "text": "describe these"},
+                {"image": gray},
+                {"image": rgb},
+            ]},
+        ]]
+        collate_mod._ensure_rgb(conversations)
+        items = conversations[0][0]["content"]
+        assert items[0]["image"].mode == "RGB"
+        assert items[1] == {"type": "text", "text": "describe these"}
+        assert items[2]["image"].mode == "RGB"
+        assert items[3]["image"].mode == "RGB"
+
+    def test_multiple_conversations(self, collate_mod):
+        img1 = PILImage.new("RGBA", (4, 4))
+        img2 = PILImage.new("L", (4, 4))
+        conversations = [
+            [{"role": "user", "content": [{"image": img1}]}],
+            [{"role": "user", "content": [{"image": img2}]}],
+        ]
+        collate_mod._ensure_rgb(conversations)
+        assert conversations[0][0]["content"][0]["image"].mode == "RGB"
+        assert conversations[1][0]["content"][0]["image"].mode == "RGB"
+
+    def test_non_image_dict_items_untouched(self, collate_mod):
+        conversations = [[
+            {"role": "user", "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "video", "video": "clip.mp4"},
+            ]},
+        ]]
+        result = collate_mod._ensure_rgb(conversations)
+        items = result[0][0]["content"]
+        assert items[0] == {"type": "text", "text": "hi"}
+        assert items[1] == {"type": "video", "video": "clip.mp4"}
+
+    def test_returns_same_list_object(self, collate_mod):
+        conversations = [[{"role": "user", "content": [{"type": "text", "text": "x"}]}]]
+        result = collate_mod._ensure_rgb(conversations)
+        assert result is conversations
+
+
+class TestDefaultCollateFnEnsureRgb:
+    """Test that default_collate_fn integrates _ensure_rgb correctly."""
+
+    def test_rgba_image_converted_before_processing(self, collate_mod, fake_qwen_utils, monkeypatch):
+        monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
+
+        captured_conversations = []
+
+        class CapturingProcessor:
+            tokenizer = DummyTokenizer()
+
+            def apply_chat_template(self, conv_list, **kwargs):
+                for conv in conv_list:
+                    for turn in conv:
+                        content = turn.get("content")
+                        if isinstance(content, list):
+                            for item in content:
+                                if isinstance(item, dict) and isinstance(item.get("image"), PILImage.Image):
+                                    captured_conversations.append(item["image"].mode)
+                batch_size = len(conv_list)
+                input_ids = torch.arange(1, 5).unsqueeze(0).repeat(batch_size, 1)
+                pixel_values = torch.ones(batch_size, 3, 64, 64, dtype=torch.float32)
+                return {"input_ids": input_ids, "pixel_values": pixel_values}
+
+        rgba_img = PILImage.new("RGBA", (4, 4), (255, 0, 0, 128))
+        conversation = [
+            {"role": "user", "content": [{"image": rgba_img}, {"type": "text", "text": "describe"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "red"}]},
+        ]
+
+        processor = CapturingProcessor()
+        collate_mod.default_collate_fn([{"conversation": conversation}], processor)
+
+        assert captured_conversations == ["RGB"]

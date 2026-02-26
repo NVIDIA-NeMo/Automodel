@@ -24,25 +24,22 @@ nemo_automodel/recipes/llm/train_ft.py \
     --step_scheduler.max_steps 10 \
     --step_scheduler.global_batch_size 16 \
     --step_scheduler.local_batch_size 8 \
-    --dataset.tokenizer.pretrained_model_name_or_path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-    --validation_dataset.tokenizer.pretrained_model_name_or_path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-    --dataset.path_or_dataset rowan/hellaswag \
-    --validation_dataset.path_or_dataset rowan/hellaswag \
-    --dataset.split train \
-    --validation_dataset.split validation \
-    --validation_dataset.num_samples_limit 128 \
+    --dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
+    --validation_dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
+    --dataset.dataset_name $HF_CACHE/squad/ \
+    --validation_dataset.dataset_name $HF_CACHE/squad/ \
+    --dataset.limit_dataset_samples 1000 \
+    --validation_dataset.limit_dataset_samples 128 \
     --step_scheduler.ckpt_every_steps 10 \
     --checkpoint.enabled true \
     --checkpoint.checkpoint_dir checkpoints/deepseek_moe_lora_test \
-    --checkpoint.load_base_model false \
     --peft.target_modules "[\"*.experts\"]" \
     --peft.dim 16 \
     --peft.alpha 32 \
     --peft.dropout 0.05 \
     --peft._target_ nemo_automodel.components._peft.lora.PeftConfig \
-    --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
     --distributed.dp_size none \
     --distributed.tp_size 1 \
     --distributed.cp_size 1 \
     --distributed.sequence_parallel false \
-    --distributed.dp_replicate_size 1
+

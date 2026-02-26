@@ -34,20 +34,16 @@ rng:
   seed: 1111
   ranked: true
 
-parallelizer:
-  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
-  activation_checkpointing: false
-  reshard_after_forward: false
-
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
   backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
     rms_norm: te
-    enable_deepep: true
+    experts: te
+    dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -55,28 +51,28 @@ model:
 checkpoint:
   enabled: false
   checkpoint_dir: checkpoints/
-  model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  model_save_format: safetensors # torch_save or safetensors
+  save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  dp_replicate_size: 1
   ep_size: 8
 
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 4
+    round_virtual_stages_to_pp_multiple: up
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
 
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
-  pp_schedule: interleaved1f1b
-  pp_microbatch_size: 4
-  round_virtual_stages_to_pp_multiple: up
-  scale_grads_in_schedule: false
-  patch_inner_model: false
-  patch_causal_lm_model: false
-  layers_per_stage: 2
 
+  moe:
+    reshard_after_forward: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -120,10 +116,13 @@ optimizer:
   lr: 1.0e-4
   weight_decay: 0
   # min_lr: 1.0e-5
+  # foreach=false is required when using TE GroupedLinear with FSDP
+  # because TE weights are regular tensors while FSDP wraps other params as DTensor
+  foreach: false
 
 # Uncomment and configure for W&B logging
-wandb:
-  project: automodel-fsdp-moe-opt
-  entity: Nemo-automodel
-  name: moonlight-16b-te-fsdp-moe-opt
-  dir: /tmp/wandb
+# wandb:
+#   project: automodel-fsdp-moe-opt
+#   entity: Nemo-automodel
+#   name: moonlight-16b-te-grouped-linear
+#   dir: /tmp/wandb

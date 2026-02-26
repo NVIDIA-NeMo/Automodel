@@ -19,6 +19,7 @@ import torch.distributed as dist
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.llm.train_ft import build_distributed, build_dataloader
+from nemo_automodel.recipes._dist_setup import setup_distributed
 
 """
 This test is to make sure that JSONL dataset can be checkpointed and loaded correctly.
@@ -33,8 +34,8 @@ def test_megatron_data_sharding():
     cfg_path = Path(__file__).parents[4] / "examples" / "llm_pretrain" / "megatron_pretrain_gpt2.yaml"
     cfg = parse_args_and_load_config(cfg_path)
     dist_env = build_distributed(cfg.get("dist_env", {}))
-    model_wrapper = cfg.distributed.instantiate(world_size=dist_env.world_size)
-    device_mesh = getattr(model_wrapper, "device_mesh", None)
+    dist_setup = setup_distributed(cfg, world_size=dist_env.world_size)
+    device_mesh = dist_setup.device_mesh
     dp_rank = device_mesh["dp"].get_local_rank()
     dp_world_size = device_mesh["dp"].size()
     tp_world_size = device_mesh["tp"].size()

@@ -23,6 +23,7 @@ examples/llm_finetune/finetune.py \
   --step_scheduler.global_batch_size 8 \
   --step_scheduler.local_batch_size 8 \
   --dataset.dataset_name $HF_CACHE/squad/ \
+  --validation_dataset.dataset_name $HF_CACHE/squad/ \
   --dataset.limit_dataset_samples 10 \
   --peft._target_ nemo_automodel.components._peft.lora.PeftConfig \
   --peft.target_modules '*_proj' \

@@ -50,12 +50,12 @@ checkpoint:
   save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  dp_replicate_size: 1
   ep_size: 1
+
   sequence_parallel: false
 
 loss_fn:

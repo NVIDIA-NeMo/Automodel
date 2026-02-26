@@ -29,10 +29,11 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeVisionRotaryEmbedding,
 )
 
+from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.qwen3_moe.model import Block
+from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -69,6 +70,34 @@ class Fp32SafeQwen3VLMoeVisionRotaryEmbedding(Qwen3VLMoeVisionRotaryEmbedding):
         return result
 
 
+class Qwen3VLMoeBlock(Block):
+    """Qwen3-VL block adapter that accepts HF-style position embeddings."""
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        freqs_cis: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **attn_kwargs: Any,
+    ) -> torch.Tensor:
+        if freqs_cis is None and position_embeddings is not None:
+            cos, sin = position_embeddings
+            head_dim = cos.shape[-1] // 2
+            freqs_cis = torch.cat((cos[..., :head_dim], sin[..., :head_dim]), dim=-1)
+        if freqs_cis is None:
+            raise ValueError("Qwen3VLMoeBlock requires freqs_cis or position_embeddings.")
+        return super().forward(
+            x=x,
+            freqs_cis=freqs_cis,
+            attention_mask=attention_mask,
+            padding_mask=padding_mask,
+            **attn_kwargs,
+        )
+
+
 class Qwen3VLMoeModel(HFQwen3VLMoeModel):
     @property
     def layers(self):
@@ -81,6 +110,61 @@ class Qwen3VLMoeModel(HFQwen3VLMoeModel):
     @property
     def norm(self):
         return self.language_model.norm
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        pixel_values=None,
+        pixel_values_videos=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        embed_tokens = self.get_input_embeddings()
+        if inputs_embeds is None:
+            if embed_tokens is not None:
+                inputs_embeds = embed_tokens(input_ids)
+            elif (
+                input_ids is not None
+                and isinstance(input_ids, torch.Tensor)
+                and input_ids.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            ):
+                inputs_embeds = input_ids
+                input_ids = None
+            else:
+                raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
+
+        if pixel_values is not None and self.visual is not None:
+            return super().forward(
+                input_ids=None,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+        outputs = self.language_model(
+            input_ids=None,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        return outputs
 
 
 class Qwen3VLMoeTextModelBackend(nn.Module):
@@ -117,8 +201,11 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
 
         embed_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx, dtype=embed_dtype)
-        self.layers = nn.ModuleList(
-            [Block(layer_id, config, self.moe_config, backend) for layer_id in range(config.num_hidden_layers)]
+        self.layers = nn.ModuleDict(
+            {
+                str(layer_id): Qwen3VLMoeBlock(layer_id, config, self.moe_config, backend)
+                for layer_id in range(config.num_hidden_layers)
+            }
         )
         self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Fp32SafeQwen3VLMoeTextRotaryEmbedding(config=config)
@@ -138,9 +225,6 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
         use_cache: bool | None = None,
         **attn_kwargs: Any,
     ) -> Qwen3VLMoeModelOutputWithPast:
-        if (input_ids is None) == (inputs_embeds is None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
         if past_key_values is not None or use_cache:
             raise NotImplementedError("KV cache is not supported for the Qwen3-VL backend implementation.")
 
@@ -167,7 +251,8 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
         head_dim = cos.shape[-1] // 2
         freqs_cis = torch.cat((cos[..., :head_dim], sin[..., :head_dim]), dim=-1)
 
-        for layer_idx, decoder_layer in enumerate(self.layers):
+        for layer_id_str, decoder_layer in self.layers.items():
+            layer_idx = int(layer_id_str)
             hidden_states = decoder_layer(
                 x=hidden_states,
                 freqs_cis=freqs_cis,
@@ -183,7 +268,8 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
                     deepstack_visual_embeds[layer_idx],
                 )
 
-        hidden_states = self.norm(hidden_states)
+        if self.norm is not None:
+            hidden_states = self.norm(hidden_states)
 
         return Qwen3VLMoeModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -224,11 +310,11 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
                 self.norm.reset_parameters()
             self.rotary_emb.device = buffer_device
 
-        for layer in self.layers:
+        for layer in self.layers.values():
             layer.init_weights(buffer_device=buffer_device)
 
 
-class Qwen3VLMoeForConditionalGeneration(HFQwen3VLMoeForConditionalGeneration, MoEFSDPSyncMixin):
+class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForConditionalGeneration, MoEFSDPSyncMixin):
     """Qwen3-VL conditional generation model using the Qwen3-MoE backend components."""
 
     @classmethod
@@ -272,7 +358,8 @@ class Qwen3VLMoeForConditionalGeneration(HFQwen3VLMoeForConditionalGeneration, M
         self.model.moe_config = self.model.language_model.moe_config
 
         self.vocab_size = text_config.vocab_size
-        self.pad_token_id = text_config.pad_token_id if text_config.pad_token_id is not None else -1
+        pad_token_id = getattr(text_config, "pad_token_id", None)
+        self.pad_token_id = pad_token_id if pad_token_id is not None else -1
 
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3VLMoeStateDictAdapter(
@@ -294,6 +381,18 @@ class Qwen3VLMoeForConditionalGeneration(HFQwen3VLMoeForConditionalGeneration, M
         fp32_safe_rotary.to(rotary.inv_freq.device)
         vision_model.rotary_pos_emb = fp32_safe_rotary
 
+    def get_input_embeddings(self):
+        return self.model.language_model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.language_model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -305,6 +404,35 @@ class Qwen3VLMoeForConditionalGeneration(HFQwen3VLMoeForConditionalGeneration, M
         cache_position: torch.Tensor | None = None,
         **kwargs: Any,
     ):
+        # PP VLM support: retrieve pixel_values from stored chunks if not passed directly
+        pixel_values = kwargs.get("pixel_values", None)
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        if (
+            pixel_values is None
+            and hasattr(self, "_vlm_pixel_values_chunks")
+            and self._vlm_pixel_values_chunks is not None
+        ):
+            # Check if we have media tokens in input_ids (151655/151652)
+            has_media_tokens = input_ids is not None and ((input_ids == 151655).any() or (input_ids == 151652).any())
+
+            if has_media_tokens:
+                chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
+                if chunk_idx < len(self._vlm_pixel_values_chunks):
+                    pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
+                    image_grid_hws = self._vlm_image_grid_hws_chunks[chunk_idx]
+                    # Convert image_grid_hws [N, 2] to image_grid_thw [N, 3] by prepending T=1
+                    if image_grid_hws is not None and image_grid_hws.numel() > 0:
+                        if image_grid_hws.shape[-1] == 2:
+                            ones = torch.ones(
+                                image_grid_hws.shape[0], 1, dtype=image_grid_hws.dtype, device=image_grid_hws.device
+                            )
+                            image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
+                        else:
+                            image_grid_thw = image_grid_hws
+                    kwargs["pixel_values"] = pixel_values
+                    kwargs["image_grid_thw"] = image_grid_thw
+                    self._vlm_chunk_idx = chunk_idx + 1
+
         if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
             input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, kwargs
@@ -313,7 +441,7 @@ class Qwen3VLMoeForConditionalGeneration(HFQwen3VLMoeForConditionalGeneration, M
             if padding_mask is not None:
                 kwargs["padding_mask"] = padding_mask
 
-        return super().forward(
+        outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -321,6 +449,15 @@ class Qwen3VLMoeForConditionalGeneration(HFQwen3VLMoeForConditionalGeneration, M
             cache_position=cache_position,
             **kwargs,
         )
+
+        hidden_states = outputs.last_hidden_state
+
+        if self.lm_head is not None:
+            logits = self.lm_head(hidden_states)
+        else:
+            logits = hidden_states
+
+        return logits
 
     @torch.no_grad()
     def initialize_weights(

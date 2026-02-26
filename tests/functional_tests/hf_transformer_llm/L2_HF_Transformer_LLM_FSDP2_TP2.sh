@@ -30,7 +30,6 @@ examples/llm_finetune/finetune.py \
   --dataset.limit_dataset_samples 10 \
   --validation_dataset.dataset_name $HF_CACHE/squad/ \
   --validation_dataset.limit_dataset_samples 10 \
-  --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
   --distributed.dp_size none \
   --distributed.tp_size 2 \
   --distributed.cp_size 1 \

@@ -25,7 +25,7 @@ vLLM.
 
 <!-- In addition to this user guide, you can also explore our Quickstart,
 which features a [standalone python3
-recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py),
+recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py),
 offering hands-on demonstrations for quickly getting started with NeMo Automodel. -->
 
 ## Run SFT and PEFT with NeMo Automodel
@@ -108,7 +108,9 @@ Here’s a glimpse of what the data looks like:
 This structure is ideal for training models in context-based question answering, where the model learns to answer questions based on the input context.
 
 :::{tip}
-In this guide, we use the `SQuAD v1.1` dataset, but you can specify your own data as needed.
+In this guide, we use the `SQuAD v1.1` dataset, but you can use your own data.
+
+To do so, edit the YAML `dataset` / `validation_dataset` sections (for example `dataset._target_`, `dataset_name`/`path_or_dataset`, and `split`). See [Integrate Your Own Text Dataset](dataset.md) and [Dataset Overview](../dataset-overview.md).
 :::
 
 ## Use a Recipe to Fine-Tune the Model
@@ -307,10 +309,10 @@ where `finetune` is name the name of the recipe file (excluding the `.py` extens
 
 ### Invoke the Recipe Script Directly
 
-Alternatively, you can run the recipe [script](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py) directly using [torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html), as shown below.
+Alternatively, you can run the recipe [script](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py) directly using [torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html), as shown below.
 
 ``` bash
-torchrun --nproc-per-node=8 examples/llm/finetune.py --config sft_guide.yaml
+torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config sft_guide.yaml
 ```
 
 ### Sample Output

@@ -33,50 +33,46 @@ step_scheduler:
   max_steps: 30
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  dp_replicate_size: 1
   ep_size: 8
-  sequence_parallel: false
 
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
-  pp_schedule: interleaved1f1b
-  pp_microbatch_size: 2
-  round_virtual_stages_to_pp_multiple: down
-  scale_grads_in_schedule: false
-  patch_inner_model: false
-  patch_causal_lm_model: false
-  layers_per_stage: 2
+  sequence_parallel: false
+  activation_checkpointing: true
+
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 2
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
 
 dist_env:
   backend: nccl
   timeout_minutes: 10
 
-parallelizer:
-  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
-  activation_checkpointing: true
-
 model:
-  _target_: nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM.from_config
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
   trust_remote_code: true
   backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
     linear: torch
     rms_norm: torch
-    enable_deepep: false
+    experts: torch
+    dispatcher: torch
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false
 
 checkpoint:
   enabled: false
-  load_base_model: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

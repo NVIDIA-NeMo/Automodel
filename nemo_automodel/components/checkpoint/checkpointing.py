@@ -15,6 +15,7 @@
 import glob
 import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -22,11 +23,17 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 import torch.distributed.checkpoint as dcp
 import yaml
+
+# Safe import of HF_HUB_CACHE from huggingface_hub.constants
+try:
+    from huggingface_hub.constants import HF_HUB_CACHE
+except ImportError:
+    HF_HUB_CACHE = None
+
 from packaging.version import parse
 from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
-from transformers.utils import TRANSFORMERS_CACHE
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
@@ -38,12 +45,16 @@ from nemo_automodel.components.checkpoint._backports.hf_storage import (
     get_fqn_to_file_index_mapping,
 )
 from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon, PeftAddon
+from nemo_automodel.components.checkpoint.conversion_mapping import (
+    get_combined_key_mapping,
+    requires_tensor_merging,
+)
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
 
 if TYPE_CHECKING:
     from peft import PeftConfig
-    from transformers.tokenization_utils import PreTrainedTokenizerBase
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 
 def _is_geq_torch_2_9() -> bool:
@@ -51,6 +62,17 @@ def _is_geq_torch_2_9() -> bool:
     Check if the current torch version is greater than or equal to 2.9.0.
     """
     return parse(torch.__version__).base_version >= "2.9.0"
+
+
+def _is_safetensors_checkpoint(path: str) -> bool:
+    """Return True if path looks like a safetensors checkpoint (so we can preserve dtype); else DCP or other."""
+    if os.path.isfile(path):
+        return path.endswith(".safetensors")
+    if not os.path.isdir(path):
+        return False
+    if os.path.isfile(os.path.join(path, "model.safetensors.index.json")):
+        return True
+    return len(glob.glob(os.path.join(path, "*.safetensors"))) > 0
 
 
 if _is_geq_torch_2_9():
@@ -87,7 +109,9 @@ class CheckpointingConfig:
     model_repo_id: str
     save_consolidated: bool
     is_peft: bool
-    model_state_dict_keys: list[str] = None  # copy of the model state dict keys before any parallelization
+    model_state_dict_keys: list[str] = (
+        None  # copy of the model state dict keys before any parallelization. Kept for BW compatibility.
+    )
     is_async: bool = False
     dequantize_base_checkpoint: bool | None = None
     original_model_root_dir: str | None = None
@@ -168,6 +192,7 @@ class Checkpointer:
         if self.config.is_peft:
             self._addons.append(PeftAddon())
 
+    @torch.no_grad()
     def save_model(
         self,
         model: nn.Module,
@@ -249,6 +274,7 @@ class Checkpointer:
                 staging_dir=self.config.staging_dir,
             )
 
+    @torch.no_grad()
     def save_optimizer(
         self, optimizer: torch.optim.Optimizer, model: nn.Module, weights_path: str, scheduler: Optional[Any] = None
     ) -> None:
@@ -263,7 +289,7 @@ class Checkpointer:
         """
         optimizer_path = os.path.join(weights_path, "optim")
         _ensure_dirs(optimizer_path)
-        optimizer_state = OptimizerState(model, optimizer, scheduler)
+        optimizer_state = OptimizerState(model, optimizer, scheduler, is_peft=self.config.is_peft)
         state_dict = optimizer_state.state_dict()
         self._optim_ctx.future = self._do_save(state_dict, optimizer_path)
 
@@ -279,11 +305,12 @@ class Checkpointer:
             weights_path: Base directory for checkpoints.
             scheduler: Optional LR scheduler to populate.
         """
-        optimizer_state = OptimizerState(model, optimizer, scheduler)
+        optimizer_state = OptimizerState(model, optimizer, scheduler, is_peft=self.config.is_peft)
         state_dict = optimizer_state.state_dict()
         self._do_load(state_dict, os.path.join(weights_path, "optim"))
         optimizer_state.load_state_dict(state_dict)
 
+    @torch.no_grad()
     def load_model(
         self,
         model: nn.Module,
@@ -299,6 +326,7 @@ class Checkpointer:
         - For PEFT (non-init): rank 0 reads `adapter_model.safetensors`, then broadcasts.
         - Otherwise: use DCP with a Hugging Face or default storage reader to populate the state dict.
         - If the model exposes a `state_dict_adapter`, convert to/from HF format as needed.
+        - For models requiring tensor merging (e.g., Mixtral), uses transformers' conversion mapping.
 
         Args:
             model: Model or parallelized model parts to load into.
@@ -316,8 +344,75 @@ class Checkpointer:
             is_init_step=is_init_step,
             skip_task_head_prefixes=getattr(self.config, "skip_task_head_prefixes_for_base_model", None),
         )
+
+        # Check if this model requires tensor merging (e.g., Mixtral with grouped experts)
+        model_type = getattr(getattr(model_state.model[0], "config", None), "model_type", None)
+        has_state_dict_adapter = hasattr(model_state.model[0], "state_dict_adapter")
+
+        # For models that need tensor merging and don't have an adapter, try using transformers' conversion
+        if is_init_step and model_type and requires_tensor_merging(model_type) and not has_state_dict_adapter:
+            converted_state_dict = _convert_checkpoint_with_transformers(model_state.model[0], model_path, key_mapping)
+            if converted_state_dict is not None:
+                # Load using full_state_dict=True to properly convert tensors to DTensors for FSDP
+                _load_full_state_dict_into_model(model_state.model, converted_state_dict)
+                return
+
+        # When loading base model for a single model and the checkpoint is safetensors (not DCP),
+        # load the full state dict on every rank and use set_model_state_dict with
+        # full_state_dict=True (no broadcast) so each rank independently slices its
+        # local DTensor shard.  This avoids NCCL collectives entirely, side-stepping
+        # the broadcast_from_rank0 hang where rank 0's synchronous CPU→GPU copies
+        # fall behind other ranks' async allocations.
+        if (
+            is_init_step
+            and len(model_state.model) == 1
+            and _is_safetensors_checkpoint(model_path)
+            and not _is_custom_model(model_state.model[0])
+        ):
+            t0 = time.monotonic()
+            state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
+            t_disk = time.monotonic()
+            if state_dict_from_disk is not None:
+                state_dict_from_disk = _maybe_adapt_state_dict_from_hf(
+                    model_state.model[0], state_dict_from_disk, moe_mesh=self.moe_mesh
+                )
+            else:
+                state_dict_from_disk = {}
+
+            # Apply key_mapping (e.g. _checkpoint_conversion_mapping) so that
+            # HF checkpoint keys are renamed to match the model's parameter FQNs.
+            # Without this, VLM models like Gemma3ForConditionalGeneration whose
+            # checkpoint keys differ from their module hierarchy (e.g.
+            # "language_model.model.X" vs "model.language_model.X") would silently
+            # fail to load base weights when using strict=False.
+            if key_mapping and state_dict_from_disk:
+                state_dict_from_disk = _apply_key_mapping(state_dict_from_disk, key_mapping)
+
+            total_bytes = sum(
+                t.nelement() * t.element_size() for t in state_dict_from_disk.values() if isinstance(t, torch.Tensor)
+            )
+            _load_full_state_dict_into_model(model_state.model, state_dict_from_disk)
+            t_end = time.monotonic()
+
+            disk_s = t_disk - t0
+            dist_s = t_end - t_disk
+            total_s = t_end - t0
+            gb = total_bytes / (1 << 30)
+            logging.info(
+                f"load_model: {gb:.2f} GB loaded in {total_s:.2f}s "
+                f"({gb / total_s:.2f} GB/s overall | "
+                f"disk read {disk_s:.2f}s, distribute {dist_s:.2f}s)"
+            )
+            return
+
+        # Standard loading path (DCP copies into model's existing tensors; dtypes follow the model)
         state_dict = model_state.state_dict()
-        storage_reader = self._get_storage_reader(model_path, key_mapping, is_init_step=is_init_step)
+        # When the model has a state_dict_adapter, it handles all key transformations
+        # (to_hf/from_hf). Passing key_mapping to the storage reader would double-transform
+        # keys: the storage reader renames checkpoint keys in metadata, and then to_hf also
+        # renames model keys, producing a mismatch in the DCP planner.
+        reader_key_mapping = None if has_state_dict_adapter else key_mapping
+        storage_reader = self._get_storage_reader(model_path, reader_key_mapping, is_init_step=is_init_step)
 
         state_dict = _maybe_adapt_state_dict_to_hf(
             model_state.model[0],
@@ -328,9 +423,71 @@ class Checkpointer:
 
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
 
-        has_state_dict_adapter = hasattr(model_state.model[0], "state_dict_adapter")
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
         model_state.load_state_dict(state_dict, strict=not (len(model_state.model) > 1 or has_state_dict_adapter))
+
+    @staticmethod
+    def initialize_model_weights(
+        model: torch.nn.Module, device: torch.device, peft_init_method: str | None = None
+    ) -> None:
+        """
+        Materialize meta-device parameters and initialize model weights.
+
+        Moves empty parameter shells to the target device, resets HF initialization
+        flags, calls the model's weight initialization method, and initializes any
+        PEFT adapters.
+
+        Args:
+            model: Model whose weights should be initialized.
+            device: Target device for materialized parameters.
+            peft_init_method: Initialization method for PEFT adapters (e.g. "xavier").
+        """
+        to_empty_parameters_only(model, device=device)
+
+        # to_empty_parameters_only only materializes parameters, not buffers.
+        # Buffers (e.g. RoPE inv_freq) may still be on meta device.  Move them
+        # to *device* with uninitialized storage so that the subsequent
+        # initialize_weights() call can overwrite them with proper values
+        # (HF's _init_weights recomputes non-persistent buffers from config).
+        # Without this, meta buffers would survive until a later model.to_empty()
+        # call, which fills them with recycled GPU memory — values that may
+        # differ between successive model builds in the same process.
+        for module in model.modules():
+            for key in list(module._buffers):
+                buf = module._buffers[key]
+                if buf is not None and buf.device.type == "meta":
+                    module._buffers[key] = torch.empty_like(buf, device=device)
+
+        # HF models set _is_hf_initialized to True after initialization.
+        # But because we initialize on meta device, these are erroneously set to True.
+        # We need to set them to False and call initialize_weights to re-initialize the weights.
+
+        # Some models cannot call initialize_weights when sharded with DTensors:
+        # - Gemma3ForConditionalGeneration: requires setting a row to zeros in the embedding matrix,
+        #   which is not supported for DTensors in the pinned torch version.
+        # - NemotronHForCausalLM: the HF remote code's _init_weights uses dt_bias.copy_()
+        #   which fails with DTensors. Note: v3 (MoE) has n_routed_experts and uses our custom
+        #   implementation which handles this correctly.
+        try:
+            model_class = model.config.architectures[0]
+        except Exception:
+            model_class = ""
+        is_nemotron_v2 = model_class == "NemotronHForCausalLM" and not getattr(model.config, "n_routed_experts", None)
+        skip_initialize_weights = is_nemotron_v2
+        if not skip_initialize_weights:
+            for _, module in model.named_modules():
+                if hasattr(module, "_is_hf_initialized"):
+                    module._is_hf_initialized = False
+
+            if hasattr(model, "initialize_weights"):
+                model.initialize_weights()
+            else:
+                logging.warning(
+                    "Warning: Model does not have initialize_weights method. Requires custom initialization to be implemented."
+                )
+
+        if peft_init_method is not None:
+            _init_peft_adapters(model, peft_init_method)
 
     def load_base_model(
         self,
@@ -338,7 +495,6 @@ class Checkpointer:
         device: torch.device,
         root_dir: str,
         model_name: str | None,
-        peft_init_method: str,
         load_base_model: bool = True,
     ) -> None:
         """
@@ -349,49 +505,24 @@ class Checkpointer:
             device: Device to load model onto
             root_dir: Root directory of the model cache or snapshots
             model_name: Name of the model or an absolute path to a snapshot
-            peft_init_method: Initialization method used for PEFT adapters
             load_base_model: If True, restore from HF base checkpoint
         """
-        to_empty_parameters_only(model, device=device)
-
-        # HF models set _is_hf_initialized to True after initialization.
-        # But because we initialize on meta device, these are erroneously set to True.
-        # We need to set them to False and call initialize_weights to re-initialize the weights.
-
-        # Gemma3ForConditionalGeneration cannot be pretrained currently. The pinned torch version
-        # doesn't support initialize_weights when the model is sharded. This is because Gemma's
-        # initialize_weights method requires setting a row to zeros in the embedding matrix.
-        # This index selection op is not supported for DTensors in the pinned torch version.
-        try:
-            model_class = model.config.architectures[0]
-        except:
-            model_class = ""
-        if model_class not in ["Gemma3ForConditionalGeneration", "NemotronHForCausalLM"]:
-            for _, module in model.named_modules():
-                if hasattr(module, "_is_hf_initialized"):
-                    module._is_hf_initialized = False
-
-            # init model weights
-            if hasattr(model, "initialize_weights"):
-                model.initialize_weights()
-            else:
-                logging.warning(
-                    "Warning: Model does not have initialize_weights method. Requires custom initialization to be implemented."
-                )
-
-        # init peft adapters with the scaled weights
-        _init_peft_adapters(model, peft_init_method)
-
         if load_base_model:
             assert model_name is not None, "model_name is required when loading base model"
+            # Get combined key mapping from model attribute and model-type specific conversions
+            model_type = getattr(getattr(model, "config", None), "model_type", None)
+            model_key_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
+            key_mapping = get_combined_key_mapping(model_type, model_key_mapping)
             self.load_model(
                 model,
                 model_path=model_name
                 if os.path.exists(model_name)
                 else get_safetensors_index_path(root_dir, model_name),
                 is_init_step=True,
-                key_mapping=getattr(model, "_checkpoint_conversion_mapping", None),
+                key_mapping=key_mapping,
             )
+
+        _reinit_rope_buffers(model, device)
 
         is_tied_lm_head = is_tied_word_embeddings(model)
         self.config.original_model_root_dir = root_dir
@@ -486,8 +617,7 @@ class Checkpointer:
         is_model = True if "/model" in path else False
         # PEFT loading is broadcasted from rank0 so it is a special case
         if self.config.is_peft and is_model and (not is_init_step):
-            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
+            state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
         else:
             dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
         return state_dict
@@ -580,14 +710,26 @@ class Checkpointer:
             fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(
                 index_path, getattr(model, "_checkpoint_conversion_mapping", None)
             )
-            # some HF models like Moonlight-16B have non-persistent buffers in the base checkpoint
-            # however, HF initializes buffers with persistent=False, so we need to make sure these
-            # buffer keys are not saved during checkpointing
-            keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - set(self.config.model_state_dict_keys))
-            if model_state.is_tied_lm_head:
-                keys_to_remove.append(model_state.lm_head_param_name)
-            for key in keys_to_remove:
-                fqn_to_file_index_mapping.pop(key, None)
+            model_part = model_state.model[0]
+            config = getattr(model_part, "config", None)
+            model_type = getattr(config, "model_type", None)
+            pre_shard_hf_state_dict_keys = (
+                getattr(model, "_pre_shard_hf_state_dict_keys", None) or self.config.model_state_dict_keys
+            )
+            if model_type and requires_tensor_merging(model_type) and not hasattr(model_part, "state_dict_adapter"):
+                # in this case, Transformers performed weight conversion so we will save the converted format in the checkpoint
+                num_shards = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
+                fqn_to_file_index_mapping = _equally_divide_layers(num_shards, pre_shard_hf_state_dict_keys)
+            else:
+                # some HF models like Moonlight-16B have non-persistent buffers in the base checkpoint
+                # however, HF initializes buffers with persistent=False, so we need to make sure these
+                # buffer keys are not saved during checkpointing
+                # The `_pre_shard_hf_state_dict_keys` attribute is set in the `apply_model_infrastructure` in auto_model.py
+                keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - set(pre_shard_hf_state_dict_keys))
+                if model_state.is_tied_lm_head:
+                    keys_to_remove.append(model_state.lm_head_param_name)
+                for key in keys_to_remove:
+                    fqn_to_file_index_mapping.pop(key, None)
         else:
             fqn_to_file_index_mapping = {k: 1 for k in state_dict.keys()}
 
@@ -651,15 +793,29 @@ class Checkpointer:
         """
         Get the path to the original model from the Hugging Face checkpoint.
         """
-        if not hasattr(model_state.model[0], "name_or_path"):
+        if not hasattr(model_state.model[0], "name_or_path") and not hasattr(
+            getattr(model_state.model[0], "config", None), "name_or_path"
+        ):
             return None
-        pretrained_model_name_or_path = getattr(model_state.model[0], "name_or_path")
-        return get_safetensors_index_path(
-            getattr(self.config, "original_model_root_dir", None) or TRANSFORMERS_CACHE, pretrained_model_name_or_path
+
+        pretrained_model_name_or_path = getattr(model_state.model[0], "name_or_path", None) or getattr(
+            getattr(model_state.model[0], "config", None), "name_or_path", None
         )
+        # Randomly initialized HF models often have an empty `name_or_path`. In that case,
+        # there is no "original" HF snapshot to reference for metadata.
+        if not pretrained_model_name_or_path:
+            return None
+
+        if os.path.isdir(pretrained_model_name_or_path):
+            return pretrained_model_name_or_path
+
+        # `original_model_root_dir` exists on the config but may be None. In that case,
+        # fall back to the standard HF hub cache root.
+        cache_dir = getattr(self.config, "original_model_root_dir", None) or HF_HUB_CACHE
+        return get_safetensors_index_path(cache_dir, pretrained_model_name_or_path)
 
 
-def get_safetensors_index_path(cache_dir: str, repo_id: str | None) -> str | None:
+def get_safetensors_index_path(cache_dir: str | Path | None, repo_id: str | None) -> str | None:
     """
     Return the directory containing the first `model.safetensors.index.json` found for given model.
 
@@ -692,6 +848,10 @@ def get_safetensors_index_path(cache_dir: str, repo_id: str | None) -> str | Non
     if os.path.exists(repo_id):
         return repo_id
 
+    cache_dir = cache_dir or HF_HUB_CACHE
+    if cache_dir is None:
+        # Defensive guard: HF_HUB_CACHE is expected to always be a string/path.
+        raise ValueError("Hugging Face cache directory is not set (cache_dir=None).")
     repo_dir = f"models--{repo_id.replace('/', '--')}"
     snapshots_root = Path(cache_dir) / repo_dir / "snapshots"
 
@@ -771,6 +931,29 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
                 module.init_lora_weights(peft_init_method)
             except Exception as e:
                 logging.warning(f"Failed to initialize weights for PEFT adapter `{module.__class__.__name__}`: {e}")
+
+
+def _reinit_rope_buffers(model: nn.Module, device: torch.device) -> None:
+    """
+    Recompute non-persistent RoPE ``inv_freq`` buffers for Nemotron-NAS models.
+    Args:
+        model: Model to reinitialize RoPE buffers for.
+        device: Device to create the new buffers on.
+    """
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    if model_type not in ("nemotron-nas",):
+        return
+
+    for name, module in model.named_modules():
+        if hasattr(module, "rope_init_fn") and hasattr(module, "inv_freq") and hasattr(module, "rope_kwargs"):
+            try:
+                inv_freq, _ = module.rope_init_fn(module.config, device, **module.rope_kwargs)
+                module.inv_freq = inv_freq
+                if hasattr(module, "original_inv_freq"):
+                    module.original_inv_freq = inv_freq.clone()
+                logging.debug(f"Reinitialized RoPE inv_freq for {name} on device {device}")
+            except Exception as e:
+                logging.warning(f"Failed to reinitialize RoPE inv_freq for {name}: {e}")
 
 
 def _apply(module, fn, recurse=True) -> nn.Module:
@@ -867,6 +1050,207 @@ def _apply(module, fn, recurse=True) -> nn.Module:
     return module
 
 
+def _apply_key_mapping(
+    state_dict: dict[str, torch.Tensor],
+    key_mapping: dict[str, str],
+) -> dict[str, torch.Tensor]:
+    """
+    Rename state-dict keys using regex-based ``key_mapping``.
+
+    This mirrors the renaming logic used by the DCP / HuggingFace storage
+    reader but operates directly on an in-memory state dict.  It is needed
+    when loading safetensors checkpoints outside of DCP so that HF checkpoint
+    keys (e.g. ``language_model.model.X``) are translated to the model's
+    parameter FQNs (e.g. ``model.language_model.X``).
+
+    Args:
+        state_dict: Original state dict whose keys may need renaming.
+        key_mapping: ``{regex_pattern: replacement}`` pairs applied in order.
+
+    Returns:
+        A new dict with renamed keys.
+    """
+    from nemo_automodel.components.checkpoint._backports.hf_storage import (
+        _get_key_renaming_mapping,
+    )
+
+    return {_get_key_renaming_mapping(k, key_mapping): v for k, v in state_dict.items()}
+
+
+def _load_full_state_dict_into_model(
+    model_parts: list[nn.Module],
+    state_dict: dict[str, torch.Tensor],
+) -> None:
+    """
+    Load a full (non-sharded) state dict into a potentially FSDP-wrapped model.
+
+    Every rank must supply the **full** state dict.  PyTorch's
+    ``set_model_state_dict`` with ``full_state_dict=True`` (but **not**
+    ``broadcast_from_rank0``) calls ``_distribute_state_dict`` which lets
+    each rank independently slice its local DTensor shard from the full
+    tensor -- no NCCL collectives are needed.
+
+    We intentionally avoid ``broadcast_from_rank0=True`` because it
+    introduces an asymmetric workload: rank 0 does a synchronous CPU→GPU
+    copy (``.to(device)``) per tensor while other ranks only do
+    ``torch.empty`` (async allocation).  The non-src ranks race ahead
+    enqueuing hundreds of NCCL broadcasts that rank 0 cannot keep up with,
+    leading to a 60 s NCCL watchdog timeout.
+
+    After loading, floating-point parameters are converted to match the
+    checkpoint dtype.  PyTorch's ``set_model_state_dict`` uses *copy*
+    semantics (``assign=False``) for non-meta parameters, which preserves
+    the model's initialisation dtype instead of the checkpoint dtype.
+    The post-load fixup ensures the safetensors dtype (e.g. bf16) is
+    honoured.
+
+    Args:
+        model_parts: List of model parts (for pipeline parallelism)
+        state_dict: Full state dict with regular tensors.  Must be
+            populated on **every** rank (not just rank 0).
+    """
+    # IMPORTANT: named_modules() returns paths that include wrapper prefixes
+    # like _checkpoint_wrapped_module, but PyTorch's _get_fqns() strips
+    # _CHECKPOINT_PREFIX from FQNs.  We must do the same so our keys match
+    # what _load_model_state_dict actually looks up.
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        _CHECKPOINT_PREFIX,
+    )
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
+    for model in model_parts:
+        for name, module in model.named_modules():
+            if type(module).get_extra_state is not nn.Module.get_extra_state:
+                key = f"{name}._extra_state" if name else "_extra_state"
+                key = key.replace(_CHECKPOINT_PREFIX, "")
+                if key not in state_dict:
+                    state_dict[key] = torch.tensor([], dtype=torch.uint8)
+
+    # full_state_dict=True WITHOUT broadcast_from_rank0: every rank already
+    # has the full checkpoint, so _distribute_state_dict slices each rank's
+    # local DTensor shard independently -- zero NCCL collectives.
+    options = StateDictOptions(
+        strict=False,
+        full_state_dict=True,
+    )
+
+    for part in model_parts:
+        set_model_state_dict(part, model_state_dict=state_dict, options=options)
+
+
+def _convert_checkpoint_with_transformers(
+    model: nn.Module,
+    model_path: str,
+    key_mapping: Optional[dict[str, str]] = None,
+) -> Optional[dict[str, torch.Tensor]]:
+    """
+    Convert a checkpoint using transformers' conversion mapping for models that need tensor merging.
+
+    This handles MoE models like Mixtral where the checkpoint has individual expert weights
+    but the model uses grouped expert tensors. The transformers library's WeightConverter
+    operations handle the tensor merging (MergeModulelist, Concatenate).
+
+    This function converts the state dict WITHOUT loading it into the model, so it can be
+    used with FSDP-aware loading mechanisms.
+
+    Args:
+        model: The model (used to get conversion mapping and target keys).
+        model_path: Path to the HuggingFace checkpoint directory.
+        key_mapping: Optional additional key mapping.
+
+    Returns:
+        Converted state dict ready for loading, or None if conversion failed.
+    """
+    try:
+        from copy import deepcopy
+
+        from safetensors import safe_open
+        from transformers.conversion_mapping import get_model_conversion_mapping
+        from transformers.core_model_loading import (
+            WeightConverter,
+            WeightRenaming,
+            dot_natural_key,
+            rename_source_key,
+        )
+    except ImportError:
+        logging.warning(
+            "transformers library with conversion_mapping not available. "
+            "Cannot use transformers' WeightConverter for tensor merging."
+        )
+        return None
+
+    try:
+        # Get the weight conversion mapping from transformers
+        weight_mapping = get_model_conversion_mapping(model, key_mapping=key_mapping, add_legacy=True)
+        if not weight_mapping:
+            logging.warning(
+                f"No conversion mapping found for model type {getattr(model.config, 'model_type', 'unknown')}"
+            )
+            return None
+
+        # Load the safetensors files
+        safetensors_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+        if not safetensors_files:
+            logging.warning(f"No safetensors files found in {model_path}")
+            return None
+
+        # Load checkpoint state dict
+        checkpoint_state_dict = {}
+        for sf_path in safetensors_files:
+            with safe_open(sf_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    checkpoint_state_dict[key] = f.get_tensor(key)
+
+        # Separate renamings and converters
+        renamings = [entry for entry in weight_mapping if isinstance(entry, WeightRenaming)]
+        converters = [entry for entry in weight_mapping if isinstance(entry, WeightConverter)]
+        pattern_to_converter = {k: converter for converter in converters for k in converter.source_patterns}
+
+        # Process checkpoint keys and apply conversions
+        converted_state_dict = {}
+        param_name_to_mapping: dict[str, WeightRenaming | WeightConverter] = {}
+
+        # Sort by key for consistent ordering
+        sorted_items = sorted(checkpoint_state_dict.items(), key=lambda kv: dot_natural_key(kv[0]))
+
+        for original_key, tensor in sorted_items:
+            # Rename the key
+            renamed_key, source_pattern = rename_source_key(original_key, renamings, converters)
+
+            # Check if this needs conversion
+            if source_pattern is not None:
+                # This key is part of a WeightConverter operation
+                new_converter = deepcopy(pattern_to_converter[source_pattern])
+                mapping = param_name_to_mapping.setdefault(renamed_key, new_converter)
+                mapping.add_tensor(renamed_key, original_key, source_pattern, tensor)
+            else:
+                # Simple rename or pass-through
+                mapping = param_name_to_mapping.setdefault(renamed_key, WeightRenaming(original_key, renamed_key))
+                mapping.add_tensor(renamed_key, original_key, original_key, tensor)
+
+        # Now apply all the conversions
+        for first_param_name, mapping in param_name_to_mapping.items():
+            try:
+                realized_value, _ = mapping.convert(first_param_name, model=model, config=model.config)
+                for target_name, param in realized_value.items():
+                    param = param[0] if isinstance(param, list) else param
+                    converted_state_dict[target_name] = param
+                mapping.reset()
+            except Exception as e:
+                logging.warning(f"Conversion failed for {first_param_name}: {e}")
+                continue
+
+        logging.info(f"Converted {len(converted_state_dict)} keys using transformers conversion mapping")
+        return converted_state_dict
+
+    except Exception as e:
+        logging.warning(f"Failed to convert checkpoint with transformers: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return None
+
+
 def _maybe_adapt_state_dict_to_hf(
     model_part: nn.Module, state_dict: dict[str, torch.Tensor], quantization: bool = False, **kwargs
 ) -> dict[str, torch.Tensor]:
@@ -877,6 +1261,78 @@ def _maybe_adapt_state_dict_to_hf(
     if adapter:
         return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
     return state_dict
+
+
+def _equally_divide_layers(num_shards: int, keys: list[str]) -> dict[str, int]:
+    """
+    Equally divide the state dict keys into num_shards shards.
+    """
+    if num_shards <= 0:
+        raise ValueError(f"num_shards must be > 0, got {num_shards}")
+
+    num_layers = len(keys)
+    if num_layers == 0:
+        return {}
+
+    layers_per_shard, remainder = divmod(num_layers, num_shards)
+    fqn_to_index_mapping: dict[str, int] = {}
+    start = 0
+    for shard_index in range(1, num_shards + 1):
+        extra = 1 if shard_index <= remainder else 0
+        end = start + layers_per_shard + extra
+        for key in keys[start:end]:
+            fqn_to_index_mapping[key] = shard_index
+        start = end
+    return fqn_to_index_mapping
+
+
+def _model_has_dtensors(module: nn.Module) -> bool:
+    """True if any parameter is a DTensor (model is already sharded)."""
+    return any(type(p).__name__ == "DTensor" for p in module.parameters())
+
+
+def _is_custom_model(module: nn.Module) -> bool:
+    """True if the model has a custom implementation in nemo_automodel/components/models/."""
+    return any((c.__module__ or "").startswith("nemo_automodel.components.models.") for c in type(module).__mro__)
+
+
+def _load_hf_checkpoint_preserving_dtype(model_path: str) -> Optional[dict[str, torch.Tensor]]:
+    """
+    Load a HuggingFace checkpoint (safetensors) into a new state dict so tensor dtypes
+    match the checkpoint (e.g. bf16). Used when loading the base model so FSDP sees
+    uniform dtype instead of the model's init dtypes (e.g. float32).
+    Returns None if the path is not a valid safetensors checkpoint.
+    """
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        return None
+    if not _is_safetensors_checkpoint(model_path):
+        return None
+    out: dict[str, torch.Tensor] = {}
+    if os.path.isfile(model_path):
+        return dict(load_file(model_path))
+    # Directory: try index first, then glob
+    index_file = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.isfile(index_file):
+        import json
+
+        with open(index_file) as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map", {})
+        for key, filename in weight_map.items():
+            sf_path = os.path.join(model_path, filename)
+            if not os.path.isfile(sf_path):
+                continue
+            with safe_open(sf_path, framework="pt", device="cpu") as f:
+                if key in f.keys():
+                    out[key] = f.get_tensor(key)
+    else:
+        for sf_path in glob.glob(os.path.join(model_path, "*.safetensors")):
+            with safe_open(sf_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    out[key] = f.get_tensor(key)
+    return out if out else None
 
 
 def _maybe_adapt_state_dict_from_hf(

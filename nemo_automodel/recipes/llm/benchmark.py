@@ -21,6 +21,7 @@ import torch
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.training.utils import (
+    prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
 )
@@ -66,7 +67,11 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if hasattr(cfg.model, "config") and hasattr(cfg.model.config, "pretrained_model_name_or_path"):
                 from transformers import AutoConfig
 
-                model_config = AutoConfig.from_pretrained(cfg.model.config.pretrained_model_name_or_path)
+                trust_remote_code = getattr(cfg.model.config, "trust_remote_code", False)
+
+                model_config = AutoConfig.from_pretrained(
+                    cfg.model.config.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+                )
                 vocab_size = model_config.vocab_size
                 # Inject vocab_size into dataset config
                 cfg.dataset.vocab_size = vocab_size
@@ -111,9 +116,17 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         self.tflops = flops / (10**12)
 
         if hasattr(self.cfg, "peft"):
-            # Calculate trainable vs non-trainable parameters without lora
-            lora_params = self.param_info["trainable_params"]
-            total_params = self.param_info["total_params"]
+            # Calculate trainable vs non-trainable parameters
+            # Need to get these before autopipeline splits the model across PP ranks
+            if self.pp is not None:
+                # PP enabled - use pre-sharding values stored on autopipeline
+                lora_params = self.pp.trainable_params_before_pp
+                total_params = self.pp.total_params_before_pp
+            else:
+                # No PP - model is not sharded, calculate directly
+                from nemo_automodel.components.utils.model_utils import print_trainable_parameters
+
+                lora_params, total_params = print_trainable_parameters(self.model_parts[0])
             frozen_params = total_params - lora_params
 
             # Adjust TFLOPS for PEFT: training has 3 computational phases:
@@ -240,6 +253,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
                     torch.cuda.nvtx.range_pop()
 
+                    if ga_step_idx == 0:
+                        prepare_after_first_microbatch()
+
                 # Optimizer step
                 with self.timers("optimizer", log_level=2):
                     for opt in self.optimizer:
@@ -274,6 +290,11 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     f"Max Memory Allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB | "
                     f"loss={reporting_loss:.4f}"
                 )
+
+            # Collect and log MoE load balance metrics (inherited from train_ft)
+            self._collect_moe_load_balance()
+            if self._wandb_enabled and self.wandb_run is not None:
+                self._log_moe_metrics(i, self.wandb_run.log)
 
             # Calculate and log MFU
             self._log_iteration_metrics(iter_timer, ga_steps, peak_tflops, rank, i)

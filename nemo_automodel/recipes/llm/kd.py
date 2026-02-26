@@ -67,31 +67,53 @@ def _build_kd_loss_fn(cfg_kd):
     return cfg_kd.instantiate()
 
 
-def _build_teacher_model(cfg_teacher, seed, has_packed_sequence, device, model_wrapper, device_mesh):
+def _build_teacher_model(
+    cfg_teacher,
+    seed,
+    has_packed_sequence,
+    device_mesh=None,
+    moe_mesh=None,
+    distributed_config=None,
+    device=None,
+):
+    """Build and initialize the teacher model for knowledge distillation.
+
+    Uses the same infrastructure as student model (NeMoAutoModelForCausalLM) but without
+    PEFT, FP8, or QAT since the teacher should be frozen in full precision.
+
+    Args:
+        cfg_teacher: Configuration for teacher model instantiation.
+        seed: Random seed for reproducibility.
+        has_packed_sequence: Whether using packed sequences.
+        device_mesh: Device mesh for distributed training.
+        moe_mesh: MOE mesh for expert parallelism.
+        distributed_config: Strategy-specific distributed config.
+        device: Device to place the teacher model on.
+
+    Returns:
+        The frozen teacher model ready for inference.
+
+    Note:
+        The `offload_teacher_model` config option is not supported with this approach.
+        Device placement is handled internally by NeMoAutoModelForCausalLM infrastructure.
+    """
+
     assert cfg_teacher is not None, "`teacher_model` section missing from YAML config"
     logger.info("Instantiating teacher model")
 
-    # Build teacher model using the same approach as student model
+    # Build teacher model using the same infrastructure as student
+    # but without PEFT/FP8/QAT (teacher should be frozen in full precision)
     with ScopedRNG(seed=seed, ranked=True):
-        kwargs: Dict[str, Any] = {}
-        if has_packed_sequence > 0:
-            kwargs["attn_implementation"] = "flash_attention_2"
+        kwargs: Dict[str, Any] = {
+            "has_packed_sequence": has_packed_sequence,
+            "device_mesh": device_mesh,
+            "moe_mesh": moe_mesh,
+            "distributed_config": distributed_config,
+        }
 
         teacher_model = cfg_teacher.instantiate(**kwargs)
 
-        # For teacher model, we'll apply FSDP2 sharding if the same model_wrapper is available
-        # but we need to be careful about device placement and parallelization
-        if model_wrapper is not None and hasattr(model_wrapper, "parallelize"):
-            logger.info("Applying FSDP2 sharding to teacher model")
-            # Create a new model wrapper instance for the teacher to avoid conflicts
-            # with the student model's parallelization
-            try:
-                teacher_model = model_wrapper.parallelize(teacher_model)
-            except Exception as e:
-                logger.warning(f"Failed to parallelize teacher model with FSDP2: {e}")
-                logger.info("Falling back to simple device placement for teacher model")
-                teacher_model = teacher_model.to(device)
-        # ensure on device
+        # Ensure the teacher model is on the correct device
         teacher_model = teacher_model.to(device)
 
         # Set teacher to eval mode and freeze parameters
@@ -135,15 +157,16 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             raise ValueError("Pipeline parallelism support will be added in the future for knowledge distillation")
 
         self._offload_teacher_model = self.cfg.get("offload_teacher_model", False)
-        # teacher specific
         teacher_device = self.dist_env.device if not self._offload_teacher_model else "cpu"
+
         self.teacher_model = _build_teacher_model(
-            self.cfg.get("teacher_model", None),
-            self.cfg.get("seed", 42),
-            self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
-            teacher_device,
-            self.model_wrapper,
-            self.device_mesh,
+            cfg_teacher=self.cfg.get("teacher_model", None),
+            seed=self.cfg.get("seed", 42),
+            has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            distributed_config=self.distributed_config,
+            device=teacher_device,
         )
         logger.info("Teacher Model: " + str(self.teacher_model))
         # KD
@@ -177,7 +200,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             get_sync_ctx(
                 model,
                 idx == num_batches - 1,
-                defer_fsdp_grad_sync=getattr(self.model_wrapper, "defer_fsdp_grad_sync", True),
+                defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
             )
             if is_train
             else nullcontext()

@@ -18,8 +18,8 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.qwen3_vl_moe.state_dict_adapter import Qwen3VLMoeStateDictAdapter
-from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.models.common import BackendConfig
 
 
 @pytest.fixture
@@ -66,7 +66,8 @@ def backend_config():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
-        enable_deepep=False,
+        experts="torch",
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -346,5 +347,3 @@ class TestConvertSingleTensorToHf:
         result = adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r"exclude.*")
 
         assert result == []
-
-
