@@ -192,7 +192,6 @@ def build_model(
 
         if cfg_moe is not None:
             from nemo_automodel.components.moe.config import MoEParallelizerConfig
-            from nemo_automodel.shared.utils import dtype_from_str
 
             if isinstance(cfg_moe, MoEParallelizerConfig):
                 kwargs["moe_config"] = cfg_moe
@@ -201,16 +200,6 @@ def build_model(
                 # activation_checkpointing is handled separately; strip config keys
                 moe_dict.pop("activation_checkpointing", None)
                 moe_dict.pop("_target_", None)
-                # Instantiate nested _target_ configs (e.g. mp_policy)
-                if "mp_policy" in moe_dict:
-                    mp_raw = moe_dict["mp_policy"]
-                    if isinstance(mp_raw, dict) and callable(mp_raw.get("_target_")):
-                        mp_raw = mp_raw.copy()
-                        target = mp_raw.pop("_target_")
-                        for key in ("param_dtype", "reduce_dtype", "output_dtype"):
-                            if key in mp_raw and isinstance(mp_raw[key], str):
-                                mp_raw[key] = dtype_from_str(mp_raw[key])
-                        moe_dict["mp_policy"] = target(**mp_raw)
                 kwargs["moe_config"] = MoEParallelizerConfig(**moe_dict)
             kwargs["activation_checkpointing"] = activation_checkpointing
 
