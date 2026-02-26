@@ -160,6 +160,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             self._get_dp_group_size(),
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
         )
+        self._setup_garbage_collection(self.step_scheduler)
 
         self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
 
@@ -184,6 +185,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             self.step_scheduler.set_epoch(epoch)
             for batches in self.step_scheduler:
                 train_log_data = self._run_train_optim_step(batches)
+                self._maybe_collect_garbage()
                 self.log_train_metrics(train_log_data)
 
                 val_loss = {}

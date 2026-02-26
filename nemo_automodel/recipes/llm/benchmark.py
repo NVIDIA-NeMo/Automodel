@@ -209,6 +209,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Main benchmarking loop
         for i in range(steps):
+            self.step_scheduler.step = i
             # Start nsys profiling if configured
             if i == nsys_start and rank in nsys_ranks:
                 logger.info(f"Rank {rank} | Starting nsys profiling")
@@ -261,6 +262,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     for opt in self.optimizer:
                         opt.step()
                     logger.debug("Optimizer step")
+            self._maybe_collect_garbage()
 
             # Synchronize num_label_tokens across DP ranks
             num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)

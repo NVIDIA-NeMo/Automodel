@@ -621,6 +621,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self._get_dp_group_size(),
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
         )
+        self._setup_garbage_collection(self.step_scheduler)
 
         # Build learning rate scheduler
         self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
@@ -659,6 +660,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.step_scheduler.set_epoch(epoch)
             for batch_idx, batches in enumerate(self.step_scheduler):
                 log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                self._maybe_collect_garbage()
                 # log
                 self.log_train_metrics(log_data)
 

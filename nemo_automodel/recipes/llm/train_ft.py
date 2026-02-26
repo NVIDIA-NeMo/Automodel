@@ -1008,6 +1008,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self._get_dp_group_size(),
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
         )
+        self._setup_garbage_collection(self.step_scheduler)
 
         # Build learning rate scheduler
         self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
@@ -1157,6 +1158,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # If QAT delayed fake-quant is configured, enable after threshold
                 self._enable_qat_if_delayed(self.step_scheduler.step)
                 train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                self._maybe_collect_garbage()
                 # Collect MoE load balance metrics (all ranks participate in all-reduce)
                 self._collect_moe_load_balance()
                 # log

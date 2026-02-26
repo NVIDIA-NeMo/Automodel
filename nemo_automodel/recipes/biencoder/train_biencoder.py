@@ -264,6 +264,7 @@ class TrainBiencoderRecipe(BaseRecipe):
             self._get_dp_group_size(),
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
         )
+        self._setup_garbage_collection(self.step_scheduler)
 
         self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
@@ -290,6 +291,7 @@ class TrainBiencoderRecipe(BaseRecipe):
             # The step scheduler yields a list of batches for gradient accumulation
             for batches in self.step_scheduler:
                 train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                self._maybe_collect_garbage()
                 self.log_train_metrics(train_log_data)
 
                 val_loss = None
