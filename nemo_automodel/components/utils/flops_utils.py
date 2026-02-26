@@ -508,6 +508,32 @@ def _nemotronh_mlp_layer_flops(config, gbs, seq_len):
     return 6 * gbs * seq_len * config.hidden_size * config.intermediate_size * 3
 
 
+def _nemotronh_moe_layer_flops(config, gbs, seq_len):
+    """Model FLOPs for a MoE layer in Nemotron V3 (hybrid Mamba/Attention/MoE).
+
+    Nemotron V3 uses relu2 (non-gated) for both routed and shared experts,
+    so each expert has 2 linear projections (up_proj + down_proj), not 3.
+
+    Accounts for:
+      1. Routed experts: only num_experts_per_tok activated per token.
+      2. Shared expert: always active for every token.
+      3. Router/gate: linear projection hidden_size -> n_routed_experts.
+    """
+    hs = config.hidden_size
+    num_tokens = gbs * seq_len
+
+    # Routed experts: num_experts_per_tok of n_routed_experts activated, each up_proj + down_proj
+    routed_expert_flops = 6 * num_tokens * config.num_experts_per_tok * hs * config.moe_intermediate_size * 2
+
+    # Shared expert: always active, up_proj + down_proj
+    shared_expert_flops = 6 * num_tokens * hs * config.moe_shared_expert_intermediate_size * 2
+
+    # Router/gate: hidden_size -> n_routed_experts
+    gate_flops = 6 * num_tokens * hs * config.n_routed_experts
+
+    return routed_expert_flops + shared_expert_flops + gate_flops
+
+
 def _non_mla_attn_layer_flops(config, gbs, seq_len):
     """Model FLOPs for attention layer"""
     hs = config.hidden_size
@@ -571,7 +597,7 @@ def _hybrid_model_flops(config, gbs, seq_len):
     hs = config.hidden_size
     vocab_size = config.vocab_size
 
-    num_attn_layers, num_mamba_layers, num_mlp_layers = 0, 0, 0
+    num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers = 0, 0, 0, 0
     for c in hybrid_override_pattern:
         if c == "M":
             num_mamba_layers += 1
@@ -579,11 +605,14 @@ def _hybrid_model_flops(config, gbs, seq_len):
             num_mlp_layers += 1
         elif c == "*":
             num_attn_layers += 1
+        elif c == "E":
+            num_moe_layers += 1
 
     return (
         num_attn_layers * _non_mla_attn_layer_flops(config, gbs, seq_len)
         + num_mamba_layers * _mamba_layer_flops(config, gbs, seq_len)
         + num_mlp_layers * _nemotronh_mlp_layer_flops(config, gbs, seq_len)
+        + num_moe_layers * _nemotronh_moe_layer_flops(config, gbs, seq_len)
         + 6 * gbs * seq_len * hs * vocab_size
     )
 

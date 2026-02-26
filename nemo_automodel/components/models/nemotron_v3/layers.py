@@ -610,8 +610,9 @@ class NemotronV3Block(nn.Module):
             self.mixer.init_weights(buffer_device=buffer_device, init_std=init_std)
 
             # Override gate weight with normal (not trunc_normal) for backward compat
-            nn.init.normal_(self.mixer.gate.weight, mean=0.0, std=init_std)
-            if self.mixer.gate.bias is not None:
+            if hasattr(self.mixer.gate, "weight"):
+                nn.init.normal_(self.mixer.gate.weight, mean=0.0, std=init_std)
+            if hasattr(self.mixer.gate, "bias") and self.mixer.gate.bias is not None:
                 nn.init.zeros_(self.mixer.gate.bias)
 
             # Zero expert biases
