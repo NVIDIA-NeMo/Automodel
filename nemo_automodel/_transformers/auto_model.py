@@ -18,6 +18,7 @@ import inspect
 import logging
 import os
 import types
+from pydoc import classify_class_attrs
 from typing import List, Optional, Union
 
 import torch
@@ -28,6 +29,7 @@ from transformers import (
     AutoModelForImageTextToText,
     AutoModelForSequenceClassification,
     AutoModelForTextToWaveform,
+    AutoModelForTokenClassification,
     PreTrainedModel,
 )
 from transformers.modeling_utils import _get_resolved_checkpoint_files
@@ -710,3 +712,9 @@ class NeMoAutoModelForTextToWaveform(_BaseNeMoAutoModelClass, AutoModelForTextTo
     """
 
     pass
+
+
+class NeMoAutoModelForTokenClassification(_BaseNeMoAutoModelClass, AutoModelForTokenClassification):
+    def __init__(self, config, *args, **kwargs):
+        print("NeMoAutoModelForTokenClassification __init__", config)
+        super().__init__(config, *args, **kwargs)
