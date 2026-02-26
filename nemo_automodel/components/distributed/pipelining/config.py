@@ -81,6 +81,8 @@ class PipelineConfig:
         loss_fn (Optional[Callable]): Loss function used for pipeline training.
             Required when pipeline is enabled. The function signature should be
             compatible with the model's output format.
+        pp_seq_len (Optional[int]): Sequence length hint for pipeline parallel
+            shape inference. If None, it will be inferred from the dataset config.
     """
 
     pp_schedule: Optional[str] = "1f1b"
@@ -96,6 +98,7 @@ class PipelineConfig:
     dtype: Optional[torch.dtype] = None
     scale_grads_in_schedule: bool = False
     loss_fn: Optional[Callable] = None
+    pp_seq_len: Optional[int] = None
 
     def __init__(
         self,
@@ -112,6 +115,7 @@ class PipelineConfig:
         dtype: Optional[torch.dtype] = None,
         scale_grads_in_schedule: bool = False,
         loss_fn: Optional[Callable] = None,
+        pp_seq_len: Optional[int] = None,
     ):
         self.pp_schedule = pp_schedule
         self.pp_schedule_csv = pp_schedule_csv
@@ -126,6 +130,7 @@ class PipelineConfig:
         self.dtype = dtype
         self.scale_grads_in_schedule = scale_grads_in_schedule
         self.loss_fn = loss_fn
+        self.pp_seq_len = pp_seq_len
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
@@ -143,4 +148,5 @@ class PipelineConfig:
             "dtype": self.dtype,
             "scale_grads_in_schedule": self.scale_grads_in_schedule,
             "loss_fn": self.loss_fn,
+            "pp_seq_len": self.pp_seq_len,
         }
