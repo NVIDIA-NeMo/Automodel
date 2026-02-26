@@ -48,7 +48,7 @@ class MoESplitExpertsStateDictMixin:
     @property
     def _is_gated_moe(self) -> bool:
         """Check if the MoE uses gated activation (e.g., SwiGLU) or non-gated (e.g., ReLU²)."""
-        from nemo_automodel.components.moe.layers import is_gated_activation
+        from nemo_automodel.components.moe.experts import is_gated_activation
 
         return is_gated_activation(self.moe_config.expert_activation)
 
