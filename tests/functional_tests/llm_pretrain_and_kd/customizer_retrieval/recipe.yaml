@@ -53,15 +53,6 @@ dataloader:
   shuffle: false
   num_workers: 0
 
-
-# optimizer:
-#   # Use AdamW (decoupled weight decay) to better match Megatron/NeMo optimizer semantics.
-#   _target_: torch.optim.AdamW
-#   betas: [0.9, 0.98]
-#   eps: 1e-5
-#   lr: 1.0e-5
-#   weight_decay: 0.1
-
 optimizer:
   _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
   # lr: 5.0e-6
@@ -87,7 +78,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: /workspace/output/biencoder_inline/checkpoints
   model_save_format: safetensors
-  save_consolidated: false
+  save_consolidated: true
 
 distributed:
   strategy: fsdp2
