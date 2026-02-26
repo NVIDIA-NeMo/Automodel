@@ -456,6 +456,8 @@ class ConfigNode:
         for k, v in self.__dict__.items():
             if k in ("_target_", "raise_on_missing_attr", "_raw_config", "_original_strings"):
                 continue
+            if k in kwargs:
+                continue  # will be overridden — skip expensive instantiation
             if k.endswith("_fn"):
                 config_kwargs[k] = v
             else:
