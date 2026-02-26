@@ -232,6 +232,10 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
     ``adapter_config.json`` is compatible with vLLM, TensorRT-LLM and the
     Hugging Face PEFT library.
 
+    For MoE expert LoRA (GroupedExpertsLoRA / GroupedExpertsDeepEPLoRA), the
+    grouped 3-D adapter parameters are expanded to per-expert HF projection
+    names (e.g. ``model.layers.0.mlp.experts.0.gate_proj``).
+
     Note:
         When torch.compile is used, module names get prefixed with `_orig_mod.`.
         This function strips those prefixes to get the original module names.
@@ -247,6 +251,8 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
+
+    _MOE_LORA_SUFFIXES = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
 
     final_target_modules = set()
     for name, _ in model.named_modules():
@@ -265,6 +271,32 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
                     final_target_modules.add(expanded)
             else:
                 final_target_modules.add(target_name)
+
+    # Detect MoE expert LoRA: adapter weights stored as nn.Parameter (not
+    # nn.Module) so they don't appear in named_modules(). Scan parameters
+    # and expand to per-expert HF projection names.
+    seen_expert_paths: set[str] = set()
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        for lora_suffix in _MOE_LORA_SUFFIXES:
+            if name.endswith(f".{lora_suffix}"):
+                expert_path = name[: -len(f".{lora_suffix}")]
+                if expert_path.startswith("_orig_mod."):
+                    expert_path = expert_path[len("_orig_mod."):]
+                if expert_path in seen_expert_paths:
+                    break
+                seen_expert_paths.add(expert_path)
+
+                n_experts = param.shape[0]
+                for expert_id in range(n_experts):
+                    if "gate_and_up" in lora_suffix:
+                        final_target_modules.add(f"{expert_path}.{expert_id}.gate_proj")
+                        final_target_modules.add(f"{expert_path}.{expert_id}.up_proj")
+                    else:
+                        final_target_modules.add(f"{expert_path}.{expert_id}.down_proj")
+                break
+
     return sorted(list(final_target_modules))
 
 
