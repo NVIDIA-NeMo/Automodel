@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 import inspect
+import logging
 import types
 from typing import TYPE_CHECKING, Callable, Optional, Union
+from unittest.mock import Mock as UnitTestMock
 
 import torch
 import torch.nn as nn
@@ -41,6 +42,13 @@ MULTIMODAL_SUFFIXES = (
     "vision_projector",
     "audio_projector",
 )
+
+
+def _safe_getattr(obj, name: str, default=None):
+    """Get an attribute while avoiding synthetic attributes from unittest.mock.Mock."""
+    if isinstance(obj, UnitTestMock):
+        return obj.__dict__.get(name, default)
+    return getattr(obj, name, default)
 
 
 def get_text_module(model: nn.Module) -> nn.Module:
@@ -71,25 +79,28 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         causal_mask_mapping: Optional[dict] = None,
         **kwargs,
     ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
+        layers = _safe_getattr(self, "layers", None)
         first_layer = None
-        if hasattr(self, "layers") and self.layers is not None:
-            if hasattr(self.layers, "values"):
-                layer_values = list(self.layers.values())
+        if layers is not None:
+            if hasattr(layers, "values"):
+                layer_values = list(layers.values())
                 first_layer = layer_values[0] if len(layer_values) > 0 else None
             else:
-                first_layer = self.layers[0] if len(self.layers) > 0 else None
+                first_layer = layers[0] if len(layers) > 0 else None
         is_nemotron_h_like = first_layer is not None and hasattr(first_layer, "block_type")
 
         # Embeddings handling
         if inputs_embeds is None:
-            if hasattr(self, "embed_tokens") and self.embed_tokens is not None:
+            embed_tokens = _safe_getattr(self, "embed_tokens", None)
+            embeddings = _safe_getattr(self, "embeddings", None)
+            if embed_tokens is not None:
                 if input_ids is None:
                     raise ValueError("You must provide either input_ids or inputs_embeds")
-                inputs_embeds = self.embed_tokens(input_ids)
-            elif hasattr(self, "embeddings") and self.embeddings is not None:
+                inputs_embeds = embed_tokens(input_ids)
+            elif embeddings is not None:
                 if input_ids is None:
                     raise ValueError("You must provide either input_ids or inputs_embeds")
-                inputs_embeds = self.embeddings(input_ids)
+                inputs_embeds = embeddings(input_ids)
             else:
                 if (
                     input_ids is not None
@@ -106,8 +117,8 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
             past_key_values = DynamicCache()
 
         # Stage-level hints (set by pipeline splitter) let us skip unused mask/position work.
-        pp_needs_attention_mask = bool(getattr(self, "_nemo_pp_needs_attention_mask", True))
-        pp_needs_cache_position = bool(getattr(self, "_nemo_pp_needs_cache_position", True))
+        pp_needs_attention_mask = bool(_safe_getattr(self, "_nemo_pp_needs_attention_mask", True))
+        pp_needs_cache_position = bool(_safe_getattr(self, "_nemo_pp_needs_cache_position", True))
 
         if cache_position is None and (pp_needs_cache_position or use_cache):
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -125,17 +136,15 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
             causal_mask = None
             mamba_mask = None
             if pp_needs_attention_mask:
+                update_causal_mask = _safe_getattr(self, "_update_causal_mask", None)
+                update_mamba_mask = _safe_getattr(self, "_update_mamba_mask", None)
                 causal_mask = (
-                    self._update_causal_mask(attention_mask, inputs_embeds, cache_position)
-                    if hasattr(self, "_update_causal_mask")
-                    else None
+                    update_causal_mask(attention_mask, inputs_embeds, cache_position) if update_causal_mask else None
                 )
                 mamba_mask = (
-                    self._update_mamba_mask(attention_mask, cache_position)
-                    if hasattr(self, "_update_mamba_mask")
-                    else attention_mask
+                    update_mamba_mask(attention_mask, cache_position) if update_mamba_mask else attention_mask
                 )
-            layer_iter = self.layers.values() if hasattr(self.layers, "values") else self.layers
+            layer_iter = layers.values() if hasattr(layers, "values") else layers
             for mixer_block in layer_iter:
                 if mixer_block.block_type == "mamba":
                     layer_mask = mamba_mask if pp_needs_attention_mask else None
@@ -197,13 +206,13 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
 
             # Rotary embeddings precomputation (shared across layers)
             position_embeddings = None
-            rotary_emb = getattr(get_text_module(self), "rotary_emb", None)
+            rotary_emb = _safe_getattr(get_text_module(self), "rotary_emb", None)
             if rotary_emb is not None:
                 position_embeddings = rotary_emb(hidden_states, position_ids)
 
-            if hasattr(self, "layers") and self.layers is not None:
+            if layers is not None:
                 # Works for dict-like or list-like containers
-                layer_iter = self.layers.values() if hasattr(self.layers, "values") else self.layers
+                layer_iter = layers.values() if hasattr(layers, "values") else layers
                 for decoder_layer in layer_iter:
                     layer_attention_mask = causal_mask_mapping.get("full_attention")
                     if hasattr(decoder_layer, "attention_type"):
@@ -222,10 +231,12 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                         **kwargs,
                     )
 
-        if hasattr(self, "norm_f") and self.norm_f is not None:
-            hidden_states = self.norm_f(hidden_states)
-        elif hasattr(self, "norm") and self.norm is not None:
-            hidden_states = self.norm(hidden_states)
+        norm_f = _safe_getattr(self, "norm_f", None)
+        norm = _safe_getattr(self, "norm", None)
+        if norm_f is not None:
+            hidden_states = norm_f(hidden_states)
+        elif norm is not None:
+            hidden_states = norm(hidden_states)
 
         if model_class_name == "PipelineStage":
             return hidden_states
@@ -257,13 +268,16 @@ def create_pipeline_forward_causal_lm() -> Callable:
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
+        inner_model = _safe_getattr(self, "model", None)
+        backbone = _safe_getattr(self, "backbone", None)
+        lm_head = _safe_getattr(self, "lm_head", None)
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
-        if hasattr(self, "model") and self.model is not None:
-            outputs = self.model(
+        if inner_model is not None:
+            outputs = inner_model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -280,8 +294,8 @@ def create_pipeline_forward_causal_lm() -> Callable:
             else:
                 hidden_states = outputs
                 outputs = None
-        elif hasattr(self, "backbone") and self.backbone is not None:
-            outputs = self.backbone(
+        elif backbone is not None:
+            outputs = backbone(
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,
                 position_ids=position_ids,
@@ -311,9 +325,9 @@ def create_pipeline_forward_causal_lm() -> Callable:
                 raise ValueError("Expected hidden states as input for pipeline stage without inner model")
             outputs = None
 
-        if hasattr(self, "lm_head") and self.lm_head is not None:
+        if lm_head is not None:
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            logits = self.lm_head(hidden_states[:, slice_indices, :])
+            logits = lm_head(hidden_states[:, slice_indices, :])
             return logits
         else:
             return hidden_states

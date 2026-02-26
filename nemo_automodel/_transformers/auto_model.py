@@ -43,6 +43,7 @@ from transformers import (  # noqa: E402
     AutoModelForTextToWaveform,
     PreTrainedModel,
 )
+
 try:  # noqa: E402
     from transformers import AutoModelForMultimodalLM  # noqa: E402
 except ImportError:  # transformers<4.58

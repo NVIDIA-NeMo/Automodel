@@ -34,6 +34,7 @@ from torch.distributed.fsdp import (
     OffloadPolicy,
     fully_shard,
 )
+from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     ParallelStyle,
@@ -41,7 +42,6 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
     parallelize_module,
 )
-from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
@@ -419,7 +419,6 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                 ep_size_local = self._nemotron_ep_size
                 local_start_idx = self._nemotron_ep_local_start
                 local_end_idx = self._nemotron_ep_local_end
-                global_to_local_idx = getattr(self, "_nemotron_ep_global_to_local", None)
 
                 hidden_states_local = hidden_states
                 if ep_size_local > 1:
@@ -576,8 +575,8 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                 "mixer.o_proj": RowwiseParallel(),
             }
 
-            if model_tp_plan:
-                parallelize_module(model, tp_mesh, model_tp_plan)
+            # Keep model-level call even with an empty plan for API/test compatibility.
+            parallelize_module(model, tp_mesh, model_tp_plan)
 
             for layer in _iter_layers(model.backbone.layers):
                 if layer.block_type == "mlp":

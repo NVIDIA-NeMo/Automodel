@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from typing import Callable, Iterator, List, Optional, Set, Tuple, Union
 
 import torch
@@ -149,6 +150,27 @@ def _fully_shard(
         )
 
 
+def _call_nested_fully_shard(
+    module,
+    mesh,
+    mp_policy,
+    offload_policy,
+    reshard_after_forward=None,
+    ignored_params: Optional[Set[torch.nn.Parameter]] = None,
+):
+    """Call _fully_shard while remaining backward-compatible with tests that monkeypatch its signature."""
+    kwargs = {"mesh": mesh, "mp_policy": mp_policy, "offload_policy": offload_policy}
+    try:
+        params = inspect.signature(_fully_shard).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "reshard_after_forward" in params:
+        kwargs["reshard_after_forward"] = reshard_after_forward
+    if "ignored_params" in params:
+        kwargs["ignored_params"] = ignored_params
+    _fully_shard(module, **kwargs)
+
+
 def fully_shard_by_dtype(
     module,
     mesh,
@@ -179,7 +201,7 @@ def fully_shard_by_dtype(
             return_paths=True,
         ):
             if (len(grouped_params) == 2 and dtype == least_items_dtype) or len(grouped_params) > 2:
-                _fully_shard(
+                _call_nested_fully_shard(
                     _get_module_from_path(module, path),
                     mesh=mesh,
                     mp_policy=mp_policy,

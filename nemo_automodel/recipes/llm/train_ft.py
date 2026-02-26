@@ -834,6 +834,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg: Configuration dictionary/object for training.
         """
         self.cfg = cfg
+        # Safe defaults for PP runtime key filtering before setup() populates model_parts.
+        self._pp_rank_needs_attention_mask = True
+        self._pp_rank_needs_cache_position = True
+        self._pp_rank_needs_causal_mask_mapping = True
 
     # ------------------ build phase ------------------
     def setup(self):
