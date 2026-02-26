@@ -28,6 +28,7 @@ from nemo_automodel.components.distributed.mesh import (
 )
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.moe.config import MoEParallelizerConfig
+from nemo_automodel.shared.utils import dtype_from_str
 
 _PARALLELISM_DEFAULTS: Dict[str, Any] = {
     "tp_size": 1,
@@ -114,6 +115,18 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     strategy_config = strategy_cls(**strategy_kwargs)
 
     pipeline_config = PipelineConfig(**pipeline_dict) if pipeline_dict is not None else None
+
+    # Instantiate nested _target_ configs (e.g. mp_policy) before constructing MoEParallelizerConfig
+    if moe_dict is not None and "mp_policy" in moe_dict:
+        mp_raw = moe_dict["mp_policy"]
+        if isinstance(mp_raw, dict) and callable(mp_raw.get("_target_")):
+            mp_raw = mp_raw.copy()
+            target = mp_raw.pop("_target_")
+            for key in ("param_dtype", "reduce_dtype", "output_dtype"):
+                if key in mp_raw and isinstance(mp_raw[key], str):
+                    mp_raw[key] = dtype_from_str(mp_raw[key])
+            moe_dict["mp_policy"] = target(**mp_raw)
+
     moe_config = MoEParallelizerConfig(**(moe_dict or {})) if ep_size > 1 else None
 
     # Full cross-field validation is deferred to MeshContext.__post_init__
