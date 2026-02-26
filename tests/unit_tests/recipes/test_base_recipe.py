@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -271,6 +272,31 @@ def test_load_checkpoint_fresh_start_empty_dir(tmp_path):
 
     # Should succeed - no checkpoints exist
     recipe_inst.load_checkpoint(restore_from=None)
+
+
+def test_setup_and_maybe_collect_garbage(tmp_path, monkeypatch):
+    recipe_inst = _ToyRecipe(tmp_path)
+    recipe_inst.step_scheduler = SimpleNamespace(gc_every_steps=2, step=1)
+
+    class _GC:
+        def __init__(self):
+            self.run_called = []
+
+        def run(self, step_count):
+            self.run_called.append(step_count)
+
+    gc_obj = _GC()
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.GarbageCollection", lambda gc_every_steps: gc_obj)
+
+    recipe_inst._setup_garbage_collection()
+    assert recipe_inst.garbage_collector is gc_obj
+
+    recipe_inst._maybe_collect_garbage()
+    assert gc_obj.run_called == [1]
+
+    recipe_inst.step_scheduler.step = 2
+    recipe_inst._maybe_collect_garbage()
+    assert gc_obj.run_called == [1, 2]
 
 
 def test_load_checkpoint_auto_detect_restores_latest(tmp_path):

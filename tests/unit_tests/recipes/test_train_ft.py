@@ -575,6 +575,43 @@ def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
     ]
 
 
+def test_run_train_validation_loop_calls_gc_hook_once_per_step():
+    class _OneStepScheduler:
+        def __init__(self):
+            self.step = 0
+            self.epoch = 0
+            self.epochs = [0]
+            self.is_val_step = False
+            self.is_ckpt_step = False
+
+        def set_epoch(self, epoch):
+            self.epoch = epoch
+
+        def __iter__(self):
+            yield ["dummy-batch"]
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    trainer.model_parts = [MagicMock()]
+    trainer.step_scheduler = _OneStepScheduler()
+    trainer.max_grad_norm = 1.0
+    trainer._enable_qat_if_delayed = MagicMock()
+    trainer._run_train_optim_step = MagicMock(return_value=SimpleNamespace(metrics={"loss": 1.0}))
+    trainer._maybe_collect_garbage = MagicMock()
+    trainer._collect_moe_load_balance = MagicMock()
+    trainer.log_train_metrics = MagicMock()
+    trainer.log_val_metrics = MagicMock()
+    trainer.save_checkpoint = MagicMock()
+    trainer.val_dataloaders = {}
+    trainer.metric_logger_train = SimpleNamespace(close=MagicMock())
+    trainer.metric_logger_valid = {}
+    trainer.checkpointer = SimpleNamespace(close=MagicMock())
+    trainer.best_metric_key = "default"
+
+    trainer.run_train_validation_loop()
+
+    trainer._maybe_collect_garbage.assert_called_once()
+
+
 def test_compute_trust_remote_code_prefers_cfg_flag():
     cfg_model = ConfigNode({"trust_remote_code": False, "pretrained_model_name_or_path": "ignored"})
 

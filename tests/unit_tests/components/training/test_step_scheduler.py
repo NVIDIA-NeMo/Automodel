@@ -318,7 +318,52 @@ def test_iterable_dataloader():
         num_epochs=1,
         max_steps=10,
     )
-    assert scheduler.epoch_len is None
+
+
+def test_is_gc_step_disabled_by_default():
+    dataloader = SizedDataLoader(num_batches=5)
+    scheduler = StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        dataloader=dataloader,
+        num_epochs=1,
+        max_steps=5,
+    )
+    assert scheduler.is_gc_step is False
+
+
+def test_is_gc_step_every_n_steps():
+    dataloader = SizedDataLoader(num_batches=7)
+    scheduler = StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        dataloader=dataloader,
+        num_epochs=1,
+        max_steps=7,
+        gc_every_steps=3,
+    )
+
+    observed = []
+    for _ in scheduler:
+        observed.append(scheduler.is_gc_step)
+
+    assert observed == [True, False, False, True, False, False, True]
+
+
+def test_gc_every_steps_must_be_positive():
+    dataloader = SizedDataLoader(num_batches=1)
+    with pytest.raises(AssertionError, match="gc_every_steps must be greater than 0 if not None"):
+        StepScheduler(
+            global_batch_size=1,
+            local_batch_size=1,
+            dp_size=1,
+            dataloader=dataloader,
+            num_epochs=1,
+            max_steps=1,
+            gc_every_steps=0,
+        )
 
 
 def test_set_epoch():

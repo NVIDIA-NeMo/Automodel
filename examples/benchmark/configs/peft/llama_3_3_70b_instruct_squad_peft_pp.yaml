@@ -11,6 +11,7 @@ benchmark:
   nsys_ranks: []    # e.g., [0] to profile rank 0
 
 step_scheduler:
+  gc_every_steps: 10
   global_batch_size: 32
   local_batch_size: 2
   ckpt_every_steps: 50

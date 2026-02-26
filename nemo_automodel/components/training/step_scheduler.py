@@ -59,6 +59,7 @@ class StepScheduler(Stateful):
         ckpt_every_steps: Optional[int] = None,
         val_every_steps: Optional[int] = None,
         log_remote_every_steps: int = 1,
+        gc_every_steps: Optional[int] = None,
         start_step: int = 0,
         start_epoch: int = 0,
         num_epochs: Optional[int] = None,
@@ -75,6 +76,7 @@ class StepScheduler(Stateful):
             ckpt_every_steps (Optional[int]): Frequency of checkpoint steps.
             val_every_steps (Optional[int]): Number of training steps between validation.
             log_remote_every_steps (int): Frequency of remote logging (e.g., WandB, MLflow). Default: 1 (every step).
+            gc_every_steps (Optional[int]): Frequency of manual garbage collection steps.
             start_step (int): Initial global step. Used when resuming from checkpoint. Default: 0.
             start_epoch (int): Initial epoch. Used when resuming from checkpoint. Default: 0.
             num_epochs (Optional[int]): Total number of epochs. Default: None or calculated from max_steps if num_epochs is None or 10 if max_steps and num_epochs are both None.
@@ -115,6 +117,8 @@ class StepScheduler(Stateful):
         assert val_every_steps is None or val_every_steps > 0, "val_every_steps must be greater than 0 if not None"
         self.log_remote_every_steps = log_remote_every_steps
         assert log_remote_every_steps > 0, "log_remote_every_steps must be greater than 0"
+        self.gc_every_steps = gc_every_steps
+        assert gc_every_steps is None or gc_every_steps > 0, "gc_every_steps must be greater than 0 if not None"
         if max_steps is None:
             assert self.epoch_len is not None, "epoch_len must be provided if max_steps is not provided"
             max_steps = _calculate_max_steps(self.num_epochs, self.epoch_len)
@@ -194,6 +198,13 @@ class StepScheduler(Stateful):
         """
         is_ckpt_step = (self.step % self.ckpt_every_steps) == self.ckpt_every_steps - 1
         return is_ckpt_step or self.is_last_batch or self.is_last_step or self.sigterm_received
+
+    @property
+    def is_gc_step(self):
+        """
+        Returns whether this step needs to run manual garbage collection.
+        """
+        return self.gc_every_steps is not None and self.step % self.gc_every_steps == 0
 
     @property
     def is_last_step(self):

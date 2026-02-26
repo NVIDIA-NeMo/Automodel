@@ -138,6 +138,7 @@ def mock_recipe(mock_config):
         recipe._bench_json_output_path = None
         recipe._wandb_enabled = False
         recipe.wandb_run = None
+        recipe.step_scheduler = SimpleNamespace(step=0, gc_every_steps=None)
         recipe._dp_allreduce = MagicMock(side_effect=lambda x, include_cp=False: x)
         recipe.device_mesh = None
         return recipe
@@ -390,6 +391,43 @@ class TestBenchmarkingRecipeRunBenchmark:
 
             # Should be called 30 times (once per iteration)
             assert mock_recipe.optimizer[0].step.call_count == 30
+
+    def test_run_benchmark_calls_gc_hook_per_iteration(self, mock_recipe):
+        mock_recipe._get_dp_group_size = MagicMock(return_value=8)
+        mock_recipe._maybe_collect_garbage = MagicMock()
+
+        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
+            if loss_buffer is not None:
+                loss_buffer.append(torch.tensor(0.5))
+
+        mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
+        mock_recipe.timers._get_global_min_max_time = MagicMock(
+            return_value={"iteration_warmup": (0.0, 1.0), "iteration": (0.0, 1.0)}
+        )
+        mock_timer = MagicMock()
+        mock_timer.active_time.return_value = 1.0
+        mock_recipe.timers._timers = {
+            "setup": mock_timer,
+            "iteration": mock_timer,
+            "iteration_warmup": mock_timer,
+        }
+        mock_recipe.dataloader.__iter__ = MagicMock(
+            return_value=iter(
+                [
+                    {
+                        "input_ids": torch.tensor([[1, 2, 3]]),
+                        "labels": torch.tensor([[1, 2, 3]]),
+                        "position_ids": torch.tensor([[0, 1, 2]]),
+                    }
+                ]
+                * 240
+            )
+        )
+
+        with patch("torch.distributed.barrier"):
+            mock_recipe.run_benchmark()
+
+        assert mock_recipe._maybe_collect_garbage.call_count == 30
 
 
 @pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
