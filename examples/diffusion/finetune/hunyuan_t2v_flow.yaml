@@ -1,0 +1,77 @@
+model:
+  pretrained_model_name_or_path: "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v"
+  mode: "finetune"
+  cache_dir: null
+  attention_backend: "_flash_3_hub"
+
+optim:
+  learning_rate: 5e-6
+
+  optimizer:
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 0
+  min_lr: 1e-6
+
+fsdp:
+  dp_size: 8
+  dp_replicate_size: 1
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  cpu_offload: false
+  activation_checkpointing: true
+  use_hf_tp_plan: false
+
+flow_matching:
+  adapter_type: "hunyuan"
+  adapter_kwargs:
+    use_condition_latents: true
+    default_image_embed_shape: [729, 1152]
+  timestep_sampling: "logit_normal"
+  logit_mean: 0.0
+  logit_std: 1.0
+  flow_shift: 3.0
+  mix_uniform_ratio: 0.1
+  sigma_min: 0.0
+  sigma_max: 1.0
+  num_train_timesteps: 1000
+  i2v_prob: 0.3
+  use_loss_weighting: false
+  log_interval: 1000
+  summary_log_interval: 100
+
+step_scheduler:
+  num_epochs: 30
+  local_batch_size: 1
+  global_batch_size: 8
+  ckpt_every_steps: 1000
+  log_every: 10
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_dataloader
+    meta_folder: PATH_TO_YOUR_DATA
+    num_workers: 2
+    device: cpu
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
+  model_save_format: torch_save
+  save_consolidated: false
+  restore_from: null
+
+wandb:
+  project: hunyuan-video-training
+  mode: online
+  name: 720p_t2v_run
+
+dist_env:
+  backend: "nccl"
+  init_method: "env://"
+
+seed: 42

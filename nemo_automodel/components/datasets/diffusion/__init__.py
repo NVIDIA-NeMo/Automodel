@@ -24,6 +24,7 @@ _LAZY_ATTRS = {
     "collate_fn_flux": (".collate_fns", "collate_fn_flux"),
     "build_flux_multiresolution_dataloader": (".collate_fns", "build_flux_multiresolution_dataloader"),
     "build_mock_dataloader": (".mock_dataloader", "build_mock_dataloader"),
+    "build_dataloader": (".meta_files_dataset", "build_dataloader"),
 }
 
 __all__ = sorted(_LAZY_ATTRS.keys())
