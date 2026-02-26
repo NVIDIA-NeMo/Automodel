@@ -18,10 +18,15 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
+# Propagate -s flag if PYTEST_PROPAGATE_S is set
+PYTEST_S_FLAG=""
+if [ "${PYTEST_PROPAGATE_S:-}" = "1" ]; then
+    PYTEST_S_FLAG="-s"
+fi
 
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run  --master-port=29504 \
 --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace  \
--m pytest tests/functional_tests/checkpoint/test_peft_vlm.py \
+-m pytest $PYTEST_S_FLAG tests/functional_tests/checkpoint/test_peft_vlm.py \
   --config examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml \
   --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_gemma3_2l/ \
   --step_scheduler.max_steps 10 \
@@ -36,7 +41,6 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run  --master-port=29504 \
   --checkpoint.enabled true \
   --checkpoint.checkpoint_dir checkpoints/ \
   --checkpoint.model_save_format safetensors \
-  --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
   --distributed.dp_size none \
   --distributed.tp_size 1 \
   --distributed.cp_size 1 \

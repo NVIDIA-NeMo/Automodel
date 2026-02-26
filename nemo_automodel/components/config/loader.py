@@ -340,6 +340,8 @@ class ConfigNode:
         # Finetune scripts can modify the config in place, so we need to keep a copy of the
         # original config for checkpointing.
         self._raw_config = deepcopy(d)
+        # Store original string values before resolution (for _fn and _target_ keys)
+        self._original_strings = {}
         # Update instead of overwrite, so other instance attributes survive.
         self.__dict__.update({k: self._wrap(k, v) for k, v in d.items()})
         self.raise_on_missing_attr = raise_on_missing_attr
@@ -368,8 +370,12 @@ class ConfigNode:
         elif isinstance(v, list):
             return [self._wrap("", i) for i in v]
         elif k.endswith("_fn"):
+            if isinstance(v, str):
+                self._original_strings[k] = v
             return _resolve_target(v)
         elif k == "_target_":
+            if isinstance(v, str):
+                self._original_strings[k] = v
             return _resolve_target(v)
         else:
             # Support `${oc.env:VAR}` (with optional default) in YAML scalars.
@@ -448,7 +454,7 @@ class ConfigNode:
         # Prepare kwargs from config
         config_kwargs = {}
         for k, v in self.__dict__.items():
-            if k in ("_target_", "raise_on_missing_attr", "_raw_config"):
+            if k in ("_target_", "raise_on_missing_attr", "_raw_config", "_original_strings"):
                 continue
             if k.endswith("_fn"):
                 config_kwargs[k] = v
@@ -460,6 +466,8 @@ class ConfigNode:
         # Resolve env interpolations at the last moment, so printing/saving the config
         # does not leak secrets (e.g., `${oc.env:HF_TOKEN}` remains in YAML output).
         config_kwargs = resolve_yaml_env_vars(config_kwargs)
+
+        import traceback
 
         try:
             return func(*args, **config_kwargs)
@@ -480,7 +488,8 @@ class ConfigNode:
                 ),
                 file=sys.stderr,
             )
-            raise
+            print(traceback.format_exc())
+            raise e
 
     def _instantiate_value(self, v):
         """
@@ -511,7 +520,9 @@ class ConfigNode:
             dict: A dictionary representation of the configuration node.
         """
         return {
-            k: self._unwrap(v) for k, v in self.__dict__.items() if k not in ("raise_on_missing_attr", "_raw_config")
+            k: self._unwrap(v)
+            for k, v in self.__dict__.items()
+            if k not in ("raise_on_missing_attr", "_raw_config", "_original_strings")
         }
 
     def _to_dotted_path(self, obj):
@@ -584,6 +595,10 @@ class ConfigNode:
             # Dicts (shouldn't normally appear because we wrap into ConfigNode, but handle defensively)
             if isinstance(value, dict):
                 return {k: _convert(k, v) for k, v in value.items()}
+            # Prefer original YAML string for _target_ / *_fn when use_orig_values is set
+            orig_strings = getattr(self, "_original_strings", {})
+            if use_orig_values and key in orig_strings:
+                return orig_strings[key]
             # Convert targets/functions to dotted path strings
             is_target_like = key == "_target_" or (isinstance(key, str) and key.endswith("_fn")) or key == "collate_fn"
             try:
@@ -601,8 +616,12 @@ class ConfigNode:
             # Primitive – already typed via translate_value/_wrap
             return value
 
-        # Walk live attributes to preserve translated scalars
-        out = {k: _convert(k, v) for k, v in self.__dict__.items() if k not in ("raise_on_missing_attr", "_raw_config")}
+        # Walk live attributes; exclude internal keys so they never appear in YAML output
+        out = {
+            k: _convert(k, v)
+            for k, v in self.__dict__.items()
+            if k not in ("raise_on_missing_attr", "_raw_config", "_original_strings")
+        }
         if resolve_env:
             out = resolve_yaml_env_vars(out)
         if redact_sensitive:
@@ -625,6 +644,28 @@ class ConfigNode:
             return [self._unwrap(i) for i in v]
         else:
             return v
+
+    def get_as_string(self, key, default=None):
+        """
+        Get the string representation of a configuration value.
+
+        If the value is a function or class (resolved from an import path),
+        returns the original import path string. Otherwise returns the value
+        as a string.
+
+        Args:
+            key (str): The key to look up.
+
+        Returns:
+            str: The string representation of the value, or None if key not found.
+        """
+        # Check if we stored the original string (for _fn and _target_ keys)
+        if key in self._original_strings:
+            return self._original_strings[key]
+        elif default is not None:
+            return default
+        else:
+            raise KeyError(f"Key {key} not found")
 
     def get(self, key, default=None):
         """
@@ -676,45 +717,54 @@ class ConfigNode:
         # wrap the final leaf value
         node.__dict__[parts[-1]] = node._wrap(parts[-1], value)
 
-    def __repr__(self, level=0):
+    def __repr__(self, level: int = 0, *, use_orig_values: bool = True):
         """
         Return a string representation of the configuration node with indentation.
 
         Args:
             level (int): The current indentation level.
+            use_orig_values (bool): If True, prefer original placeholder strings (e.g. `${VAR}`)
+                stored on `_OrigValueStr` values for safe logging. If False, show resolved values.
 
         Returns:
             str: An indented string representation of the configuration.
         """
         indent = "  " * level
         lines = [
-            f"{indent}{key}: {self._repr_value(value, level)}"
+            f"{indent}{key}: {self._repr_value(value, level, use_orig_values=use_orig_values)}"
             for key, value in self.__dict__.items()
-            if key not in ("raise_on_missing_attr", "_raw_config")
+            if key not in ("raise_on_missing_attr", "_raw_config", "_original_strings")
         ]
         return "\n".join(lines) + f"\n{indent}"
 
-    def _repr_value(self, value, level):
+    def _repr_value(self, value, level, *, use_orig_values: bool = True):
         """
         Format a configuration value for the string representation.
 
         Args:
             value: The configuration value.
             level (int): The indentation level.
+            use_orig_values (bool): If True, prefer original placeholder strings stored on
+                `_OrigValueStr` values for safe logging. If False, show resolved values.
 
         Returns:
             str: A formatted string representation of the value.
         """
         if isinstance(value, ConfigNode):
-            return value.__repr__(level + 1)
+            return value.__repr__(level + 1, use_orig_values=use_orig_values)
         elif isinstance(value, list):
             return (
                 "[\n"
-                + "\n".join([f"{'  ' * (level + 1)}{self._repr_value(i, level + 1)}" for i in value])
+                + "\n".join(
+                    [
+                        f"{'  ' * (level + 1)}{self._repr_value(i, level + 1, use_orig_values=use_orig_values)}"
+                        for i in value
+                    ]
+                )
                 + f"\n{'  ' * level}]"
             )
         else:
-            if hasattr(value, "_orig_value"):
+            if use_orig_values and hasattr(value, "_orig_value"):
                 return repr(getattr(value, "_orig_value"))
             return repr(value)
 
@@ -725,7 +775,9 @@ class ConfigNode:
         Returns:
             str: The string representation.
         """
-        return self.__repr__(level=0)
+        # Keep printing safe by default: preserve original placeholders (e.g. `${VAR}`) for any
+        # values that were resolved from environment variables.
+        return self.__repr__(level=0, use_orig_values=True)
 
     def __contains__(self, key):
         """
@@ -746,6 +798,26 @@ class ConfigNode:
                 else:
                     return False
         return current != self
+
+
+def config_to_yaml_str(cfg_obj, *, use_orig_values: bool = True):
+    """
+    Convert a config object to a YAML string suitable for logging/printing.
+
+    Uses original placeholder strings (e.g. `${VAR}`) and original _target_/*_fn
+    strings when use_orig_values is True; never includes internal keys like
+    _original_strings. If cfg_obj is a ConfigNode, uses to_yaml_dict(); otherwise
+    falls back to to_dict() or a plain dict.
+    """
+    if cfg_obj is None:
+        return ""
+    if hasattr(cfg_obj, "to_yaml_dict"):
+        cfg_dict = cfg_obj.to_yaml_dict(use_orig_values=use_orig_values)
+    elif hasattr(cfg_obj, "to_dict"):
+        cfg_dict = cfg_obj.to_dict()
+    else:
+        cfg_dict = dict(cfg_obj)
+    return yaml.safe_dump(cfg_dict, sort_keys=False, default_flow_style=False).strip()
 
 
 def load_yaml_config(path):

@@ -15,8 +15,12 @@
 import os
 
 import torch
+from torch import nn
 
-from nemo_automodel.components.checkpoint.addons import _maybe_save_custom_model_code
+from nemo_automodel.components.checkpoint.addons import (
+    _extract_target_modules,
+    _maybe_save_custom_model_code,
+)
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 
 
@@ -45,9 +49,9 @@ def test_maybe_save_custom_model_code_copies_py_files_and_structure(tmp_path):
     # Act
     _maybe_save_custom_model_code(str(src_root), str(dst_root))
 
-    # Assert: .py files copied with preserved structure; non-.py ignored
+    # Assert: .py files copied with preserved structure; non-.py and __init__.py ignored
     assert (dst_root / "main.py").exists()
-    assert (dst_root / "pkg" / "__init__.py").exists()
+    assert not (dst_root / "pkg" / "__init__.py").exists()
     assert (dst_root / "pkg" / "subpkg" / "module.py").exists()
     assert not (dst_root / "pkg" / "readme.txt").exists()
 
@@ -96,5 +100,117 @@ def test_model_state_disables_tied_embeddings_for_non_tied_models():
 
     state_dict = state.state_dict()
     assert "lm_head.weight" in state_dict
+
+
+# _extract_target_modules tests
+def _make_model_with_named_modules(module_names):
+    """Build a dummy model whose ``named_modules`` yields the given names.
+
+    We simulate LoRA sub-modules by adding ``nn.Identity`` leaves under
+    the requested paths.  ``_extract_target_modules`` looks for any
+    module whose name contains "lora", so we add leaves like
+    ``<target>.lora_A``.
+    """
+    root = nn.Module()
+    for name in module_names:
+        parts = name.split(".")
+        parent = root
+        for part in parts[:-1]:
+            if not hasattr(parent, part):
+                setattr(parent, part, nn.Module())
+            parent = getattr(parent, part)
+        setattr(parent, parts[-1], nn.Identity())
+    return root
+
+
+class TestExtractTargetModules:
+    """Tests for _extract_target_modules with combined-projection expansion."""
+
+    def test_simple_non_combined_modules(self):
+        """Non-combined module names pass through unchanged."""
+        model = _make_model_with_named_modules(
+            [
+                "model.layers.0.self_attn.o_proj.lora_A",
+                "model.layers.0.self_attn.o_proj.lora_B",
+                "model.layers.0.mlp.down_proj.lora_A",
+            ]
+        )
+        result = _extract_target_modules(model)
+        assert "model.layers.0.self_attn.o_proj" in result
+        assert "model.layers.0.mlp.down_proj" in result
+
+    def test_qkv_proj_expanded(self):
+        """qkv_proj is expanded to q_proj, k_proj, v_proj."""
+        model = _make_model_with_named_modules(
+            [
+                "model.layers.0.self_attn.qkv_proj.lora_A",
+                "model.layers.0.self_attn.qkv_proj.lora_B",
+            ]
+        )
+        result = _extract_target_modules(model)
+        assert "model.layers.0.self_attn.q_proj" in result
+        assert "model.layers.0.self_attn.k_proj" in result
+        assert "model.layers.0.self_attn.v_proj" in result
+        # Combined name should NOT appear
+        assert all("qkv_proj" not in m for m in result)
+
+    def test_gate_up_proj_expanded(self):
+        """gate_up_proj is expanded to gate_proj, up_proj."""
+        model = _make_model_with_named_modules(
+            [
+                "model.layers.0.mlp.gate_up_proj.lora_A",
+                "model.layers.0.mlp.gate_up_proj.lora_B",
+            ]
+        )
+        result = _extract_target_modules(model)
+        assert "model.layers.0.mlp.gate_proj" in result
+        assert "model.layers.0.mlp.up_proj" in result
+        assert all("gate_up_proj" not in m for m in result)
+
+    def test_mixed_combined_and_regular(self):
+        """Mixed combined and regular module names."""
+        model = _make_model_with_named_modules(
+            [
+                "model.layers.0.self_attn.qkv_proj.lora_A",
+                "model.layers.0.self_attn.o_proj.lora_A",
+                "model.layers.0.mlp.gate_up_proj.lora_A",
+                "model.layers.0.mlp.down_proj.lora_A",
+            ]
+        )
+        result = _extract_target_modules(model)
+        expected = {
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.0.self_attn.k_proj",
+            "model.layers.0.self_attn.v_proj",
+            "model.layers.0.self_attn.o_proj",
+            "model.layers.0.mlp.gate_proj",
+            "model.layers.0.mlp.up_proj",
+            "model.layers.0.mlp.down_proj",
+        }
+        assert set(result) == expected
+
+    def test_torch_compile_prefix_stripped(self):
+        """_orig_mod. prefix from torch.compile is stripped before expansion."""
+        model = _make_model_with_named_modules(
+            [
+                "_orig_mod.model.layers.0.self_attn.qkv_proj.lora_A",
+            ]
+        )
+        result = _extract_target_modules(model)
+        assert "model.layers.0.self_attn.q_proj" in result
+        assert "model.layers.0.self_attn.k_proj" in result
+        assert "model.layers.0.self_attn.v_proj" in result
+        assert all("_orig_mod" not in m for m in result)
+
+    def test_result_is_sorted(self):
+        """Return value is sorted."""
+        model = _make_model_with_named_modules(
+            [
+                "model.layers.0.mlp.gate_up_proj.lora_A",
+                "model.layers.0.self_attn.qkv_proj.lora_A",
+            ]
+        )
+        result = _extract_target_modules(model)
+        assert result == sorted(result)
 
 

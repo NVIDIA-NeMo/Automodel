@@ -24,8 +24,9 @@ from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFChe
 from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
+from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
+from nemo_automodel.components.moe.layers import MLP, MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 logger = logging.getLogger(__name__)
@@ -127,9 +128,13 @@ class GptOssModel(nn.Module):
                 "beta_slow": 1.0,
                 "original_max_position_embeddings": 4096,
             }
+        if hasattr(config, "rope_parameters") and config.rope_parameters:
+            rope_theta = config.rope_parameters.get("rope_theta", 10000.0)
+        else:
+            rope_theta = getattr(config, "rope_theta", 10000.0)
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
-            base=getattr(config, "rope_theta", 10000.0),
+            base=rope_theta,
             dtype=torch.float32,
             initial_context_length=rope_scaling["original_max_position_embeddings"],
             scaling_factor=rope_scaling["factor"],
@@ -229,6 +234,18 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             self.state_dict_adapter = GPTOSSStateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
             )
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
 
     def forward(
         self,

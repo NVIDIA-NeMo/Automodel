@@ -608,6 +608,7 @@ def test_hf_peft_checkpoint():
         "lora_alpha": 32,
         "peft_type": "LORA",
         "r": 8,
+        "use_dora": False,
         "target_modules": [
             "model.language_model.layers.0.mlp.down_proj",
             "model.language_model.layers.0.mlp.gate_proj",
@@ -634,6 +635,7 @@ def test_hf_peft_checkpoint():
         "lora_dtype": None,
         "match_all_linear": False,
         "target_modules": [],
+        "use_dora": False,
         "use_triton": True,
     }
 
@@ -690,11 +692,9 @@ def test_hf_peft_checkpoint():
         "model/adapter_config.json",
         "model/automodel_peft_config.json",
         "model/chat_template.jinja",
-        "model/preprocessor_config.json",
         "model/processor_config.json",
         "model/tokenizer_config.json",
         "model/tokenizer.json",
-        "model/special_tokens_map.json",
         "optim/__0_0.distcp",
         "optim/__1_0.distcp",
         "optim/.metadata",
@@ -762,9 +762,91 @@ def test_hf_peft_checkpoint():
     restored_trainer = FinetuneRecipeForVLM(cfg)
     restored_trainer.setup()
     restored_model = restored_trainer.model_parts[0]
+
+    # --- Compare all parameters & buffers between source and restored models,
+    #     and also compare each against the original HF checkpoint on disk ---
+    source_model = trainer.model_parts[0]
+
+    from nemo_automodel.components.checkpoint.checkpointing import _load_hf_checkpoint_preserving_dtype
+    hf_model_path = cfg.get("model.pretrained_model_name_or_path")
+    hf_state_dict = _load_hf_checkpoint_preserving_dtype(hf_model_path) or {}
+    print(f"HF checkpoint loaded: {len(hf_state_dict)} keys from {hf_model_path}", flush=True)
+    # Print first 10 keys from HF checkpoint and model to diagnose key mismatches
+    hf_keys_sorted = sorted(hf_state_dict.keys())
+    model_keys_sorted = sorted(n for n, _ in source_model.named_parameters() if "lora" not in n)
+    print(f"HF checkpoint keys (first 10): {hf_keys_sorted[:10]}", flush=True)
+    print(f"Model param keys  (first 10, no lora): {model_keys_sorted[:10]}", flush=True)
+    param_mismatches = []
+    buffer_mismatches = []
+    for (sn, sp), (rn, rp) in zip(
+        source_model.named_parameters(), restored_model.named_parameters()
+    ):
+        assert sn == rn, f"Parameter name mismatch: {sn} vs {rn}"
+        sp_full = sp.full_tensor() if hasattr(sp, "full_tensor") else sp
+        rp_full = rp.full_tensor() if hasattr(rp, "full_tensor") else rp
+        # Also look up the HF checkpoint value for this parameter
+        hf_val = hf_state_dict.get(sn)
+        src_vs_hf = ""
+        rst_vs_hf = ""
+        if hf_val is not None and hf_val.shape == sp_full.shape:
+            if not torch.equal(sp_full.cpu(), hf_val):
+                d = (sp_full.cpu().float() - hf_val.float()).abs()
+                src_vs_hf = f"src!=HF(max={d.max().item():.6e})"
+            else:
+                src_vs_hf = "src==HF"
+            if not torch.equal(rp_full.cpu(), hf_val):
+                d = (rp_full.cpu().float() - hf_val.float()).abs()
+                rst_vs_hf = f"rst!=HF(max={d.max().item():.6e})"
+            else:
+                rst_vs_hf = "rst==HF"
+        elif hf_val is None:
+            src_vs_hf = "no_hf_key"
+            rst_vs_hf = "no_hf_key"
+        else:
+            src_vs_hf = f"shape_mismatch(hf={list(hf_val.shape)})"
+            rst_vs_hf = src_vs_hf
+
+        if not torch.equal(sp_full, rp_full):
+            diff = (sp_full.float() - rp_full.float()).abs()
+            param_mismatches.append(
+                f"  PARAM {sn}: shape={list(sp_full.shape)} dtype={sp_full.dtype} "
+                f"max_diff={diff.max().item():.6e} mean_diff={diff.mean().item():.6e} "
+                f"src_norm={sp_full.float().norm().item():.4f} rst_norm={rp_full.float().norm().item():.4f} "
+                f"| {src_vs_hf} | {rst_vs_hf}"
+            )
+    for (sn, sb), (rn, rb) in zip(
+        source_model.named_buffers(), restored_model.named_buffers()
+    ):
+        assert sn == rn, f"Buffer name mismatch: {sn} vs {rn}"
+        if sb.is_meta or rb.is_meta:
+            buffer_mismatches.append(f"  BUFFER {sn}: src_meta={sb.is_meta} rst_meta={rb.is_meta}")
+            continue
+        sb_full = sb.full_tensor() if hasattr(sb, "full_tensor") else sb
+        rb_full = rb.full_tensor() if hasattr(rb, "full_tensor") else rb
+        if sb_full.shape != rb_full.shape:
+            buffer_mismatches.append(f"  BUFFER {sn}: shape mismatch {list(sb_full.shape)} vs {list(rb_full.shape)}")
+        elif not torch.equal(sb_full, rb_full):
+            diff = (sb_full.float() - rb_full.float()).abs()
+            buffer_mismatches.append(
+                f"  BUFFER {sn}: shape={list(sb_full.shape)} dtype={sb_full.dtype} "
+                f"max_diff={diff.max().item():.6e} mean_diff={diff.mean().item():.6e}"
+            )
+    if param_mismatches or buffer_mismatches:
+        print(f"\n{'='*80}", flush=True)
+        print(f"WEIGHT COMPARISON: {len(param_mismatches)} param mismatches, {len(buffer_mismatches)} buffer mismatches", flush=True)
+        for m in param_mismatches:
+            print(m, flush=True)
+        for m in buffer_mismatches:
+            print(m, flush=True)
+        print(f"{'='*80}\n", flush=True)
+    else:
+        print("WEIGHT COMPARISON: All parameters and buffers match exactly.", flush=True)
+
     source_model_loss = get_validation_loss(trainer.model_parts[0], val_batch, trainer.loss_fn, trainer.dist_env.device)
     restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
-    assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
+    assert torch.allclose(source_model_loss, restored_model_loss), (
+        f"Model loss mismatch: source={source_model_loss.item()}, restored={restored_model_loss.item()}"
+    )
 
     # compare the recipe configs
     with open(Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "config.yaml", "r") as f:

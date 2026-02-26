@@ -47,18 +47,19 @@ compile:
   backend: null  # Use default backend (inductor)
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   dp_size: none
-  dp_replicate_size: 1 # dp_shard_size = dp_size / dp_replicate_size and dp_shard_size < dp_size. For DDP usecase, use DDPManager
   tp_size: 1
   cp_size: 1
+
   sequence_parallel: false
 
 qat:
   fake_quant_after_n_steps: 1
   enabled: True
-  quantizer:
-    _target_: torchao.quantization.qat.Int8DynActInt4WeightQATQuantizer
+  qat_config:
+    _target_: nemo_automodel.components.quantization.qat.QATConfig
+    quantizer_type: int8_dynact_int4weight
     groupsize: 256
 
 loss_fn:

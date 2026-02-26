@@ -45,11 +45,10 @@ checkpoint:
   save_consolidated: false
 
 distributed:
-  _target_: nemo_automodel.components.distributed.megatron_fsdp.MegatronFSDPManager
+  strategy: megatron_fsdp
   dp_size: none
   tp_size: 1
   cp_size: 1
-
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

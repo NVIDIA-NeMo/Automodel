@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import logging
-from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
@@ -22,43 +21,45 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from nemo_automodel.components.distributed.config import DDPConfig
 from nemo_automodel.components.distributed.parallelizer import _extract_model_layers
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
 class DDPManager:
     """
-    Manages setting up distributed training using PyTorch's DDP.
+    Manager for distributed training using PyTorch's DDP.
 
-    Attributes:
-        backend (str): The distributed backend to use (e.g. "nccl" or "gloo"). Defaults to "nccl".
-        rank (int): Global rank of this process. This is set during distributed setup.
-        world_size (int): Total number of processes in the distributed group. Set at distributed setup.
+    This manager wraps models with DistributedDataParallel for data-parallel
+    distributed training.
+
+    Args:
+        config (DDPConfig): Configuration for DDP distributed training.
+
+    Example:
+        from nemo_automodel.components.distributed.config import DDPConfig
+
+        config = DDPConfig(activation_checkpointing=True)
+        manager = DDPManager(config)
+        model = manager.parallelize(model)
     """
 
-    backend: str = field(default="nccl", metadata={"help": "Distributed backend, e.g. 'nccl' or 'gloo'."})
+    def __init__(self, config: DDPConfig):
+        self.config = config
 
-    world_size: int = field(default_factory=lambda: int, metadata={"help": "Total number of distributed processes."})
+        # Extract config fields for easy access
+        self.activation_checkpointing = config.activation_checkpointing
+        self.backend = config.backend
 
-    # This is populated in setup_distributed(), not by user:
-    rank: int = field(init=False, default_factory=lambda: int, metadata={"help": "Global rank of this process."})
-
-    activation_checkpointing: bool = field(default=False, metadata={"help": "Enable activation checkpointing if True."})
-
-    def __post_init__(self):
-        """
-        Post-initialization hook that sets up the distributed environment.
-        """
-        return self._setup_distributed()
+        # Setup distributed environment
+        self._setup_distributed()
 
     def _setup_distributed(self):
         """
-        Initialize the torch.distributed process group and set up device configuration.
+        Initialize device configuration for DDP.
 
-        The method sets the `rank` and `world_size` of the DDPManager,
-        configures the device (GPU for 'nccl' backend, CPU otherwise), and initializes the process group.
+        Sets the rank, world_size, and device based on the backend.
         """
         if not dist.is_available():
             raise RuntimeError("torch.distributed not available")

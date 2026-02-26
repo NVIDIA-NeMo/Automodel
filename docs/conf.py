@@ -27,9 +27,9 @@ import sys
 # pylint: skip-file
 
 project = "NeMo-AutoModel"
-copyright = "2025, NVIDIA Corporation"
+copyright = "2026, NVIDIA Corporation"
 author = "NVIDIA Corporation"
-release = "latest"
+release = "nightly"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -41,6 +41,7 @@ extensions = [
     "sphinx.ext.doctest",  # Allows testing in docstrings
     "sphinx.ext.napoleon",  # For google style docstrings
     "sphinx_copybutton",  # For copy button in code blocks
+    "sphinx_design",  # For grid layout and card components
 ]
 
 templates_path = ["_templates"]
@@ -87,6 +88,10 @@ suppress_warnings = [
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
 html_theme = "nvidia_sphinx_theme"
+# Add the docs render/build date to the footer on every page.
+# The NVIDIA theme includes a "last-updated" footer component that shows
+# Sphinx's `last_updated` value when this is set.
+html_last_updated_fmt = "%Y-%m-%d"
 html_theme_options = {
     "icon_links": [
         {

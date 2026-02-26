@@ -18,29 +18,28 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from functools import partial
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.nn as nn
 import wandb
+from huggingface_hub import constants as hf_constants
+from megatron_fsdp import MegatronFSDP
 from megatron_fsdp.fully_shard import fully_shard_optimizer
-from torch.distributed.device_mesh import DeviceMesh
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
-from transformers.utils import TRANSFORMERS_CACHE
 from wandb import Settings
 
-from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+from nemo_automodel._transformers import NeMoAutoModelForImageTextToText, NeMoAutoModelForMultimodalLM
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
+from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -59,10 +58,8 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import (
-    _supports_logits_to_keep,
-    apply_parameter_freezing,
-)
+from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
+from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -86,62 +83,49 @@ def _get_model_name(cfg_model):
         return None
 
 
-def _freeze_model(model: nn.Module, cfg_freeze: Optional[Dict[str, Any]] = None, freeze_embeddings: bool = True):
-    """
-    Freeze the model.
-
-    Args:
-        model: The model to freeze.
-        cfg_freeze: The configuration for freezing the model.
-        freeze_embeddings: Whether to freeze embeddings.
-
-    Returns:
-        nn.Module: The frozen model.
-    """
-    if cfg_freeze is not None:
-        apply_parameter_freezing(model, cfg_freeze)
-    elif freeze_embeddings:
-        logging.info("Freezing embeddings")
-        for m in model.modules():
-            if isinstance(m, nn.Embedding):
-                m.weight.requires_grad = False
-    return model
-
-
-def build_model_and_optimizer(
+def build_model(
     cfg_model,
-    cfg_opt,
     cfg_freeze,
     cfg_peft,
-    model_wrapper,
     seed,
-    checkpointer: Checkpointer,
-    tp_size=1,
-    cp_size=1,
-    freeze_embeddings=True,
     cfg_fp8=None,
     cfg_compile=None,
-    loss_fn=None,
-    parallelize_fn=None,
-    autopipeline: AutoPipeline | None = None,
-) -> tuple[nn.Module | AutoPipeline, list["Optimizer"], nn.Module]:  # noqa: F821
+    device_mesh=None,
+    moe_mesh=None,
+    distributed_config=None,
+    pipeline_config=None,
+    cfg_moe=None,
+    activation_checkpointing=False,
+) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model for VLM.
 
     Returns:
-        The instantiated model, optimizer, and loss function.
+        The instantiated model and optimizer.
     """
     with ScopedRNG(seed=seed, ranked=True):
         # Build infrastructure kwargs
         kwargs = {
-            "tp_size": tp_size,
-            "cp_size": cp_size,
-            "parallelize_fn": parallelize_fn,
-            "checkpointer": checkpointer,
             "peft_config": cfg_peft,
-            "model_wrapper": model_wrapper,
-            "loss_fn": loss_fn,
-            "autopipeline": autopipeline,
+            "device_mesh": device_mesh,
+            "moe_mesh": moe_mesh,
+            "distributed_config": distributed_config,
+            "pipeline_config": pipeline_config,
+            "freeze_config": cfg_freeze.to_dict() if cfg_freeze is not None else None,
         }
+
+        if cfg_moe is not None:
+            from nemo_automodel.components.moe.config import MoEParallelizerConfig
+
+            if isinstance(cfg_moe, MoEParallelizerConfig):
+                kwargs["moe_config"] = cfg_moe
+            else:
+                moe_dict = cfg_moe.to_dict() if hasattr(cfg_moe, "to_dict") else dict(cfg_moe)
+                # activation_checkpointing is handled separately; strip config keys
+                moe_dict.pop("activation_checkpointing", None)
+                moe_dict.pop("_target_", None)
+                kwargs["moe_config"] = MoEParallelizerConfig(**moe_dict)
+            kwargs["activation_checkpointing"] = activation_checkpointing
+
         if cfg_fp8 is not None:
             fp8_config = build_fp8_config(cfg_fp8)
             kwargs["fp8_config"] = fp8_config
@@ -152,6 +136,8 @@ def build_model_and_optimizer(
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
             NeMoAutoModelForImageTextToText.from_config,
             NeMoAutoModelForImageTextToText.from_pretrained,
+            NeMoAutoModelForMultimodalLM.from_config,
+            NeMoAutoModelForMultimodalLM.from_pretrained,
         )
 
         if is_nemo_auto_model:
@@ -162,35 +148,37 @@ def build_model_and_optimizer(
                 f"VLM finetuning requires NeMoAutoModelForImageTextToText. "
                 f"Got model target: {cfg_model.get('_target_', None)}"
             )
+    return model
 
-    # VLM-specific: Apply freezing after model is built
-    # For PEFT, base model params are already frozen; this handles additional freezing (e.g., embeddings)
-    model = _freeze_model(model, cfg_freeze, freeze_embeddings)
 
-    # Check loss function compatibility
-    if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
-        logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
-        loss_fn = MaskedCrossEntropy()
+def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
+    """Build an optimizer for the model.
 
-    if tp_size > 1:
+    Args:
+        model: The model to build an optimizer for.
+        cfg_opt: The configuration for the optimizer.
+        distributed_config: The distributed configuration.
+        device_mesh: The device mesh.
+    """
+    if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
         # TP does not support foreach
         cfg_opt.foreach = False
 
-    if hasattr(model, "parts"):
-        optimizer = []
-        for part in model.parts:
-            trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
-            assert len(trainable_params) > 0, "trainable_params cannot be empty"
-            optimizer.append(cfg_opt.instantiate(params=trainable_params))
-    else:
-        trainable_params = list(filter(lambda x: x.requires_grad, model.parameters()))
+    optimizer = []
+    for part in getattr(model, "parts", [model]):
+        trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
-        optimizer = cfg_opt.instantiate(params=trainable_params)
-        if isinstance(model_wrapper, MegatronFSDPManager) and torch.distributed.get_world_size() > 1:
-            fully_shard_optimizer(model, optimizer)
-        optimizer = [optimizer]
+        tmp_optimizer = cfg_opt.instantiate(params=trainable_params)
+        if isinstance(distributed_config, MegatronFSDPConfig) and torch.distributed.get_world_size() > 1:
+            # Only call fully_shard_optimizer when the model was actually wrapped
+            # with MegatronFSDP. When dp_mesh.size()==1 the parallelizer skips
+            # MegatronFSDP wrapping and the parameters won't carry the required
+            # _megatron_fsdp_model attribute.
+            if isinstance(part, MegatronFSDP):
+                fully_shard_optimizer(tmp_optimizer)
+        optimizer.append(tmp_optimizer)
 
-    return model, optimizer, loss_fn
+    return optimizer
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
@@ -210,7 +198,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         checkpoint_dir="checkpoints/",
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
-        model_cache_dir=cache_dir if cache_dir is not None else TRANSFORMERS_CACHE,
+        model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HUB_CACHE,
         save_consolidated=True,
         is_peft=is_peft,
     )
@@ -267,21 +255,22 @@ def build_dataloader(
     with ScopedRNG(seed=seed, ranked=True):
         processor = None
         processor_kwargs = {}
-        if cfg_processor is not None and hasattr(cfg_processor, "instantiate"):
-            processor = cfg_processor.instantiate()
-        elif cfg_processor is not None:
-            processor_kwargs = cfg_processor.to_dict()
-
-        # If no processor was instantiated, try AutoProcessor
-        if processor is None:
-            try:
-                processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
-            except Exception as e:
-                # Some models do not provide an AutoProcessor
-                processor = None
-                logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
 
         with FirstRankPerNode():
+            if cfg_processor is not None and hasattr(cfg_processor, "instantiate"):
+                processor = cfg_processor.instantiate()
+            elif cfg_processor is not None:
+                processor_kwargs = cfg_processor.to_dict()
+
+            # If no processor was instantiated, try AutoProcessor
+            if processor is None:
+                try:
+                    processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
+                except Exception as e:
+                    # Some models do not provide an AutoProcessor
+                    processor = None
+                    logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
+
             ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
 
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -297,19 +286,6 @@ def build_dataloader(
                 processor_type = "default"
                 logging.warning(f"You are using {processor_type} with default collate function.")
             collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
-
-        return cfg_dl.instantiate(
-            dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=local_batch_size
-        ), processor
-
-        # Ensure spawn start method to avoid fork-safety issues with CUDA/JIT
-        try:
-            import torch.multiprocessing as mp
-
-            if mp.get_start_method(allow_none=True) is None:
-                mp.set_start_method("spawn", force=True)
-        except RuntimeError:
-            pass
 
         return cfg_dl.instantiate(
             dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=local_batch_size
@@ -485,25 +461,6 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     return loss_fn(**loss_fn_kwargs)
 
 
-def parallelize_for_pp(
-    model: nn.Module,
-    *,
-    world_mesh: DeviceMesh,
-    moe_mesh: Optional[DeviceMesh] = None,
-    pp_enabled: bool = False,
-    dp_axis_names: Union[tuple[str, ...], str] = ("data_parallel",),
-    cp_axis_name: Optional[str] = None,
-    tp_axis_name: Optional[str] = None,
-    ep_axis_name: Optional[str] = None,
-    ep_shard_axis_names: Optional[tuple[str, ...]] = None,
-    model_wrapper: Optional[Any] = None,
-) -> nn.Module:
-    if model_wrapper is not None:
-        if callable(getattr(model_wrapper, "parallelize", None)):
-            model = model_wrapper.parallelize(model)
-    return model
-
-
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
 # ---------------------------------------------------------------------------
@@ -538,13 +495,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
-        self.device_mesh = None
-        self.moe_mesh = None
-        self.model_wrapper = None
-        if "distributed" in self.cfg:
-            self.model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
-            self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
-            self.moe_mesh = getattr(self.model_wrapper, "moe_mesh", None)
+        self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+        self.distributed_config = self.dist_setup.strategy_config
+        self.device_mesh = self.dist_setup.device_mesh
+        self.moe_mesh = self.dist_setup.moe_mesh
+        self.pp_enabled = self.dist_setup.pp_enabled
+        self.pipeline_config = self.dist_setup.pipeline_config
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -555,59 +511,34 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self._log_experiment_details()
         self._log_library_versions()
 
-        self.pp_enabled: bool = (
-            True if hasattr(self.model_wrapper, "pp_size") and self.model_wrapper.pp_size > 1 else False
-        )
-        autopipeline_cfg = self.cfg.get("autopipeline", None)
+        # Build loss_fn (will be set on pipeline_config if PP enabled)
+        self.loss_fn = build_loss_fn(self.cfg.loss_fn)
+
+        # Pipeline runtime fields: override pp_batch_size and pp_microbatch_size
         if self.pp_enabled:
             pp_batch_size = self.cfg.step_scheduler.local_batch_size
-            pp_microbatch_size = self.cfg.autopipeline.pp_microbatch_size
-            assert pp_batch_size // self.cfg.autopipeline.pp_microbatch_size >= self.model_wrapper.pp_size, (
-                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {self.cfg.autopipeline.pp_microbatch_size} must be greater than or equal to pp_size {self.model_wrapper.pp_size}"
+            pp_microbatch_size = self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
+
+            assert pp_batch_size // pp_microbatch_size >= self.dist_setup.pp_size, (
+                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.dist_setup.pp_size}"
             )
 
-            assert autopipeline_cfg is not None, (
-                "AutoPipeline configuration is required when pipeline parallelism is enabled"
+            assert not isinstance(self.distributed_config, MegatronFSDPConfig), (
+                "MegatronFSDPConfig is not supported when pipeline parallelism is enabled"
             )
-            assert not isinstance(self.model_wrapper, MegatronFSDPManager), (
-                "MegatronFSDPManager is not supported when pipeline parallelism is enabled"
+
+            # Update pipeline_config runtime fields
+            self.pipeline_config.pp_batch_size = pp_batch_size
+            self.pipeline_config.pp_microbatch_size = pp_microbatch_size
+            self.pipeline_config.patch_stage_backward_maybe_with_nosync = self.cfg.get(
+                "model.backend.enable_fsdp_optimizations", False
             )
-            # Create AutoPipeline from config
-            autopipeline = autopipeline_cfg.instantiate(
-                world_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                pp_axis_name="pp",
-                dp_axis_names=(
-                    ("dp_replicate", "dp_shard_cp")
-                    if "dp_replicate" in self.device_mesh.mesh_dim_names
-                    and "dp_shard_cp" in self.device_mesh.mesh_dim_names
-                    else ("dp_shard_cp",)
-                ),
-                cp_axis_name="cp" if "cp" in self.device_mesh.mesh_dim_names else None,
-                tp_axis_name="tp" if "tp" in self.device_mesh.mesh_dim_names else None,
-                ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
-                ep_shard_axis_names=(
-                    ("ep_shard",) if self.moe_mesh is not None and "ep_shard" in self.moe_mesh.mesh_dim_names else None
-                ),
-                pp_batch_size=pp_batch_size,
-                pp_microbatch_size=pp_microbatch_size,
-                patch_stage_backward_maybe_with_nosync=self.cfg.get("model.backend.enable_fsdp_optimizations", False),
-                device=torch.cuda.current_device(),
-            )
-            assert isinstance(autopipeline, AutoPipeline), (
-                f"autopipeline {autopipeline.__class__} is not an instance of AutoPipeline"
-            )
-        else:
-            autopipeline = None
+            self.pipeline_config.loss_fn = self.loss_fn
 
         # Build components with VLM-specific functions
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
-        self.loss_fn = build_loss_fn(self.cfg.loss_fn)
-        parallelize_fn = getattr(self.cfg.get("parallelizer", None), "instantiate", None)
-        if parallelize_fn is None and self.pp_enabled:
-            parallelize_fn = partial(parallelize_for_pp, model_wrapper=self.model_wrapper)
 
         # Build checkpoint config
         checkpoint_config = build_checkpoint_config(
@@ -632,22 +563,25 @@ class FinetuneRecipeForVLM(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
-        model, self.optimizer, self.loss_fn = build_model_and_optimizer(
+        model = build_model(
             self.cfg.model,
-            self.cfg.optimizer,
             self.cfg.get("freeze_config", None),
             self.peft_config,
-            self.model_wrapper,
             seed=self.cfg.get("seed", 42),
-            tp_size=self.cfg.get("distributed.tp_size", 1),
-            cp_size=self.cfg.get("distributed.cp_size", 1),
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
-            loss_fn=self.loss_fn,
-            parallelize_fn=parallelize_fn,
-            checkpointer=self.checkpointer,
-            autopipeline=autopipeline,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            distributed_config=self.distributed_config,
+            pipeline_config=self.pipeline_config,
+            cfg_moe=self.dist_setup.moe_config,
+            activation_checkpointing=self.dist_setup.activation_checkpointing,
         )
+        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+
+        if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
+            logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
+            self.loss_fn = MaskedCrossEntropy()
 
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
@@ -792,23 +726,26 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 input_ids = batch.pop("input_ids")
 
-                # VLM: Custom chunking for pixel_values and image_grid_hws
+                # VLM: Custom chunking for pixel_values and image_grid
                 # These tensors have non-standard structure that can't be naively chunked by dim 0
                 # TODO: @HuiyingLi properly handle pixel_values split
                 pixel_values = batch.pop("pixel_values", None)
                 image_grid_hws = batch.pop("image_grid_hws", None)
+                image_grid_thw = batch.pop("image_grid_thw", None)
 
-                if self.pp.info.has_first_stage and pixel_values is not None and image_grid_hws is not None:
+                image_grid = image_grid_hws if image_grid_hws is not None else image_grid_thw
+
+                if self.pp.info.has_first_stage and pixel_values is not None and image_grid is not None:
                     stage0_model = self.model_parts[0]
                     n_microbatches = self.pp._info.schedule._n_microbatches
                     batch_size = input_ids.shape[0]
-                    n_images = image_grid_hws.shape[0]
+                    n_images = image_grid.shape[0]
 
-                    patch_counts = image_grid_hws[:, 0] * image_grid_hws[:, 1]
+                    patch_counts = image_grid.prod(dim=1)
                     cumsum = torch.cumsum(patch_counts, dim=0)
 
                     pixel_values_chunks = []
-                    image_grid_hws_chunks = []
+                    image_grid_chunks = []
 
                     if n_images == batch_size:
                         # 1 image per sample
@@ -817,24 +754,24 @@ class FinetuneRecipeForVLM(BaseRecipe):
                             img_start = mb_idx * images_per_mb
                             img_end = min(img_start + images_per_mb, n_images)
 
-                            image_grid_hws_chunks.append(image_grid_hws[img_start:img_end])
+                            image_grid_chunks.append(image_grid[img_start:img_end])
 
                             patch_start = 0 if img_start == 0 else cumsum[img_start - 1].item()
                             patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
                             pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
                     else:
                         pixel_values_chunks.append(pixel_values)
-                        image_grid_hws_chunks.append(image_grid_hws)
+                        image_grid_chunks.append(image_grid)
                         for _ in range(n_microbatches - 1):
                             pixel_values_chunks.append(pixel_values[:0])
-                            image_grid_hws_chunks.append(image_grid_hws[:0])
+                            image_grid_chunks.append(image_grid[:0])
                         logging.warning(
                             f"VLM chunking: n_images={n_images} != batch_size={batch_size}, giving all images to first microbatch"
                         )
 
                     # Store pre-chunked tensors on model for forward to use
                     stage0_model._vlm_pixel_values_chunks = pixel_values_chunks
-                    stage0_model._vlm_image_grid_hws_chunks = image_grid_hws_chunks
+                    stage0_model._vlm_image_grid_hws_chunks = image_grid_chunks
                     stage0_model._vlm_chunk_idx = 0
 
                 if self.pp.info.has_first_stage:
@@ -843,7 +780,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     self.pp.info.schedule.step(target=targets, losses=losses, **batch)
 
                 # Clear stored VLM chunks after PP step
-                if self.pp.info.has_first_stage and pixel_values is not None:
+                if self.pp.info.has_first_stage and pixel_values is not None and image_grid is not None:
                     stage0_model = self.model_parts[0]
                     stage0_model._vlm_pixel_values_chunks = None
                     stage0_model._vlm_image_grid_hws_chunks = None
@@ -861,7 +798,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 get_sync_ctx(
                     model,
                     idx == num_batches - 1,
-                    defer_fsdp_grad_sync=getattr(self.model_wrapper, "defer_fsdp_grad_sync", True),
+                    defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
                 )
                 if is_train
                 else nullcontext()
@@ -872,7 +809,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     out = model(logits_to_keep=1, **batch)
                     if "hidden_states" not in out:
                         raise ValueError(
-                            "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
+                            "FusedLinearCrossEntropy requires the model to output hidden states. "
+                            "Set `model.text_config.output_hidden_states=True` in the config."
                         )
                 else:
                     out = model(**batch)

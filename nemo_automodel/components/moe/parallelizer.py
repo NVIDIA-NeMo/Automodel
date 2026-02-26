@@ -19,7 +19,6 @@ import logging
 
 import torch
 import torch.nn as nn
-from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
@@ -31,8 +30,8 @@ from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
 from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
+from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.layers import (
-    GroupedExpertsDeepEP,
     MoE,
 )
 from nemo_automodel.shared.utils import dtype_from_str
@@ -74,7 +73,7 @@ class ExpertParallel(ParallelStyle):
         )
 
 
-def apply_ep(model: nn.Module, ep_mesh: DeviceMesh):
+def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None = None):
     """Applies EP to MoE module."""
     assert ep_mesh.size() > 1
 
@@ -86,12 +85,19 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh):
     _model = get_text_module(_model)
 
     for _, block in _model.layers.named_children():
-        if isinstance(block.mlp, MoE):
-            parallelize_module(
-                module=block.mlp.experts,
-                device_mesh=ep_mesh,
-                parallelize_plan=ExpertParallel(),
-            )
+        moe_module = block.moe if hasattr(block, "moe") else block.mlp
+        if isinstance(moe_module, MoE):
+            # GroupedExpertsTEGroupedLinear uses TE's GroupedLinear which creates
+            # local experts directly. It doesn't support DTensor wrapping, so we
+            # skip distribute_module entirely and just initialize token dispatcher.
+            if isinstance(moe_module.experts, GroupedExpertsTE):
+                moe_module.experts.init_token_dispatcher(ep_mesh=ep_mesh, moe_mesh=moe_mesh)
+            else:
+                parallelize_module(
+                    module=moe_module.experts,
+                    device_mesh=ep_mesh,
+                    parallelize_plan=ExpertParallel(),
+                )
 
 
 def apply_ac(
@@ -106,7 +112,8 @@ def apply_ac(
         model: The model to apply activation checkpointing to.
         ignore_router: If True, uses selective checkpointing that saves router outputs.
         hidden_size: Hidden dimension size. If None, derived from model.config.hidden_size.
-        num_experts: Number of routed experts. If None, derived from model.config.num_experts.
+        num_experts: Number of routed experts. If None, derived from moe_config.n_routed_experts
+            first, then falls back to model.config attributes.
     """
     # Derive hidden_size and num_experts from model.config if not provided
     if hidden_size is None:
@@ -116,10 +123,16 @@ def apply_ac(
             raise ValueError("hidden_size must be provided or model must have config.hidden_size attribute")
 
     if num_experts is None:
-        if hasattr(model, "config") and hasattr(model.config, "num_experts"):
-            num_experts = model.config.num_experts
+        _inner = getattr(model, "model", model)
+        if hasattr(_inner, "moe_config") and hasattr(_inner.moe_config, "n_routed_experts"):
+            num_experts = _inner.moe_config.n_routed_experts
         else:
-            raise ValueError("num_experts must be provided or model must have config.num_experts attribute")
+            for attr in ["num_experts", "moe_num_experts", "n_routed_experts"]:
+                if hasattr(model, "config") and hasattr(model.config, attr):
+                    num_experts = getattr(model.config, attr)
+                    break
+            else:
+                raise ValueError("num_experts must be provided or model must have config.num_experts attribute")
 
     def _custom_policy(ctx, func, *args, **kwargs):
         if func == torch.ops.aten.mm.default:
@@ -187,11 +200,12 @@ def apply_fsdp(
     _model = get_text_module(_model)
 
     for _, block in _model.layers.named_children():
-        if isinstance(block.mlp, MoE) and ep_shard_enabled:
+        moe_module = block.moe if hasattr(block, "moe") else block.mlp
+        if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
             # shards than experts (dim=0).
             fully_shard(
-                block.mlp.experts,
+                moe_module.experts,
                 mesh=ep_shard_mesh,
                 shard_placement_fn=lambda _: Shard(1),
                 reshard_after_forward=reshard_after_forward,
@@ -203,8 +217,8 @@ def apply_fsdp(
         # removed from the FSDP for the transformer block due to the rules of the
         # PyTorch FSDP implementation.
         ignored_params = None
-        if isinstance(block.mlp, MoE) and ep_enabled:
-            ignored_params = set(block.mlp.experts.parameters())
+        if isinstance(moe_module, MoE) and ep_enabled:
+            ignored_params = set(moe_module.experts.parameters())
 
         fully_shard_default(block, ignored_params=ignored_params)
 
@@ -286,6 +300,7 @@ def parallelize_model(
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
+    mp_policy: MixedPrecisionPolicy | None = None,
 ):
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
         "Tensor parallelism not supported for custom MoE models"
@@ -302,7 +317,7 @@ def parallelize_model(
             f"expert_parallel_degree {moe_mesh[ep_axis_name].size()}"
         )
 
-        apply_ep(model, moe_mesh[ep_axis_name])
+        apply_ep(model, moe_mesh[ep_axis_name], moe_mesh=moe_mesh)
 
     if activation_checkpointing:
         apply_ac(model, ignore_router=ignore_router_for_ac)
@@ -321,6 +336,7 @@ def parallelize_model(
             ep_enabled=ep_enabled,
             ep_shard_enabled=ep_shard_mesh is not None and ep_shard_mesh.size() > 1,
             ep_shard_mesh=ep_shard_mesh,
+            mp_policy=mp_policy,
             reshard_after_forward=reshard_after_forward,
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,

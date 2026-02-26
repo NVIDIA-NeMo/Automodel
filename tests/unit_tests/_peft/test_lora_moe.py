@@ -21,7 +21,8 @@ try:
 except ImportError:
     grouped_gemm = None
 
-from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, MoEConfig
+from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components._peft.lora_moe import GroupedExpertsLoRA, GroupedExpertsDeepEPLoRA
 from nemo_automodel.components._peft.lora import patch_moe_module, apply_lora_to_linear_modules, PeftConfig
 

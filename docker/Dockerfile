@@ -34,7 +34,15 @@ FROM ${PYTORCH_IMAGE} AS pytorch
 
 FROM ${BASE_IMAGE} AS update_base_container
 
+ENV PIP_NO_CACHE_DIR=1
 WORKDIR /opt
+
+ENV DEBIAN_FRONTEND=noninteractive
+# Address CVE-2025-68973
+RUN apt-get update && apt install -y --only-upgrade gnupg && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
 # Install uv
 ENV UV_VERSION="0.8.22"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
@@ -83,6 +91,16 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     rm -rf DeepEP; \
     fi
 
+# Address base image CVE
+RUN pip install "aiohttp>=3.13.3" \
+        "jaraco-context>=6.1.0" \
+        "nbconvert>=7.17.0" \
+        "pillow>=12.1.1" \
+        "protobuf>=6.33.5" \
+        "setuptools>=80.10.2" \
+        "urllib3>=2.6.0" \
+        "wheel>=0.46.2"
+
 FROM automodel_dep as automodel_final
 
 WORKDIR /opt/Automodel
@@ -90,6 +108,7 @@ WORKDIR /opt/Automodel
 COPY pyproject.toml uv.lock /opt/Automodel/
 COPY nemo_automodel/__init__.py nemo_automodel/package_info.py /opt/Automodel/nemo_automodel/
 COPY docker/common/uv-pytorch.toml docker/common/uv-pytorch.lock /opt/Automodel/docker/common/
+COPY docker/common/update_pyproject_pytorch.sh /opt/Automodel/docker/common/
 
 # Install Automodel
 ARG BASE_IMAGE=cuda
@@ -98,8 +117,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     --mount=type=cache,target=/root/.cache/uv \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \
-        sed -i '/\[tool\.uv\]/r /opt/Automodel/docker/common/uv-pytorch.toml' pyproject.toml && \
-        mv /opt/Automodel/docker/common/uv-pytorch.lock /opt/Automodel/uv.lock; \
+        bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi && \
     uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups && \
     uv cache prune --ci

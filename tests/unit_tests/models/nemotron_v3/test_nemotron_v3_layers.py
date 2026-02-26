@@ -21,7 +21,7 @@ from nemo_automodel.components.models.nemotron_v3.layers import (
     NemotronV3Block,
 )
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.moe.layers import MoEConfig
+from nemo_automodel.components.moe.config import MoEConfig
 
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
 
@@ -507,3 +507,56 @@ class TestNemotronV3Mamba2Mixer:
         assert mixer.conv1d.out_channels == mixer.conv_dim
         assert mixer.conv1d.kernel_size[0] == config.conv_kernel
         assert mixer.conv1d.groups == mixer.conv_dim
+
+
+class TestBackwardCompatibility:
+    """Verify that attention and block layers still work without cache args."""
+
+    @pytest.fixture
+    def config(self):
+        return MockNemotronV3Config()
+
+    @pytest.fixture
+    def backend(self):
+        return BackendConfig(
+            linear="torch",
+            attn="sdpa",
+            rms_norm="torch",
+            enable_deepep=False,
+            fake_balanced_gate=False,
+            enable_hf_state_dict_adapter=False,
+        )
+
+    def test_attention_no_cache_args(self, config):
+        """Verify attn(hidden) still works without cache args."""
+        attn = NemotronV3Attention(config)
+        hidden = torch.randn(2, 8, config.hidden_size)
+        out = attn(hidden)
+        assert out.shape == (2, 8, config.hidden_size)
+
+    def test_attention_mask_only(self, config):
+        """Verify attn(hidden, attention_mask=...) still works without cache args."""
+        attn = NemotronV3Attention(config)
+        batch_size, seq_len = 2, 8
+        hidden = torch.randn(batch_size, seq_len, config.hidden_size)
+        mask = torch.zeros(batch_size, 1, seq_len, seq_len)
+        mask.masked_fill_(torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool(), float("-inf"))
+        out = attn(hidden, attention_mask=mask)
+        assert out.shape == (batch_size, seq_len, config.hidden_size)
+
+    def test_block_attention_no_cache_args(self, config, backend):
+        """Verify block(hidden) still works for attention block without cache args."""
+        config.layers_block_type = ["attention"]
+        block = NemotronV3Block(config, layer_idx=0, moe_config=None, backend=backend)
+        hidden = torch.randn(2, 8, config.hidden_size)
+        out = block(hidden)
+        assert out.shape == (2, 8, config.hidden_size)
+
+    def test_block_mlp_no_cache_args(self, config, backend):
+        """Verify block(hidden) still works for mlp block without cache args."""
+        config.layers_block_type = ["mlp"]
+        block = NemotronV3Block(config, layer_idx=0, moe_config=None, backend=backend)
+        block = block.to(torch.bfloat16)
+        hidden = torch.randn(2, 8, config.hidden_size, dtype=torch.bfloat16)
+        out = block(hidden)
+        assert out.shape == (2, 8, config.hidden_size)

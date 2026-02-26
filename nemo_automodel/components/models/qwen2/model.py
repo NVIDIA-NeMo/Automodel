@@ -364,7 +364,7 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
     ALWAYS uses combined projections - this is the whole point of the custom implementation.
     """
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
@@ -400,6 +400,18 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
             print(f"[Qwen2ForCausalLM] Attention implementation: {self.config._attn_implementation}")
             print("[Qwen2ForCausalLM] Custom implementation with COMBINED QKV and gate_up projections")
             print(f"[Qwen2ForCausalLM] torch_dtype: {self.config.torch_dtype}")
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
 
     @can_return_tuple
     def forward(

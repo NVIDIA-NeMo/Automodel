@@ -13,7 +13,7 @@
 # limitations under the License.
 
 [build-system]
-requires = ["setuptools >= 61.0"]
+requires = ["setuptools >= 80.10.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -78,13 +78,13 @@ dependencies = [
     "diffusers",
     "ftfy",
     "imageio-ffmpeg",
-    "megatron-fsdp",
+    "megatron-fsdp>=0.2.3",
     "opencv-python-headless==4.10.0.84",
     "pybind11",
     "pyyaml",
-    "torch<=2.10.0",
+    "torch>=2.6.0,<=2.10.0",
     "torchdata",
-    "transformers<=4.57.5",
+    "transformers>=5.0.0",
     "wandb",
     "torchao",
     "mlflow",
@@ -116,16 +116,17 @@ moe = [
     "deep_ep",
 ]
 vlm = [
-    "pillow",
-    "qwen-vl-utils[decord]; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
-    "qwen-omni-utils",
-    "timm<=1.0.22",
+    "albumentations",
     "backoff",
+    "mistral_common[opencv]>=1.9.0",
     "numpy",
     "numba",
+    "open-clip-torch",
+    "pillow",
+    "qwen-omni-utils",
+    "qwen-vl-utils[decord]; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "timm<=1.0.22",
     "torchcodec; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
-    "mistral_common[opencv]",
-    "albumentations"
 ]
 all = [
     "nemo_automodel[cuda]",
@@ -149,6 +150,7 @@ docs = [
     "sphinx-autobuild",    # For live doc serving while editing docs
     "sphinx-autodoc2",     # For documenting Python API
     "sphinx-copybutton",   # Adds a copy button for code blocks
+    "sphinx-design",       # For grid layout and card components
     "myst_parser",         # For our markdown docs
     "nvidia-sphinx-theme", # Our NVIDIA theme
 ]
@@ -157,8 +159,8 @@ linting = [
     "ruff~=0.9.0",
     "import-linter~=2.4",
 ]
-test = ["coverage", "pytest", "peft"]
-dev = ["cut-cross-entropy", "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
+test = ["coverage", "pytest", "peft>=0.18.1", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
+dev = ["cut-cross-entropy", "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')", "dion @ git+https://github.com/microsoft/dion.git; platform_machine == 'x86_64' and platform_system != 'Darwin'"]
 
 [tool.uv]
 default-groups = ["build", "docs", "test"]
@@ -173,13 +175,25 @@ no-build-isolation-package = [
     "transformer-engine-torch",
 ]
 constraint-dependencies = [
+    "aiohttp>=3.13.3", # Address CVE GHSA-6mq8-rvhq-8wgg
+    "cryptography>=46.0.5", # Address CVE GHSA-r6ph-v2qm-q3c2
+    "jaraco-context>=6.1.0", # Address CVE GHSA-58pv-8j8x-9vj2
+    "pillow>=12.1.1", # Address CVE GHSA-cfh3-3jmp-rvhc
+    "protobuf>=6.33.5", # Address CVE GHSA-7gcm-g887-7qv7
+    "pyasn1>=0.6.2", # Address CVE GHSA-63vm-454h-vhhq
     "starlette>=0.49.1", # Address CVE GHSA-7f5h-v6xp-fcq8
+    "setuptools>=80.10.2",
+    "urllib3>=2.6.3", # Address CVE GHSA-gm62-xv2j-4w53
+    "wheel>=0.46.2", # Address CVE GHSA-8rrh-rw8j-w5fx
+    "fonttools>=4.60.2", # Address CVE-2025-66034
+    "mlflow>=3.10.0rc0", # Address CVE
 ]
+prerelease = "allow"
 
 [tool.uv.sources]
 deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "e3908bf5bd0cc6265bcb225d15cd8c996d4759ef" }
 cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
-liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "49e63538e64b00780e424e34bc4f193dcfeba75c" }
+liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" }
 torch = [
   { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
   { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
@@ -226,6 +240,9 @@ name = "nv_grouped_gemm"
 version = "1.1.4.post8"
 requires-dist = ["torch", "packaging", "ninja", "setuptools"]
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
 [tool.coverage.paths]
 source = [".", "/workspace", "/home/runner/work/Automodel/Automodel"]
 
@@ -243,6 +260,8 @@ omit = [
     "nemo_automodel/_transformers/tokenization/tokenization_mistral_common.py",
     # requires databricks
     "nemo_automodel/components/datasets/llm/delta_lake_dataset.py",
+    # Weird file suddenly appearing in coverage
+    "_remote_module_non_scriptable",
 ]
 
 [tool.ruff]
