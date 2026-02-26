@@ -13,9 +13,7 @@
 # limitations under the License.
 
 # Finetuning config for DeepSeek V3.2 on HellaSwag
-#
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm/finetune.py --config examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml
+# Replace /path/to/deepseek-v32 with the path to the DeepSeek V3.2 model
 
 seed: 1234
 
@@ -27,47 +25,46 @@ step_scheduler:
   num_epochs: 2
 
 distributed:
+  strategy: fsdp2
   tp_size: 1
   cp_size: 1
   pp_size: 4
   ep_size: 64
 
-distributed_config:
-  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false
+  activation_checkpointing: true
 
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.config.PipelineConfig
-  pp_schedule: interleaved1f1b
-  pp_microbatch_size: 1
-  round_virtual_stages_to_pp_multiple: down
-  scale_grads_in_schedule: false
-  patch_inner_model: false
-  patch_causal_lm_model: false
-  layers_per_stage: 2
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
+
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
 
 dist_env:
   backend: nccl
   timeout_minutes: 10
 
-moe_config:
-  _target_: nemo_automodel.components.moe.config.MoEParallelizerConfig
-  activation_checkpointing: true
-  reshard_after_forward: false
-  wrap_outer_model: false
-
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: nemo_automodel.components.models.deepseek_v32.config.DeepseekV32Config.from_pretrained
-    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3.2
+    pretrained_model_name_or_path: /path/to/deepseek-v32
+    name_or_path: /path/to/deepseek-v32
   trust_remote_code: true
+  load_base_model: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa # TE requires the latest cudnn version so disabling by default
     linear: te
     rms_norm: te
-    rope_fusion: true
+    rope_fusion: false
     enable_deepep: true
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
@@ -75,7 +72,6 @@ model:
 
 checkpoint:
   enabled: false
-  load_base_model: true
   dequantize_base_checkpoint: true
 
 loss_fn:
@@ -86,6 +82,9 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: /path/to/deepseek-v32
 
 packed_sequence:
   packed_sequence_size: 0
@@ -101,6 +100,9 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: /path/to/deepseek-v32
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

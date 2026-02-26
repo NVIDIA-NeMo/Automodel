@@ -189,14 +189,14 @@ class DummyModelConfig:
 
     def get(self, key, default=None):
         return getattr(self, key, default)
-    
+
     def get_as_string(self, key, default=None):
         return str(getattr(self, key, default))
 
 
 def test_peft_with_pipeline_parallelism_enabled(caplog):
     """Test that _apply_peft_and_lower_precision disables triton with PP."""
-    from nemo_automodel._transformers.auto_model import _apply_peft_and_lower_precision
+    from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
 
     cfg_peft = DummyPeftConfig()
     model = DummyModel()
@@ -230,7 +230,13 @@ def test_peft_without_pipeline_parallelism(caplog):
                 with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
                     with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
                         with patch('nemo_automodel._transformers.infrastructure._shard_ep_fsdp') as mock_shard:
-                            mock_shard.return_value = DummyModel()
+                            # Return a DummyModel with lora_dummy_param so freeze doesn't remove all trainable params
+                            sharded_model = DummyModel()
+                            sharded_model.register_parameter(
+                                "lora_dummy_param",
+                                nn.Parameter(torch.tensor(1.0, device=torch.device("cuda")), requires_grad=True)
+                            )
+                            mock_shard.return_value = sharded_model
                             with caplog.at_level(logging.INFO):
                                 # This should work fine without PP
                                 model = build_model(
@@ -250,7 +256,7 @@ def test_peft_without_pipeline_parallelism(caplog):
 
 def test_peft_with_tp_disables_triton(caplog):
     """Test that _apply_peft_and_lower_precision disables triton with TP."""
-    from nemo_automodel._transformers.auto_model import _apply_peft_and_lower_precision
+    from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
 
     cfg_peft = DummyPeftConfig()
     model = DummyModel()
@@ -394,10 +400,18 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         "nemo_automodel.recipes.llm.train_ft.build_checkpoint_config",
         lambda *a, **k: SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None),
     )
-    # Avoid requiring a distributed _target_
+    # Stub setup_distributed to avoid requiring torch.distributed init
     monkeypatch.setattr(
-        "nemo_automodel.components.config.loader.ConfigNode.instantiate",
-        lambda self, *a, **k: SimpleNamespace(pp_size=0, device_mesh=None, moe_mesh=None),
+        "nemo_automodel.recipes.llm.train_ft.setup_distributed",
+        lambda cfg, world_size: SimpleNamespace(
+            strategy_config=None,
+            pipeline_config=None,
+            moe_config=None,
+            activation_checkpointing=False,
+            pp_enabled=False,
+            device_mesh=None,
+            moe_mesh=None,
+        ),
     )
 
     # Stub Checkpointer
@@ -667,6 +681,7 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
     object.__setattr__(recipe, "pp_enabled", True)
     object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info))
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
+    object.__setattr__(recipe, "te_fp8", None)
 
     return recipe
 
@@ -1155,6 +1170,160 @@ def test_build_model_and_optimizer_return_values():
 # =============================================================================
 # Tests for _get_model_name helper
 # =============================================================================
+
+# =============================================================================
+# Tests for PP mask precomputation guard in build_dataloader
+# =============================================================================
+
+
+def test_build_dataloader_pp_autoconfig_failure_skips_mask_collate(caplog):
+    """When AutoConfig.from_pretrained raises, mask precomputation is skipped and a warning is logged."""
+    cfg_ds = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
+            "tokenizer": None,
+            "num_shards": 4,
+        }
+    )
+    cfg_dl = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
+            "num_workers": 0,
+        }
+    )
+    cfg_model = ConfigNode({"pretrained_model_name_or_path": "bad/model"})
+    cfg_ps = ConfigNode({})
+
+    with (
+        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", side_effect=OSError("not found")),
+        caplog.at_level(logging.WARNING),
+    ):
+        dl, tok = build_dataloader(
+            cfg_ds=cfg_ds,
+            cfg_dl=cfg_dl,
+            cfg_model=cfg_model,
+            cfg_ps=cfg_ps,
+            seed=123,
+            local_batch_size=2,
+            global_batch_size=4,
+            max_steps=None,
+            val_check_interval=None,
+            dp_rank=0,
+            dp_world_size=1,
+            pp_enabled=True,
+        )
+
+    assert "Failed to load model config for causal mask precomputation" in caplog.text
+    # collate_fn should NOT have been set since AutoConfig failed
+    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
+    captured = getattr(mod.dl_factory_capture, "captured")
+    assert "collate_fn" not in captured
+
+
+def test_build_dataloader_pp_autoconfig_success_sets_mask_collate():
+    """When AutoConfig.from_pretrained succeeds and no collate_fn exists, a mask-only collate is set."""
+    cfg_ds = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
+            "tokenizer": None,
+            "num_shards": 4,
+        }
+    )
+    cfg_dl = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
+            "num_workers": 0,
+        }
+    )
+    cfg_model = ConfigNode({"pretrained_model_name_or_path": "good/model"})
+    cfg_ps = ConfigNode({})
+
+    mock_config = MagicMock()
+    with (
+        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=mock_config),
+        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch", side_effect=lambda b, **kw: b),
+    ):
+        dl, tok = build_dataloader(
+            cfg_ds=cfg_ds,
+            cfg_dl=cfg_dl,
+            cfg_model=cfg_model,
+            cfg_ps=cfg_ps,
+            seed=123,
+            local_batch_size=2,
+            global_batch_size=4,
+            max_steps=None,
+            val_check_interval=None,
+            dp_rank=0,
+            dp_world_size=1,
+            pp_enabled=True,
+        )
+
+    # collate_fn should have been set (mask-only path)
+    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
+    captured = getattr(mod.dl_factory_capture, "captured")
+    assert "collate_fn" in captured
+    assert callable(captured["collate_fn"])
+
+
+def test_build_dataloader_pp_autoconfig_success_chains_existing_collate():
+    """When AutoConfig.from_pretrained succeeds and collate_fn exists, they are chained."""
+    call_order = []
+
+    def my_collate(batch):
+        call_order.append("base")
+        return batch
+
+    cfg_ds = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
+            "tokenizer": None,
+            "num_shards": 4,
+        }
+    )
+    cfg_dl = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
+            "num_workers": 0,
+            "collate_fn": my_collate,
+        }
+    )
+    cfg_model = ConfigNode({"pretrained_model_name_or_path": "good/model"})
+    cfg_ps = ConfigNode({})
+
+    mock_config = MagicMock()
+
+    def mock_add_masks(batch, model_config=None):
+        call_order.append("masks")
+        return batch
+
+    with (
+        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=mock_config),
+        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch", side_effect=mock_add_masks),
+    ):
+        dl, tok = build_dataloader(
+            cfg_ds=cfg_ds,
+            cfg_dl=cfg_dl,
+            cfg_model=cfg_model,
+            cfg_ps=cfg_ps,
+            seed=123,
+            local_batch_size=2,
+            global_batch_size=4,
+            max_steps=None,
+            val_check_interval=None,
+            dp_rank=0,
+            dp_world_size=1,
+            pp_enabled=True,
+        )
+
+    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
+    captured = getattr(mod.dl_factory_capture, "captured")
+    assert "collate_fn" in captured
+    chained_fn = captured["collate_fn"]
+
+    # Invoke the chained collate to verify ordering
+    chained_fn(["dummy_batch"])
+    assert call_order == ["base", "masks"]
+
 
 @pytest.mark.parametrize("cfg_attrs,expected", [
     # String config

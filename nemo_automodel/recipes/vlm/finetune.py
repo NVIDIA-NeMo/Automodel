@@ -32,14 +32,13 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 from wandb import Settings
 
-from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+from nemo_automodel._transformers import NeMoAutoModelForImageTextToText, NeMoAutoModelForMultimodalLM
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
-from nemo_automodel.components.distributed.device_mesh import create_device_mesh
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
@@ -60,6 +59,7 @@ from nemo_automodel.components.training.utils import (
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
 from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
+from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -88,13 +88,14 @@ def build_model(
     cfg_freeze,
     cfg_peft,
     seed,
-    freeze_embeddings=True,
     cfg_fp8=None,
     cfg_compile=None,
     device_mesh=None,
     moe_mesh=None,
     distributed_config=None,
     pipeline_config=None,
+    cfg_moe=None,
+    activation_checkpointing=False,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model for VLM.
 
@@ -111,6 +112,20 @@ def build_model(
             "pipeline_config": pipeline_config,
             "freeze_config": cfg_freeze.to_dict() if cfg_freeze is not None else None,
         }
+
+        if cfg_moe is not None:
+            from nemo_automodel.components.moe.config import MoEParallelizerConfig
+
+            if isinstance(cfg_moe, MoEParallelizerConfig):
+                kwargs["moe_config"] = cfg_moe
+            else:
+                moe_dict = cfg_moe.to_dict() if hasattr(cfg_moe, "to_dict") else dict(cfg_moe)
+                # activation_checkpointing is handled separately; strip config keys
+                moe_dict.pop("activation_checkpointing", None)
+                moe_dict.pop("_target_", None)
+                kwargs["moe_config"] = MoEParallelizerConfig(**moe_dict)
+            kwargs["activation_checkpointing"] = activation_checkpointing
+
         if cfg_fp8 is not None:
             fp8_config = build_fp8_config(cfg_fp8)
             kwargs["fp8_config"] = fp8_config
@@ -121,6 +136,8 @@ def build_model(
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
             NeMoAutoModelForImageTextToText.from_config,
             NeMoAutoModelForImageTextToText.from_pretrained,
+            NeMoAutoModelForMultimodalLM.from_config,
+            NeMoAutoModelForMultimodalLM.from_pretrained,
         )
 
         if is_nemo_auto_model:
@@ -238,21 +255,22 @@ def build_dataloader(
     with ScopedRNG(seed=seed, ranked=True):
         processor = None
         processor_kwargs = {}
-        if cfg_processor is not None and hasattr(cfg_processor, "instantiate"):
-            processor = cfg_processor.instantiate()
-        elif cfg_processor is not None:
-            processor_kwargs = cfg_processor.to_dict()
-
-        # If no processor was instantiated, try AutoProcessor
-        if processor is None:
-            try:
-                processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
-            except Exception as e:
-                # Some models do not provide an AutoProcessor
-                processor = None
-                logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
 
         with FirstRankPerNode():
+            if cfg_processor is not None and hasattr(cfg_processor, "instantiate"):
+                processor = cfg_processor.instantiate()
+            elif cfg_processor is not None:
+                processor_kwargs = cfg_processor.to_dict()
+
+            # If no processor was instantiated, try AutoProcessor
+            if processor is None:
+                try:
+                    processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
+                except Exception as e:
+                    # Some models do not provide an AutoProcessor
+                    processor = None
+                    logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
+
             ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
 
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -477,23 +495,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
-        self.device_mesh = None
-        self.moe_mesh = None
-        self.distributed_config = None
-
-        if "distributed_config" in self.cfg:
-            self.distributed_config = self.cfg.distributed_config.instantiate()
-
-            self.device_mesh, self.moe_mesh = create_device_mesh(
-                self.distributed_config,
-                dp_size=self.cfg.get("distributed.dp_size", None),
-                dp_replicate_size=self.cfg.get("distributed.dp_replicate_size", None),
-                tp_size=self.cfg.get("distributed.tp_size", 1),
-                pp_size=self.cfg.get("distributed.pp_size", 1),
-                cp_size=self.cfg.get("distributed.cp_size", 1),
-                ep_size=self.cfg.get("distributed.ep_size", 1),
-                world_size=self.dist_env.world_size,
-            )
+        self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+        self.distributed_config = self.dist_setup.strategy_config
+        self.device_mesh = self.dist_setup.device_mesh
+        self.moe_mesh = self.dist_setup.moe_mesh
+        self.pp_enabled = self.dist_setup.pp_enabled
+        self.pipeline_config = self.dist_setup.pipeline_config
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -504,38 +511,29 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self._log_experiment_details()
         self._log_library_versions()
 
-        self.pp_enabled: bool = self.cfg.get("distributed.pp_size", 1) > 1
+        # Build loss_fn (will be set on pipeline_config if PP enabled)
+        self.loss_fn = build_loss_fn(self.cfg.loss_fn)
 
-        # Build pipeline config if PP enabled
-        self.pipeline_config = None
+        # Pipeline runtime fields: override pp_batch_size and pp_microbatch_size
         if self.pp_enabled:
-            pp_size = self.cfg.get("distributed.pp_size", 1)
             pp_batch_size = self.cfg.step_scheduler.local_batch_size
-            pp_microbatch_size = self.cfg.autopipeline.pp_microbatch_size
+            pp_microbatch_size = self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
 
-            assert pp_batch_size // pp_microbatch_size >= pp_size, (
-                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {pp_size}"
+            assert pp_batch_size // pp_microbatch_size >= self.dist_setup.pp_size, (
+                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.dist_setup.pp_size}"
             )
 
-            assert self.cfg.get("autopipeline", None) is not None, (
-                "AutoPipeline configuration is required when pipeline parallelism is enabled"
-            )
             assert not isinstance(self.distributed_config, MegatronFSDPConfig), (
                 "MegatronFSDPConfig is not supported when pipeline parallelism is enabled"
             )
 
-            # Build loss_fn first (needed for pipeline_config)
-            self.loss_fn = build_loss_fn(self.cfg.loss_fn)
-
-            # Instantiate PipelineConfig from YAML, override runtime-computed args
-            self.pipeline_config = self.cfg.autopipeline.instantiate(
-                pp_microbatch_size=pp_microbatch_size,
-                pp_batch_size=pp_batch_size,
-                patch_stage_backward_maybe_with_nosync=self.cfg.get("model.backend.enable_fsdp_optimizations", False),
-                loss_fn=self.loss_fn,
+            # Update pipeline_config runtime fields
+            self.pipeline_config.pp_batch_size = pp_batch_size
+            self.pipeline_config.pp_microbatch_size = pp_microbatch_size
+            self.pipeline_config.patch_stage_backward_maybe_with_nosync = self.cfg.get(
+                "model.backend.enable_fsdp_optimizations", False
             )
-        else:
-            self.loss_fn = build_loss_fn(self.cfg.loss_fn)
+            self.pipeline_config.loss_fn = self.loss_fn
 
         # Build components with VLM-specific functions
         self.peft_config = None
@@ -576,6 +574,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             moe_mesh=self.moe_mesh,
             distributed_config=self.distributed_config,
             pipeline_config=self.pipeline_config,
+            cfg_moe=self.dist_setup.moe_config,
+            activation_checkpointing=self.dist_setup.activation_checkpointing,
         )
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 

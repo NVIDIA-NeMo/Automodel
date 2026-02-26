@@ -24,38 +24,14 @@ from nemo_automodel.shared.utils import dtype_from_str
 
 @dataclass
 class MoEParallelizerConfig:
-    """
-    Configuration for MoE (Mixture of Experts) model parallelization.
+    """Configuration for MoE model parallelization (EP + FSDP settings)."""
 
-    This config controls how MoE models are parallelized with expert parallelism,
-    activation checkpointing, and FSDP settings.
-
-    Attributes:
-        activation_checkpointing (bool): Enable activation checkpointing for
-            transformer blocks to reduce memory usage. Defaults to False.
-        ignore_router_for_ac (bool): If True, uses selective checkpointing that
-            saves router outputs during activation checkpointing. This can improve
-            training stability for MoE models. Defaults to False.
-        reshard_after_forward (bool): If True, reshard parameters after forward
-            pass in FSDP. Can reduce memory but may increase communication.
-            Defaults to False.
-        lm_head_precision (Optional[Union[str, torch.dtype]]): Precision for the
-            language model head. If "float32" or torch.float32, uses full precision
-            for the lm_head to improve training stability. Defaults to None (uses
-            default mixed precision policy).
-        wrap_outer_model (bool): If True, wraps the outer model with FSDP when
-            the model has nested structure (e.g., CausalLM wrapping base model).
-            Defaults to True.
-    """
-
-    activation_checkpointing: bool = False
     ignore_router_for_ac: bool = False
     reshard_after_forward: bool = False
     lm_head_precision: Optional[Union[str, torch.dtype]] = None
     wrap_outer_model: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert config to dictionary."""
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
 
@@ -90,3 +66,23 @@ class MoEConfig:
     def __post_init__(self):
         if isinstance(self.dtype, str):
             self.dtype = dtype_from_str(self.dtype, default=torch.bfloat16)
+
+
+@dataclass
+class MoEMetricsConfig:
+    """Configuration for MoE load balance metrics logging.
+
+    Attributes:
+        enabled: Whether to enable load balance metric tracking.
+        mode: Logging mode - "brief" for scalar line charts only,
+            "detailed" adds per-layer breakdowns.
+        detailed_every_steps: How often to log detailed metrics (only used when mode="detailed").
+            None means every step.
+        top_k_experts: Number of top (highest) and bottom (lowest) utilization experts
+            to emit per layer. Reduces wandb key count for models with many experts.
+    """
+
+    enabled: bool = False
+    mode: str = "brief"
+    detailed_every_steps: Optional[int] = None
+    top_k_experts: int = 5

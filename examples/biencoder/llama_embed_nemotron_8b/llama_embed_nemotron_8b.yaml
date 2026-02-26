@@ -19,6 +19,9 @@
 
 seed: 125
 
+train_n_passages: 5
+temperature: 0.02
+
 step_scheduler:
   global_batch_size: 128
   local_batch_size: 1
@@ -26,16 +29,10 @@ step_scheduler:
   val_every_steps: 3000
   num_epochs: 1
 
-dist_env:
-  backend: nccl
-  timeout_minutes: 1
-
 model:
-  _target_: nemo_automodel.components.models.biencoder.NeMoAutoModelBiencoder.from_pretrained
+  _target_: nemo_automodel.NeMoAutoModelBiencoder.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
-  train_n_passages: 5
   pooling: avg
-  t: 0.02
   torch_dtype: bfloat16
 
 tokenizer:
@@ -95,12 +92,11 @@ checkpoint:
   save_consolidated: true
 
 distributed:
+  strategy: fsdp2
   dp_size: none
   tp_size: 1
   cp_size: 1
 
-distributed_config:
-  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false
 
 dist_env:

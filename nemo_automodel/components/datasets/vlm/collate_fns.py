@@ -36,6 +36,8 @@ except ImportError:
 import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from PIL import Image as PILImage
+
 logger = logging.getLogger(__name__)
 
 from nemo_automodel.components.datasets.vlm.utils import default_stop_tokens
@@ -308,6 +310,7 @@ def kimi_vl_collate_fn(
         "return_tensors": "pt",
         "padding": True,
         "truncation": True,
+        "add_special_tokens": False,
     }
     if max_length is not None:
         processor_kwargs["max_length"] = max_length
@@ -601,6 +604,18 @@ def nemotron_parse_collate_fn(
     return batch
 
 
+def _ensure_rgb(conversations):
+    """Convert any PIL images in conversations to RGB to handle RGBA/grayscale inputs."""
+    for conv in conversations:
+        for turn in conv:
+            content = turn.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and isinstance(item.get("image"), PILImage.Image):
+                        item["image"] = item["image"].convert("RGB")
+    return conversations
+
+
 def default_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
@@ -610,7 +625,7 @@ def default_collate_fn(
     if not HAVE_QWEN_VL_UTILS:
         raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
 
-    conversations = [example["conversation"] for example in examples]
+    conversations = _ensure_rgb([example["conversation"] for example in examples])
     processor_kwargs = {
         "tokenize": True,
         "padding": True,

@@ -48,22 +48,20 @@ peft:
   dropout: 0.0
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints/qwen3_moe_lora
   model_save_format: safetensors
 
-moe_config:
-  _target_: nemo_automodel.components.moe.config.MoEParallelizerConfig
-  activation_checkpointing: true
-
 distributed:
+  strategy: fsdp2
   tp_size: 1
   cp_size: 1
   pp_size: 1
   ep_size: 8
+  activation_checkpointing: true
 
-distributed_config:
-  _target_: nemo_automodel.components.distributed.config.FSDP2Config
+  sequence_parallel: false
+  activation_checkpointing: true
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

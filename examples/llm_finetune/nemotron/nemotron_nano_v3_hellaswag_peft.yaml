@@ -13,10 +13,8 @@
 # limitations under the License.
 
 
-# To run this recipe, please use the following command. Replace --nproc-per-node=8 with the number of GPUs on your node:
-# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_v3_squad_peft.yaml
-# For multi-node, use the following:
-# torchrun --nproc-per-node=8 --nnodes=2 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_v3_squad_peft.yaml
+# To run this recipe, please use the following command:
+# python examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag_peft.yaml
 
 
 step_scheduler:
@@ -39,6 +37,10 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   trust_remote_code: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    rms_norm: torch
+    linear: torch
 
 # torch.compile configuration
 compile:
@@ -50,18 +52,18 @@ compile:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  exclude_modules: ["*.out_proj"]  # mamba layers use custom kernels that take in the out_proj.weight directly, thus lora doesn't work here.
   dim: 8
   alpha: 32
   use_triton: True
 
 distributed:
+  strategy: fsdp2
   dp_size: none
   tp_size: 1
   cp_size: 1
+  ep_size: 4
 
-distributed_config:
-  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false
 
 loss_fn:

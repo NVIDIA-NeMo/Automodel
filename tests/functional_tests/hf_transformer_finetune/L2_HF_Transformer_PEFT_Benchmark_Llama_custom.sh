@@ -26,8 +26,9 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
 nemo_automodel/recipes/llm/benchmark.py \
     --config examples/llm_finetune/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark.yaml \
     --model.pretrained_model_name_or_path=${MODEL_PATH} \
+    --model.num_hidden_layers=2 \
     --distributed.tp_size=2 \
     --distributed.pp_size=1 \
-    --distributed_config.sequence_parallel=False \
+    --distributed.sequence_parallel=False \
     --benchmark.warmup_steps=2 \
     --step_scheduler.max_steps=4

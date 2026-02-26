@@ -20,7 +20,7 @@ step_scheduler:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 1
+  timeout_minutes: 10
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
@@ -46,24 +46,22 @@ checkpoint:
   save_consolidated: false
 
 distributed:
+  strategy: fsdp2
   dp_size: none
   tp_size: 2
   cp_size: 1
   pp_size: 4
 
-distributed_config:
-  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false
   activation_checkpointing: true
 
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.config.PipelineConfig
-  pp_schedule: interleaved1f1b
-  pp_microbatch_size: 1
-  layers_per_stage: 2
-  scale_grads_in_schedule: false
-  round_virtual_stages_to_pp_multiple: up
-  dtype: bf16
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 2
+    scale_grads_in_schedule: false
+    round_virtual_stages_to_pp_multiple: up
+    dtype: bf16
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

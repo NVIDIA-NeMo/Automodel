@@ -15,22 +15,26 @@
 
 set -exo pipefail
 
+COVERAGE_ARGS="--data-file=/workspace/.coverage --source=/workspace/ --parallel-mode"
+
 # Run the biencoder recipe (uses nemo_automodel/recipes/biencoder/train_biencoder.py via module entrypoint).
-python3 -m nemo_automodel.recipes.biencoder.train_biencoder \
+python3 -m coverage run ${COVERAGE_ARGS} \
+    -m nemo_automodel.recipes.biencoder.train_biencoder \
     --config \
     tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/recipe.yaml \
     --model.pretrained_model_name_or_path $TEST_DATA_DIR/llama-nemotron-embed-1b-v2/ \
     --tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/llama-nemotron-embed-1b-v2/ \
-    --dataloader.dataset.data_dir_list [$TEST_DATA_DIR/embedding_testdata/training.jsonl] \
+    --dataloader.dataset.data_dir_list $TEST_DATA_DIR/embedding_testdata/training.jsonl \
 
 # Compare baseline vs finetuned biencoder checkpoint (pos-neg separation should not degrade).
-python3 \
+python3 -m coverage run --append ${COVERAGE_ARGS} \
     tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/compare_biencoder_models.py \
     $TEST_DATA_DIR/llama-nemotron-embed-1b-v2 \
     /workspace/output/biencoder_inline/checkpoints/epoch_0_step_31/ \
-    $TEST_DATA_DIR/embedding_testdata/testing.jsonl
+    $TEST_DATA_DIR/embedding_testdata/testing.jsonl \
+    true
 
-# ---- Checkpoint restoration tests ----
+# Checkpoint restoration tests
 # Test 1: Full-model checkpoint restoration (NeMo -> save -> transformers load)
 # Test 2: PEFT (LoRA) checkpoint restoration (NeMo -> save -> transformers + safetensors load)
 BASE_MODEL_PATH=$TEST_DATA_DIR/llama-nemotron-embed-1b-v2 \
@@ -38,5 +42,6 @@ CHECKPOINT_DIR=/workspace/output/biencoder_ckpt_restore/checkpoints \
 PEFT_CHECKPOINT_DIR=/workspace/output/biencoder_ckpt_restore_peft/checkpoints \
 RECIPE_YAML=tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/recipe_ckpt_restore.yaml \
 PEFT_RECIPE_YAML=tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/recipe_peft.yaml \
-python3 -m pytest -xvs \
+python3 -m coverage run --append ${COVERAGE_ARGS} \
+    -m pytest -xvs \
     tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/test_biencoder_checkpoint_restoration.py

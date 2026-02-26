@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.step3p5.layers import (
     Step3p5Attention,
@@ -342,7 +343,7 @@ class Step3p5Model(nn.Module):
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class Step3p5ForCausalLM(nn.Module, MoEFSDPSyncMixin):
+class Step3p5ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Step3p5 model for causal language modeling."""
 
     @classmethod
@@ -394,6 +395,18 @@ class Step3p5ForCausalLM(nn.Module, MoEFSDPSyncMixin):
                 self.backend,
                 dtype=get_dtype(getattr(config, "torch_dtype", "bfloat16"), torch.bfloat16),
             )
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
 
     def forward(
         self,

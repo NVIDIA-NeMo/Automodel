@@ -38,6 +38,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-Nano-9B-v2
   trust_remote_code: true
+  force_hf: true
 
 # torch.compile configuration
 compile:
@@ -48,12 +49,11 @@ compile:
   backend: null  # Use default backend (inductor)
 
 distributed:
+  strategy: fsdp2
   dp_size: none
   tp_size: 1
   cp_size: 1
 
-distributed_config:
-  _target_: nemo_automodel.components.distributed.config.FSDP2Config
   sequence_parallel: false
 
 loss_fn:
