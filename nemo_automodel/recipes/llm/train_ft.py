@@ -1008,6 +1008,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self._get_dp_group_size(),
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
         )
+        self._setup_garbage_collection(self.step_scheduler)
 
         # Build learning rate scheduler
         self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
@@ -1181,6 +1182,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         val_losses,
                         best_metric_key=self.best_metric_key,
                     )
+                self._maybe_collect_garbage()
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():

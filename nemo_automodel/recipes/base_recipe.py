@@ -44,6 +44,7 @@ except ImportError:
 from nemo_automodel.components.checkpoint.checkpointing import save_config
 from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.components.training.garbage_collection import GarbageCollection
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 
@@ -652,6 +653,7 @@ class BaseRecipe:
         attrs = {
             "Gradient accumulation steps": step_scheduler.grad_acc_steps,
             "Checkpoint every steps": step_scheduler.ckpt_every_steps,
+            "Garbage collect every steps": getattr(step_scheduler, "gc_every_steps", None),
             "Current Epoch": step_scheduler.epoch,
             "Number of epochs": step_scheduler.num_epochs,
             "Validation every steps": step_scheduler.val_every_steps,
@@ -660,6 +662,27 @@ class BaseRecipe:
         logging.info("Step scheduler:")
         for k, v in attrs.items():
             logging.info(f"- {k}: {v}")
+
+    def _setup_garbage_collection(self, step_scheduler: StepScheduler | None = None) -> None:
+        """Initialize manual garbage collection based on step scheduler config."""
+        if step_scheduler is None:
+            step_scheduler = getattr(self, "step_scheduler", None)
+
+        gc_every_steps = getattr(step_scheduler, "gc_every_steps", None)
+        if gc_every_steps is None:
+            self.garbage_collector = None
+            return
+
+        self.garbage_collector = GarbageCollection(gc_every_steps=gc_every_steps)
+
+    def _maybe_collect_garbage(self) -> None:
+        """Run manual garbage collection if the current step is configured for it."""
+        step_scheduler = getattr(self, "step_scheduler", None)
+        garbage_collector = getattr(self, "garbage_collector", None)
+        if step_scheduler is None or garbage_collector is None:
+            return
+
+        garbage_collector.run(step_scheduler.step)
 
     def _get_dp_group(self, include_cp: bool = False):
         if not self.device_mesh:
