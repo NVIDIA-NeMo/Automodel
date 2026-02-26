@@ -104,6 +104,7 @@ def _make_tiny_moe_model(device="cpu"):
             return None
 
     model = TinyMoE().to(device)
+    model.state_dict_adapter = _Adapter()
     peft_config = PeftConfig(
         target_modules=["*experts*"],
         dim=LORA_DIM,

@@ -22,6 +22,7 @@ import torch
 from torch import nn
 
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
+from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -275,31 +276,33 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
     # Detect MoE expert LoRA: adapter weights stored as nn.Parameter (not
     # nn.Module) so they don't appear in named_modules(). Scan parameters
     # and expand to per-expert HF projection names.
-    # Track (expert_path, group) to avoid redundant work while still
-    # processing both "gate_and_up" and "down" groups independently.
-    seen_expert_groups: set[tuple[str, str]] = set()
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        for lora_suffix in _MOE_LORA_SUFFIXES:
-            if name.endswith(f".{lora_suffix}"):
-                expert_path = name[: -len(f".{lora_suffix}")]
-                if expert_path.startswith("_orig_mod."):
-                    expert_path = expert_path[len("_orig_mod.") :]
+    # Only applies to models that use split-expert state dict conversion
+    # (MoESplitExpertsStateDictMixin); models with natively merged experts
+    # (e.g. Qwen 3.5) don't need per-expert expansion.
+    if hasattr(model, "state_dict_adapter") and isinstance(model.state_dict_adapter, MoESplitExpertsStateDictMixin):
+        seen_expert_groups: set[tuple[str, str]] = set()
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            for lora_suffix in _MOE_LORA_SUFFIXES:
+                if name.endswith(f".{lora_suffix}"):
+                    expert_path = name[: -len(f".{lora_suffix}")]
+                    if expert_path.startswith("_orig_mod."):
+                        expert_path = expert_path[len("_orig_mod.") :]
 
-                group = "gate_and_up" if "gate_and_up" in lora_suffix else "down"
-                if (expert_path, group) in seen_expert_groups:
+                    group = "gate_and_up" if "gate_and_up" in lora_suffix else "down"
+                    if (expert_path, group) in seen_expert_groups:
+                        break
+                    seen_expert_groups.add((expert_path, group))
+
+                    n_experts = param.shape[0]
+                    for expert_id in range(n_experts):
+                        if group == "gate_and_up":
+                            final_target_modules.add(f"{expert_path}.{expert_id}.gate_proj")
+                            final_target_modules.add(f"{expert_path}.{expert_id}.up_proj")
+                        else:
+                            final_target_modules.add(f"{expert_path}.{expert_id}.down_proj")
                     break
-                seen_expert_groups.add((expert_path, group))
-
-                n_experts = param.shape[0]
-                for expert_id in range(n_experts):
-                    if group == "gate_and_up":
-                        final_target_modules.add(f"{expert_path}.{expert_id}.gate_proj")
-                        final_target_modules.add(f"{expert_path}.{expert_id}.up_proj")
-                    else:
-                        final_target_modules.add(f"{expert_path}.{expert_id}.down_proj")
-                break
 
     return sorted(list(final_target_modules))
 
