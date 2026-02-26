@@ -283,7 +283,19 @@ def _list_hf_subsets(repo_id: str) -> List[str]:
 
 
 def _load_hf_subset(repo_id: str, subset: str):
-    """Load a single HF subset and return ``(normalized_data_list, CorpusInfo)``."""
+    """Load a single HF subset and return ``(normalized_data_list, CorpusInfo)``.
+
+    Note:
+        The direct ``hf://`` path currently expects the Automodel retrieval schema:
+        - ``{subset}/dataset_metadata.json`` with ``corpus_id`` metadata
+        - ``{subset}_corpus`` split with corpus columns like ``id`` and ``text``
+        - ``{subset}`` split with query columns like ``question`` and ``pos_doc``
+
+        FEVER and SyntheticClassificationData from
+        ``nvidia/embed-nemotron-dataset-v1`` are examples that follow this layout.
+        Datasets with different structures should use a custom adapter/preprocessor
+        before calling this loader.
+    """
 
     # 1. Download dataset_metadata.json
     meta_path = hf_hub_download(
@@ -315,7 +327,9 @@ def _load_hf_subset(repo_id: str, subset: str):
             f"HF corpus dataset '{repo_id}/{subset}_corpus' does not match the expected schema. "
             f"Required columns: {sorted(_CORPUS_REQUIRED_COLS)}, "
             f"found columns: {sorted(corpus_hf.column_names)}. "
-            f"Missing: {sorted(missing_cols)}."
+            f"Missing: {sorted(missing_cols)}. "
+            f"If your dataset uses a different format, implement a custom "
+            f"adapter/preprocessor before using direct hf:// loading."
         )
 
     # 3. Build HFCorpusDataset + CorpusInfo
@@ -332,7 +346,9 @@ def _load_hf_subset(repo_id: str, subset: str):
             f"HF query dataset '{repo_id}/{subset}' does not match the expected schema. "
             f"Required columns: {sorted(_QUERY_REQUIRED_COLS)}, "
             f"found columns: {sorted(queries_hf.column_names)}. "
-            f"Missing: {sorted(missing_query_cols)}."
+            f"Missing: {sorted(missing_query_cols)}. "
+            f"If your dataset uses a different format, implement a custom "
+            f"adapter/preprocessor before using direct hf:// loading."
         )
 
     # 5. Normalize to the standard {question_id, question, corpus_id, pos_doc, neg_doc} shape
@@ -552,6 +568,12 @@ def make_retrieval_dataset(
         - 'doc_image': List of images or empty strings
 
     Note:
+        Direct ``hf://`` loading currently supports HF datasets that already follow
+        the Automodel retrieval schema (corpus-id based layout used by
+        ``nvidia/embed-nemotron-dataset-v1`` subsets such as FEVER and
+        SyntheticClassificationData). For other HF dataset formats, implement a
+        custom adapter/preprocessor before calling this loader.
+
         Tokenization should be handled by a collator (e.g., RetrievalBiencoderCollator)
         which is more efficient for batch padding and supports dynamic processing.
     """
