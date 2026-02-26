@@ -283,7 +283,7 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
             if name.endswith(f".{lora_suffix}"):
                 expert_path = name[: -len(f".{lora_suffix}")]
                 if expert_path.startswith("_orig_mod."):
-                    expert_path = expert_path[len("_orig_mod."):]
+                    expert_path = expert_path[len("_orig_mod.") :]
                 if expert_path in seen_expert_paths:
                     break
                 seen_expert_paths.add(expert_path)

@@ -325,9 +325,7 @@ class MoESplitExpertsStateDictMixin:
                         continue
                     gate_ts = [experts[eid].transpose(0, 1).contiguous() for eid in sorted_ids]
                     up_ts = [up_experts[eid].transpose(0, 1).contiguous() for eid in sorted_ids]
-                    combined = torch.cat(
-                        [torch.stack(gate_ts, dim=0), torch.stack(up_ts, dim=0)], dim=-1
-                    )
+                    combined = torch.cat([torch.stack(gate_ts, dim=0), torch.stack(up_ts, dim=0)], dim=-1)
                     result[f"{base_key}.lora_gate_and_up_B"] = combined
                     processed.add(up_key)
                 else:
