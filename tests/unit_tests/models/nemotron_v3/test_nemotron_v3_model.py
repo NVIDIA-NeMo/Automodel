@@ -363,8 +363,8 @@ class TestNemotronHForCausalLM:
 
         assert output.logits.shape == (batch_size, seq_len, config.vocab_size)
 
-    def test_causal_lm_forward_float32_logits(self, config, backend):
-        """Test that logits are computed in float32."""
+    def test_causal_lm_forward_logits_dtype(self, config, backend):
+        """Test that logits preserve model dtype (no float32 upcast)."""
         from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
 
         model = NemotronHForCausalLM(config, backend=backend)
@@ -375,7 +375,7 @@ class TestNemotronHForCausalLM:
 
         output = model(input_ids)
 
-        assert output.logits.dtype == torch.float32
+        assert output.logits.dtype == torch.bfloat16
 
     def test_causal_lm_forward_with_inputs_embeds(self, config, backend):
         """Test causal LM forward pass with inputs_embeds."""
@@ -390,7 +390,7 @@ class TestNemotronHForCausalLM:
         output = model(inputs_embeds=inputs_embeds)
 
         assert output.logits.shape == (batch_size, seq_len, config.vocab_size)
-        assert output.logits.dtype == torch.float32
+        assert output.logits.dtype == torch.bfloat16
 
     def test_causal_lm_forward_no_input_ids_no_inputs_embeds_raises(self, config, backend):
         """Test that ValueError is raised when neither input_ids nor inputs_embeds is provided."""

@@ -10,6 +10,7 @@ The table below shows training performance for full sequences with no padding ac
 
 | Model | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec/GPU |
 |-------|------:|----:|----:|----:|---:|-----------:|---:|---:|---:|---:|---:|-----:|---------|-------------------------:|---------------------:|---------------:|
+| Nemotron V3 Nano 30B (26.02) | 8 | 512 | 4 | 4 | 16 | 4096 | 1 | 1 | 1 | 8 | - | 8 | TE + DeepEP + TorchSDPA | 15.614 | 328 | 16,789 |
 | DeepSeek V3 671B | 1024 | 8192 | 1 | 8 | 4 | 4096 | 1 | 4 | 1 | 64 | 8 | 256 | TE + DeepEP | 37.87 | 216 | 865 |
 | DeepSeek V3 671B | 256 | 512 | 1 | 8 | 1 | 4096 | 1 | 4 | 1 | 64 | 8 | 64 | TE + DeepEP | 8.18 | 250 | 1,002 |
 | Kimi K2 | 256 | 512 | 1 | 8 | 2 | 4096 | 1 | 8 | 1 | 32 | 4 | 32 | TE + DeepEP | 8.86 | 189 | 924 |
