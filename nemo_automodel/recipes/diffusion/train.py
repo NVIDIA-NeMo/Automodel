@@ -31,7 +31,7 @@ from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import build_distributed, build_wandb
 from torch.distributed.fsdp import MixedPrecisionPolicy
-from transformers.utils.hub import TRANSFORMERS_CACHE
+from huggingface_hub.constants import HF_HUB_CACHE
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
@@ -412,7 +412,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             enabled=checkpoint_cfg.get("enabled"),
             checkpoint_dir=checkpoint_cfg.get("checkpoint_dir"),
             model_save_format=checkpoint_cfg.get("model_save_format"),
-            model_cache_dir=model_cache_dir if model_cache_dir is not None else TRANSFORMERS_CACHE,
+            model_cache_dir=model_cache_dir if model_cache_dir is not None else HF_HUB_CACHE,
             model_repo_id=self.model_id,
             save_consolidated=checkpoint_cfg.get("save_consolidated"),
             is_peft=False,
