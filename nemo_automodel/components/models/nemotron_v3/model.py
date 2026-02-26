@@ -334,8 +334,9 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             ``loss``, ``past_key_values``, and ``hidden_states``.
         """
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None
-            else getattr(self.config, 'output_hidden_states', False)
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
         )
 
         # Forward through base model
