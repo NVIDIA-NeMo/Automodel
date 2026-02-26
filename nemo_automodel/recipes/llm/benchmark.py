@@ -67,7 +67,11 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if hasattr(cfg.model, "config") and hasattr(cfg.model.config, "pretrained_model_name_or_path"):
                 from transformers import AutoConfig
 
-                model_config = AutoConfig.from_pretrained(cfg.model.config.pretrained_model_name_or_path)
+                trust_remote_code = getattr(cfg.model.config, "trust_remote_code", False)
+
+                model_config = AutoConfig.from_pretrained(
+                    cfg.model.config.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+                )
                 vocab_size = model_config.vocab_size
                 # Inject vocab_size into dataset config
                 cfg.dataset.vocab_size = vocab_size
@@ -205,6 +209,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Main benchmarking loop
         for i in range(steps):
+            self.step_scheduler.step = i
             # Start nsys profiling if configured
             if i == nsys_start and rank in nsys_ranks:
                 logger.info(f"Rank {rank} | Starting nsys profiling")
@@ -299,6 +304,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if i == nsys_end and rank in nsys_ranks:
                 logger.info(f"Rank {rank} | Stopping nsys profiling")
                 torch.cuda.cudart().cudaProfilerStop()
+
+            self._maybe_collect_garbage()
 
         # Final summary
         self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)

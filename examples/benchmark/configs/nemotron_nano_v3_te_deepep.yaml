@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Benchmarking config for Gptoss 120B Te Deepep
+# Benchmarking config for Qwen3 Moe 30B Te Deepep
 
 seed: 1234
 
@@ -22,12 +22,12 @@ benchmark:
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
-  num_nodes: 8
+  num_nodes: 1
 
 step_scheduler:
   gc_every_steps: 10
   global_batch_size: 512
-  local_batch_size: 2
+  local_batch_size: 4
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
@@ -38,22 +38,9 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 64
+  ep_size: 8
 
-  sequence_parallel: false
   activation_checkpointing: true
-
-  pipeline:
-    pp_schedule: interleaved1f1b
-    pp_microbatch_size: 2
-    round_virtual_stages_to_pp_multiple: down
-    scale_grads_in_schedule: false
-    patch_inner_model: false
-    patch_causal_lm_model: false
-    layers_per_stage: 2
-
-  moe:
-    reshard_after_forward: true
 
 dist_env:
   backend: nccl
@@ -63,18 +50,17 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: openai/gpt-oss-120b
-  trust_remote_code: true
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: flex
     linear: te
     rms_norm: te
-    rope_fusion: true
     experts: gmm
     dispatcher: deepep
     fake_balanced_gate: true
-    enable_hf_state_dict_adapter: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
 
 checkpoint:
   enabled: false
@@ -101,4 +87,3 @@ optimizer:
   eps: 1e-8
   lr: 0.0001
   weight_decay: 0
-
