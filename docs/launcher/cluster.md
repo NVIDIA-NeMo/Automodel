@@ -20,6 +20,8 @@ All cluster launch methods use the same CLI command. The launcher is selected by
 automodel your_config.yaml
 # or use the short alias:
 am your_config.yaml
+# both also work with uv run:
+uv run automodel your_config.yaml
 ```
 
 ### Lightweight CLI-Only Install for Login Nodes

@@ -158,6 +158,9 @@ automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml --nproc-per-
 
 # VLM example: single-GPU fine-tuning (Gemma-3-VL) with LoRA
 automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml
+
+# Both commands also work with uv run:
+uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml --nproc-per-node 8
 ```
 
 > [!TIP]

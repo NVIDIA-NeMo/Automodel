@@ -39,6 +39,12 @@ A short alias `am` is also available:
 am <config.yaml> [--nproc-per-node N]
 ```
 
+Both commands also work with `uv run` for reproducible environments:
+```bash
+uv run automodel <config.yaml> [--nproc-per-node N]
+uv run am <config.yaml> [--nproc-per-node N]
+```
+
 Where:
 - `<config.yaml>`: Path to your YAML configuration file (must contain a `recipe._target_` key)
 - `--nproc-per-node`: Optional override for the number of GPUs to use
