@@ -66,6 +66,10 @@ Select a modality and task to find the right guide.
 | **LLM**    | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/finetune.md#recipe-config) | [Guide](guides/llm/toolcalling.md) | [Guide](guides/quantization-aware-training.md) | [Guide](guides/llm/knowledge-distillation.md) | [Guide](guides/llm/pretraining.md) |
 | **VLM**    | [Guide](guides/overview.md) | [Guide](guides/omni/gemma3-3n.md) | -- | -- | -- | -- |
 
+|                 | Embedding Fine-Tuning | Reranker Fine-Tuning |
+|-----------------|----------------------|---------------------|
+| **Retriever**   | [Guide](guides/retriever/embedding-finetuning.md) | Coming Soon |
+
 ## Performance
 
 Training throughput on NVIDIA GPUs with optimized kernels for Hugging Face models.
@@ -244,6 +248,14 @@ guides/quantization-aware-training.md
 guides/llm/databricks.md
 ::::
 
+
+::::{toctree}
+:hidden:
+:caption: NeMo Retriever
+
+guides/retriever/embedding-finetuning.md
+guides/retriever/reranker-finetuning.md
+::::
 
 ::::{toctree}
 :hidden:
