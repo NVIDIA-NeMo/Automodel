@@ -77,23 +77,31 @@ class CombinedProjectionStateDictAdapter:
 
     # ── 1-D bias DTensor helpers ──────────────────────────────────────────
     #
-    # FSDP2 shards 1-D bias vectors with Shard(0), but the interleaved
-    # layout doesn't always divide evenly across shards.  These two methods
-    # form a pair:
+    # Why 2-D weights are fine:
+    #   TP shards on column dim and FSDP on the other, so reshape/split/cat
+    #   along the interleave axis stays within each shard—no gather needed.
+    #
+    # Why 1-D biases need special handling:
+    #   Biases only have dim-0, which FSDP shards with Shard(0).  The
+    #   interleaved KV-head layout may not divide evenly across shards,
+    #   so we must all-gather before reshape and redistribute afterwards.
+    #   Communication cost is negligible since bias tensors are tiny
+    #   (e.g. hidden_size elements).
+    #
+    # The two helpers form a pair:
     #   _gather_1d_bias  – all-gather to Replicate so reshape/split/cat work
-    #   _restore_1d_bias – redistribute back to the original Shard(0) placement
-    # For 2-D weights and plain tensors both methods are no-ops.
+    #   _restore_1d_bias – redistribute back to the original Shard(0)
 
     @staticmethod
     def _gather_1d_bias(tensor: torch.Tensor) -> tuple[torch.Tensor, tuple | None]:
         """All-gather a 1-D bias DTensor to ``Replicate``.
 
-        Returns ``(gathered, orig_placement)`` where *orig_placement* is a
+        Must only be called on 1-D bias tensors.  Returns
+        ``(gathered, orig_placement)`` where *orig_placement* is a
         ``(device_mesh, placements)`` tuple that ``_restore_1d_bias`` accepts,
-        or ``None`` for 2-D / plain tensors (no-op).
+        or ``None`` when the tensor is a plain (non-DTensor) bias.
         """
-        if tensor.ndim != 1:
-            return tensor, None
+        assert tensor.ndim == 1, f"_gather_1d_bias expects a 1-D bias tensor, got ndim={tensor.ndim}"
         try:
             from torch.distributed.tensor import DTensor
             from torch.distributed.tensor.placement_types import Replicate, Shard
@@ -111,8 +119,9 @@ class CombinedProjectionStateDictAdapter:
     def _restore_1d_bias(tensor: torch.Tensor, orig_placement: tuple | None) -> torch.Tensor:
         """Redistribute a 1-D bias back to the placement saved by ``_gather_1d_bias``.
 
-        No-op when *orig_placement* is ``None`` (2-D weights / plain tensors).
+        No-op when *orig_placement* is ``None`` (plain non-DTensor bias).
         """
+        assert tensor.ndim == 1, f"_restore_1d_bias expects a 1-D bias tensor, got ndim={tensor.ndim}"
         if orig_placement is None:
             return tensor
         return tensor.redistribute(*orig_placement)
@@ -283,8 +292,7 @@ class CombinedProjectionStateDictAdapter:
             qkv_weight_key = f"{prefix}.self_attn.qkv_proj.weight"
 
             if qkv_weight_key in state_dict:
-                qkv_tensor = state_dict[qkv_weight_key]
-                q_weight, k_weight, v_weight = self._deinterleave_qkv(qkv_tensor)
+                q_weight, k_weight, v_weight = self._deinterleave_qkv(state_dict[qkv_weight_key])
 
                 hf_state_dict[f"{prefix}.self_attn.q_proj.weight"] = q_weight
                 hf_state_dict[f"{prefix}.self_attn.k_proj.weight"] = k_weight
@@ -305,8 +313,7 @@ class CombinedProjectionStateDictAdapter:
             gate_up_weight_key = f"{prefix}.mlp.gate_up_proj.weight"
 
             if gate_up_weight_key in state_dict:
-                gu_tensor = state_dict[gate_up_weight_key]
-                gate_weight, up_weight = self._deinterleave_gate_up(gu_tensor)
+                gate_weight, up_weight = self._deinterleave_gate_up(state_dict[gate_up_weight_key])
 
                 hf_state_dict[f"{prefix}.mlp.gate_proj.weight"] = gate_weight
                 hf_state_dict[f"{prefix}.mlp.up_proj.weight"] = up_weight
