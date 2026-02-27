@@ -24,11 +24,16 @@ class MockMiniMaxM2Config:
     max_position_embeddings: int = 256
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
+    rope_parameters: dict = None
     num_local_experts: int = 4
     num_experts_per_tok: int = 2
     scoring_func: str = "sigmoid"
     use_qk_norm: bool = True
     torch_dtype: str = "bfloat16"
+
+    def __post_init__(self):
+        if self.rope_parameters is None:
+            self.rope_parameters = {"rope_theta": self.rope_theta, "rope_type": "default"}
 
 
 @pytest.fixture

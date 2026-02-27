@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -26,7 +26,6 @@ from nemo_automodel.components.models.step3p5.model import (
     parse_moe_layers_enum,
 )
 from nemo_automodel.components.moe.config import MoEConfig
-
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -43,6 +42,7 @@ class MockStep3p5Config:
     max_position_embeddings: int = 256
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
+    rope_parameters: dict = None
     partial_rotary_factors: list = None
     layer_types: list = None
     attention_other_setting: dict = None
@@ -64,6 +64,8 @@ class MockStep3p5Config:
     swiglu_limits_shared: list = None
 
     def __post_init__(self):
+        if self.rope_parameters is None:
+            self.rope_parameters = {"rope_theta": self.rope_theta, "rope_type": "default"}
         if self.layer_types is None:
             self.layer_types = ["full_attention", "sliding_attention"]
         if self.attention_other_setting is None:

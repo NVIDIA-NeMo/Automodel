@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -22,6 +23,7 @@ from nemo_automodel.components.models.common.utils import (
     TEFp8Config,
     get_is_first_microbatch,
     get_is_optim_step,
+    get_rope_config,
     set_is_first_microbatch,
     set_is_optim_step,
 )
@@ -130,3 +132,50 @@ class TestBackendConfigTeFp8:
         """te_fp8 requires linear='te' or experts='te'."""
         with pytest.raises(ValueError, match="te_fp8 requires at least one TE backend"):
             BackendConfig(te_fp8=TEFp8Config(), linear="torch", experts="torch")
+
+
+class TestGetRopeConfig:
+    def test_extracts_rope_theta(self):
+        config = SimpleNamespace(
+            rope_parameters={"rope_theta": 1_000_000, "rope_type": "default"},
+        )
+        rope_theta, _, _ = get_rope_config(config)
+        assert rope_theta == 1_000_000
+
+    def test_returns_rope_parameters_as_rope_scaling(self):
+        params = {"rope_theta": 10_000, "rope_type": "default"}
+        config = SimpleNamespace(rope_parameters=params)
+        _, rope_parameters, _ = get_rope_config(config)
+        assert rope_parameters is params
+
+    def test_partial_rotary_factor(self):
+        config = SimpleNamespace(
+            rope_parameters={"rope_theta": 10_000, "partial_rotary_factor": 0.5},
+        )
+        _, _, partial_rotary_factor = get_rope_config(config)
+        assert partial_rotary_factor == 0.5
+
+    def test_partial_rotary_factor_defaults_to_one(self):
+        config = SimpleNamespace(
+            rope_parameters={"rope_theta": 10_000},
+        )
+        _, _, partial_rotary_factor = get_rope_config(config)
+        assert partial_rotary_factor == 1.0
+
+    def test_yarn_scaling_parameters(self):
+        config = SimpleNamespace(
+            rope_parameters={
+                "rope_theta": 1_000_000,
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "beta_slow": 1.0,
+                "beta_fast": 32.0,
+                "original_max_position_embeddings": 8192,
+            },
+        )
+        rope_theta, rope_parameters, _ = get_rope_config(config)
+        assert rope_theta == 1_000_000
+        assert rope_parameters["factor"] == 4.0
+        assert rope_parameters["beta_slow"] == 1.0
+        assert rope_parameters["beta_fast"] == 32.0
+        assert rope_parameters["original_max_position_embeddings"] == 8192
