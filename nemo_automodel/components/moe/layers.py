@@ -500,6 +500,8 @@ class Gate(nn.Module):
         # Compute f_i (fraction of tokens dispatched to each expert).
         # If uniform distribution, expert_load will be topk * num_location / n_experts, and f_i will be 1
         # Maximum value f_i entries happens when expert_load = num_location, the value will be n_experts / topk
+        # Protect against division by zero when all tokens are masked (e.g. padding-heavy CP rank).
+        context_length = torch.clamp(context_length, min=1)
         f_i = expert_load * self.n_experts / (self.topk * context_length)  # Normalized fraction, (n_experts)
 
         # Compute P_i (average routing probability per expert)
@@ -579,6 +581,9 @@ class MoE(nn.Module):
             self.shared_experts = None
             self.shared_expert_gate = None
 
+        # Set during model parallelization (see parallelizer.apply_cp)
+        self.cp_mesh: Optional[DeviceMesh] = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -596,6 +601,9 @@ class MoE(nn.Module):
             torch.Tensor: Output tensor after expert routing and computation.
             Optional[torch.Tensor]: Auxiliary loss for load balancing (if applicable).
         """
+        if cp_mesh is None:
+            cp_mesh = self.cp_mesh
+
         # Reshape the inputs to 2-D since we are just distributing tokens.
         shape = x.size()
         x = x.view(-1, self.dim)
