@@ -243,7 +243,7 @@ checkpoint:
 ```
 ```bash
 # Or via CLI override:
-automodel finetune llm -c config.yaml --checkpoint.checkpoint_dir /mnt/shared/my_checkpoints
+automodel config.yaml --checkpoint.checkpoint_dir /mnt/shared/my_checkpoints
 ```
 
 When using a custom path, make sure the corresponding host directory is mounted into the container with `-v`.

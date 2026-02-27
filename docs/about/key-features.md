@@ -161,10 +161,10 @@ The CLI simplifies job launch across environments:
 
 ```bash
 # Single-node interactive
-automodel finetune llm -c config.yaml
+automodel config.yaml
 
-# Multi-node SLURM batch
-automodel finetune llm -c config.yaml  # with slurm: section in YAML
+# Multi-node SLURM batch (add a slurm: section to the YAML)
+automodel config.yaml
 ```
 
 See the [Local Workstation](../launcher/local-workstation.md) and [Cluster](../launcher/cluster.md) guides.

@@ -257,20 +257,69 @@ The above `docker` command uses the volume `-v` option to mount the local `Autom
 under `/opt/Automodel`.
 :::
 
-## Bonus: Install Extras
-Some functionality may require optional extras. You can install them like this:
+## Install Profiles
+
+NeMo AutoModel provides several install extras for different use cases.
+
+### Full Install (default)
+
+Installs the core library with all LLM training dependencies (PyTorch, CUDA, etc.):
+
 ```bash
-pip3 install nemo-automodel[cli]    # Installs only the Automodel CLI
-pip3 install nemo-automodel         # Installs the CLI and all LLM dependencies.
-pip3 install nemo-automodel[vlm]    # Install all VLM-related dependencies.
+pip3 install nemo-automodel
 ```
+
+### CLI-Only Install (Login Nodes)
+
+If you only need to **submit jobs** from a login node or CI environment (SLURM,
+Kubernetes, NeMo-Run) and do **not** need to run training locally, use the
+lightweight CLI-only install:
+
+```bash
+pip3 install nemo-automodel[cli]
+```
+
+This installs only `pyyaml` and `nemo-run` -- no PyTorch, no CUDA. The
+`automodel` and `am` CLI commands will be available for job submission. If you
+accidentally try to run a local/interactive job with this install, you will get
+a clear error with instructions to install the full package.
+
+### VLM Dependencies
+
+For vision-language model training, add the VLM extras:
+
+```bash
+pip3 install nemo-automodel[vlm]
+```
+
+### CUDA-Specific Packages
+
+For models requiring TransformerEngine, bitsandbytes, Mamba, or other
+CUDA-compiled packages:
+
+```bash
+pip3 install nemo-automodel[cuda]
+```
+
+### All Extras
+
+Install everything (CUDA, VLM, NeMo-Run, etc.):
+
+```bash
+pip3 install nemo-automodel[all]
+```
+
+:::{tip}
+You can combine extras: `pip3 install nemo-automodel[vlm,cuda]`
+:::
 
 ## Summary
 | Goal                        | Command or Method                                               |
 | --------------------------- | --------------------------------------------------------------- |
 | Stable install (PyPI)       | `pip3 install nemo-automodel`                                   |
+| CLI-only (login nodes)      | `pip3 install nemo-automodel[cli]`                              |
 | Latest from GitHub          | `pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git` |
 | Editable install (dev mode) | `pip install -e .` after cloning                                |
 | Run without installing      | Use `PYTHONPATH=$(pwd)` to run scripts                          |
 | Use in Docker container     | Mount repo and `pip install -e .` inside container              |
-| Fast install (using `uv`)     | `uv pip install ...`                                            |
+| Fast install (using `uv`)   | `uv pip install ...`                                            |
