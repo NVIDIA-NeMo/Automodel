@@ -369,20 +369,11 @@ def get_rope_config(config) -> tuple[float, dict, float]:
         config: A HuggingFace model config object.
 
     Returns:
-        Tuple of (rope_theta, rope_scaling, partial_rotary_factor).
+        Tuple of (rope_theta, rope_parameters, partial_rotary_factor).
     """
-    rope_parameters = getattr(config, "rope_parameters", None) or {}
-
-    if "rope_theta" in rope_parameters:
-        rope_theta = rope_parameters["rope_theta"]
-    else:
-        rope_theta = config.rope_theta
-
-    if "partial_rotary_factor" in rope_parameters:
-        partial_rotary_factor = rope_parameters["partial_rotary_factor"]
-    else:
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
-
+    rope_parameters = config.rope_parameters
+    rope_theta = rope_parameters["rope_theta"]
+    partial_rotary_factor = rope_parameters.get("partial_rotary_factor", 1.0)
     return rope_theta, rope_parameters, partial_rotary_factor
 
 
