@@ -14,6 +14,7 @@
 
 import re
 from typing import Any, Optional
+import gc
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -400,7 +401,8 @@ class MoESplitExpertsStateDictMixin:
             rf"(?P<prefix>(?:model\.)?(?:language_model\.)?)layers\.(\d+)\.{re.escape(expert_segment)}\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
         )
 
-        for key, value in hf_state_dict.items():
+        for key in list(hf_state_dict.keys()):
+            value = hf_state_dict.pop(key)
             if f".{expert_segment}." in key and key.endswith(".weight"):
                 m = expert_pattern.match(key)
                 if m is None:
@@ -471,6 +473,12 @@ class MoESplitExpertsStateDictMixin:
                         stacked = torch.stack(tensors, dim=0).to(self.dtype)
                         state_dict[native_key] = create_dtensor_from_local(stacked, device_mesh, rank)
 
+                        # Free completed expert tensors to release GPU memory
+                        del expert_weights_by_layer[layer_num][native_key]
+                        if not expert_weights_by_layer[layer_num]:
+                            del expert_weights_by_layer[layer_num]
+                        gc.collect()
+
                 else:  # down_proj
                     expert_weights_by_layer[layer_num][native_key][expert_num] = value
 
@@ -493,6 +501,12 @@ class MoESplitExpertsStateDictMixin:
 
                         dtensor = create_dtensor_from_local(stacked, device_mesh, rank)
                         state_dict[native_key] = dtensor
+
+                        # Free completed expert tensors to release GPU memory
+                        del expert_weights_by_layer[layer_num][native_key]
+                        if not expert_weights_by_layer[layer_num]:
+                            del expert_weights_by_layer[layer_num]
+                        gc.collect()
 
             else:
                 if not key.endswith("_scale_inv"):

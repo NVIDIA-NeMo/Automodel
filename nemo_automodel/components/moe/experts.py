@@ -233,16 +233,16 @@ class GroupedExperts(nn.Module):
         # Non-gated (ReLU²): [n_experts, dim, inter_dim]
         up_proj_dim = config.moe_inter_dim * 2 if self.is_gated else config.moe_inter_dim
         self.gate_and_up_projs = nn.Parameter(
-            torch.empty(config.n_routed_experts, config.dim, up_proj_dim, dtype=config.dtype)
+            torch.empty(config.n_routed_experts, config.expert_dim, up_proj_dim, dtype=config.dtype)
         )
 
         self.down_projs = nn.Parameter(
-            torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim, dtype=config.dtype)
+            torch.empty(config.n_routed_experts, config.moe_inter_dim, config.expert_dim, dtype=config.dtype)
         )
 
         if self.expert_bias:
             self.gate_up_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, up_proj_dim, dtype=config.dtype))
-            self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim, dtype=config.dtype))
+            self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.expert_dim, dtype=config.dtype))
         else:
             self.gate_up_proj_bias = None
             self.down_proj_bias = None
@@ -579,13 +579,13 @@ class GroupedExpertsDeepEP(nn.Module):
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
         # Non-gated (ReLU²): [n_experts, dim, inter_dim]
         up_proj_dim = config.moe_inter_dim * 2 if self.is_gated else config.moe_inter_dim
-        self.gate_and_up_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.dim, up_proj_dim))
+        self.gate_and_up_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.expert_dim, up_proj_dim))
 
-        self.down_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim))
+        self.down_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim, config.expert_dim))
 
         if self.expert_bias:
             self.gate_up_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, up_proj_dim))
-            self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim))
+            self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.expert_dim))
         else:
             self.gate_up_proj_bias = None
             self.down_proj_bias = None
@@ -775,7 +775,7 @@ class GroupedExpertsTE(nn.Module):
         # Create TE GroupedLinear layers with full expert count on meta device first
         self.gate_up_linear = GroupedLinear(
             num_gemms=config.n_routed_experts,
-            in_features=config.dim,
+            in_features=config.expert_dim,
             out_features=gate_up_out_features,
             bias=self.expert_bias,
             params_dtype=config.dtype,
@@ -785,7 +785,7 @@ class GroupedExpertsTE(nn.Module):
         self.down_linear = GroupedLinear(
             num_gemms=config.n_routed_experts,
             in_features=config.moe_inter_dim,
-            out_features=config.dim,
+            out_features=config.expert_dim,
             bias=self.expert_bias,
             params_dtype=config.dtype,
             device="meta",
@@ -1050,7 +1050,7 @@ class GroupedExpertsTE(nn.Module):
 
         self.gate_up_linear = GroupedLinear(
             num_gemms=self.num_local_experts,
-            in_features=self.config.dim,
+            in_features=self.config.expert_dim,
             out_features=gate_up_out_features,
             bias=self.expert_bias,
             params_dtype=self.config.dtype,
@@ -1061,7 +1061,7 @@ class GroupedExpertsTE(nn.Module):
         self.down_linear = GroupedLinear(
             num_gemms=self.num_local_experts,
             in_features=self.config.moe_inter_dim,
-            out_features=self.config.dim,
+            out_features=self.config.expert_dim,
             bias=self.expert_bias,
             params_dtype=self.config.dtype,
             device="meta",

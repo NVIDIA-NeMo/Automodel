@@ -79,6 +79,7 @@ class NemotronV3Model(nn.Module):
             shared_expert_inter_dim=config.moe_shared_expert_intermediate_size,
             shared_expert_activation="relu2",  # Use ReLU² for shared experts
             force_e_score_correction_bias=True,  # NemotronV3 checkpoint has this buffer
+            moe_latent_size=getattr(config, 'moe_latent_size', None),
         )
 
         # Embeddings

@@ -578,6 +578,18 @@ class MoE(nn.Module):
         else:
             self.shared_experts = None
             self.shared_expert_gate = None
+        
+        # When enabled, input is projected to latent space before MoE and back after
+        if config.moe_latent_size is not None:
+            self.fc1_latent_proj = initialize_linear_module(
+                backend.linear, config.dim, config.moe_latent_size, bias=config.expert_bias, dtype=config.dtype
+            )
+            self.fc2_latent_proj = initialize_linear_module(
+                backend.linear, config.moe_latent_size, config.dim, bias=config.expert_bias, dtype=config.dtype
+            )
+        else:
+            self.fc1_latent_proj = None
+            self.fc2_latent_proj = None
 
     def forward(
         self,
@@ -603,11 +615,20 @@ class MoE(nn.Module):
             token_mask = (~padding_mask).flatten()
         else:
             token_mask = torch.ones(x.size(0), dtype=torch.bool, device=x.device)
+        
+        # Apply latent projection before MoE if enabled
+        if self.fc1_latent_proj is not None:
+            x_latent = self.fc1_latent_proj(x)
+        else:
+            x_latent = x
 
         weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
 
         if self.shared_experts is None:
-            y = self.experts(x, token_mask, weights, indices)
+            y = self.experts(x_latent, token_mask, weights, indices)
+            # Apply latent projection after MoE if enabled
+            if self.fc2_latent_proj is not None:
+                y = self.fc2_latent_proj(y)
             return y.view(shape)
 
         # Execute shared experts in a separate stream to overlap compute with the
@@ -622,7 +643,11 @@ class MoE(nn.Module):
             if self.shared_expert_gate is not None:
                 z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
 
-        y = self.experts(x, token_mask, weights, indices)
+        y = self.experts(x_latent, token_mask, weights, indices)
+
+        # Apply latent projection after MoE if enabled
+        if self.fc2_latent_proj is not None:
+            y = self.fc2_latent_proj(y)
 
         # Wait for the shared experts stream to complete all operations before
         # adding together the outputs of grouped experts and shared experts.
@@ -658,3 +683,12 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
             to_local(module.up_proj.weight).normal_(mean=0.0, std=init_std)
             if module.gate_proj is not None:
                 to_local(module.gate_proj.weight).normal_(mean=0.0, std=init_std)
+        elif isinstance(module, MoE):
+            if module.fc1_latent_proj is not None:
+                to_local(module.fc1_latent_proj.weight).normal_(mean=0.0, std=init_std)
+                if module.fc1_latent_proj.bias is not None:
+                    to_local(module.fc1_latent_proj.bias).zero_()
+            if module.fc2_latent_proj is not None:
+                to_local(module.fc2_latent_proj.weight).normal_(mean=0.0, std=init_std)
+                if module.fc2_latent_proj.bias is not None:
+                    to_local(module.fc2_latent_proj.bias).zero_()
