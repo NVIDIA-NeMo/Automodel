@@ -369,7 +369,7 @@ class Gate(nn.Module):
             # Scale the aux_loss by the number of tokens.
             # Training scales all gradients by 1/(number of tokens).
             # To correct this scaling, we need to scale the aux_loss by number of tokens here.
-            MoEAuxLossAutoScaler.apply(weights, aux_loss * weights.shape[0])
+            weights = MoEAuxLossAutoScaler.apply(weights, self.aux_loss_coeff * aux_loss)
 
         if self._track_load_balance and aux_loss is not None:
             self._last_aux_loss = aux_loss.detach()
