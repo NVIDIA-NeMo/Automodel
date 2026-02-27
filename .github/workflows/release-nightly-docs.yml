@@ -15,6 +15,11 @@
 name: Release Nightly Docs
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/**'
   schedule:
     - cron: "0 10 * * *"
 
