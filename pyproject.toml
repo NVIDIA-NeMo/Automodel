@@ -130,9 +130,7 @@ vlm = [
 ]
 cli = [
     "pyyaml",
-    "nemo_run",
 ]
-nemo-run = ["nemo_run"]
 all = [
     "nemo_automodel[cuda]",
     "nemo_automodel[delta-databricks]",
