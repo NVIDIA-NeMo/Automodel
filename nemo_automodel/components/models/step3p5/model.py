@@ -17,7 +17,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig, get_rope_config, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.step3p5.layers import (
@@ -270,14 +270,15 @@ class Step3p5Model(nn.Module):
         partial_rotary_factors = getattr(config, "partial_rotary_factors", None)
         partial_rotary_factor = partial_rotary_factors[0] if partial_rotary_factors else 1.0
 
+        _, rope_scaling, _ = get_rope_config(config)
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
             base=rope_theta,
             dtype=torch.float32,
-            initial_context_length=4096,
-            scaling_factor=1.0,
-            ntk_alpha=1.0,
-            ntk_beta=32.0,
+            initial_context_length=rope_scaling.get("original_max_position_embeddings", 4096),
+            scaling_factor=rope_scaling.get("factor", 1.0),
+            ntk_alpha=rope_scaling.get("beta_slow", 1.0),
+            ntk_beta=rope_scaling.get("beta_fast", 32.0),
             partial_rotary_factor=partial_rotary_factor,
             device=torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"),
         )

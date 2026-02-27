@@ -18,7 +18,12 @@ import torch
 import torch.nn as nn
 from transformers.models.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common import (
+    BackendConfig,
+    get_rope_config,
+    initialize_linear_module,
+    initialize_rms_norm_module,
+)
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.glm4_moe.layers import Glm4MoeAttention
 from nemo_automodel.components.models.glm4_moe.state_dict_adapter import Glm4MoeStateDictAdapter
@@ -131,18 +136,16 @@ class Glm4MoeModel(nn.Module):
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
 
-        if hasattr(config, "rope_parameters"):
-            partial_rotary_factor = config.rope_parameters.get("partial_rotary_factor", 1.0)
-            base = config.rope_parameters["rope_theta"]
-        else:
-            partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
-            base = config.rope_theta
+        base, rope_scaling, partial_rotary_factor = get_rope_config(config)
 
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
             base=base,
             dtype=torch.float32,
-            scaling_factor=1.0,
+            initial_context_length=rope_scaling.get("original_max_position_embeddings", 4096),
+            scaling_factor=rope_scaling.get("factor", 1.0),
+            ntk_alpha=rope_scaling.get("beta_slow", 1.0),
+            ntk_beta=rope_scaling.get("beta_fast", 32.0),
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
             partial_rotary_factor=partial_rotary_factor,
         )

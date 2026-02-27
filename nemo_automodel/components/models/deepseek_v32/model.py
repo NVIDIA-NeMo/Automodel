@@ -22,7 +22,7 @@ the use of DeepseekV32MLA (with Indexer) instead of the standard MLA.
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
+from nemo_automodel.components.models.common import BackendConfig, get_rope_config, initialize_rms_norm_module
 from nemo_automodel.components.models.deepseek_v3.model import (
     Block,
     DeepseekV3ForCausalLM,
@@ -116,13 +116,14 @@ class DeepseekV32Model(DeepseekV3Model):
         self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
 
         self.max_seq_len = config.max_position_embeddings
+        rope_theta, rope_scaling, _ = get_rope_config(config)
         self.register_buffer(
             "freqs_cis",
             precompute_freqs_cis(
                 config.qk_rope_head_dim,
                 self.max_seq_len,
-                config.rope_parameters["rope_theta"] if hasattr(config, "rope_parameters") else config.rope_theta,
-                config.rope_parameters if hasattr(config, "rope_parameters") else config.rope_scaling,
+                rope_theta,
+                rope_scaling,
             ),
             persistent=False,
         )
