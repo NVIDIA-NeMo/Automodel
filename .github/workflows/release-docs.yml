@@ -13,12 +13,6 @@
 # limitations under the License.
 name: Release docs
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'docs/**'
-
   workflow_dispatch:
     inputs:
       dry-run:
@@ -93,8 +87,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build-docs]
     env:
-      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run || false }}
-      NOTIFY_EMAILS: ${{ github.event_name == 'workflow_dispatch' && inputs.notify-emails || 'akoumparouli@nvidia.com' }}
+      DRY_RUN: ${{ inputs.dry-run }}
+      NOTIFY_EMAILS: ${{ inputs.notify-emails || 'akoumparouli@nvidia.com' }}
     steps:
       - uses: actions/checkout@v6
         with:
