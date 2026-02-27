@@ -14,7 +14,8 @@
 
 # single node 8xh200
 # To run this recipe:
-#   automodel examples/llm_finetune/mistral/mixtral-8x7b-v0-1_squad_peft.yaml
+#   automodel examples/llm_finetune/mistral/mixtral-8x7b-v0-1_squad_peft.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe:
   _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction

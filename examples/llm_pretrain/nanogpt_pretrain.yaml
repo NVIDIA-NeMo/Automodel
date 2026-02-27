@@ -2,7 +2,8 @@
 # produced by the `modded-nanogpt` preprocessing pipeline.
 
 # To run this recipe:
-#   automodel examples/llm_pretrain/nanogpt_pretrain.yaml
+#   automodel examples/llm_pretrain/nanogpt_pretrain.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe:
   _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction

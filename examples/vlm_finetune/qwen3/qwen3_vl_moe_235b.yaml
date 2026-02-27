@@ -14,7 +14,8 @@
 
 
 # To run this recipe:
-#   automodel examples/vlm_finetune/qwen3/qwen3_vl_moe_235b.yaml
+#   automodel examples/vlm_finetune/qwen3/qwen3_vl_moe_235b.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe:
   _target_: nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM

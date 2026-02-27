@@ -13,7 +13,8 @@
 # limitations under the License.
 
 # To run this recipe:
-#   automodel examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml
+#   automodel examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe:
   _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction

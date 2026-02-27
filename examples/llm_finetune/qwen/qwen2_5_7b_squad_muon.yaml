@@ -14,7 +14,8 @@
 
 
 # To run this recipe:
-#   automodel examples/llm_finetune/qwen/qwen2_5_7b_squad_muon.yaml
+#   automodel examples/llm_finetune/qwen/qwen2_5_7b_squad_muon.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe:
   _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction

@@ -14,7 +14,8 @@
 
 
 # To run this recipe:
-#   automodel examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml
+#   automodel examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe:
   _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction

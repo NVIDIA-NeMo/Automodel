@@ -17,7 +17,8 @@
 
 
 # To run this recipe:
-#   automodel examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml
+#   automodel examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe:
   _target_: nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM
