@@ -85,7 +85,7 @@ loss_fn:
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
-  vocab_size: 151552
+  vocab_size: 1024
   seq_len: 4096
   num_samples: 100000
 
