@@ -11,21 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 from __future__ import annotations
+
+import warnings
+
+warnings.warn(
+    "Running recipes via examples/ scripts is deprecated. "
+    "Use: automodel <config.yaml> [--nproc-per-node N]\n"
+    "See BREAKING_CHANGES.md for details.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 
 def main(default_config_path="examples/llm_pretrain/nanogpt_pretrain.yaml"):
-    """Entry-point for launching NanoGPT-style pre-training.
+    """Entry-point for launching pre-training.
 
-    The script follows the same invocation pattern as *examples/llm_finetune/finetune.py*:
-
-    ```bash
-    torchrun --nproc-per-node <NGPU> examples/llm_pretrain/pretrain.py \
-        --config examples/llm/nanogpt_pretrain.yaml
-    ```
+    .. deprecated::
+        Use ``automodel <config.yaml>`` instead.
     """
     cfg = parse_args_and_load_config(default_config_path)
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
