@@ -27,7 +27,6 @@ from .hunyuan import HunyuanVideoProcessor
 from .registry import ProcessorRegistry
 from .wan import WanProcessor
 
-
 __all__ = [
     # Base classes
     "BaseModelProcessor",

@@ -30,7 +30,6 @@ from torch import autocast
 from .base import BaseModelProcessor
 from .registry import ProcessorRegistry
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -125,8 +124,6 @@ class FluxProcessor(BaseModelProcessor):
         """
         vae = models["vae"]
         image_tensor = image_tensor.to(device, dtype=torch.bfloat16)
-
-        device_type = "cuda" if "cuda" in device else "cpu"
 
         with torch.no_grad():
             latent = vae.encode(image_tensor).latent_dist.sample()

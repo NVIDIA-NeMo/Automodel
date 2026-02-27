@@ -45,7 +45,6 @@ from .adapters import (
     SimpleAdapter,
 )
 
-
 logger = logging.getLogger(__name__)
 
 

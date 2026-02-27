@@ -51,12 +51,11 @@ import torch.nn as nn
 from nemo_automodel.components.distributed import parallelizer
 from nemo_automodel.components.distributed.ddp import DDPManager
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
-from nemo_automodel.shared.utils import dtype_from_str
-
 from nemo_automodel.components.distributed.parallelizer import (
     HunyuanParallelizationStrategy,
     WanParallelizationStrategy,
 )
+from nemo_automodel.shared.utils import dtype_from_str
 
 # diffusers is an optional dependency
 try:

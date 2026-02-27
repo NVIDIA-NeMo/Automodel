@@ -28,7 +28,6 @@ from .sampler import (
 )
 from .text_to_image_dataset import TextToImageDataset
 
-
 logger = logging.getLogger(__name__)
 
 

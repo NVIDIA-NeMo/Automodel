@@ -36,7 +36,6 @@ from .flux import FluxAdapter
 from .hunyuan import HunyuanAdapter
 from .simple import SimpleAdapter
 
-
 __all__ = [
     "FlowMatchingContext",
     "ModelAdapter",

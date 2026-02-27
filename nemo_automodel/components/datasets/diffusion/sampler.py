@@ -22,7 +22,6 @@ from torch.utils.data import DataLoader, Sampler
 
 from .text_to_image_dataset import TextToImageDataset
 
-
 logger = logging.getLogger(__name__)
 
 

@@ -46,7 +46,6 @@ from diffusers import HunyuanVideo15ImageToVideoPipeline
 from PIL import Image
 from tqdm import tqdm
 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 

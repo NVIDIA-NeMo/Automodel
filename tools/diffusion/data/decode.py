@@ -21,6 +21,7 @@ from typing import Dict
 import cv2
 import numpy as np
 import torch
+
 try:
     from diffusers import AutoencoderKLWan
 except ImportError:

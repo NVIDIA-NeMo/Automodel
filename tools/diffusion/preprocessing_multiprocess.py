@@ -48,7 +48,6 @@ from multiprocessing import Pool
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-
 logger = logging.getLogger(__name__)
 
 import cv2
@@ -64,7 +63,6 @@ from tools.diffusion.processors import (
     ProcessorRegistry,
     get_caption_loader,
 )
-
 
 # =============================================================================
 # Constants
