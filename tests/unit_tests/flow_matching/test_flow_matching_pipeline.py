@@ -854,5 +854,169 @@ class TestIntegration:
         assert pipeline.sigma_max == 0.9
 
 
+class TestPipelineEdgeCases:
+    """Test edge cases for uncovered lines in pipeline.py."""
+
+    def test_missing_batch_key_raises(self, simple_adapter):
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            log_interval=1000,
+            summary_log_interval=1000,
+        )
+        mock_model = MockModel()
+        batch = {"text_embeddings": torch.randn(2, 77, 4096)}  # no latents key
+        with pytest.raises(KeyError, match="video_latents.*image_latents"):
+            pipeline.step(mock_model, batch, torch.device("cpu"), torch.float32, global_step=0)
+
+    def test_image_latents_key_works(self, simple_adapter):
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            log_interval=1000,
+            summary_log_interval=1000,
+        )
+        mock_model = MockModel()
+        batch = {
+            "image_latents": torch.randn(2, 16, 1, 8, 8),
+            "text_embeddings": torch.randn(2, 77, 4096),
+            "data_type": "image",
+        }
+        _, avg_loss, _, metrics = pipeline.step(mock_model, batch, torch.device("cpu"), torch.float32, global_step=0)
+        assert not torch.isnan(avg_loss)
+
+    def test_loss_explosion_raises(self, simple_adapter):
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            flow_shift=1.0,
+            use_loss_weighting=False,
+            log_interval=1000,
+            summary_log_interval=1000,
+        )
+        # Model that returns very large values to trigger loss > 100
+        big_model = MockModel(output_scale=100.0)
+        batch = {
+            "video_latents": torch.randn(2, 16, 4, 8, 8),
+            "text_embeddings": torch.randn(2, 77, 4096),
+        }
+        with pytest.raises(ValueError, match="Loss exploded"):
+            pipeline.step(big_model, batch, torch.device("cpu"), torch.float32, global_step=0)
+
+    def test_nan_loss_raises(self, simple_adapter):
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            flow_shift=1.0,
+            log_interval=1000,
+            summary_log_interval=1000,
+        )
+
+        class NanModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(1, 1)
+
+            def forward(self, hidden_states, timestep, encoder_hidden_states, return_dict=False):
+                return (torch.full_like(hidden_states, float("nan")),)
+
+        nan_model = NanModel()
+        batch = {
+            "video_latents": torch.randn(2, 16, 4, 8, 8),
+            "text_embeddings": torch.randn(2, 77, 4096),
+        }
+        with pytest.raises(ValueError, match="Loss exploded"):
+            pipeline.step(nan_model, batch, torch.device("cpu"), torch.float32, global_step=0)
+
+
+class TestDebugLogging:
+    """Test debug logging paths in pipeline.py."""
+
+    def test_log_detailed_single_element_sigma(self, simple_adapter):
+        pipeline = FlowMatchingPipeline(model_adapter=simple_adapter)
+        # Single-element sigma triggers the `.item()` path
+        pipeline._log_detailed(
+            global_step=0,
+            sampling_method="uniform",
+            batch_size=1,
+            sigma=torch.tensor([0.5]),
+            timesteps=torch.tensor([500.0]),
+            latents=torch.randn(1, 16, 4, 8, 8),
+            noise=torch.randn(1, 16, 4, 8, 8),
+            noisy_latents=torch.randn(1, 16, 4, 8, 8),
+        )
+
+    def test_log_detailed_multi_element_sigma(self, simple_adapter):
+        pipeline = FlowMatchingPipeline(model_adapter=simple_adapter)
+        pipeline._log_detailed(
+            global_step=0,
+            sampling_method="logit_normal",
+            batch_size=4,
+            sigma=torch.tensor([0.1, 0.3, 0.5, 0.9]),
+            timesteps=torch.tensor([100.0, 300.0, 500.0, 900.0]),
+            latents=torch.randn(4, 16, 4, 8, 8),
+            noise=torch.randn(4, 16, 4, 8, 8),
+            noisy_latents=torch.randn(4, 16, 4, 8, 8),
+        )
+
+    def test_log_detailed_large_noisy_triggers_warning(self, simple_adapter):
+        pipeline = FlowMatchingPipeline(model_adapter=simple_adapter)
+        latents = torch.randn(1, 16, 4, 8, 8) * 0.1
+        noise = torch.randn(1, 16, 4, 8, 8) * 0.1
+        # noisy_latents much larger than expected
+        noisy_latents = torch.randn(1, 16, 4, 8, 8) * 100.0
+        pipeline._log_detailed(
+            global_step=0,
+            sampling_method="uniform",
+            batch_size=1,
+            sigma=torch.tensor([0.5]),
+            timesteps=torch.tensor([500.0]),
+            latents=latents,
+            noise=noise,
+            noisy_latents=noisy_latents,
+        )
+
+    def test_log_loss_detailed(self, simple_adapter):
+        pipeline = FlowMatchingPipeline(model_adapter=simple_adapter)
+        pipeline._log_loss_detailed(
+            global_step=0,
+            model_pred=torch.randn(2, 16, 4, 8, 8),
+            target=torch.randn(2, 16, 4, 8, 8),
+            loss_weight=torch.tensor([1.5, 2.0]).view(2, 1, 1, 1, 1),
+            unweighted_loss=torch.tensor(0.5),
+            weighted_loss=torch.tensor(0.8),
+        )
+
+    def test_debug_env_var_detailed_log(self, simple_adapter, monkeypatch):
+        monkeypatch.setenv("DEBUG_TRAINING", "1")
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            log_interval=1,
+            summary_log_interval=1,
+        )
+        mock_model = MockModel()
+        batch = {
+            "video_latents": torch.randn(2, 16, 4, 8, 8),
+            "text_embeddings": torch.randn(2, 77, 4096),
+        }
+        _, avg_loss, _, metrics = pipeline.step(
+            mock_model, batch, torch.device("cpu"), torch.float32, global_step=0
+        )
+        assert not torch.isnan(avg_loss)
+
+    def test_debug_env_var_summary_log(self, simple_adapter, monkeypatch):
+        monkeypatch.setenv("DEBUG_TRAINING", "1")
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            log_interval=1000,  # Not a detailed log step
+            summary_log_interval=1,  # But is a summary log step
+        )
+        mock_model = MockModel()
+        batch = {
+            "video_latents": torch.randn(2, 16, 4, 8, 8),
+            "text_embeddings": torch.randn(2, 77, 4096),
+        }
+        _, avg_loss, _, metrics = pipeline.step(
+            mock_model, batch, torch.device("cpu"), torch.float32, global_step=1
+        )
+        assert not torch.isnan(avg_loss)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
