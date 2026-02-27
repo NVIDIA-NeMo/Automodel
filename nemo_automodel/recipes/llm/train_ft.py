@@ -56,6 +56,7 @@ from nemo_automodel.components.distributed.megatron_fsdp import fully_shard_opti
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
+from nemo_automodel.components.loggers.comet_utils import build_comet
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.mlflow_utils import build_mlflow
@@ -858,6 +859,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.mlflow_logger.log_params(self.cfg.to_dict())
             logging.info("MLflow experiment tracking enabled")
 
+        self.comet_logger = None
+        if self.dist_env.is_main and hasattr(self.cfg, "comet"):
+            self.comet_logger = build_comet(self.cfg)
+            self.comet_logger.log_params(self.cfg.to_dict())
+            logging.info("Comet experiment tracking enabled")
+
         # Log experiment details on main rank
         self._log_experiment_details()
         self._log_library_versions()
@@ -1483,6 +1490,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.mlflow_logger is not None:
             self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
+        if self.comet_logger is not None:
+            self.comet_logger.log_metrics(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
+
         # JSONL validation log
         if not metric_logger is None:
             metric_logger.log(log_data)
@@ -1517,16 +1527,23 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        # Log to remote services (WandB, MLflow) according to step_scheduler frequency
+        # Log to remote services (WandB, MLflow, Comet) according to step_scheduler frequency
         if self.step_scheduler.is_remote_logging_step:
             if wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
             if self.mlflow_logger is not None:
                 self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
+            if self.comet_logger is not None:
+                self.comet_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         # Log MoE load balance metrics (already collected/reduced on all ranks)
-        if self.step_scheduler.is_remote_logging_step and wandb.run is not None:
-            self._log_moe_metrics(self.step_scheduler.step, wandb.log)
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
+                self._log_moe_metrics(self.step_scheduler.step, wandb.log)
+            if self.comet_logger is not None:
+                self._log_moe_metrics(
+                    self.step_scheduler.step, lambda m, step: self.comet_logger.log_metrics(m, step=step)
+                )
 
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
