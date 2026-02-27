@@ -42,9 +42,7 @@ class NemoRunLauncher(Launcher):
         try:
             import nemo_run as run
         except ImportError:
-            logger.error(
-                "nemo-run is not installed. Install with: pip install nemo-run"
-            )
+            logger.error("nemo-run is not installed. Install with: pip install nemo-run")
             sys.exit(1)
 
         nr_config = NemoRunConfig(**launcher_config)
@@ -85,7 +83,4 @@ class NemoRunLauncher(Launcher):
                 **nr_config.executor_kwargs,
             )
         else:
-            raise ValueError(
-                f"Unknown nemo_run executor: {nr_config.executor!r}. "
-                f"Supported: local, slurm, k8s"
-            )
+            raise ValueError(f"Unknown nemo_run executor: {nr_config.executor!r}. Supported: local, slurm, k8s")

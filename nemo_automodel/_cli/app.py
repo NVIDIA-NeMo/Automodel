@@ -18,8 +18,7 @@
 import warnings
 
 warnings.warn(
-    "nemo_automodel._cli.app has moved to cli.app. "
-    "Update your imports. This shim will be removed in a future release.",
+    "nemo_automodel._cli.app has moved to cli.app. Update your imports. This shim will be removed in a future release.",
     DeprecationWarning,
     stacklevel=2,
 )

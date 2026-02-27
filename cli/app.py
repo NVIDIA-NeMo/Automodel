@@ -59,10 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(
         prog="automodel",
-        description=(
-            "CLI for NeMo AutoModel recipes. "
-            "The YAML config specifies both the recipe and the launcher."
-        ),
+        description=("CLI for NeMo AutoModel recipes. The YAML config specifies both the recipe and the launcher."),
     )
     parser.add_argument(
         "config",
@@ -137,9 +134,7 @@ def main():
         from nemo_automodel.components.launcher.interactive import InteractiveLauncher
 
         cfg = parse_args_and_load_config(str(config_path))
-        return InteractiveLauncher().launch(
-            cfg, config_path, recipe_target, args.nproc_per_node, extra
-        )
+        return InteractiveLauncher().launch(cfg, config_path, recipe_target, args.nproc_per_node, extra)
 
 
 if __name__ == "__main__":
