@@ -48,7 +48,7 @@ class MoESplitExpertsStateDictMixin:
     @property
     def _is_gated_moe(self) -> bool:
         """Check if the MoE uses gated activation (e.g., SwiGLU) or non-gated (e.g., ReLU²)."""
-        from nemo_automodel.components.moe.layers import is_gated_activation
+        from nemo_automodel.components.moe.experts import is_gated_activation
 
         return is_gated_activation(self.moe_config.expert_activation)
 
@@ -194,6 +194,150 @@ class MoESplitExpertsStateDictMixin:
                     return stacked_tensor
 
         return None
+
+    def _convert_lora_expert_to_hf(
+        self,
+        fqn: str,
+        tensor: torch.Tensor,
+        n_experts: int,
+        inter_dim: int,
+        expert_segment: str,
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Convert a grouped MoE expert LoRA tensor to per-expert HF PEFT format.
+
+        Handles the four LoRA parameter types produced by GroupedExpertsLoRA /
+        GroupedExpertsDeepEPLoRA and converts them to per-expert ``lora_A.weight``
+        / ``lora_B.weight`` keys that HF PEFT understands.
+
+        The prefix (e.g. ``base_model.model.model.``) is preserved from the
+        incoming *fqn* so that both PEFT and FFT save paths work correctly.
+        """
+        match = re.search(r"(.*)layers\.(\d+)\.", fqn)
+        if not match:
+            return None
+        fqn_prefix = match.group(1)
+        layer_num = match.group(2)
+        suffix = fqn.rsplit(".", 1)[-1]
+
+        splits = self._split_experts_weights(tensor, n_experts)
+        result: list[tuple[str, torch.Tensor]] = []
+
+        for i, w in enumerate(splits):
+            expert_id = self._last_expert_ids[i]
+            base = f"{fqn_prefix}layers.{layer_num}.{expert_segment}.{expert_id}"
+
+            if suffix == "lora_gate_and_up_A":
+                # [dim, lora_dim] -> [lora_dim, dim] (nn.Linear convention)
+                w_t = w.transpose(0, 1).contiguous()
+                if self._is_gated_moe:
+                    result.append((f"{base}.gate_proj.lora_A.weight", w_t))
+                    result.append((f"{base}.up_proj.lora_A.weight", w_t.clone()))
+                else:
+                    result.append((f"{base}.up_proj.lora_A.weight", w_t))
+
+            elif suffix == "lora_gate_and_up_B":
+                # [lora_dim, 2*inter] (gated) or [lora_dim, inter] (non-gated)
+                if self._is_gated_moe:
+                    w_gate = w[:, :inter_dim].transpose(0, 1).contiguous()
+                    w_up = w[:, inter_dim:].transpose(0, 1).contiguous()
+                    result.append((f"{base}.gate_proj.lora_B.weight", w_gate))
+                    result.append((f"{base}.up_proj.lora_B.weight", w_up))
+                else:
+                    result.append((f"{base}.up_proj.lora_B.weight", w.transpose(0, 1).contiguous()))
+
+            elif suffix == "lora_down_A":
+                # [inter_dim, lora_dim] -> [lora_dim, inter_dim]
+                result.append((f"{base}.down_proj.lora_A.weight", w.transpose(0, 1).contiguous()))
+
+            elif suffix == "lora_down_B":
+                # [lora_dim, dim] -> [dim, lora_dim]
+                result.append((f"{base}.down_proj.lora_B.weight", w.transpose(0, 1).contiguous()))
+
+        return result
+
+    def _recombine_lora_expert_keys(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        """Recombine per-expert HF LoRA keys back to grouped MoE LoRA format.
+
+        This is the reverse of ``_convert_lora_expert_to_hf``.  It detects
+        per-expert LoRA keys (e.g.
+        ``layers.0.mlp.experts.0.gate_proj.lora_A.weight``) and recombines
+        them into the grouped tensors expected by GroupedExpertsLoRA /
+        GroupedExpertsDeepEPLoRA (e.g. ``layers.0.mlp.experts.lora_gate_and_up_A``).
+        """
+        expert_segment = re.escape(self._expert_path_segment)
+        n_experts = self.moe_config.n_routed_experts
+
+        lora_pattern = re.compile(
+            rf"(?P<prefix>.*)layers\.(?P<layer>\d+)\.{expert_segment}\."
+            rf"(?P<expert>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight"
+        )
+
+        # Group: (prefix, layer, proj, lora) -> {expert_id: tensor}
+        lora_groups: dict[tuple, dict[int, torch.Tensor]] = {}
+        consumed_keys: set[str] = set()
+
+        for key, value in state_dict.items():
+            m = lora_pattern.match(key)
+            if m:
+                group_key = (m.group("prefix"), m.group("layer"), m.group("proj"), m.group("lora"))
+                lora_groups.setdefault(group_key, {})[int(m.group("expert"))] = value
+                consumed_keys.add(key)
+
+        if not consumed_keys:
+            return state_dict
+
+        result = {k: v for k, v in state_dict.items() if k not in consumed_keys}
+        processed: set[tuple] = set()
+
+        for (prefix, layer, proj, lora), experts in lora_groups.items():
+            group_id = (prefix, layer, proj, lora)
+            if group_id in processed:
+                continue
+            processed.add(group_id)
+
+            if len(experts) != n_experts:
+                for eid, t in experts.items():
+                    orig_seg = self._expert_path_segment
+                    result[f"{prefix}layers.{layer}.{orig_seg}.{eid}.{proj}.{lora}.weight"] = t
+                continue
+
+            sorted_ids = sorted(experts.keys())
+            base_key = f"{prefix}layers.{layer}.{self._expert_path_segment}"
+
+            if proj in ("gate_proj", "up_proj") and lora == "lora_A":
+                if self._is_gated_moe and proj == "up_proj":
+                    continue  # gate_proj.lora_A already produces this (deduplicate)
+                tensors = [experts[eid].transpose(0, 1).contiguous() for eid in sorted_ids]
+                result[f"{base_key}.lora_gate_and_up_A"] = torch.stack(tensors, dim=0)
+                if self._is_gated_moe:
+                    processed.add((prefix, layer, "up_proj", "lora_A"))
+
+            elif proj in ("gate_proj", "up_proj") and lora == "lora_B":
+                if self._is_gated_moe and proj == "up_proj":
+                    continue  # handled by gate_proj.lora_B below
+                if self._is_gated_moe:
+                    up_key = (prefix, layer, "up_proj", "lora_B")
+                    up_experts = lora_groups.get(up_key, {})
+                    if len(up_experts) != n_experts:
+                        for eid, t in experts.items():
+                            orig_seg = self._expert_path_segment
+                            result[f"{prefix}layers.{layer}.{orig_seg}.{eid}.{proj}.{lora}.weight"] = t
+                        continue
+                    gate_ts = [experts[eid].transpose(0, 1).contiguous() for eid in sorted_ids]
+                    up_ts = [up_experts[eid].transpose(0, 1).contiguous() for eid in sorted_ids]
+                    combined = torch.cat([torch.stack(gate_ts, dim=0), torch.stack(up_ts, dim=0)], dim=-1)
+                    result[f"{base_key}.lora_gate_and_up_B"] = combined
+                    processed.add(up_key)
+                else:
+                    tensors = [experts[eid].transpose(0, 1).contiguous() for eid in sorted_ids]
+                    result[f"{base_key}.lora_gate_and_up_B"] = torch.stack(tensors, dim=0)
+
+            elif proj == "down_proj":
+                native_suffix = "lora_down_A" if lora == "lora_A" else "lora_down_B"
+                tensors = [experts[eid].transpose(0, 1).contiguous() for eid in sorted_ids]
+                result[f"{base_key}.{native_suffix}"] = torch.stack(tensors, dim=0)
+
+        return result
 
     def _to_hf_w_split_experts(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Convert DeepEP format to HuggingFace format.
@@ -354,6 +498,9 @@ class MoESplitExpertsStateDictMixin:
                 if not key.endswith("_scale_inv"):
                     state_dict[key] = value
 
+        # Recombine any per-expert HF LoRA keys back to grouped format
+        state_dict = self._recombine_lora_expert_keys(state_dict)
+
         return state_dict
 
     def _convert_single_merged_expert_to_hf_split_experts(
@@ -427,5 +574,12 @@ class MoESplitExpertsStateDictMixin:
                     )
                 )
             return result
+
+        # MoE expert LoRA keys: split grouped 3-D adapter tensors into per-expert
+        # HF-PEFT-compatible keys so that AutoPeftModelForCausalLM can load & merge.
+        _LORA_EXPERT_SUFFIXES = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
+        for suffix in _LORA_EXPERT_SUFFIXES:
+            if f".{expert_segment}.{suffix}" in fqn and fqn.endswith(f".{suffix}"):
+                return self._convert_lora_expert_to_hf(fqn, tensor, n_experts, inter_dim, expert_segment)
 
         return None
