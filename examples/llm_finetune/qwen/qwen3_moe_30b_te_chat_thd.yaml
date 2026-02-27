@@ -25,7 +25,7 @@
 
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 4
+  local_batch_size: 1
   ckpt_every_steps: 500
   num_epochs: 2
 
@@ -81,7 +81,10 @@ loss_fn:
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
-  path_or_dataset_id: your/path/to/train.jsonl
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  truncation: true
+  seq_length: 4096
 
 packed_sequence:
   # No packing — the THD collater synthesizes seq_lens from ChatDataset output.
@@ -94,7 +97,10 @@ dataloader:
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
-  path_or_dataset_id: your/path/to/validation.jsonl
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  truncation: true
+  seq_length: 4096
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
