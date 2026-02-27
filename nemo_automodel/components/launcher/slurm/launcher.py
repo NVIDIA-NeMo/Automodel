@@ -116,7 +116,7 @@ class SlurmLauncher(Launcher):
             f"--nproc_per_node={slurm_config['ntasks_per_node']} ",
             f"--nnodes={slurm_config['nodes']} ",
             "--rdzv_backend=c10d ",
-            f"--rdzv_endpoint=${{MASTER_ADDR}}:${{MASTER_PORT}}",
+            "--rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT}",
             script_path,
             "-c",
             f"{job_conf_path}",
