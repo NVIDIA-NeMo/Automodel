@@ -3223,6 +3223,9 @@ all = [
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "transformer-engine", marker = "sys_platform == 'never'" },
 ]
+cli = [
+    { name = "pyyaml" },
+]
 cuda = [
     { name = "bitsandbytes" },
     { name = "causal-conv1d" },
@@ -3338,6 +3341,7 @@ requires-dist = [
     { name = "pillow", marker = "extra == 'vlm'" },
     { name = "pybind11" },
     { name = "pyyaml" },
+    { name = "pyyaml", marker = "extra == 'cli'" },
     { name = "qwen-omni-utils", marker = "extra == 'vlm'" },
     { name = "qwen-vl-utils", extras = ["decord"], marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm'" },
     { name = "sentencepiece", marker = "extra == 'extra'" },
@@ -3352,7 +3356,7 @@ requires-dist = [
     { name = "transformers", specifier = ">=5.0.0" },
     { name = "wandb" },
 ]
-provides-extras = ["cuda", "extra", "fa", "delta-databricks", "moe", "vlm", "all"]
+provides-extras = ["cuda", "extra", "fa", "delta-databricks", "moe", "vlm", "cli", "all"]
 
 [package.metadata.requires-dev]
 build = [
