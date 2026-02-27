@@ -20,7 +20,7 @@ build-backend = "setuptools.build_meta"
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["nemo_automodel", "nemo_automodel.*"]
+include = ["nemo_automodel", "nemo_automodel.*", "cli"]
 
 [tool.setuptools.package-data]
 nemo_automodel = [
@@ -128,6 +128,11 @@ vlm = [
     "timm<=1.0.22",
     "torchcodec; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
 ]
+cli = [
+    "pyyaml",
+    "nemo_run",
+]
+nemo-run = ["nemo_run"]
 all = [
     "nemo_automodel[cuda]",
     "nemo_automodel[delta-databricks]",
@@ -141,7 +146,8 @@ Repository = "https://github.com/NVIDIA/NeMo-Automodel"
 Download = "https://github.com/NVIDIA/NeMo-Automodel/releases"
 
 [project.scripts]
-automodel = "nemo_automodel._cli.app:main"
+automodel = "cli.app:main"
+am = "cli.app:main"
 
 [dependency-groups]
 build = ["setuptools", "torch<=2.10.0", "packaging", "psutil"]
