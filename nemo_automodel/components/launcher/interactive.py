@@ -94,11 +94,8 @@ class InteractiveLauncher(Launcher):
 
         if nproc_per_node == 1 or num_devices == 1:
             logger.info("Launching job locally on a single device")
-            from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-
-            cfg = parse_args_and_load_config(config_path)
             recipe_cls = resolve_recipe_cls(recipe_target)
-            recipe = recipe_cls(cfg)
+            recipe = recipe_cls(config)
             recipe.setup()
             return recipe.run_train_validation_loop()
         else:

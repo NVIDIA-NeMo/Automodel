@@ -125,16 +125,20 @@ def main():
 
     elif nemo_run_config := config.pop("nemo_run", None):
         logger.info("Launching job via NeMo-Run")
+        from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
         from nemo_automodel.components.launcher.nemo_run.launcher import NemoRunLauncher
 
-        return NemoRunLauncher().launch(config, config_path, recipe_target, nemo_run_config, extra)
+        cfg = parse_args_and_load_config(str(config_path))
+        return NemoRunLauncher().launch(cfg, config_path, recipe_target, nemo_run_config, extra)
 
     else:
         logger.info("Launching job interactively (local)")
+        from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
         from nemo_automodel.components.launcher.interactive import InteractiveLauncher
 
+        cfg = parse_args_and_load_config(str(config_path))
         return InteractiveLauncher().launch(
-            config, config_path, recipe_target, args.nproc_per_node, extra
+            cfg, config_path, recipe_target, args.nproc_per_node, extra
         )
 
 

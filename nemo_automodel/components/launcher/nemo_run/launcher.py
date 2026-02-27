@@ -52,11 +52,7 @@ class NemoRunLauncher(Launcher):
 
         recipe_cls = resolve_recipe_cls(recipe_target)
 
-        from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-
-        cfg = parse_args_and_load_config(config_path)
-
-        recipe = run.Partial(recipe_cls, cfg=cfg)
+        recipe = run.Partial(recipe_cls, cfg=config)
 
         with run.Experiment("automodel_job") as exp:
             exp.add(recipe, executor=executor, name="automodel")
