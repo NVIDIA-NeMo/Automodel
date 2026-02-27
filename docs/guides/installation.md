@@ -279,10 +279,11 @@ lightweight CLI-only install:
 pip3 install nemo-automodel[cli]
 ```
 
-This installs only `pyyaml` and `nemo-run` -- no PyTorch, no CUDA. The
-`automodel` and `am` CLI commands will be available for job submission. If you
-accidentally try to run a local/interactive job with this install, you will get
-a clear error with instructions to install the full package.
+This installs only `pyyaml` -- no PyTorch, no CUDA. The `automodel` and `am`
+CLI commands will be available for SLURM and Kubernetes job submission. If you
+also need the NeMo-Run launcher, install it separately (`pip install nemo-run`).
+If you accidentally try to run a local/interactive job with this install, you
+will get a clear error with instructions to install the full package.
 
 ### VLM Dependencies
 

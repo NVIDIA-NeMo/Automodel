@@ -68,9 +68,11 @@ training locally:
 pip install nemo_automodel[cli]
 ```
 
-This installs only `pyyaml` and `nemo-run` -- no PyTorch, no CUDA dependencies.
-If you try to run a local/interactive job with the CLI-only install, you will
-get a clear error message with instructions to install the full package.
+This installs only `pyyaml` -- no PyTorch, no CUDA dependencies. It is enough
+to submit jobs via SLURM or Kubernetes. If you also need NeMo-Run, install it
+separately (`pip install nemo-run`). If you try to run a local/interactive job
+with the CLI-only install, you will get a clear error message with instructions
+to install the full package.
 
 ## CLI Module Moved to Repository Root
 

@@ -31,9 +31,10 @@ the lightweight CLI package:
 pip install nemo_automodel[cli]
 ```
 
-This installs only `pyyaml` and `nemo-run` -- no PyTorch or CUDA dependencies.
-It supports SLURM, Kubernetes, and NeMo-Run submission. If you accidentally
-try to run a local job, you will get a clear error with install instructions.
+This installs only `pyyaml` -- no PyTorch or CUDA dependencies. It supports
+SLURM and Kubernetes submission out of the box. For NeMo-Run submission,
+also install `pip install nemo-run`. If you accidentally try to run a local
+job, you will get a clear error with install instructions.
 
 For interactive testing on a Slurm node (without the `slurm:` YAML section):
   - Single node, single GPU
@@ -191,8 +192,6 @@ automodel your_config_with_nemo_run.yaml
 NeMo-Run is an optional dependency. Install it with:
 ```bash
 pip install nemo-run
-# or
-pip install nemo_automodel[nemo-run]
 ```
 :::
 
