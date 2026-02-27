@@ -15,10 +15,12 @@
 # Configuration for fine-tuning Qwen/Qwen3-VL-8B-Instruct with RDR dataset for image description
 
 
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py --config examples/vlm_finetune/qwen3/qwen3_vl_8b_instruct_rdr.yaml
-# Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
+# To run this recipe:
+#   automodel examples/vlm_finetune/qwen3/qwen3_vl_8b_instruct_rdr.yaml
+
+recipe:
+  _target_: nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM
 
 step_scheduler:
   global_batch_size: 8

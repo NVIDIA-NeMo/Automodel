@@ -1,6 +1,12 @@
 # Example configuration for pretraining a nanoGPT-style model on binary token shards
 # produced by the `modded-nanogpt` preprocessing pipeline.
 
+# To run this recipe:
+#   automodel examples/llm_pretrain/nanogpt_pretrain.yaml
+
+recipe:
+  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 32
   local_batch_size: 2

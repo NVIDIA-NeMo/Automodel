@@ -16,6 +16,12 @@
 
 
 
+# To run this recipe:
+#   automodel examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml
+
+recipe:
+  _target_: nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM
+
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1

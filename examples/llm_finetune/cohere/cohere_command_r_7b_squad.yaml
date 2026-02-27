@@ -13,6 +13,12 @@
 # limitations under the License.
 
 
+# To run this recipe:
+#   automodel examples/llm_finetune/cohere/cohere_command_r_7b_squad.yaml
+
+recipe:
+  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 128
   local_batch_size: 4

@@ -1,5 +1,11 @@
 # GLUE MRPC with RoBERTa-large + LoRA
 
+# To run this recipe:
+#   automodel examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
+
+recipe:
+  _target_: nemo_automodel.recipes.llm.train_seq_cls.TrainFinetuneRecipeForSequenceClassification
+
 step_scheduler:
   global_batch_size: 32
   local_batch_size: 32

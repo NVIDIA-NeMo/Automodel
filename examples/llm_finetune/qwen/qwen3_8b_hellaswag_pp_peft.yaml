@@ -13,11 +13,12 @@
 # limitations under the License.
 
 
-# To run this recipe, please use the following command:
-# export HF_HOME=/nemo-rl/hf_cache/
-# /nemo-rl/hemild/automodel-main/.venv/bin/torchrun --nproc-per-node=8 nemo_automodel/recipes/llm/train_ft.py --config examples/llm_finetune/qwen3/qwen3_8b_hellaswag_pp_peft.yaml
-# This config combines Pipeline Parallelism with PEFT (LoRA) for efficient training
 
+# To run this recipe:
+#   automodel examples/llm_finetune/qwen/qwen3_8b_hellaswag_pp_peft.yaml
+
+recipe:
+  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 128

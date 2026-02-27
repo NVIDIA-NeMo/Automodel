@@ -15,6 +15,12 @@
 # Example recipe to finetune Qwen/Qwen3-VL-30B-A3B-Instruct with Transformer Engine + DeePeep kernels.
 # Requires `qwen-vl-utils` for the collate function and vision preprocessing.
 
+# To run this recipe:
+#   automodel examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml
+
+recipe:
+  _target_: nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM
+
 step_scheduler:
   global_batch_size: 16
   local_batch_size: 1

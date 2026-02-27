@@ -1,5 +1,11 @@
 # Based on your existing config, modified for benchmarking
 
+# To run this recipe:
+#   automodel examples/benchmark/configs/peft/llama_3_3_70b_instruct_squad_peft_pp.yaml
+
+recipe:
+  _target_: nemo_automodel.recipes.llm.benchmark.BenchmarkingRecipeForNextTokenPrediction
+
 seed: 42
 
 # NEW: Add benchmark section

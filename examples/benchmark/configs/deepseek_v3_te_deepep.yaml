@@ -14,6 +14,12 @@
 
 # Benchmarking config for Deepseek V3 Te Deepep
 
+# To run this recipe:
+#   automodel examples/benchmark/configs/deepseek_v3_te_deepep.yaml
+
+recipe:
+  _target_: nemo_automodel.recipes.llm.benchmark.BenchmarkingRecipeForNextTokenPrediction
+
 seed: 1234
 
 benchmark:

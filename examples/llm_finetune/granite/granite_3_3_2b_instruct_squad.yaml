@@ -14,6 +14,12 @@
 
 
 
+# To run this recipe:
+#   automodel examples/llm_finetune/granite/granite_3_3_2b_instruct_squad.yaml
+
+recipe:
+  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 64
   local_batch_size: 8

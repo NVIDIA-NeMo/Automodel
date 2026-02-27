@@ -15,6 +15,12 @@
 # If transformers complains about unseen model, try to install transformers from 
 # git@github.com:Fazziekey/transformers.git@seed-oss
 
+# To run this recipe:
+#   automodel examples/llm_finetune/seed/seed_oss_36B_hellaswag.yaml
+
+recipe:
+  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 128
   local_batch_size: 8

@@ -14,6 +14,12 @@
 
 # Benchmarking config for Qwen3 Moe 30B Te Deepep
 
+# To run this recipe:
+#   automodel examples/benchmark/configs/qwen3_moe_235b_te_deepep.yaml
+
+recipe:
+  _target_: nemo_automodel.recipes.llm.benchmark.BenchmarkingRecipeForNextTokenPrediction
+
 seed: 1234
 
 benchmark:

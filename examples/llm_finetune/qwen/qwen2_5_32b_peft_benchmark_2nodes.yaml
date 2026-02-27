@@ -2,6 +2,12 @@
 # Based on Qwen2_72B_peft_benchmark.yaml but using custom model implementation
 # Similar to custom_llama3_3_70b_instruct_peft_benchmark.yaml
 
+# To run this recipe:
+#   automodel examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark_2nodes.yaml
+
+recipe:
+  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
+
 seed: 42
 
 # Benchmark section
