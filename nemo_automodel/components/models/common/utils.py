@@ -362,11 +362,36 @@ def _make_lazy_te_patcher():
 _patch_te_modules = _make_lazy_te_patcher()
 
 
+def get_rope_config(config) -> tuple[float, dict, float]:
+    """Extract rope configuration from ``config.rope_parameters``.
+
+    Args:
+        config: A HuggingFace model config object.
+
+    Returns:
+        Tuple of (rope_theta, rope_scaling, partial_rotary_factor).
+    """
+    rope_parameters = getattr(config, "rope_parameters", None) or {}
+
+    if "rope_theta" in rope_parameters:
+        rope_theta = rope_parameters["rope_theta"]
+    else:
+        rope_theta = config.rope_theta
+
+    if "partial_rotary_factor" in rope_parameters:
+        partial_rotary_factor = rope_parameters["partial_rotary_factor"]
+    else:
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+
+    return rope_theta, rope_parameters, partial_rotary_factor
+
+
 __all__ = [
     "BackendConfig",
     "TEFp8Config",
     "get_is_first_microbatch",
     "get_is_optim_step",
+    "get_rope_config",
     "initialize_linear_module",
     "initialize_rms_norm_module",
     "set_is_first_microbatch",

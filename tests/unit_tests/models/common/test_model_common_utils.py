@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -22,6 +23,7 @@ from nemo_automodel.components.models.common.utils import (
     TEFp8Config,
     get_is_first_microbatch,
     get_is_optim_step,
+    get_rope_config,
     set_is_first_microbatch,
     set_is_optim_step,
 )
@@ -130,3 +132,145 @@ class TestBackendConfigTeFp8:
         """te_fp8 requires linear='te' or experts='te'."""
         with pytest.raises(ValueError, match="te_fp8 requires at least one TE backend"):
             BackendConfig(te_fp8=TEFp8Config(), linear="torch", experts="torch")
+
+
+class TestGetRopeConfig:
+    def test_newer_hf_format_with_rope_parameters(self):
+        config = SimpleNamespace(
+            rope_parameters={"rope_theta": 1_000_000, "rope_type": "default"},
+        )
+        rope_theta, rope_scaling, partial_rotary_factor = get_rope_config(config)
+        assert rope_theta == 1_000_000
+        assert rope_scaling == {"rope_theta": 1_000_000, "rope_type": "default"}
+        assert partial_rotary_factor == 1.0
+
+    def test_no_rope_parameters_attribute(self):
+        config = SimpleNamespace(rope_theta=10_000)
+        rope_theta, rope_scaling, partial_rotary_factor = get_rope_config(config)
+        assert rope_theta == 10_000
+        assert rope_scaling == {}
+        assert partial_rotary_factor == 1.0
+
+    def test_rope_theta_falls_back_to_config_attribute(self):
+        config = SimpleNamespace(
+            rope_parameters={"rope_type": "default"},
+            rope_theta=500_000,
+        )
+        rope_theta, _, _ = get_rope_config(config)
+        assert rope_theta == 500_000
+
+    def test_rope_theta_from_rope_parameters_preferred(self):
+        config = SimpleNamespace(
+            rope_parameters={"rope_theta": 1_000_000},
+            rope_theta=10_000,
+        )
+        rope_theta, _, _ = get_rope_config(config)
+        assert rope_theta == 1_000_000
+
+    def test_rope_theta_not_on_config_when_in_rope_parameters(self):
+        config = SimpleNamespace(
+            rope_parameters={"rope_theta": 1_000_000},
+        )
+        rope_theta, _, _ = get_rope_config(config)
+        assert rope_theta == 1_000_000
+
+    def test_partial_rotary_factor_from_rope_parameters(self):
+        config = SimpleNamespace(
+            rope_parameters={"rope_theta": 10_000, "partial_rotary_factor": 0.5},
+        )
+        _, _, partial_rotary_factor = get_rope_config(config)
+        assert partial_rotary_factor == 0.5
+
+    def test_partial_rotary_factor_falls_back_to_config_attribute(self):
+        config = SimpleNamespace(
+            rope_parameters={"rope_theta": 10_000},
+            partial_rotary_factor=0.25,
+        )
+        _, _, partial_rotary_factor = get_rope_config(config)
+        assert partial_rotary_factor == 0.25
+
+    def test_partial_rotary_factor_defaults_to_one(self):
+        config = SimpleNamespace(
+            rope_parameters={"rope_theta": 10_000},
+        )
+        _, _, partial_rotary_factor = get_rope_config(config)
+        assert partial_rotary_factor == 1.0
+
+    def test_rope_parameters_none_returns_empty_dict(self):
+        config = SimpleNamespace(
+            rope_parameters=None,
+            rope_theta=10_000,
+        )
+        rope_theta, rope_scaling, _ = get_rope_config(config)
+        assert rope_theta == 10_000
+        assert rope_scaling == {}
+
+    def test_rope_parameters_empty_dict(self):
+        config = SimpleNamespace(
+            rope_parameters={},
+            rope_theta=10_000,
+        )
+        rope_theta, rope_scaling, _ = get_rope_config(config)
+        assert rope_theta == 10_000
+        assert rope_scaling == {}
+
+    def test_yarn_scaling_through_rope_parameters(self):
+        config = SimpleNamespace(
+            rope_parameters={
+                "rope_theta": 1_000_000,
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "beta_slow": 1.0,
+                "beta_fast": 32.0,
+                "original_max_position_embeddings": 8192,
+            },
+        )
+        rope_theta, rope_scaling, _ = get_rope_config(config)
+        assert rope_theta == 1_000_000
+        assert rope_scaling["factor"] == 4.0
+        assert rope_scaling["beta_slow"] == 1.0
+        assert rope_scaling["beta_fast"] == 32.0
+        assert rope_scaling["original_max_position_embeddings"] == 8192
+
+    def test_rope_parameters_is_rope_scaling(self):
+        params = {"rope_theta": 10_000, "factor": 2.0}
+        config = SimpleNamespace(rope_parameters=params)
+        _, rope_scaling, _ = get_rope_config(config)
+        assert rope_scaling is params
+
+    def test_rope_theta_fallback_when_rope_parameters_lacks_key(self):
+        """When rope_scaling is passed to from_pretrained, HuggingFace's
+        _init_rope_parameters() creates config.rope_parameters with
+        inv_freq and attention_factor but NOT rope_theta. The function
+        must fall back to config.rope_theta instead of raising KeyError.
+        """
+        config = SimpleNamespace(
+            rope_parameters={"inv_freq": [0.1, 0.2], "attention_factor": 1.0},
+            rope_theta=1_000_000,
+        )
+        rope_theta, rope_scaling, partial_rotary_factor = get_rope_config(config)
+        assert rope_theta == 1_000_000
+        assert rope_scaling == {"inv_freq": [0.1, 0.2], "attention_factor": 1.0}
+        assert partial_rotary_factor == 1.0
+
+    def test_yarn_parameters_propagated_from_rope_parameters(self):
+        """When rope_parameters contains scaling fields (factor, beta_slow,
+        beta_fast, original_max_position_embeddings), they must be
+        accessible from the returned rope_scaling dict so that
+        RotaryEmbedding can use them instead of hardcoded defaults.
+        """
+        config = SimpleNamespace(
+            rope_parameters={
+                "rope_theta": 1_000_000,
+                "rope_type": "yarn",
+                "factor": 5.5,
+                "beta_slow": 1.0,
+                "beta_fast": 32.0,
+                "original_max_position_embeddings": 40960,
+            },
+        )
+        _, rope_scaling, _ = get_rope_config(config)
+        assert rope_scaling.get("factor") == 5.5
+        assert rope_scaling.get("original_max_position_embeddings") == 40960
+        assert rope_scaling.get("beta_slow") == 1.0
+        assert rope_scaling.get("beta_fast") == 32.0

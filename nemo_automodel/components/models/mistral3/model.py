@@ -37,6 +37,7 @@ from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditiona
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple, logging
 
+from nemo_automodel.components.models.common import get_rope_config
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
 logger = logging.get_logger(__name__)
@@ -213,7 +214,7 @@ class Ministral3RotaryEmbedding(nn.Module):
         device: Optional["torch.device"] = None,
         seq_len: Optional[int] = None,
     ) -> tuple["torch.Tensor", float]:
-        base = config.rope_parameters["rope_theta"]
+        base, _, _ = get_rope_config(config)
         dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
         attention_factor = 1.0
         inv_freq = 1.0 / (
