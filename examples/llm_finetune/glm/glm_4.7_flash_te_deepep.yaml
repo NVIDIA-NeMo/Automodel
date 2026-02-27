@@ -27,10 +27,6 @@ rng:
   seed: 1111
   ranked: true
 
-moe_config:
-  _target_: nemo_automodel.components.moe.config.MoEParallelizerConfig
-  activation_checkpointing: true
-
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: zai-org/GLM-4.7-Flash
@@ -65,6 +61,11 @@ distributed:
   cp_size: 1
   pp_size: 1
   ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
 
 distributed_config:
   _target_: nemo_automodel.components.distributed.config.FSDP2Config
