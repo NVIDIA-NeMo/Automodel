@@ -92,7 +92,7 @@ Then submit the job:
 automodel your_config_with_slurm.yaml
 ```
 
-The CLI will automatically submit the job to Slurm and handle the distributed setup. The above example launches one node with eight workers per node using torchrun (`--nproc_per_node=8`).
+The CLI will automatically submit the job to Slurm and handle the distributed setup. The above example launches one node with eight workers per node using torchrun (`--nproc-per-node=8`).
 
 
 ### Launch a Batch Job on Slurm with Modified Code
