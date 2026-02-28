@@ -431,3 +431,27 @@ class TestScaleGradsAndClipGradNorm:
         # Non-expert params: only PP scaling -> 4
         assert torch.allclose(model.gate.weight.grad, torch.ones_like(model.gate.weight) * 4.0)
         assert torch.allclose(expert_param.grad, torch.ones_like(expert_param) * 2.0)
+
+    def test_pp_scaling_with_zero_num_label_tokens(self):
+        """Test that num_label_tokens=0 does not cause division by zero."""
+        model = _MoEModule()
+        model.gate.weight.grad = torch.ones_like(model.gate.weight) * 4.0
+
+        device_mesh = Mock()
+        device_mesh.mesh_dim_names = ["pp"]
+        device_mesh.__getitem__ = Mock(return_value=Mock(size=Mock(return_value=2)))
+
+        # Should not raise ZeroDivisionError — max(0, 1) == 1
+        scale_grads_and_clip_grad_norm(
+            max_grad_norm=None,
+            model_parts=[model],
+            pp_enabled=True,
+            device_mesh=device_mesh,
+            pp_axis_name="pp",
+            dp_group_size=4,
+            num_label_tokens=0,
+        )
+
+        # pp_divisor = max(0, 1) / 4 = 0.25 → grads divided by 0.25 → 4 / 0.25 = 16
+        expected = torch.ones_like(model.gate.weight) * 16.0
+        assert torch.allclose(model.gate.weight.grad, expected)
