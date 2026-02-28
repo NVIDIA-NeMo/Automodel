@@ -133,7 +133,10 @@ def build_comet(cfg) -> CometLogger:
     if not comet_config:
         raise ValueError("Comet configuration not found in config")
 
-    project_name = comet_config.get("project_name", "automodel-experiment")
+    project_name = comet_config.get("project_name", None)
+    if not project_name:
+        raise ValueError("comet.project_name is required")
+
     workspace = comet_config.get("workspace", None)
     api_key = comet_config.get("api_key", None)
     experiment_name = comet_config.get("experiment_name", "")
