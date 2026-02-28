@@ -85,6 +85,7 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
   path_or_dataset_id: allenai/tulu-3-sft-mixture
   split: train
+  shuffle_seed: 42
   truncation: true
   seq_length: 1024
   padding: max_length
@@ -102,6 +103,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
   path_or_dataset_id: allenai/tulu-3-sft-mixture
   split: "train[:128]"
+  shuffle_seed: 42
   truncation: true
   seq_length: 1024
   padding: max_length
