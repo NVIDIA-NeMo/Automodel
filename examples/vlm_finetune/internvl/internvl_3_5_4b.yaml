@@ -13,7 +13,12 @@
 # limitations under the License.
 
 # Configuration for fine-tuning Gemma 3 VL 4B with MedPix dataset for image description
-# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py --config examples/vlm_finetune/internvl/internvl_3_5_4b.yaml
+# To run this recipe:
+#   automodel examples/vlm_finetune/internvl/internvl_3_5_4b.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe:
+  _target_: nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM
 
 step_scheduler:
   global_batch_size: 16

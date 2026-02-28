@@ -151,26 +151,27 @@ uv run python -c "import nemo_automodel; print('AutoModel ready')"
 
 
 ### Run a Recipe
-To run a NeMo AutoModel recipe, you need a recipe script (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/finetune.py), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/finetune.py)) and a YAML config file (e.g., [LLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml), [VLM](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml)):
-```
-# Command invocation format:
-uv run <recipe_script_path> --config <yaml_config_path>
+All recipes are launched via the `automodel` CLI (or its short alias `am`). Each YAML config specifies the recipe class and all training parameters:
+```bash
+# LLM example: multi-GPU fine-tuning with FSDP2
+automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml --nproc-per-node 8
 
-# LLM example: multi-GPU with FSDP2
-uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml
+# VLM example: single-GPU fine-tuning (Gemma-3-VL) with LoRA
+automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml
 
-# VLM example: single GPU fine-tuning (Gemma-3-VL) with LoRA
-uv run examples/vlm_finetune/finetune.py --config examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml
+# Both commands also work with uv run:
+uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml --nproc-per-node 8
 ```
+
+> [!TIP]
+> **Login-node / CI installs:** If you only need to submit jobs (SLURM, k8s, NeMo-Run) and don't need to train locally, install the lightweight CLI package: `pip install nemo-automodel[cli]`
 
 
 ## LLM Pre-training
 ### LLM Pre-training Single Node
 We provide an example SFT experiment using the [Fineweb dataset](https://arxiv.org/abs/2406.17557/) with a nano-GPT model, ideal for quick experimentation on a single node.
 ```sh
-uv run torchrun --nproc-per-node=8 \
-  examples/llm_pretrain/pretrain.py \
-  -c examples/llm_pretrain/nanogpt_pretrain.yaml
+automodel examples/llm_pretrain/nanogpt_pretrain.yaml --nproc-per-node 8
 ```
 
 <!-- ### LLM Pre-training Multi Node -->
@@ -185,60 +186,41 @@ We provide an example SFT experiment using the [SQuAD dataset](https://rajpurkar
 The default SFT configuration is set to run on a single GPU. To start the experiment:
 
 ```sh
-uv run python3 \
-  examples/llm_finetune/finetune.py \
-  -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
-This fine-tunes the `Llama3.2-1B` model on the SQuAD dataset using a 1 GPU.
+This fine-tunes the `Llama3.2-1B` model on the SQuAD dataset using a single GPU.
 
-To use multiple GPUs on a single node in an interactive environment, you can run the same command
-using torchrun and adjust the `--proc-per-node` argument to the number of needed GPUs.
+To use multiple GPUs on a single node, add the `--nproc-per-node` argument:
 
 ```sh
-uv run torchrun --nproc-per-node=8 \
-  examples/llm_finetune/finetune.py \
-  -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
-```
-
-Alternatively, you can use the `automodel` CLI application to launch the same job, for example:
-```sh
-uv run automodel finetune llm \
-  --nproc-per-node=8 \
-  -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node 8
 ```
 
 ### LLM SFT Multi Node
-You can use the `automodel` CLI application to launch a job on a SLURM cluster, for example:
-```sh
-# First you need to specify the SLURM section in your YAML config, for example:
-
-cat << EOF > examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+To launch on a SLURM cluster, add a `slurm:` section to your YAML config and run the same CLI command:
+```yaml
+# Inside your YAML config:
 slurm:
-  job_name: llm-finetune # set to the job name you want to use
-  nodes: 2 # set to the needed number of nodes
+  job_name: llm-finetune
+  nodes: 2
   ntasks_per_node: 8
   time: 00:30:00
   account: your_account
   partition: gpu
-  container_image: nvcr.io/nvidia/nemo:25.07
-  gpus_per_node: 8 # This adds "#SBATCH --gpus-per-node=8" to the script
-  # Optional: Add extra mount points if needed
+  container_image: nvcr.io/nvidia/nemo-automodel:25.11.00
+  gpus_per_node: 8
   extra_mounts:
     - /lustre:/lustre
-  # Optional: Specify custom HF_HOME location (will auto-create if not specified)
   hf_home: /path/to/your/HF_HOME
-  # Optional : Specify custom env vars
-  # env_vars:
-  #   ENV_VAR: value
-  # Optional: Specify custom job directory (defaults to cwd/slurm_jobs)
-  # job_dir: /path/to/slurm/jobs
-EOF
-
-# using the updated YAML you can launch the job.
-uv run automodel finetune llm \
-  -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
+```sh
+automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+```
+
+The CLI automatically detects the `slurm:` section, generates an SBATCH script, and submits the job.
+Kubernetes (`k8s:`) and NeMo-Run (`nemo_run:`) sections are also supported -- see our
+[cluster guide](https://docs.nvidia.com/nemo/automodel/latest/launcher/cluster.html) for details.
 
 ## LLM Parameter-Efficient Fine-Tuning (PEFT)
 
@@ -246,22 +228,16 @@ We provide a PEFT example using the [HellaSwag dataset](https://rowanzellers.com
 
 ### LLM PEFT Single Node
 ```bash
-# Memory‑efficient SFT with LoRA
-uv run examples/llm_finetune/finetune.py \
---config examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml
+# Memory-efficient SFT with LoRA
+automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml
 
-# You can always overwrite parameters by appending them to the command, for example,
-# if you want to increase the micro-batch size you can do
-uv run examples/llm_finetune/finetune.py \
-  --config examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml \
+# Override any YAML parameter via the command line:
+automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml \
   --step_scheduler.local_batch_size 16
-
-# The above command will modify the `local_batch_size` variable to have value 16 in the
-# section `step_scheduler` of the yaml file.
 ```
 
 > [!NOTE]
-> Launching a multi-node PEFT example requires only adding a `slurm` section to your config, similarly to the SFT case.
+> Launching a multi-node PEFT example requires only adding a `slurm:` (or `k8s:` / `nemo_run:`) section to your config, similarly to the SFT case.
 
 
 ## VLM Supervised Fine-Tuning (SFT)
@@ -270,10 +246,8 @@ We provide a VLM SFT example using Qwen2.5‑VL for end‑to‑end fine‑tuning
 
 ### VLM SFT Single Node
 ```bash
-# Qwen2.5‑VL on a 8 GPUs
-uv run torchrun --nproc-per-node=8 \
-  examples/vlm_finetune/finetune.py \
-  --config examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml
+# Qwen2.5-VL on 8 GPUs
+automodel examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml --nproc-per-node 8
 ```
 
 ## VLM Parameter-Efficient Fine-Tuning (PEFT)
@@ -282,10 +256,8 @@ We provide a VLM PEFT (LoRA) example for memory‑efficient adaptation with Gemm
 
 ### VLM PEFT Single Node
 ```bash
-# Qwen2.5‑VL on a 8 GPUs
-uv run torchrun --nproc-per-node=8 \
-  examples/vlm_finetune/finetune.py \
-  --config examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix_peft.yaml
+# Gemma-3-VL PEFT on 8 GPUs
+automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix_peft.yaml --nproc-per-node 8
 ```
 
 
@@ -365,19 +337,19 @@ model_save_format: safetensors
 
 ```
 NeMo-Automodel/
+├── cli/                            # `automodel` / `am` CLI entry-point
+│   └── app.py
 ├── docker/                         # Container build files
 ├── docs/                           # Documentation and guides
 ├── examples/
 │   ├── benchmark/                  # Benchmarking scripts
-│   ├── llm_finetune/              # LLM finetune recipes
-│   ├── llm_kd/                    # LLM knowledge-distillation recipes
-│   ├── llm_pretrain/              # LLM pretrain recipes
-│   ├── llm_seq_cls/               # LLM sequence classification
-│   ├── vlm_finetune/             # VLM finetune recipes
-│   └── vlm_generate/             # VLM generation recipes
+│   ├── llm_finetune/              # LLM finetune YAML configs
+│   ├── llm_kd/                    # LLM knowledge-distillation configs
+│   ├── llm_pretrain/              # LLM pretrain configs
+│   ├── llm_seq_cls/               # LLM sequence classification configs
+│   ├── vlm_finetune/             # VLM finetune configs
+│   └── vlm_generate/             # VLM generation configs
 ├── nemo_automodel/
-│   ├── _cli/
-│   │   └── app.py                 # the `automodel` CLI job launcher
 │   ├── _transformers/             # HF model integrations
 │   ├── components/                # Core library
 │   │   ├── _peft/                 # PEFT implementations (LoRA)
@@ -386,7 +358,7 @@ NeMo-Automodel/
 │   │   ├── config/
 │   │   ├── datasets/              # LLM (HellaSwag, etc.) & VLM datasets
 │   │   ├── distributed/           # FSDP2, Megatron FSDP, Pipelining, etc.
-│   │   ├── launcher/              # The job launcher component (SLURM)
+│   │   ├── launcher/              # Launcher backends (SLURM, k8s, NeMo-Run)
 │   │   ├── loggers/               # Loggers
 │   │   ├── loss/                  # Optimized loss functions
 │   │   ├── models/                # User-defined model examples

@@ -14,6 +14,13 @@
 
 # Benchmarking config for Gptoss 120B Te Deepep
 
+# To run this recipe:
+#   automodel examples/benchmark/configs/gptoss_120b_te_deepep.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe:
+  _target_: nemo_automodel.recipes.llm.benchmark.BenchmarkingRecipeForNextTokenPrediction
+
 seed: 1234
 
 benchmark:

@@ -15,8 +15,12 @@
 # QLora configuration for Llama-3.1-8B on SQuAD dataset
 # Uses 4-bit quantization with LoRA adapters
 # 
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=1 examples/llm_finetune/finetune.py --config examples/llm_finetune/llama3_1/llama3_1_8b_squad_qlora.yaml
+# To run this recipe:
+#   automodel examples/llm_finetune/llama3_1/llama3_1_8b_squad_qlora.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe:
+  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 32
