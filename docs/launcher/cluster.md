@@ -30,7 +30,7 @@ If you only need to submit jobs from a login node (no local training), install
 the lightweight CLI package:
 
 ```bash
-pip install nemo_automodel[cli]
+pip install nemo-automodel[cli]
 ```
 
 This installs only `pyyaml` -- no PyTorch or CUDA dependencies. It supports
