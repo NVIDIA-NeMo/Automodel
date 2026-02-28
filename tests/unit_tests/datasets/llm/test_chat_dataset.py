@@ -123,6 +123,16 @@ def test_load_openai_messages_hf_shuffle_and_slice(monkeypatch):
     assert call_log["shuffle_seed"] == 42
     assert call_log["select_indices"] == list(range(10, 20))
 
+    # Custom seed
+    call_log.clear()
+    tcd._load_openai_messages("org/name", split="train", shuffle_seed=123)
+    assert call_log["shuffle_seed"] == 123
+
+    # Disable shuffle
+    call_log.clear()
+    tcd._load_openai_messages("org/name", split="train", shuffle_seed=None)
+    assert "shuffle_seed" not in call_log
+
 
 def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
     # Stub tokenizer
