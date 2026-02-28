@@ -119,6 +119,9 @@ Recipes are executable Python scripts paired with YAML configuration files. Each
 4. **Checkpoint** using Distributed Checkpoint (DCP) with SafeTensors output
 
 ```yaml
+recipe:
+  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
+
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
