@@ -156,6 +156,34 @@ def test_build_comet_auto_generates_experiment_name(monkeypatch):
     assert calls["set_name"] == ["org_my-model"]
 
 
+def test_build_comet_raises_without_project_name(monkeypatch):
+    _install_fake_comet_ml()
+
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True, raising=False)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0, raising=False)
+
+    from nemo_automodel.components.loggers.comet_utils import build_comet
+
+    class CometCfg:
+        def __init__(self):
+            self._data = {"workspace": "test"}
+
+        def get(self, key, default=None):
+            return self._data.get(key, default)
+
+    class Cfg:
+        def __init__(self):
+            self.comet = CometCfg()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    with pytest.raises(ValueError, match="comet.project_name is required"):
+        build_comet(Cfg())
+
+
 def test_build_comet_raises_without_config(monkeypatch):
     _install_fake_comet_ml()
 
