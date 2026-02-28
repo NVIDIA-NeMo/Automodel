@@ -91,17 +91,17 @@ class _StubTokenizerChat(_StubTokenizerPlain):  # noqa: D401
         # Separate prompt messages (system, user) from assistant messages
         prompt_messages = [m for m in messages if m["role"] != "assistant"]
         assistant_messages = [m for m in messages if m["role"] == "assistant"]
-        
+
         # Build ids: [SOT] + prompt tokens + [SOT] + assistant tokens + [EOS]
         ids: List[int] = [self._start_of_turn_token_id]
-        
+
         # Add all prompt tokens (system + user)
         prompt_token_count = 0
         for msg in prompt_messages:
             tokens = msg["content"].split()
             ids.extend(self._id_for_token(tok) for tok in tokens)
             prompt_token_count += len(tokens)
-        
+
         # Add second SOT and assistant tokens
         ids.append(self._start_of_turn_token_id)
         assistant_token_count = 0
@@ -109,15 +109,15 @@ class _StubTokenizerChat(_StubTokenizerPlain):  # noqa: D401
             tokens = msg["content"].split()
             ids.extend(self._id_for_token(tok) for tok in tokens)
             assistant_token_count += len(tokens)
-        
+
         ids.append(self.eos_token_id)
-        
+
         # Handle return_dict parameter
         if kwargs.get("return_dict", False):
             result = {"input_ids": ids}
             # Handle return_assistant_tokens_mask parameter
             if kwargs.get("return_assistant_tokens_mask", False):
-                # Create mask: first SOT and prompt tokens are 0 (masked), 
+                # Create mask: first SOT and prompt tokens are 0 (masked),
                 # second SOT and assistant tokens are 1 (not masked)
                 mask = [0] * (1 + prompt_token_count)  # first SOT + prompt tokens
                 mask += [1] * (1 + assistant_token_count + 1)  # second SOT + assistant tokens + EOS
@@ -210,6 +210,44 @@ def test_apply_tokenizer_chat_template_answer_only_mask():
     assert all(v != -100 for v in out["labels"][pos:])
 
 
+def test_apply_chat_template_attention_mask_zeros_out_padding_in_loss_mask():
+    """Verify that padding positions from the tokenizer's attention_mask zero out the loss mask.
+
+    Without the fix, mask=[1]*len(input_ids) would mark padding positions as
+    supervised, leading to incorrect loss on pad tokens.
+
+    The stub tokenizer returns 3 padding tokens (id=0) with attention_mask=0.
+    After _package_tokenized_example removes the first token (BOS shift) and
+    appends EOS, the 3 padding positions should still have label=-100 in the
+    output.
+    """
+    tok = _StubTokenizerChatNoGenWithPadding()
+    out = format_chat_template(
+        tok,
+        formatted_text=[
+            {"role": "user", "content": "hello world"},
+            {"role": "assistant", "content": "hi"},
+        ],
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        answer_only_loss_mask=False,
+    )
+
+    labels = out["labels"]
+    # The stub produces: [hello, world, hi, EOS, pad, pad, pad] then appends EOS.
+    # After BOS-shift in _package_tokenized_example, the 3 pad positions map to
+    # consecutive -100 values in labels.
+    num_ignored = labels.count(-100)
+    assert num_ignored == 3, (
+        f"Expected 3 padding positions with label=-100, got {num_ignored}. labels={labels}"
+    )
+    # Verify supervised tokens don't include pad token id (0)
+    supervised = [v for v in labels if v != -100]
+    assert 0 not in supervised, (
+        f"Pad token (0) should not appear in supervised labels, got {supervised}"
+    )
+
+
 def test_apply_tokenizer_chat_template_full_loss_mask():
     tok = _StubTokenizerChat()
     out = format_chat_template(
@@ -226,6 +264,44 @@ def test_apply_tokenizer_chat_template_full_loss_mask():
     assert set(out) == {"input_ids", "labels", "attention_mask"}
     assert len(out["input_ids"]) == len(out["labels"]) == len(out["attention_mask"])
     assert all(v == 1 for v in out["attention_mask"])
+
+
+class _StubTokenizerChatNoGenWithPadding:
+    """Chat tokenizer without generation keyword that returns attention_mask with padding.
+
+    Without the generation keyword and with answer_only_loss_mask=False,
+    format_chat_template sets mask=[1]*len(input_ids), incorrectly marking
+    padding positions as supervised.  The attention_mask zeroing fix should
+    correct this.
+    """
+
+    eos_token_id = 2
+    chat_template = "<dummy template no generation>"
+
+    def __init__(self):
+        self._vocab = {}
+        self._cursor = 3
+
+    def _id_for_token(self, tok):
+        if tok not in self._vocab:
+            self._vocab[tok] = self._cursor
+            self._cursor += 1
+        return self._vocab[tok]
+
+    def apply_chat_template(self, messages, **kwargs):
+        ids = []
+        for msg in messages:
+            ids.extend(self._id_for_token(tok) for tok in str(msg["content"]).split())
+        ids.append(self.eos_token_id)
+        # Simulate padding: add 3 pad tokens
+        real_len = len(ids)
+        ids = ids + [0] * 3
+        if kwargs.get("return_dict", False):
+            return {
+                "input_ids": ids,
+                "attention_mask": [1] * real_len + [0] * 3,
+            }
+        return ids
 
 
 class _StubTokenizerChatNoGen:

@@ -142,6 +142,39 @@ def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
     assert new_batch is batch
 
 
+def test_make_cp_batch_and_ctx_includes_padding_mask(monkeypatch):
+    """Verify that padding_mask is included in CP buffers when present in batch."""
+
+    captured_kwargs = {}
+
+    def _fake_create_ctx(**kwargs):
+        captured_kwargs.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
+
+    def _fake_get_train_ctx(enable_loss_parallel, enable_compiled_autograd, cp_ctx):
+        return "dummy_train_ctx"
+
+    monkeypatch.setattr(_cu, "get_train_context", _fake_get_train_ctx)
+
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
+    padding_mask = torch.tensor([[True, False, True]])
+    batch = {
+        "input_ids": torch.tensor([[10, 20, 30]]),
+        "labels": torch.tensor([[10, 20, 30]]),
+        "padding_mask": padding_mask,
+    }
+
+    _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask=None)
+
+    # padding_mask should be in cp_buffers
+    assert any(
+        t is padding_mask for t in captured_kwargs["cp_buffers"]
+    ), "padding_mask must be included in cp_buffers"
+    assert padding_mask in captured_kwargs["cp_no_restore_buffers"]
+
+
 # ============================================================================
 # Tests for make_cp_batch_for_te
 # ============================================================================
@@ -206,6 +239,75 @@ def test_make_cp_batch_for_te_basic(monkeypatch):
 
     # Verify cu_seqlens are properly formatted
     assert result["cu_seqlens"].dtype == torch.int32
+
+
+def test_shard_thd_chunk_includes_attention_mask(monkeypatch):
+    """Test that _shard_thd_chunk_for_te partitions and includes attention_mask when present."""
+    cp_mesh = _DummySubMesh(size=2)
+
+    def mock_get_rank(group=None):
+        return 0
+
+    def mock_thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
+        return torch.arange(total_tokens)
+
+    class MockTex:
+        @staticmethod
+        def thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
+            return mock_thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank)
+
+    import sys
+    sys.modules['transformer_engine_torch'] = MockTex
+
+    monkeypatch.setattr(torch.distributed, "get_rank", mock_get_rank)
+
+    # Simulate a THD-format chunk with attention_mask
+    batch = {
+        "input_ids": torch.tensor([1, 2, 3, 4]),
+        "labels": torch.tensor([10, 20, 30, 40]),
+        "position_ids": torch.tensor([0, 1, 2, 3]),
+        "padding_mask": torch.tensor([False, False, False, True]),
+        "cu_seqlens": torch.tensor([0, 4], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([0, 4], dtype=torch.int32),
+        "attention_mask": torch.tensor([1, 1, 1, 0]),
+    }
+
+    result = _cu._shard_thd_chunk_for_te(batch, cp_mesh, "thd", -1000, 0)
+
+    assert "attention_mask" in result, "attention_mask should be in output"
+    assert result["attention_mask"].dtype == torch.bool
+
+
+def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
+    """Test that _shard_thd_chunk_for_te handles missing padding_mask gracefully."""
+    cp_mesh = _DummySubMesh(size=2)
+
+    def mock_get_rank(group=None):
+        return 0
+
+    class MockTex:
+        @staticmethod
+        def thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
+            return torch.arange(total_tokens)
+
+    import sys
+    sys.modules['transformer_engine_torch'] = MockTex
+
+    monkeypatch.setattr(torch.distributed, "get_rank", mock_get_rank)
+
+    # Batch without padding_mask — should not raise KeyError
+    batch = {
+        "input_ids": torch.tensor([1, 2, 3, 4]),
+        "labels": torch.tensor([10, 20, 30, 40]),
+        "position_ids": torch.tensor([0, 1, 2, 3]),
+        "cu_seqlens": torch.tensor([0, 4], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([0, 4], dtype=torch.int32),
+    }
+
+    result = _cu._shard_thd_chunk_for_te(batch, cp_mesh, "thd", -1000, 0)
+
+    assert "input_ids" in result
+    assert "attention_mask" not in result
 
 
 def test_make_cp_batch_for_te_unsupported_format():

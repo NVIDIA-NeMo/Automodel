@@ -113,3 +113,20 @@ def test_masked_cross_entropy_num_label_tokens_normalization():
     assert torch.allclose(loss_masked, expected_loss, atol=1e-6), (
         f"Expected normalized loss {expected_loss.item()}, but got {loss_masked.item()}."
     )
+
+
+def test_masked_cross_entropy_num_label_tokens_zero_no_nan():
+    """Ensure that ``num_label_tokens=0`` does not produce NaN (division-by-zero guard)."""
+    seq_len = 8
+    num_classes = 4
+
+    logits = torch.randn(seq_len, num_classes)
+    targets = torch.randint(0, num_classes, (seq_len,))
+
+    loss = MaskedCrossEntropy()(logits, targets, num_label_tokens=0)
+
+    assert not torch.isnan(loss), "Loss must not be NaN when num_label_tokens is 0"
+    assert not torch.isinf(loss), "Loss must not be Inf when num_label_tokens is 0"
+    # max(0, 1) == 1, so the loss should equal the unreduced sum
+    expected = F.cross_entropy(logits, targets, reduction="sum")
+    assert torch.allclose(loss, expected, atol=1e-6)
