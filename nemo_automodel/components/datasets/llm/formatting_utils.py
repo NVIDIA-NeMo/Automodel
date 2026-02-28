@@ -298,7 +298,7 @@ def format_chat_template(
             tokenize=True,
             return_dict=True,
             return_assistant_tokens_mask=template_has_generation_kwd,
-            padding=padding,
+            padding=False,
             truncation=truncation,
             max_length=seq_length,
         )
@@ -306,6 +306,15 @@ def format_chat_template(
         mask = [0] * len_prompt_ids + [1] * (len(input_ids) - len_prompt_ids)
     else:
         mask = [1] * len(input_ids)
+
+    # When the tokenizer applied padding (e.g. padding="max_length"), the mask
+    # computed above may incorrectly mark padding positions as 1.  Use the
+    # tokenizer's own attention_mask to zero them out.
+    tokenizer_attn_mask = tokenized_chat.get("attention_mask")
+    if tokenizer_attn_mask is not None:
+        for i in range(min(len(mask), len(tokenizer_attn_mask))):
+            if not tokenizer_attn_mask[i]:
+                mask[i] = 0
 
     if getattr(tokenizer, "eos_token_id", None) and input_ids[-1] != tokenizer.eos_token_id:
         input_ids += [tokenizer.eos_token_id]
