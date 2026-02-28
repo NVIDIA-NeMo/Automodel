@@ -39,12 +39,22 @@ from huggingface_hub import constants as hf_constants  # noqa: E402
 from transformers import (  # noqa: E402
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
-    AutoModelForMultimodalLM,
     AutoModelForSequenceClassification,
     AutoModelForTextToWaveform,
     PreTrainedModel,
 )
-from transformers.initialization import no_init_weights  # noqa: E402
+
+try:  # noqa: E402
+    from transformers import AutoModelForMultimodalLM  # noqa: E402
+except ImportError:  # transformers<4.58
+    # Older transformers releases expose image-text multimodal auto-models
+    # under AutoModelForImageTextToText but not AutoModelForMultimodalLM.
+    AutoModelForMultimodalLM = AutoModelForImageTextToText
+try:  # noqa: E402
+    from transformers.initialization import no_init_weights  # noqa: E402
+except ImportError:  # transformers<4.58
+    from transformers.modeling_utils import no_init_weights  # noqa: E402
+
 from transformers.models.auto.auto_factory import _BaseAutoModelClass  # noqa: E402
 from transformers.utils import ContextManagers  # noqa: E402
 
