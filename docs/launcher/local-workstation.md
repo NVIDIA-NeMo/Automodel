@@ -69,7 +69,7 @@ For interactive single-node jobs, the CLI automatically detects the number of av
 uses `torchrun` for multi-GPU training. You can manually specify the number of GPUs using the `--nproc-per-node` option:
 
 ```bash
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node=2
+automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node 2
 ```
 
 If you don't specify `--nproc-per-node`, it will use all available GPUs on your system.
