@@ -500,6 +500,8 @@ class Gate(nn.Module):
         # Compute f_i (fraction of tokens dispatched to each expert).
         # If uniform distribution, expert_load will be topk * num_location / n_experts, and f_i will be 1
         # Maximum value f_i entries happens when expert_load = num_location, the value will be n_experts / topk
+        # Protect against division by zero when all tokens are masked (e.g. padding-heavy CP rank).
+        context_length = torch.clamp(context_length, min=1)
         f_i = expert_load * self.n_experts / (self.topk * context_length)  # Normalized fraction, (n_experts)
 
         # Compute P_i (average routing probability per expert)
