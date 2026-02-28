@@ -70,6 +70,24 @@ _INSTALL_MSG = (
 class InteractiveLauncher(Launcher):
     """Launch a recipe locally on the current node using torchrun or in-process."""
 
+    @staticmethod
+    def _is_torchrun_worker() -> bool:
+        """Return True when this process was already spawned by torchrun.
+
+        torchrun (``torch.distributed.run``) sets ``LOCAL_RANK`` in the
+        environment of every worker it spawns.  When the user launches the CLI
+        via ``torchrun --nproc-per-node N cli/app.py config.yaml``, each
+        worker must run the recipe in-process instead of re-launching torchrun.
+        """
+        return "LOCAL_RANK" in os.environ
+
+    def _run_recipe_in_process(self, recipe_target: str, config: Dict[str, Any]) -> int:
+        """Instantiate and run a recipe in the current process."""
+        recipe_cls = resolve_recipe_cls(recipe_target)
+        recipe = recipe_cls(config)
+        recipe.setup()
+        return recipe.run_train_validation_loop()
+
     def launch(
         self,
         config: Dict[str, Any],
@@ -85,6 +103,17 @@ class InteractiveLauncher(Launcher):
             logger.error(_INSTALL_MSG)
             return 1
 
+        # Already inside a torchrun worker (e.g. user ran
+        # ``torchrun --nproc-per-node N cli/app.py config.yaml``).
+        # Run the recipe directly; do NOT re-launch torchrun.
+        if self._is_torchrun_worker():
+            logger.info(
+                "Detected existing torchrun environment (LOCAL_RANK=%s); "
+                "running recipe in-process.",
+                os.environ["LOCAL_RANK"],
+            )
+            return self._run_recipe_in_process(recipe_target, config)
+
         nproc_per_node: Optional[int] = launcher_config
         repo_root = _get_repo_root()
         script_path = _recipe_module_path(recipe_target, repo_root)
@@ -94,10 +123,7 @@ class InteractiveLauncher(Launcher):
 
         if nproc_per_node == 1 or num_devices == 1:
             logger.info("Launching job locally on a single device")
-            recipe_cls = resolve_recipe_cls(recipe_target)
-            recipe = recipe_cls(config)
-            recipe.setup()
-            return recipe.run_train_validation_loop()
+            return self._run_recipe_in_process(recipe_target, config)
         else:
             effective_nproc = nproc_per_node if nproc_per_node is not None else num_devices
             logger.info("Launching job locally on %d devices", effective_nproc)

@@ -266,4 +266,79 @@ def test_interactive_launcher_multi_device_with_extra_args(tmp_path):
     assert mock_args.nproc_per_node == 2
 
 
+# ---------------------------------------------------------------------------
+# InteractiveLauncher.launch – torchrun worker detection (in-process path)
+# ---------------------------------------------------------------------------
+def test_interactive_launcher_torchrun_worker_runs_in_process(tmp_path, monkeypatch):
+    """When LOCAL_RANK is set (i.e. already inside torchrun), run in-process."""
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("")
+    monkeypatch.setenv("LOCAL_RANK", "3")
+
+    mock_recipe_instance = mock.MagicMock()
+    mock_recipe_instance.run_train_validation_loop.return_value = 0
+    mock_recipe_cls = mock.MagicMock(return_value=mock_recipe_instance)
+    mock_dist, _ = _make_torch_distributed_mock(world_size=8)
+
+    with (
+        mock.patch.dict("sys.modules", {"torch.distributed.run": mock_dist}),
+        mock.patch(
+            "nemo_automodel.components.launcher.interactive.resolve_recipe_cls",
+            return_value=mock_recipe_cls,
+        ),
+    ):
+        launcher = InteractiveLauncher()
+        rc = launcher.launch(
+            config={"key": "val"},
+            config_path=cfg_file,
+            recipe_target="some.module.Recipe",
+            launcher_config=None,
+        )
+    assert rc == 0
+    mock_recipe_cls.assert_called_once_with({"key": "val"})
+    mock_recipe_instance.setup.assert_called_once()
+    mock_recipe_instance.run_train_validation_loop.assert_called_once()
+    mock_dist.run.assert_not_called()
+
+
+def test_interactive_launcher_torchrun_worker_ignores_nproc(tmp_path, monkeypatch):
+    """nproc_per_node should be ignored when already inside torchrun."""
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+
+    mock_recipe_instance = mock.MagicMock()
+    mock_recipe_instance.run_train_validation_loop.return_value = 0
+    mock_recipe_cls = mock.MagicMock(return_value=mock_recipe_instance)
+    mock_dist, _ = _make_torch_distributed_mock(world_size=8)
+
+    with (
+        mock.patch.dict("sys.modules", {"torch.distributed.run": mock_dist}),
+        mock.patch(
+            "nemo_automodel.components.launcher.interactive.resolve_recipe_cls",
+            return_value=mock_recipe_cls,
+        ),
+    ):
+        launcher = InteractiveLauncher()
+        rc = launcher.launch(
+            config={"key": "val"},
+            config_path=cfg_file,
+            recipe_target="some.module.Recipe",
+            launcher_config=4,
+        )
+    assert rc == 0
+    mock_recipe_instance.setup.assert_called_once()
+    mock_dist.run.assert_not_called()
+
+
+def test_is_torchrun_worker_false(monkeypatch):
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
+    assert InteractiveLauncher._is_torchrun_worker() is False
+
+
+def test_is_torchrun_worker_true(monkeypatch):
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    assert InteractiveLauncher._is_torchrun_worker() is True
+
+
 import nemo_automodel.components.launcher.interactive

@@ -19,12 +19,22 @@ Usage
 -----
 ::
 
+    # Recommended — the CLI handles torchrun internally:
+    python3 app.py <config.yaml> [--nproc-per-node N] [--key.subkey=override ...]
+
+    # Also supported — external torchrun launch:
+    torchrun --nproc-per-node N app.py <config.yaml> [--key.subkey=override ...]
+
+    # Via console entry-points (if installed):
     automodel <config.yaml> [--nproc-per-node N] [--key.subkey=override ...]
-    am <config.yaml> [--nproc-per-node N] [--key.subkey=override ...]
 
 The YAML config must contain a ``recipe._target_`` key that specifies which
 recipe class to instantiate.  Launcher selection is automatic based on the
 presence of ``slurm:``, ``k8s:``, or ``nemo_run:`` sections in the YAML.
+
+When launched via ``torchrun``, the CLI detects the existing distributed
+environment and runs the recipe in-process on each worker instead of
+re-spawning torchrun.
 """
 
 import argparse
