@@ -94,14 +94,14 @@ Save the above code as `pipeline_example.py` and run with:
 
 ```bash
 # Run with 2 GPUs for 2 pipeline stages
-uv run torchrun --nproc_per_node=2 pipeline_example.py
+uv run torchrun --nproc-per-node=2 pipeline_example.py
 ```
 
 For a complete training example:
 
 ```bash
 # Run fine-tuning with 2-way pipeline parallelism using Llama 3.1 8B
-uv run torchrun --nproc_per_node=2 examples/llm_finetune/finetune.py \
+uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py \
     --config examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_pp.yaml
 ```
 
@@ -606,7 +606,7 @@ You can easily add pipeline parallelism to any existing training configuration t
 Add pipeline parallelism to an existing config using command-line arguments:
 
 ```bash
-uv run torchrun --nproc_per_node=2 examples/llm_finetune/finetune.py \
+uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py \
     --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --distributed.strategy fsdp2 \
     --distributed.pp_size 2 \
@@ -617,7 +617,7 @@ uv run torchrun --nproc_per_node=2 examples/llm_finetune/finetune.py \
 ```
 
 Key parameters to override:
-- `--distributed.pp_size`: Number of pipeline stages (must match nproc_per_node)
+- `--distributed.pp_size`: Number of pipeline stages (must match nproc-per-node)
 - `pp_batch_size` is automatically inferred from `--dataloader.batch_size`
 - `--distributed.pipeline.pp_schedule`: Pipeline schedule (1f1b, interleaved_1f1b, etc.)
 
@@ -647,7 +647,7 @@ distributed:
 
 #### Pipeline + Data Parallelism (4 GPUs Total)
 ```bash
-uv run torchrun --nproc_per_node=4 examples/llm_finetune/finetune.py \
+uv run torchrun --nproc-per-node=4 examples/llm_finetune/finetune.py \
     --config your_config.yaml \
     --distributed.pp_size 2 \
     --distributed.dp_size 2 \
@@ -656,7 +656,7 @@ uv run torchrun --nproc_per_node=4 examples/llm_finetune/finetune.py \
 
 #### Pipeline + Tensor Parallelism (4 GPUs Total)
 ```bash
-uv run torchrun --nproc_per_node=4 examples/llm_finetune/finetune.py \
+uv run torchrun --nproc-per-node=4 examples/llm_finetune/finetune.py \
     --config your_config.yaml \
     --distributed.pp_size 2 \
     --distributed.tp_size 2 \
@@ -665,7 +665,7 @@ uv run torchrun --nproc_per_node=4 examples/llm_finetune/finetune.py \
 
 #### Full Hybrid: PP + DP + TP (8 GPUs Total)
 ```bash
-uv run torchrun --nproc_per_node=8 examples/llm_finetune/finetune.py \
+uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py \
     --config your_config.yaml \
     --distributed.pp_size 2 \
     --distributed.dp_size 2 \
@@ -715,7 +715,7 @@ dataloader:
 Run training with:
 ```bash
 # Run with 2 GPUs for 2-way pipeline parallelism
-uv run torchrun --nproc_per_node=2 examples/llm_finetune/finetune.py --config config.yaml
+uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py --config config.yaml
 ```
 
 ## Troubleshooting
