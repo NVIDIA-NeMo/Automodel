@@ -77,7 +77,7 @@ slurm:
   time: 00:30:00
   account: your_account
   partition: gpu
-  container_image: nvcr.io/nvidia/nemo-automodel:25.11.00
+  container_image: nvcr.io/nvidia/nemo-automodel:latest
   gpus_per_node: 8
   extra_mounts:
     - /lustre:/lustre
