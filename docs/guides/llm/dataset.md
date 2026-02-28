@@ -1,16 +1,45 @@
 # Integrate Your Own Text Dataset
 
-This guide shows you how to integrate your own dataset into NeMo Automodel for training. You'll learn about two main dataset types: **completion datasets** for language modeling (like [HellaSwag](https://huggingface.co/datasets/rowan/hellaswag)) and **instruction datasets** for question-answering tasks (like [SQuAD](https://huggingface.co/datasets/rajpurkar/squad)). We'll cover how to create custom datasets by implementing the required methods and preprocessing functions, and finally show you how to specify your own data logic using YAML configuration with file paths—allowing you to define custom dataset processing without modifying the main codebase.
+This guide shows you how to integrate your own dataset into NeMo Automodel for training. You'll learn about three main dataset types: **conversation datasets** for multi-turn chat and tool calling (using [ChatDataset](chat-dataset.md)), **completion datasets** for language modeling (like [HellaSwag](https://huggingface.co/datasets/rowan/hellaswag)), and **instruction datasets** for question-answering tasks (like [SQuAD](https://huggingface.co/datasets/rajpurkar/squad)). We'll cover how to create custom datasets by implementing the required methods and preprocessing functions, and finally show you how to specify your own data logic using YAML configuration with file paths—allowing you to define custom dataset processing without modifying the main codebase.
 
 ## Quick Start Summary
-| **Type**        |  **Use Case**    | **Example** | **Preprocessor**               | **Section**              |
+| **Type**        |  **Use Case**    | **Example** | **Dataset Class**               | **Section**              |
 | --------------- | ------------------ | -------------- | --------------------------------- | --------------------------- |
+| 💬 Conversation | Multi-turn chat, tool calling | OpenAI messages JSONL | `ChatDataset`       | [Jump](#conversation-datasets)  |
 | ✍️ Completion   | Language modeling  | HellaSwag      | `SFTSingleTurnPreprocessor`       | [Jump](#completion-datasets)  |
 | 🗣️ Instruction  | Question answering | SQuAD          | `make_*` function                 | [Jump](#instruction-datasets) |
 
 ## Types of Supported Datasets
 
 NeMo Automodel supports a variety of datasets, depending on the task.
+
+### Conversation Datasets
+
+**Conversation datasets** use the [OpenAI messages format](https://platform.openai.com/docs/guides/text?api=chat) — the most widely adopted schema for chat and tool-calling data. If your data has a `messages` list with `role` / `content` fields, `ChatDataset` is the fastest path to training.
+
+`ChatDataset` handles single-turn Q&A, multi-turn dialogue, system prompts, tool definitions, tool calls, and tool responses — all from a single class.
+
+#### Example: Local JSONL
+
+Prepare your data as one JSON object per line (`.jsonl`):
+
+```json
+{"messages": [{"role": "user", "content": "What is the capital of France?"}, {"role": "assistant", "content": "Paris."}]}
+{"messages": [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "Summarize photosynthesis."}, {"role": "assistant", "content": "Plants convert sunlight into chemical energy using chlorophyll."}]}
+```
+
+Then reference it in your YAML config:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.ChatDataset
+  path_or_dataset_id: /path/to/train.jsonl
+  seq_length: 2048
+  padding: max_length
+  truncation: longest_first
+```
+
+For a complete guide — including tool-calling examples, answer-only loss masking, and an end-to-end worked example — see the dedicated [ChatDataset guide](chat-dataset.md).
 ### Completion Datasets
 
 **Completion datasets** are single text sequences designed for language modeling where the model learns to predict the next token given a context. These datasets typically contain a context (prompt) and a target (completion) that the model should learn to generate.

@@ -49,91 +49,50 @@ dataset:
   start_of_turn_token: "<|assistant|>"
 ```
 
-- **ColumnMappedTextInstructionDataset (generic instruction SFT)**
-  - Class: `nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset`
-  - Use case: quickly adapt instruction datasets by mapping your schema's columns to `context`, `question`, `answer`
-  - Sources: local JSON/JSONL or Hugging Face Hub dataset ID
-  - Notes:
-    - For tokenizers with chat templates and answer-only loss, you may set `answer_only_loss_mask: true` and provide `start_of_turn_token`.
-    - Supports streaming mode for large datasets (see [Streaming Datasets](#streaming-datasets) section below).
-    - Map-style, non-streaming dataset (supports `len(ds)` and `ds[i]`)
-    - For streaming (including Delta Lake / Databricks), use `ColumnMappedTextInstructionIterableDataset`
-  - Example YAML:
-```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
-  path_or_dataset_id: Muennighoff/natural-instructions
-  split: train
-  column_mapping:
-    context: definition
-    question: inputs
-    answer: targets
-  answer_only_loss_mask: true
-  start_of_turn_token: "<|assistant|>"
-```
-See the detailed guide, [Column-Mapped Text Instruction Dataset](llm/column-mapped-text-instruction-dataset.md), for more information.
-
-- **ChatDataset (multi-turn conversations and tool calling)**
+- **ChatDataset (multi-turn conversations, chat, and tool calling)** — *Recommended for most users bringing their own data*
   - Class: `nemo_automodel.components.datasets.llm.ChatDataset`
-  - Use case: multi-turn conversations and tool calling in OpenAI chat format
+  - Use case: conversations, Q&A, instruction following, and tool calling in the widely adopted OpenAI messages format
   - Sources: local JSON/JSONL or Hugging Face Hub dataset ID
-  - Key args:
-    - `path_or_dataset_id`: path to local file(s) or HuggingFace dataset ID
-    - `tokenizer`: tokenizer instance (required. Must have chat template support)
-    - `split`: dataset split (e.g., "train", "validation")
-    - `name`: dataset configuration/subset name
-    - `seq_length`: maximum sequence length for padding/truncation
-    - `padding`: padding strategy ("do_not_pad", "max_length", etc.)
-    - `truncation`: truncation strategy ("do_not_truncate", "longest_first", etc.)
-    - `start_of_turn_token`: token marking assistant response start (for answer-only loss)
-    - `chat_template`: optional override for tokenizer's chat template
-  - Notes:
-    - Requires a tokenizer with chat template support
-    - Supports both single-turn and multi-turn tool calling
-    - Tool definitions are provided in a `tools` field at the conversation level
-    - Tool calls appear in assistant messages via `tool_calls` field
-    - Tool responses use the `tool` role
-### ChatDataset (Multi-Turn Conversations and Tool Calling)
+
+### ChatDataset (Multi-Turn Conversations, Chat, and Tool Calling)
+
+`ChatDataset` is the recommended dataset class for fine-tuning on conversational data. It accepts the [OpenAI messages format](https://platform.openai.com/docs/guides/text?api=chat) — the most widely used schema for chat data — and handles single-turn Q&A, multi-turn dialogue, system prompts, tool definitions, tool calls, and tool responses.
+
 - Class: `nemo_automodel.components.datasets.llm.ChatDataset`
-- Use case: multi-turn conversations and tool calling in OpenAI chat format
 - Sources: local JSON/JSONL or Hugging Face Hub dataset ID
 - Key args:
   - `path_or_dataset_id`: path to local file(s) or Hugging Face dataset ID
   - `tokenizer`: tokenizer instance (required; must have chat template support)
   - `split`: dataset split (e.g., "train", "validation")
-  - `name`: dataset configuration/subset name
   - `seq_length`: maximum sequence length for padding/truncation
   - `padding`: padding strategy ("do_not_pad", "max_length", etc.)
   - `truncation`: truncation strategy ("do_not_truncate", "longest_first", etc.)
   - `start_of_turn_token`: token marking assistant response start (for answer-only loss)
   - `chat_template`: optional override for tokenizer's chat template
-:::{note}
-- Requires a tokenizer with chat template support
-- Supports both single-turn and multi-turn tool calling
-- Tool definitions are provided in a `tools` field at the conversation level
-- Tool calls appear in assistant messages through the `tool_calls` field
-- Tool responses use the `tool` role
-:::
-- Example YAML:
+
+- Example YAML (local JSONL):
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.ChatDataset
+  path_or_dataset_id: /path/to/train.jsonl
+  seq_length: 2048
+  padding: max_length
+  truncation: longest_first
+```
+- Example YAML (Hugging Face dataset):
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.ChatDataset
   path_or_dataset_id: Salesforce/xlam-function-calling-60k
   split: train
-  tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: google/functiongemma-270m-it
   seq_length: 2048
   start_of_turn_token: "<start_of_turn>"
 ```
-  - Expected data format (OpenAI messages format):
+- Expected data format (OpenAI messages format):
 ```json
 {
   "messages": [
-    {
-      "role": "user",
-      "content": "What's the weather in Seattle?"
-    },
+    {"role": "user", "content": "What's the weather in Seattle?"},
     {
       "role": "assistant",
       "content": "",
@@ -153,10 +112,7 @@ dataset:
       "tool_call_id": "call_1",
       "content": "{\"temperature\": 65, \"condition\": \"cloudy\"}"
     },
-    {
-      "role": "assistant",
-      "content": "It's 65°F and cloudy in Seattle."
-    }
+    {"role": "assistant", "content": "It's 65°F and cloudy in Seattle."}
   ],
   "tools": [
     {
@@ -166,9 +122,7 @@ dataset:
         "description": "Get current weather for a city",
         "parameters": {
           "type": "object",
-          "properties": {
-            "city": {"type": "string"}
-          },
+          "properties": {"city": {"type": "string"}},
           "required": ["city"]
         }
       }
@@ -176,49 +130,43 @@ dataset:
   ]
 }
 ```
-  - For single-turn tool calling (one tool call per conversation), omit the tool response and final assistant message:
+- For plain conversations without tools, simply omit the `tools` field:
 ```json
 {
   "messages": [
-    {
-      "role": "user",
-      "content": "Book a table for two at 7pm in Seattle."
-    },
-    {
-      "role": "assistant",
-      "content": "",
-      "tool_calls": [
-        {
-          "id": "call_1",
-          "type": "function",
-          "function": {
-            "name": "book_table",
-            "arguments": "{\"party_size\": 2, \"time\": \"19:00\", \"city\": \"Seattle\"}"
-          }
-        }
-      ]
-    }
-  ],
-  "tools": [
-    {
-      "type": "function",
-      "function": {
-        "name": "book_table",
-        "description": "Book a restaurant table",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "party_size": {"type": "integer"},
-            "time": {"type": "string"},
-            "city": {"type": "string"}
-          }
-        }
-      }
-    }
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "What is the capital of France?"},
+    {"role": "assistant", "content": "The capital of France is Paris."}
   ]
 }
 ```
-See the [Function Calling guide](llm/toolcalling.md) for an end-to-end example with FunctionGemma.
+
+See the detailed [ChatDataset guide](llm/chat-dataset.md) for a complete walkthrough with end-to-end examples, and the [Function Calling guide](llm/toolcalling.md) for a tool-calling example with FunctionGemma.
+
+- **ColumnMappedTextInstructionDataset (generic instruction SFT)**
+  - Class: `nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset`
+  - Use case: quickly adapt instruction datasets with simple column schemas (e.g., `instruction`/`output`) by mapping columns to `context`, `question`, `answer`
+  - Sources: local JSON/JSONL or Hugging Face Hub dataset ID
+  - Notes:
+    - Best for data that is **not** in OpenAI messages format — if your data has `messages`, use `ChatDataset` instead
+    - For tokenizers with chat templates and answer-only loss, you may set `answer_only_loss_mask: true` and provide `start_of_turn_token`.
+    - Supports streaming mode for large datasets (see [Streaming Datasets](#streaming-datasets) section below).
+    - Map-style, non-streaming dataset (supports `len(ds)` and `ds[i]`)
+    - For streaming (including Delta Lake / Databricks), use `ColumnMappedTextInstructionIterableDataset`
+  - Example YAML:
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+  path_or_dataset_id: Muennighoff/natural-instructions
+  split: train
+  column_mapping:
+    context: definition
+    question: inputs
+    answer: targets
+  answer_only_loss_mask: true
+  start_of_turn_token: "<|assistant|>"
+```
+See the detailed guide, [Column-Mapped Text Instruction Dataset](llm/column-mapped-text-instruction-dataset.md), for more information.
 
 ### Retrieval/Biencoder (Embedding Fine-Tuning)
 - Factory: `nemo_automodel.components.datasets.llm.make_retrieval_dataset`
@@ -486,7 +434,33 @@ See [Gemma-3n](omni/gemma3-3n.md) and [VLM dataset](vlm/dataset.md) for end-to-e
 ---
 
 ## Bring Your Own Dataset
-You can integrate custom datasets with zero code changes to NeMo Automodel by using `_target_` in YAML. There are three approaches:
+You can integrate custom datasets with zero code changes to NeMo Automodel by using `_target_` in YAML. There are several approaches, depending on your data format.
+
+### Use ChatDataset for Conversational Data (Recommended)
+If your data is in [OpenAI messages format](https://platform.openai.com/docs/guides/text?api=chat) (or you can convert it), `ChatDataset` is the fastest path. This covers most use cases: single-turn Q&A, multi-turn chat, system prompts, and tool calling.
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.ChatDataset
+  path_or_dataset_id: /path/to/train.jsonl   # or org/repo on HF
+  seq_length: 2048
+  padding: max_length
+  truncation: longest_first
+```
+See the [ChatDataset guide](llm/chat-dataset.md) for data format details and worked examples.
+
+### Use ColumnMappedTextInstructionDataset for Tabular Instruction Data
+When your data has simple columns like `instruction` / `output` (not in messages format), map them to logical fields:
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+  path_or_dataset_id: /abs/path/to/*.jsonl  # or org/repo on HF
+  column_mapping:
+    context: definition
+    question: inputs
+    answer: targets
+  answer_only_loss_mask: true
+  start_of_turn_token: "<|assistant|>"
+```
 
 ### Point to an Existing Class or Function (Dotted Path)
 - LLM example (class):
@@ -518,21 +492,6 @@ dataset:
   split: train
 ```
 Where `build_my_dataset` returns either a `datasets.Dataset` or a list/iterator of conversation dicts (for VLM).
-
-### Use ColumnMappedTextInstructionDataset for Most Instruction Datasets (LLM)
-- Ideal when your data has columns like `instruction`, `input`, or `output` but with arbitrary names
-- Supports local JSON/JSONL and HF Hub
-```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
-  path_or_dataset_id: /abs/path/to/*.jsonl  # or org/repo on HF
-  column_mapping:
-    context: definition
-    question: inputs
-    answer: targets
-  answer_only_loss_mask: true
-  start_of_turn_token: "<|assistant|>"
-```
 
 ### Implement a Minimal Custom Class Pattern (LLM Completion)
 If you prefer Python, implement `get_context` and `get_target` and reuse the built-in preprocessor:

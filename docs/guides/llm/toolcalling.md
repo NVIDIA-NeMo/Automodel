@@ -49,7 +49,11 @@ Example entry:
 ```
 
 
-The helper `make_xlam_dataset` converts each xLAM row into OpenAI-style tool schemas and tool calls, then renders them through the chat template so loss is applied only on the tool-call arguments:
+The helper `make_xlam_dataset` converts each xLAM row into OpenAI-style tool schemas and tool calls, then renders them through the chat template so loss is applied only on the tool-call arguments.
+
+:::{tip}
+`make_xlam_dataset` is a convenience wrapper for the xLAM dataset specifically. For your own tool-calling or conversational data in OpenAI messages format, use [`ChatDataset`](chat-dataset.md) directly — it accepts the same messages/tools schema and works with any local JSONL file or Hugging Face dataset.
+:::
 
 ```python
 def _format_example(

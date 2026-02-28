@@ -110,7 +110,11 @@ This structure is ideal for training models in context-based question answering,
 :::{tip}
 In this guide, we use the `SQuAD v1.1` dataset, but you can use your own data.
 
-To do so, edit the YAML `dataset` / `validation_dataset` sections (for example `dataset._target_`, `dataset_name`/`path_or_dataset`, and `split`). See [Integrate Your Own Text Dataset](dataset.md) and [Dataset Overview](../dataset-overview.md).
+- **Conversational / chat data** (OpenAI messages format): use [ChatDataset](chat-dataset.md) — the recommended option for most users bringing their own data.
+- **Simple instruction / output columns**: use [ColumnMappedTextInstructionDataset](column-mapped-text-instruction-dataset.md).
+- **Other formats**: see [Integrate Your Own Text Dataset](dataset.md) and [Dataset Overview](../dataset-overview.md).
+
+To switch, edit the YAML `dataset` / `validation_dataset` sections (for example `dataset._target_`, `path_or_dataset_id`, and `split`).
 :::
 
 ## Use a Recipe to Fine-Tune the Model
