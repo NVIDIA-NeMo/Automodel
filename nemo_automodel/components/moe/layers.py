@@ -581,6 +581,9 @@ class MoE(nn.Module):
             self.shared_experts = None
             self.shared_expert_gate = None
 
+        # Set during model parallelization (see parallelizer.apply_cp)
+        self.cp_mesh: Optional[DeviceMesh] = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -598,6 +601,9 @@ class MoE(nn.Module):
             torch.Tensor: Output tensor after expert routing and computation.
             Optional[torch.Tensor]: Auxiliary loss for load balancing (if applicable).
         """
+        if cp_mesh is None:
+            cp_mesh = self.cp_mesh
+
         # Reshape the inputs to 2-D since we are just distributing tokens.
         shape = x.size()
         x = x.view(-1, self.dim)
