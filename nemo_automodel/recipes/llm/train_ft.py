@@ -38,6 +38,7 @@ from nemo_automodel._transformers.infrastructure import (
     apply_model_infrastructure,
     instantiate_infrastructure,
 )
+from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
@@ -78,6 +79,7 @@ from nemo_automodel.components.training.utils import (
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
 )
+from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     _supports_seq_lens,
@@ -1027,6 +1029,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for mp in self.model_parts:
                 enable_load_balance_tracking(mp)
 
+        self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
+
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         # Initialize JSONL loggers
         self.metric_logger_train = build_metric_logger(
@@ -1374,6 +1378,28 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         time_delta = t - self.timestamp
         self.timestamp = t
         tps = num_tokens_in_batch / time_delta
+
+        mfu = None
+        if batches:
+            step_flops = 0.0
+            flops_supported = True
+            for batch in batches:
+                input_ids = batch.get("input_ids")
+                if input_ids is None:
+                    flops_supported = False
+                    break
+                batch_flops = self.mfu_calculator.get_flops(input_ids)
+                if batch_flops is None:
+                    flops_supported = False
+                    break
+                step_flops += float(batch_flops)
+
+            if flops_supported:
+                step_flops = self._dp_allreduce(
+                    torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device), include_cp=True
+                ).item()
+                mfu = calculate_mfu(step_flops / 1e12, self.dist_env.world_size, time_delta)
+
         reporting_loss = torch.sum(torch.stack(loss_buffer))
         reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
         if self.pp_enabled:
@@ -1399,6 +1425,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,
                 "tps": tps,
                 "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
+                "mfu": mfu,
                 "num_tokens_per_step": num_tokens_in_batch,
                 "num_label_tokens": num_label_tokens,
             },

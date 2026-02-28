@@ -21,6 +21,7 @@ import time
 import torch
 import wandb
 
+from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -28,6 +29,7 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample, build
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
+from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import (
@@ -119,6 +121,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 
         self.model_parts = [model]
+        self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
 
         self.dataloader, self.tokenizer = build_dataloader(
             self.cfg.dataset,
@@ -275,6 +278,27 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         self.timestamp = t
         tps = num_tokens_in_batch / time_delta
 
+        mfu = None
+        if batches:
+            step_flops = 0.0
+            flops_supported = True
+            for batch in batches:
+                input_ids = batch.get("input_ids")
+                if input_ids is None:
+                    flops_supported = False
+                    break
+                batch_flops = self.mfu_calculator.get_flops(input_ids)
+                if batch_flops is None:
+                    flops_supported = False
+                    break
+                step_flops += float(batch_flops)
+
+            if flops_supported:
+                step_flops = self._dp_allreduce(
+                    torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device), include_cp=True
+                ).item()
+                mfu = calculate_mfu(step_flops / 1e12, self.dist_env.world_size, time_delta)
+
         total_loss = torch.sum(torch.stack(losses))
         total_loss = self._dp_allreduce(total_loss, include_cp=True).detach()
         loss = total_loss / len(batches)
@@ -290,6 +314,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,
                 "tps": tps,
                 "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
+                "mfu": mfu,
             },
         )
 
