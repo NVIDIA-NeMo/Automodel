@@ -160,16 +160,33 @@ def make_cp_batch_and_ctx(
 
     input_ids = batch["input_ids"]
     position_ids = batch["position_ids"]
-
     labels = batch["labels"]
+
+    # Collect all available tensors for context parallel
+    cp_buffers = [input_ids, labels, position_ids]
+    cp_seq_dims = [1, 1, 1]
+    cp_no_restore_buffers = {input_ids, labels}
+
+    # Add loss_mask if available
     if loss_mask is not None:
-        cp_buffers = [input_ids, labels, position_ids, loss_mask]
-        cp_seq_dims = [1, 1, 1, 1]
-        cp_no_restore_buffers = {input_ids, labels, loss_mask}
-    else:
-        cp_buffers = [input_ids, labels, position_ids]
-        cp_seq_dims = [1, 1, 1]
-        cp_no_restore_buffers = {input_ids, labels}
+        cp_buffers.append(loss_mask)
+        cp_seq_dims.append(1)
+        cp_no_restore_buffers.add(loss_mask)
+
+    # Add padding_mask if available in batch
+    if "padding_mask" in batch:
+        padding_mask = batch["padding_mask"]
+        cp_buffers.append(padding_mask)
+        cp_seq_dims.append(1)
+        cp_no_restore_buffers.add(padding_mask)
+
+    # Add attention_mask if available in batch
+    if "attention_mask" in batch:
+        attention_mask = batch["attention_mask"]
+        cp_buffers.append(attention_mask)
+        cp_seq_dims.append(1)
+        # Note: attention_mask typically doesn't need to be in no_restore_buffers
+        # as it's used for attention computation and may need to be restored
 
     cp_ctx = create_context_parallel_ctx(
         cp_mesh=cp_mesh,
@@ -280,7 +297,7 @@ def make_cp_batch_for_te(
             _shard_thd_chunk_for_te(chunk_batch, cp_mesh, qkv_format, seq_lens_padding_value, padding_token_id)
         )
 
-    return {
+    return_dict = {
         "input_ids": torch.stack([chunk["input_ids"] for chunk in chunks]),
         "labels": torch.stack([chunk["labels"] for chunk in chunks]),
         "position_ids": torch.stack([chunk["position_ids"] for chunk in chunks]),
@@ -291,6 +308,12 @@ def make_cp_batch_for_te(
         "cp_size": cp_mesh.size() if cp_mesh is not None else 1,
         "cp_rank": torch.distributed.get_rank(group=cp_mesh.get_group()) if cp_mesh is not None else 0,
     }
+
+    # Add attention_mask if available in chunks
+    if "attention_mask" in chunks[0]:
+        return_dict["attention_mask"] = torch.stack([chunk["attention_mask"] for chunk in chunks])
+
+    return return_dict
 
 
 def _shard_thd_chunk_for_te(
@@ -316,11 +339,18 @@ def _shard_thd_chunk_for_te(
     cp_size = cp_mesh.size()
 
     cp_rank = torch.distributed.get_rank(group=cp_mesh.get_group()) if cp_mesh is not None else 0
-    for key in ["input_ids", "labels", "position_ids", "padding_mask"]:
-        val = batch[key]
-        index = tex.thd_get_partitioned_indices(filtered_cu_seqlens_padded, val.size(0), cp_size, cp_rank)
-        val = val.index_select(0, index)
-        batch[key] = val
+
+    # Handle all mask keys that may be present in the batch
+    mask_keys = ["input_ids", "labels", "position_ids", "padding_mask"]
+    if "attention_mask" in batch:
+        mask_keys.append("attention_mask")
+
+    for key in mask_keys:
+        if key in batch:
+            val = batch[key]
+            index = tex.thd_get_partitioned_indices(filtered_cu_seqlens_padded, val.size(0), cp_size, cp_rank)
+            val = val.index_select(0, index)
+            batch[key] = val
 
     max_seqlen = (filtered_cu_seqlens_padded[1:] - filtered_cu_seqlens_padded[:-1]).max().item()
     output_batch = {
@@ -334,4 +364,9 @@ def _shard_thd_chunk_for_te(
         "cp_size": cp_size,
         "cp_rank": cp_rank,
     }
+
+    # Add attention_mask to output if it was processed
+    if "attention_mask" in batch:
+        output_batch["attention_mask"] = batch["attention_mask"].bool().contiguous()
+
     return output_batch

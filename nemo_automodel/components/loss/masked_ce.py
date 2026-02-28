@@ -82,5 +82,5 @@ class MaskedCrossEntropy(nn.Module):
         loss = F.cross_entropy(logits, labels, reduction=self.reduction)
         if num_label_tokens is not None:
             assert self.reduction == "sum", "num_label_tokens is only supported when reduction is 'sum'"
-            loss = loss / num_label_tokens
+            loss = loss / max(num_label_tokens, 1)
         return loss
