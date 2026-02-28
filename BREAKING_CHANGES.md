@@ -65,7 +65,7 @@ where you only need to submit jobs (SLURM, k8s, NeMo-Run) without running
 training locally:
 
 ```
-pip install nemo_automodel[cli]
+pip install nemo-automodel[cli]
 ```
 
 This installs only `pyyaml` -- no PyTorch, no CUDA dependencies. It is enough
