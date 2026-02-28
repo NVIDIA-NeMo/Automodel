@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import pytest
 import torch
-from unittest.mock import Mock, patch, MagicMock
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
@@ -441,6 +441,7 @@ class TestNemotronHForCausalLM:
     def test_causal_lm_generation_mixin_in_mro(self, config, backend):
         """Test that GenerationMixin is in the MRO."""
         from transformers.generation import GenerationMixin
+
         from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
 
         assert GenerationMixin in NemotronHForCausalLM.__mro__
@@ -454,6 +455,7 @@ class TestNemotronHForCausalLM:
     def test_causal_lm_has_generation_config(self, config, backend):
         """Test that model has generation_config set after __init__."""
         from transformers.generation import GenerationConfig
+
         from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
 
         model = NemotronHForCausalLM(config, backend=backend)
@@ -464,6 +466,7 @@ class TestNemotronHForCausalLM:
     def test_causal_lm_forward_returns_causal_lm_output(self, config, backend):
         """Test that forward returns CausalLMOutputWithPast."""
         from transformers.modeling_outputs import CausalLMOutputWithPast
+
         from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
 
         model = NemotronHForCausalLM(config, backend=backend)
@@ -492,6 +495,67 @@ class TestNemotronHForCausalLM:
         assert output.loss is not None
         assert output.loss.ndim == 0  # scalar loss
 
+    def test_causal_lm_output_hidden_states(self, config, backend):
+        """Test output_hidden_states parameter controls hidden state return."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        model = NemotronHForCausalLM(config, backend=backend)
+        model = model.to(torch.bfloat16)
+
+        batch_size, seq_len = 2, 8
+        input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+
+        # Default: hidden_states should be None
+        output = model(input_ids)
+        assert output.hidden_states is None
+
+        # Enabled: returns a tuple with one tensor of correct shape/dtype
+        output = model(input_ids, output_hidden_states=True)
+        assert isinstance(output.hidden_states, tuple)
+        assert len(output.hidden_states) == 1
+        assert output.hidden_states[0].shape == (batch_size, seq_len, config.hidden_size)
+        assert output.hidden_states[0].dtype == torch.bfloat16
+
+        # return_dict accepted without error (API compatibility)
+        output = model(input_ids, output_hidden_states=True, return_dict=True)
+        assert output.hidden_states is not None
+
+    def test_causal_lm_hidden_states_config_and_override(self, config, backend):
+        """Test config.output_hidden_states and explicit parameter override."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config.output_hidden_states = True
+        model = NemotronHForCausalLM(config, backend=backend)
+        model = model.to(torch.bfloat16)
+
+        input_ids = torch.randint(0, config.vocab_size, (2, 8))
+
+        # Config enables hidden states when parameter is not passed
+        output = model(input_ids)
+        assert output.hidden_states is not None
+        assert isinstance(output.hidden_states, tuple)
+
+        # Explicit False overrides config
+        output = model(input_ids, output_hidden_states=False)
+        assert output.hidden_states is None
+
+    def test_causal_lm_hidden_states_with_labels(self, config, backend):
+        """Test hidden states returned alongside loss computation."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        model = NemotronHForCausalLM(config, backend=backend)
+        model = model.to(torch.bfloat16)
+
+        batch_size, seq_len = 2, 8
+        input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+        labels = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+
+        output = model(input_ids, labels=labels, output_hidden_states=True)
+        assert output.loss is not None
+        assert output.loss.ndim == 0
+        assert output.hidden_states is not None
+        assert output.hidden_states[0].shape == (batch_size, seq_len, config.hidden_size)
+
     def test_causal_lm_prepare_inputs_for_generation(self, config, backend):
         """Test prepare_inputs_for_generation returns full sequence."""
         from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
@@ -502,9 +566,7 @@ class TestNemotronHForCausalLM:
         input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
         attention_mask = torch.ones(batch_size, seq_len)
 
-        model_inputs = model.prepare_inputs_for_generation(
-            input_ids, attention_mask=attention_mask
-        )
+        model_inputs = model.prepare_inputs_for_generation(input_ids, attention_mask=attention_mask)
 
         # Full sequence is always forwarded (no cache slicing)
         assert model_inputs["input_ids"].shape == (batch_size, seq_len)
@@ -513,6 +575,7 @@ class TestNemotronHForCausalLM:
     def test_causal_lm_generate(self, config, backend):
         """Test that .generate() produces token sequences of the requested length."""
         from transformers import PretrainedConfig
+
         from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
 
         # Wrap the mock config in a real PretrainedConfig so that GenerationMixin's
@@ -578,7 +641,10 @@ class TestNemotronV3KVCache:
 
         # Check ssm_state shape
         assert cache.ssm_states[0].shape == (
-            batch_size, config.mamba_num_heads, config.mamba_head_dim, config.ssm_state_size
+            batch_size,
+            config.mamba_num_heads,
+            config.mamba_head_dim,
+            config.ssm_state_size,
         )
 
     def test_cache_kv_update(self, config):
@@ -605,8 +671,8 @@ class TestNemotronV3KVCache:
 
     def test_attention_with_cache_prefill_decode(self, config, backend):
         """Test correct shapes through prefill -> decode with attention cache."""
-        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Attention
         from nemo_automodel.components.models.nemotron_v3.cache import NemotronHybridCache
+        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Attention
 
         attn = NemotronV3Attention(config)
         batch_size, prompt_len = 2, 4
@@ -627,6 +693,7 @@ class TestNemotronV3KVCache:
     def test_generate_with_cache(self, config, backend):
         """End-to-end .generate() with cache (attention+mlp config, CPU)."""
         from transformers import PretrainedConfig
+
         from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
 
         hf_config = PretrainedConfig(is_encoder_decoder=False, eos_token_id=1, pad_token_id=0)
@@ -649,6 +716,7 @@ class TestNemotronV3KVCache:
     def test_generate_cache_vs_no_cache_deterministic(self, config, backend):
         """Verify greedy decode output matches between cached and uncached generation."""
         from transformers import PretrainedConfig
+
         from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
 
         hf_config = PretrainedConfig(is_encoder_decoder=False, eos_token_id=1, pad_token_id=0)
@@ -700,7 +768,9 @@ class TestNemotronV3KVCache:
         cache.update(k, v, layer_idx)
 
         # Set distinctive conv states
-        cache.conv_states[0] = torch.arange(batch_size).float().view(batch_size, 1, 1).expand_as(cache.conv_states[0]).clone()
+        cache.conv_states[0] = (
+            torch.arange(batch_size).float().view(batch_size, 1, 1).expand_as(cache.conv_states[0]).clone()
+        )
 
         # Reorder: swap batch elements
         beam_idx = torch.tensor([2, 0, 1])
@@ -714,14 +784,14 @@ class TestNemotronV3KVCache:
 
 
 try:
-    import mamba_ssm
+    import mamba_ssm  # noqa: F401
+
     _has_mamba_ssm = True
 except ImportError:
     _has_mamba_ssm = False
 
 skip_if_no_mamba = pytest.mark.skipif(
-    not torch.cuda.is_available() or not _has_mamba_ssm,
-    reason="CUDA and mamba_ssm required for Mamba cache tests"
+    not torch.cuda.is_available() or not _has_mamba_ssm, reason="CUDA and mamba_ssm required for Mamba cache tests"
 )
 
 
@@ -763,8 +833,8 @@ class TestNemotronV3MambaCacheGPU:
     @skip_if_no_mamba
     def test_mamba_mixer_prefill_decode(self, config, backend):
         """Test Mamba mixer prefill (path B) then decode (path C) with cache."""
-        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
         from nemo_automodel.components.models.nemotron_v3.cache import NemotronHybridCache
+        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
 
         mixer = NemotronV3Mamba2Mixer(config, layer_idx=0).to(torch.bfloat16).cuda()
 
@@ -791,6 +861,7 @@ class TestNemotronV3MambaCacheGPU:
     def test_hybrid_model_with_mamba_generate(self, config, backend):
         """End-to-end .generate() with hybrid mamba+attention config on GPU."""
         from transformers import PretrainedConfig
+
         from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
 
         hf_config = PretrainedConfig(is_encoder_decoder=False, eos_token_id=1, pad_token_id=0)
@@ -814,6 +885,7 @@ class TestNemotronV3MambaCacheGPU:
     def test_hybrid_mamba_cache_vs_no_cache(self, config, backend):
         """Verify cached vs uncached generation match for hybrid mamba+attention."""
         from transformers import PretrainedConfig
+
         from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
 
         hf_config = PretrainedConfig(is_encoder_decoder=False, eos_token_id=1, pad_token_id=0)

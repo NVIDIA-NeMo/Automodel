@@ -306,6 +306,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         cache_position: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Forward pass with optional loss computation.
@@ -322,13 +324,21 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             position_ids: Unused – accepted for API compatibility with GenerationMixin.
             logits_to_keep: If > 0, only compute logits for the last ``logits_to_keep``
                 token positions (avoids materialising the full logit matrix during generation).
+            output_hidden_states: Whether to return hidden states
+            return_dict: Accepted for API compatibility (always returns CausalLMOutputWithPast)
             **kwargs: Additional arguments forwarded to the base model.
 
         Returns:
             :class:`~transformers.modeling_outputs.CausalLMOutputWithPast` with
             ``logits`` (float32, ``[batch_size, seq_len, vocab_size]``), optional
-            ``loss``, and ``past_key_values``.
+            ``loss``, ``past_key_values``, and ``hidden_states``.
         """
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
         # Forward through base model
         hidden_states = self.model(
             input_ids,
@@ -366,7 +376,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             loss=loss,
             logits=logits,
             past_key_values=past_key_values if use_cache else None,
-            hidden_states=None,
+            hidden_states=(hidden_states,) if output_hidden_states else None,
             attentions=None,
         )
 
