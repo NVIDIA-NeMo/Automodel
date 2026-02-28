@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
 
@@ -46,24 +47,57 @@ def _as_iter(val: Union[str, Sequence[str]]) -> Iterator[str]:
             yield x
 
 
+_SPLIT_SLICE_RE = re.compile(r"^(\w+)\[(\d*):(\d*)\]$")
+
+
 def _load_openai_messages(
-    path_or_dataset_id: Union[str, Sequence[str]], split: Optional[str] = None, name: Optional[str] = None
+    path_or_dataset_id: Union[str, Sequence[str]],
+    split: Optional[str] = None,
+    name: Optional[str] = None,
+    shuffle_seed: Optional[int] = None,
 ):
     """Load OpenAI chat messages datasets from HF or local JSON/JSONL files.
 
-    For HF repo IDs, we delegate to datasets.load_dataset.
+    For HF repo IDs, we delegate to datasets.load_dataset.  The full base
+    split is loaded and shuffled *before* any slice (e.g. ``[1024:]``) is
+    applied so that train/val splits sample from a consistent random order.
+
     For local files, we manually parse JSONL/JSON to avoid pyarrow type
     inference issues (e.g., heterogeneous field types under `tools`).
 
     Args:
         path_or_dataset_id: HF dataset ID or local file path(s).
-        split: Dataset split to load (e.g., "train", "validation").
+        split: Dataset split to load (e.g., "train", "train[1024:]").
         name: Dataset configuration/subset name
+        shuffle_seed: Random seed for shuffling HF datasets before slicing.
+            Set to ``None`` to disable shuffling.
     """
     if isinstance(path_or_dataset_id, str) and _is_hf_repo_id(path_or_dataset_id):
-        return load_dataset(
-            path_or_dataset_id, name=name, split=split, streaming=False, verification_mode=VerificationMode.NO_CHECKS
+        # Parse split string: "train[1024:]" -> base="train", slice(1024, None)
+        base_split = split or "train"
+        sl = None
+        match = _SPLIT_SLICE_RE.match(base_split)
+        if match:
+            base_split = match.group(1)
+            start = int(match.group(2)) if match.group(2) else None
+            end = int(match.group(3)) if match.group(3) else None
+            sl = slice(start, end)
+
+        dataset = load_dataset(
+            path_or_dataset_id,
+            name=name,
+            split=base_split,
+            streaming=False,
+            verification_mode=VerificationMode.NO_CHECKS,
         )
+        if shuffle_seed is not None:
+            dataset = dataset.shuffle(seed=shuffle_seed)
+
+        if sl is not None:
+            indices = range(*sl.indices(len(dataset)))
+            dataset = dataset.select(indices)
+
+        return dataset
 
     files = list(_as_iter(path_or_dataset_id))
     if not files:
@@ -137,6 +171,7 @@ class ChatDataset(Dataset):
         truncation: Union[str, bool] = "do_not_truncate",
         start_of_turn_token: Optional[str] = None,
         chat_template: Optional[str] = None,
+        shuffle_seed: Optional[int] = None,
     ) -> None:
         if tokenizer is None:
             raise ValueError("Tokenizer is required")
@@ -155,7 +190,7 @@ class ChatDataset(Dataset):
         self.truncation = truncation
         self.start_of_turn_token = start_of_turn_token
 
-        self.dataset = _load_openai_messages(path_or_dataset_id, split=split, name=name)
+        self.dataset = _load_openai_messages(path_or_dataset_id, split=split, name=name, shuffle_seed=shuffle_seed)
 
         # Ensure pad token presence for downstream padding
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
