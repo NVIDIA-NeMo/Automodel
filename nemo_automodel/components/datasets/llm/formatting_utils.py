@@ -152,8 +152,21 @@ def _package_tokenized_example(
     """
     labels = input_ids.copy()
     input_ids = input_ids[:-1]
-    # input_ids= [a, b] -> attention_mask = [1, 1]
-    attention_mask = [1] * len(input_ids)
+    # Compute content length before any padding so the attention mask is correct
+    # even when input_ids arrive already padded (e.g. from apply_chat_template
+    # with padding="max_length").
+    content_length = len(input_ids)
+    if pad_token_id is not None and content_length > 0:
+        # Strip trailing pad tokens to find real content length.
+        end = content_length
+        while end > 0 and input_ids[end - 1] == pad_token_id:
+            end -= 1
+        if pad_token_id == eos_token_id:
+            # When pad_token_id == eos_token_id, keep one trailing eos as real content.
+            content_length = min(end + 1, content_length)
+        else:
+            content_length = end
+    attention_mask = [1] * content_length + [0] * (len(input_ids) - content_length)
     # Labels: mask out prompt tokens
     labels[:] = [label if bool(m) else -100 for label, m in zip(labels, assistant_masks)]
     # remove BOS
