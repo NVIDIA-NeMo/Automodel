@@ -51,7 +51,10 @@ _SPLIT_SLICE_RE = re.compile(r"^(\w+)\[(\d*):(\d*)\]$")
 
 
 def _load_openai_messages(
-    path_or_dataset_id: Union[str, Sequence[str]], split: Optional[str] = None, name: Optional[str] = None
+    path_or_dataset_id: Union[str, Sequence[str]],
+    split: Optional[str] = None,
+    name: Optional[str] = None,
+    shuffle_seed: Optional[int] = 42,
 ):
     """Load OpenAI chat messages datasets from HF or local JSON/JSONL files.
 
@@ -66,6 +69,8 @@ def _load_openai_messages(
         path_or_dataset_id: HF dataset ID or local file path(s).
         split: Dataset split to load (e.g., "train", "train[1024:]").
         name: Dataset configuration/subset name
+        shuffle_seed: Random seed for shuffling HF datasets before slicing.
+            Set to ``None`` to disable shuffling.
     """
     if isinstance(path_or_dataset_id, str) and _is_hf_repo_id(path_or_dataset_id):
         # Parse split string: "train[1024:]" -> base="train", slice(1024, None)
@@ -85,7 +90,8 @@ def _load_openai_messages(
             streaming=False,
             verification_mode=VerificationMode.NO_CHECKS,
         )
-        dataset = dataset.shuffle(seed=42)
+        if shuffle_seed is not None:
+            dataset = dataset.shuffle(seed=shuffle_seed)
 
         if sl is not None:
             indices = range(*sl.indices(len(dataset)))
@@ -165,6 +171,7 @@ class ChatDataset(Dataset):
         truncation: Union[str, bool] = "do_not_truncate",
         start_of_turn_token: Optional[str] = None,
         chat_template: Optional[str] = None,
+        shuffle_seed: Optional[int] = 42,
     ) -> None:
         if tokenizer is None:
             raise ValueError("Tokenizer is required")
@@ -183,7 +190,7 @@ class ChatDataset(Dataset):
         self.truncation = truncation
         self.start_of_turn_token = start_of_turn_token
 
-        self.dataset = _load_openai_messages(path_or_dataset_id, split=split, name=name)
+        self.dataset = _load_openai_messages(path_or_dataset_id, split=split, name=name, shuffle_seed=shuffle_seed)
 
         # Ensure pad token presence for downstream padding
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
