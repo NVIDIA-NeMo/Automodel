@@ -158,11 +158,12 @@ def _package_tokenized_example(
     content_length = len(input_ids)
     if pad_token_id is not None and content_length > 0:
         # Strip trailing pad tokens to find real content length.
+        # When pad_token_id == eos_token_id, keep one trailing eos as real content.
         end = content_length
         while end > 0 and input_ids[end - 1] == pad_token_id:
             end -= 1
         if pad_token_id == eos_token_id:
-            # When pad_token_id == eos_token_id, keep one trailing eos as real content.
+            # Keep one trailing eos token as the real EOS
             content_length = min(end + 1, content_length)
         else:
             content_length = end
@@ -285,13 +286,17 @@ def format_chat_template(
 
     template_has_generation_kwd = GENERATION_REGEX.search(tokenizer.chat_template) is not None
 
+    # Disable padding here so that apply_chat_template returns only real
+    # tokens.  Padding is deferred to _package_tokenized_example (via
+    # seq_length) where both input_ids and labels are padded together and
+    # the attention_mask correctly marks pad positions as 0.
     tokenized_chat = tokenizer.apply_chat_template(
         formatted_text,
         tools=tools,
         tokenize=True,
         return_dict=True,
         return_assistant_tokens_mask=template_has_generation_kwd,
-        padding=padding,
+        padding=False,
         truncation=truncation,
         max_length=seq_length,
     )
