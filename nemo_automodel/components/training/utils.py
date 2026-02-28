@@ -296,8 +296,6 @@ def scale_grads_and_clip_grad_norm(
 
     # Precompute scale factors
     pp_divisor: float | None = None
-    if num_label_tokens is not None:
-        num_label_tokens = max(num_label_tokens, 1)
     if pp_enabled and num_label_tokens is not None and dp_group_size is not None:
         if dp_group_size != 0:
             candidate = num_label_tokens / dp_group_size
