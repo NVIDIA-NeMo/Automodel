@@ -191,7 +191,7 @@ python examples/llm_finetune/prepare_massive_nlu.py --output_dir data/massive_nl
 automodel examples/llm_finetune/llama3_2/llama_3_2_3b_instruct_massive_nlu_peft.yaml
 ```
 
-See also the Qwen chat example config at `examples/llm_finetune/qwen/qwen2_5_7b_instruct_chat.yaml`.
+See also the Qwen chat example config at [`examples/llm_finetune/qwen/qwen2_5_7b_instruct_chat.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_7b_instruct_chat.yaml).
 
 ---
 
