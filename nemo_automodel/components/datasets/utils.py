@@ -243,7 +243,14 @@ def default_collater(batch, pad_seq_len_divisible=None):
     }
 
     # convert to tensors
-    return {k: batchify(torch.LongTensor(v)) for k, v in ans.items()}
+    result = {k: batchify(torch.LongTensor(v)) for k, v in ans.items()}
+
+    # Add padding_mask similar to cp_utils.py
+    if "input_ids" in result:
+        input_ids_pad_token = get_pad_token_from_key("input_ids", pad_token_ids) or 0
+        result["padding_mask"] = (result["input_ids"] == input_ids_pad_token).bool()
+
+    return result
 
 
 def packed_sequence_thd_collater(batch):

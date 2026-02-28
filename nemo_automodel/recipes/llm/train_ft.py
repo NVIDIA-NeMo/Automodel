@@ -1047,6 +1047,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
 
+        from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+
+        if not self.pp_enabled:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+                float(self._get_dp_group_size(include_cp=True))
+            )
+
     def _collect_moe_load_balance(self):
         """Collect MoE load balance metrics with DP all-reduce.
 
