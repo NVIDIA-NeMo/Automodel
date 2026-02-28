@@ -921,6 +921,28 @@ class TestMoE:
         assert isinstance(moe.gate, Gate)
         assert isinstance(moe.experts, GroupedExpertsDeepEP)
 
+    def test_moe_init_with_hybridep_single_device(self, moe_config, backend_config):
+        """HybridEP dispatcher enabled but world size == 1 should fall back to GroupedExperts."""
+        backend_config.experts = "torch_mm"
+        backend_config.dispatcher = "hybridep"
+        with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=1):
+            moe = MoE(moe_config, backend_config)
+
+        assert isinstance(moe.gate, Gate)
+        assert isinstance(moe.experts, GroupedExperts)
+
+    def test_moe_init_with_hybridep_multi_device(self, moe_config, backend_config):
+        """HybridEP dispatcher enabled and world size > 1 should use GroupedExpertsDeepEP."""
+        backend_config.experts = "torch_mm"
+        backend_config.dispatcher = "hybridep"
+        with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=2):
+            moe = MoE(moe_config, backend_config)
+
+        assert isinstance(moe.gate, Gate)
+        assert isinstance(moe.experts, GroupedExpertsDeepEP)
+        assert moe.experts.dispatcher_backend == "hybridep"
+        assert moe.experts.dispatcher_num_sms == backend_config.dispatcher_num_sms
+
     def test_moe_init_with_shared_experts(self, moe_config, backend_config):
         """Test MoE initialization with shared experts."""
         moe_config.n_shared_experts = 2
