@@ -191,9 +191,9 @@ docker run --gpus all -it --rm \
 
 ---
 ## Installation Options for Developers
-## Installation Options for Developers
 
 This section provides installation options for developers, including pulling the latest source from GitHub, using editable mode, or mounting the repo inside a NeMo Docker container.
+
 ### Install from GitHub (Source)
 
 
@@ -216,7 +216,6 @@ uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
 :::
 
 ### Install in Developer Mode (Editable Install)
-### Install in Developer Mode (Editable Install)
 
 To contribute or modify the code:
 
@@ -230,7 +229,6 @@ pip3 install -e .
 This installs AutoModel in editable mode, so changes to the code are immediately reflected in Python.
 :::
 
-### Mount the Repo into a NeMo Docker Container
 ### Mount the Repo into a NeMo Docker Container
 
 To run `Automodel` inside a NeMo container while **mounting your local repo**, follow these steps:
