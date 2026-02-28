@@ -41,8 +41,9 @@ export WANDB_API_KEY=your_wandb_key
 srun --output=output.out \
      --error=output.err \
      --container-image /your/path/to/automodel26.02.image.sqsh --no-container-mount-home bash -c "
-  CUDA_DEVICE_MAX_CONNECTIONS=1 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 examples/vlm_finetune/finetune.py \
-  -c examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml \
+  CUDA_DEVICE_MAX_CONNECTIONS=1 automodel \
+  examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml \
+  --nproc-per-node=8 \
   --model.pretrained_model_name_or_path=/your/local/qwen3.5weights \
   --processor.pretrained_model_name_or_path=/your/local/qwen3.5weights "
 ```

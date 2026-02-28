@@ -135,8 +135,8 @@ dataset:
 Override any field from the CLI:
 
 ```bash
-uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py \
-  --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+  --nproc-per-node=8 \
   --step_scheduler.local_batch_size 16
 ```
 

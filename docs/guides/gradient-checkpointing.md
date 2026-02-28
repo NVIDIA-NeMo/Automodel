@@ -77,13 +77,11 @@ Run your training script and inspect the peak memory:
 ```bash
 
 # If running on 8x GPUs
-uv run torchrun --nproc-per-node=8 \
-  examples/llm_finetune/finetune.py \
-  -c examples/llm_finetune/llama3_2/llama_3_2_1b_my_finetune.yaml
+automodel examples/llm_finetune/llama3_2/llama_3_2_1b_my_finetune.yaml \
+  --nproc-per-node=8
 
 # If running on 1x GPU
-uv run examples/llm_finetune/finetune.py \
-  -c examples/llm_finetune/llama3_2/llama_3_2_1b_my_finetune.yaml
+automodel examples/llm_finetune/llama3_2/llama_3_2_1b_my_finetune.yaml
 ```
 If we run with the above settings (activation ckpt = on, lc-ce = on, fsdp = on), look for a log line similar to:
 ```
