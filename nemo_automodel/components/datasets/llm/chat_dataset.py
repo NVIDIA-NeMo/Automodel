@@ -54,7 +54,7 @@ def _load_openai_messages(
     path_or_dataset_id: Union[str, Sequence[str]],
     split: Optional[str] = None,
     name: Optional[str] = None,
-    shuffle_seed: Optional[int] = 42,
+    shuffle_seed: Optional[int] = None,
 ):
     """Load OpenAI chat messages datasets from HF or local JSON/JSONL files.
 
@@ -171,7 +171,7 @@ class ChatDataset(Dataset):
         truncation: Union[str, bool] = "do_not_truncate",
         start_of_turn_token: Optional[str] = None,
         chat_template: Optional[str] = None,
-        shuffle_seed: Optional[int] = 42,
+        shuffle_seed: Optional[int] = None,
     ) -> None:
         if tokenizer is None:
             raise ValueError("Tokenizer is required")
