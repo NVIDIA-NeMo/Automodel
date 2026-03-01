@@ -85,6 +85,7 @@ from nemo_automodel.components.utils.model_utils import (
 )
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.shared.te_patches import apply_te_patches
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -835,6 +836,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         setup_logging()
 
         apply_cache_compatibility_patches()
+        apply_te_patches()
         # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
         # Enable NVTX patching only when explicitly requested in config
