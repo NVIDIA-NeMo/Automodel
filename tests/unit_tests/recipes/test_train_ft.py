@@ -1392,3 +1392,117 @@ def test_get_model_name_from_nested_config():
 
     result = _get_model_name(cfg_model)
     assert result == "nested/model"
+
+
+# ---------------------------------------------------------------------------
+# _log_moe_metrics tests
+# ---------------------------------------------------------------------------
+
+
+def _make_moe_layer_loads(loads_list):
+    """Build a layer_loads dict from a list of 1-D lists (mirrors test_load_balance_metrics helper)."""
+    result = {}
+    for i, load in enumerate(loads_list):
+        result[f"layers.{i}.moe.gate"] = {
+            "expert_load": torch.tensor(load, dtype=torch.float32),
+            "aux_loss": None,
+            "n_experts": len(load),
+        }
+    return result
+
+
+def _make_trainer_for_moe(moe_cfg_dict, layer_loads=None):
+    """Create a bare recipe instance with cfg and _moe_layer_loads set."""
+    trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    trainer.cfg = ConfigNode({"moe_metrics": moe_cfg_dict})
+    trainer._moe_layer_loads = layer_loads
+    return trainer
+
+
+def test_log_moe_metrics_skips_when_no_loads():
+    """wandb_log_fn should not be called when _moe_layer_loads is None."""
+    trainer = _make_trainer_for_moe({"enabled": True, "mode": "brief"}, layer_loads=None)
+    log_fn = MagicMock()
+
+    trainer._log_moe_metrics(step=1, wandb_log_fn=log_fn)
+
+    log_fn.assert_not_called()
+
+
+def test_log_moe_metrics_brief_mode_default():
+    """Brief mode should call wandb_log_fn once with correct step."""
+    loads = _make_moe_layer_loads([[100.0, 200.0, 300.0, 400.0]])
+    trainer = _make_trainer_for_moe({"enabled": True, "mode": "brief", "top_k_experts": 2}, layer_loads=loads)
+    log_fn = MagicMock()
+
+    trainer._log_moe_metrics(step=42, wandb_log_fn=log_fn)
+
+    log_fn.assert_called_once()
+    _, kwargs = log_fn.call_args
+    assert kwargs["step"] == 42
+    metrics = log_fn.call_args[0][0]
+    assert "moe/cv_mean" in metrics
+
+
+def test_log_moe_metrics_passes_top_k_zero():
+    """top_k_experts=0 should produce no moe_expert_utilization/ keys."""
+    loads = _make_moe_layer_loads([[100.0, 200.0, 300.0, 400.0]])
+    trainer = _make_trainer_for_moe({"enabled": True, "mode": "brief", "top_k_experts": 0}, layer_loads=loads)
+    log_fn = MagicMock()
+
+    trainer._log_moe_metrics(step=1, wandb_log_fn=log_fn)
+
+    log_fn.assert_called_once()
+    metrics = log_fn.call_args[0][0]
+    util_keys = [k for k in metrics if k.startswith("moe_expert_utilization/")]
+    assert len(util_keys) == 0
+    assert "moe/cv_mean" in metrics
+
+
+def test_log_moe_metrics_passes_top_k_from_config():
+    """top_k_experts=3 should produce moe_expert_utilization/ keys."""
+    loads = _make_moe_layer_loads([[100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0]])
+    trainer = _make_trainer_for_moe({"enabled": True, "mode": "brief", "top_k_experts": 3}, layer_loads=loads)
+    log_fn = MagicMock()
+
+    trainer._log_moe_metrics(step=1, wandb_log_fn=log_fn)
+
+    log_fn.assert_called_once()
+    metrics = log_fn.call_args[0][0]
+    util_keys = [k for k in metrics if k.startswith("moe_expert_utilization/")]
+    assert len(util_keys) > 0
+    assert len(util_keys) <= 6  # at most 2 * top_k
+
+
+def test_log_moe_metrics_detailed_mode():
+    """Detailed mode should call compute_detailed_metrics (includes per-layer keys)."""
+    loads = _make_moe_layer_loads([[100.0, 200.0], [300.0, 400.0]])
+    trainer = _make_trainer_for_moe(
+        {"enabled": True, "mode": "detailed", "top_k_experts": 2}, layer_loads=loads
+    )
+    log_fn = MagicMock()
+
+    trainer._log_moe_metrics(step=10, wandb_log_fn=log_fn)
+
+    log_fn.assert_called_once()
+    metrics = log_fn.call_args[0][0]
+    assert "moe/layer_0/cv" in metrics
+    assert "moe/layer_1/cv" in metrics
+
+
+def test_log_moe_metrics_detailed_mode_non_detailed_step():
+    """On non-detailed steps, detailed mode should fall back to brief metrics."""
+    loads = _make_moe_layer_loads([[100.0, 200.0], [300.0, 400.0]])
+    trainer = _make_trainer_for_moe(
+        {"enabled": True, "mode": "detailed", "top_k_experts": 2, "detailed_every_steps": 10},
+        layer_loads=loads,
+    )
+    log_fn = MagicMock()
+
+    trainer._log_moe_metrics(step=5, wandb_log_fn=log_fn)
+
+    log_fn.assert_called_once()
+    metrics = log_fn.call_args[0][0]
+    # Brief metrics: no per-layer keys
+    assert "moe/layer_0/cv" not in metrics
+    assert "moe/cv_mean" in metrics
