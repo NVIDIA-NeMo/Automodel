@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.components.loss.linear_ce import HAVE_CUT_CROSS_ENTROPY
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
     _get_model_name,
@@ -1026,6 +1027,7 @@ class TestCalculateLoss:
         assert loss.dim() == 0  # scalar
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="FusedLinearCE requires CUDA")
+    @pytest.mark.skipif(not HAVE_CUT_CROSS_ENTROPY, reason="cut_cross_entropy not installed")
     def test_calculate_loss_with_fused_linear_ce(self):
         """Test calculate_loss with FusedLinearCrossEntropy."""
         from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -1052,6 +1054,7 @@ class TestCalculateLoss:
         assert loss.dim() == 0
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="FusedLinearCE requires CUDA")
+    @pytest.mark.skipif(not HAVE_CUT_CROSS_ENTROPY, reason="cut_cross_entropy not installed")
     def test_calculate_loss_fused_ce_finds_lm_head_by_name(self):
         """Test that FusedLinearCE can find lm_head via named_parameters when model has no get_output_embeddings."""
         from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -1569,6 +1572,7 @@ class TestForwardBackwardStepNonPP:
     """Tests for _forward_backward_step without pipeline parallelism."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="FusedLinearCE requires CUDA")
+    @pytest.mark.skipif(not HAVE_CUT_CROSS_ENTROPY, reason="cut_cross_entropy not installed")
     def test_non_pp_with_fused_linear_ce(self, monkeypatch):
         """Test non-PP path with FusedLinearCrossEntropy."""
         from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
