@@ -40,7 +40,16 @@ def _apply_fused_adam_quantized_tensor_patch() -> None:
     QuantizedTensor parameters because their ``.shape`` does not carry the
     correct metadata for allocation.  The fix dequantizes the param first and
     uses ``torch.zeros_like`` / ``torch.empty_like`` instead.
+
+    The fix was merged upstream in TE 2.12 via
+    https://github.com/NVIDIA/TransformerEngine/pull/2535.
     """
+    from nemo_automodel.shared.import_utils import is_te_min_version
+
+    if is_te_min_version("2.12"):
+        _logger.debug("TE >= 2.12 detected; FusedAdam QuantizedTensor patch not needed.")
+        return
+
     try:
         import inspect
 

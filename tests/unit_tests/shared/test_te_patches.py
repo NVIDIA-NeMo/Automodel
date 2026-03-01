@@ -20,6 +20,10 @@ from nemo_automodel.shared.te_patches import (
     apply_te_patches,
 )
 
+# All tests that call _apply_fused_adam_quantized_tensor_patch need to mock
+# is_te_min_version since it is called at the top of that function.
+_MOCK_TE_VERSION = "nemo_automodel.shared.import_utils.is_te_min_version"
+
 
 class TestApplyTePatchesIdempotent:
     def setup_method(self):
@@ -50,7 +54,29 @@ class TestFusedAdamQuantizedTensorPatch:
     def teardown_method(self):
         te_patches_module._TE_PATCHES_APPLIED = False
 
-    def test_skips_when_te_not_installed(self):
+    @patch(_MOCK_TE_VERSION, return_value=True)
+    def test_skips_when_te_version_ge_2_12(self, _mock_ver):
+        mock_fused_adam_cls = MagicMock()
+        original_method = MagicMock()
+        mock_fused_adam_cls._initialize_state = original_method
+
+        mock_fused_adam_module = MagicMock()
+        mock_fused_adam_module.FusedAdam = mock_fused_adam_cls
+
+        with patch.dict("sys.modules", {
+            "transformer_engine": MagicMock(),
+            "transformer_engine.pytorch": MagicMock(),
+            "transformer_engine.pytorch.optimizers": MagicMock(),
+            "transformer_engine.pytorch.optimizers.fused_adam": mock_fused_adam_module,
+            "transformer_engine.pytorch.quantized_tensor": MagicMock(),
+        }):
+            _apply_fused_adam_quantized_tensor_patch()
+
+        # Should NOT patch when TE >= 2.12
+        assert mock_fused_adam_cls._initialize_state is original_method
+
+    @patch(_MOCK_TE_VERSION, return_value=False)
+    def test_skips_when_te_not_installed(self, _mock_ver):
         with patch.dict("sys.modules", {
             "transformer_engine": None,
             "transformer_engine.pytorch": None,
@@ -61,7 +87,8 @@ class TestFusedAdamQuantizedTensorPatch:
             # Should not raise when TE is not importable
             _apply_fused_adam_quantized_tensor_patch()
 
-    def test_patches_fused_adam_when_te_available(self):
+    @patch(_MOCK_TE_VERSION, return_value=False)
+    def test_patches_fused_adam_when_te_available(self, _mock_ver):
         mock_quantized_tensor_cls = type("QuantizedTensor", (), {})
 
         mock_fused_adam_cls = MagicMock()
@@ -96,7 +123,8 @@ class TestFusedAdamQuantizedTensorPatch:
         assert mock_fused_adam_cls._initialize_state is not original_method
         assert callable(mock_fused_adam_cls._initialize_state)
 
-    def test_patches_when_only_partial_upstream_fix(self):
+    @patch(_MOCK_TE_VERSION, return_value=False)
+    def test_patches_when_only_partial_upstream_fix(self, _mock_ver):
         mock_fused_adam_cls = MagicMock()
         original_method = MagicMock()
         original_method.__name__ = "_initialize_state"
@@ -127,7 +155,8 @@ class TestFusedAdamQuantizedTensorPatch:
         # Should still patch since the full upstream fix is not present
         assert mock_fused_adam_cls._initialize_state is not original_method
 
-    def test_skips_patch_when_already_handled_upstream(self):
+    @patch(_MOCK_TE_VERSION, return_value=False)
+    def test_skips_patch_when_already_handled_upstream(self, _mock_ver):
         mock_fused_adam_cls = MagicMock()
         original_method = MagicMock()
         original_method.__name__ = "_initialize_state"
