@@ -65,6 +65,29 @@ Simple generation script and configurations for VLMs.
 
 - Folder: [examples/vlm_generate](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/vlm_generate)
 
+## NeMo Retriever
+This section provides recipes for training retrieval models — embedding models and rerankers — used in semantic search and retrieval-augmented generation (RAG) pipelines.
+
+### Embedding Model Fine-Tuning
+
+Fine-tune a biencoder (dual-encoder) embedding model using contrastive learning on (query, positive document, hard negatives) triples. Supports shared or separate query/passage encoders, multiple pooling strategies, and LoRA.
+
+- Folder: [examples/biencoder](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/biencoder)
+- Representative backbone: Llama 3.2 1B (bidirectional variant)
+- How-to guide: [Embedding model fine-tuning](retriever/embedding-finetuning.md)
+
+### Hard Negative Mining
+
+Mine high-quality hard negatives from your corpus using a trained embedding model, improving the quality of subsequent fine-tuning rounds.
+
+- Script: [examples/biencoder/mine_hard_negatives.py](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/biencoder/mine_hard_negatives.py)
+- Config: [examples/biencoder/mining_config.yaml](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/biencoder/mining_config.yaml)
+- How-to guide: [Embedding model fine-tuning — Hard Negative Mining](retriever/embedding-finetuning.md#hard-negative-mining)
+
+### Reranker Fine-Tuning (Coming Soon)
+
+Cross-encoder reranker training for second-stage re-ranking in retrieval pipelines. See the [reranker fine-tuning](retriever/reranker-finetuning.md) page for status and planned features.
+
 ## Diffusion Generation
 
 WAN 2.2 example for diffusion-based image generation.
