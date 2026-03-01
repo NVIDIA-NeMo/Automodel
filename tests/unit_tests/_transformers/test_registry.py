@@ -12,93 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
-import logging
-import pkgutil
 import types
 
 import pytest
 
 
-def _make_fake_package():
-    return types.SimpleNamespace(__path__=["/dev/null"])
-
-
-def _make_fake_walk(orig_walk, prefix_to_names):
-    """
-    Return a fake pkgutil.walk_packages that only intercepts specific prefixes.
-    For any other prefix, it delegates to the original implementation.
-    """
-
-    def _fake_walk(path=None, prefix="", onerror=None):
-        names = prefix_to_names.get(prefix)
-        if names is not None:
-            return [(None, n, False) for n in names]
-        return orig_walk(path, prefix, onerror)
-
-    return _fake_walk
-
-
-def _make_fake_import(orig_import, package_to_modules):
-    """
-    Return a fake importlib.import_module that serves fake packages/modules for
-    keys present in package_to_modules; delegates to original import otherwise.
-
-    package_to_modules: dict[str, object]
-        Keys are fully-qualified module names (e.g., "test.pkg", "test.pkg.mod").
-        Values are either a fake package (with __path__) or a fake module object.
-    """
-
-    def _fake_import(name, package=None):
-        if name in package_to_modules:
-            return package_to_modules[name]
-        return orig_import(name, package=package)
-
-    return _fake_import
-
-
 def _new_registry_instance(registry_module):
-    # Use an empty modeling_path to avoid scanning the real codebase
-    return registry_module._ModelRegistry(modeling_path=[])
+    """Create a fresh registry with an empty auto_map for testing."""
+    from nemo_automodel._transformers.registry import _LazyArchMapping
+
+    mapping = _LazyArchMapping(auto_map={})
+    return registry_module._ModelRegistry(model_arch_name_to_cls=mapping)
 
 
-def test_mapping_registers_single_class(monkeypatch):
-    # Prepare fakes for our synthetic package
-    pkg_name = "test.pkg.single"
-    mod_name = f"{pkg_name}.modA"
+def test_register_single_class():
+    from nemo_automodel._transformers import registry as reg
+
+    inst = _new_registry_instance(reg)
 
     class FakeModelA:
         pass
 
-    fake_pkg = _make_fake_package()
-    fake_mod = types.SimpleNamespace(ModelClass=FakeModelA)
-
-    # Patch discovery/import only for our synthetic prefix
-    orig_walk = pkgutil.walk_packages
-    monkeypatch.setattr(
-        pkgutil,
-        "walk_packages",
-        _make_fake_walk(orig_walk, {f"{pkg_name}.": [mod_name]}),
-    )
-    orig_import = importlib.import_module
-    monkeypatch.setattr(
-        importlib,
-        "import_module",
-        _make_fake_import(orig_import, {pkg_name: fake_pkg, mod_name: fake_mod}),
-    )
-
-    from nemo_automodel._transformers import registry as reg
-
-    inst = _new_registry_instance(reg)
-    inst._mapping_model_arch_name_to_cls(pkg_name)
+    inst.register("FakeModelA", FakeModelA)
 
     assert "FakeModelA" in inst.model_arch_name_to_cls
     assert inst.model_arch_name_to_cls["FakeModelA"] is FakeModelA
 
 
-def test_mapping_registers_list_of_classes(monkeypatch):
-    pkg_name = "test.pkg.multi"
-    mod_name = f"{pkg_name}.mod"
+def test_register_multiple_classes():
+    from nemo_automodel._transformers import registry as reg
+
+    inst = _new_registry_instance(reg)
 
     class FakeModelB:
         pass
@@ -106,26 +50,8 @@ def test_mapping_registers_list_of_classes(monkeypatch):
     class FakeModelC:
         pass
 
-    fake_pkg = _make_fake_package()
-    fake_mod = types.SimpleNamespace(ModelClass=[FakeModelB, FakeModelC])
-
-    orig_walk = pkgutil.walk_packages
-    monkeypatch.setattr(
-        pkgutil,
-        "walk_packages",
-        _make_fake_walk(orig_walk, {f"{pkg_name}.": [mod_name]}),
-    )
-    orig_import = importlib.import_module
-    monkeypatch.setattr(
-        importlib,
-        "import_module",
-        _make_fake_import(orig_import, {pkg_name: fake_pkg, mod_name: fake_mod}),
-    )
-
-    from nemo_automodel._transformers import registry as reg
-
-    inst = _new_registry_instance(reg)
-    inst._mapping_model_arch_name_to_cls(pkg_name)
+    inst.register("FakeModelB", FakeModelB)
+    inst.register("FakeModelC", FakeModelC)
 
     assert "FakeModelB" in inst.model_arch_name_to_cls
     assert "FakeModelC" in inst.model_arch_name_to_cls
@@ -133,197 +59,148 @@ def test_mapping_registers_list_of_classes(monkeypatch):
     assert inst.model_arch_name_to_cls["FakeModelC"] is FakeModelC
 
 
-def test_naming_override_applied(monkeypatch):
-    pkg_name = "test.pkg.override"
-    mod_name = f"{pkg_name}.mod"
-
-    # Create a class with the exact name to be overridden
-    Qwen3OmniMoeThinkerForConditionalGeneration = type(  # noqa: N806
-        "Qwen3OmniMoeThinkerForConditionalGeneration", (), {}
-    )
-
-    fake_pkg = _make_fake_package()
-    fake_mod = types.SimpleNamespace(ModelClass=Qwen3OmniMoeThinkerForConditionalGeneration)
-
-    orig_walk = pkgutil.walk_packages
-    monkeypatch.setattr(
-        pkgutil,
-        "walk_packages",
-        _make_fake_walk(orig_walk, {f"{pkg_name}.": [mod_name]}),
-    )
-    orig_import = importlib.import_module
-    monkeypatch.setattr(
-        importlib,
-        "import_module",
-        _make_fake_import(orig_import, {pkg_name: fake_pkg, mod_name: fake_mod}),
-    )
-
-    from nemo_automodel._transformers import registry as reg
-
-    inst = _new_registry_instance(reg)
-    inst._mapping_model_arch_name_to_cls(pkg_name)
-
-    # Ensure the override mapping key is used
-    assert "Qwen3OmniMoeForConditionalGeneration" in inst.model_arch_name_to_cls
-    assert (
-        inst.model_arch_name_to_cls["Qwen3OmniMoeForConditionalGeneration"]
-        is Qwen3OmniMoeThinkerForConditionalGeneration
-    )
-
-
-def test_duplicate_model_raises_assertion(monkeypatch):
-    pkg_name = "test.pkg.dup"
-    mod1 = f"{pkg_name}.mod1"
-    mod2 = f"{pkg_name}.mod2"
-
-    # Two different classes but same __name__ "DupClass"
-    DupClass1 = type("DupClass", (), {})
-    DupClass2 = type("DupClass", (), {})
-
-    fake_pkg = _make_fake_package()
-    fake_mod1 = types.SimpleNamespace(ModelClass=DupClass1)
-    fake_mod2 = types.SimpleNamespace(ModelClass=DupClass2)
-
-    orig_walk = pkgutil.walk_packages
-    monkeypatch.setattr(
-        pkgutil,
-        "walk_packages",
-        _make_fake_walk(orig_walk, {f"{pkg_name}.": [mod1, mod2]}),
-    )
-    orig_import = importlib.import_module
-    monkeypatch.setattr(
-        importlib,
-        "import_module",
-        _make_fake_import(orig_import, {pkg_name: fake_pkg, mod1: fake_mod1, mod2: fake_mod2}),
-    )
-
+def test_duplicate_register_raises():
     from nemo_automodel._transformers import registry as reg
 
     inst = _new_registry_instance(reg)
 
-    with pytest.raises(AssertionError):
-        inst._mapping_model_arch_name_to_cls(pkg_name)
-
-
-def test_register_modeling_path_adds_and_registers(monkeypatch):
-    pkg_name = "test.pkg.register"
-    mod_name = f"{pkg_name}.mod"
-
-    class ModelX:
+    class DupClass:
         pass
 
-    fake_pkg = _make_fake_package()
-    fake_mod = types.SimpleNamespace(ModelClass=ModelX)
+    inst.register("DupClass", DupClass)
 
-    orig_walk = pkgutil.walk_packages
-    monkeypatch.setattr(
-        pkgutil,
-        "walk_packages",
-        _make_fake_walk(orig_walk, {f"{pkg_name}.": [mod_name]}),
-    )
-    orig_import = importlib.import_module
-    monkeypatch.setattr(
-        importlib,
-        "import_module",
-        _make_fake_import(orig_import, {pkg_name: fake_pkg, mod_name: fake_mod}),
-    )
+    with pytest.raises(ValueError, match="Duplicated model implementation"):
+        inst.register("DupClass", DupClass)
 
+
+def test_duplicate_register_exist_ok():
     from nemo_automodel._transformers import registry as reg
 
     inst = _new_registry_instance(reg)
-    assert pkg_name not in inst.modeling_path
-    inst.register_modeling_path(pkg_name)
 
-    assert pkg_name in inst.modeling_path
-    assert "ModelX" in inst.model_arch_name_to_cls
-    assert inst.model_arch_name_to_cls["ModelX"] is ModelX
+    class OrigClass:
+        pass
+
+    class ReplacementClass:
+        pass
+
+    inst.register("MyArch", OrigClass)
+    inst.register("MyArch", ReplacementClass, exist_ok=True)
+
+    assert inst.model_arch_name_to_cls["MyArch"] is ReplacementClass
 
 
-def test_supported_models_and_getter(monkeypatch):
-    pkg_name = "test.pkg.getter"
-    mod_name = f"{pkg_name}.mod"
+def test_supported_models_and_getter():
+    from nemo_automodel._transformers import registry as reg
+
+    inst = _new_registry_instance(reg)
 
     class A:
         pass
 
-    fake_pkg = _make_fake_package()
-    fake_mod = types.SimpleNamespace(ModelClass=A)
+    inst.register("A", A)
 
-    orig_walk = pkgutil.walk_packages
-    monkeypatch.setattr(
-        pkgutil,
-        "walk_packages",
-        _make_fake_walk(orig_walk, {f"{pkg_name}.": [mod_name]}),
-    )
-    orig_import = importlib.import_module
-    monkeypatch.setattr(
-        importlib,
-        "import_module",
-        _make_fake_import(orig_import, {pkg_name: fake_pkg, mod_name: fake_mod}),
-    )
-
-    from nemo_automodel._transformers import registry as reg
-
-    inst = _new_registry_instance(reg)
-    inst._mapping_model_arch_name_to_cls(pkg_name)
-
-    keys_view_type = type({}.keys())
-    assert isinstance(inst.supported_models, keys_view_type)
     assert "A" in inst.supported_models
     assert inst.get_model_cls_from_model_arch("A") is A
 
 
-def test_ignore_import_error_logs_warning(monkeypatch, caplog):
-    pkg_name = "test.pkg.bad"
-    bad_mod_name = f"{pkg_name}.badmod"
-
-    fake_pkg = _make_fake_package()
-
-    orig_import = importlib.import_module
-
-    def _raising_import(name, package=None):
-        if name == pkg_name:
-            return fake_pkg
-        if name == bad_mod_name:
-            raise RuntimeError("boom")
-        return orig_import(name, package=package)
-
-    orig_walk = pkgutil.walk_packages
-    monkeypatch.setattr(
-        pkgutil,
-        "walk_packages",
-        _make_fake_walk(orig_walk, {f"{pkg_name}.": [bad_mod_name]}),
-    )
-    monkeypatch.setattr(importlib, "import_module", _raising_import)
-
+def test_get_registry_is_cached():
     from nemo_automodel._transformers import registry as reg
 
-    caplog.set_level(logging.WARNING, logger=reg.__name__)
-    inst = _new_registry_instance(reg)
-    inst._mapping_model_arch_name_to_cls(pkg_name)
-
-    assert any("Ignore import error when loading" in rec.message for rec in caplog.records)
-
-
-def test_get_registry_is_cached(monkeypatch):
-    # Avoid scanning the real codebase by overriding MODELING_PATH
-    from nemo_automodel._transformers import registry as reg
-
-    pkg_name = "test.pkg.cached"
-    fake_pkg = _make_fake_package()
-
-    orig_walk = pkgutil.walk_packages
-    monkeypatch.setattr(pkgutil, "walk_packages", _make_fake_walk(orig_walk, {f"{pkg_name}.": []}))
-    orig_import = importlib.import_module
-    monkeypatch.setattr(
-        importlib, "import_module", _make_fake_import(orig_import, {pkg_name: fake_pkg})
-    )
-
-    monkeypatch.setattr(reg, "MODELING_PATH", [pkg_name])
-
-    # Reset cache and verify memoization
     reg.get_registry.cache_clear()
     r1 = reg.get_registry()
     r2 = reg.get_registry()
     assert r1 is r2
 
+
+def test_lazy_arch_mapping_auto_map():
+    """Static auto_map entries are lazily loaded on first access."""
+    from nemo_automodel._transformers.registry import _LazyArchMapping
+
+    class FakeClass:
+        pass
+
+    fake_module = types.SimpleNamespace(FakeClass=FakeClass)
+    mapping = _LazyArchMapping({"FakeArch": ("fake.module", "FakeClass")})
+
+    mapping._modules["fake.module"] = fake_module
+
+    assert "FakeArch" in mapping
+    assert mapping["FakeArch"] is FakeClass
+    assert "FakeArch" in mapping._loaded
+
+    with pytest.raises(KeyError):
+        mapping["NonExistent"]
+
+
+def test_lazy_arch_mapping_extra_overrides_auto_map():
+    """Dynamically registered entries take precedence over static entries."""
+    from nemo_automodel._transformers.registry import _LazyArchMapping
+
+    class StaticClass:
+        pass
+
+    class DynamicClass:
+        pass
+
+    fake_module = types.SimpleNamespace(StaticClass=StaticClass)
+    mapping = _LazyArchMapping({"MyArch": ("fake.module", "StaticClass")})
+    mapping._modules["fake.module"] = fake_module
+
+    assert mapping["MyArch"] is StaticClass
+
+    mapping["MyArch"] = DynamicClass
+    assert mapping["MyArch"] is DynamicClass
+
+
+def test_lazy_arch_mapping_unavailable_model():
+    """Auto_map entries whose imports fail are removed and excluded from containment."""
+    from nemo_automodel._transformers.registry import _LazyArchMapping
+
+    mapping = _LazyArchMapping({"BadArch": ("nonexistent.module.path", "BadClass")})
+
+    assert "BadArch" not in mapping
+    assert "BadArch" not in mapping._auto_map
+
+
+def test_default_registry_has_static_entries():
+    """The default registry is populated from MODEL_ARCH_MAPPING."""
+    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING, _ModelRegistry
+
+    inst = _ModelRegistry()
+    for arch_name in MODEL_ARCH_MAPPING:
+        assert arch_name in inst.model_arch_name_to_cls.keys()
+
+
+def test_all_model_folders_registered_in_auto_map():
+    """Every model folder with a model.py must have at least one entry in MODEL_ARCH_MAPPING.
+
+    This catches the case where a developer adds a new model directory under
+    ``nemo_automodel/components/models/`` but forgets to add it to the static
+    ``MODEL_ARCH_MAPPING`` in ``registry.py``.
+    """
+    import pathlib
+
+    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+
+    models_root = pathlib.Path(__file__).resolve().parents[3] / "nemo_automodel" / "components" / "models"
+
+    # Collect the set of module paths referenced by the auto_map
+    registered_module_paths = {module_path for module_path, _ in MODEL_ARCH_MAPPING.values()}
+
+    missing = []
+    for model_dir in sorted(models_root.iterdir()):
+        if not model_dir.is_dir() or model_dir.name.startswith(("_", ".")):
+            continue
+        model_file = model_dir / "model.py"
+        if not model_file.exists():
+            continue
+        expected_module = f"nemo_automodel.components.models.{model_dir.name}.model"
+        if expected_module not in registered_module_paths:
+            missing.append(model_dir.name)
+
+    assert not missing, (
+        f"Model folder(s) {missing} contain a model.py but are not registered "
+        f"in MODEL_ARCH_MAPPING (registry.py). Add an entry for each architecture "
+        f"exported by these modules."
+    )
