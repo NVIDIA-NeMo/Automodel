@@ -19,7 +19,6 @@ MFU calculation for various model architectures.
 """
 
 import logging
-from dataclasses import dataclass, field
 from os import PathLike
 from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
 
@@ -35,25 +34,68 @@ from nemo_automodel.components.utils.flops_utils import (
 
 logger = logging.getLogger(__name__)
 
+# Device theoretical FLOPS (FLOPs/s) adapted from https://github.com/verl-project/verl/blob/main/verl/utils/flops_counter.py#L22-L85
+_DEVICE_FLOPS: Dict[str, float] = {
+    "CPU": 448e9,
+    "GB200": 2.5e15,
+    "B200": 2.25e15,
+    "MI300X": 1336e12,
+    "H100": 989e12,
+    "H800": 989e12,
+    "H200": 989e12,
+    "A100": 312e12,
+    "A800": 312e12,
+    "L40S": 362.05e12,
+    "L40": 181.05e12,
+    "A40": 149.7e12,
+    "L20": 119.5e12,
+    "H20": 148e12,
+    "910B": 354e12,
+    "Ascend910": 354e12,
+    "RTX 3070 Ti": 21.75e12,
+}
 
-@dataclass
-class _MFUDeviceRegistry:
-    device_to_peak_tflops: Dict[str, float] = field(default_factory=dict)
-
-    def register(self, device: str, peak_tflops: float) -> None:
-        key = str(device).lower()
-        self.device_to_peak_tflops[key] = float(peak_tflops)
-        logger.debug(f"Registered MFU device '{key}' with peak TFLOPs={peak_tflops}")
-
-    def get_peak_tflops(self, device: str) -> float:
-        key = str(device).lower()
-        if key not in self.device_to_peak_tflops:
-            supported = ", ".join(sorted(self.device_to_peak_tflops.keys()))
-            raise ValueError(f"Unsupported device '{device}'. Supported devices: {supported}")
-        return self.device_to_peak_tflops[key]
+_UNIT_TO_SCALE = {
+    "B": 1e9,
+    "K": 1e3,
+    "M": 1e6,
+    "G": 1e9,
+    "T": 1e12,
+    "P": 1e15,
+}
 
 
-MFUDeviceRegistry = _MFUDeviceRegistry(device_to_peak_tflops={"h100": 1979.0})
+def get_device_flops(unit: str = "T", device_name: Optional[str] = None) -> float:
+    """Get theoretical device FLOPS in a requested unit.
+
+    Args:
+        unit: One of ``B/K/M/G/T/P``. Default ``T`` (TFLOPs/s).
+        device_name: Optional explicit device name for lookup. If ``None``,
+            the current torch device name is inferred.
+
+    Returns:
+        Theoretical FLOPS in requested unit. Returns ``float("inf")`` for
+        unknown devices.
+    """
+    unit = unit.upper()
+    if unit not in _UNIT_TO_SCALE:
+        supported = ", ".join(_UNIT_TO_SCALE.keys())
+        raise ValueError(f"Unsupported unit '{unit}'. Supported units: {supported}")
+
+    if device_name is None:
+        if torch.cuda.is_available():
+            device_name = torch.cuda.get_device_name(torch.cuda.current_device())
+        else:
+            device_name = "CPU"
+
+    flops = float("inf")
+    normalized_device = str(device_name).lower()
+    for key, value in sorted(_DEVICE_FLOPS.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if key.lower() in normalized_device:
+            flops = value
+            break
+
+    return flops / _UNIT_TO_SCALE[unit]
 
 
 class AutoMFU:
@@ -71,12 +113,12 @@ class AutoMFU:
         """
         self.config = config
         self.flops_formula = get_flops_formula_for_hf_config(config)
-        self.reference_mfu = MFUDeviceRegistry.get_peak_tflops(device)
+        self.reference_mfu = get_device_flops(unit="T", device_name=device)
 
     @classmethod
     def register_device(cls, device: str, peak_tflops: float) -> None:
         """Register or override a device peak TFLOPs entry used for MFU calculation."""
-        MFUDeviceRegistry.register(device, peak_tflops)
+        _DEVICE_FLOPS[str(device)] = float(peak_tflops) * 1e12
 
     @classmethod
     def from_config(
