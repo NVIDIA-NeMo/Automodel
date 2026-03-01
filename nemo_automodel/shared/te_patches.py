@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -50,9 +50,16 @@ def _apply_fused_adam_quantized_tensor_patch() -> None:
         _logger.debug(f"Skipping FusedAdam QuantizedTensor patch (import failed): {e}")
         return
 
-    # Skip if upstream already handles QuantizedTensor.
-    if "QuantizedTensor" in inspect.getsource(FusedAdam._initialize_state):
-        _logger.debug("FusedAdam._initialize_state already handles QuantizedTensor, skipping patch.")
+    # Skip if upstream already contains the full fix from
+    # https://github.com/NVIDIA/TransformerEngine/pull/2535
+    _src = inspect.getsource(FusedAdam._initialize_state)
+    _upstream_fix_lines = (
+        "param.dequantize() if isinstance(param, QuantizedTensor)",
+        "torch.zeros_like(param_for_empty",
+        "torch.empty_like(param_for_empty",
+    )
+    if all(line in _src for line in _upstream_fix_lines):
+        _logger.debug("FusedAdam._initialize_state already contains upstream QuantizedTensor fix, skipping patch.")
         return
 
     def _patched_initialize_state(self, param, state_name, zero_buffer, store_param_remainders=False):

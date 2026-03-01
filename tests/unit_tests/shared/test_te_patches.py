@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -65,7 +65,7 @@ class TestFusedAdamQuantizedTensorPatch:
         mock_quantized_tensor_cls = type("QuantizedTensor", (), {})
 
         mock_fused_adam_cls = MagicMock()
-        # _initialize_state source without "QuantizedTensor" means patch should apply
+        # Source without the upstream fix lines means patch should apply
         original_method = MagicMock()
         original_method.__name__ = "_initialize_state"
         mock_fused_adam_cls._initialize_state = original_method
@@ -76,18 +76,56 @@ class TestFusedAdamQuantizedTensorPatch:
         mock_qt_module = MagicMock()
         mock_qt_module.QuantizedTensor = mock_quantized_tensor_cls
 
+        # Old TE source that uses torch.zeros(param.shape, ...) without the fix
+        old_source = (
+            "def _initialize_state(self, param, state_name, zero_buffer):\n"
+            "    data = torch.zeros(param.shape, dtype=torch.int16, device=param.device)\n"
+            "    data = torch.empty(param.shape, dtype=dtype, device=param.device)\n"
+        )
+
         with patch.dict("sys.modules", {
             "transformer_engine": MagicMock(),
             "transformer_engine.pytorch": MagicMock(),
             "transformer_engine.pytorch.optimizers": MagicMock(),
             "transformer_engine.pytorch.optimizers.fused_adam": mock_fused_adam_module,
             "transformer_engine.pytorch.quantized_tensor": mock_qt_module,
-        }), patch("inspect.getsource", return_value="def _initialize_state(self, param): pass"):
+        }), patch("inspect.getsource", return_value=old_source):
             _apply_fused_adam_quantized_tensor_patch()
 
         # Verify _initialize_state was replaced
         assert mock_fused_adam_cls._initialize_state is not original_method
         assert callable(mock_fused_adam_cls._initialize_state)
+
+    def test_patches_when_only_partial_upstream_fix(self):
+        mock_fused_adam_cls = MagicMock()
+        original_method = MagicMock()
+        original_method.__name__ = "_initialize_state"
+        mock_fused_adam_cls._initialize_state = original_method
+
+        mock_fused_adam_module = MagicMock()
+        mock_fused_adam_module.FusedAdam = mock_fused_adam_cls
+
+        mock_qt_module = MagicMock()
+        mock_qt_module.QuantizedTensor = type("QuantizedTensor", (), {})
+
+        # Source mentions QuantizedTensor but is missing the full fix lines
+        partial_source = (
+            "def _initialize_state(self, param):\n"
+            "    # QuantizedTensor mentioned in a comment\n"
+            "    data = torch.zeros(param.shape, dtype=torch.int16)\n"
+        )
+
+        with patch.dict("sys.modules", {
+            "transformer_engine": MagicMock(),
+            "transformer_engine.pytorch": MagicMock(),
+            "transformer_engine.pytorch.optimizers": MagicMock(),
+            "transformer_engine.pytorch.optimizers.fused_adam": mock_fused_adam_module,
+            "transformer_engine.pytorch.quantized_tensor": mock_qt_module,
+        }), patch("inspect.getsource", return_value=partial_source):
+            _apply_fused_adam_quantized_tensor_patch()
+
+        # Should still patch since the full upstream fix is not present
+        assert mock_fused_adam_cls._initialize_state is not original_method
 
     def test_skips_patch_when_already_handled_upstream(self):
         mock_fused_adam_cls = MagicMock()
@@ -100,17 +138,25 @@ class TestFusedAdamQuantizedTensorPatch:
 
         mock_qt_module = MagicMock()
 
+        # Simulate upstream source that contains all three fix lines from TE PR #2535
+        upstream_fixed_source = (
+            "def _initialize_state(self, param, state_name, zero_buffer):\n"
+            "    dtype = self.name_to_dtype_map[state_name]\n"
+            "    param_for_empty = param.dequantize() if isinstance(param, QuantizedTensor) else param\n"
+            "    if store_param_remainders:\n"
+            "        data = torch.zeros_like(param_for_empty, dtype=torch.int16)\n"
+            "    else:\n"
+            "        data = torch.empty_like(param_for_empty, dtype=dtype)\n"
+        )
+
         with patch.dict("sys.modules", {
             "transformer_engine": MagicMock(),
             "transformer_engine.pytorch": MagicMock(),
             "transformer_engine.pytorch.optimizers": MagicMock(),
             "transformer_engine.pytorch.optimizers.fused_adam": mock_fused_adam_module,
             "transformer_engine.pytorch.quantized_tensor": mock_qt_module,
-        }), patch(
-            "inspect.getsource",
-            return_value="def _initialize_state(self, param): QuantizedTensor handling here",
-        ):
+        }), patch("inspect.getsource", return_value=upstream_fixed_source):
             _apply_fused_adam_quantized_tensor_patch()
 
-        # Should NOT have been replaced since upstream already handles it
+        # Should NOT have been replaced since upstream already has the full fix
         assert mock_fused_adam_cls._initialize_state is original_method
