@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Union
 
 from datasets import Dataset, concatenate_datasets, load_dataset
+from huggingface_hub import HfApi, hf_hub_download
 
 EXAMPLE_TEMPLATE = {"text": "", "image": "", "nr_ocr": ""}
 
@@ -51,6 +52,23 @@ class TextQADataset(AbstractDataset):
 
     def get_all_ids(self):
         return sorted(list(self.docid2idx.keys()))
+
+
+class HFCorpusDataset(AbstractDataset):
+    """Wraps an already-loaded HuggingFace Dataset as a corpus (in-memory, no local Parquet)."""
+
+    def __init__(self, hf_dataset: Dataset, path: str = ""):
+        self.path = path
+        self._data = hf_dataset
+        self._docid2idx = {str(doc_id): idx for idx, doc_id in enumerate(self._data["id"])}
+
+    def get_document_by_id(self, id):
+        example = deepcopy(EXAMPLE_TEMPLATE)
+        example["text"] = self._data[self._docid2idx[id]]["text"]
+        return example
+
+    def get_all_ids(self):
+        return sorted(self._docid2idx.keys())
 
 
 DATASETS = {
@@ -224,6 +242,176 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
     return (dataset, corpus_dict)
 
 
+_HF_PREFIX = "hf://"
+
+
+def _parse_hf_uri(uri: str):
+    """Parse an ``hf://`` URI into ``(repo_id, subset_or_none)``.
+
+    Examples::
+
+        "hf://nvidia/embed-nemotron-dataset-v1/FEVER"  -> ("nvidia/embed-nemotron-dataset-v1", "FEVER")
+        "hf://nvidia/embed-nemotron-dataset-v1"         -> ("nvidia/embed-nemotron-dataset-v1", None)
+    """
+    if not uri.startswith(_HF_PREFIX):
+        raise ValueError(f"Not an HF URI (must start with {_HF_PREFIX!r}): {uri}")
+    path = uri[len(_HF_PREFIX) :].strip("/")
+    parts = path.split("/")
+    if len(parts) < 2:
+        raise ValueError(f"HF URI must contain at least org/repo: {uri}")
+    repo_id = f"{parts[0]}/{parts[1]}"
+    subset = "/".join(parts[2:]) if len(parts) > 2 else None
+    return repo_id, subset
+
+
+def _list_hf_subsets(repo_id: str) -> List[str]:
+    """Discover all subset names in *repo_id* by finding ``dataset_metadata.json`` files."""
+    api = HfApi()
+    tree = api.list_repo_tree(repo_id=repo_id, repo_type="dataset", recursive=True)
+    subsets = set()
+    for item in tree:
+        if item.path.endswith("/dataset_metadata.json"):
+            subset_name = os.path.dirname(item.path)
+            if subset_name and subset_name != ".":
+                subsets.add(subset_name)
+    return sorted(subsets)
+
+
+# ---------------------------------------------------------------------------
+# Core HF subset loader
+# ---------------------------------------------------------------------------
+
+
+def _load_hf_subset(repo_id: str, subset: str):
+    """Load a single HF subset and return ``(normalized_data_list, CorpusInfo)``.
+
+    Note:
+        The direct ``hf://`` path currently expects the Automodel retrieval schema:
+        - ``{subset}/dataset_metadata.json`` with ``corpus_id`` metadata
+        - ``{subset}_corpus`` split with corpus columns like ``id`` and ``text``
+        - ``{subset}`` split with query columns like ``question`` and ``pos_doc``
+
+        FEVER and SyntheticClassificationData from
+        ``nvidia/embed-nemotron-dataset-v1`` are examples that follow this layout.
+        Datasets with different structures should use a custom adapter/preprocessor
+        before calling this loader.
+    """
+
+    # 1. Download dataset_metadata.json
+    meta_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=f"{subset}/dataset_metadata.json",
+        repo_type="dataset",
+    )
+    with open(meta_path, "r") as f:
+        metadata = json.load(f)
+
+    corpus_id = metadata["corpus_id"]
+
+    if metadata.get("ids_only", False):
+        raise ValueError(
+            f"HF subset '{repo_id}/{subset}' has ids_only=true in its metadata, meaning "
+            f"document and query text must be resolved from an external source before use. "
+            f"This is not supported for direct HF loading. Either use a subset that contains "
+            f"inline text, or pre-process the dataset with data_preparation.py and load the "
+            f"resulting local JSON files via a file path instead."
+        )
+
+    # 2. Load corpus
+    _CORPUS_REQUIRED_COLS = {"id", "text"}
+    corpus_hf = load_dataset(repo_id, f"{subset}_corpus", split="train")
+
+    missing_cols = _CORPUS_REQUIRED_COLS - set(corpus_hf.column_names)
+    if missing_cols:
+        raise ValueError(
+            f"HF corpus dataset '{repo_id}/{subset}_corpus' does not match the expected schema. "
+            f"Required columns: {sorted(_CORPUS_REQUIRED_COLS)}, "
+            f"found columns: {sorted(corpus_hf.column_names)}. "
+            f"Missing: {sorted(missing_cols)}. "
+            f"If your dataset uses a different format, implement a custom "
+            f"adapter/preprocessor before using direct hf:// loading."
+        )
+
+    # 3. Build HFCorpusDataset + CorpusInfo
+    hf_corpus = HFCorpusDataset(corpus_hf, path=f"hf://{repo_id}/{subset}")
+    corpus_info = CorpusInfo(metadata, hf_corpus)
+
+    # 4. Load queries
+    _QUERY_REQUIRED_COLS = {"question", "pos_doc"}
+    queries_hf = load_dataset(repo_id, subset, split="train")
+
+    missing_query_cols = _QUERY_REQUIRED_COLS - set(queries_hf.column_names)
+    if missing_query_cols:
+        raise ValueError(
+            f"HF query dataset '{repo_id}/{subset}' does not match the expected schema. "
+            f"Required columns: {sorted(_QUERY_REQUIRED_COLS)}, "
+            f"found columns: {sorted(queries_hf.column_names)}. "
+            f"Missing: {sorted(missing_query_cols)}. "
+            f"If your dataset uses a different format, implement a custom "
+            f"adapter/preprocessor before using direct hf:// loading."
+        )
+
+    # 5. Normalize to the standard {question_id, question, corpus_id, pos_doc, neg_doc} shape
+    normalized_data = []
+    for idx, item in enumerate(queries_hf):
+        normalized_item = {
+            "question_id": str(item.get("question_id", f"{subset}:{idx}")),
+            "question": item["question"],
+            "corpus_id": corpus_id,
+        }
+        # pos_doc
+        pos_docs = item["pos_doc"]
+        if not isinstance(pos_docs, list):
+            pos_docs = [pos_docs]
+        if not pos_docs:
+            raise ValueError(f"HF subset {repo_id}/{subset} record {idx} has empty pos_doc")
+        normalized_item["pos_doc"] = []
+        for doc in pos_docs:
+            if isinstance(doc, dict) and "id" in doc:
+                normalized_item["pos_doc"].append({"id": str(doc["id"])})
+            else:
+                normalized_item["pos_doc"].append({"id": str(doc)})
+        # neg_doc (may be absent or empty — validated later at transform time)
+        neg_docs = item.get("neg_doc", [])
+        if not isinstance(neg_docs, list):
+            neg_docs = [neg_docs]
+        normalized_item["neg_doc"] = []
+        for doc in neg_docs:
+            if isinstance(doc, dict) and "id" in doc:
+                normalized_item["neg_doc"].append({"id": str(doc["id"])})
+            else:
+                normalized_item["neg_doc"].append({"id": str(doc)})
+        normalized_data.append(normalized_item)
+
+    return normalized_data, corpus_info
+
+
+def _load_hf_sources(hf_uris: List[str]):
+    """Load one or more ``hf://`` URIs and return ``(Dataset, corpus_dict)``."""
+    hf_data: List[dict] = []
+    corpus_dict: dict = {}
+
+    for uri in hf_uris:
+        repo_id, subset = _parse_hf_uri(uri)
+        subsets = [subset] if subset is not None else _list_hf_subsets(repo_id)
+
+        for sub in subsets:
+            logging.info(f"Loading HF subset: {repo_id}/{sub}")
+            data_list, corpus_info = _load_hf_subset(repo_id, sub)
+            hf_data.extend(data_list)
+            if corpus_info.corpus_id in corpus_dict:
+                existing = corpus_dict[corpus_info.corpus_id]
+                if existing.path != corpus_info.path:
+                    raise ValueError(
+                        f"Duplicate corpus_id '{corpus_info.corpus_id}' with different paths: "
+                        f"{existing.path} vs {corpus_info.path}"
+                    )
+            else:
+                corpus_dict[corpus_info.corpus_id] = corpus_info
+
+    return Dataset.from_list(hf_data), corpus_dict
+
+
 def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
     """
     Transform function to convert from raw format to training format.
@@ -261,9 +449,15 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
 
         # Get negatives (limit to num_neg_docs)
         negatives = batch_negatives[i_example]
-        neg_ids = [i for i in range(len(negatives))]
-        cur_neg_ids = [neg_ids[idx % len(neg_ids)] for idx in range(num_neg_docs)]
-        cur_pos_neg_doc += [negatives[n_id] for n_id in cur_neg_ids]
+        if num_neg_docs > 0 and len(negatives) == 0:
+            raise ValueError(
+                f"neg_doc is empty for example {i_example} but {num_neg_docs} negative(s) requested "
+                f"(train_n_passages > 1). Provide negatives or set train_n_passages=1."
+            )
+        if num_neg_docs > 0:
+            neg_ids = [i for i in range(len(negatives))]
+            cur_neg_ids = [neg_ids[idx % len(neg_ids)] for idx in range(num_neg_docs)]
+            cur_pos_neg_doc += [negatives[n_id] for n_id in cur_neg_ids]
 
         cur_pos_neg_doc_batch.append(cur_pos_neg_doc)
 
@@ -338,7 +532,7 @@ def _create_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: b
 
 
 def make_retrieval_dataset(
-    data_dir_list: Union[List[str], str],
+    data_dir_list: Union[List[str], str] = None,
     data_type: str = "train",
     train_n_passages: int = 5,
     eval_negative_size: int = 10,
@@ -351,12 +545,13 @@ def make_retrieval_dataset(
     """
     Load and return dataset in retrieval format for biencoder training.
 
-    This function loads data from JSON files using the same method as
-    RetrievalMultiModalDatasetLoader and returns it ready for training.
-    Uses set_transform() for lazy evaluation - tokenization is handled by collator.
+    Entries in *data_dir_list* can be local JSON file paths **or** ``hf://`` URIs
+    pointing to a HuggingFace dataset repository (e.g.
+    ``hf://nvidia/embed-nemotron-dataset-v1/SciFact``).  Uses ``set_transform()``
+    for lazy evaluation — tokenization is handled by the collator.
 
     Args:
-        data_dir_list: Path(s) to JSON file(s) containing training data
+        data_dir_list: Path(s) to JSON file(s) or ``hf://`` URIs.
         data_type: Type of data ("train" or "eval")
         train_n_passages: Number of passages for training (1 positive + n-1 negatives)
         eval_negative_size: Number of negative documents for evaluation
@@ -364,6 +559,7 @@ def make_retrieval_dataset(
         do_shuffle: Whether to shuffle the dataset
         max_train_samples: Maximum number of training samples to use
         train_data_select_offset: Offset for selecting training samples
+        use_dataset_instruction: Whether to use instruction from dataset's metadata
 
     Returns:
         A HuggingFace Dataset where each example is a dict with keys:
@@ -372,14 +568,45 @@ def make_retrieval_dataset(
         - 'doc_image': List of images or empty strings
 
     Note:
+        Direct ``hf://`` loading currently supports HF datasets that already follow
+        the Automodel retrieval schema (corpus-id based layout used by
+        ``nvidia/embed-nemotron-dataset-v1`` subsets such as FEVER and
+        SyntheticClassificationData). For other HF dataset formats, implement a
+        custom adapter/preprocessor before calling this loader.
+
         Tokenization should be handled by a collator (e.g., RetrievalBiencoderCollator)
         which is more efficient for batch padding and supports dynamic processing.
     """
 
-    logging.info(f"Loading data from {data_dir_list if isinstance(data_dir_list, str) else len(data_dir_list)} file(s)")
+    if data_dir_list is None:
+        raise ValueError("data_dir_list is required")
+    if not isinstance(data_dir_list, list):
+        data_dir_list = [data_dir_list]
 
-    # Load datasets using the same method as RetrievalMultiModalDatasetLoader
-    dataset, corpus_dict = load_datasets(data_dir_list, concatenate=True)
+    hf_uris = [p for p in data_dir_list if p.startswith(_HF_PREFIX)]
+    local_paths = [p for p in data_dir_list if not p.startswith(_HF_PREFIX)]
+
+    logging.info(f"Loading data from {len(data_dir_list)} source(s) ({len(hf_uris)} HF, {len(local_paths)} local)")
+
+    datasets_list = []
+    corpus_dict: dict = {}
+
+    if hf_uris:
+        hf_dataset, hf_corpus = _load_hf_sources(hf_uris)
+        datasets_list.append(hf_dataset)
+        corpus_dict.update(hf_corpus)
+
+    if local_paths:
+        local_dataset, local_corpus = load_datasets(local_paths, concatenate=True)
+        datasets_list.append(local_dataset)
+        for cid, cinfo in local_corpus.items():
+            if cid in corpus_dict and corpus_dict[cid].path != cinfo.path:
+                raise ValueError(
+                    f"Duplicate corpus_id '{cid}' with different paths: {corpus_dict[cid].path} vs {cinfo.path}"
+                )
+            corpus_dict[cid] = cinfo
+
+    dataset = concatenate_datasets(datasets_list) if len(datasets_list) > 1 else datasets_list[0]
 
     logging.info(f"Loaded dataset with {len(dataset)} examples")
 
@@ -413,7 +640,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Load and transform dataset to retrieval format")
     parser.add_argument(
-        "--data_dir_list", type=str, nargs="+", required=True, help="Path(s) to JSON file(s) containing training data"
+        "--data_dir_list",
+        type=str,
+        nargs="+",
+        required=True,
+        help="Path(s) to JSON file(s) or hf:// URIs",
     )
     parser.add_argument(
         "--data_type", type=str, default="train", choices=["train", "eval"], help="Type of data (train or eval)"
