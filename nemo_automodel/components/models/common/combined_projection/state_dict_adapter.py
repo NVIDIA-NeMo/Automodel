@@ -75,31 +75,58 @@ class CombinedProjectionStateDictAdapter:
         self.kv_size = self.num_key_value_heads * self.head_dim
         self.group_size = self.num_attention_heads // self.num_key_value_heads
 
+    # ── 1-D bias DTensor helpers ──────────────────────────────────────────
+    #
+    # Why 2-D weights are fine:
+    #   TP shards on column dim and FSDP on the other, so reshape/split/cat
+    #   along the interleave axis stays within each shard—no gather needed.
+    #
+    # Why 1-D biases need special handling:
+    #   Biases only have dim-0, which FSDP shards with Shard(0).  The
+    #   interleaved KV-head layout may not divide evenly across shards,
+    #   so we must all-gather before reshape and redistribute afterwards.
+    #   Communication cost is negligible since bias tensors are tiny
+    #   (e.g. hidden_size elements).
+    #
+    # The two helpers form a pair:
+    #   _gather_1d_bias  – all-gather to Replicate so reshape/split/cat work
+    #   _restore_1d_bias – redistribute back to the original Shard(0)
+
     @staticmethod
-    def _gather_1d_if_needed(tensor: torch.Tensor, divisor: int) -> torch.Tensor:
-        """Gather a 1-D DTensor on dim 0 when the local shard isn't divisible by *divisor*.
+    def _gather_1d_bias(tensor: torch.Tensor) -> tuple[torch.Tensor, tuple | None]:
+        """All-gather a 1-D bias DTensor to ``Replicate``.
 
-        FSDP2's ``shard_placement_fn`` only accepts ``Shard`` placements (not
-        ``Replicate``), so 1-D bias vectors of combined projections end up with
-        ``Shard(0)`` even though their interleaved layout may not divide evenly
-        across the FSDP shard count.  This helper gathers such biases to full
-        before reshape / split operations in the state-dict adapter.
-
-        Weights are handled by FSDP ``Shard(1)``, so they never need this.
+        Must only be called on 1-D bias tensors.  Returns
+        ``(gathered, orig_placement)`` where *orig_placement* is a
+        ``(device_mesh, placements)`` tuple that ``_restore_1d_bias`` accepts,
+        or ``None`` when the tensor is a plain (non-DTensor) bias.
         """
-        if tensor.ndim != 1:
-            return tensor
+        assert tensor.ndim == 1, f"_gather_1d_bias expects a 1-D bias tensor, got ndim={tensor.ndim}"
         try:
             from torch.distributed.tensor import DTensor
             from torch.distributed.tensor.placement_types import Replicate, Shard
         except ImportError:
-            return tensor
+            return tensor, None
         if not isinstance(tensor, DTensor):
-            return tensor
-        if tensor.to_local().shape[0] % divisor == 0:
-            return tensor
+            return tensor, None
+        orig = (tensor.device_mesh, tensor.placements)
         new_placements = tuple(Replicate() if isinstance(p, Shard) and p.dim == 0 else p for p in tensor.placements)
-        return tensor.redistribute(tensor.device_mesh, new_placements)
+        if new_placements == tensor.placements:
+            return tensor, orig
+        return tensor.redistribute(tensor.device_mesh, new_placements), orig
+
+    @staticmethod
+    def _restore_1d_bias(tensor: torch.Tensor, orig_placement: tuple | None) -> torch.Tensor:
+        """Redistribute a 1-D bias back to the placement saved by ``_gather_1d_bias``.
+
+        No-op when *orig_placement* is ``None`` (plain non-DTensor bias).
+        """
+        assert tensor.ndim == 1, f"_restore_1d_bias expects a 1-D bias tensor, got ndim={tensor.ndim}"
+        if orig_placement is None:
+            return tensor
+        return tensor.redistribute(*orig_placement)
+
+    # ── Interleave / de-interleave ──────────────────────────────────────
 
     def _interleave_qkv(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """Interleave Q, K, V by KV-head groups for TP-correct ColwiseParallel sharding.
@@ -108,9 +135,6 @@ class CombinedProjectionStateDictAdapter:
         where each group has (group_size * head_dim) Q rows, head_dim K rows, head_dim V rows.
         """
         q_group_width = self.group_size * self.head_dim
-        q = self._gather_1d_if_needed(q, q_group_width)
-        k = self._gather_1d_if_needed(k, self.head_dim)
-        v = self._gather_1d_if_needed(v, self.head_dim)
         rest = q.shape[1:]
         q = q.reshape(self.num_key_value_heads, q_group_width, *rest)
         k = k.reshape(self.num_key_value_heads, self.head_dim, *rest)
@@ -118,14 +142,8 @@ class CombinedProjectionStateDictAdapter:
         return torch.cat([q, k, v], dim=1).reshape(-1, *rest)
 
     def _deinterleave_qkv(self, qkv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """De-interleave QKV from KV-head-grouped layout back to separate Q, K, V.
-
-        Works for full (unsharded), TP-sharded, and FSDP-sharded tensors.
-        When the tensor is a DTensor whose dim-0 local shard doesn't align with
-        the QKV group boundary, the tensor is gathered to full first.
-        """
+        """De-interleave QKV from KV-head-grouped layout back to separate Q, K, V."""
         group_width = (self.group_size + 2) * self.head_dim
-        qkv = self._gather_1d_if_needed(qkv, group_width)
         rest = qkv.shape[1:]
         qkv = qkv.reshape(-1, group_width, *rest)
         q, k, v = qkv.split([self.group_size * self.head_dim, self.head_dim, self.head_dim], dim=1)
@@ -137,7 +155,6 @@ class CombinedProjectionStateDictAdapter:
 
     def _deinterleave_gate_up(self, gate_up: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """De-interleave gate/up from row-interleaved layout."""
-        gate_up = self._gather_1d_if_needed(gate_up, 2)
         rest = gate_up.shape[1:]
         gate_up = gate_up.reshape(-1, 2, *rest)
         return gate_up[:, 0].contiguous(), gate_up[:, 1].contiguous()
@@ -188,9 +205,10 @@ class CombinedProjectionStateDictAdapter:
                     k_bias_key = f"{prefix}.self_attn.k_proj.bias"
                     v_bias_key = f"{prefix}.self_attn.v_proj.bias"
 
-                    qkv_bias = self._interleave_qkv(
-                        hf_state_dict[q_bias_key], hf_state_dict[k_bias_key], hf_state_dict[v_bias_key]
-                    )
+                    q_bias, orig = self._gather_1d_bias(hf_state_dict[q_bias_key])
+                    k_bias, _ = self._gather_1d_bias(hf_state_dict[k_bias_key])
+                    v_bias, _ = self._gather_1d_bias(hf_state_dict[v_bias_key])
+                    qkv_bias = self._restore_1d_bias(self._interleave_qkv(q_bias, k_bias, v_bias), orig)
                     custom_state_dict[f"{prefix}.self_attn.qkv_proj.bias"] = qkv_bias
                     processed_keys.update([q_bias_key, k_bias_key, v_bias_key])
 
@@ -211,7 +229,9 @@ class CombinedProjectionStateDictAdapter:
                 if gate_bias_key in hf_state_dict:
                     up_bias_key = f"{prefix}.mlp.up_proj.bias"
 
-                    gate_up_bias = self._interleave_gate_up(hf_state_dict[gate_bias_key], hf_state_dict[up_bias_key])
+                    gate_bias, orig = self._gather_1d_bias(hf_state_dict[gate_bias_key])
+                    up_bias, _ = self._gather_1d_bias(hf_state_dict[up_bias_key])
+                    gate_up_bias = self._restore_1d_bias(self._interleave_gate_up(gate_bias, up_bias), orig)
                     custom_state_dict[f"{prefix}.mlp.gate_up_proj.bias"] = gate_up_bias
                     processed_keys.update([gate_bias_key, up_bias_key])
 
@@ -224,9 +244,9 @@ class CombinedProjectionStateDictAdapter:
         # This is the reverse of _split_remaining_combined_projection_keys in to_hf().
         self._recombine_split_projection_keys(custom_state_dict)
 
-        # Handle tied weights: if lm_head.weight is missing but embed_tokens exists, tie them
-        # This is common in Qwen2 and Llama where lm_head shares weights with embeddings
-        # Only do this if config specifies tie_word_embeddings=True
+        # Handle tied weights: if lm_head.weight is missing but embed_tokens exists, tie them.
+        # to_hf() strips lm_head.weight for tied models so DCP doesn't corrupt the
+        # shared storage; re-add it here from the loaded embed_tokens tensor.
         if getattr(self.config, "tie_word_embeddings", True):
             embed_key = "model.embed_tokens.weight" if self._uses_model_prefix else "embed_tokens.weight"
             lm_head_key = "lm_head.weight"
@@ -282,11 +302,11 @@ class CombinedProjectionStateDictAdapter:
                 # Handle biases if present
                 qkv_bias_key = f"{prefix}.self_attn.qkv_proj.bias"
                 if qkv_bias_key in state_dict:
-                    q_bias, k_bias, v_bias = self._deinterleave_qkv(state_dict[qkv_bias_key])
-
-                    hf_state_dict[f"{prefix}.self_attn.q_proj.bias"] = q_bias
-                    hf_state_dict[f"{prefix}.self_attn.k_proj.bias"] = k_bias
-                    hf_state_dict[f"{prefix}.self_attn.v_proj.bias"] = v_bias
+                    qkv_bias, orig = self._gather_1d_bias(state_dict[qkv_bias_key])
+                    q_bias, k_bias, v_bias = self._deinterleave_qkv(qkv_bias)
+                    hf_state_dict[f"{prefix}.self_attn.q_proj.bias"] = self._restore_1d_bias(q_bias, orig)
+                    hf_state_dict[f"{prefix}.self_attn.k_proj.bias"] = self._restore_1d_bias(k_bias, orig)
+                    hf_state_dict[f"{prefix}.self_attn.v_proj.bias"] = self._restore_1d_bias(v_bias, orig)
                     processed_keys.add(qkv_bias_key)
 
             # Split gate_up_proj into separate gate and up
@@ -302,10 +322,10 @@ class CombinedProjectionStateDictAdapter:
                 # Handle biases if present
                 gate_up_bias_key = f"{prefix}.mlp.gate_up_proj.bias"
                 if gate_up_bias_key in state_dict:
-                    gate_bias, up_bias = self._deinterleave_gate_up(state_dict[gate_up_bias_key])
-
-                    hf_state_dict[f"{prefix}.mlp.gate_proj.bias"] = gate_bias
-                    hf_state_dict[f"{prefix}.mlp.up_proj.bias"] = up_bias
+                    gu_bias, orig = self._gather_1d_bias(state_dict[gate_up_bias_key])
+                    gate_bias, up_bias = self._deinterleave_gate_up(gu_bias)
+                    hf_state_dict[f"{prefix}.mlp.gate_proj.bias"] = self._restore_1d_bias(gate_bias, orig)
+                    hf_state_dict[f"{prefix}.mlp.up_proj.bias"] = self._restore_1d_bias(up_bias, orig)
                     processed_keys.add(gate_up_bias_key)
 
         # Copy all other weights that weren't processed
