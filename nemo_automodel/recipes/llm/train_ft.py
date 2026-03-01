@@ -86,6 +86,7 @@ from nemo_automodel.components.utils.model_utils import (
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
+from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -282,6 +283,13 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
         distributed_config: The distributed configuration.
         device_mesh: The device mesh.
     """
+    # Resolve dtype strings (e.g. "torch.bfloat16") to torch.dtype objects for
+    # optimizers like TE FusedAdam that accept dtype kwargs.
+    for attr in ("master_weight_dtype", "exp_avg_dtype", "exp_avg_sq_dtype"):
+        val = getattr(cfg_opt, attr, None)
+        if isinstance(val, str):
+            setattr(cfg_opt, attr, dtype_from_str(val))
+
     if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
         # TP does not support foreach
         cfg_opt.foreach = False
