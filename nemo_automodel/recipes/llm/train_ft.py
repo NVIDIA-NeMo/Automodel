@@ -1234,10 +1234,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
         )
         labels = batch.pop("labels")
-        # padding_mask is collater/CP metadata — not a model input.  MoE models
-        # derive it internally from attention_mask when padding_mask is absent,
-        # so it is safe (and necessary for HF models) to always strip it here.
-        batch.pop("padding_mask", None)
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
