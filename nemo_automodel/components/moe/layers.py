@@ -77,7 +77,9 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
                     for t, b in zip(
                         torch.split(
                             value.view(-1, shape[-1]),
-                            tokens_per_expert.tolist() if isinstance(tokens_per_expert, torch.Tensor) else tokens_per_expert,
+                            tokens_per_expert.tolist()
+                            if isinstance(tokens_per_expert, torch.Tensor)
+                            else tokens_per_expert,
                         ),
                         bias,
                     )
