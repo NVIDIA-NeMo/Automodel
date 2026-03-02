@@ -1682,12 +1682,12 @@ class TestRunTrainOptimStepSetsMoEScale:
         object.__setattr__(recipe, "timestamp", 0.0)
         return recipe
 
-    def test_pp_enabled_sets_scale_to_num_label_tokens(self, monkeypatch):
+    def test_pp_enabled_sets_scale_to_num_label_tokens_over_num_batches(self, monkeypatch):
         from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 
         recipe = self._make_recipe(monkeypatch, pp_enabled=True, dp_group_size=4)
 
-        # 3 valid labels out of 4
+        # 3 valid labels out of 4, single microbatch
         batches = [{"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[1, 2, 3, -100]])}]
 
         # Mock PP loss reporting path
@@ -1697,9 +1697,10 @@ class TestRunTrainOptimStepSetsMoEScale:
         recipe._run_train_optim_step(batches)
 
         assert MoEAuxLossAutoScaler.main_loss_backward_scale is not None
+        # num_label_tokens=3, num_batches=1 → 3.0/1 = 3.0
         assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(3.0)
 
-    def test_pp_disabled_sets_scale_to_dp_group_size(self, monkeypatch):
+    def test_pp_disabled_sets_scale_to_dp_group_size_over_num_batches(self, monkeypatch):
         from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 
         dp_size = 8
@@ -1710,4 +1711,23 @@ class TestRunTrainOptimStepSetsMoEScale:
         recipe._run_train_optim_step(batches)
 
         assert MoEAuxLossAutoScaler.main_loss_backward_scale is not None
+        # dp_size=8, num_batches=1 → 8.0/1 = 8.0
         assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(float(dp_size))
+
+    def test_scale_divides_by_num_microbatches(self, monkeypatch):
+        from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+
+        dp_size = 4
+        recipe = self._make_recipe(monkeypatch, pp_enabled=False, dp_group_size=dp_size)
+
+        # 2 microbatches (gradient accumulation)
+        batches = [
+            {"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[1, 2, 3, -100]])},
+            {"input_ids": torch.tensor([[5, 6, 7, 8]]), "labels": torch.tensor([[5, 6, -100, -100]])},
+        ]
+
+        recipe._run_train_optim_step(batches)
+
+        assert MoEAuxLossAutoScaler.main_loss_backward_scale is not None
+        # dp_size=4, num_batches=2 → 4.0/2 = 2.0
+        assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(2.0)
