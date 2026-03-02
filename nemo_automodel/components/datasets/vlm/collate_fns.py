@@ -121,9 +121,7 @@ def build_labels(
                     add_special_tokens=False,
                     return_tensors="pt",
                 )["input_ids"][0].to(encoded.device)
-                answer_start, answer_end = _find_pattern_indices(
-                    encoded, assistant_tokens, search_start_index
-                )
+                answer_start, answer_end = _find_pattern_indices(encoded, assistant_tokens, search_start_index)
 
             if answer_end < len(encoded):
                 next_token_id = int(encoded[answer_end].item())
