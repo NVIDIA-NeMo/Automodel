@@ -113,6 +113,18 @@ def build_labels(
 
             answer_start, answer_end = _find_pattern_indices(encoded, assistant_tokens, search_start_index)
 
+            # handle tokenizers that can produce different tokens for text with leading
+            # whitespace when tokenized standalone vs in-context
+            if answer_start < 0 and assistant_text != assistant_text.lstrip():
+                assistant_tokens = tokenizer(
+                    assistant_text.lstrip(),
+                    add_special_tokens=False,
+                    return_tensors="pt",
+                )["input_ids"][0].to(encoded.device)
+                answer_start, answer_end = _find_pattern_indices(
+                    encoded, assistant_tokens, search_start_index
+                )
+
             if answer_end < len(encoded):
                 next_token_id = int(encoded[answer_end].item())
                 next_token_str = _decode_single_token(tokenizer, next_token_id)
