@@ -170,15 +170,22 @@ def _create_fsdp2_device_mesh(
     if dp_replicate_size is None or dp_replicate_size <= 0:
         dp_replicate_size = 1
 
-    # HSDP usecase: dp_size = dp_replicate_size * dp_shard_size
-    assert dp_size % dp_replicate_size == 0, "dp_size must be a multiple of dp_replicate_size"
-    assert dp_replicate_size < dp_size or dp_replicate_size == 1, (
-        "dp_replicate_size must be less than dp_size since ddp usecase is not supported by FSDP2"
-    )
+    if dp_size % dp_replicate_size != 0:
+        raise ValueError(
+            f"dp_size ({dp_size}) must be a multiple of dp_replicate_size ({dp_replicate_size})."
+        )
+    if dp_replicate_size > 1 and dp_replicate_size >= dp_size:
+        raise ValueError(
+            f"dp_replicate_size ({dp_replicate_size}) must be less than dp_size ({dp_size}); "
+            f"pure DDP replication is not supported by FSDP2."
+        )
 
-    # Expert parallelism calculations
     dp_cp_size = dp_size * cp_size
-    assert dp_cp_size % ep_size == 0, f"{dp_cp_size=} must be a multiple of {ep_size=}"
+    if dp_cp_size % ep_size != 0:
+        raise ValueError(
+            f"(dp_size * cp_size) = {dp_size} * {cp_size} = {dp_cp_size} "
+            f"must be a multiple of ep_size ({ep_size})."
+        )
     if ep_size < dp_cp_size:
         ep_shard_size = dp_cp_size // ep_size
     else:
@@ -196,8 +203,10 @@ def _create_fsdp2_device_mesh(
         MeshAxisName.TP,
     )
     for shape, name in zip(mesh_shape, mesh_names):
-        assert isinstance(shape, int), f"Expected {name} to be an int, but got {type(shape)}"
-        assert shape > 0, f"Expected {name} > 0, got {shape}"
+        if not isinstance(shape, int):
+            raise TypeError(f"Expected {name} to be an int, got {type(shape).__name__}")
+        if shape <= 0:
+            raise ValueError(f"Expected {name} > 0, got {shape}")
 
     device_mesh = init_device_mesh(
         device_type="cuda" if backend == "nccl" else "cpu",
@@ -282,8 +291,10 @@ def _create_megatron_fsdp_device_mesh(
     mesh_shape = (dp_size, cp_size, tp_size)
     mesh_names = (MeshAxisName.DP, MeshAxisName.CP, MeshAxisName.TP)
     for shape, name in zip(mesh_shape, mesh_names):
-        assert isinstance(shape, int), f"Expected {name} to be an int, but got {type(shape)}"
-        assert shape > 0, f"Expected {name} > 0, got {shape}"
+        if not isinstance(shape, int):
+            raise TypeError(f"Expected {name} to be an int, got {type(shape).__name__}")
+        if shape <= 0:
+            raise ValueError(f"Expected {name} > 0, got {shape}")
 
     # Build mesh [dp, cp, tp]
     device_mesh = init_device_mesh(
@@ -323,8 +334,10 @@ def _create_moe_mesh(
     mesh_shape = (pp_size, ep_shard_size, ep_size)
     mesh_names = (MeshAxisName.PP, MeshAxisName.EP_SHARD, MeshAxisName.EP)
     for shape, name in zip(mesh_shape, mesh_names):
-        assert isinstance(shape, int), f"Expected {name} to be an int, but got {type(shape)}"
-        assert shape > 0, f"Expected {name} > 0, got {shape}"
+        if not isinstance(shape, int):
+            raise TypeError(f"Expected {name} to be an int, got {type(shape).__name__}")
+        if shape <= 0:
+            raise ValueError(f"Expected {name} > 0, got {shape}")
 
     moe_mesh = init_device_mesh(
         device_type="cuda" if backend == "nccl" else "cpu",
