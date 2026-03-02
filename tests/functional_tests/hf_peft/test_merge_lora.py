@@ -262,8 +262,8 @@ class TestDenseLoRAMerge:
 
         log_p = torch.nn.functional.log_softmax(merged_logits, dim=-1)
         q = torch.nn.functional.softmax(ref_logits, dim=-1)
-        kl = torch.nn.functional.kl_div(log_p, q, reduction="batchmean", log_target=False)
-        print(f"KL divergence: {kl.item():.5e}")
+        kl = torch.nn.functional.kl_div(log_p, q, reduction="none", log_target=False)
+        kl = kl.sum(-1).view(-1).max()
         assert kl.item() < 1e-6, f"KL divergence too high: {kl.item():.3e}"
 
     def test_cli_invocation(self):
@@ -512,8 +512,8 @@ class TestMoELoRAMerge:
 
         log_p = torch.nn.functional.log_softmax(merged_logits, dim=-1)
         q = torch.nn.functional.softmax(ref_logits, dim=-1)
-        kl = torch.nn.functional.kl_div(log_p, q, reduction="batchmean", log_target=False)
-
+        kl = torch.nn.functional.kl_div(log_p, q, reduction="none", log_target=False)
+        kl = kl.sum(-1).view(-1).max()
         assert kl.item() < 1e-6, f"KL divergence too high: {kl.item():.3e}"
 
     def test_round_trip_grouped_to_hf_and_back(self):
