@@ -52,7 +52,6 @@ import gc
 import json
 import logging
 import os
-import sys
 
 import torch
 
@@ -83,9 +82,7 @@ def dequantize_model(model, dtype=torch.float16, device="cpu"):
                 logger.info("Dequantizing %s", name)
                 quant_state = copy.deepcopy(module.weight.quant_state)
                 quant_state[2] = dtype
-                weights = dequantize_4bit(
-                    module.weight.data, quant_state=quant_state, quant_type="nf4"
-                ).to(dtype)
+                weights = dequantize_4bit(module.weight.data, quant_state=quant_state, quant_type="nf4").to(dtype)
 
                 new_module = torch.nn.Linear(
                     module.in_features, module.out_features, bias=module.bias is not None, dtype=dtype
@@ -198,9 +195,7 @@ def merge_lora(
 
     if save_tokenizer:
         try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                base_model, trust_remote_code=trust_remote_code
-            )
+            tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=trust_remote_code)
             tokenizer.save_pretrained(output_dir)
             logger.info("Tokenizer saved to %s", output_dir)
         except Exception as e:
@@ -215,9 +210,7 @@ def merge_lora(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Merge a LoRA / QLoRA adapter into a HuggingFace base model."
-    )
+    parser = argparse.ArgumentParser(description="Merge a LoRA / QLoRA adapter into a HuggingFace base model.")
     parser.add_argument(
         "--base-model",
         "-m",
