@@ -1086,7 +1086,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         moe_metrics_cfg = self.cfg.get("moe_metrics", None)
         mode = moe_metrics_cfg.get("mode", "brief") if moe_metrics_cfg else "brief"
-        top_k = moe_metrics_cfg.get("top_k_experts", 5) if moe_metrics_cfg else 5
+        top_k = moe_metrics_cfg.get("top_k_experts", 0) if moe_metrics_cfg else 0
         if mode == "detailed":
             detailed_every = moe_metrics_cfg.get("detailed_every_steps", None) if moe_metrics_cfg else None
             if detailed_every is None or step % detailed_every == 0:
