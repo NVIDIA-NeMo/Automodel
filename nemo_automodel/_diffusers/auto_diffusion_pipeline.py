@@ -49,8 +49,10 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.distributed import parallelizer
+from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.distributed.ddp import DDPManager
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
 from nemo_automodel.components.distributed.parallelizer import (
     HunyuanParallelizationStrategy,
     WanParallelizationStrategy,
@@ -208,14 +210,33 @@ def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
     """
     Factory function to create the appropriate parallel manager based on config.
 
-    The manager type is determined by the '_manager_type' key in manager_args:
-    - 'ddp': Creates a DDPManager for standard Distributed Data Parallel
-    - 'fsdp2' (default): Creates an FSDP2Manager for Fully Sharded Data Parallel
+    Constructs the proper config objects (FSDP2Config / DDPConfig) and, for FSDP2,
+    creates the required device mesh before instantiating the manager.  This mirrors
+    the pattern used by ``_instantiate_distributed`` in the transformers infrastructure.
+
+    The manager type is determined by the ``_manager_type`` key in *manager_args*:
+    - ``'ddp'``: Creates :class:`DDPConfig` + :class:`DDPManager`
+    - ``'fsdp2'`` (default): Creates :class:`FSDP2Config`, builds a
+      :class:`DeviceMesh` via :func:`create_device_mesh`, then creates
+      :class:`FSDP2Manager`
 
     Args:
-        manager_args: Dictionary of arguments for the manager. Must include '_manager_type'
-                     key to specify which manager to create. The '_manager_type' key is
-                     removed before passing args to the manager constructor.
+        manager_args: Flat dictionary of arguments.  Recognised keys:
+
+            Common:
+                ``_manager_type`` (str): ``'fsdp2'`` or ``'ddp'``.
+                ``activation_checkpointing`` (bool): Enable activation checkpointing.
+                ``backend`` (str): Distributed backend (default ``'nccl'``).
+
+            FSDP2-specific (mesh creation):
+                ``world_size`` (int): Total number of processes.
+                ``dp_size``, ``dp_replicate_size``, ``tp_size``, ``cp_size``,
+                ``pp_size``, ``ep_size`` (int): Parallelism dimensions.
+
+            FSDP2-specific (config):
+                ``mp_policy``: :class:`MixedPrecisionPolicy` instance.
+                ``sequence_parallel`` (bool), ``tp_plan`` (dict),
+                ``offload_policy``, ``defer_fsdp_grad_sync`` (bool).
 
     Returns:
         Either an FSDP2Manager or DDPManager instance.
@@ -223,16 +244,43 @@ def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
     Raises:
         ValueError: If an unknown manager type is specified.
     """
-    # Make a copy to avoid modifying the original dict
     args = manager_args.copy()
     manager_type = args.pop("_manager_type", "fsdp2").lower()
 
     if manager_type == "ddp":
-        logger.info("[Parallel] Creating DDPManager with args: %s", args)
-        return DDPManager(**args)
+        config = DDPConfig(
+            activation_checkpointing=args.get("activation_checkpointing", False),
+            backend=args.get("backend", "nccl"),
+        )
+        logger.info("[Parallel] Creating DDPManager with config: %s", config)
+        return DDPManager(config)
+
     elif manager_type == "fsdp2":
-        logger.info("[Parallel] Creating FSDP2Manager with args: %s", args)
-        return FSDP2Manager(**args)
+        config = FSDP2Config(
+            activation_checkpointing=args.get("activation_checkpointing", False),
+            mp_policy=args.get("mp_policy", None),
+            backend=args.get("backend", "nccl"),
+            sequence_parallel=args.get("sequence_parallel", False),
+            tp_plan=args.get("tp_plan", None),
+            offload_policy=args.get("offload_policy", None),
+            defer_fsdp_grad_sync=args.get("defer_fsdp_grad_sync", True),
+        )
+
+        world_size = args.get("world_size") or torch.distributed.get_world_size()
+        device_mesh, moe_mesh = create_device_mesh(
+            config,
+            dp_size=args.get("dp_size"),
+            dp_replicate_size=args.get("dp_replicate_size"),
+            tp_size=args.get("tp_size", 1),
+            pp_size=args.get("pp_size", 1),
+            cp_size=args.get("cp_size", 1),
+            ep_size=args.get("ep_size", 1),
+            world_size=world_size,
+        )
+
+        logger.info("[Parallel] Creating FSDP2Manager with config: %s", config)
+        return FSDP2Manager(config, device_mesh=device_mesh, moe_mesh=moe_mesh)
+
     else:
         raise ValueError(f"Unknown manager type: '{manager_type}'. Expected 'ddp' or 'fsdp2'.")
 

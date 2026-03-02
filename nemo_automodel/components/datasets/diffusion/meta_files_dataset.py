@@ -253,4 +253,9 @@ def create_dataloader(
     batch_size: int,
     num_nodes: int,
 ) -> Tuple[DataLoader, Optional[DistributedSampler]]:
-    return build_dataloader(meta_folder=meta_folder, batch_size=batch_size, num_nodes=num_nodes)
+    return build_dataloader(
+        meta_folder=meta_folder,
+        batch_size=batch_size,
+        dp_rank=0,
+        dp_world_size=num_nodes,
+    )

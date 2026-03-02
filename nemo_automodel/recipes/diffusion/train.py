@@ -106,19 +106,27 @@ def build_model_and_optimizer(
         fsdp_cfg = fsdp_cfg or {}
         logging.info("[INFO] Using FSDP2 (Fully Sharded Data Parallel) for training")
 
-        dp_size = fsdp_cfg.get("dp_size", None)
-
+        dp_size = fsdp_cfg.get("dp_size")
+        tp_size = fsdp_cfg.get("tp_size", 1)
+        cp_size = fsdp_cfg.get("cp_size", 1)
+        pp_size = fsdp_cfg.get("pp_size", 1)
+        
         if dp_size is None:
-            denom = max(1, fsdp_cfg.get("tp_size", 1) * fsdp_cfg.get("cp_size", 1) * fsdp_cfg.get("pp_size", 1))
-            dp_size = max(1, world_size // denom)
+            denom = tp_size * cp_size * pp_size
+            if world_size % denom != 0:
+                raise ValueError(
+                    f"world_size ({world_size}) must be divisible by "
+                    f"tp_size*cp_size*pp_size ({tp_size}*{cp_size}*{pp_size}={denom})"
+                )
+            dp_size = world_size // denom
 
         manager_args: Dict[str, Any] = {
             "_manager_type": "fsdp2",
-            "dp_size": fsdp_cfg.get("dp_size", None),
+            "dp_size": dp_size,
             "dp_replicate_size": fsdp_cfg.get("dp_replicate_size", None),
-            "tp_size": fsdp_cfg.get("tp_size", 1),
-            "cp_size": fsdp_cfg.get("cp_size", 1),
-            "pp_size": fsdp_cfg.get("pp_size", 1),
+            "tp_size": tp_size,
+            "cp_size": cp_size,
+            "pp_size": pp_size,
             "backend": "nccl",
             "world_size": world_size,
             "use_hf_tp_plan": fsdp_cfg.get("use_hf_tp_plan", False),
