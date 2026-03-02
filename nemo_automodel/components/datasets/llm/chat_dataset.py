@@ -58,9 +58,11 @@ def _load_openai_messages(
 ):
     """Load OpenAI chat messages datasets from HF or local JSON/JSONL files.
 
-    For HF repo IDs, we delegate to datasets.load_dataset.  The full base
-    split is loaded and shuffled *before* any slice (e.g. ``[1024:]``) is
-    applied so that train/val splits sample from a consistent random order.
+    For HF repo IDs, we delegate to datasets.load_dataset.  When *split*
+    is provided, the full base split is loaded and shuffled *before* any
+    slice (e.g. ``[1024:]``) is applied so that train/val splits sample
+    from a consistent random order.  When *split* is ``None`` it is passed
+    through to ``load_dataset`` as-is (no default override).
 
     For local files, we manually parse JSONL/JSON to avoid pyarrow type
     inference issues (e.g., heterogeneous field types under `tools`).
@@ -74,14 +76,15 @@ def _load_openai_messages(
     """
     if isinstance(path_or_dataset_id, str) and _is_hf_repo_id(path_or_dataset_id):
         # Parse split string: "train[1024:]" -> base="train", slice(1024, None)
-        base_split = split or "train"
+        base_split = split
         sl = None
-        match = _SPLIT_SLICE_RE.match(base_split)
-        if match:
-            base_split = match.group(1)
-            start = int(match.group(2)) if match.group(2) else None
-            end = int(match.group(3)) if match.group(3) else None
-            sl = slice(start, end)
+        if split is not None:
+            match = _SPLIT_SLICE_RE.match(split)
+            if match:
+                base_split = match.group(1)
+                start = int(match.group(2)) if match.group(2) else None
+                end = int(match.group(3)) if match.group(3) else None
+                sl = slice(start, end)
 
         dataset = load_dataset(
             path_or_dataset_id,
