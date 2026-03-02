@@ -86,8 +86,14 @@ def test_llama_bidirectional_model_init_and_mask():
     assert all(getattr(layer.self_attn, "is_causal", True) is False for layer in model.layers)
     mask = torch.tensor([[1, 1, 0]])
     out_mask = model._update_causal_mask(mask)
-    assert out_mask is mask
-    assert model._update_causal_mask(torch.ones_like(mask)) is None
+    # _update_causal_mask returns a 4D additive attention mask (0 for keep, -inf for masked)
+    assert out_mask.shape == (1, 1, 3, 3)
+    assert torch.allclose(out_mask[0, 0, :, :2], torch.zeros(3, 2, dtype=out_mask.dtype))
+    assert torch.all(out_mask[0, 0, :, 2] < 0)
+
+    out_mask_all_ones = model._update_causal_mask(torch.ones_like(mask))
+    assert out_mask_all_ones.shape == (1, 1, 3, 3)
+    assert torch.allclose(out_mask_all_ones, torch.zeros_like(out_mask_all_ones))
 
 
 # --- Fakes for classification and biencoder tests ---
