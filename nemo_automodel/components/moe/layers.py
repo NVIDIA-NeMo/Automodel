@@ -516,37 +516,6 @@ class GroupedExpertsDeepEP(nn.Module):
         down_projs (nn.Parameter): Linear layer for hidden-to-output transformation.
     """
 
-    @staticmethod
-    def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
-        if bias is None:
-            return value
-        shape = value.shape
-        if permuted_probs is not None:
-            output = (
-                torch.cat(
-                    [
-                        t + b * p
-                        for t, b, p in zip(
-                            torch.split(value.view(-1, shape[-1]), tokens_per_expert.tolist()),
-                            bias,
-                            torch.split(permuted_probs, tokens_per_expert.tolist()),
-                        )
-                    ]
-                )
-                .view(shape)
-                .to(value.dtype)
-            )
-        else:
-            output = (
-                torch.cat(
-                    [t + b for t, b in zip(torch.split(value.view(-1, shape[-1]), tokens_per_expert.tolist()), bias)]
-                )
-                .view(shape)
-                .to(value.dtype)
-            )
-
-        return output
-
     def __init__(self, config: MoEConfig, backend=None):
         """
         Initializes the GroupedExperts module.
@@ -682,14 +651,14 @@ class GroupedExpertsDeepEP(nn.Module):
 
                 if self.expert_bias:
                     gate_up_proj_bias = self.gate_up_proj_bias.to_local()
-                    output1 = self._apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
+                    output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
 
                 output1 = self.expert_activation(output1, permuted_probs)
                 output2 = ops.gmm(output1, down_projs, tokens_per_expert, trans_b=False)
 
                 if self.expert_bias:
                     down_bias = self.down_proj_bias.to_local()
-                    output2 = self._apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
+                    output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
         else:
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
             output1_ = self.expert_activation(output1, permuted_probs)
