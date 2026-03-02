@@ -267,6 +267,7 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
         "lora_A_init": "xavier",
         "lora_dtype": None,
         "match_all_linear": True,
+        "moe_rank_scaling": False,
         "target_modules": [],
         "use_dora": False,
         "use_triton": False,

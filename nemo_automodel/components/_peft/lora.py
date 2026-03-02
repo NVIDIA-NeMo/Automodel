@@ -21,14 +21,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components._peft.lora_kernel import (
     lora_da_dx_update_wrapper,
     lora_db_update_wrapper,
     lora_forward_wrapper,
 )
-from nemo_automodel.components._peft.lora_moe import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components._peft.module_matcher import ModuleMatcher
-from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP
+from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.shared.import_utils import safe_import, safe_import_te
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -52,6 +52,7 @@ class PeftConfig:
     lora_A_init: str = "xavier"
     lora_dtype: Optional[torch.dtype] = None
     use_triton: bool = False
+    moe_rank_scaling: bool = False
 
     def to_dict(self):
         return self.__dict__.copy()
@@ -70,6 +71,7 @@ class PeftConfig:
             lora_A_init=d.get("lora_A_init", "xavier"),
             lora_dtype=d.get("lora_dtype", None),
             use_triton=d.get("use_triton", False),
+            moe_rank_scaling=d.get("moe_rank_scaling", False),
         )
 
 
@@ -437,7 +439,9 @@ def patch_moe_module(
     Returns:
         nn.Module: The LoRA-wrapped MoE module (GroupedExpertsLoRA or GroupedExpertsDeepEPLoRA).
     """
-    if isinstance(orig_module, GroupedExpertsDeepEP):
+    if isinstance(orig_module, GroupedExpertsTE):
+        raise NotImplementedError("LoRA is not supported for Transformer Engine (TE) expert modules.")
+    elif isinstance(orig_module, GroupedExpertsDeepEP):
         new_module = GroupedExpertsDeepEPLoRA(
             orig_module,
             lora_dim=dim,
@@ -504,7 +508,7 @@ def apply_lora_to_linear_modules(
     )
     num_modules_matched = 0
     for name, module in list(model.named_modules()):
-        if isinstance(module, (GroupedExperts, GroupedExpertsDeepEP)):
+        if isinstance(module, (GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE)):
             if matcher.match(module, name):
                 if peft_config.use_dora:
                     raise NotImplementedError("DoRA is not supported for MoE expert modules in Automodel yet.")
@@ -513,10 +517,29 @@ def apply_lora_to_linear_modules(
                 if quantization_config is not None and lora_dtype is None:
                     lora_dtype = quantization_config.bnb_4bit_compute_dtype or torch.bfloat16
 
+                # Compute effective LoRA rank for MoE modules
+                moe_dim = peft_config.dim
+                if peft_config.moe_rank_scaling:
+                    n_act = module.config.n_activated_experts
+                    moe_dim = peft_config.dim // n_act
+                    if moe_dim < 1:
+                        raise ValueError(
+                            f"moe_rank_scaling: dim={peft_config.dim} // n_activated_experts={n_act} "
+                            f"gives rank {moe_dim}. Increase dim to at least n_activated_experts."
+                        )
+                    if peft_config.dim % n_act != 0:
+                        logger.warning(
+                            "moe_rank_scaling: dim=%d is not evenly divisible by n_activated_experts=%d; "
+                            "using floor division rank=%d.",
+                            peft_config.dim,
+                            n_act,
+                            moe_dim,
+                        )
+
                 # Replace the module in the model
                 new_module = patch_moe_module(
                     module,
-                    dim=peft_config.dim,
+                    dim=moe_dim,
                     alpha=peft_config.alpha,
                     lora_A_init_method=peft_config.lora_A_init,
                     lora_dtype=lora_dtype,
