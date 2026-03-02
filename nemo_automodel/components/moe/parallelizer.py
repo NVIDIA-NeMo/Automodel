@@ -284,6 +284,10 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
             cp_comm_type=cp_comm_type,
         )
 
+        moe_module = block.moe if hasattr(block, "moe") else block.mlp
+        if isinstance(moe_module, MoE):
+            moe_module.cp_mesh = cp_mesh
+
 
 def parallelize_model(
     model: torch.nn.Module,
