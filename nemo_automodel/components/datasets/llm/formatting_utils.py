@@ -153,8 +153,8 @@ def _package_tokenized_example(
     labels = input_ids.copy()
     input_ids = input_ids[:-1]
     # Compute content length before any padding so the attention mask is correct
-    # even when input_ids arrive already padded (e.g. from apply_chat_template
-    # with padding="max_length").
+    # even when input_ids arrive already padded (e.g. from tokenizer() with
+    # padding="max_length" in format_prompt_response_example).
     content_length = len(input_ids)
     if pad_token_id is not None and content_length > 0:
         # Strip trailing pad tokens to find real content length.
