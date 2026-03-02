@@ -110,7 +110,7 @@ def build_model_and_optimizer(
         tp_size = fsdp_cfg.get("tp_size", 1)
         cp_size = fsdp_cfg.get("cp_size", 1)
         pp_size = fsdp_cfg.get("pp_size", 1)
-        
+
         if dp_size is None:
             denom = tp_size * cp_size * pp_size
             if world_size % denom != 0:
