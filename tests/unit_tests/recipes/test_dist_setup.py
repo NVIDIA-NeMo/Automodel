@@ -493,3 +493,38 @@ class TestValidateNumGpusErrors:
             validate_num_gpus(
                 world_size=8, tp_size=-1, pp_size=1, cp_size=1, ep_size=1, dp_size=None, dp_replicate_size=None
             )
+
+    # -- total-product-of-axes checks ----------------------------------------
+
+    def test_all_axes_product_exceeds_world_size(self):
+        """tp * pp * cp * dp = 2 * 2 * 2 * 4 = 32 ≠ 16 GPUs."""
+        with pytest.raises(ValueError, match="do not match"):
+            validate_num_gpus(
+                world_size=16, tp_size=2, pp_size=2, cp_size=2, ep_size=1, dp_size=4, dp_replicate_size=None
+            )
+
+    def test_all_axes_product_less_than_world_size(self):
+        """tp * pp * cp * dp = 2 * 2 * 1 * 1 = 4 ≠ 8 GPUs."""
+        with pytest.raises(ValueError, match="do not match"):
+            validate_num_gpus(
+                world_size=8, tp_size=2, pp_size=2, cp_size=1, ep_size=1, dp_size=1, dp_replicate_size=None
+            )
+
+    def test_all_axes_product_matches_world_size(self):
+        """tp * pp * cp * dp = 2 * 2 * 2 * 2 = 16 == 16 GPUs — should pass."""
+        validate_num_gpus(
+            world_size=16, tp_size=2, pp_size=2, cp_size=2, ep_size=1, dp_size=2, dp_replicate_size=None
+        )
+
+    def test_all_axes_with_ep_product_matches(self):
+        """tp * pp * cp * dp = 2 * 2 * 2 * 4 = 32 GPUs, ep=4 divides dp*cp=8 — should pass."""
+        validate_num_gpus(
+            world_size=32, tp_size=2, pp_size=2, cp_size=2, ep_size=4, dp_size=4, dp_replicate_size=None
+        )
+
+    def test_all_axes_with_ep_product_mismatch(self):
+        """tp * pp * cp * dp = 2 * 2 * 2 * 4 = 32 ≠ 64 GPUs."""
+        with pytest.raises(ValueError, match="do not match"):
+            validate_num_gpus(
+                world_size=64, tp_size=2, pp_size=2, cp_size=2, ep_size=4, dp_size=4, dp_replicate_size=None
+            )
