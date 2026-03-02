@@ -233,6 +233,39 @@ class TestDenseLoRAMerge:
         for name, _ in merged_model.named_modules():
             assert "lora_" not in name, f"LoRA module {name} should be absent"
 
+    def test_merged_logits_kl_div_vs_unmerged(self):
+        """KL-div between merged model and adapter-applied model must be ~0."""
+        from peft import PeftModel
+        from tools.merge_lora import merge_lora
+        from transformers import AutoModelForCausalLM
+
+        output_dir = os.path.join(self.tmp_path, "merged_kl")
+        merge_lora(
+            base_model=self.base_model_path,
+            adapter_path=self.adapter_path,
+            output_dir=output_dir,
+            dtype="float32",
+            device="cpu",
+            save_tokenizer=False,
+        )
+        merged_model = AutoModelForCausalLM.from_pretrained(output_dir).eval()
+
+        base = AutoModelForCausalLM.from_pretrained(self.base_model_path)
+        ref_model = PeftModel.from_pretrained(base, self.adapter_path).eval()
+
+        torch.manual_seed(123)
+        input_ids = torch.randint(0, 256, (2, 32))
+
+        with torch.no_grad():
+            merged_logits = merged_model(input_ids).logits
+            ref_logits = ref_model(input_ids).logits
+
+        log_p = torch.nn.functional.log_softmax(merged_logits, dim=-1)
+        q = torch.nn.functional.softmax(ref_logits, dim=-1)
+        kl = torch.nn.functional.kl_div(log_p, q, reduction="batchmean", log_target=False)
+        print(f"KL divergence: {kl.item():.5e}")
+        assert kl.item() < 1e-6, f"KL divergence too high: {kl.item():.3e}"
+
     def test_cli_invocation(self):
         """Verify the tool works when invoked as a script."""
         output_dir = os.path.join(self.tmp_path, "merged_cli")
@@ -269,6 +302,9 @@ MOE_INTER_DIM = 128
 N_LAYERS = 2
 
 
+MOE_VOCAB_SIZE = 256
+
+
 class _Expert(nn.Module):
     def __init__(self):
         super().__init__()
@@ -276,12 +312,19 @@ class _Expert(nn.Module):
         self.up_proj = nn.Linear(MOE_DIM, MOE_INTER_DIM, bias=False)
         self.down_proj = nn.Linear(MOE_INTER_DIM, MOE_DIM, bias=False)
 
+    def forward(self, x):
+        return self.down_proj(torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
+
 
 class _HFStyleMoE(nn.Module):
     """Mimics an HF transformers MoE model with per-expert Linear layers."""
 
     def __init__(self):
         super().__init__()
+        from transformers import PretrainedConfig
+
+        self.config = PretrainedConfig(hidden_size=MOE_DIM)
+        self.embed_tokens = nn.Embedding(MOE_VOCAB_SIZE, MOE_DIM)
         self.layers = nn.ModuleList()
         for _ in range(N_LAYERS):
             layer = nn.Module()
@@ -289,6 +332,14 @@ class _HFStyleMoE(nn.Module):
             mlp.experts = nn.ModuleList([_Expert() for _ in range(N_EXPERTS)])
             layer.mlp = mlp
             self.layers.append(layer)
+        self.lm_head = nn.Linear(MOE_DIM, MOE_VOCAB_SIZE, bias=False)
+
+    def forward(self, input_ids, **kwargs):
+        x = self.embed_tokens(input_ids)
+        for layer in self.layers:
+            expert_out = torch.stack([e(x) for e in layer.mlp.experts]).mean(dim=0)
+            x = x + expert_out
+        return type("Output", (), {"logits": self.lm_head(x)})()
 
     def prepare_inputs_for_generation(self, *args, **kwargs):
         raise NotImplementedError("stub for HF PEFT compatibility")
@@ -437,6 +488,33 @@ class TestMoELoRAMerge:
             assert "lora_" not in name, f"LoRA param {name} should not survive merge"
         for name, _ in merged.named_modules():
             assert "lora_" not in name, f"LoRA module {name} should not survive merge"
+
+    def test_merged_logits_kl_div_vs_unmerged(self):
+        """KL-div between merged and adapter-applied MoE models must be ~0."""
+        from peft import PeftModel
+
+        torch.manual_seed(99)
+        ref_model = PeftModel.from_pretrained(
+            _HFStyleMoE(), self.adapter_path
+        ).eval()
+
+        torch.manual_seed(99)
+        merged = PeftModel.from_pretrained(
+            _HFStyleMoE(), self.adapter_path
+        ).merge_and_unload().eval()
+
+        torch.manual_seed(123)
+        input_ids = torch.randint(0, MOE_VOCAB_SIZE, (2, 16))
+
+        with torch.no_grad():
+            ref_logits = ref_model(input_ids).logits
+            merged_logits = merged(input_ids).logits
+
+        log_p = torch.nn.functional.log_softmax(merged_logits, dim=-1)
+        q = torch.nn.functional.softmax(ref_logits, dim=-1)
+        kl = torch.nn.functional.kl_div(log_p, q, reduction="batchmean", log_target=False)
+
+        assert kl.item() < 1e-6, f"KL divergence too high: {kl.item():.3e}"
 
     def test_round_trip_grouped_to_hf_and_back(self):
         """Verify grouped → HF → grouped round-trip preserves tensor values."""
