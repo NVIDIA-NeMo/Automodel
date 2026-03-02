@@ -24,4 +24,4 @@ if [ "${PYTEST_PROPAGATE_S:-}" = "1" ]; then
 fi
 
 coverage run --data-file=/workspace/.coverage --source=/workspace --parallel-mode \
-    -m pytest $PYTEST_S_FLAG tests/functional_tests/lora_merge/test_merge_lora.py::TestDenseLoRAMerge -v
+    -m pytest $PYTEST_S_FLAG tests/functional_tests/hf_peft/test_merge_lora.py::TestMoELoRAMerge -v
