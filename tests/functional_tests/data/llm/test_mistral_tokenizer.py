@@ -19,6 +19,7 @@ for Mistral model types and that basic tokenization operations work.
 """
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -95,7 +96,7 @@ class TestMistralCommonBackendTokenization:
             tokenize=True,
             add_generation_prompt=True,
         )
-        token_ids = result["input_ids"] if isinstance(result, dict) else result
+        token_ids = result["input_ids"] if isinstance(result, Mapping) else result
         if hasattr(token_ids, "tolist"):
             token_ids = token_ids.tolist()
         if isinstance(token_ids[0], list):
@@ -114,6 +115,7 @@ class TestMistralCommonBackendTokenization:
 
     def test_batch_encode(self, mistral_tokenizer_path):
         tokenizer = NeMoAutoTokenizer.from_pretrained(mistral_tokenizer_path)
+        tokenizer.pad_token_id = tokenizer.eos_token_id
         texts = ["Hello world", "How are you?"]
         result = tokenizer(texts, padding=True)
         assert "input_ids" in result
