@@ -773,6 +773,78 @@ class TestFormatPromptCompletionPadEos:
         assert len(supervised) > 0, "Must have supervised (answer) tokens"
 
 
+class _StubTokenizerChatTruncating(_StubTokenizerChat):
+    """Chat tokenizer that respects max_length truncation like HF tokenizers."""
+
+    def apply_chat_template(self, messages, **kwargs):
+        result = super().apply_chat_template(messages, **kwargs)
+        max_length = kwargs.get("max_length")
+        if max_length is not None:
+            if kwargs.get("return_dict", False):
+                ids = result["input_ids"][:max_length]
+                result["input_ids"] = ids
+                if "assistant_masks" in result:
+                    result["assistant_masks"] = result["assistant_masks"][:max_length]
+            else:
+                result = result[:max_length]
+        return result
+
+
+class TestFormatChatTemplateNoEosAfterTruncation:
+    """EOS must NOT be appended when the sequence was truncated to seq_length.
+
+    When apply_chat_template returns seq_length tokens (i.e. the sequence was
+    truncated), appending EOS makes the total seq_length+1 which after
+    BOS-removal in _package_tokenized_example produces exactly seq_length
+    labels with no room for -100 padding.  The last label becomes the
+    spurious EOS instead of -100.
+    """
+
+    def _messages(self):
+        # Long enough content to exceed any small seq_length
+        return [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "a b c d e f g h i j k l m n o p q r s t"},
+            {"role": "assistant", "content": "x y z w v u"},
+        ]
+
+    def test_no_eos_appended_when_truncated_generation_kwd(self):
+        tok = _StubTokenizerChatTruncating()
+        seq_length = 10  # Force truncation
+        out = format_chat_template(
+            tok,
+            [m.copy() for m in self._messages()],
+            eos_token_id=tok.eos_token_id,
+            pad_token_id=tok.eos_token_id,
+            seq_length=seq_length,
+            padding="max_length",
+            truncation=True,
+        )
+        # All labels must be exactly seq_length
+        assert len(out["labels"]) == seq_length
+        # The last label must be -100 (padding), NOT eos_token_id
+        assert out["labels"][-1] == -100, (
+            f"Last label should be -100 (padding) after truncation, got {out['labels'][-1]}"
+        )
+
+    def test_eos_still_appended_when_not_truncated(self):
+        tok = _StubTokenizerChatTruncating()
+        seq_length = 100  # Large enough — no truncation
+        out = format_chat_template(
+            tok,
+            [m.copy() for m in self._messages()],
+            eos_token_id=tok.eos_token_id,
+            pad_token_id=tok.eos_token_id,
+            seq_length=seq_length,
+            padding="max_length",
+            truncation=True,
+        )
+        assert len(out["labels"]) == seq_length
+        # EOS should be in the supervised region (not truncated, so EOS was appended)
+        supervised = [v for v in out["labels"] if v != -100]
+        assert tok.eos_token_id in supervised
+
+
 class TestFormatChatTemplatePadEos:
     """Tests for format_chat_template when pad_token_id == eos_token_id."""
 

@@ -334,7 +334,8 @@ def format_chat_template(
             if not tokenizer_attn_mask[i]:
                 mask[i] = 0
 
-    if getattr(tokenizer, "eos_token_id", None) and input_ids[-1] != tokenizer.eos_token_id:
+    was_truncated = seq_length is not None and len(input_ids) >= seq_length
+    if getattr(tokenizer, "eos_token_id", None) and input_ids[-1] != tokenizer.eos_token_id and not was_truncated:
         input_ids += [tokenizer.eos_token_id]
         mask += [1]
 
