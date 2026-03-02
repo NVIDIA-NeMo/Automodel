@@ -33,8 +33,7 @@ MISTRAL_7B_INSTRUCT_PATH = _TOKENIZER_BASE / "Mistral-7B-Instruct-v0.1"
 
 @pytest.fixture
 def mistral_tokenizer_path():
-    if not MISTRAL_7B_INSTRUCT_PATH.exists():
-        pytest.skip(f"Missing tokenizer data: {MISTRAL_7B_INSTRUCT_PATH}")
+    assert MISTRAL_7B_INSTRUCT_PATH.exists(), "path not exists"
     return str(MISTRAL_7B_INSTRUCT_PATH)
 
 
