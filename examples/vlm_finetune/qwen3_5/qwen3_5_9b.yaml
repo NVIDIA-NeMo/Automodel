@@ -94,7 +94,7 @@ optimizer:
   lr: 1.0e-5
   weight_decay: 0.1
 
-wandb:
-  project: huiyingl_workspace
-  entity: Nemo-automodel
-  name: qwen3_5_9b
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_name>
