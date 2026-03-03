@@ -2,9 +2,7 @@
 
 ## Introduction
 
-Embedding models map text into dense vector representations used for semantic search, retrieval-augmented generation (RAG), and other information retrieval tasks. Fine-tuning an embedding model on domain-specific data improves retrieval quality by teaching the model to better distinguish relevant documents from irrelevant ones within your target domain.
-
-NeMo AutoModel supports **biencoder (dual-encoder) embedding model fine-tuning** using contrastive learning. Each training example consists of a query paired with one positive document and one or more hard negative documents. The model learns to produce embeddings where queries are close to their relevant documents and far from irrelevant ones.
+NeMo AutoModel supports **biencoder (dual-encoder) embedding model fine-tuning** using contrastive learning. Each training example pairs a query with one positive document and one or more hard negatives. The model learns embeddings where queries are near relevant documents and far from irrelevant ones — improving retrieval quality on domain-specific data.
 
 ### Architecture Overview
 
@@ -89,8 +87,6 @@ tokenizer:
 ```
 
 ### Dataset and Collator
-
-The dataset factory and collator handle loading and tokenizing query-passage pairs.
 
 ```yaml
 dataloader:
@@ -188,7 +184,7 @@ distributed:
   sequence_parallel: false
 ```
 
-The biencoder recipe supports FSDP2 for data parallelism. Tensor parallelism is available for larger backbones.
+FSDP2 for data parallelism. Tensor parallelism available for larger backbones.
 
 :::{note}
 Pipeline parallelism is not supported for biencoder training.
@@ -204,7 +200,7 @@ checkpoint:
   save_consolidated: true
 ```
 
-Consolidated checkpoints are saved in the Hugging Face `safetensors` format, making them directly loadable for inference or further fine-tuning.
+Saves Hugging Face `safetensors` format, directly loadable for inference or further fine-tuning.
 
 ### LoRA/PEFT (Optional)
 
@@ -263,7 +259,7 @@ The corpus directory must contain a `merlin_metadata.json` file. See the [Bienco
 
 ### Hard Negative Mining
 
-High-quality hard negatives are critical for training effective embedding models. NeMo AutoModel includes a built-in hard negative mining tool that uses an existing embedding model to find challenging negatives from your corpus.
+NeMo AutoModel includes a hard negative mining tool that uses an existing embedding model to find challenging negatives from your corpus.
 
 ```bash
 torchrun --nproc_per_node=8 examples/biencoder/mine_hard_negatives.py \
@@ -290,12 +286,10 @@ The mining pipeline:
 
 ## Training Workflow
 
-A typical embedding model fine-tuning workflow:
-
-1. **Prepare training data** in inline JSONL or corpus-ID JSON format
-2. **(Optional) Mine hard negatives** using the mining tool
-3. **Configure the recipe** by editing the YAML config
-4. **Launch training**:
+1. Prepare training data (inline JSONL or corpus-ID JSON)
+2. (Optional) Mine hard negatives
+3. Edit the YAML config
+4. Launch training:
 
 ```bash
 torchrun --nproc-per-node=8 examples/biencoder/finetune.py \
@@ -312,7 +306,7 @@ INFO:root:step 30 | epoch 0 | val_loss 1.1230 | val_acc1 0.7820 | val_mrr 0.8450
 
 ## Using the Fine-Tuned Model
 
-The consolidated checkpoint is saved in Hugging Face format and can be loaded directly for inference:
+Consolidated checkpoints are in Hugging Face format and loadable directly:
 
 ```python
 from sentence_transformers import SentenceTransformer
@@ -334,7 +328,7 @@ print(similarities)
 
 ## Full Example Config
 
-Below is the complete reference configuration:
+Copy-pasteable reference config (combines all sections above):
 
 ```yaml
 seed: 42
