@@ -448,6 +448,40 @@ def test_resolve_target_file_colon(tmp_path):
     assert target() == 42
 
 
+def test_instantiate_skips_kwargs_overridden_nested(tmp_module):
+    """Nested _target_ configs must NOT be instantiated when overridden by kwargs."""
+    mod = tmp_module(
+        "skip_mod",
+        """
+        call_count = 0
+
+        def expensive_factory(value=0):
+            import skip_mod
+            skip_mod.call_count += 1
+            return value
+
+        class Container:
+            def __init__(self, child, label="default"):
+                self.child = child
+                self.label = label
+        """,
+    )
+    cfg = ConfigNode(
+        {
+            "_target_": "skip_mod.Container",
+            "child": {"_target_": "skip_mod.expensive_factory", "value": "42"},
+            "label": "from_config",
+        }
+    )
+
+    pre_instantiated_child = "already_built"
+    result = cfg.instantiate(child=pre_instantiated_child)
+
+    assert result.child == "already_built"
+    assert result.label == "from_config"
+    assert mod.call_count == 0, "nested _target_ should not have been called when overridden by kwarg"
+
+
 def test_resolve_target_asserts_on_non_py_suffix(tmp_path):
     """When the left part before ':' does not end in .py an AssertionError is raised."""
     bad = tmp_path / "data.txt"

@@ -1,4 +1,4 @@
-# YAML Configuration and Environment Variable Interpolation
+# YAML Configuration
 
 NeMo AutoModel recipes are configured with YAML. Under the hood, YAML is parsed into a `ConfigNode` which:
 

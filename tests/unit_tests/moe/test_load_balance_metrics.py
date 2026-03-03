@@ -131,6 +131,17 @@ class TestComputeBriefMetrics:
         util_keys = [k for k in metrics if k.startswith("moe_expert_utilization/layer_")]
         assert len(util_keys) <= 6
 
+    def test_top_k_zero_disables_expert_utilization(self):
+        """top_k=0 should produce no moe_expert_utilization/ keys."""
+        layer_loads = _make_layer_loads([[100.0, 200.0, 300.0, 400.0]])
+        metrics = compute_brief_metrics(layer_loads, top_k=0)
+
+        util_keys = [k for k in metrics if k.startswith("moe_expert_utilization/")]
+        assert len(util_keys) == 0
+        # Aggregate metrics should still be present
+        assert "moe/cv_mean" in metrics
+        assert "moe/expert_utilization_median" in metrics
+
     def test_no_aux_loss(self):
         """When aux_loss is None, aux_loss_mean should be absent."""
         layer_loads = _make_layer_loads([[100.0, 100.0]])
@@ -215,6 +226,18 @@ class TestComputeDetailedMetrics:
         assert len(util_keys) <= 4
         assert "moe_expert_utilization/layer_0_expert_3" in metrics
         assert "moe_expert_utilization/layer_0_expert_0" in metrics
+
+    def test_top_k_zero_disables_expert_utilization(self):
+        """top_k=0 should produce no moe_expert_utilization/ keys in detailed mode."""
+        layer_loads = _make_layer_loads([[100.0, 200.0, 300.0, 400.0]])
+        metrics = compute_detailed_metrics(layer_loads, top_k=0)
+
+        util_keys = [k for k in metrics if k.startswith("moe_expert_utilization/")]
+        assert len(util_keys) == 0
+        # Per-layer and aggregate metrics should still be present
+        assert "moe/layer_0/cv" in metrics
+        assert "moe/cv_mean" in metrics
+        assert "moe/expert_utilization_median" in metrics
 
     def test_per_layer_values_correct(self):
         """Per-layer CV should match expected values."""

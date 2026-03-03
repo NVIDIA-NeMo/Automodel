@@ -456,6 +456,8 @@ class ConfigNode:
         for k, v in self.__dict__.items():
             if k in ("_target_", "raise_on_missing_attr", "_raw_config", "_original_strings"):
                 continue
+            if k in kwargs:
+                continue  # will be overridden — skip expensive instantiation
             if k.endswith("_fn"):
                 config_kwargs[k] = v
             else:
@@ -466,6 +468,8 @@ class ConfigNode:
         # Resolve env interpolations at the last moment, so printing/saving the config
         # does not leak secrets (e.g., `${oc.env:HF_TOKEN}` remains in YAML output).
         config_kwargs = resolve_yaml_env_vars(config_kwargs)
+
+        import traceback
 
         try:
             return func(*args, **config_kwargs)
@@ -486,7 +490,8 @@ class ConfigNode:
                 ),
                 file=sys.stderr,
             )
-            raise
+            print(traceback.format_exc())
+            raise e
 
     def _instantiate_value(self, v):
         """

@@ -12,9 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Optional
 
 from transformers import AutoConfig
+
+
+def _should_load_before_shard(
+    *,
+    autopipeline: Optional[object],
+    tp_size: int,
+    ep_size: int,
+    pretrained_model_name_or_path: str,
+    load_base_model: bool,
+    peft_config: Optional[object],
+) -> bool:
+    """Decide whether to load the checkpoint before FSDP/TP/EP sharding.
+
+    Load-before-shard is only safe when running single-GPU (no PP, TP, or EP),
+    a checkpoint actually needs loading, and no PEFT adapter is involved.
+    With any model parallelism the post-shard load path must be used to avoid
+    NCCL collective mismatches or key/device inconsistencies.
+    """
+    no_pp = autopipeline is None
+    no_tp = tp_size <= 1
+    no_ep = ep_size <= 1
+    need_checkpoint_load = bool(pretrained_model_name_or_path and load_base_model)
+    return no_pp and no_tp and no_ep and need_checkpoint_load and (peft_config is None)
 
 
 def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
@@ -41,8 +64,77 @@ def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
     return overwrite_dict
 
 
+def apply_qwen3_omni_config_patch():
+    """Fix Qwen3OmniMoeTalkerCodePredictorConfig accessing use_sliding_window."""
+    from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTalkerCodePredictorConfig
+
+    if not hasattr(Qwen3OmniMoeTalkerCodePredictorConfig, "use_sliding_window"):
+        Qwen3OmniMoeTalkerCodePredictorConfig.use_sliding_window = False
+
+
+def _patch_bytes_to_unicode():
+    """Re-export bytes_to_unicode on transformers.models.gpt2.tokenization_gpt2.
+
+    In transformers v5 this helper was removed from the GPT-2 tokenizer module,
+    but some custom tokenizers shipped with model weights (e.g. Kimi) still
+    import it from there via ``trust_remote_code``.  Monkey-patching it back
+    avoids an ImportError without modifying the transformers package.
+    """
+    import importlib
+
+    gpt2_tok = importlib.import_module("transformers.models.gpt2.tokenization_gpt2")
+    if hasattr(gpt2_tok, "bytes_to_unicode"):
+        return
+
+    from functools import lru_cache
+
+    @lru_cache()
+    def bytes_to_unicode():
+        bs = (
+            list(range(ord("!"), ord("~") + 1))
+            + list(range(ord("¡"), ord("¬") + 1))
+            + list(range(ord("®"), ord("ÿ") + 1))
+        )
+        cs = bs[:]
+        n = 0
+        for b in range(2**8):
+            if b not in bs:
+                bs.append(b)
+                cs.append(2**8 + n)
+                n += 1
+        cs = [chr(n) for n in cs]
+        return dict(zip(bs, cs))
+
+    gpt2_tok.bytes_to_unicode = bytes_to_unicode
+
+
+def _patch_special_tokens_pattern():
+    """Default ``special_tokens_pattern`` to ``"none"`` for PreTrainedTokenizer.
+
+    Transformers v5 introduced ``special_tokens_pattern`` (default ``"cls_sep"``)
+    which makes ``build_inputs_with_special_tokens`` prepend ``cls_token_id`` and
+    append ``sep_token_id``.  Custom tokenizers (e.g. TikToken-based Kimi) that
+    lack CLS/SEP tokens end up with ``None`` IDs in the sequence, crashing
+    ``pad()``.
+    """
+    from transformers.tokenization_python import PreTrainedTokenizer
+
+    _orig_init = PreTrainedTokenizer.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        kwargs.setdefault("special_tokens_pattern", "none")
+        return _orig_init(self, *args, **kwargs)
+
+    if not getattr(PreTrainedTokenizer.__init__, "_nemo_stp_patched", False):
+        PreTrainedTokenizer.__init__ = _patched_init
+        PreTrainedTokenizer.__init__._nemo_stp_patched = True  # type: ignore[attr-defined]
+
+
 def apply_cache_compatibility_patches():
     """Apply compatibility patches for transformers cache utilities."""
+    _patch_bytes_to_unicode()
+    _patch_special_tokens_pattern()
+
     # Alias cache API for models expecting get_usable_length
     from transformers.cache_utils import DynamicCache
 
