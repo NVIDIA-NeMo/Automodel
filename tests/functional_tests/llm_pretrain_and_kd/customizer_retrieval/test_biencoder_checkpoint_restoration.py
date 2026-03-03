@@ -155,12 +155,19 @@ class TestBiencoderCheckpointRestoration:
 
     @pytest.fixture(autouse=True)
     def _cleanup(self):
-        """Remove training checkpoints after each test."""
-        yield
+        """Remove training checkpoints before *and* after each test so stale
+        checkpoints from a previous CI run never cause auto-resume failures."""
         for ckpt_dir in (CHECKPOINT_DIR, PEFT_CHECKPOINT_DIR):
             p = Path(ckpt_dir)
             if p.exists():
                 shutil.rmtree(p, ignore_errors=True)
+        try:
+            yield
+        finally:
+            for ckpt_dir in (CHECKPOINT_DIR, PEFT_CHECKPOINT_DIR):
+                p = Path(ckpt_dir)
+                if p.exists():
+                    shutil.rmtree(p, ignore_errors=True)
 
     # ------------------------------------------------------------------ #
     # Test 1: full-model checkpoint restoration                           #
