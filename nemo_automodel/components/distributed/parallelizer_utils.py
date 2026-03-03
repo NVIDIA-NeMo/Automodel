@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from typing import Callable, Iterator, List, Optional, Set, Tuple, Union
 
 import torch
@@ -101,22 +102,97 @@ def _get_module_from_path(layer, path):
     return layer
 
 
-def _fully_shard(module, mesh, mp_policy, offload_policy):
+def _call_fully_shard(
+    module,
+    mesh,
+    mp_policy,
+    offload_policy,
+    reshard_after_forward=None,
+    ignored_params: Optional[Set[torch.nn.Parameter]] = None,
+):
+    kwargs = {"mesh": mesh, "mp_policy": mp_policy, "offload_policy": offload_policy}
+    if reshard_after_forward is not None:
+        kwargs["reshard_after_forward"] = reshard_after_forward
+    if ignored_params:
+        module_params = set(module.parameters())
+        local_ignored_params = {p for p in ignored_params if p in module_params}
+        if local_ignored_params:
+            kwargs["ignored_params"] = local_ignored_params
+    fully_shard(module, **kwargs)
+
+
+def _fully_shard(
+    module,
+    mesh,
+    mp_policy,
+    offload_policy,
+    reshard_after_forward=None,
+    ignored_params: Optional[Set[torch.nn.Parameter]] = None,
+):
     if isinstance(module, nn.ModuleList):
         for layer in module:
-            _fully_shard(layer, mesh, mp_policy, offload_policy)
+            _fully_shard(
+                layer,
+                mesh,
+                mp_policy,
+                offload_policy,
+                reshard_after_forward=reshard_after_forward,
+                ignored_params=ignored_params,
+            )
     else:
-        fully_shard(module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+        _call_fully_shard(
+            module,
+            mesh,
+            mp_policy,
+            offload_policy,
+            reshard_after_forward=reshard_after_forward,
+            ignored_params=ignored_params,
+        )
 
 
-def fully_shard_by_dtype(module, mesh, mp_policy, offload_policy):
+def _call_nested_fully_shard(
+    module,
+    mesh,
+    mp_policy,
+    offload_policy,
+    reshard_after_forward=None,
+    ignored_params: Optional[Set[torch.nn.Parameter]] = None,
+):
+    """Call _fully_shard while remaining backward-compatible with tests that monkeypatch its signature."""
+    kwargs = {"mesh": mesh, "mp_policy": mp_policy, "offload_policy": offload_policy}
+    try:
+        params = inspect.signature(_fully_shard).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "reshard_after_forward" in params:
+        kwargs["reshard_after_forward"] = reshard_after_forward
+    if "ignored_params" in params:
+        kwargs["ignored_params"] = ignored_params
+    _fully_shard(module, **kwargs)
+
+
+def fully_shard_by_dtype(
+    module,
+    mesh,
+    mp_policy,
+    offload_policy,
+    reshard_after_forward=None,
+    ignored_params: Optional[Set[torch.nn.Parameter]] = None,
+):
     # calling _group_params_by_dtype is not optimal here, because we may
     # end up with two traversals over the module, but this code is not in the hot path.
     grouped_params = _group_params_by_dtype(module)
     if len(grouped_params) == 0:
         return
     elif len(grouped_params) == 1:
-        fully_shard(module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+        _call_fully_shard(
+            module,
+            mesh,
+            mp_policy,
+            offload_policy,
+            reshard_after_forward=reshard_after_forward,
+            ignored_params=ignored_params,
+        )
     else:
         least_items_dtype = min(grouped_params.items(), key=lambda x: len(x[1]))[0]
         for path, mod, dtype in iter_maximal_uniform_dtype_subtrees(
@@ -125,11 +201,20 @@ def fully_shard_by_dtype(module, mesh, mp_policy, offload_policy):
             return_paths=True,
         ):
             if (len(grouped_params) == 2 and dtype == least_items_dtype) or len(grouped_params) > 2:
-                _fully_shard(
+                _call_nested_fully_shard(
                     _get_module_from_path(module, path),
                     mesh=mesh,
                     mp_policy=mp_policy,
                     offload_policy=offload_policy,
+                    reshard_after_forward=reshard_after_forward,
+                    ignored_params=ignored_params,
                 )
         if len(grouped_params) == 2:
-            fully_shard(module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+            _call_fully_shard(
+                module,
+                mesh,
+                mp_policy,
+                offload_policy,
+                reshard_after_forward=reshard_after_forward,
+                ignored_params=ignored_params,
+            )
