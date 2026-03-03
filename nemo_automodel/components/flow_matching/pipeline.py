@@ -88,6 +88,7 @@ class FlowMatchingPipeline:
     Features:
     - Noise scheduling with linear interpolation
     - Timestep sampling with various strategies
+    - Optional sigma-noise flow shift toggle
     - Flow shift transformation
     - Sigma clamping for finetuning
     - Loss weighting
@@ -120,6 +121,8 @@ class FlowMatchingPipeline:
         logit_std: float = 1.0,
         # Mix sampling parameters
         mix_uniform_ratio: float = 0.1,
+        # Sigma sampling mode
+        use_sigma_noise: bool = True,
         # Sigma clamping for finetuning (pretrain uses [0.0, 1.0])
         sigma_min: float = 0.0,
         sigma_max: float = 1.0,
@@ -148,6 +151,8 @@ class FlowMatchingPipeline:
             logit_mean: Mean for logit-normal distribution
             logit_std: Std for logit-normal distribution
             mix_uniform_ratio: Ratio of uniform samples when using mix
+            use_sigma_noise: Whether to use shifted sigma-noise sampling. If False,
+                sample sigma uniformly without flow shift ("uniform_no_shift")
             sigma_min: Minimum sigma (0.0 for pretrain)
             sigma_max: Maximum sigma (1.0 for pretrain)
             use_loss_weighting: Whether to apply flow-based loss weighting
@@ -164,6 +169,7 @@ class FlowMatchingPipeline:
         self.logit_mean = logit_mean
         self.logit_std = logit_std
         self.mix_uniform_ratio = mix_uniform_ratio
+        self.use_sigma_noise = use_sigma_noise
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.use_loss_weighting = use_loss_weighting
@@ -196,6 +202,14 @@ class FlowMatchingPipeline:
         """
         if device is None:
             device = self.device
+
+        # Backward-compatible path from pre-migration training step:
+        # disable flow shift and sample plain uniform sigma.
+        if not self.use_sigma_noise:
+            sigma = torch.rand(size=(batch_size,), device=device)
+            sigma = torch.clamp(sigma, self.sigma_min, self.sigma_max)
+            timesteps = sigma * self.num_train_timesteps
+            return sigma, timesteps, "uniform_no_shift"
 
         # Determine if we should use uniform (for mix strategy)
         use_uniform = self.timestep_sampling == "uniform" or (

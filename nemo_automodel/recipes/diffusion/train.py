@@ -320,6 +320,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.model_id = self.cfg.get("model.pretrained_model_name_or_path")
         self.attention_backend = self.cfg.get("model.attention_backend")
         self.learning_rate = self.cfg.get("optim.learning_rate", 5e-6)
+        self.clip_grad_max_norm = float(self.cfg.get("optim.clip_grad", 1.0))
         self.bf16 = torch.bfloat16
 
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -362,23 +363,29 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.logit_std = fm_cfg.get("logit_std", 1.0)
         self.flow_shift = fm_cfg.get("flow_shift", 3.0)
         self.mix_uniform_ratio = fm_cfg.get("mix_uniform_ratio", 0.1)
+        self.use_sigma_noise = fm_cfg.get("use_sigma_noise", True)
         self.sigma_min = fm_cfg.get("sigma_min", 0.0)
         self.sigma_max = fm_cfg.get("sigma_max", 1.0)
         self.num_train_timesteps = fm_cfg.get("num_train_timesteps", 1000)
         self.i2v_prob = fm_cfg.get("i2v_prob", 0.3)
+        self.cfg_dropout_prob = fm_cfg.get("cfg_dropout_prob", 0.1)
         self.use_loss_weighting = fm_cfg.get("use_loss_weighting", True)
         self.log_interval = fm_cfg.get("log_interval", 100)
         self.summary_log_interval = fm_cfg.get("summary_log_interval", 10)
 
         # Adapter-specific configuration
         adapter_kwargs = fm_cfg.get("adapter_kwargs", {})
-        self.adapter_kwargs = adapter_kwargs.to_dict()
+        self.adapter_kwargs = (
+            adapter_kwargs.to_dict() if hasattr(adapter_kwargs, "to_dict") else dict(adapter_kwargs or {})
+        )
 
         logging.info("[INFO] Flow Matching V2 Pipeline")
         logging.info(f"[INFO]   - Adapter type: {self.adapter_type}")
         logging.info(f"[INFO]   - Timestep sampling: {self.timestep_sampling}")
         logging.info(f"[INFO]   - Flow shift: {self.flow_shift}")
         logging.info(f"[INFO]   - Mix uniform ratio: {self.mix_uniform_ratio}")
+        logging.info(f"[INFO]   - Use sigma noise: {self.use_sigma_noise}")
+        logging.info(f"[INFO]   - CFG dropout prob: {self.cfg_dropout_prob}")
         logging.info(f"[INFO]   - Use loss weighting: {self.use_loss_weighting}")
 
         # Get pipeline_spec for pretraining mode (required when mode != "finetune")
@@ -509,9 +516,11 @@ class TrainDiffusionRecipe(BaseRecipe):
             timestep_sampling=self.timestep_sampling,
             flow_shift=self.flow_shift,
             i2v_prob=self.i2v_prob,
+            cfg_dropout_prob=self.cfg_dropout_prob,
             logit_mean=self.logit_mean,
             logit_std=self.logit_std,
             mix_uniform_ratio=self.mix_uniform_ratio,
+            use_sigma_noise=self.use_sigma_noise,
             sigma_min=self.sigma_min,
             sigma_max=self.sigma_max,
             use_loss_weighting=self.use_loss_weighting,
@@ -574,7 +583,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                     (average_weighted_loss / len(batch_group)).backward()
                     micro_losses.append(float(average_weighted_loss.item()))
 
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.clip_grad_max_norm)
                 grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm
 
                 self.optimizer.step()

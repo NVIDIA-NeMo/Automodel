@@ -34,7 +34,6 @@ from nemo_automodel.components.flow_matching.pipeline import (
     create_pipeline,
 )
 
-
 # =============================================================================
 # Fixtures
 # =============================================================================
@@ -202,6 +201,24 @@ class TestTimestepSampling:
         sigma, timesteps, method = pipeline.sample_timesteps(batch_size, torch.device("cpu"))
 
         assert method == "uniform"
+        assert sigma.shape == (batch_size,)
+        assert timesteps.shape == (batch_size,)
+        assert (sigma >= 0).all() and (sigma <= 1).all(), "Sigma should be in [0, 1]"
+        assert (timesteps >= 0).all() and (timesteps <= 1000).all(), "Timesteps should be in [0, T]"
+
+    def test_uniform_sampling_no_shift_when_sigma_noise_disabled(self, simple_adapter):
+        """Test no-shift sigma sampling path used when use_sigma_noise=False."""
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            timestep_sampling="logit_normal",
+            flow_shift=10.0,
+            use_sigma_noise=False,
+        )
+
+        batch_size = 100
+        sigma, timesteps, method = pipeline.sample_timesteps(batch_size, torch.device("cpu"))
+
+        assert method == "uniform_no_shift"
         assert sigma.shape == (batch_size,)
         assert timesteps.shape == (batch_size,)
         assert (sigma >= 0).all() and (sigma <= 1).all(), "Sigma should be in [0, 1]"
@@ -831,12 +848,14 @@ class TestIntegration:
             flow_shift=3.0,
             sigma_min=0.1,
             sigma_max=0.9,
+            use_sigma_noise=False,
         )
 
         # Verify state after initialization
         assert pipeline.flow_shift == 3.0
         assert pipeline.sigma_min == 0.1
         assert pipeline.sigma_max == 0.9
+        assert pipeline.use_sigma_noise is False
 
         # Run some steps
         mock_model = MockModel()
@@ -852,6 +871,7 @@ class TestIntegration:
         assert pipeline.flow_shift == 3.0
         assert pipeline.sigma_min == 0.1
         assert pipeline.sigma_max == 0.9
+        assert pipeline.use_sigma_noise is False
 
 
 class TestPipelineEdgeCases:
@@ -995,9 +1015,7 @@ class TestDebugLogging:
             "video_latents": torch.randn(2, 16, 4, 8, 8),
             "text_embeddings": torch.randn(2, 77, 4096),
         }
-        _, avg_loss, _, metrics = pipeline.step(
-            mock_model, batch, torch.device("cpu"), torch.float32, global_step=0
-        )
+        _, avg_loss, _, metrics = pipeline.step(mock_model, batch, torch.device("cpu"), torch.float32, global_step=0)
         assert not torch.isnan(avg_loss)
 
     def test_debug_env_var_summary_log(self, simple_adapter, monkeypatch):
@@ -1012,9 +1030,7 @@ class TestDebugLogging:
             "video_latents": torch.randn(2, 16, 4, 8, 8),
             "text_embeddings": torch.randn(2, 77, 4096),
         }
-        _, avg_loss, _, metrics = pipeline.step(
-            mock_model, batch, torch.device("cpu"), torch.float32, global_step=1
-        )
+        _, avg_loss, _, metrics = pipeline.step(mock_model, batch, torch.device("cpu"), torch.float32, global_step=1)
         assert not torch.isnan(avg_loss)
 
 
