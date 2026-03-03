@@ -252,6 +252,11 @@ jobs:
             timeout: 20
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          - test-name: L2_vLLM_Deployment
+            test-folder: vllm_deployment
+            timeout: 30
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
     needs: [pre-flight, cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}

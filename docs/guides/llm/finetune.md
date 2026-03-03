@@ -21,7 +21,7 @@ models from the Hugging Face Hub using NeMo Automodel. You'll learn how
 to prepare datasets, train models, generate text with fine-tuned
 checkpoints, evaluate performance using the LM Eval Harness, share your
 models on the Hugging Face Model Hub, and deploy them efficiently with
-vLLM.
+[vLLM and SGLang](deployment.md).
 
 <!-- In addition to this user guide, you can also explore our Quickstart,
 which features a [standalone python3
@@ -512,7 +512,7 @@ Before running this command, make sure you have specified the checkpoint
 path that you used during fine-tuning, we will use
 [/ft_checkpoints/llama3.2_1b]{.title-ref} as in the fine-tuning section. -->
 
-## Export to vLLM
+## Deploy with vLLM
 
 [vLLM](https://github.com/vllm-project/vllm) is an efficient inference
 engine designed to optimize the deployment of large language models
@@ -520,18 +520,18 @@ engine designed to optimize the deployment of large language models
 parallel processing and optimized memory management, vLLM accelerates
 inference while maintaining model accuracy.
 
-The following script demonstrates how to use a fine-tuned checkpoint
-in vLLM, allowing seamless deployment and efficient inference:
-
 :::{note}
-Make sure vLLM is installed (pip install vllm, or use the environment that includes it).
+Make sure vLLM is installed (`pip install vllm`, or use the NeMo AutoModel Docker container which includes it).
 :::
 
+### SFT checkpoint
+
+Point vLLM at the **consolidated** checkpoint directory:
 
 ``` python
 from vllm import LLM, SamplingParams
 
-llm = LLM(model="checkpoints/epoch_0_step_10/model/consolidated/", model_impl="transformers")
+llm = LLM(model="checkpoints/epoch_0_step_10/model/consolidated/")
 params = SamplingParams(max_tokens=20)
 outputs = llm.generate("Toronto is a city in Canada.", sampling_params=params)
 print(f"Generated text: {outputs[0].outputs[0].text}")
@@ -540,30 +540,30 @@ print(f"Generated text: {outputs[0].outputs[0].text}")
 >>> Generated text:  It is the capital of Ontario. Toronto is a global hub for cultural tourism. The City of Toronto
 ```
 
-Similarly, the following script demonstrates how to export a PEFT adapter for vLLM,
-allowing seamless deployment and efficient inference.
+Or launch an OpenAI-compatible server:
 
-:::{note}
-Make sure vLLM is installed (pip install vllm, or use the environment
-that includes it) before proceeding with vLLMHFExporter.
-:::
+```bash
+vllm serve checkpoints/epoch_0_step_10/model/consolidated/ --host 0.0.0.0 --port 8000
+```
+
+### PEFT / LoRA adapter
+
+vLLM can serve LoRA adapters on top of the base model without merging:
 
 ``` python
-from nemo.export.vllm_hf_exporter import vLLMHFExporter
+from vllm import LLM, SamplingParams
+from vllm.lora.request import LoRARequest
 
-if __name__ == '__main__':
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model', required=True, type=str, help="Local path of the base model")
-    parser.add_argument('--lora-model', required=True, type=str, help="Local path of the lora model")
-    args = parser.parse_args()
-
-    lora_model_name = "lora_model"
-
-    exporter = vLLMHFExporter()
-    exporter.export(model=args.model, enable_lora=True)
-    exporter.add_lora_models(lora_model_name=lora_model_name, lora_model=args.lora_model)
-
-    print("vLLM Output: ", exporter.forward(input_texts=["How are you doing?"], lora_model_name=lora_model_name))
+llm = LLM(model="meta-llama/Llama-3.2-1B", enable_lora=True)
+params = SamplingParams(max_tokens=20)
+outputs = llm.generate(
+    "Toronto is a city in Canada.",
+    sampling_params=params,
+    lora_request=LoRARequest("my-adapter", 1, "checkpoints/epoch_0_step_10/model/"),
+)
+print(f"Generated text: {outputs[0].outputs[0].text}")
 ```
+
+:::{tip}
+For the full deployment guide — including **SGLang**, multi-GPU tensor parallelism, Docker deployment, and troubleshooting — see [Deploying Models with vLLM and SGLang](deployment.md).
+:::

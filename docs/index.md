@@ -61,10 +61,10 @@ Built on `transformers` for day-0 model support and OOTB compatibility.
 
 Select a modality and task to find the right guide.
 
-|            | SFT | PEFT (LoRA) | Tool Calling | QAT | Knowledge Distillation | Pretrain |
-|------------|-----|-------------|--------------|-----|------------------------|----------|
-| **LLM**    | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/finetune.md#recipe-config) | [Guide](guides/llm/toolcalling.md) | [Guide](guides/quantization-aware-training.md) | [Guide](guides/llm/knowledge-distillation.md) | [Guide](guides/llm/pretraining.md) |
-| **VLM**    | [Guide](guides/overview.md) | [Guide](guides/omni/gemma3-3n.md) | -- | -- | -- | -- |
+|            | SFT | PEFT (LoRA) | Tool Calling | QAT | Knowledge Distillation | Pretrain | Deployment |
+|------------|-----|-------------|--------------|-----|------------------------|----------|------------|
+| **LLM**    | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/finetune.md#recipe-config) | [Guide](guides/llm/toolcalling.md) | [Guide](guides/quantization-aware-training.md) | [Guide](guides/llm/knowledge-distillation.md) | [Guide](guides/llm/pretraining.md) | [Guide](guides/llm/deployment.md) |
+| **VLM**    | [Guide](guides/overview.md) | [Guide](guides/omni/gemma3-3n.md) | -- | -- | -- | -- | -- |
 
 ## Performance
 
@@ -244,6 +244,11 @@ guides/quantization-aware-training.md
 guides/llm/databricks.md
 ::::
 
+::::{toctree}
+:hidden:
+:caption: Deployment & Inference
+guides/llm/deployment.md
+::::
 
 ::::{toctree}
 :hidden:
