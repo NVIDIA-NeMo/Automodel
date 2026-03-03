@@ -181,10 +181,10 @@ class Qwen3Model(nn.Module):
 
 class Qwen3ForCausalLM(HFCheckpointingMixin, nn.Module):
     @classmethod
-    def from_config(cls, config, backend: BackendConfig | None = None, **kwargs):
-        return cls(config, backend, **kwargs)
+    def from_config(cls, config, backend: BackendConfig | None = None):
+        return cls(config, backend)
 
-    def __init__(self, config, backend: BackendConfig | None = None, **kwargs):
+    def __init__(self, config, backend: BackendConfig | None = None):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
