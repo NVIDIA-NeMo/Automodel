@@ -63,9 +63,7 @@ class Block(nn.Module):
         super().__init__()
         self.self_attn = Qwen3Attention(config, backend)
         self.mlp = Qwen3MLP(config, backend)
-        self.input_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps
         )
@@ -138,9 +136,7 @@ class Qwen3Model(nn.Module):
     ) -> torch.Tensor:
         if position_ids is None:
             position_ids = (
-                torch.arange(0, input_ids.shape[1], device=input_ids.device)
-                .unsqueeze(0)
-                .expand(input_ids.shape[0], -1)
+                torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
             )
 
         freqs_cis = position_ids_to_freqs_cis(
@@ -189,9 +185,7 @@ class Qwen3ForCausalLM(HFCheckpointingMixin, nn.Module):
         self.config = config
         self.backend = backend or BackendConfig()
         self.model = Qwen3Model(config, backend=self.backend)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, config.hidden_size, config.vocab_size, bias=False
-        )
+        self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
