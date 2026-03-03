@@ -22,7 +22,7 @@ import pytest
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.moe.config import MoEParallelizerConfig
-from nemo_automodel.recipes._dist_setup import parse_distributed_section
+from nemo_automodel.recipes._dist_setup import parse_distributed_section, validate_num_gpus
 
 # ---------------------------------------------------------------------------
 # Basic dict parsing
@@ -354,3 +354,177 @@ class TestIntegration:
     def test_backend_configuration(self, strategy):
         result = parse_distributed_section({"strategy": strategy, "backend": "gloo"})
         assert result["strategy_config"].backend == "gloo"
+
+
+# ---------------------------------------------------------------------------
+# validate_num_gpus – happy paths
+# ---------------------------------------------------------------------------
+
+
+class TestValidateNumGpusHappy:
+    def test_single_gpu(self):
+        validate_num_gpus(world_size=1, tp_size=1, pp_size=1, cp_size=1, ep_size=1, dp_size=None, dp_replicate_size=None)
+
+    def test_8gpu_tp2_pp2(self):
+        validate_num_gpus(world_size=8, tp_size=2, pp_size=2, cp_size=1, ep_size=1, dp_size=None, dp_replicate_size=None)
+
+    def test_8gpu_tp8(self):
+        validate_num_gpus(world_size=8, tp_size=8, pp_size=1, cp_size=1, ep_size=1, dp_size=None, dp_replicate_size=None)
+
+    def test_16gpu_tp2_pp2_cp2(self):
+        validate_num_gpus(
+            world_size=16, tp_size=2, pp_size=2, cp_size=2, ep_size=1, dp_size=None, dp_replicate_size=None
+        )
+
+    def test_explicit_dp_size(self):
+        validate_num_gpus(world_size=8, tp_size=2, pp_size=1, cp_size=1, ep_size=1, dp_size=4, dp_replicate_size=None)
+
+    def test_hsdp(self):
+        validate_num_gpus(world_size=16, tp_size=2, pp_size=1, cp_size=1, ep_size=1, dp_size=None, dp_replicate_size=2)
+
+    def test_ep(self):
+        validate_num_gpus(world_size=8, tp_size=1, pp_size=1, cp_size=1, ep_size=2, dp_size=None, dp_replicate_size=None)
+
+    def test_ep_with_cp(self):
+        validate_num_gpus(world_size=8, tp_size=1, pp_size=1, cp_size=2, ep_size=4, dp_size=None, dp_replicate_size=None)
+
+    def test_full_parallelism(self):
+        validate_num_gpus(
+            world_size=64, tp_size=2, pp_size=2, cp_size=2, ep_size=4, dp_size=None, dp_replicate_size=2
+        )
+
+    def test_none_sizes_treated_as_1(self):
+        validate_num_gpus(
+            world_size=4, tp_size=None, pp_size=None, cp_size=None, ep_size=None, dp_size=None, dp_replicate_size=None
+        )
+
+    def test_zero_sizes_treated_as_1(self):
+        validate_num_gpus(
+            world_size=4, tp_size=0, pp_size=0, cp_size=0, ep_size=0, dp_size=None, dp_replicate_size=None
+        )
+
+
+# ---------------------------------------------------------------------------
+# validate_num_gpus – error cases
+# ---------------------------------------------------------------------------
+
+
+class TestValidateNumGpusErrors:
+    def test_zero_world_size(self):
+        with pytest.raises(ValueError, match="must be a positive integer"):
+            validate_num_gpus(
+                world_size=0, tp_size=1, pp_size=1, cp_size=1, ep_size=1, dp_size=None, dp_replicate_size=None
+            )
+
+    def test_negative_world_size(self):
+        with pytest.raises(ValueError, match="must be a positive integer"):
+            validate_num_gpus(
+                world_size=-1, tp_size=1, pp_size=1, cp_size=1, ep_size=1, dp_size=None, dp_replicate_size=None
+            )
+
+    def test_tp_exceeds_gpus(self):
+        with pytest.raises(ValueError, match="Not enough GPUs"):
+            validate_num_gpus(
+                world_size=4, tp_size=8, pp_size=1, cp_size=1, ep_size=1, dp_size=None, dp_replicate_size=None
+            )
+
+    def test_product_exceeds_gpus(self):
+        with pytest.raises(ValueError, match="Not enough GPUs"):
+            validate_num_gpus(
+                world_size=4, tp_size=2, pp_size=2, cp_size=2, ep_size=1, dp_size=None, dp_replicate_size=None
+            )
+
+    def test_world_not_divisible(self):
+        with pytest.raises(ValueError, match="not divisible"):
+            validate_num_gpus(
+                world_size=7, tp_size=2, pp_size=1, cp_size=1, ep_size=1, dp_size=None, dp_replicate_size=None
+            )
+
+    def test_world_not_divisible_suggests_fix(self):
+        with pytest.raises(ValueError, match="nearest valid"):
+            validate_num_gpus(
+                world_size=5, tp_size=2, pp_size=1, cp_size=1, ep_size=1, dp_size=None, dp_replicate_size=None
+            )
+
+    def test_explicit_dp_mismatch(self):
+        with pytest.raises(ValueError, match="do not match"):
+            validate_num_gpus(
+                world_size=8, tp_size=2, pp_size=1, cp_size=1, ep_size=1, dp_size=2, dp_replicate_size=None
+            )
+
+    def test_explicit_dp_mismatch_suggests_auto(self):
+        with pytest.raises(ValueError, match="auto-infer"):
+            validate_num_gpus(
+                world_size=8, tp_size=2, pp_size=1, cp_size=1, ep_size=1, dp_size=2, dp_replicate_size=None
+            )
+
+    def test_hsdp_not_divisible(self):
+        with pytest.raises(ValueError, match="does not evenly divide"):
+            validate_num_gpus(
+                world_size=8, tp_size=1, pp_size=1, cp_size=1, ep_size=1, dp_size=None, dp_replicate_size=3
+            )
+
+    def test_hsdp_replicate_equals_dp(self):
+        with pytest.raises(ValueError, match="strictly less than"):
+            validate_num_gpus(
+                world_size=8, tp_size=1, pp_size=1, cp_size=1, ep_size=1, dp_size=None, dp_replicate_size=8
+            )
+
+    def test_ep_exceeds_dp_cp(self):
+        with pytest.raises(ValueError, match="exceeds"):
+            validate_num_gpus(
+                world_size=4, tp_size=2, pp_size=1, cp_size=1, ep_size=4, dp_size=None, dp_replicate_size=None
+            )
+
+    def test_ep_not_divisible(self):
+        with pytest.raises(ValueError, match="not divisible by ep_size"):
+            validate_num_gpus(
+                world_size=12, tp_size=1, pp_size=1, cp_size=1, ep_size=5, dp_size=None, dp_replicate_size=None
+            )
+
+    def test_ep_not_divisible_suggests_valid(self):
+        with pytest.raises(ValueError, match="Valid ep_size"):
+            validate_num_gpus(
+                world_size=12, tp_size=1, pp_size=1, cp_size=1, ep_size=5, dp_size=None, dp_replicate_size=None
+            )
+
+    def test_negative_tp_size(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            validate_num_gpus(
+                world_size=8, tp_size=-1, pp_size=1, cp_size=1, ep_size=1, dp_size=None, dp_replicate_size=None
+            )
+
+    # -- total-product-of-axes checks ----------------------------------------
+
+    def test_all_axes_product_exceeds_world_size(self):
+        """tp * pp * cp * dp = 2 * 2 * 2 * 4 = 32 ≠ 16 GPUs."""
+        with pytest.raises(ValueError, match="do not match"):
+            validate_num_gpus(
+                world_size=16, tp_size=2, pp_size=2, cp_size=2, ep_size=1, dp_size=4, dp_replicate_size=None
+            )
+
+    def test_all_axes_product_less_than_world_size(self):
+        """tp * pp * cp * dp = 2 * 2 * 1 * 1 = 4 ≠ 8 GPUs."""
+        with pytest.raises(ValueError, match="do not match"):
+            validate_num_gpus(
+                world_size=8, tp_size=2, pp_size=2, cp_size=1, ep_size=1, dp_size=1, dp_replicate_size=None
+            )
+
+    def test_all_axes_product_matches_world_size(self):
+        """tp * pp * cp * dp = 2 * 2 * 2 * 2 = 16 == 16 GPUs — should pass."""
+        validate_num_gpus(
+            world_size=16, tp_size=2, pp_size=2, cp_size=2, ep_size=1, dp_size=2, dp_replicate_size=None
+        )
+
+    def test_all_axes_with_ep_product_matches(self):
+        """tp * pp * cp * dp = 2 * 2 * 2 * 4 = 32 GPUs, ep=4 divides dp*cp=8 — should pass."""
+        validate_num_gpus(
+            world_size=32, tp_size=2, pp_size=2, cp_size=2, ep_size=4, dp_size=4, dp_replicate_size=None
+        )
+
+    def test_all_axes_with_ep_product_mismatch(self):
+        """tp * pp * cp * dp = 2 * 2 * 2 * 4 = 32 ≠ 64 GPUs."""
+        with pytest.raises(ValueError, match="do not match"):
+            validate_num_gpus(
+                world_size=64, tp_size=2, pp_size=2, cp_size=2, ep_size=4, dp_size=4, dp_replicate_size=None
+            )
