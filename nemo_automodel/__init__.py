@@ -33,6 +33,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "NeMoAutoModelForTextToWaveform": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForTextToWaveform"),
     "NeMoAutoModelBiencoder": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelBiencoder"),
     "NeMoAutoTokenizer": ("nemo_automodel._transformers.auto_tokenizer", "NeMoAutoTokenizer"),
+    "NeMoAutoDiffusionPipeline": ("nemo_automodel._diffusers.auto_diffusion_pipeline", "NeMoAutoDiffusionPipeline"),
 }
 
 __all__ = sorted([*_SUBMODULES, "__version__", "__package_name__", *_LAZY_ATTRS.keys()])

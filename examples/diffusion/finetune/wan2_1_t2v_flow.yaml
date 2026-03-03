@@ -1,0 +1,70 @@
+seed: 42
+
+wandb:
+  project: wan-t2v-flow-matching
+  mode: online
+  name: wan2_1_t2v_fm_v2
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+  mode: finetune  # "finetune" loads pretrained weights, "pretrain" initializes random weights
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  num_epochs: 100
+  log_every: 2
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_dataloader
+    meta_folder: PATH_TO_YOUR_DATA
+    num_workers: 2
+    device: cpu
+
+optim:
+  learning_rate: 5e-6
+  optimizer:
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 0
+  min_lr: 1e-6
+
+# Flow matching V2 configuration
+flow_matching:
+  adapter_type: "simple"  # Options: "hunyuan", "simple"
+  adapter_kwargs: {}
+  timestep_sampling: "uniform"  # Options: "uniform", "logit_normal", "lognorm", "mix", "mode"
+  logit_mean: 0.0
+  logit_std: 1.0
+  flow_shift: 3.0
+  mix_uniform_ratio: 0.1
+  sigma_min: 0.0
+  sigma_max: 1.0
+  num_train_timesteps: 1000
+  i2v_prob: 0.3
+  use_loss_weighting: true
+  log_interval: 100
+  summary_log_interval: 10
+
+fsdp:
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  dp_replicate_size: 1
+  dp_size: 8
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
+  model_save_format: torch_save
+  save_consolidated: false
+  restore_from: null

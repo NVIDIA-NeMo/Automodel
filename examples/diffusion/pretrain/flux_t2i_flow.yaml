@@ -1,0 +1,89 @@
+model:
+  pretrained_model_name_or_path: "black-forest-labs/FLUX.1-dev"
+  mode: "pretrain"
+  cache_dir: null
+
+  pipeline_spec:
+    transformer_cls: "FluxTransformer2DModel"
+    subfolder: "transformer"
+    load_full_pipeline: false
+    enable_gradient_checkpointing: false
+
+optim:
+  learning_rate: 2e-5
+
+  optimizer:
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 0
+  min_lr: 1e-6
+
+fsdp:
+  dp_size: 32
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  activation_checkpointing: false
+  cpu_offload: false
+
+flow_matching:
+  adapter_type: "flux"
+  adapter_kwargs:
+    #Critical: use 1 guidance scale for pretraining
+    guidance_scale: 1
+    use_guidance_embeds: false
+  timestep_sampling: "uniform"
+  logit_mean: 0.0
+  logit_std: 1.0
+  flow_shift: 1.0
+  mix_uniform_ratio: 0.1
+  sigma_min: 0.0
+  sigma_max: 1.0
+  num_train_timesteps: 1000
+  i2v_prob: 0.0
+  #Critical: use_loss_weighting needs to be false for pretraining
+  use_loss_weighting: false
+  log_interval: 100
+  summary_log_interval: 10
+
+step_scheduler:
+  num_epochs: 500000
+  local_batch_size: 2
+  global_batch_size: 64
+  ckpt_every_steps: 1000
+  log_every: 1
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_flux_multiresolution_dataloader
+    cache_dir: PATH_TO_YOUR_DATA
+    train_text_encoder: false
+    num_workers: 1
+    # Supported resolutions include [256x256], [512x512], and [1024x1024].
+    # While a 1:1 aspect ratio is currently used as a proxy for the closest image size,
+    # the implementation is designed to support multiple aspect ratios.
+    base_resolution: [256, 256]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
+  model_save_format: torch_save
+  save_consolidated: false
+  restore_from:
+
+wandb:
+  project: flux-pretraining
+  mode: online
+  name: flux_pretrain_ddp_test_run_1
+
+dist_env:
+  backend: "nccl"
+  init_method: "env://"
+
+seed: 42
