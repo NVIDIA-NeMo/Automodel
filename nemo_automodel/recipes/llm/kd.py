@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Knowledge Distillation recipe for next-token prediction with NeMo-AutoModel.
+"""Knowledge Distillation recipe for next-token prediction with NeMo AutoModel.
 
 This recipe fine-tunes a *student* model using the logits of a frozen *teacher* model. It
 extends ``FinetuneRecipeForNextTokenPrediction`` adding:
@@ -29,8 +29,8 @@ The file exposes ``KnowledgeDistillationRecipeForNextTokenPrediction`` and a
 recipes:
 
     python -m torch.distributed.run --nproc-per-node=8 \
-        nemo_automodel/recipes/llm/knowledge_distillation.py \
-        -c examples/llm/llama_3_2_1b_kd.yaml
+        nemo_automodel/recipes/llm/kd.py \
+        -c examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml
 """
 
 from __future__ import annotations

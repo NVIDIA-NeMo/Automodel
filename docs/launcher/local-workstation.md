@@ -1,10 +1,10 @@
-# Run on Your Local Workstation
+# Run AutoModel on Your Local Workstation
 
-NeMo Automodel supports training and fine-tuning jobs on configurations ranging from single-GPU workstations to multi-node, multi-GPU clusters.
+NeMo AutoModel supports training and fine-tuning jobs on configurations ranging from single-GPU workstations to multi-node, multi-GPU clusters.
 Use this guide for local, single-node workflows. For setup details, refer to our [Installation Guide](../guides/installation.md).
 For executing distributed multi-node jobs, please refer to our [Run on a Cluster](./cluster.md) guide.
 
-NeMo Automodel uses recipes to run end-to-end workflows. If you're new to recipes, see the [Repository Structure](../repository-structure.md) guide.
+NeMo AutoModel uses recipes to run end-to-end workflows. If you're new to recipes, see the [Repository Structure](../repository-structure.md) guide.
 
 ## Quick Start: Choose Your Job Launch Option
 
@@ -16,16 +16,16 @@ NeMo Automodel uses recipes to run end-to-end workflows. If you're new to recipe
 - **Direct recipe script**
   - Single GPU
     ```bash
-    python nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+    python examples/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
     ```
   - Multi-GPU (single node)
     ```bash
-    torchrun --nproc-per-node=2 nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+    torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
     ```
 
-## Run with Automodel CLI (Single Node)
+## Run with AutoModel CLI (Single Node)
 
-The Automodel CLI is the preferred method for most users. It offers a unified interface to launch training scaling from a local workstation (this guide) to large clusters (see our [cluster guide](./cluster.md)).
+The AutoModel CLI is the preferred method for most users. It offers a unified interface to launch training scaling from a local workstation (this guide) to large clusters (see our [cluster guide](./cluster.md)).
 
 ### Basic Usage
 
@@ -67,7 +67,7 @@ When you need more control over the environment or are actively developing with 
 ### Train on a Single GPU
 
 ```bash
-uv run nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+uv run examples/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 ### Train on Multiple GPUs with Torchrun (Single Node)
@@ -75,7 +75,7 @@ uv run nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/
 For multi-GPU single-node training, use `torchrun` directly:
 
 ```bash
-uv run torchrun --nproc-per-node=2 nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 ### Why Use uv?
@@ -90,21 +90,21 @@ uv provides several advantages for development and experimentation:
 
 ## Run with Torchrun
 
-If you have NeMo Automodel installed in your environment and prefer to run recipes directly without uv, you can use `torchrun` directly:
+If you have NeMo AutoModel installed in your environment and prefer to run recipes directly without uv, you can use `torchrun` directly:
 
 ### Train on a Single GPU
 
 ```bash
-python nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+python examples/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 ### Train on Multiple GPUs (Single Node)
 
 ```bash
-torchrun --nproc-per-node=2 nemo_automodel/recipes/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
-This approach requires that you have already installed NeMo Automodel and its dependencies in your Python environment (see the [installation guide](../guides/installation.md) for details).
+This approach requires that you have already installed NeMo AutoModel and its dependencies in your Python environment (see the [installation guide](../guides/installation.md) for details).
 
 ## Customize Configuration Settings
 
@@ -122,7 +122,7 @@ For example, if you want to fine-tune `Qwen/Qwen3-0.6B` instead of `meta-llama/L
 
 ## When to Use Which Approach
 
-**Use the Automodel CLI when:**
+**Use the AutoModel CLI when:**
 - You want a simple, unified interface
 - You are running locally on a single machine
 - You don't need to modify the underlying code
