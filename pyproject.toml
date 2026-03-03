@@ -79,6 +79,7 @@ dependencies = [
     "ftfy",
     "imageio-ffmpeg",
     "megatron-fsdp>=0.2.3",
+    "mistral-common[image,audio,hf-hub,sentencepiece]",
     "opencv-python-headless==4.10.0.84",
     "pybind11",
     "pyyaml",

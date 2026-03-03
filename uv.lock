@@ -2796,8 +2796,21 @@ wheels = [
 ]
 
 [package.optional-dependencies]
+audio = [
+    { name = "soundfile" },
+    { name = "soxr" },
+]
+hf-hub = [
+    { name = "huggingface-hub" },
+]
+image = [
+    { name = "opencv-python-headless" },
+]
 opencv = [
     { name = "opencv-python-headless" },
+]
+sentencepiece = [
+    { name = "sentencepiece" },
 ]
 
 [[package]]
@@ -3180,6 +3193,7 @@ dependencies = [
     { name = "ftfy" },
     { name = "imageio-ffmpeg" },
     { name = "megatron-fsdp" },
+    { name = "mistral-common", extra = ["audio", "hf-hub", "image", "sentencepiece"] },
     { name = "mlflow" },
     { name = "opencv-python-headless" },
     { name = "pybind11" },
@@ -3317,6 +3331,7 @@ requires-dist = [
     { name = "imageio-ffmpeg" },
     { name = "mamba-ssm", marker = "extra == 'cuda'" },
     { name = "megatron-fsdp", specifier = ">=0.2.3" },
+    { name = "mistral-common", extras = ["audio", "hf-hub", "image", "sentencepiece"] },
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'", specifier = ">=1.9.0" },
     { name = "mlflow" },
     { name = "nemo-automodel", extras = ["cuda"], marker = "extra == 'all'" },

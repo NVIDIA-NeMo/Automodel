@@ -86,7 +86,7 @@ def _build_shifted_pair(text_ids: list[int]):
 
 
 #  Parametrised fixture - one entry per tokenizer family
-
+# /home/TestData/automodel/tokenizers/Mistral-7B-Instruct-v0.1
 _TEST_DATA_DIR = os.environ.get("TEST_DATA_DIR", "/home/TestData/automodel")
 _TOKENIZER_BASE = Path(_TEST_DATA_DIR) / "tokenizers"
 
@@ -101,8 +101,7 @@ TOKENIZER_MODELS = [
 @pytest.fixture(params=TOKENIZER_MODELS)
 def tok(request):
     path = Path(request.param)
-    if not path.exists():
-        pytest.skip(f"Missing tokenizer data: {path}")
+    assert path.exists(), f"Missing tokenizer data: {path}"
     return NeMoAutoTokenizer.from_pretrained(request.param, trust_remote_code=True)
 
 
