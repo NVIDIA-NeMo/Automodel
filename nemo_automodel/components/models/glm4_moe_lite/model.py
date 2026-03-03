@@ -20,6 +20,7 @@ import torch.nn as nn
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
+    get_rope_config,
     initialize_linear_module,
     initialize_rms_norm_module,
 )
@@ -140,11 +141,7 @@ class Glm4MoeLiteModel(nn.Module):
         self.qk_rope_head_dim = config.qk_rope_head_dim
 
         # Precompute freqs for MLA's rotary embedding
-        rope_scaling = getattr(config, "rope_scaling", None)
-        if hasattr(config, "rope_parameters"):
-            rope_theta = config.rope_parameters["rope_theta"]
-        else:
-            rope_theta = config.rope_theta
+        rope_theta, rope_scaling, _ = get_rope_config(config)
 
         self.freqs = precompute_freqs_cis(
             qk_rope_head_dim=self.qk_rope_head_dim,

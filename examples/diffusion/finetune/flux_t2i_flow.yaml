@@ -1,0 +1,85 @@
+model:
+  pretrained_model_name_or_path: "black-forest-labs/FLUX.1-dev"
+  mode: "finetune"
+  cache_dir: null
+  attention_backend: "_flash_3_hub"
+
+  pipeline_spec:
+    transformer_cls: "FluxTransformer2DModel"
+    subfolder: "transformer"
+    load_full_pipeline: false
+    enable_gradient_checkpointing: false
+
+optim:
+  learning_rate: 1e-5
+
+  optimizer:
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+#adjust dp_size to the total number of GPUs
+fsdp:
+  dp_size: 8
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  activation_checkpointing: false
+  cpu_offload: false
+
+flow_matching:
+  adapter_type: "flux"
+  adapter_kwargs:
+    #Critical: use 3.5 guidance scale for finetuning
+    guidance_scale: 3.5
+    use_guidance_embeds: true
+  timestep_sampling: "logit_normal"
+  logit_mean: 0.0
+  logit_std: 1.0
+  flow_shift: 3.0
+  mix_uniform_ratio: 0.1
+  sigma_min: 0.0
+  sigma_max: 1.0
+  num_train_timesteps: 1000
+  i2v_prob: 0.0
+  use_loss_weighting: true
+  log_interval: 100
+  summary_log_interval: 10
+
+step_scheduler:
+  num_epochs: 5000
+  local_batch_size: 1
+  global_batch_size: 8
+  ckpt_every_steps: 2000
+  log_every: 1
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_flux_multiresolution_dataloader
+    cache_dir: PATH_TO_YOUR_DATA
+    train_text_encoder: false
+    num_workers: 10
+    # Supported resolutions include [256x256], [512x512], and [1024x1024].
+    # While a 1:1 aspect ratio is currently used as a proxy for the closest image size,
+    # the implementation is designed to support multiple aspect ratios.
+    base_resolution: [512, 512]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
+  model_save_format: torch_save
+  save_consolidated: false
+  restore_from: null
+
+wandb:
+  project: flux-finetuning
+  mode: online
+  name: flux_pretrain_ddp_test_run_1
+
+dist_env:
+  backend: "nccl"
+  init_method: "env://"
+
+seed: 42
