@@ -25,6 +25,7 @@ from torch.utils.data import Dataset
 from nemo_automodel.components.datasets.llm.formatting_utils import (
     _add_pad_token,
     _has_chat_template,
+    _resolve_chat_template,
     format_chat_template,
 )
 
@@ -181,8 +182,7 @@ class ChatDataset(Dataset):
 
         # Enforce chat-template availability for tool-calling data
         if chat_template is not None:
-            # Allow overriding the tokenizer's template
-            tokenizer.chat_template = chat_template
+            tokenizer.chat_template = _resolve_chat_template(chat_template)
 
         if not _has_chat_template(tokenizer):
             raise ValueError("ChatDataset requires a tokenizer with chat template support.")

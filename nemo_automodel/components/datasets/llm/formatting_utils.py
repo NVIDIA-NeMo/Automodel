@@ -12,13 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+_JINJA_CHARS = "{}\n"
+
+
+def _resolve_chat_template(chat_template: Optional[str]) -> Optional[str]:
+    """Resolve a chat template string that may be a file path.
+
+    If *chat_template* points to an existing file, its contents are returned.
+    If opening it as a file fails and the string contains Jinja-like characters
+    (``{``, ``}``, or newlines) it is treated as a literal template.  Otherwise
+    a :class:`ValueError` is raised so the caller knows the path was invalid.
+
+    Args:
+        chat_template: A Jinja template string or path to a template file.
+
+    Returns:
+        The resolved template string, or ``None`` when the input is ``None``.
+    """
+    if chat_template is None:
+        return None
+
+    p = Path(chat_template)
+    if p.exists():
+        content = p.read_text(encoding="utf-8")
+        try:
+            content = json.loads(content)["chat_template"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+        return content
+    return chat_template
+
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
