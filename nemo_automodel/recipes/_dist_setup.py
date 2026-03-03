@@ -77,7 +77,14 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     strategy_cls = STRATEGY_MAP[strategy_name]
 
     # -- parallelism sizes --------------------------------------------------
-    parallelism = {k: cfg.pop(k, default) for k, default in _PARALLELISM_DEFAULTS.items()}
+    # Use `val if val is not None` so that explicit YAML nulls (``ep_size:``
+    # or ``ep_size: null``) fall back to the default instead of propagating
+    # None — dict.pop only returns the default when the key is *absent*.
+    parallelism = {
+        k: (v if v is not None else default)
+        for k, default in _PARALLELISM_DEFAULTS.items()
+        for v in [cfg.pop(k, default)]
+    }
 
     # -- sub-configs --------------------------------------------------------
     pipeline_dict: Optional[dict] = cfg.pop("pipeline", None)
