@@ -32,7 +32,6 @@ from torch import Tensor
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers import PreTrainedModel
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     ModelOutput,
@@ -179,16 +178,25 @@ class LlamaBidirectionalModel(LlamaModel):
         for layer in self.layers:
             layer.self_attn.is_causal = False
 
-    def _update_causal_mask(
-        self,
-        attention_mask: torch.Tensor,
-        input_tensor: Optional[torch.Tensor] = None,
-        **kwargs,
-    ):
+    def _update_causal_mask(self, attention_mask: torch.Tensor, **kwargs):
+        """Override causal mask to allow bidirectional attention.
+
+        For flash_attention_2 the raw 2-D padding mask (or None) is returned
+        because FA2 computes cu_seqlens from it internally.
+
+        For eager / sdpa the 2-D mask is expanded to a 4-D float tensor
+        ``(batch, 1, seq, seq)`` with 0 for attended and ``-inf`` for padding.
+
+        All paths use only pointwise tensor ops (no ``.any()`` / ``.all()``)
+        so the method is compatible with ``torch.export`` / ONNX tracing.
+        """
         if attention_mask is None:
             return None
-        dtype = input_tensor.dtype if input_tensor is not None else torch.float32
-        return _prepare_4d_attention_mask(attention_mask, dtype)
+        if getattr(self.config, "_attn_implementation", None) == "flash_attention_2":
+            return attention_mask
+        bsz, src_len = attention_mask.shape
+        expanded = attention_mask[:, None, None, :].expand(bsz, 1, src_len, src_len).to(torch.float32)
+        return (1.0 - expanded) * torch.finfo(torch.float32).min
 
     @check_model_inputs
     @auto_docstring
@@ -221,7 +229,8 @@ class LlamaBidirectionalModel(LlamaModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(attention_mask=attention_mask, input_tensor=inputs_embeds)
+        causal_mask = self._update_causal_mask(attention_mask=attention_mask)
+        kwargs["is_causal"] = False
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)

@@ -84,16 +84,22 @@ def test_llama_bidirectional_model_init_and_mask():
     )
     model = lbm.LlamaBidirectionalModel(cfg)
     assert all(getattr(layer.self_attn, "is_causal", True) is False for layer in model.layers)
+
+    # Default attn_implementation is NOT flash_attention_2, so the method
+    # should return a 4-D additive mask (0 for attended, -inf for padding).
     mask = torch.tensor([[1, 1, 0]])
     out_mask = model._update_causal_mask(mask)
-    # _update_causal_mask returns a 4D additive attention mask (0 for keep, -inf for masked)
     assert out_mask.shape == (1, 1, 3, 3)
     assert torch.allclose(out_mask[0, 0, :, :2], torch.zeros(3, 2, dtype=out_mask.dtype))
     assert torch.all(out_mask[0, 0, :, 2] < 0)
 
+    # All-ones mask still produces a 4-D tensor of zeros (no positions masked)
     out_mask_all_ones = model._update_causal_mask(torch.ones_like(mask))
     assert out_mask_all_ones.shape == (1, 1, 3, 3)
     assert torch.allclose(out_mask_all_ones, torch.zeros_like(out_mask_all_ones))
+
+    # None input -> returns None
+    assert model._update_causal_mask(None) is None
 
 
 # --- Fakes for classification and biencoder tests ---

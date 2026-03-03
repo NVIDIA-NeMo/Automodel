@@ -227,16 +227,18 @@ class TestCustomizerRetrieval:
     @pytest.fixture(scope="class")
     def checkpoint_dir(self):
         """Run training once for all tests in this class and return the
-        checkpoint path.  Clean up after all tests complete."""
+        checkpoint path.  Clean up before *and* after so stale checkpoints
+        from a previous CI run never cause auto-resume failures."""
+        for d in (Path(CHECKPOINT_DIR), Path(ONNX_OUTPUT_DIR)):
+            if d.exists():
+                shutil.rmtree(d, ignore_errors=True)
         ckpt = _run_training()
-        yield ckpt
-        # Cleanup after all tests in the class.
-        ckpt_root = Path(CHECKPOINT_DIR)
-        if ckpt_root.exists():
-            shutil.rmtree(ckpt_root, ignore_errors=True)
-        onnx_dir = Path(ONNX_OUTPUT_DIR)
-        if onnx_dir.exists():
-            shutil.rmtree(onnx_dir, ignore_errors=True)
+        try:
+            yield ckpt
+        finally:
+            for d in (Path(CHECKPOINT_DIR), Path(ONNX_OUTPUT_DIR)):
+                if d.exists():
+                    shutil.rmtree(d, ignore_errors=True)
 
     @pytest.fixture(scope="class")
     def dist_device(self):
@@ -320,7 +322,7 @@ class TestCustomizerRetrieval:
             normalize=True,
             opset=17,
             export_dtype="fp32",
-            verify=False,  # we do our own checks below
+            verify=True,  # we do our own checks below
         )
 
         # 1. File exists.
