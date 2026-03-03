@@ -218,33 +218,50 @@ def test_pipeline_spec_validate_for_from_config_passes_with_cls():
 def test_create_parallel_manager_fsdp2_default():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
 
-    with patch(f"{MODULE_PATH}.FSDP2Manager") as MockFSDP2:
+    mock_mesh = Mock()
+    mock_moe_mesh = Mock()
+    with (
+        patch(f"{MODULE_PATH}.FSDP2Manager") as MockFSDP2,
+        patch(f"{MODULE_PATH}.FSDP2Config") as MockConfig,
+        patch(f"{MODULE_PATH}.create_device_mesh", return_value=(mock_mesh, mock_moe_mesh)),
+    ):
         MockFSDP2.return_value = Mock()
-        manager = _create_parallel_manager({"some_arg": "value"})
+        manager = _create_parallel_manager({"world_size": 1})
 
-    MockFSDP2.assert_called_once_with(some_arg="value")
+    MockConfig.assert_called_once()
+    MockFSDP2.assert_called_once_with(MockConfig.return_value, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
     assert manager is MockFSDP2.return_value
 
 
 def test_create_parallel_manager_ddp():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
 
-    with patch(f"{MODULE_PATH}.DDPManager") as MockDDP:
+    with (
+        patch(f"{MODULE_PATH}.DDPManager") as MockDDP,
+        patch(f"{MODULE_PATH}.DDPConfig") as MockConfig,
+    ):
         MockDDP.return_value = Mock()
         manager = _create_parallel_manager({"_manager_type": "ddp", "some_arg": "value"})
 
-    MockDDP.assert_called_once_with(some_arg="value")
+    MockConfig.assert_called_once_with(activation_checkpointing=False, backend="nccl")
+    MockDDP.assert_called_once_with(MockConfig.return_value)
     assert manager is MockDDP.return_value
 
 
 def test_create_parallel_manager_explicit_fsdp2():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
 
-    with patch(f"{MODULE_PATH}.FSDP2Manager") as MockFSDP2:
+    mock_mesh = Mock()
+    mock_moe_mesh = Mock()
+    with (
+        patch(f"{MODULE_PATH}.FSDP2Manager") as MockFSDP2,
+        patch(f"{MODULE_PATH}.FSDP2Config") as MockConfig,
+        patch(f"{MODULE_PATH}.create_device_mesh", return_value=(mock_mesh, mock_moe_mesh)),
+    ):
         MockFSDP2.return_value = Mock()
-        manager = _create_parallel_manager({"_manager_type": "fsdp2"})
+        manager = _create_parallel_manager({"_manager_type": "fsdp2", "world_size": 1})
 
-    MockFSDP2.assert_called_once_with()
+    MockFSDP2.assert_called_once_with(MockConfig.return_value, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
 
 
 def test_create_parallel_manager_unknown_type_raises():
