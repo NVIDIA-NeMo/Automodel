@@ -22,8 +22,6 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-_JINJA_CHARS = "{}\n"
-
 
 def _resolve_chat_template(chat_template: Optional[str]) -> Optional[str]:
     """Resolve a chat template string that may be a file path.
@@ -210,7 +208,10 @@ def _package_tokenized_example(
         assert input_ids[-1] != eos_token_id, f"input_ids[-1]={input_ids[-1]} == eos_token_id={eos_token_id}"
     assert len(input_ids) == len(labels), f"len(input_ids)={len(input_ids)} != len(labels)={len(labels)}"
 
-    if isinstance(seq_length, int) and padding not in [None, "do_not_pad", False]:
+    # Only pad to a fixed length for "max_length".  For "longest" / True the
+    # collator pads to the longest sample in the batch, so the dataset must
+    # return variable-length sequences (same as "do_not_pad").
+    if isinstance(seq_length, int) and padding in ("max_length",):
         input_ids = _pad_to_seq_length(input_ids, pad_token_id, seq_length)
         labels = _pad_to_seq_length(labels, -100, seq_length)
 
@@ -319,28 +320,23 @@ def format_chat_template(
 
     template_has_generation_kwd = GENERATION_REGEX.search(tokenizer.chat_template) is not None
 
-    # Disable padding here so that apply_chat_template returns only real
-    # tokens.  Padding is deferred to _package_tokenized_example (via
-    # seq_length) where both input_ids and labels are padded together and
-    # the attention_mask correctly marks pad positions as 0.
     tokenized_chat = tokenizer.apply_chat_template(
         formatted_text,
         tools=tools,
         tokenize=True,
         return_dict=True,
         return_assistant_tokens_mask=template_has_generation_kwd,
-        padding=False,
+        padding=padding,
         truncation=truncation,
         max_length=seq_length,
     )
 
-    # Choose the last conversation as answer other history are context by finding the last masked token
-    # which indicates end of context and beginning of answer
     input_ids = tokenized_chat.get("input_ids")
     if template_has_generation_kwd:
         mask = tokenized_chat["assistant_masks"]
     elif not template_has_generation_kwd and answer_only_loss_mask:
-        # in this case we need to manually split up the formatted_text. Only the final assistant turn should be considered as answer.
+        # Tokenize prompt-only without padding to get its real length,
+        # then derive the mask from the length difference.
         answer_text = formatted_text.pop()
         assert answer_text["role"] == "assistant", "The last message in the formatted_text must be an assistant message"
         tokenized_prompt = tokenizer.apply_chat_template(
@@ -358,19 +354,13 @@ def format_chat_template(
     else:
         mask = [1] * len(input_ids)
 
-    # When the tokenizer applied padding (e.g. padding="max_length"), the mask
-    # computed above may incorrectly mark padding positions as 1.  Use the
-    # tokenizer's own attention_mask to zero them out.
+    # Zero out the loss mask at padding positions using the tokenizer's
+    # own attention_mask so pad tokens are never treated as supervised.
     tokenizer_attn_mask = tokenized_chat.get("attention_mask")
     if tokenizer_attn_mask is not None:
         for i in range(min(len(mask), len(tokenizer_attn_mask))):
             if not tokenizer_attn_mask[i]:
                 mask[i] = 0
-
-    was_truncated = seq_length is not None and len(input_ids) >= seq_length
-    if getattr(tokenizer, "eos_token_id", None) and input_ids[-1] != tokenizer.eos_token_id and not was_truncated:
-        input_ids += [tokenizer.eos_token_id]
-        mask += [1]
 
     return _package_tokenized_example(
         tokenizer=tokenizer,

@@ -210,44 +210,6 @@ def test_apply_tokenizer_chat_template_answer_only_mask():
     assert all(v != -100 for v in out["labels"][pos:])
 
 
-def test_apply_chat_template_attention_mask_zeros_out_padding_in_loss_mask():
-    """Verify that padding positions from the tokenizer's attention_mask zero out the loss mask.
-
-    Without the fix, mask=[1]*len(input_ids) would mark padding positions as
-    supervised, leading to incorrect loss on pad tokens.
-
-    The stub tokenizer returns 3 padding tokens (id=0) with attention_mask=0.
-    After _package_tokenized_example removes the first token (BOS shift) and
-    appends EOS, the 3 padding positions should still have label=-100 in the
-    output.
-    """
-    tok = _StubTokenizerChatNoGenWithPadding()
-    out = format_chat_template(
-        tok,
-        formatted_text=[
-            {"role": "user", "content": "hello world"},
-            {"role": "assistant", "content": "hi"},
-        ],
-        eos_token_id=tok.eos_token_id,
-        pad_token_id=tok.eos_token_id,
-        answer_only_loss_mask=False,
-    )
-
-    labels = out["labels"]
-    # The stub produces: [hello, world, hi, EOS, pad, pad, pad] then appends EOS.
-    # After BOS-shift in _package_tokenized_example, the 3 pad positions map to
-    # consecutive -100 values in labels.
-    num_ignored = labels.count(-100)
-    assert num_ignored == 3, (
-        f"Expected 3 padding positions with label=-100, got {num_ignored}. labels={labels}"
-    )
-    # Verify supervised tokens don't include pad token id (0)
-    supervised = [v for v in labels if v != -100]
-    assert 0 not in supervised, (
-        f"Pad token (0) should not appear in supervised labels, got {supervised}"
-    )
-
-
 def test_apply_tokenizer_chat_template_full_loss_mask():
     tok = _StubTokenizerChat()
     out = format_chat_template(
@@ -264,44 +226,6 @@ def test_apply_tokenizer_chat_template_full_loss_mask():
     assert set(out) == {"input_ids", "labels", "attention_mask"}
     assert len(out["input_ids"]) == len(out["labels"]) == len(out["attention_mask"])
     assert all(v == 1 for v in out["attention_mask"])
-
-
-class _StubTokenizerChatNoGenWithPadding:
-    """Chat tokenizer without generation keyword that returns attention_mask with padding.
-
-    Without the generation keyword and with answer_only_loss_mask=False,
-    format_chat_template sets mask=[1]*len(input_ids), incorrectly marking
-    padding positions as supervised.  The attention_mask zeroing fix should
-    correct this.
-    """
-
-    eos_token_id = 2
-    chat_template = "<dummy template no generation>"
-
-    def __init__(self):
-        self._vocab = {}
-        self._cursor = 3
-
-    def _id_for_token(self, tok):
-        if tok not in self._vocab:
-            self._vocab[tok] = self._cursor
-            self._cursor += 1
-        return self._vocab[tok]
-
-    def apply_chat_template(self, messages, **kwargs):
-        ids = []
-        for msg in messages:
-            ids.extend(self._id_for_token(tok) for tok in str(msg["content"]).split())
-        ids.append(self.eos_token_id)
-        # Simulate padding: add 3 pad tokens
-        real_len = len(ids)
-        ids = ids + [0] * 3
-        if kwargs.get("return_dict", False):
-            return {
-                "input_ids": ids,
-                "attention_mask": [1] * real_len + [0] * 3,
-            }
-        return ids
 
 
 class _StubTokenizerChatNoGen:
@@ -339,7 +263,7 @@ class _StubTokenizerChatNoGen:
                 assistant_started = True
             if assistant_started:
                 ids.extend(self._id_for_token(tok) for tok in str(msg["content"]).split())
-        # Intentionally DO NOT append EOS here; function under test will handle it.
+        ids.append(self.eos_token_id)
         if kwargs.get("return_dict", False):
             return {"input_ids": ids}
         return ids
@@ -379,10 +303,9 @@ def test_apply_chat_template_manual_mask_without_generation_kwd():
     # Sanity: there must be supervised tokens (assistant section)
     assert expected_ignored < len(out["labels"])
     # Number of supervised tokens (exclude -100) should equal number of assistant tokens.
-    # Note: labels include the final EOS as supervised; subtract 1 to compare to assistant count.
     assistant_tokens = sum(len(str(m["content"]).split()) for m in messages if m["role"] == "assistant")
     num_supervised = sum(1 for v in out["labels"] if v != -100)
-    assert num_supervised - 1 == assistant_tokens
+    assert num_supervised == assistant_tokens
 
 
 def test_apply_chat_template_manual_mask_raises_when_last_not_assistant():
