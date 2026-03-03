@@ -108,8 +108,7 @@ class InteractiveLauncher(Launcher):
         # Run the recipe directly; do NOT re-launch torchrun.
         if self._is_torchrun_worker():
             logger.info(
-                "Detected existing torchrun environment (LOCAL_RANK=%s); "
-                "running recipe in-process.",
+                "Detected existing torchrun environment (LOCAL_RANK=%s); running recipe in-process.",
                 os.environ["LOCAL_RANK"],
             )
             return self._run_recipe_in_process(recipe_target, config)
