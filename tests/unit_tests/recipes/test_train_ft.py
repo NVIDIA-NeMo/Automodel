@@ -12,21 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 import importlib
+import logging
 import sys
 import types
-import torch
-import torch.nn as nn
-import pytest
 from contextlib import AbstractContextManager
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
+
+import pytest
+import torch
+import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
 
 # Skip decorator for tests that require CUDA
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+from torch.utils.data import IterableDataset
+
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     build_dataloader,
@@ -35,7 +38,6 @@ from nemo_automodel.recipes.llm.train_ft import (
     build_validation_dataloader,
     compute_trust_remote_code_from_model,
 )
-from torch.utils.data import IterableDataset
 
 
 class DummyIterableDataset(IterableDataset):  # noqa: D401
@@ -1205,6 +1207,91 @@ def test_build_model_and_optimizer_return_values():
 
 
 # =============================================================================
+# Tests for optimizer dtype string resolution in build_optimizer
+# =============================================================================
+
+
+class TestBuildOptimizerDtypeResolution:
+    """Tests that build_optimizer resolves dtype strings to torch.dtype for TE FusedAdam kwargs."""
+
+    def _make_cfg_opt(self, **extra_attrs):
+        cfg = DummyOptConfig()
+        for k, v in extra_attrs.items():
+            setattr(cfg, k, v)
+        return cfg
+
+    def _make_model(self):
+        model = DummyModel()
+        # Ensure at least one param requires grad
+        for p in model.parameters():
+            p.requires_grad_(True)
+        return model
+
+    def test_resolves_all_three_dtype_strings(self):
+        cfg_opt = self._make_cfg_opt(
+            master_weight_dtype="torch.float32",
+            exp_avg_dtype="torch.bfloat16",
+            exp_avg_sq_dtype="torch.float16",
+        )
+        model = self._make_model()
+
+        build_optimizer(model, cfg_opt, None, None)
+
+        assert cfg_opt.master_weight_dtype is torch.float32
+        assert cfg_opt.exp_avg_dtype is torch.bfloat16
+        assert cfg_opt.exp_avg_sq_dtype is torch.float16
+
+    def test_resolves_dtype_strings_without_torch_prefix(self):
+        cfg_opt = self._make_cfg_opt(
+            exp_avg_dtype="bfloat16",
+            exp_avg_sq_dtype="float16",
+        )
+        model = self._make_model()
+
+        build_optimizer(model, cfg_opt, None, None)
+
+        assert cfg_opt.exp_avg_dtype is torch.bfloat16
+        assert cfg_opt.exp_avg_sq_dtype is torch.float16
+
+    def test_preserves_torch_dtype_objects(self):
+        cfg_opt = self._make_cfg_opt(
+            master_weight_dtype=torch.float32,
+            exp_avg_dtype=torch.bfloat16,
+        )
+        model = self._make_model()
+
+        build_optimizer(model, cfg_opt, None, None)
+
+        # Should remain unchanged since they are already torch.dtype
+        assert cfg_opt.master_weight_dtype is torch.float32
+        assert cfg_opt.exp_avg_dtype is torch.bfloat16
+
+    def test_ignores_missing_dtype_attrs(self):
+        cfg_opt = self._make_cfg_opt()  # No dtype attrs
+        model = self._make_model()
+
+        # Should not raise
+        build_optimizer(model, cfg_opt, None, None)
+
+        assert not hasattr(cfg_opt, "master_weight_dtype")
+        assert not hasattr(cfg_opt, "exp_avg_dtype")
+        assert not hasattr(cfg_opt, "exp_avg_sq_dtype")
+
+    def test_resolves_partial_dtype_attrs(self):
+        cfg_opt = self._make_cfg_opt(
+            exp_avg_dtype="torch.bfloat16",
+            # master_weight_dtype and exp_avg_sq_dtype not set
+        )
+        model = self._make_model()
+
+        build_optimizer(model, cfg_opt, None, None)
+
+        assert cfg_opt.exp_avg_dtype is torch.bfloat16
+        assert not hasattr(cfg_opt, "master_weight_dtype")
+        assert not hasattr(cfg_opt, "exp_avg_sq_dtype")
+
+
+# =============================================================================
 # Tests for _get_model_name helper
 # =============================================================================
 
@@ -1392,3 +1479,235 @@ def test_get_model_name_from_nested_config():
 
     result = _get_model_name(cfg_model)
     assert result == "nested/model"
+
+
+# ---------------------------------------------------------------------------
+# _log_moe_metrics tests
+# ---------------------------------------------------------------------------
+
+
+def _make_moe_layer_loads(loads_list):
+    """Build a layer_loads dict from a list of 1-D lists (mirrors test_load_balance_metrics helper)."""
+    result = {}
+    for i, load in enumerate(loads_list):
+        result[f"layers.{i}.moe.gate"] = {
+            "expert_load": torch.tensor(load, dtype=torch.float32),
+            "aux_loss": None,
+            "n_experts": len(load),
+        }
+    return result
+
+
+def _make_trainer_for_moe(moe_cfg_dict, layer_loads=None):
+    """Create a bare recipe instance with cfg and _moe_layer_loads set."""
+    trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    trainer.cfg = ConfigNode({"moe_metrics": moe_cfg_dict})
+    trainer._moe_layer_loads = layer_loads
+    return trainer
+
+
+def test_log_moe_metrics_skips_when_no_loads():
+    """wandb_log_fn should not be called when _moe_layer_loads is None."""
+    trainer = _make_trainer_for_moe({"enabled": True, "mode": "brief"}, layer_loads=None)
+    log_fn = MagicMock()
+
+    trainer._log_moe_metrics(step=1, wandb_log_fn=log_fn)
+
+    log_fn.assert_not_called()
+
+
+def test_log_moe_metrics_brief_mode_default():
+    """Brief mode should call wandb_log_fn once with correct step."""
+    loads = _make_moe_layer_loads([[100.0, 200.0, 300.0, 400.0]])
+    trainer = _make_trainer_for_moe({"enabled": True, "mode": "brief", "top_k_experts": 2}, layer_loads=loads)
+    log_fn = MagicMock()
+
+    trainer._log_moe_metrics(step=42, wandb_log_fn=log_fn)
+
+    log_fn.assert_called_once()
+    _, kwargs = log_fn.call_args
+    assert kwargs["step"] == 42
+    metrics = log_fn.call_args[0][0]
+    assert "moe/cv_mean" in metrics
+
+
+def test_log_moe_metrics_passes_top_k_zero():
+    """top_k_experts=0 should produce no moe_expert_utilization/ keys."""
+    loads = _make_moe_layer_loads([[100.0, 200.0, 300.0, 400.0]])
+    trainer = _make_trainer_for_moe({"enabled": True, "mode": "brief", "top_k_experts": 0}, layer_loads=loads)
+    log_fn = MagicMock()
+
+    trainer._log_moe_metrics(step=1, wandb_log_fn=log_fn)
+
+    log_fn.assert_called_once()
+    metrics = log_fn.call_args[0][0]
+    util_keys = [k for k in metrics if k.startswith("moe_expert_utilization/")]
+    assert len(util_keys) == 0
+    assert "moe/cv_mean" in metrics
+
+
+def test_log_moe_metrics_passes_top_k_from_config():
+    """top_k_experts=3 should produce moe_expert_utilization/ keys."""
+    loads = _make_moe_layer_loads([[100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0]])
+    trainer = _make_trainer_for_moe({"enabled": True, "mode": "brief", "top_k_experts": 3}, layer_loads=loads)
+    log_fn = MagicMock()
+
+    trainer._log_moe_metrics(step=1, wandb_log_fn=log_fn)
+
+    log_fn.assert_called_once()
+    metrics = log_fn.call_args[0][0]
+    util_keys = [k for k in metrics if k.startswith("moe_expert_utilization/")]
+    assert len(util_keys) > 0
+    assert len(util_keys) <= 6  # at most 2 * top_k
+
+
+def test_log_moe_metrics_detailed_mode():
+    """Detailed mode should call compute_detailed_metrics (includes per-layer keys)."""
+    loads = _make_moe_layer_loads([[100.0, 200.0], [300.0, 400.0]])
+    trainer = _make_trainer_for_moe(
+        {"enabled": True, "mode": "detailed", "top_k_experts": 2}, layer_loads=loads
+    )
+    log_fn = MagicMock()
+
+    trainer._log_moe_metrics(step=10, wandb_log_fn=log_fn)
+
+    log_fn.assert_called_once()
+    metrics = log_fn.call_args[0][0]
+    assert "moe/layer_0/cv" in metrics
+    assert "moe/layer_1/cv" in metrics
+
+
+def test_log_moe_metrics_detailed_mode_non_detailed_step():
+    """On non-detailed steps, detailed mode should fall back to brief metrics."""
+    loads = _make_moe_layer_loads([[100.0, 200.0], [300.0, 400.0]])
+    trainer = _make_trainer_for_moe(
+        {"enabled": True, "mode": "detailed", "top_k_experts": 2, "detailed_every_steps": 10},
+        layer_loads=loads,
+    )
+    log_fn = MagicMock()
+
+    trainer._log_moe_metrics(step=5, wandb_log_fn=log_fn)
+
+    log_fn.assert_called_once()
+    metrics = log_fn.call_args[0][0]
+    # Brief metrics: no per-layer keys
+    assert "moe/layer_0/cv" not in metrics
+    assert "moe/cv_mean" in metrics
+
+
+class TestRunTrainOptimStepSetsMoEScale:
+    """Tests that _run_train_optim_step sets MoEAuxLossAutoScaler.main_loss_backward_scale."""
+
+    def setup_method(self):
+        from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+
+        MoEAuxLossAutoScaler.main_loss_backward_scale = None
+
+    def teardown_method(self):
+        from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+
+        MoEAuxLossAutoScaler.main_loss_backward_scale = None
+
+    def _make_recipe(self, monkeypatch, pp_enabled, dp_group_size=4):
+
+        from nemo_automodel.components.config.loader import ConfigNode
+
+        cfg = ConfigNode(
+            {
+                "nvtx": False,
+                "model": {},
+                "dataloader": {"collate_fn": "nemo_automodel.components.datasets.utils.default_collater"},
+                "dataset": {},
+                "validation_dataloader": {},
+                "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
+                "optimizer": {},
+                "loss_fn": {},
+                "checkpoint": {"best_metric_key": "default"},
+                "distributed": {"cp_size": 1},
+                "autopipeline": {"pp_microbatch_size": 1},
+            }
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.llm.train_ft.build_distributed",
+            lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+        )
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_te_dot_product_attention", lambda cfg: False)
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda cfg: False)
+
+        recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+
+        object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
+        object.__setattr__(recipe, "device_mesh", None)
+        object.__setattr__(recipe, "moe_mesh", None)
+        object.__setattr__(recipe, "pp_enabled", pp_enabled)
+        object.__setattr__(recipe, "te_fp8", None)
+        object.__setattr__(recipe, "model_parts", [nn.Linear(4, 4)])
+        object.__setattr__(recipe, "optimizer", [SimpleNamespace(step=lambda: None, zero_grad=lambda: None,
+                                                                  param_groups=[{"lr": 0.01}])])
+        object.__setattr__(recipe, "lr_schedulers", [])
+        object.__setattr__(recipe, "step_scheduler", SimpleNamespace(step=1, epoch=0))
+
+        if pp_enabled:
+            pp_info = SimpleNamespace(has_first_stage=True, has_last_stage=True)
+            object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info))
+            mock_mesh = MagicMock()
+            mock_mesh.reshape.return_value.__getitem__ = lambda self, idx: MagicMock(item=lambda: 0)
+            object.__setattr__(recipe, "device_mesh", SimpleNamespace(mesh=mock_mesh))
+        object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
+
+        monkeypatch.setattr(recipe, "_dp_allreduce", lambda val, include_cp=False: val if isinstance(val, torch.Tensor) else torch.tensor(val))
+        monkeypatch.setattr(recipe, "_get_dp_group_size", lambda include_cp=False: dp_group_size)
+        monkeypatch.setattr(recipe, "_get_cp_group_size", lambda: 1)
+
+        def mock_forward_backward_step(idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train=True):
+            loss_buffer.append(torch.tensor(0.5))
+
+        monkeypatch.setattr(recipe, "_forward_backward_step", mock_forward_backward_step)
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.llm.train_ft.scale_grads_and_clip_grad_norm",
+            lambda *a, **k: torch.tensor(1.0),
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.llm.train_ft.prepare_for_grad_accumulation", lambda *a, **k: None
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.llm.train_ft.prepare_for_final_backward", lambda *a, **k: None
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.llm.train_ft.prepare_after_first_microbatch", lambda *a, **k: None
+        )
+        object.__setattr__(recipe, "checkpointer", SimpleNamespace(maybe_wait_for_staging=lambda: None))
+        object.__setattr__(recipe, "lr_scheduler", None)
+        object.__setattr__(recipe, "timestamp", 0.0)
+        return recipe
+
+    def test_pp_enabled_sets_scale_to_num_label_tokens(self, monkeypatch):
+        from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+
+        recipe = self._make_recipe(monkeypatch, pp_enabled=True, dp_group_size=4)
+
+        # 3 valid labels out of 4
+        batches = [{"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[1, 2, 3, -100]])}]
+
+        # Mock PP loss reporting path
+        monkeypatch.setattr("torch.distributed.send", lambda *a, **k: None)
+        monkeypatch.setattr("torch.distributed.recv", lambda *a, **k: None)
+
+        recipe._run_train_optim_step(batches)
+
+        assert MoEAuxLossAutoScaler.main_loss_backward_scale is not None
+        assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(3.0)
+
+    def test_pp_disabled_sets_scale_to_dp_group_size(self, monkeypatch):
+        from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+
+        dp_size = 8
+        recipe = self._make_recipe(monkeypatch, pp_enabled=False, dp_group_size=dp_size)
+
+        batches = [{"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[1, 2, 3, -100]])}]
+
+        recipe._run_train_optim_step(batches)
+
+        assert MoEAuxLossAutoScaler.main_loss_backward_scale is not None
+        assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(float(dp_size))

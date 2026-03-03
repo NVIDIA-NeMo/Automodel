@@ -62,6 +62,7 @@ from nemo_automodel.components.loggers.mlflow_utils import build_mlflow
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
@@ -85,6 +86,8 @@ from nemo_automodel.components.utils.model_utils import (
 )
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.shared.te_patches import apply_te_patches
+from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -281,6 +284,13 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
         distributed_config: The distributed configuration.
         device_mesh: The device mesh.
     """
+    # Resolve dtype strings (e.g. "torch.bfloat16") to torch.dtype objects for
+    # optimizers like TE FusedAdam that accept dtype kwargs.
+    for attr in ("master_weight_dtype", "exp_avg_dtype", "exp_avg_sq_dtype"):
+        val = getattr(cfg_opt, attr, None)
+        if isinstance(val, str):
+            setattr(cfg_opt, attr, dtype_from_str(val))
+
     if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
         # TP does not support foreach
         cfg_opt.foreach = False
@@ -835,6 +845,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         setup_logging()
 
         apply_cache_compatibility_patches()
+        apply_te_patches()
         # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
         # Enable NVTX patching only when explicitly requested in config
@@ -1086,7 +1097,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         moe_metrics_cfg = self.cfg.get("moe_metrics", None)
         mode = moe_metrics_cfg.get("mode", "brief") if moe_metrics_cfg else "brief"
-        top_k = moe_metrics_cfg.get("top_k_experts", 5) if moe_metrics_cfg else 5
+        top_k = moe_metrics_cfg.get("top_k_experts", 0) if moe_metrics_cfg else 0
         if mode == "detailed":
             detailed_every = moe_metrics_cfg.get("detailed_every_steps", None) if moe_metrics_cfg else None
             if detailed_every is None or step % detailed_every == 0:
@@ -1301,6 +1312,27 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+
+        # MoE aux loss gradients are injected via MoEAuxLossAutoScaler, which
+        # multiplies them by main_loss_backward_scale during backward.  This
+        # counteracts the unwanted scaling that FSDP and PP post-hoc rescaling
+        # apply to *all* gradients (including aux loss):
+        #
+        #   Non-PP: FSDP allreduce divides grads by dp_group_size.
+        #           Scale = dp_group_size  →  net = 1.
+        #
+        #   PP:     FSDP divides by dp_group_size, then
+        #           scale_grads_and_clip_grad_norm divides by
+        #           (num_label_tokens / dp_group_size).  The dp_group_size
+        #           factors cancel, leaving net 1/num_label_tokens.
+        #           Scale = num_label_tokens  →  net = 1.
+        if self.pp_enabled:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(float(num_label_tokens))
+        else:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+                float(self._get_dp_group_size(include_cp=True))
+            )
+
         loss_buffer = []
 
         # number of tokens in the batch, excluding any tail padding.
