@@ -20,7 +20,7 @@ checkpoints, share your models on the Hugging Face Model Hub, and deploy
 them efficiently with vLLM.
 
 In addition to this user guide, you can also explore our Quickstart,
-which features a [standalone python3 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/finetune.py),
+which features a [standalone python3 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/finetune.py),
 offering hands-on demonstrations for quickly getting started with NeMo AutoModel. 
 
 ## Run SFT and PEFT with NeMo AutoModel
