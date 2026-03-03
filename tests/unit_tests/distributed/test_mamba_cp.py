@@ -218,14 +218,14 @@ class TestParameterSlicing:
             assert torch.equal(sliced, expected), f"D mismatch on rank {rank}"
 
     def test_conv1d_weight_slicing_shape(self):
-        """conv1d weight [conv_dim, 1, K] -> [conv_dim_local, 1, K] per rank."""
+        """conv1d weight [conv_dim, 1, K] -> [conv_dim_local, K] per rank (squeezed)."""
         for rank in range(self.CP_SIZE):
             mcp = self._build(rank)
             w = mcp.get_conv1d_weight()
             d_inner_local = self.d_inner // self.CP_SIZE
             n_groups_local = self.N_GROUPS // self.CP_SIZE
             conv_dim_local = d_inner_local + 2 * n_groups_local * self.D_STATE
-            assert w.shape == (conv_dim_local, 1, self.KERNEL_SIZE), f"Weight shape mismatch rank {rank}"
+            assert w.shape == (conv_dim_local, self.KERNEL_SIZE), f"Weight shape mismatch rank {rank}"
 
     def test_conv1d_bias_slicing_shape(self):
         """conv1d bias [conv_dim] -> [conv_dim_local] per rank."""
@@ -241,8 +241,9 @@ class TestParameterSlicing:
         """Verify that the x-portion of conv1d weight is correctly sliced per rank."""
         # The full weight is filled with arange(conv_dim * K).reshape(conv_dim, 1, K).
         # x-portion occupies rows [0, d_inner).  Each rank gets d_inner/cp_size rows.
+        # get_conv1d_weight() squeezes dim-1, so expected shape is [rows, K].
         full_weight = torch.arange(self.conv_dim * self.KERNEL_SIZE, dtype=torch.float32).reshape(
-            self.conv_dim, 1, self.KERNEL_SIZE
+            self.conv_dim, self.KERNEL_SIZE
         )
         d_inner_local = self.d_inner // self.CP_SIZE
 
@@ -335,7 +336,7 @@ class TestParameterSlicingWithReplication:
         d_inner_local = self.d_inner // self.CP_SIZE
         bc_size_local = mcp.n_groups_local * self.D_STATE
         expected_conv_dim_local = d_inner_local + 2 * bc_size_local
-        assert w.shape == (expected_conv_dim_local, 1, self.KERNEL_SIZE)
+        assert w.shape == (expected_conv_dim_local, self.KERNEL_SIZE)
 
 class TestGroupReplication:
     """Verify B/C state replication via expand+reshape when n_groups < cp_size."""

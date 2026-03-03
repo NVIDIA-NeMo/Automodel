@@ -19,19 +19,24 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.models.common import initialize_rms_norm_module
+from nemo_automodel.components.attention.utils import (
+    initialize_attn_module_and_func,
+    postprocess_output_for_attn,
+    preprocess_args_and_kwargs_for_attn,
+)
+from nemo_automodel.components.models.common import (
+    BackendConfig,
+    initialize_linear_module,
+    initialize_rms_norm_module,
+)
 
 
 class NemotronV3Attention(nn.Module):
-    """Multi-headed attention for NemotronV3 (Nano-v3).
+    """GQA attention for NemotronV3 (no RoPE), compatible with TE/SDPA backends."""
 
-    This is a standard GQA attention module following the NemotronH architecture.
-    Uses PyTorch's scaled_dot_product_attention (SDPA) for the attention computation.
-    Note: RoPE is not applied in this module, matching the HF NemotronHAttention implementation.
-    """
-
-    def __init__(self, config):
+    def __init__(self, config, backend: BackendConfig | None = None):
         super().__init__()
+        self.backend = backend or BackendConfig()
 
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
@@ -40,26 +45,27 @@ class NemotronV3Attention(nn.Module):
         self.attention_bias = getattr(config, "attention_bias", False)
         self.attention_dropout = getattr(config, "attention_dropout", 0.0)
 
-        # Q, K, V, O projections
-        self.q_proj = nn.Linear(
-            self.hidden_size,
-            self.num_attention_heads * self.head_dim,
-            bias=self.attention_bias,
+        self.q_proj = initialize_linear_module(
+            self.backend.linear, self.hidden_size, self.num_attention_heads * self.head_dim, self.attention_bias
         )
-        self.k_proj = nn.Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=self.attention_bias,
+        self.k_proj = initialize_linear_module(
+            self.backend.linear, self.hidden_size, self.num_key_value_heads * self.head_dim, self.attention_bias
         )
-        self.v_proj = nn.Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=self.attention_bias,
+        self.v_proj = initialize_linear_module(
+            self.backend.linear, self.hidden_size, self.num_key_value_heads * self.head_dim, self.attention_bias
         )
-        self.o_proj = nn.Linear(
-            self.num_attention_heads * self.head_dim,
-            self.hidden_size,
-            bias=self.attention_bias,
+        self.o_proj = initialize_linear_module(
+            self.backend.linear, self.num_attention_heads * self.head_dim, self.hidden_size, self.attention_bias
+        )
+
+        softmax_scale = self.head_dim**-0.5
+        self.attn_module, self.attn_func = initialize_attn_module_and_func(
+            attn_impl=self.backend.attn,
+            num_attention_heads=self.num_attention_heads,
+            num_qk_channels=self.head_dim,
+            num_v_channels=self.head_dim,
+            softmax_scale=softmax_scale,
+            num_gqa_groups=self.num_key_value_heads,
         )
 
     def forward(
@@ -68,44 +74,43 @@ class NemotronV3Attention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_values=None,
         layer_idx: int | None = None,
+        **attn_kwargs,
     ) -> torch.Tensor:
         bsz, seqlen, _ = hidden_states.size()
+        q, k, v = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
 
-        # Compute Q, K, V
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        # Inference path: KV cache with SDPA
+        if past_key_values is not None:
+            q = q.view(bsz, seqlen, self.num_attention_heads, self.head_dim).transpose(1, 2)
+            k = k.view(bsz, seqlen, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            v = v.view(bsz, seqlen, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            if layer_idx is not None:
+                k, v = past_key_values.update(k, v, layer_idx)
+            is_causal = attention_mask is None and q.shape[2] > 1 and q.shape[2] == k.shape[2]
+            output = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attention_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=is_causal,
+                enable_gqa=self.num_key_value_heads != self.num_attention_heads,
+            )
+            output = output.transpose(1, 2).contiguous()
+            output = output.view(bsz, seqlen, self.num_attention_heads * self.head_dim)
+            return self.o_proj(output)
 
-        # Reshape to (B, H, S, D) for SDPA
-        q = q.view(bsz, seqlen, self.num_attention_heads, self.head_dim).transpose(1, 2)
-        k = k.view(bsz, seqlen, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, seqlen, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        # Training path: backend-aware attention (TE or SDPA)
+        q = q.view(bsz, seqlen, self.num_attention_heads, self.head_dim)
+        k = k.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
+        v = v.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
 
-        # Update KV cache if present
-        if past_key_values is not None and layer_idx is not None:
-            k, v = past_key_values.update(k, v, layer_idx)
-
-        # Run attention with SDPA
-        # During cached decode (q has 1 token, k/v have many), use explicit mask
-        # instead of is_causal since SDPA's causal mask requires matching seq lengths.
-        is_causal = attention_mask is None and q.shape[2] > 1 and q.shape[2] == k.shape[2]
-        output = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attention_mask,
-            dropout_p=self.attention_dropout if self.training else 0.0,
-            is_causal=is_causal,
-            enable_gqa=self.num_key_value_heads != self.num_attention_heads,
+        q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            q, k, v, attention_mask, self.backend.attn, **attn_kwargs
         )
-
-        # Reshape back to (B, S, H * D)
-        output = output.transpose(1, 2).contiguous()
-        output = output.view(bsz, seqlen, self.num_attention_heads * self.head_dim)
-
-        # Output projection
-        output = self.o_proj(output)
-
+        output = self.attn_func(q, k, v, **_attn_kwargs)
+        output = postprocess_output_for_attn(output, self.backend.attn)
+        output = self.o_proj(output.flatten(2))
         return output
 
     @torch.no_grad()
@@ -115,13 +120,11 @@ class NemotronV3Attention(nn.Module):
         rescale_prenorm_residual: bool = True,
         buffer_device: torch.device | None = None,
     ) -> None:
-        """Initialize attention weights following NemotronV3 spec."""
         with buffer_device:
             for proj in [self.q_proj, self.k_proj, self.v_proj, self.o_proj]:
                 if proj.bias is not None:
                     nn.init.zeros_(proj.bias)
 
-            # Rescale o_proj for stable residual stream
             if rescale_prenorm_residual:
                 self.o_proj.weight /= math.sqrt(num_hidden_layers)
 
@@ -525,7 +528,7 @@ class NemotronV3Block(nn.Module):
         if self.block_type == "mamba":
             self.mixer = NemotronV3Mamba2Mixer(config, layer_idx=layer_idx)
         elif self.block_type == "attention":
-            self.mixer = NemotronV3Attention(config)
+            self.mixer = NemotronV3Attention(config, backend=backend)
         elif self.block_type == "mlp":
             from nemo_automodel.components.moe.layers import MLP
             from nemo_automodel.shared.utils import dtype_from_str
@@ -563,6 +566,7 @@ class NemotronV3Block(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_values=None,
         cache_position: torch.LongTensor | None = None,
+        **attn_kwargs,
     ) -> torch.Tensor:
         """Forward pass through the block.
 
@@ -574,6 +578,8 @@ class NemotronV3Block(nn.Module):
                 - For mlp/moe: None
             past_key_values: Optional NemotronHybridCache for KV/SSM caching.
             cache_position: Token position indices for cache updates.
+            **attn_kwargs: Additional keyword arguments forwarded to attention layers
+                only (e.g. cu_seqlens, cp_size, cp_rank for Context Parallelism).
 
         Returns:
             Output tensor of shape (batch, seq_len, hidden_size)
@@ -602,6 +608,7 @@ class NemotronV3Block(nn.Module):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 layer_idx=self.layer_idx,
+                **attn_kwargs,
             )
         elif self.block_type in ["mlp", "moe"]:
             hidden_states = self.mixer(hidden_states)

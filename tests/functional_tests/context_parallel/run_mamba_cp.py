@@ -29,6 +29,18 @@ import sys
 import torch
 import torch.distributed as dist
 
+from nemo_automodel.components.distributed.cp_utils import _dual_chunk_swap_select
+
+
+def dual_chunk_swap_unsplit(chunks_per_rank, cp_size, seq_dim=1):
+    """Reconstruct full sequence from DualChunkSwap-ordered rank outputs."""
+    all_chunks = [None] * (2 * cp_size)
+    for rank_idx, rank_output in enumerate(chunks_per_rank):
+        c0, c1 = torch.chunk(rank_output, 2, dim=seq_dim)
+        all_chunks[rank_idx] = c0
+        all_chunks[2 * cp_size - rank_idx - 1] = c1
+    return torch.cat(all_chunks, dim=seq_dim)
+
 
 def init_distributed():
     """Initialize distributed environment from torchrun env vars."""
@@ -132,8 +144,9 @@ def run_test():
         D=mixer_with_cp.D,
     )
 
-    half_seq = seq_len // world_size
-    x_local = x_full[:, rank * half_seq : (rank + 1) * half_seq, :].detach().clone().requires_grad_(True)
+    cp_size = world_size
+    x_local = _dual_chunk_swap_select(x_full.detach(), cp_size=cp_size, cp_rank=rank, seq_dim=1).clone().requires_grad_(True)
+    half_seq = x_local.shape[1]
 
     output_with_cp = mixer_with_cp(x_local)
     loss_with_cp = output_with_cp.sum()
@@ -151,8 +164,8 @@ def run_test():
     dist.all_gather(output_gathered, output_with_cp.contiguous())
     dist.all_gather(grad_gathered, x_local.grad.contiguous())
 
-    output_with_cp_full = torch.cat(output_gathered, dim=1)
-    grad_with_cp_full = torch.cat(grad_gathered, dim=1)
+    output_with_cp_full = dual_chunk_swap_unsplit(output_gathered, cp_size=cp_size, seq_dim=1)
+    grad_with_cp_full = dual_chunk_swap_unsplit(grad_gathered, cp_size=cp_size, seq_dim=1)
 
     in_proj_grad_cp = mixer_with_cp.in_proj.weight.grad.detach().clone()
     dist.all_reduce(in_proj_grad_cp, op=dist.ReduceOp.SUM)

@@ -149,6 +149,32 @@ def _all_to_all_hp2cp(
     )
 
 
+def _undo_attention_load_balancing(input_: torch.Tensor, cp_size: int) -> torch.Tensor:
+    """Reorder from DualChunkSwap to sequential for SSM processing.
+
+    Operates on dim=1 (sequence) of [B, L_global, H_local].
+    For cp_size=2 (4 chunks): reorder [0,3,1,2] → [0,1,2,3].
+    """
+    num_chunks = 2 * cp_size
+    chunks = torch.chunk(input_, chunks=num_chunks, dim=1)
+    # Even indices select from first halves, odd indices (reversed) select from second halves
+    order = [2 * i for i in range(cp_size)] + [num_chunks - 1 - 2 * i for i in range(cp_size)]
+    return torch.cat([chunks[i] for i in order], dim=1)
+
+
+def _redo_attention_load_balancing(input_: torch.Tensor, cp_size: int) -> torch.Tensor:
+    """Reorder from sequential back to DualChunkSwap for attention.
+
+    Inverse of _undo_attention_load_balancing.
+    """
+    num_chunks = 2 * cp_size
+    chunks = torch.chunk(input_, chunks=num_chunks, dim=1)
+    order = [None] * num_chunks
+    order[::2] = range(cp_size)
+    order[1::2] = reversed(range(cp_size, num_chunks))
+    return torch.cat([chunks[i] for i in order], dim=1)
+
+
 # ---------------------------------------------------------------------------
 # MambaContextParallel – orchestrates CP for a single Mamba mixer layer
 # ---------------------------------------------------------------------------
@@ -253,7 +279,8 @@ class MambaContextParallel:
         C_state = _all_to_all_cp2hp(C_state, self.cp_group, B)
         dt = _all_to_all_cp2hp(dt, self.cp_group, B)
 
-        return torch.cat([z, x, B_state, C_state, dt], dim=-1)
+        result = torch.cat([z, x, B_state, C_state, dt], dim=-1)
+        return _undo_attention_load_balancing(result, self.cp_size)
 
     def post_conv_ssm(self, output: torch.Tensor) -> torch.Tensor:
         """Redistribute SSM output from hidden-sharded back to sequence-sharded layout.
@@ -269,6 +296,7 @@ class MambaContextParallel:
             return output
 
         B = output.shape[0]
+        output = _redo_attention_load_balancing(output, self.cp_size)
         return _all_to_all_hp2cp(output, self.cp_group, B)
 
     # ------------------------------------------------------------------ #

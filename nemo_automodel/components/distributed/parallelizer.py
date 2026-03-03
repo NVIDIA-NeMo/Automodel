@@ -251,7 +251,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                 if layer.block_type == "mlp":
                     parallelize_module(layer, tp_mesh, mlp_tp_plan)
 
-        # Set up context parallel for Mamba layers
+        # Set up context parallel for Mamba and Attention layers
         cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
         if cp_mesh is not None and cp_mesh.size() > 1:
             cp_group = cp_mesh.get_group()
@@ -271,6 +271,17 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                         A_log=mixer.A_log,
                         D=mixer.D,
                     )
+                elif hasattr(layer, "block_type") and layer.block_type == "attention":
+                    from transformer_engine.pytorch.attention import DotProductAttention
+
+                    attn_module = layer.mixer.attn_module
+                    if isinstance(attn_module, DotProductAttention):
+                        attn_module.set_context_parallel_group(
+                            cp_group,
+                            torch.distributed.get_process_group_ranks(cp_group),
+                            torch.cuda.Stream(),
+                            cp_comm_type="p2p",
+                        )
 
         if activation_checkpointing:
             for i in range(len(layers)):
