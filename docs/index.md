@@ -66,9 +66,9 @@ Select a modality and task to find the right guide.
 | **LLM**    | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/finetune.md#recipe-config) | [Guide](guides/llm/toolcalling.md) | [Guide](guides/quantization-aware-training.md) | [Guide](guides/llm/knowledge-distillation.md) | [Guide](guides/llm/pretraining.md) |
 | **VLM**    | [Guide](guides/overview.md) | [Guide](guides/omni/gemma3-3n.md) | -- | -- | -- | -- |
 
-|                 | Embedding Fine-Tuning | Reranker Fine-Tuning |
-|-----------------|----------------------|---------------------|
-| **Retriever**   | [Guide](guides/retriever/embedding-finetuning.md) | Coming Soon |
+|                 | Embedding Fine-Tuning |
+|-----------------|----------------------|
+| **Retriever**   | [Guide](guides/retriever/embedding-finetuning.md) |
 
 ## Performance
 
@@ -254,7 +254,6 @@ guides/llm/databricks.md
 :caption: NeMo Retriever
 
 guides/retriever/embedding-finetuning.md
-guides/retriever/reranker-finetuning.md
 ::::
 
 ::::{toctree}
