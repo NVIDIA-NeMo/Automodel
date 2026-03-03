@@ -20,6 +20,8 @@ variants of:
 - Qwen3ForCausalLM (HF)
 - Qwen3ForSequenceClassification (HF)
 - Ministral3ForCausalLM (NeMo Automodel custom)
+- LlamaForCausalLM (NeMo Automodel custom, combined QKV + gate_up projections)
+- Qwen2ForCausalLM (NeMo Automodel custom, combined QKV + gate_up projections)
 
 It also validates both tensor-parallel plans:
 - sequence_parallel=False
@@ -53,11 +55,14 @@ from torch.distributed.tensor.placement_types import Replicate
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan
+from nemo_automodel.components.models.common.utils import BackendConfig
+from nemo_automodel.components.models.llama.model import LlamaConfig, LlamaForCausalLM
 from nemo_automodel.components.models.mistral3.model import Ministral3Config, Ministral3ForCausalLM
+from nemo_automodel.components.models.qwen2.model import Qwen2Config, Qwen2ForCausalLM
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
-ModelKind = Literal["qwen3", "qwen3_seq_cls", "ministral3"]
+ModelKind = Literal["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2"]
 SPMode = Literal["true", "false", "both"]
 
 
@@ -205,6 +210,51 @@ def _build_minified_model(kind: ModelKind):
         )
         return cfg, Qwen3ForSequenceClassification(cfg)
 
+    if kind == "llama":
+        num_layers = 2
+        backend = BackendConfig(rms_norm="torch")
+        cfg = LlamaConfig(
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=256,
+            num_hidden_layers=num_layers,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            use_cache=False,
+            tie_word_embeddings=True,
+            attention_bias=False,
+            attn_implementation="eager",
+            dtype=torch.float32,
+        )
+        return cfg, LlamaForCausalLM(cfg, backend=backend)
+
+    if kind == "qwen2":
+        num_layers = 2
+        backend = BackendConfig(rms_norm="torch")
+        cfg = Qwen2Config(
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=256,
+            num_hidden_layers=num_layers,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            use_cache=False,
+            tie_word_embeddings=True,
+            use_sliding_window=False,
+            sliding_window=None,
+            layer_types=["full_attention"] * num_layers,
+            attn_implementation="eager",
+            dtype=torch.float32,
+        )
+        model = Qwen2ForCausalLM(cfg, backend=backend)
+        with torch.no_grad():
+            for _, module in model.named_modules():
+                if isinstance(module, torch.nn.Linear) and module.bias is not None:
+                    torch.nn.init.normal_(module.bias, mean=0.1, std=0.1)
+        return cfg, model
+
     raise ValueError(f"Unknown model kind: {kind}")
 
 
@@ -273,8 +323,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--models",
         nargs="+",
-        default=["qwen3", "qwen3_seq_cls", "ministral3"],
-        choices=["qwen3", "qwen3_seq_cls", "ministral3"],
+        default=["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2"],
+        choices=["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2"],
         help="Which models to test.",
     )
     parser.add_argument(

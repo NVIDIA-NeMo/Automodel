@@ -17,6 +17,7 @@ import types
 
 import pytest
 import torch
+from PIL import Image as PILImage
 
 
 CONVERSATION = [
@@ -1042,3 +1043,146 @@ def test_kimi_k25_vl_collate_fn_labels_shifted(collate_mod, monkeypatch):
     # Then input_ids[:, :-1] means labels also become [:, :-1] from the shape matching
     # Final: [20, 30, 40]
     assert batch["labels"].shape[1] == 4  # 5 - 1 = 4
+
+
+# =============================================================================
+# Tests for _ensure_rgb
+# =============================================================================
+
+
+class TestEnsureRgb:
+    """Tests for _ensure_rgb helper that converts PIL images to RGB."""
+
+    def test_rgba_image_converted_to_rgb(self, collate_mod):
+        img = PILImage.new("RGBA", (4, 4), (255, 0, 0, 128))
+        conversations = [[
+            {"role": "user", "content": [{"image": img}]},
+        ]]
+        collate_mod._ensure_rgb(conversations)
+        assert conversations[0][0]["content"][0]["image"].mode == "RGB"
+
+    def test_grayscale_image_converted_to_rgb(self, collate_mod):
+        img = PILImage.new("L", (4, 4), 128)
+        conversations = [[
+            {"role": "user", "content": [{"image": img}]},
+        ]]
+        collate_mod._ensure_rgb(conversations)
+        assert conversations[0][0]["content"][0]["image"].mode == "RGB"
+
+    def test_palette_image_converted_to_rgb(self, collate_mod):
+        img = PILImage.new("P", (4, 4))
+        conversations = [[
+            {"role": "user", "content": [{"image": img}]},
+        ]]
+        collate_mod._ensure_rgb(conversations)
+        assert conversations[0][0]["content"][0]["image"].mode == "RGB"
+
+    def test_rgb_image_unchanged(self, collate_mod):
+        img = PILImage.new("RGB", (4, 4), (255, 0, 0))
+        conversations = [[
+            {"role": "user", "content": [{"image": img}]},
+        ]]
+        collate_mod._ensure_rgb(conversations)
+        result = conversations[0][0]["content"][0]["image"]
+        assert result.mode == "RGB"
+
+    def test_no_images_passthrough(self, collate_mod):
+        conversations = [[
+            {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+        ]]
+        result = collate_mod._ensure_rgb(conversations)
+        assert result == conversations
+
+    def test_string_content_skipped(self, collate_mod):
+        conversations = [[
+            {"role": "assistant", "content": "plain string"},
+        ]]
+        result = collate_mod._ensure_rgb(conversations)
+        assert result[0][0]["content"] == "plain string"
+
+    def test_empty_conversations(self, collate_mod):
+        assert collate_mod._ensure_rgb([]) == []
+
+    def test_multiple_images_in_one_turn(self, collate_mod):
+        rgba = PILImage.new("RGBA", (4, 4))
+        gray = PILImage.new("L", (4, 4))
+        rgb = PILImage.new("RGB", (4, 4))
+        conversations = [[
+            {"role": "user", "content": [
+                {"image": rgba},
+                {"type": "text", "text": "describe these"},
+                {"image": gray},
+                {"image": rgb},
+            ]},
+        ]]
+        collate_mod._ensure_rgb(conversations)
+        items = conversations[0][0]["content"]
+        assert items[0]["image"].mode == "RGB"
+        assert items[1] == {"type": "text", "text": "describe these"}
+        assert items[2]["image"].mode == "RGB"
+        assert items[3]["image"].mode == "RGB"
+
+    def test_multiple_conversations(self, collate_mod):
+        img1 = PILImage.new("RGBA", (4, 4))
+        img2 = PILImage.new("L", (4, 4))
+        conversations = [
+            [{"role": "user", "content": [{"image": img1}]}],
+            [{"role": "user", "content": [{"image": img2}]}],
+        ]
+        collate_mod._ensure_rgb(conversations)
+        assert conversations[0][0]["content"][0]["image"].mode == "RGB"
+        assert conversations[1][0]["content"][0]["image"].mode == "RGB"
+
+    def test_non_image_dict_items_untouched(self, collate_mod):
+        conversations = [[
+            {"role": "user", "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "video", "video": "clip.mp4"},
+            ]},
+        ]]
+        result = collate_mod._ensure_rgb(conversations)
+        items = result[0][0]["content"]
+        assert items[0] == {"type": "text", "text": "hi"}
+        assert items[1] == {"type": "video", "video": "clip.mp4"}
+
+    def test_returns_same_list_object(self, collate_mod):
+        conversations = [[{"role": "user", "content": [{"type": "text", "text": "x"}]}]]
+        result = collate_mod._ensure_rgb(conversations)
+        assert result is conversations
+
+
+class TestDefaultCollateFnEnsureRgb:
+    """Test that default_collate_fn integrates _ensure_rgb correctly."""
+
+    def test_rgba_image_converted_before_processing(self, collate_mod, fake_qwen_utils, monkeypatch):
+        monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
+
+        captured_conversations = []
+
+        class CapturingProcessor:
+            tokenizer = DummyTokenizer()
+
+            def apply_chat_template(self, conv_list, **kwargs):
+                for conv in conv_list:
+                    for turn in conv:
+                        content = turn.get("content")
+                        if isinstance(content, list):
+                            for item in content:
+                                if isinstance(item, dict) and isinstance(item.get("image"), PILImage.Image):
+                                    captured_conversations.append(item["image"].mode)
+                batch_size = len(conv_list)
+                input_ids = torch.arange(1, 5).unsqueeze(0).repeat(batch_size, 1)
+                pixel_values = torch.ones(batch_size, 3, 64, 64, dtype=torch.float32)
+                return {"input_ids": input_ids, "pixel_values": pixel_values}
+
+        rgba_img = PILImage.new("RGBA", (4, 4), (255, 0, 0, 128))
+        conversation = [
+            {"role": "user", "content": [{"image": rgba_img}, {"type": "text", "text": "describe"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "red"}]},
+        ]
+
+        processor = CapturingProcessor()
+        collate_mod.default_collate_fn([{"conversation": conversation}], processor)
+
+        assert captured_conversations == ["RGB"]

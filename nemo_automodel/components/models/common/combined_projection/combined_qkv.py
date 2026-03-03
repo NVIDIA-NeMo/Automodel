@@ -20,6 +20,26 @@ for any attention module, improving memory efficiency and reducing kernel launch
 
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DTensor
+
+
+def _assert_colwise_parallel(weight: torch.Tensor, name: str) -> None:
+    """Verify that a combined-projection weight uses ColwiseParallel (Shard(0)) if TP is active.
+
+    Shard(dim=1) is expected from FSDP pre-sharding of combined projections and
+    is excluded from the check — it is temporary and undone by FSDP all-gather
+    before the actual matmul.
+    """
+    if isinstance(weight, DTensor) and weight.placements:
+        from torch.distributed.tensor.placement_types import Shard
+
+        tp_shards = [p for p in weight.placements if isinstance(p, Shard) and p.dim != 1]
+        if tp_shards and not any(p.dim == 0 for p in tp_shards):
+            raise ValueError(
+                f"{name} uses an interleaved layout that requires ColwiseParallel "
+                f"(Shard(0)) for correct TP sharding, but got placements={weight.placements}. "
+                f"Check your TP plan."
+            )
 
 
 class CombinedQKVAttentionMixin:
@@ -68,6 +88,9 @@ class CombinedQKVAttentionMixin:
         self.use_combined_qkv = True  # Always combined in custom implementations
         self.q_size = num_attention_heads * head_dim
         self.kv_size = num_key_value_heads * head_dim
+        self._num_kv_groups = num_attention_heads // num_key_value_heads
+        self._head_dim = head_dim
+        self._tp_checked = False
 
         # Combined QKV projection for improved efficiency
         self.qkv_proj = nn.Linear(
@@ -79,7 +102,10 @@ class CombinedQKVAttentionMixin:
     def compute_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute Q, K, V from hidden states using combined projection.
 
-        Handles tensor parallelism by dynamically computing split sizes based on actual tensor dimensions.
+        The QKV weight uses a KV-head-grouped interleaved layout:
+            [Q_group_0 | K_0 | V_0 | Q_group_1 | K_1 | V_1 | ...]
+        This ensures ColwiseParallel TP sharding gives each rank complete
+        KV-head groups. We split within each group (a local operation).
 
         Args:
             hidden_states: Input hidden states [batch, seq_len, hidden_size]
@@ -87,14 +113,13 @@ class CombinedQKVAttentionMixin:
         Returns:
             Tuple of (query, key, value) tensors, each [batch, seq_len, ...]
         """
-        # Combined QKV projection and split
+        if not self._tp_checked:
+            _assert_colwise_parallel(self.qkv_proj.weight, "qkv_proj")
+            self._tp_checked = True
+
         qkv = self.qkv_proj(hidden_states)
 
-        # Compute split sizes based on actual tensor size (handles TP sharding)
-        qkv_size = qkv.shape[-1]
-        total_size = self.q_size + 2 * self.kv_size
-        local_q_size = (self.q_size * qkv_size) // total_size
-        local_kv_size = (self.kv_size * qkv_size) // total_size
-
-        q, k, v = qkv.split([local_q_size, local_kv_size, local_kv_size], dim=-1)
-        return q, k, v
+        group_width = (self._num_kv_groups + 2) * self._head_dim
+        qkv = qkv.unflatten(-1, (-1, group_width))
+        q, k, v = qkv.split([self._num_kv_groups * self._head_dim, self._head_dim, self._head_dim], dim=-1)
+        return q.flatten(-2), k.flatten(-2), v.flatten(-2)
