@@ -251,6 +251,27 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                 if layer.block_type == "mlp":
                     parallelize_module(layer, tp_mesh, mlp_tp_plan)
 
+        # Set up context parallel for Mamba layers
+        cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
+        if cp_mesh is not None and cp_mesh.size() > 1:
+            cp_group = cp_mesh.get_group()
+            for layer in layers:
+                if hasattr(layer, "block_type") and layer.block_type == "mamba":
+                    from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+
+                    mixer = layer.mixer
+                    mixer.cp = MambaContextParallel(
+                        cp_group=cp_group,
+                        num_heads=mixer.num_heads,
+                        head_dim=mixer.head_dim,
+                        n_groups=mixer.n_groups,
+                        d_state=mixer.ssm_state_size,
+                        conv1d=mixer.conv1d,
+                        dt_bias=mixer.dt_bias,
+                        A_log=mixer.A_log,
+                        D=mixer.D,
+                    )
+
         if activation_checkpointing:
             for i in range(len(layers)):
                 if layers[i].block_type == "mlp":

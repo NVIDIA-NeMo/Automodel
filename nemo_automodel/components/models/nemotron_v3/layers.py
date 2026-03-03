@@ -221,6 +221,9 @@ class NemotronV3Mamba2Mixer(nn.Module):
         # Output projection
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.use_bias)
 
+        # Context parallelism — set post-construction by the parallelizer
+        self.cp = None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -262,30 +265,61 @@ class NemotronV3Mamba2Mixer(nn.Module):
                 hidden_states = hidden_states * attention_mask.unsqueeze(-1)
 
             projected_states = self.in_proj(hidden_states)
-            A = -torch.exp(self.A_log.float())
+
             dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
 
-            out = mamba_split_conv1d_scan_combined(
-                projected_states,
-                self.conv1d.weight.squeeze(1),
-                self.conv1d.bias,
-                self.dt_bias,
-                A,
-                D=self.D,
-                chunk_size=self.chunk_size,
-                seq_idx=None,
-                activation=self.activation,
-                rmsnorm_weight=self.norm.weight,
-                rmsnorm_eps=self.norm.variance_epsilon,
-                outproj_weight=self.out_proj.weight,
-                outproj_bias=self.out_proj.bias,
-                headdim=self.head_dim,
-                ngroups=self.n_groups,
-                norm_before_gate=False,
-                return_final_states=False,
-                **dt_limit_kwargs,
-            )
-            return out
+            if self.cp is not None:
+                projected_states = self.cp.pre_conv_ssm(projected_states)
+                A = -torch.exp(self.cp.get_A_log().float())
+
+                out = mamba_split_conv1d_scan_combined(
+                    projected_states,
+                    self.cp.get_conv1d_weight(),
+                    self.cp.get_conv1d_bias(),
+                    self.cp.get_dt_bias(),
+                    A,
+                    D=self.cp.get_D(),
+                    chunk_size=self.chunk_size,
+                    activation=self.activation,
+                    rmsnorm_weight=None,
+                    outproj_weight=None,
+                    headdim=self.head_dim,
+                    ngroups=self.cp.n_groups_local,
+                    norm_before_gate=False,
+                    return_final_states=False,
+                    **dt_limit_kwargs,
+                )
+                if out.ndim == 4:
+                    out = out.reshape(out.shape[0], out.shape[1], -1)
+
+                out = self.cp.post_conv_ssm(out)
+                out = self.norm(out, gate=None)
+                out = self.out_proj(out)
+                return out
+            else:
+                A = -torch.exp(self.A_log.float())
+
+                out = mamba_split_conv1d_scan_combined(
+                    projected_states,
+                    self.conv1d.weight.squeeze(1),
+                    self.conv1d.bias,
+                    self.dt_bias,
+                    A,
+                    D=self.D,
+                    chunk_size=self.chunk_size,
+                    seq_idx=None,
+                    activation=self.activation,
+                    rmsnorm_weight=self.norm.weight,
+                    rmsnorm_eps=self.norm.variance_epsilon,
+                    outproj_weight=self.out_proj.weight,
+                    outproj_bias=self.out_proj.bias,
+                    headdim=self.head_dim,
+                    ngroups=self.n_groups,
+                    norm_before_gate=False,
+                    return_final_states=False,
+                    **dt_limit_kwargs,
+                )
+                return out
 
         # --- Path C: Decode (single token, cached state) ---
         if use_precomputed_states:
