@@ -12,27 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Biencoder models for embedding and retrieval tasks.
+"""Llama Bidirectional model for embedding and retrieval tasks."""
 
-This module contains biencoder architectures and bidirectional models
-optimized for information retrieval and semantic search tasks.
-"""
-
-from .biencoder_model import NeMoAutoModelBiencoder  # noqa: F401
-from .llama_bidirectional_model import (  # noqa: F401
-    BiencoderModel,
-    BiencoderOutput,
+from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
     LlamaBidirectionalForSequenceClassification,
     LlamaBidirectionalModel,
 )
 
 __all__ = [
-    "BiencoderModel",
-    "BiencoderOutput",
-    "NeMoAutoModelBiencoder",
-    "LlamaBidirectionalConfig",
     "LlamaBidirectionalModel",
+    "LlamaBidirectionalConfig",
     "LlamaBidirectionalForSequenceClassification",
 ]

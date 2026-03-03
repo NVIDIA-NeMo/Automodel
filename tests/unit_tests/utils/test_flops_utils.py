@@ -166,6 +166,26 @@ def _glm4_moe_cfg() -> SimpleNamespace:
     )
 
 
+def _nemotronh_nano_v3_cfg() -> SimpleNamespace:
+    return SimpleNamespace(
+        hidden_size=2688,
+        num_hidden_layers=52,
+        num_attention_heads=32,
+        num_key_value_heads=2,
+        intermediate_size=1856,
+        vocab_size=131072,
+        mamba_num_heads=64,
+        mamba_head_dim=64,
+        ssm_state_size=128,
+        n_groups=8,
+        num_experts_per_tok=6,
+        moe_intermediate_size=1856,
+        moe_shared_expert_intermediate_size=3712,
+        n_routed_experts=128,
+        hybrid_override_pattern="MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME",
+    )
+
+
 @pytest.mark.parametrize(
     "name, func, cfg_factory, kwargs, expected",
     [
@@ -181,6 +201,7 @@ def _glm4_moe_cfg() -> SimpleNamespace:
         ("glm4_moe", flops_utils.glm4_moe_flops, _glm4_moe_cfg, dict(gbs=1, seq_len=2048), 120277337899008),
         ("deepseekv3_moonlight", flops_utils.deepseekv3_flops, _moonlight_16b_config, dict(gbs=1, seq_len=2048), 30625801175040),
         ("deepseekv3_dsv3", flops_utils.deepseekv3_flops, _deepseek_v3_config, dict(gbs=1, seq_len=1024), 233225179889664),
+        ("nemotronh_nano_v3", flops_utils.nemotronh_flops, _nemotronh_nano_v3_cfg, dict(gbs=1, seq_len=2048), 39612063940608),
     ],
 )
 def test_flops_formulas_with_precomputed_values(name, func, cfg_factory, kwargs, expected):

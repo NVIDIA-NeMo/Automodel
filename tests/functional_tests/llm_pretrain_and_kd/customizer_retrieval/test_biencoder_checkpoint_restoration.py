@@ -80,8 +80,11 @@ def _run_training(recipe_yaml: str, checkpoint_dir: str) -> Path:
     """Launch biencoder training as a subprocess and return the checkpoint dir."""
     cmd = [
         sys.executable,
-        "-m",
-        "nemo_automodel.recipes.biencoder.train_biencoder",
+        "-m", "coverage", "run",
+        "--data-file=/workspace/.coverage",
+        "--source=/workspace/",
+        "--parallel-mode",
+        "-m", "nemo_automodel.recipes.biencoder.train_biencoder",
         "--config",
         recipe_yaml,
     ]
@@ -170,10 +173,8 @@ class TestBiencoderCheckpointRestoration:
         """Train biencoder -> load trained model back in NeMo -> save ->
         restore with transformers -> verify state dicts match."""
 
-        from nemo_automodel.components.models.biencoder.llama_bidirectional_model import (
-            BiencoderModel,
-            LlamaBidirectionalModel,
-        )
+        from nemo_automodel._transformers.biencoder import BiencoderModel
+        from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel
 
         # ---- Step 1: Train ------------------------------------------------
         checkpoint_dir = _run_training(RECIPE_YAML, CHECKPOINT_DIR)
@@ -197,11 +198,8 @@ class TestBiencoderCheckpointRestoration:
             lm_q=lm_q,
             lm_p=lm_q,
             share_encoder=True,
-            train_n_passages=2,
-            eval_negative_size=1,
             pooling="avg",
             l2_normalize=True,
-            t=0.02,
         )
 
         # ---- Step 3: Save from NeMo (HF format) --------------------------
@@ -238,10 +236,8 @@ class TestBiencoderCheckpointRestoration:
         weights restored by transformers + LoRA weights by safetensors."""
 
         from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
-        from nemo_automodel.components.models.biencoder.llama_bidirectional_model import (
-            BiencoderModel,
-            LlamaBidirectionalModel,
-        )
+        from nemo_automodel._transformers.biencoder import BiencoderModel
+        from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel
 
         # ---- Step 1: Train with PEFT -------------------------------------
         checkpoint_dir = _run_training(PEFT_RECIPE_YAML, PEFT_CHECKPOINT_DIR)
@@ -265,11 +261,8 @@ class TestBiencoderCheckpointRestoration:
             lm_q=lm_q,
             lm_p=lm_q,
             share_encoder=True,
-            train_n_passages=2,
-            eval_negative_size=1,
             pooling="avg",
             l2_normalize=True,
-            t=0.02,
         )
 
         peft_config = PeftConfig(match_all_linear=True, dim=8, alpha=32, use_triton=False)

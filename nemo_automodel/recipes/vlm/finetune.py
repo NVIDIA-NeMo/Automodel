@@ -32,7 +32,7 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 from wandb import Settings
 
-from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+from nemo_automodel._transformers import NeMoAutoModelForImageTextToText, NeMoAutoModelForMultimodalLM
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -136,6 +136,8 @@ def build_model(
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
             NeMoAutoModelForImageTextToText.from_config,
             NeMoAutoModelForImageTextToText.from_pretrained,
+            NeMoAutoModelForMultimodalLM.from_config,
+            NeMoAutoModelForMultimodalLM.from_pretrained,
         )
 
         if is_nemo_auto_model:
@@ -253,21 +255,22 @@ def build_dataloader(
     with ScopedRNG(seed=seed, ranked=True):
         processor = None
         processor_kwargs = {}
-        if cfg_processor is not None and hasattr(cfg_processor, "instantiate"):
-            processor = cfg_processor.instantiate()
-        elif cfg_processor is not None:
-            processor_kwargs = cfg_processor.to_dict()
-
-        # If no processor was instantiated, try AutoProcessor
-        if processor is None:
-            try:
-                processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
-            except Exception as e:
-                # Some models do not provide an AutoProcessor
-                processor = None
-                logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
 
         with FirstRankPerNode():
+            if cfg_processor is not None and hasattr(cfg_processor, "instantiate"):
+                processor = cfg_processor.instantiate()
+            elif cfg_processor is not None:
+                processor_kwargs = cfg_processor.to_dict()
+
+            # If no processor was instantiated, try AutoProcessor
+            if processor is None:
+                try:
+                    processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
+                except Exception as e:
+                    # Some models do not provide an AutoProcessor
+                    processor = None
+                    logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
+
             ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
 
         sampler = torch.utils.data.distributed.DistributedSampler(
