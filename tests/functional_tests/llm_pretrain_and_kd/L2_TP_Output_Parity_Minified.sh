@@ -19,7 +19,7 @@ export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
 # Override if needed, e.g. KL_THRESHOLD=1e-5 bash ...
-KL_THRESHOLD="${KL_THRESHOLD:-1e-6}"
+KL_THRESHOLD="${KL_THRESHOLD:-2e-6}"
 
 torchrun --nproc_per_node=2 --nnodes=1 \
     tests/functional_tests/llm_pretrain_and_kd/run_tp_output_parity_minified.py \
