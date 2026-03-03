@@ -30,7 +30,6 @@ import os
 import shutil
 import subprocess
 import sys
-from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -65,6 +64,11 @@ EVAL_MAX_LENGTH = 128
 EVAL_BATCH_SIZE = 8
 EVAL_TEMPERATURE = 0.02  # native inference temperature for the model
 
+ONNX_OUTPUT_DIR = os.environ.get(
+    "ONNX_OUTPUT_DIR",
+    "/workspace/output/biencoder_inline/onnx",
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers (thin wrappers around compare_biencoder_models logic)
@@ -74,7 +78,11 @@ def _run_training() -> Path:
     """Launch the biencoder training recipe as a subprocess and return the
     checkpoint directory produced by the run."""
     cmd = [
-        sys.executable, "-m", "nemo_automodel.recipes.biencoder.train_biencoder",
+        sys.executable, "-m", "coverage", "run",
+        "--data-file=/workspace/.coverage",
+        "--source=/workspace/",
+        "--parallel-mode",
+        "-m", "nemo_automodel.recipes.biencoder.train_biencoder",
         "--config", RECIPE_YAML,
     ]
     result = subprocess.run(cmd, cwd=str(_REPO_ROOT), check=True)
@@ -88,24 +96,18 @@ def _run_training() -> Path:
 
 
 def _build_eval_model(device: torch.device):
-    """Build a NeMoAutoModelBiencoder for evaluation with the native inference
-    temperature (t=0.02)."""
-    from nemo_automodel.components.models.biencoder import NeMoAutoModelBiencoder
+    """Build a NeMoAutoModelBiencoder for evaluation."""
+    from nemo_automodel._transformers.auto_model import NeMoAutoModelBiencoder
 
     return NeMoAutoModelBiencoder.from_pretrained(
         pretrained_model_name_or_path=BASE_MODEL_PATH,
         share_encoder=True,
-        add_linear_pooler=False,
-        out_dimension=768,
-        do_gradient_checkpointing=False,
-        train_n_passages=2,
-        eval_negative_size=1,
         pooling="avg",
         l2_normalize=True,
-        t=EVAL_TEMPERATURE,
         use_liger_kernel=False,
         use_sdpa_patching=False,
         torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
     ).to(device).eval()
 
 
@@ -159,6 +161,8 @@ def _iter_batches(ds, batch_size: int, max_samples: int):
 @torch.no_grad()
 def _compute_pos_neg_diffs(model, collator, ds, device, batch_size, max_samples):
     """Compute per-sample (pos_score - neg_score) diffs."""
+    from nemo_automodel.recipes.biencoder.train_biencoder import contrastive_scores_and_labels
+
     model.eval()
     diffs: list[np.ndarray] = []
 
@@ -169,8 +173,14 @@ def _compute_pos_neg_diffs(model, collator, ds, device, batch_size, max_samples)
         query = {k[2:]: v for k, v in batch.items() if k.startswith("q_")}
         passage = {k[2:]: v for k, v in batch.items() if k.startswith("d_")}
 
-        out = model(query=query, passage=passage)
-        scores = out.scores  # [batch, n_passages]
+        q_reps = model.encode(query, encoder="query")
+        p_reps = model.encode(passage, encoder="passage")
+
+        # 2 passages per query: 1 positive + 1 negative
+        n_passages = 2
+        scores, _ = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
+
+        # [batch, n_passages]
         assert scores is not None and scores.shape[-1] >= 2, (
             f"Unexpected scores shape: {None if scores is None else tuple(scores.shape)}"
         )
@@ -184,19 +194,11 @@ def _compute_pos_neg_diffs(model, collator, ds, device, batch_size, max_samples)
 
 
 def _load_finetuned_weights(model, checkpoint_dir: Path):
-    """Load fine-tuned weights into an existing model instance.
-
-    The training recipe saves via ``Checkpointer.save_model`` which writes
-    safetensors into a ``model/`` sub-directory under the checkpoint step
-    folder.  The ``BiencoderStateDictAdapter`` on the model handles the
-    key translations (lm_q.* <-> model.*) so no explicit ``key_mapping``
-    is needed here.
-    """
+    """Load fine-tuned weights into an existing model instance."""
     import glob as _glob
 
     from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
-    model_dir = checkpoint_dir / "model"
     st = _glob.glob(str(checkpoint_dir / "**" / "*.safetensors"), recursive=True)
     assert st, f"No .safetensors found under {checkpoint_dir}"
 
@@ -210,7 +212,8 @@ def _load_finetuned_weights(model, checkpoint_dir: Path):
         is_peft=False,
     )
     checkpointer = Checkpointer(config=ckpt_cfg, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
-    checkpointer.load_model(model, model_path=str(model_dir))
+    key_mapping = {r"^(?!(model\.|linear_pooler\.))": "model."}
+    checkpointer.load_model(model, model_path=str(checkpoint_dir / "model"), key_mapping=key_mapping)
     checkpointer.close()
     return model
 
@@ -221,46 +224,58 @@ def _load_finetuned_weights(model, checkpoint_dir: Path):
 
 class TestCustomizerRetrieval:
     """End-to-end: train biencoder with customizer-aligned recipe, then assert
-    the fine-tuned model is not degraded vs baseline."""
+    the fine-tuned model is not degraded vs baseline, and the ONNX export
+    produces valid embeddings."""
 
-    @pytest.fixture(autouse=True)
-    def _cleanup(self):
-        """Remove training checkpoints after each test."""
-        yield
-        ckpt_dir = Path(CHECKPOINT_DIR)
-        if ckpt_dir.exists():
-            shutil.rmtree(ckpt_dir, ignore_errors=True)
+    # -- Fixtures -----------------------------------------------------------
 
-    def test_biencoder_finetuning_not_degraded(self):
-        # ---- Step 1: Train ------------------------------------------------
-        checkpoint_dir = _run_training()
+    @pytest.fixture(scope="class")
+    def checkpoint_dir(self):
+        """Run training once for all tests in this class and return the
+        checkpoint path.  Clean up after all tests complete."""
+        ckpt = _run_training()
+        yield ckpt
+        # Cleanup after all tests in the class.
+        ckpt_root = Path(CHECKPOINT_DIR)
+        if ckpt_root.exists():
+            shutil.rmtree(ckpt_root, ignore_errors=True)
+        onnx_dir = Path(ONNX_OUTPUT_DIR)
+        if onnx_dir.exists():
+            shutil.rmtree(onnx_dir, ignore_errors=True)
 
-        # ---- Step 2: Initialize torch.distributed for eval ----------------
+    @pytest.fixture(scope="class")
+    def dist_device(self):
+        """Initialize torch.distributed once for the class and return device."""
         from nemo_automodel.components.distributed.init_utils import initialize_distributed
 
         dist = initialize_distributed(backend="nccl", timeout_minutes=5)
-        device = dist.device if dist.device is not None else torch.device("cpu")
+        return dist.device if dist.device is not None else torch.device("cpu")
 
-        # ---- Step 3: Build eval infrastructure ----------------------------
+    # -- Test: finetuned model not degraded ---------------------------------
+
+    def test_biencoder_finetuning_not_degraded(self, checkpoint_dir, dist_device):
+        device = dist_device
+
+        # Build eval infrastructure.
         model = _build_eval_model(device)
         ds = _build_eval_dataset()
         collator = _build_collator()
         max_samples = len(ds)
 
-        # ---- Step 4: Compute baseline diffs -------------------------------
+        # Compute baseline diffs.
         base_diffs = _compute_pos_neg_diffs(
             model=model, collator=collator, ds=ds,
             device=device, batch_size=EVAL_BATCH_SIZE, max_samples=max_samples,
         )
 
-        # ---- Step 5: Load fine-tuned weights & recompute ------------------
+        # Load fine-tuned weights and recompute.
         model = _load_finetuned_weights(model, checkpoint_dir)
         ft_diffs = _compute_pos_neg_diffs(
             model=model, collator=collator, ds=ds,
             device=device, batch_size=EVAL_BATCH_SIZE, max_samples=max_samples,
         )
 
-        # ---- Step 6: Statistical comparison -------------------------------
+        # Statistical comparison.
         import scipy.stats
 
         t_stat, p_value = scipy.stats.ttest_rel(base_diffs, ft_diffs)
@@ -281,4 +296,87 @@ class TestCustomizerRetrieval:
         assert model_not_degraded, (
             f"Fine-tuned model appears degraded vs baseline "
             f"(t={t_stat:.4f}, p={p_value:.6f}, CohenD={cohen_d:.4f})"
+        )
+
+    # -- Test: ONNX export + verification -----------------------------------
+
+    def test_onnx_export_and_verify(self, checkpoint_dir):
+        """Export the fitests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/test_customizer_retrieval.pyne-tuned checkpoint to ONNX and verify the graph
+        produces valid, finite, correctly-shaped embeddings."""
+        import onnxruntime
+        from transformers import AutoTokenizer
+
+        from nemo_automodel.components.models.llama_bidirectional.export_onnx import export_to_onnx
+
+        # The recipe sets save_consolidated=true, so the checkpoint has a
+        # model/consolidated/ directory with standard HF-named safetensors
+        # that AutoModel.from_pretrained can load directly.
+        consolidated_dir = checkpoint_dir / "model" / "consolidated"
+        assert consolidated_dir.is_dir(), (
+            f"Consolidated checkpoint not found at {consolidated_dir}. "
+            "Ensure the recipe sets save_consolidated: true."
+        )
+
+        onnx_path = export_to_onnx(
+            model_path=str(consolidated_dir),
+            output_dir=ONNX_OUTPUT_DIR,
+            tokenizer_path=BASE_MODEL_PATH,
+            pooling="avg",
+            normalize=True,
+            opset=17,
+            export_dtype="fp32",
+            verify=False,  # we do our own checks below
+        )
+
+        # 1. File exists.
+        assert Path(onnx_path).exists(), f"ONNX model not found at {onnx_path}"
+
+        # 2. Tokenizer was saved alongside.
+        tokenizer_dir = Path(ONNX_OUTPUT_DIR) / "tokenizer"
+        assert tokenizer_dir.exists(), f"Tokenizer dir not found at {tokenizer_dir}"
+
+        # 3. Load the ONNX model in onnxruntime.
+        session = onnxruntime.InferenceSession(onnx_path)
+        input_names = [inp.name for inp in session.get_inputs()]
+        output_names = [out.name for out in session.get_outputs()]
+
+        assert "input_ids" in input_names, f"Expected 'input_ids' in inputs, got {input_names}"
+        assert "attention_mask" in input_names, f"Expected 'attention_mask' in inputs, got {input_names}"
+        assert "embeddings" in output_names, f"Expected 'embeddings' in outputs, got {output_names}"
+
+        # 4. Run inference on sample sentences.
+        tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir), trust_remote_code=True)
+        sentences = [
+            "What is deep learning?",
+            "Neural networks are a type of machine learning model.",
+            "The cat sat on the mat.",
+        ]
+        tokenized = tokenizer(sentences, return_tensors="np", padding=True, truncation=True)
+        feed = {name: tokenized[name] for name in input_names if name in tokenized}
+
+        outputs = session.run(output_names, feed)
+        embeddings = outputs[0]
+
+        print(f"\nONNX output shape: {embeddings.shape}")
+        print(f"ONNX embedding[0][:8]: {embeddings[0][:8]}")
+
+        # 5. Shape: [batch_size, hidden_dim].
+        assert embeddings.ndim == 2, f"Expected 2-D output, got shape {embeddings.shape}"
+        assert embeddings.shape[0] == len(sentences), (
+            f"Batch mismatch: expected {len(sentences)}, got {embeddings.shape[0]}"
+        )
+
+        # 6. All values are finite.
+        assert np.isfinite(embeddings).all(), "ONNX output contains non-finite values"
+
+        # 7. Embeddings are L2-normalised (norm ≈ 1.0 per row).
+        norms = np.linalg.norm(embeddings, axis=1)
+        np.testing.assert_allclose(norms, 1.0, atol=1e-4, err_msg="Embeddings are not L2-normalised")
+
+        # 8. Different sentences should produce different embeddings.
+        cos_01 = float(np.dot(embeddings[0], embeddings[1]))
+        cos_02 = float(np.dot(embeddings[0], embeddings[2]))
+        print(f"Cosine(0,1)={cos_01:.4f}  Cosine(0,2)={cos_02:.4f}")
+        assert not np.allclose(embeddings[0], embeddings[1], atol=1e-3), (
+            "Different sentences produced identical embeddings"
         )

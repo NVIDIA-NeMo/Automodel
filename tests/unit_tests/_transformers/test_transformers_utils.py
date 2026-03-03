@@ -12,11 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 from unittest.mock import Mock, patch
 
 import pytest
 
-from nemo_automodel._transformers.utils import sliding_window_overwrite
+from nemo_automodel._transformers.utils import (
+    _patch_bytes_to_unicode,
+    _patch_special_tokens_pattern,
+    apply_cache_compatibility_patches,
+    apply_qwen3_omni_config_patch,
+    sliding_window_overwrite,
+)
 
 
 class TestSlidingWindowOverwrite:
@@ -165,3 +172,188 @@ class TestSlidingWindowOverwrite:
 
         # Should return empty dict when use_sliding_window is not exactly False
         assert result == {}
+
+
+class TestPatchBytesToUnicode:
+    """Tests for _patch_bytes_to_unicode compatibility patch."""
+
+    def test_bytes_to_unicode_is_available_after_patch(self):
+        """After patching, the GPT-2 tokenizer module exposes bytes_to_unicode."""
+        _patch_bytes_to_unicode()
+        gpt2_tok = importlib.import_module("transformers.models.gpt2.tokenization_gpt2")
+        assert hasattr(gpt2_tok, "bytes_to_unicode")
+        assert callable(gpt2_tok.bytes_to_unicode)
+
+    def test_bytes_to_unicode_returns_correct_mapping(self):
+        """The patched bytes_to_unicode returns a dict mapping all 256 byte values."""
+        _patch_bytes_to_unicode()
+        gpt2_tok = importlib.import_module("transformers.models.gpt2.tokenization_gpt2")
+        mapping = gpt2_tok.bytes_to_unicode()
+
+        assert isinstance(mapping, dict)
+        assert len(mapping) == 256
+        for byte_val in range(256):
+            assert byte_val in mapping
+            assert isinstance(mapping[byte_val], str)
+
+    def test_bytes_to_unicode_is_idempotent(self):
+        """Calling the patch twice does not break anything."""
+        _patch_bytes_to_unicode()
+        gpt2_tok = importlib.import_module("transformers.models.gpt2.tokenization_gpt2")
+        first_result = gpt2_tok.bytes_to_unicode()
+
+        _patch_bytes_to_unicode()
+        second_result = gpt2_tok.bytes_to_unicode()
+
+        assert first_result == second_result
+
+    def test_bytes_to_unicode_does_not_overwrite_existing(self):
+        """If bytes_to_unicode already exists, the patch is a no-op."""
+        gpt2_tok = importlib.import_module("transformers.models.gpt2.tokenization_gpt2")
+        sentinel = lambda: "sentinel"
+        original = getattr(gpt2_tok, "bytes_to_unicode", None)
+        gpt2_tok.bytes_to_unicode = sentinel
+        try:
+            _patch_bytes_to_unicode()
+            assert gpt2_tok.bytes_to_unicode is sentinel
+        finally:
+            if original is not None:
+                gpt2_tok.bytes_to_unicode = original
+            else:
+                delattr(gpt2_tok, "bytes_to_unicode")
+
+
+class TestPatchSpecialTokensPattern:
+    """Tests for _patch_special_tokens_pattern compatibility patch."""
+
+    def test_patch_sets_default_special_tokens_pattern_to_none(self):
+        """After patching, new PreTrainedTokenizer instances default to 'none' pattern."""
+        _patch_special_tokens_pattern()
+        from transformers.tokenization_python import PreTrainedTokenizer
+
+        assert getattr(PreTrainedTokenizer.__init__, "_nemo_stp_patched", False)
+
+    def test_patch_is_idempotent(self):
+        """Calling the patch multiple times does not stack wrappers."""
+        _patch_special_tokens_pattern()
+        from transformers.tokenization_python import PreTrainedTokenizer
+
+        first_init = PreTrainedTokenizer.__init__
+        _patch_special_tokens_pattern()
+        assert PreTrainedTokenizer.__init__ is first_init
+
+    def _make_spy_and_patch(self):
+        """Set up a spy __init__ and apply the patch on top of it.
+
+        Returns (call_record dict, cleanup callable).
+        """
+        from transformers.tokenization_python import PreTrainedTokenizer
+
+        saved_init = PreTrainedTokenizer.__init__
+        call_record = {}
+
+        def spy_init(self, *args, **kwargs):
+            call_record.update(kwargs)
+            raise RuntimeError("spy_stop")
+
+        PreTrainedTokenizer.__init__ = spy_init
+        PreTrainedTokenizer.__init__._nemo_stp_patched = False
+        _patch_special_tokens_pattern()
+
+        def cleanup():
+            PreTrainedTokenizer.__init__ = saved_init
+
+        return call_record, cleanup
+
+    def test_patch_injects_none_when_kwarg_omitted(self):
+        """When special_tokens_pattern is NOT passed, the patch injects 'none'."""
+        from transformers.tokenization_python import PreTrainedTokenizer
+
+        call_record, cleanup = self._make_spy_and_patch()
+        try:
+            try:
+                PreTrainedTokenizer(vocab_file="/dev/null")
+            except RuntimeError:
+                pass
+            assert call_record.get("special_tokens_pattern") == "none"
+        finally:
+            cleanup()
+
+    def test_patch_preserves_explicit_special_tokens_pattern(self):
+        """If caller explicitly passes special_tokens_pattern, the patch doesn't override it."""
+        from transformers.tokenization_python import PreTrainedTokenizer
+
+        call_record, cleanup = self._make_spy_and_patch()
+        try:
+            try:
+                PreTrainedTokenizer(vocab_file="/dev/null", special_tokens_pattern="cls_sep")
+            except RuntimeError:
+                pass
+            assert call_record.get("special_tokens_pattern") == "cls_sep"
+        finally:
+            cleanup()
+
+
+class TestApplyCacheCompatibilityPatchesIntegration:
+    """Tests for apply_cache_compatibility_patches calling the new sub-patches."""
+
+    def test_calls_bytes_to_unicode_patch(self):
+        """apply_cache_compatibility_patches invokes _patch_bytes_to_unicode."""
+        with patch("nemo_automodel._transformers.utils._patch_bytes_to_unicode") as mock_btu:
+            with patch("nemo_automodel._transformers.utils._patch_special_tokens_pattern"):
+                apply_cache_compatibility_patches()
+            mock_btu.assert_called_once()
+
+    def test_calls_special_tokens_pattern_patch(self):
+        """apply_cache_compatibility_patches invokes _patch_special_tokens_pattern."""
+        with patch("nemo_automodel._transformers.utils._patch_special_tokens_pattern") as mock_stp:
+            with patch("nemo_automodel._transformers.utils._patch_bytes_to_unicode"):
+                apply_cache_compatibility_patches()
+            mock_stp.assert_called_once()
+
+    def test_applies_dynamic_cache_alias(self):
+        """apply_cache_compatibility_patches aliases get_usable_length when needed."""
+        apply_cache_compatibility_patches()
+        from transformers.cache_utils import DynamicCache
+
+        assert hasattr(DynamicCache, "get_usable_length") or hasattr(DynamicCache, "get_seq_length")
+
+
+class TestApplyQwen3OmniConfigPatch:
+    """Test cases for apply_qwen3_omni_config_patch function."""
+
+    def test_patch_sets_use_sliding_window_default(self):
+        """Verify the patch adds use_sliding_window=False to the config class."""
+        from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+            Qwen3OmniMoeTalkerCodePredictorConfig,
+        )
+
+        apply_qwen3_omni_config_patch()
+        assert hasattr(Qwen3OmniMoeTalkerCodePredictorConfig, "use_sliding_window")
+
+    def test_patch_is_idempotent(self):
+        """Calling the patch twice does not raise or change the value."""
+        from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+            Qwen3OmniMoeTalkerCodePredictorConfig,
+        )
+
+        apply_qwen3_omni_config_patch()
+        apply_qwen3_omni_config_patch()
+        assert Qwen3OmniMoeTalkerCodePredictorConfig.use_sliding_window is False
+
+    def test_patch_does_not_overwrite_existing_attribute(self):
+        """If the attribute already exists (e.g. fixed upstream), patch is a no-op."""
+        from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+            Qwen3OmniMoeTalkerCodePredictorConfig,
+        )
+
+        original = getattr(Qwen3OmniMoeTalkerCodePredictorConfig, "use_sliding_window", None)
+        Qwen3OmniMoeTalkerCodePredictorConfig.use_sliding_window = True
+        try:
+            apply_qwen3_omni_config_patch()
+            assert Qwen3OmniMoeTalkerCodePredictorConfig.use_sliding_window is True
+        finally:
+            if original is None:
+                del Qwen3OmniMoeTalkerCodePredictorConfig.use_sliding_window
+            else:
+                Qwen3OmniMoeTalkerCodePredictorConfig.use_sliding_window = original

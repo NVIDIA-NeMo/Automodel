@@ -413,6 +413,53 @@ def register_parallel_strategy(arg=None, *, name: Optional[str] = None):
     return _register
 
 
+def _pre_shard_combined_projections(
+    module: nn.Module,
+    mesh: DeviceMesh,
+    mp_policy: Optional[MixedPrecisionPolicy],
+    offload_policy: Optional[OffloadPolicy] = None,
+) -> None:
+    """Pre-shard combined projection modules (qkv_proj, gate_up_proj) on dim 1.
+
+    Combined QKV and gate_up projections use interleaved layouts on dim 0
+    (grouping Q/K/V rows or gate/up rows).  Standard FSDP ``Shard(0)`` can
+    break these group boundaries when ``num_kv_heads`` does not divide evenly
+    by the FSDP shard count, causing reshape failures in the state-dict adapter.
+
+    Sharding on dim 1 keeps dim 0 intact so reshape / split operations work
+    for any model configuration.  1-D tensors (biases) use ``Shard(0)`` because
+    FSDP's ``shard_placement_fn`` only accepts ``Shard`` placements; the
+    state-dict adapter's ``_gather_1d_if_needed`` gathers them when the local
+    shard doesn't align with interleaved group boundaries.
+
+    Follows the same pattern as MoE expert sharding
+    (``nemo_automodel/components/moe/parallelizer.py``).
+    """
+    try:
+        from nemo_automodel.components.models.common.combined_projection.combined_mlp import CombinedGateUpMLP
+        from nemo_automodel.components.models.common.combined_projection.combined_qkv import CombinedQKVAttentionMixin
+    except ImportError:
+        return
+
+    _shard_fn = lambda p: Shard(1) if p.ndim >= 2 else Shard(0)
+
+    for sub in module.modules():
+        target = None
+        if isinstance(sub, CombinedQKVAttentionMixin) and hasattr(sub, "qkv_proj"):
+            target = sub.qkv_proj
+        elif isinstance(sub, CombinedGateUpMLP) and hasattr(sub, "gate_up_proj"):
+            target = sub.gate_up_proj
+
+        if target is not None and not isinstance(target, FSDPModule):
+            fully_shard(
+                target,
+                mesh=mesh,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+                shard_placement_fn=_shard_fn,
+            )
+
+
 def apply_fsdp2_sharding_recursively(
     module: nn.Module,
     mesh: DeviceMesh,
@@ -449,6 +496,10 @@ def apply_fsdp2_sharding_recursively(
             if isinstance(child_module, nn.ModuleList):
                 apply_fsdp2_sharding_recursively(child_module, mesh, mp_policy, offload_policy)
             else:
+                # Pre-shard combined projection submodules on dim 1 so that
+                # the parent fully_shard (dim 0) skips them automatically.
+                _pre_shard_combined_projections(child_module, mesh, mp_policy, offload_policy)
+
                 # As an optimization, do not reshard after forward for the last
                 # transformer block since FSDP would prefetch it immediately
                 reshard_after_forward = int(layer_id) < len(module) - 1

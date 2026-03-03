@@ -174,7 +174,7 @@ def _compute_expert_utilization(
     Returns:
         Dict like ``{"moe_expert_utilization/layer_0_expert_5": 1.23, ...}``.
     """
-    if not per_layer_utilizations:
+    if not per_layer_utilizations or top_k <= 0:
         return {}
 
     # Build flat list of (utilization, layer_idx, expert_idx)

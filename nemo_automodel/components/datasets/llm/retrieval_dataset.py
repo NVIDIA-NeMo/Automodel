@@ -170,6 +170,17 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
         with open(data_dir, "r") as f:
             train_data = json.load(f)
         qa_corpus_paths = train_data["corpus"]
+
+        # Resolve relative corpus paths relative to the JSON file's directory
+        # This makes the data portable across machines/containers
+        json_dir = os.path.dirname(os.path.abspath(data_dir))
+        if isinstance(qa_corpus_paths, dict):
+            qa_corpus_paths = [qa_corpus_paths]
+        for corpus_info in qa_corpus_paths:
+            corpus_path = corpus_info.get("path", "")
+            if corpus_path and not os.path.isabs(corpus_path):
+                corpus_info["path"] = os.path.normpath(os.path.join(json_dir, corpus_path))
+
         add_corpus(qa_corpus_paths, corpus_dict)
 
         # Extract only the required fields for training, ignoring extra fields

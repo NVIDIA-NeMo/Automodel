@@ -18,7 +18,12 @@ import torch
 import torch.nn as nn
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common import (
+    BackendConfig,
+    get_rope_config,
+    initialize_linear_module,
+    initialize_rms_norm_module,
+)
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.deepseek_v3.layers import MLA
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids, precompute_freqs_cis
@@ -143,13 +148,14 @@ class DeepseekV3Model(nn.Module):
         self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
 
         self.max_seq_len = config.max_position_embeddings
+        rope_theta, rope_scaling, _ = get_rope_config(config)
         self.register_buffer(
             "freqs_cis",
             precompute_freqs_cis(
                 config.qk_rope_head_dim,
                 self.max_seq_len,
-                config.rope_parameters["rope_theta"] if hasattr(config, "rope_parameters") else config.rope_theta,
-                config.rope_parameters if hasattr(config, "rope_parameters") else config.rope_scaling,
+                rope_theta,
+                rope_scaling,
             ),
             persistent=False,
         )
@@ -211,13 +217,12 @@ class DeepseekV3Model(nn.Module):
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
 
         with buffer_device:
+            rope_theta, rope_scaling, _ = get_rope_config(self.config)
             self.freqs_cis = precompute_freqs_cis(
                 self.config.qk_rope_head_dim,
                 self.max_seq_len,
-                self.config.rope_parameters["rope_theta"]
-                if hasattr(self.config, "rope_parameters")
-                else self.config.rope_theta,
-                self.config.rope_scaling,
+                rope_theta,
+                rope_scaling,
             )
             self.freqs_cis = self.freqs_cis.to(buffer_device)
             if self.embed_tokens is not None:
@@ -333,13 +338,12 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         self.to(dtype)
         with buffer_device:
+            rope_theta, rope_scaling, _ = get_rope_config(self.config)
             self.model.freqs_cis = precompute_freqs_cis(
                 self.config.qk_rope_head_dim,
                 self.model.max_seq_len,
-                self.config.rope_parameters["rope_theta"]
-                if hasattr(self.config, "rope_parameters")
-                else self.config.rope_theta,
-                self.config.rope_scaling,
+                rope_theta,
+                rope_scaling,
             )
 
 
