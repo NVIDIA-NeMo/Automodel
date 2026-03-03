@@ -302,29 +302,25 @@ training jobs when you do not need to override any configuration from
 the default recipes. -->
 
 ``` bash
-automodel finetune llm -c sft_guide.yaml
+automodel sft_guide.yaml
 ```
-
-where `finetune` is name the name of the recipe file (excluding the `.py` extension) and `llm` the domain of the model.
 
 ### Invoke the Recipe Script Directly
 
 Alternatively, you can run the recipe [script](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py) directly using [torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html), as shown below.
 
 ``` bash
-torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config sft_guide.yaml
+torchrun --nproc-per-node=8 nemo_automodel/recipes/llm/train_ft.py -c sft_guide.yaml
 ```
 
 ### Sample Output
 Running the recipe using either the `automodel` app or by directly invoking the recipe script should produce
 the following log:
 ```
-$ automodel finetune llm -c sft_guide.yaml
-INFO:root:Domain:  llm
-INFO:root:Command: finetune
-INFO:root:Config:  /mnt/4tb/auto/Automodel/sft_guide.yaml
-INFO:root:Running job using source from: /mnt/4tb/auto/Automodel
-INFO:root:Launching job locally on 2 devices
+$ automodel sft_guide.yaml
+INFO:cli.app:Config: /mnt/4tb/auto/Automodel/sft_guide.yaml
+INFO:cli.app:Recipe: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
+INFO:cli.app:Launching job interactively (local)
 cfg-path: /mnt/4tb/auto/Automodel/sft_guide.yaml
 INFO:root:step 4 | epoch 0 | loss 1.5514 | grad_norm 102.0000 | mem: 11.66 GiB | tps 6924.50
 INFO:root:step 8 | epoch 0 | loss 0.7913 | grad_norm 46.2500 | mem: 14.58 GiB | tps 9328.79

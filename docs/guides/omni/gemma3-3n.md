@@ -123,7 +123,7 @@ We provide [example custom collate functions](https://github.com/NVIDIA-NeMo/Aut
 
 ## Run the Fine-Tune Script
 
-The VLM fine-tuning functionality is provided through [`examples/vlm_finetune/finetune.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/finetune.py).
+Use the `automodel` CLI to launch fine-tuning with a YAML configuration file.
 
 ### Apply YAML-Based Configuration
 
@@ -136,14 +136,14 @@ The simplest way to run fine-tuning is with a YAML configuration file. We provid
 * **Single GPU**
 
 ```bash
-uv run examples/vlm_finetune/finetune.py --config examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml
+automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml
 ```
 
 * **Multi GPU**
 
 ```bash
-uv run torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py \
-    --config examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml
+automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml \
+    --nproc-per-node=2
 ```
 
 #### Run Gemma 3n Fine-Tuning
@@ -151,14 +151,14 @@ uv run torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py \
 * **Single GPU**
 
 ```bash
-uv run examples/vlm_finetune/finetune.py --config examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml
+automodel examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml
 ```
 
 * **Multi-GPU**
 
 ```bash
-uv run torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py \
-    --config examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml
+automodel examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml \
+    --nproc-per-node=2
 ```
 
 #### Override Configuration Parameters
@@ -166,8 +166,7 @@ uv run torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py \
 You can override any configuration parameter using dot-notation without modifying the YAML file:
 
 ```bash
-uv run examples/vlm_finetune/finetune.py \
-    --config examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml \
+automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml \
     --step_scheduler.ckpt_every_steps 100 \
     --step_scheduler.max_steps 1000 \
     --optimizer.lr 2e-5 \
@@ -195,7 +194,7 @@ For memory-efficient training, you can use Low-Rank Adaptation (LoRA) instead of
 To run PEFT with Gemma 3:
 
 ```bash
-uv run examples/vlm_finetune/finetune.py --config examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix_peft.yaml
+automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix_peft.yaml
 ```
 
 The LoRA configuration excludes vision and audio components from adaptation to preserve pre-trained visual representations:

@@ -13,15 +13,13 @@
 # limitations under the License.
 
 
-# To run this recipe, please use the following command:
-# torchrun --nproc_per_node 8
-#     --nnodes $NNODES
-#     --master_addr $MASTER_ADDR
-#     --master_port 29400
-#     --node_rank $NODE_RANK
-#     examples/llm_pretrain/pretrain.py
-#     --config examples/llm_pretrain/deepseekv3_pretrain.yaml
 
+# To run this recipe:
+#   automodel examples/llm_pretrain/deepseekv3_pretrain.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe:
+  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 512

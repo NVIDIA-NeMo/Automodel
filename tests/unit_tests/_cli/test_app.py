@@ -11,29 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import shutil
 
-# Patch the script module
-import sys, importlib
+import shutil
+import sys
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import yaml
-import os
 
 sys.modules["nemo_run"] = mock.MagicMock()
-
-# Simulate torch distributed imports
 sys.modules["torch.distributed.run"] = mock.MagicMock()
 
-# Import the script under test
-import argparse
+import cli.app as module
 
-import nemo_automodel._cli.app as module
 
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
 
 @pytest.fixture
 def tmp_yaml_file():
@@ -45,6 +41,77 @@ def tmp_yaml_file():
     yield tmp_file
     shutil.rmtree(tmp_dir)
 
+
+@pytest.fixture
+def recipe_yaml(tmp_path):
+    """YAML with a recipe._target_ (no launcher section)."""
+    cfg = tmp_path / "recipe.yaml"
+    cfg.write_text(yaml.dump({
+        "recipe": {
+            "_target_": "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction",
+        },
+        "step_scheduler": {"num_epochs": 1},
+    }))
+    return cfg
+
+
+@pytest.fixture
+def slurm_yaml(tmp_path):
+    """YAML with recipe + slurm section."""
+    cfg = tmp_path / "slurm.yaml"
+    cfg.write_text(yaml.dump({
+        "recipe": {
+            "_target_": "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction",
+        },
+        "step_scheduler": {"num_epochs": 1},
+        "slurm": {
+            "job_name": "test_job",
+            "nodes": 1,
+            "ntasks_per_node": 8,
+            "job_dir": str(tmp_path / "slurm_jobs"),
+        },
+    }))
+    return cfg
+
+
+@pytest.fixture
+def k8s_yaml(tmp_path):
+    """YAML with recipe + k8s section."""
+    cfg = tmp_path / "k8s.yaml"
+    cfg.write_text(yaml.dump({
+        "recipe": {
+            "_target_": "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction",
+        },
+        "step_scheduler": {"num_epochs": 1},
+        "k8s": {
+            "num_nodes": 2,
+            "gpus_per_node": 8,
+            "image": "nvcr.io/nvidia/nemo-automodel:latest",
+        },
+    }))
+    return cfg
+
+
+@pytest.fixture
+def nemo_run_yaml(tmp_path):
+    """YAML with recipe + nemo_run section."""
+    cfg = tmp_path / "nemo_run.yaml"
+    cfg.write_text(yaml.dump({
+        "recipe": {
+            "_target_": "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction",
+        },
+        "step_scheduler": {"num_epochs": 1},
+        "nemo_run": {
+            "executor": "local",
+            "num_gpus_per_node": 1,
+        },
+    }))
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# load_yaml tests
+# ---------------------------------------------------------------------------
 
 def test_load_yaml_valid(tmp_yaml_file):
     data = module.load_yaml(tmp_yaml_file)
@@ -64,308 +131,160 @@ def test_load_yaml_bad_format(tmp_path):
         module.load_yaml(bad_yaml)
 
 
-def test_main_slurm_preserves_env_var_placeholders(monkeypatch, tmp_path: Path):
-    # The slurm section is passed through as-is (no env interpolation) so users can
-    # defer env expansion to the batch script runtime and avoid leaking secrets.
-    cfg = tmp_path / "cfg.yaml"
-    cfg.write_text(
-        f"""
-        slurm:
-          job_name: test_job
-          job_dir: {tmp_path / "slurm_jobs"}
-          hf_home: ${{HF_HOME}}
-          nodes: 1
-          ntasks_per_node: 2
-        """
+# ---------------------------------------------------------------------------
+# build_parser tests
+# ---------------------------------------------------------------------------
+
+def test_build_parser_requires_config():
+    parser = module.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args([])
+
+
+def test_build_parser_accepts_config(tmp_path):
+    cfg = tmp_path / "test.yaml"
+    cfg.write_text("foo: bar")
+    parser = module.build_parser()
+    args, extra = parser.parse_known_args([str(cfg)])
+    assert args.config == cfg
+    assert args.nproc_per_node is None
+
+
+def test_build_parser_nproc_per_node(tmp_path):
+    cfg = tmp_path / "test.yaml"
+    cfg.write_text("foo: bar")
+    parser = module.build_parser()
+    args, _ = parser.parse_known_args([str(cfg), "--nproc-per-node=4"])
+    assert args.nproc_per_node == 4
+
+
+# ---------------------------------------------------------------------------
+# main() dispatch tests
+# ---------------------------------------------------------------------------
+
+def test_main_missing_recipe(monkeypatch, tmp_yaml_file):
+    """YAML without recipe._target_ should exit with error."""
+    monkeypatch.setattr("sys.argv", ["automodel", str(tmp_yaml_file)])
+    with pytest.raises(SystemExit) as exc_info:
+        module.main()
+    assert exc_info.value.code == 1
+
+
+def test_main_dispatches_to_interactive(monkeypatch, recipe_yaml):
+    """No launcher section -> InteractiveLauncher."""
+    monkeypatch.setattr("sys.argv", ["automodel", str(recipe_yaml)])
+
+    launched = {}
+
+    class FakeInteractiveLauncher:
+        def launch(self, config, config_path, recipe_target, nproc, extra):
+            launched["recipe_target"] = recipe_target
+            launched["nproc"] = nproc
+            return 0
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.launcher.interactive.InteractiveLauncher",
+        FakeInteractiveLauncher,
     )
-
-    captured = {}
-
-    def fake_launch_with_slurm(args, job_conf_path, job_dir, slurm_config, extra_args=None):
-        captured["job_dir"] = job_dir
-        captured["slurm_config"] = dict(slurm_config)
-        return 0
-
-    monkeypatch.setattr(module, "launch_with_slurm", fake_launch_with_slurm)
-    monkeypatch.setattr(module.time, "time", lambda: 1234567890)
-    monkeypatch.setattr("sys.argv", ["automodel", "finetune", "llm", "-c", str(cfg)])
-
     result = module.main()
     assert result == 0
-    assert os.path.basename(captured["job_dir"]) == "1234567890"
-    assert captured["slurm_config"]["hf_home"] == "${HF_HOME}"
-    # job_dir is used to construct the job directory and should not be forwarded.
-    assert "job_dir" not in captured["slurm_config"]
+    assert "TrainFinetuneRecipeForNextTokenPrediction" in launched["recipe_target"]
 
 
-def test_load_function_success(tmp_path):
-    # Create a mock Python file with a function
-    file_path = tmp_path / "mock_module.py"
-    file_path.write_text("def mock_func(): return 'success'")
-    func = module.load_function(file_path, "mock_func")
-    assert callable(func)
-    assert func() == "success"
+def test_main_dispatches_to_slurm(monkeypatch, slurm_yaml):
+    """slurm: section -> SlurmLauncher."""
+    monkeypatch.setattr("sys.argv", ["automodel", str(slurm_yaml)])
 
+    launched = {}
 
-def test_load_function_missing_file():
-    with pytest.raises(FileNotFoundError):
-        module.load_function("missing.py", "func")
+    class FakeSlurmLauncher:
+        def launch(self, config, config_path, recipe_target, launcher_config, extra):
+            launched["launcher_config"] = launcher_config
+            launched["recipe_target"] = recipe_target
+            return 0
 
-
-def test_load_function_missing_func(tmp_path):
-    file_path = tmp_path / "mock_module2.py"
-    file_path.write_text("x = 5")
-    with pytest.raises(ImportError):
-        module.load_function(file_path, "missing_func")
-
-
-def test_build_parser(monkeypatch):
-    recipes_path = Path(__file__).parents[3]  # / "recipes"
-    # Simulate recipes path structure
-    monkeypatch.setattr(module.Path, "parents", [None, None, recipes_path])
-    parser = module.build_parser()
-    assert parser is not None
-
-
-def test_launch_with_slurm(monkeypatch, tmp_path):
-    mock_script = "some_script.py"
-    mock_config = "some_config.yaml"
-    mock_slurm_config = {"nodes": 1}
-
-    fake_executor = mock.MagicMock()
-    fake_exp = mock.MagicMock()
-    dummy_args = SimpleNamespace(
-        domain="llm",
-        command="finetune",
+    monkeypatch.setattr(
+        "nemo_automodel.components.launcher.slurm.launcher.SlurmLauncher",
+        FakeSlurmLauncher,
     )
+    result = module.main()
+    assert result == 0
+    assert launched["launcher_config"]["job_name"] == "test_job"
 
-    # Create a temporary repo_root directory that exists
-    repo_root = tmp_path / "repo_root"
-    repo_root.mkdir()
 
-    monkeypatch.setattr(module, "load_yaml", lambda x: {"slurm": mock_slurm_config})
-    monkeypatch.setitem(
-        sys.modules,
-        "nemo_run",
-        mock.MagicMock(
-            SlurmExecutor=lambda **kwargs: fake_executor,
-            LocalTunnel=lambda: "tunnel",
-            Experiment=mock.MagicMock(return_value=fake_exp),
-            Script=mock.MagicMock(),
-        ),
+def test_main_dispatches_to_k8s(monkeypatch, k8s_yaml):
+    """k8s: section -> K8sLauncher."""
+    monkeypatch.setattr("sys.argv", ["automodel", str(k8s_yaml)])
+
+    launched = {}
+
+    class FakeK8sLauncher:
+        def launch(self, config, config_path, recipe_target, launcher_config, extra):
+            launched["launcher_config"] = launcher_config
+            return 0
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.launcher.k8s.launcher.K8sLauncher",
+        FakeK8sLauncher,
     )
-    monkeypatch.setitem(
-        sys.modules,
-        "nemo_run.config",
-        mock.MagicMock(
-            job_dir='',
-        )
+    result = module.main()
+    assert result == 0
+    assert launched["launcher_config"]["num_nodes"] == 2
+
+
+def test_main_dispatches_to_nemo_run(monkeypatch, nemo_run_yaml):
+    """nemo_run: section -> NemoRunLauncher."""
+    monkeypatch.setattr("sys.argv", ["automodel", str(nemo_run_yaml)])
+
+    launched = {}
+
+    class FakeNemoRunLauncher:
+        def launch(self, config, config_path, recipe_target, launcher_config, extra):
+            launched["launcher_config"] = launcher_config
+            return 0
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.launcher.nemo_run.launcher.NemoRunLauncher",
+        FakeNemoRunLauncher,
     )
-    # fake implementation
-    def fake_submit_slurm_job(cfg, job_dir):
-        parts = cfg.command.split()
-        assert len(parts) == 19
-        return "FAKE_JOB_ID"
-
-    import nemo_automodel.components.launcher.slurm.utils as slurm_utils
-    monkeypatch.setattr(slurm_utils, "submit_slurm_job", fake_submit_slurm_job)
-    job_dir = '/tmp/a/0123456789/'
-
-    # Create a proper SlurmConfig object with defaults, then add repo_root
-    from nemo_automodel.components.launcher.slurm.config import SlurmConfig
-    slurm_config_obj = SlurmConfig(job_name="test_job")  # Required field
-    # Convert to dict and add repo_root (which is handled separately in launch_with_slurm)
-    slurm_config_dict = {}
-    for key, value in slurm_config_obj.__dict__.items():
-        # Skip fields that will be overridden in launch_with_slurm to avoid conflicts
-        if key in ['command', 'chdir']:
-            continue
-        # Convert Path objects to strings for dictionary representation
-        elif hasattr(value, '__fspath__'):  # Path-like objects
-            slurm_config_dict[key] = str(value)
-        # Initialize list fields as empty lists if they're None (to avoid AttributeError on append)
-        elif key in ['extra_mounts'] and value is None:
-            slurm_config_dict[key] = []
-        else:
-            slurm_config_dict[key] = value
-    slurm_config_dict["repo_root"] = str(repo_root)
-    module.launch_with_slurm(dummy_args, job_dir +'y.conf', job_dir, slurm_config=slurm_config_dict)
-
-    # maybe separate test?
-    with pytest.raises(AssertionError, match='Expected last dir to be unix timestamp'):
-        job_dir = '/tmp/a/123456789/'
-        module.launch_with_slurm(dummy_args, job_dir +'y.conf', job_dir, slurm_config=slurm_config_dict)
+    result = module.main()
+    assert result == 0
+    assert launched["launcher_config"]["executor"] == "local"
 
 
-    dummy_cfg = tmp_path / "dummy.yaml"
-    dummy_cfg.write_text("foo: bar\n")
-    fake_config = {"slurm": {"job_dir": str(tmp_path / "slurm_jobs")}, "foo": "bar"}
-    monkeypatch.setattr(module, "load_yaml", lambda x: dict(fake_config))
-    monkeypatch.setattr(module.time, "time", lambda: 1234567890)
-
-    captured = {}
-    def fake_launch_with_slurm_main(args, job_conf_path, job_dir, slurm_config, extra_args=None):
-        captured["job_conf_path"] = job_conf_path
-        captured["job_dir"] = job_dir
-        captured["slurm_config"] = slurm_config
-        captured["extra_args"] = extra_args
-        # ensure job_config.yaml contains only non-slurm keys
-        with open(job_conf_path, "r") as fp:
-            data = yaml.safe_load(fp)
-        assert data == {"foo": "bar"}
-        assert os.path.basename(job_dir) == "1234567890"
-        return 0
-
-    monkeypatch.setattr(module, "launch_with_slurm", fake_launch_with_slurm_main)
+def test_main_passes_extra_args(monkeypatch, recipe_yaml):
+    """Extra CLI args should be forwarded to the launcher."""
     monkeypatch.setattr(
         "sys.argv",
-        ["automodel", "finetune", "llm", "-c", str(dummy_cfg), "--some-unknown-flag", "abc"],
+        ["automodel", str(recipe_yaml), "--model.pretrained_model_name_or_path=foo"],
     )
-    result = module.main()
-    assert result == 0
-    assert captured["extra_args"] == ["--some-unknown-flag", "abc"]
 
+    launched = {}
 
-def test_main_single_node(monkeypatch, tmp_yaml_file):
-    config_path = tmp_yaml_file
+    class FakeInteractiveLauncher:
+        def launch(self, config, config_path, recipe_target, nproc, extra):
+            launched["extra"] = extra
+            return 0
 
-    monkeypatch.setattr("sys.argv", ["prog", "finetune", "llm", "-c", str(config_path)])
-    monkeypatch.setattr(module, "load_yaml", lambda x: {})
-    import torch.distributed.run as thrun
-    monkeypatch.setattr(thrun, "determine_local_world_size", lambda **kwargs: 1)
-
-    def dummy_main(config_path_arg):
-        assert config_path_arg == config_path
-        return 0
-
-    monkeypatch.setattr(module, "load_function", lambda f, n: dummy_main)
-    monkeypatch.setattr(module.Path, "parents", [None, None, Path(__file__).parent])
-
-    result = module.main()
-    assert result == 0
-
-
-def test_main_multi_node(monkeypatch, tmp_yaml_file):
-    config_path = tmp_yaml_file
-
-    # Simulate CLI args using sys.argv
-    monkeypatch.setattr("sys.argv", ["prog", "finetune", "llm", "-c", str(config_path)])
-
-    monkeypatch.setattr(module, "load_yaml", lambda x: {})
-    run_mod = importlib.import_module("torch.distributed.run")
-    monkeypatch.setattr(run_mod, "run", lambda *a, **kw: 0)
-    import torch.distributed.run as trn
-    monkeypatch.setattr(trn, "get_args_parser", lambda: argparse.Namespace(parse_known_args=lambda: (DummyArgs(), None)))
-    monkeypatch.setattr(trn, "determine_local_world_size", lambda **kwargs: 4)
-
-    # Simulate torchrun parser and arguments
-    class DummyArgs:
-        def __init__(self):
-            self.training_script = None
-            self.training_script_args = ["finetune", "--config", str(config_path)]
-            self.nproc_per_node = None
-
-    # Dummy load_function and Path.parents
-    monkeypatch.setattr(module, "load_function", lambda f, n: None)
-    monkeypatch.setattr(module.Path, "parents", [None, None, Path(__file__).parent])
-
-    result = module.main()
-    assert result == 0
-
-
-def test_main_k8s_not_implemented(monkeypatch, tmp_yaml_file):
-    config_path = tmp_yaml_file
-
-    # Get the original parser builder
-    original_build_parser = module.build_parser
-
-    def custom_parser():
-        parser = original_build_parser()
-        parser.set_defaults(config=str(config_path), domain="llm", command="finetune")
-        return parser
-
-    monkeypatch.setattr("sys.argv", ["automodel", "finetune", "llm", "-c", str(config_path)])
-    monkeypatch.setattr(module, "build_parser", custom_parser)
-    monkeypatch.setattr(module, "load_yaml", lambda x: {"k8s": {}})
-    monkeypatch.setattr(module.Path, "parents", [None, None, Path(__file__).parent])
-
-    with pytest.raises(NotImplementedError):
-        module.main()
-
-
-def argparse_mock(args_list):
-    parser = module.build_parser()
-    return parser.parse_args(args_list)
-
-
-def argparse_mock_parser():
-    class DummyParser:
-        def parse_args(self):
-            return SimpleNamespace(
-                training_script="dummy.py",
-                training_script_args=["finetune", "--config", "dummy.yaml"],
-                nproc_per_node=None,
-            )
-
-    return DummyParser()
-
-def test_repo_root_when_found(monkeypatch):
-    dummy_root = Path("/tmp/dummy_repo").resolve()
-
-    # Pretend an initial PYTHONPATH
-    monkeypatch.setenv("PYTHONPATH", "foo:bar")
-
-    # Force the helper to return our dummy path
     monkeypatch.setattr(
-        module, "get_automodel_repo_root", lambda: dummy_root, raising=True
+        "nemo_automodel.components.launcher.interactive.InteractiveLauncher",
+        FakeInteractiveLauncher,
     )
-
-    # Act
-    result = module.get_repo_root()
-
-    # Assert return value
-    assert result == dummy_root
-
-    # Assert PYTHONPATH was *prepended* with dummy_root and old entries kept
-    assert os.environ["PYTHONPATH"].split(":") == [str(dummy_root), "foo", "bar"]
+    module.main()
+    assert "--model.pretrained_model_name_or_path=foo" in launched["extra"]
 
 
-def test_repo_root_when_not_found(monkeypatch):
-    # Start from a known PYTHONPATH
-    monkeypatch.setenv("PYTHONPATH", "foo:bar")
-
-    # Make helper return None
-    monkeypatch.setattr(module, "get_automodel_repo_root", lambda: None, raising=True)
-
-    # Act
-    result = module.get_repo_root()
-
-    # Expected path = two parents up from the module's file
-    expected = Path(module.__file__).parents[2]
-    assert result == expected
-
-    # PYTHONPATH must remain unchanged
-    assert os.environ["PYTHONPATH"] == "foo:bar"
-
+# ---------------------------------------------------------------------------
+# Repo structure test (unchanged)
+# ---------------------------------------------------------------------------
 
 def test_repo_structure():
-    """
-    inside the nemo_automodel/_cli/app.py we assume a specific directory structure.
-    This test ensures the directory structure is preserved.
-    """
-    # Find the Automodel repository root relative to this test file
-    # This test file is at: tests/unit_tests/_cli/test_app.py
-    # So we need to go up 3 levels to reach the repo root
     repo_root = Path(__file__).parents[3]
-
-    with pytest.raises(AssertionError):
-        assert (repo_root / "nemo_automodel_abc").exists()
+    assert (repo_root / "cli").exists()
+    assert (repo_root / "cli" / "app.py").exists()
     assert (repo_root / "nemo_automodel").exists()
     assert (repo_root / "nemo_automodel" / "components").exists()
-    assert (repo_root / "nemo_automodel" / "_cli").exists()
     assert (repo_root / "nemo_automodel" / "recipes").exists()
     assert (repo_root / "nemo_automodel" / "shared").exists()
     assert (repo_root / "docs").exists()
     assert (repo_root / "examples").exists()
-
-

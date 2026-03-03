@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# To run this recipe, please use the following command:
-# python examples/biencoder/finetune.py --config examples/biencoder/llama3_2_1b_biencoder.yaml
-# Or with torchrun for multi-GPU:
-# torchrun --nproc-per-node=8 examples/biencoder/finetune.py --config examples/biencoder/llama3_2_1b_biencoder.yaml
+# To run this recipe:
+#   automodel examples/biencoder/llama3_2_1b_biencoder.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe:
+  _target_: nemo_automodel.recipes.biencoder.train_biencoder.TrainBiencoderRecipe
 
 seed: 42
 

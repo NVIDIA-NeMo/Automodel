@@ -88,7 +88,7 @@ Install NeMo AutoModel and launch your first training job.
 :::{grid-item-card} {octicon}`download;1.5em;sd-mr-1` Installation
 :link: guides/installation
 :link-type: doc
-Install via PyPI, Docker, or from source.
+Install via PyPI, Docker, or from source. Use `nemo-automodel[cli]` for lightweight login-node installs.
 :::
 
 :::{grid-item-card} {octicon}`gear;1.5em;sd-mr-1` Configuration
