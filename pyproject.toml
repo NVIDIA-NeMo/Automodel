@@ -76,6 +76,11 @@ classifiers = [
 dependencies = [
     "datasets>=4.0.0",
     "megatron-fsdp>=0.2.3",
+<<<<<<< pranav/migrate-dfm
+=======
+    "mistral-common[image,audio,hf-hub,sentencepiece]",
+    "opencv-python-headless==4.10.0.84",
+>>>>>>> main
     "pybind11",
     "pyyaml",
     "torch>=2.6.0,<=2.10.0",
