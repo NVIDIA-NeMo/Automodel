@@ -34,7 +34,7 @@ model:
     attn: te
     linear: torch
     rms_norm: te
-    experts: te
+    experts: torch_mm
     dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
@@ -48,7 +48,7 @@ peft:
   dropout: 0.0
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints/qwen3_moe_lora
   model_save_format: safetensors
 
@@ -58,9 +58,10 @@ distributed:
   cp_size: 1
   pp_size: 1
   ep_size: 8
+  activation_checkpointing: true
 
   sequence_parallel: false
-  activation_checkpointing: true
+  activation_checkpointing: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
