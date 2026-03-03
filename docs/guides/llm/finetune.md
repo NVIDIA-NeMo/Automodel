@@ -297,7 +297,7 @@ the default recipes.
 automodel finetune llm -c sft_guide.yaml
 ```
 
-where `finetune` is the CLI command (it maps to the LLM training recipe under `nemo_automodel/recipes/llm/train_ft.py`) and `llm` is the model domain.
+where `finetune` is the CLI command and `llm` is the model domain.
 
 ### Invoke the Recipe Script Directly
 
