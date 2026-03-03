@@ -99,12 +99,12 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     # Route activation_checkpointing: for non-EP configs it goes on the
     # strategy config; for EP configs it stays only on MeshContext
     # (the MoE infra reads it from there).
-    ep_size: int = parallelism.get("ep_size", 1)
+    ep_size: int = parallelism.get("ep_size") or 1
 
     # YAML-level sanity: silently discard sub-configs that don't apply to the
     # current parallelism sizes (e.g. pipeline section present but pp_size=1,
     # which is common when a YAML template is overridden via CLI).
-    pp_size: int = parallelism.get("pp_size", 1)
+    pp_size: int = parallelism.get("pp_size") or 1
     if pipeline_dict is not None and pp_size <= 1:
         pipeline_dict = None
     if moe_dict is not None and ep_size <= 1:
