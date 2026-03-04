@@ -19,6 +19,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
@@ -1925,3 +1926,136 @@ def test_vlm_build_model_accepts_multimodal_lm_entry_points(entry_point):
         )
 
     assert model is not None
+
+
+# -----------------------------------------------------------------------------
+# rope_fusion disabled when cp > 1
+# -----------------------------------------------------------------------------
+
+
+def _patch_vlm_setup_minimals(monkeypatch, cp_size):
+    """Patch heavy dependencies so FinetuneRecipeForVLM.setup() runs lightly."""
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.build_distributed",
+        lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.setup_logging", lambda: None)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.apply_cache_compatibility_patches", lambda: None)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.StatefulRNG", lambda *a, **k: "rng")
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_loss_fn", lambda cfg: "loss_fn")
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.build_checkpoint_config",
+        lambda *a, **k: SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.setup_distributed",
+        lambda cfg, world_size: SimpleNamespace(
+            strategy_config=None,
+            pipeline_config=None,
+            moe_config=None,
+            activation_checkpointing=False,
+            pp_enabled=False,
+            device_mesh=None,
+            moe_mesh=None,
+            cp_size=cp_size,
+        ),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.Checkpointer",
+        lambda **kwargs: SimpleNamespace(
+            config=kwargs["config"],
+            load_base_model=lambda *a, **k: None,
+            maybe_wait_for_staging=lambda: None,
+            close=lambda: None,
+        ),
+    )
+
+    dummy_model = DummyModel()
+    dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda **k: None)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_model", lambda *a, **k: dummy_model)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_optimizer", lambda *a, **k: [dummy_opt])
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_dataloader", lambda *a, **k: ("dl", "proc"))
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.build_step_scheduler",
+        lambda *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_lr_scheduler", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.build_metric_logger",
+        lambda *a, **k: SimpleNamespace(log=lambda *a, **k: None, close=lambda: None),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._log_experiment_details",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._log_library_versions",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._log_model_and_optimizer_details",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM.load_checkpoint",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._log_step_scheduler_details",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.torch.cuda.reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_dp_rank", lambda self, include_cp=False: 0)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_dp_group_size", lambda self, include_cp=False: 1)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_cp_group_size", lambda self: 1)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_tp_rank", lambda self: 0)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_pp_rank", lambda self: 0)
+
+
+def _minimal_vlm_cfg(cp_size: int, rope_fusion: bool):
+    return ConfigNode(
+        {
+            "model": {"backend": {"rope_fusion": rope_fusion}},
+            "dataloader": {},
+            "dataset": {"path_or_dataset": "dummy"},
+            "validation_dataloader": {},
+            "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
+            "optimizer": {},
+            "loss_fn": {},
+            "checkpoint": {"best_metric_key": "default"},
+            "distributed": {"cp_size": cp_size},
+        }
+    )
+
+
+def test_vlm_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
+    """rope_fusion should be set to False during VLM setup when cp_size > 1."""
+    cfg = _minimal_vlm_cfg(cp_size=2, rope_fusion=True)
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=2)
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert cfg.model.backend.rope_fusion is False
+
+
+def test_vlm_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):
+    """rope_fusion should remain True in VLM setup when cp_size == 1."""
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=True)
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert cfg.model.backend.rope_fusion is True
+
+
+def test_vlm_rope_fusion_stays_false_when_already_disabled(monkeypatch):
+    """rope_fusion=False should stay False in VLM setup regardless of cp_size."""
+    cfg = _minimal_vlm_cfg(cp_size=4, rope_fusion=False)
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=4)
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert cfg.model.backend.rope_fusion is False
