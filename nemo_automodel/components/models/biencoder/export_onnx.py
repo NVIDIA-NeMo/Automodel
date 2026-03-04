@@ -46,9 +46,7 @@ from transformers import AutoModel, AutoTokenizer
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
 # Thin nn.Module wrappers used to build a single trace-able graph for ONNX
-# ---------------------------------------------------------------------------
 
 
 class _Pooling(nn.Module):
