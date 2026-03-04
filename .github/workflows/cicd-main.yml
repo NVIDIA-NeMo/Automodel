@@ -131,7 +131,24 @@ jobs:
         run: |
           source ./venv/bin/activate
           uv run --active ty --version
-          uv run --active ty check
+
+          uv pip install -q tomli
+          TY_DIRS=$(python3 -c "
+          try:
+              import tomllib
+          except ModuleNotFoundError:
+              import tomli as tomllib
+          from pathlib import Path
+          data = tomllib.loads(Path('pyproject.toml').read_text())
+          dirs = set()
+          for override in data.get('tool', {}).get('ty', {}).get('overrides', []):
+              for pattern in override.get('include', []):
+                  dirs.add(pattern.replace('/**', ''))
+          print(' '.join(sorted(dirs)))
+          ")
+
+          echo "ty check targets: $TY_DIRS"
+          uv run --active ty check $TY_DIRS
 
   Nemo_Linting_Test:
     needs: [linting, import_linting, type_checking]
