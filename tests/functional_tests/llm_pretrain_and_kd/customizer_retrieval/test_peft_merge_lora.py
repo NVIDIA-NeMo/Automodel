@@ -330,8 +330,7 @@ class TestMergeLoraRealBiencoder:
     def test_merge_lora_real_biencoder(self):
         from peft import LoraConfig, PeftModel, get_peft_model
 
-        from nemo_automodel.components.models.biencoder import BiencoderModel
-        from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel
+        from nemo_automodel.components.models.biencoder import BiencoderModel, LlamaBidirectionalModel
         from tools.merge_lora import merge_lora
 
         # 1. Load base model
@@ -346,7 +345,7 @@ class TestMergeLoraRealBiencoder:
         base_model.save_pretrained(base_dir)
 
         # Copy custom model code so trust_remote_code can discover it.
-        import nemo_automodel.components.models.llama_bidirectional.model as _mod
+        import nemo_automodel.components.models.biencoder.llama_bidirectional_model as _mod
 
         model_py_src = Path(_mod.__file__)
         shutil.copy2(str(model_py_src), os.path.join(base_dir, "model.py"))
