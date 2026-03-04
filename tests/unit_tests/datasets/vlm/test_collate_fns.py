@@ -51,7 +51,7 @@ class DummyQwen25Processor:
         assert tokenize is False
         return "dummy chat string"
 
-    def __call__(self, *, text, images, padding, return_tensors):
+    def __call__(self, *, text, images=None, videos=None, padding, return_tensors, **kwargs):
         batch_size = len(text)
         input_ids = torch.arange(1, 6).unsqueeze(0).repeat(batch_size, 1)
         return {
@@ -90,7 +90,11 @@ class DummyQwen3OmniProcessor:
     def apply_chat_template(self, conversation, *, add_generation_prompt, tokenize, **kwargs):
         assert add_generation_prompt is False
         assert tokenize is False
-        return "chat:" + conversation[0]["content"][0]["text"]
+        # Find first text content (may be preceded by an injected fake image).
+        for item in conversation[0]["content"]:
+            if isinstance(item, dict) and item.get("type") == "text":
+                return "chat:" + item["text"]
+        return "chat:default"
 
     def __call__(self, *, text, return_tensors, padding, **kwargs):
         assert return_tensors == "pt"
@@ -180,7 +184,6 @@ class DummyKimiVLProcessor:
     def __call__(self, *, text, return_tensors, padding, truncation, **kwargs):
         assert return_tensors == "pt"
         assert padding is True or padding == "max_length"
-        assert truncation is True
         self.forward_calls.append(
             {
                 "text": list(text),
@@ -367,8 +370,8 @@ def collate_mod():
 def fake_qwen_utils(monkeypatch):
     vision_utils = types.ModuleType("qwen_vl_utils")
 
-    def _fake_process_vision_info(conversation):
-        return torch.zeros(3, 224, 224), None
+    def _fake_process_vision_info(conversation, **kwargs):
+        return None, None
 
     vision_utils.process_vision_info = _fake_process_vision_info
     monkeypatch.setitem(sys.modules, "qwen_vl_utils", vision_utils)
@@ -387,9 +390,7 @@ def test_dispatch_table(collate_mod):
     assert collate_mod.COLLATE_FNS["default"] is collate_mod.default_collate_fn
 
 
-def test_qwen25_collate_shapes(collate_mod, fake_qwen_utils, monkeypatch):
-    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
-
+def test_qwen25_collate_shapes(collate_mod, monkeypatch):
     processor = DummyQwen25Processor()
     batch = collate_mod.qwen2_5_collate_fn([{"conversation": CONVERSATION}], processor)
 
@@ -461,7 +462,7 @@ def test_nemotron_parse_collate_shifts_and_casts(collate_mod, monkeypatch):
     assert torch.equal(batch["decoder_attention_mask"], torch.tensor([[1, 1, 1]]))
 
 
-@pytest.mark.parametrize("fn_name", ["qwen2_5_collate_fn", "default_collate_fn", "qwen3_omni_collate_fn"])
+@pytest.mark.parametrize("fn_name", ["default_collate_fn", "qwen3_omni_collate_fn"])
 def test_import_error_when_qwen_utils_missing(collate_mod, fn_name, monkeypatch):
     monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", False, raising=True)
     monkeypatch.setattr(collate_mod, "HAVE_QWEN_OMNI_UTILS", False, raising=True)
@@ -963,8 +964,8 @@ def test_kimi_k25_vl_collate_fn_with_max_length(collate_mod, monkeypatch):
     assert batch["input_ids"].shape[1] == 99
 
 
-def test_kimi_k25_vl_collate_fn_truncation(collate_mod, monkeypatch):
-    """Test kimi_k25_vl_collate_fn truncates when max_length is smaller."""
+def test_kimi_k25_vl_collate_fn_drops_overlong(collate_mod, monkeypatch):
+    """Test kimi_k25_vl_collate_fn drops samples exceeding max_length instead of truncating."""
     # Custom processor that produces longer sequences
     class LongSequenceProcessor:
         def __init__(self):
@@ -982,23 +983,15 @@ def test_kimi_k25_vl_collate_fn_truncation(collate_mod, monkeypatch):
 
     processor = LongSequenceProcessor()
 
-    def fake_build_labels(input_ids, conversations, processor_arg):
-        batch_size, seq_len = input_ids.shape
-        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
-
-    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
-
     conversation = [
         {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
         {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
     ]
     examples = [{"conversation": conversation}]
 
-    # Truncate to 20 tokens
-    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=20)
-
-    # After :-1 shift, should be 19
-    assert batch["input_ids"].shape[1] == 19
+    # All samples exceed max_length=20 → ValueError
+    with pytest.raises(ValueError, match="All samples in batch exceed max_length"):
+        collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=20)
 
 
 def test_kimi_k25_vl_collate_fn_multiple_examples(collate_mod, monkeypatch):
@@ -1257,6 +1250,8 @@ class TestDefaultCollateFnEnsureRgb:
         collate_mod.default_collate_fn([{"conversation": conversation}], processor)
 
         assert captured_conversations == ["RGB"]
+
+
 # =============================================================================
 # Tests for fake image fallback (FSDP / Zero3 hang prevention)
 # =============================================================================
