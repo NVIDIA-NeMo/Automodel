@@ -22,6 +22,7 @@ model:
   trust_remote_code: true
   pooling: avg
   l2_normalize: true
+  task: embedding
   use_liger_kernel: false
   use_sdpa_patching: false
   torch_dtype: bfloat16

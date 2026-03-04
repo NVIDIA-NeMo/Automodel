@@ -710,13 +710,8 @@ class NeMoAutoModelForTextToWaveform(_BaseNeMoAutoModelClass, AutoModelForTextTo
 class NeMoAutoModelEncoder:
     """NeMo AutoModel for encoder/embedding tasks with full infrastructure support.
 
-    This class provides a unified interface for loading encoder models with
-    support for PEFT, FSDP, TP, CP, FP8, QAT, and other infrastructure features.
-    It uses the EncoderModel.build() method to create the model and then applies
-    all infrastructure through apply_model_infrastructure().
-
-    This class properly integrates with the model registry and applies all
-    kernel patching and infrastructure support.
+    Wraps ``EncoderModel.build()`` with kernel patching, PEFT, FSDP, and
+    other distributed infrastructure via ``apply_model_infrastructure()``.
 
     Examples:
     --------
@@ -733,6 +728,7 @@ class NeMoAutoModelEncoder:
         pretrained_model_name_or_path: str,
         pooling: str = "avg",
         l2_normalize: bool = True,
+        task: str = "embedding",
         attn_implementation: str = "flash_attention_2",
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
@@ -747,48 +743,21 @@ class NeMoAutoModelEncoder:
         peft_config: Optional[dict] = None,
         **kwargs,
     ) -> PreTrainedModel:
-        """
-        Load an encoder model from pretrained weights with full infrastructure support.
+        """Load an encoder model with infrastructure (FSDP, PEFT, kernel patching, etc.).
 
-        This method builds an encoder using EncoderModel.build(), applies kernel
-        patching, and then applies all infrastructure (FSDP, checkpointing, etc.)
-        through apply_model_infrastructure().
-
-        Args:
-            pretrained_model_name_or_path: Path to pretrained model or model identifier.
-            pooling: Pooling strategy ('avg', 'cls', 'last', etc.).
-            l2_normalize: Whether to L2 normalize embeddings.
-            attn_implementation: Attention implementation to use (e.g.,
-                ``"flash_attention_2"``, ``"sdpa"``, ``"eager"``).
-                Defaults to ``"flash_attention_2"``.
-            use_liger_kernel: Whether to apply Liger kernel optimizations.
-            use_sdpa_patching: Whether to apply SDPA patching.
-            sdpa_method: SDPA backend methods to use.
-            torch_dtype: Data type passed to the underlying model initialization.
-            device_mesh: Pre-created device mesh for distributed training.
-            moe_mesh: Device mesh for expert parallelism (FSDP2 only).
-            tp_plan: Custom tensor parallel plan; overrides distributed_config.tp_plan.
-            distributed_config: Strategy-specific distributed training configuration.
-            moe_config: MoE parallelizer configuration.
-            compile_config: Configuration for torch.compile.
-            **kwargs: Additional arguments passed to EncoderModel.build.
-
-        Returns:
-            EncoderModel instance with loaded weights and all infrastructure applied.
-
-        Notes:
-            If kernel patching fails, the method retries with adjusted parameters.
+        Builds via ``EncoderModel.build()``, then applies infrastructure through
+        ``apply_model_infrastructure()``. Retries with degraded kernel settings on failure.
         """
         from nemo_automodel._transformers.encoder import EncoderModel
 
         logger.info(f"Loading NeMoAutoModelEncoder from {pretrained_model_name_or_path}")
 
         def _retry(**override):
-            """Internal helper to re-enter this function with patched parameters."""
             return cls.from_pretrained(
                 pretrained_model_name_or_path,
                 pooling=pooling,
                 l2_normalize=l2_normalize,
+                task=task,
                 attn_implementation=attn_implementation,
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
@@ -829,6 +798,7 @@ class NeMoAutoModelEncoder:
             model_name_or_path=pretrained_model_name_or_path,
             pooling=pooling,
             l2_normalize=l2_normalize,
+            task=task,
             attn_implementation=attn_implementation,
             **kwargs,
         )

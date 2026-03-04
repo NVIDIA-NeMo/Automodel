@@ -33,6 +33,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelEncoder.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
   pooling: avg
+  task: embedding
   torch_dtype: bfloat16
 
 tokenizer:

@@ -68,10 +68,14 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
     return emb
 
 
-# HuggingFace model_type -> bidirectional architecture class name in ModelRegistry
+# HuggingFace model_type -> task -> bidirectional architecture class name in ModelRegistry
+_LLAMA_TASKS = {
+    "embedding": "LlamaBidirectionalModel",
+    "classification": "LlamaBidirectionalForSequenceClassification",
+}
 SUPPORTED_BACKBONES = {
-    "llama": "LlamaBidirectionalModel",
-    "llama_bidirec": "LlamaBidirectionalModel",
+    "llama": _LLAMA_TASKS,
+    "llama_bidirec": _LLAMA_TASKS,
 }
 
 
@@ -83,11 +87,13 @@ class EncoderModel(nn.Module):
         lm_q: PreTrainedModel,
         pooling: str = "avg",
         l2_normalize: bool = True,
+        task: str = "embedding",
     ):
         super().__init__()
         self.lm_q = lm_q
         self.pooling = pooling
         self.l2_normalize = l2_normalize
+        self.task = task
         self.config = self.lm_q.config
 
         # HuggingFace consolidated checkpoint compatibility
@@ -100,8 +106,11 @@ class EncoderModel(nn.Module):
             "AutoConfig": f"model.{encoder_class_name.replace('Model', 'Config')}",
         }
 
-    def forward(self, input_dict: dict) -> Optional[torch.Tensor]:
-        """Forward pass — going through __call__ ensures FSDP2 unshard hooks fire."""
+    def forward(self, input_dict: dict = None, **kwargs) -> Optional[torch.Tensor]:
+        """Forward pass -- going through __call__ ensures FSDP2 unshard hooks fire."""
+        if self.task == "classification":
+            inputs = input_dict if input_dict is not None else kwargs
+            return self.lm_q(**inputs, return_dict=True)
         return self.encode(input_dict)
 
     def encode(self, input_dict: dict) -> Optional[torch.Tensor]:
@@ -147,6 +156,7 @@ class EncoderModel(nn.Module):
         pooling: str = "avg",
         l2_normalize: bool = True,
         trust_remote_code: bool = False,
+        task: str = "embedding",
         **hf_kwargs,
     ):
         """Build encoder model from a pretrained backbone."""
@@ -156,21 +166,22 @@ class EncoderModel(nn.Module):
         config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
         model_type = getattr(config, "model_type", "")
 
-        arch_name = SUPPORTED_BACKBONES.get(model_type.lower())
-        if arch_name is None:
-            supported = ", ".join(SUPPORTED_BACKBONES.keys())
+        task_map = SUPPORTED_BACKBONES.get(model_type.lower())
+        if task_map is None:
             raise ValueError(
                 f"Unsupported model type '{model_type}' for encoder. "
-                f"Supported types: {supported}. "
-                f"To add support for a new backbone, update SUPPORTED_BACKBONES and "
-                "create a bidirectional model class with ModelClass export."
+                f"Supported types: {', '.join(SUPPORTED_BACKBONES)}."
+            )
+
+        arch_name = task_map.get(task)
+        if arch_name is None:
+            raise ValueError(
+                f"Unsupported task '{task}' for model type '{model_type}'. "
+                f"Available tasks: {', '.join(task_map)}."
             )
 
         if arch_name not in ModelRegistry.model_arch_name_to_cls:
-            raise ValueError(
-                f"Bidirectional model class '{arch_name}' not found in ModelRegistry. "
-                f"Ensure the model is exported via ModelClass in the corresponding module."
-            )
+            raise ValueError(f"Model class '{arch_name}' not found in ModelRegistry.")
         BidirectionalModelClass = ModelRegistry.model_arch_name_to_cls[arch_name]
         logger.info(f"Using {arch_name} from registry")
 
@@ -182,6 +193,7 @@ class EncoderModel(nn.Module):
             lm_q=lm_q,
             pooling=pooling,
             l2_normalize=l2_normalize,
+            task=task,
         )
         return model
 
