@@ -38,7 +38,6 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: /path/to/model
-  trust_remote_code: true
 
 distributed:
   strategy: fsdp2

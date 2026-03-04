@@ -37,8 +37,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: /path/to/model
-  trust_remote_code: true
+  pretrained_model_name_or_path: /adasif/models/models--nvidia--nemotron-super-rl-030326/snapshots/dea8fce277f999b5dcf60a1d1e96ea80782689b8
 
 # torch.compile configuration
 compile:
