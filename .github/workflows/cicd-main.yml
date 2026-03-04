@@ -148,7 +148,7 @@ jobs:
           ")
 
           echo "ty check targets: $TY_DIRS"
-          uv run --active ty check $TY_DIRS
+          uv run --active ty check --verbose $TY_DIRS
 
   Nemo_Linting_Test:
     needs: [linting, import_linting, type_checking]
