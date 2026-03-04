@@ -199,28 +199,6 @@ class ChatDataset(Dataset):
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
         self.pad_token_id = _add_pad_token(self.tokenizer) or eos_token_id
 
-        # "longest" / True: pad every sample to the longest tokenized length
-        # in the dataset.  Resolve once at init by batching all conversations
-        # through apply_chat_template(padding="longest"), then use the
-        # resulting length with "max_length" padding per sample.
-        self._effective_pad_length = None
-        if padding in (True, "longest"):
-            all_messages = []
-            for idx in range(len(self.dataset)):
-                row = self.dataset[idx]
-                messages = row.get("messages")
-                if isinstance(messages, list):
-                    all_messages.append(_normalize_messages(messages))
-            if all_messages:
-                batch = tokenizer.apply_chat_template(
-                    all_messages,
-                    tokenize=True,
-                    padding="longest",
-                    return_dict=True,
-                )
-                self._effective_pad_length = len(batch["input_ids"][0])
-            self.padding = "max_length"
-
     def __len__(self) -> int:
         return len(self.dataset)
 
@@ -241,7 +219,7 @@ class ChatDataset(Dataset):
             normalized,
             eos_token_id,
             self.pad_token_id,
-            seq_length=self._effective_pad_length or self.seq_length,
+            seq_length=self.seq_length,
             padding=self.padding,
             truncation=self.truncation,
             tools=tools,
