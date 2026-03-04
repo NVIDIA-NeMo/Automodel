@@ -50,7 +50,7 @@ compile:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  exclude_modules: ["*.out_proj"]  # mamba layers use custom kernels that take in the out_proj.weight directly, thus lora doesn't work here.
   dim: 8
   alpha: 32
   use_triton: True
