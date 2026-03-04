@@ -509,29 +509,48 @@ def _nemotronh_mlp_layer_flops(config, gbs, seq_len):
 
 
 def _nemotronh_moe_layer_flops(config, gbs, seq_len):
-    """Model FLOPs for a MoE layer in Nemotron V3 (hybrid Mamba/Attention/MoE).
+    """Model FLOPs for a MoE layer in Nemotron V3/Super V3 (hybrid Mamba/Attention/MoE).
 
     Nemotron V3 uses relu2 (non-gated) for both routed and shared experts,
     so each expert has 2 linear projections (up_proj + down_proj), not 3.
 
+    When moe_latent_size is set (Super V3), routed experts operate in a reduced
+    latent space with additional projection layers (fc1_latent_proj, fc2_latent_proj).
+    The shared expert and gate always operate in the full hidden_size dimension.
+
     Accounts for:
       1. Routed experts: only num_experts_per_tok activated per token.
-      2. Shared expert: always active for every token.
+      2. Shared expert: always active for every token (full hidden_size).
       3. Router/gate: linear projection hidden_size -> n_routed_experts.
+      4. Latent projections (if moe_latent_size is set): down and up projections.
     """
     hs = config.hidden_size
     num_tokens = gbs * seq_len
 
-    # Routed experts: num_experts_per_tok of n_routed_experts activated, each up_proj + down_proj
-    routed_expert_flops = 6 * num_tokens * config.num_experts_per_tok * hs * config.moe_intermediate_size * 2
+    # Determine if latent MoE is used
+    moe_latent_size = getattr(config, "moe_latent_size", None)
 
-    # Shared expert: always active, up_proj + down_proj
+    if moe_latent_size is not None:
+        # Latent MoE: experts operate in reduced latent space
+        expert_dim = moe_latent_size
+        # fc1_latent_proj (hs -> latent) + fc2_latent_proj (latent -> hs)
+        latent_proj_flops = 6 * num_tokens * hs * moe_latent_size * 2
+    else:
+        expert_dim = hs
+        latent_proj_flops = 0
+
+    # Routed experts: num_experts_per_tok activated, each up_proj + down_proj
+    routed_expert_flops = (
+        6 * num_tokens * config.num_experts_per_tok * expert_dim * config.moe_intermediate_size * 2
+    )
+
+    # Shared expert: always active on full hidden_size, up_proj + down_proj
     shared_expert_flops = 6 * num_tokens * hs * config.moe_shared_expert_intermediate_size * 2
 
-    # Router/gate: hidden_size -> n_routed_experts
+    # Router/gate: hidden_size -> n_routed_experts (always full dimension)
     gate_flops = 6 * num_tokens * hs * config.n_routed_experts
 
-    return routed_expert_flops + shared_expert_flops + gate_flops
+    return routed_expert_flops + shared_expert_flops + gate_flops + latent_proj_flops
 
 
 def _non_mla_attn_layer_flops(config, gbs, seq_len):
