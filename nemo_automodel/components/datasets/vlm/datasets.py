@@ -1067,3 +1067,235 @@ def make_meta_dataset(
     return result
 
 
+class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
+    """Dataset wrapper that tokenizes samples in ``__getitem__``.
+
+    Instead of deferring ``apply_chat_template`` to the collate function, this
+    wrapper performs tokenization per-sample so that:
+
+    * The collate function only needs to pad and stack.
+    * Overlong samples are detected **after** precise tokenization (including
+      media-token expansion) and replaced with a different random sample.
+    * Tokenization work is distributed across DataLoader workers.
+
+    Each ``__getitem__`` call returns a dict with at least::
+
+        {
+            "input_ids":      (seq_len,),
+            "attention_mask": (seq_len,),
+            "labels":         (seq_len,),
+        }
+
+    Plus optional media tensors (``pixel_values``, ``image_grid_thw``,
+    ``pixel_values_videos``, ``video_grid_thw``).
+    """
+
+    def __init__(self, dataset, processor, max_length=None, max_retries=10):
+        self.dataset = dataset
+        self.processor = processor
+        self.max_length = max_length
+        self.max_retries = max_retries
+        # Compatibility attributes expected by build_dataloader
+        self.preload_media = False
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        from nemo_automodel.components.datasets.vlm.collate_fns import (
+            _extract_media_from_conversations,
+            build_labels_from_template,
+        )
+        from nemo_automodel.components.datasets.vlm.fake_image import (
+            _conversation_has_media,
+            inject_fake_image_into_conversation,
+            mask_fake_vision_tokens_single,
+        )
+
+        for attempt in range(self.max_retries):
+            try:
+                example = self.dataset[idx]
+                # preserve_video_metadata=True: store _video_fps and
+                # _frame_indices on each video item so we can fix timestamps.
+                example = _preload_media(
+                    example, self.processor, preserve_video_metadata=True,
+                )
+                conversation = example["conversation"]
+
+                # Inject fake image into pure-text samples for FSDP/Zero3.
+                injected_fake = not _conversation_has_media(conversation)
+                if injected_fake:
+                    conversation = inject_fake_image_into_conversation(conversation)
+
+                # Ensure images are RGB
+                for message in conversation:
+                    content = message.get("content")
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and isinstance(
+                                item.get("image"), Image.Image
+                            ):
+                                item["image"] = item["image"].convert("RGB")
+
+                # --- Two-step tokenization for correct video timestamps ---
+                # Step 1: render template text (may have wrong timestamps
+                # because the processor falls back to fps=24 for pre-loaded
+                # frames).
+                text = self.processor.apply_chat_template(
+                    [conversation], tokenize=False,
+                )
+                if isinstance(text, list):
+                    text = text[0]
+
+                # Step 2: fix timestamps using preserved metadata.
+                text = _fix_video_timestamps(text, conversation)
+
+                # Step 3: extract pre-loaded media for the processor.
+                images, videos = _extract_media_from_conversations(
+                    [conversation],
+                )
+
+                # Step 4: tokenize the corrected text and process media.
+                result = self.processor(
+                    text=[text],
+                    images=images,
+                    videos=videos,
+                    return_tensors="pt",
+                )
+
+                input_ids = result["input_ids"][0]  # (seq_len,)
+                seq_len = input_ids.shape[0]
+
+                # Precise length check — replace overlong samples
+                if self.max_length is not None and seq_len > self.max_length:
+                    logger.warning(
+                        "Sample %d: %d tokens > max_length %d, replacing.",
+                        idx, seq_len, self.max_length,
+                    )
+                    idx = random.randint(0, len(self.dataset) - 1)
+                    continue
+
+                # Build labels using template markers
+                labels = build_labels_from_template(
+                    result["input_ids"],  # (1, seq_len)
+                    [conversation],
+                    self.processor,
+                )[0]  # (seq_len,)
+
+                output = {
+                    "input_ids": input_ids,
+                    "attention_mask": result["attention_mask"][0],
+                    "labels": labels,
+                }
+
+                # Copy media tensors (these don't have a sample batch dim)
+                for key in ("pixel_values", "pixel_values_videos",
+                            "image_grid_thw", "video_grid_thw"):
+                    if key in result and result[key] is not None:
+                        output[key] = result[key]
+
+                # Mask fake vision tokens so they don't affect attention.
+                if injected_fake:
+                    mask_fake_vision_tokens_single(output, self.processor)
+
+                return output
+
+            except Exception as e:
+                logger.warning(
+                    "Error processing sample %d (attempt %d/%d): %s",
+                    idx, attempt + 1, self.max_retries, e,
+                )
+                idx = random.randint(0, len(self.dataset) - 1)
+
+        raise RuntimeError(
+            f"Failed to load a valid sample after {self.max_retries} retries"
+        )
+
+    def robust_collate(self, collate_fn):
+        """Wrap *collate_fn* so that on failure the entire batch is re-sampled."""
+        dataset = self
+
+        def wrapper(examples):
+            last_error = None
+            for attempt in range(dataset.max_retries):
+                try:
+                    return collate_fn(examples)
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        f"Collate failed (attempt {attempt + 1}/{dataset.max_retries}): {e}. "
+                        "Re-sampling batch."
+                    )
+                    examples = [
+                        dataset[random.randint(0, len(dataset) - 1)]
+                        for _ in range(len(examples))
+                    ]
+            raise RuntimeError(
+                f"Collate failed after {dataset.max_retries} retries. Last error: {last_error}"
+            )
+
+        return wrapper
+
+
+class RobustDatasetWrapper(torch.utils.data.Dataset):
+    """Wrapper that catches ``__getitem__`` and collate errors, substituting random replacement samples.
+
+    This handles failures such as corrupted files, missing media, bad data,
+    or processor errors (e.g. multimodal token mismatch from truncation)
+    without crashing the entire training run.
+    """
+
+    def __init__(self, dataset, max_retries: int = 10):
+        self.dataset = dataset
+        self.max_retries = max_retries
+        self.preload_media = False
+        self.processor = None
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        from nemo_automodel.components.datasets.vlm.fake_image import (
+            _conversation_has_media,
+            inject_fake_image_into_conversation,
+        )
+
+        for _ in range(self.max_retries):
+            try:
+                example = self.dataset[idx]
+                if self.preload_media:
+                    example = _preload_media(example, self.processor)
+                    # Inject fake image into pure-text samples for FSDP/Zero3.
+                    conversation = example.get("conversation")
+                    if conversation and not _conversation_has_media(conversation):
+                        example["conversation"] = inject_fake_image_into_conversation(conversation)
+                        example["_injected_fake"] = True
+                return example
+            except Exception as e:
+                logger.warning(f"Error loading sample {idx}: {e}. Retrying with a different sample.")
+                idx = random.randint(0, len(self.dataset) - 1)
+        raise RuntimeError(f"Failed to load a valid sample after {self.max_retries} retries")
+
+    def robust_collate(self, collate_fn):
+        """Wrap a collate_fn so that on failure the entire batch is re-sampled and retried."""
+        dataset = self
+
+        def wrapper(examples):
+            last_error = None
+            for attempt in range(dataset.max_retries):
+                try:
+                    return collate_fn(examples)
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        f"Collate failed (attempt {attempt + 1}/{dataset.max_retries}): {e}. "
+                        "Re-sampling batch."
+                    )
+                    examples = [
+                        dataset[random.randint(0, len(dataset) - 1)] for _ in range(len(examples))
+                    ]
+            raise RuntimeError(
+                f"Collate failed after {dataset.max_retries} retries. Last error: {last_error}"
+            )
+
+        return wrapper
