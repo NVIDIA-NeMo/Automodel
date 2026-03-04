@@ -98,8 +98,7 @@ RUN pip install "aiohttp>=3.13.3" \
         "pillow>=12.1.1" \
         "protobuf>=6.33.5" \
         "setuptools>=80.10.2" \
-        "urllib3>=2.6.0" \
-        "wheel>=0.46.2"
+        "urllib3>=2.6.0"
 
 FROM automodel_dep as automodel_final
 
