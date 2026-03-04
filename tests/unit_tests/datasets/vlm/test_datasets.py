@@ -1116,3 +1116,190 @@ class TestReadVideoFrames:
         assert len(frames) == 8  # rounded UP from 5 to 8, not down to 4
 
 
+# ---------------------------------------------------------------------------
+# Tests for RobustDatasetWrapper preload toggle
+# ---------------------------------------------------------------------------
+
+
+class TestRobustDatasetWrapperPreload:
+    """Tests for the preload_media toggle on RobustDatasetWrapper."""
+
+    def test_preload_default_false(self):
+        """preload_media defaults to False and processor to None."""
+        wrapper = ds.RobustDatasetWrapper([{"conversation": []}])
+        assert wrapper.preload_media is False
+        assert wrapper.processor is None
+
+    def test_preload_enabled_returns_pil(self, tmp_path):
+        """When preload_media=True, __getitem__ returns PIL Images."""
+        img = Image.new("RGB", (4, 4), color="green")
+        img_path = tmp_path / "img.png"
+        img.save(str(img_path))
+
+        data = [
+            {
+                "conversation": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "image", "image": str(img_path)}],
+                    },
+                ],
+            },
+        ]
+        wrapper = ds.RobustDatasetWrapper(data)
+        wrapper.preload_media = True
+
+        result = wrapper[0]
+        loaded = result["conversation"][0]["content"][0]["image"]
+        assert isinstance(loaded, Image.Image)
+        assert loaded.mode == "RGB"
+
+    def test_preload_disabled_returns_string(self, tmp_path):
+        """When preload_media=False, __getitem__ returns path strings."""
+        img = Image.new("RGB", (4, 4), color="green")
+        img_path = tmp_path / "img.png"
+        img.save(str(img_path))
+
+        data = [
+            {
+                "conversation": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "image", "image": str(img_path)}],
+                    },
+                ],
+            },
+        ]
+        wrapper = ds.RobustDatasetWrapper(data)
+        # preload_media is False by default
+
+        result = wrapper[0]
+        assert result["conversation"][0]["content"][0]["image"] == str(img_path)
+
+    def test_preload_failure_retries(self):
+        """When preload fails on one sample, retry picks a different sample."""
+        good_img = Image.new("RGB", (4, 4), color="red")
+        data = [
+            {
+                "conversation": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "image", "image": "/nonexistent.png"}],
+                    },
+                ],
+            },
+            {
+                "conversation": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "image", "image": good_img}],
+                    },
+                ],
+            },
+        ]
+        wrapper = ds.RobustDatasetWrapper(data, max_retries=10)
+        wrapper.preload_media = True
+
+        # Requesting index 0 (bad path) should eventually retry and succeed
+        # with a random fallback sample
+        result = wrapper[0]
+        loaded = result["conversation"][0]["content"][0]["image"]
+        assert isinstance(loaded, Image.Image)
+
+
+# ---------------------------------------------------------------------------
+# Tests for dataset-level fake image injection (FSDP / Zero3)
+# ---------------------------------------------------------------------------
+
+
+class TestRobustDatasetWrapperFakeImageInjection:
+    """RobustDatasetWrapper injects fake images into pure-text samples at __getitem__ time."""
+
+    def test_text_only_gets_fake_image_when_preload(self):
+        """Pure-text sample gets a fake image injected when preload_media=True."""
+        data = [
+            {
+                "conversation": [
+                    {"role": "user", "content": [{"type": "text", "text": "What is 1+1?"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "2"}]},
+                ],
+            },
+        ]
+        wrapper = ds.RobustDatasetWrapper(data)
+        wrapper.preload_media = True
+
+        result = wrapper[0]
+        # Should have _injected_fake flag
+        assert result.get("_injected_fake") is True
+        # First user content item should now be a fake image
+        user_content = result["conversation"][0]["content"]
+        assert user_content[0]["type"] == "image"
+        assert isinstance(user_content[0]["image"], Image.Image)
+        # Original text should still be present
+        assert user_content[1] == {"type": "text", "text": "What is 1+1?"}
+
+    def test_image_sample_not_injected(self, tmp_path):
+        """Sample with real image should NOT get fake image injected."""
+        img = Image.new("RGB", (4, 4), color="blue")
+        img_path = tmp_path / "img.png"
+        img.save(str(img_path))
+
+        data = [
+            {
+                "conversation": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": str(img_path)},
+                            {"type": "text", "text": "Describe"},
+                        ],
+                    },
+                    {"role": "assistant", "content": [{"type": "text", "text": "A blue image"}]},
+                ],
+            },
+        ]
+        wrapper = ds.RobustDatasetWrapper(data)
+        wrapper.preload_media = True
+
+        result = wrapper[0]
+        assert "_injected_fake" not in result
+        # Only the original image + text, no extra fake image
+        user_content = result["conversation"][0]["content"]
+        assert len(user_content) == 2
+        assert user_content[0]["type"] == "image"
+
+    def test_no_injection_when_preload_disabled(self):
+        """When preload_media=False (eval mode), no injection happens."""
+        data = [
+            {
+                "conversation": [
+                    {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+                ],
+            },
+        ]
+        wrapper = ds.RobustDatasetWrapper(data)
+        # preload_media defaults to False
+
+        result = wrapper[0]
+        assert "_injected_fake" not in result
+        # Content should be unchanged
+        user_content = result["conversation"][0]["content"]
+        assert len(user_content) == 1
+        assert user_content[0]["type"] == "text"
+
+    def test_does_not_mutate_original(self):
+        """Injection should not mutate the original dataset sample."""
+        original_conv = [
+            {"role": "user", "content": [{"type": "text", "text": "test"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+        ]
+        data = [{"conversation": original_conv}]
+        wrapper = ds.RobustDatasetWrapper(data)
+        wrapper.preload_media = True
+
+        result = wrapper[0]
+        assert result.get("_injected_fake") is True
+        # Original conversation should be unchanged
+        assert len(original_conv[0]["content"]) == 1
+        assert original_conv[0]["content"][0]["type"] == "text"
