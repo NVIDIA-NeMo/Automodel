@@ -19,8 +19,8 @@ from .delta_lake_dataset import (  # noqa: F401
     DeltaLakeDataset,
     is_delta_lake_path,
 )
-from .nanogpt_dataset import NanogptDataset  # noqa: F401
 from .encoder_collator import RetrievalEncoderCollator  # noqa: F401
+from .nanogpt_dataset import NanogptDataset  # noqa: F401
 from .retrieval_dataset import make_retrieval_dataset  # noqa: F401
 from .squad import make_squad_dataset  # noqa: F401
 from .xlam import make_xlam_dataset  # noqa: F401

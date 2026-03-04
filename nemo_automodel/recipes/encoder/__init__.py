@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from .mine_hard_negatives import MineHardNegativesRecipe
+from .train_cross_encoder import TrainCrossEncoderRecipe
 from .train_retriever_encoder import TrainRetrieverEncoderRecipe
 
-__all__ = ["MineHardNegativesRecipe", "TrainRetrieverEncoderRecipe"]
+__all__ = ["MineHardNegativesRecipe", "TrainRetrieverEncoderRecipe", "TrainCrossEncoderRecipe"]

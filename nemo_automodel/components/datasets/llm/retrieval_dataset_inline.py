@@ -286,6 +286,7 @@ def _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_i
 
     return result
 
+
 def _cross_encoder_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
     """
     Transform function to convert from raw format to training format.
@@ -299,18 +300,20 @@ def _cross_encoder_transform_func(examples, num_neg_docs, corpus_dict, use_datas
     # Flattening query-grouped docs images and text and repeating queries
     cur_pos_neg_image_batch_flatten = [y for x in cur_pos_neg_image_batch for y in x]
     cur_pos_neg_text_batch_flatten = [y for x in cur_pos_neg_text_batch for y in x]
-    questions_repeated = [[q]*len(i) for q, i in zip(questions, cur_pos_neg_image_batch)]
-    questions_repeated_flatten  = [y for x in questions_repeated for y in x]
+    questions_repeated = [[q] * len(i) for q, i in zip(questions, cur_pos_neg_image_batch)]
+    questions_repeated_flatten = [y for x in questions_repeated for y in x]
     num_labels = len(questions)
-    
-    assert len(cur_pos_neg_image_batch_flatten) == len(cur_pos_neg_text_batch_flatten) == len(questions_repeated_flatten)
-    return {"doc_image": cur_pos_neg_image_batch_flatten, 
-            "doc_text": cur_pos_neg_text_batch_flatten, 
-            "question": questions_repeated_flatten,
-            # Only necessary for training. Collator might use it to create the labels with the right shape
-            "num_labels": [num_labels] * len(questions_repeated_flatten)
-            }
 
+    assert (
+        len(cur_pos_neg_image_batch_flatten) == len(cur_pos_neg_text_batch_flatten) == len(questions_repeated_flatten)
+    )
+    return {
+        "doc_image": cur_pos_neg_image_batch_flatten,
+        "doc_text": cur_pos_neg_text_batch_flatten,
+        "question": questions_repeated_flatten,
+        # Only necessary for training. Collator might use it to create the labels with the right shape
+        "num_labels": [num_labels] * len(questions_repeated_flatten),
+    }
 
 
 def _create_retrieval_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
@@ -329,6 +332,7 @@ def _create_retrieval_transform_func(num_neg_docs, corpus_dict, use_dataset_inst
 
 def _create_cross_encoder_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
     """Create transform function with specified number of negative documents."""
+
     def transform(examples):
         return _cross_encoder_transform_func(
             examples,
@@ -338,6 +342,7 @@ def _create_cross_encoder_transform_func(num_neg_docs, corpus_dict, use_dataset_
         )
 
     return transform
+
 
 def make_retrieval_dataset(
     data_dir_list: Union[List[str], str],

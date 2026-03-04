@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Union, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Union
 
 import torch
-from transformers import PreTrainedTokenizerBase, DataCollatorWithPadding
+from transformers import DataCollatorWithPadding, PreTrainedTokenizerBase
 from transformers.file_utils import PaddingStrategy
 
 if TYPE_CHECKING:
@@ -239,38 +239,32 @@ class RetrievalEncoderCollator:
 
 
 class CrossEncoderCollator(DataCollatorWithPadding):
-    def __init__(
-        self, 
-        rerank_max_length: int, 
-        train_n_passages: int,
-        *args,
-        **kwargs
-    ):
+    def __init__(self, rerank_max_length: int, train_n_passages: int, *args, **kwargs):
         self.rerank_max_length = rerank_max_length
         self.train_n_passages = train_n_passages
         # Call Base with all args and kwargs
         self.args = None
-        if 'args' in kwargs:
-            self.args = kwargs.pop('args')
+        if "args" in kwargs:
+            self.args = kwargs.pop("args")
         super().__init__(*args, **kwargs)
 
     def __call__(self, features: List[Dict[str, Any]]) -> "BatchEncoding":
-        query_examples = [x['question'] for x in features]
-        doc_examples = [x['doc_text'] for x in features]        
+        query_examples = [x["question"] for x in features]
+        doc_examples = [x["doc_text"] for x in features]
 
         def format_text(q, p):
             return f"question:{q} \n \n passage:{p}"
 
-        examples = [format_text(q,d) for q, d in zip(query_examples, doc_examples)]
+        examples = [format_text(q, d) for q, d in zip(query_examples, doc_examples)]
 
-        batch_dict  = self.tokenizer(
+        batch_dict = self.tokenizer(
             examples,
             max_length=self.rerank_max_length,
             padding=True,
             truncation=True,
             pad_to_multiple_of=self.pad_to_multiple_of,
             return_tensors=self.return_tensors,
-        )        
+        )
 
         if "num_labels" in features[0]:
             batch_dict["labels"] = torch.zeros(features[0]["num_labels"], dtype=torch.long)

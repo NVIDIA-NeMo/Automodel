@@ -438,22 +438,34 @@ class TrainRetrieverEncoderRecipe(BaseRecipe):
                     all_scores.append(scores.detach().cpu())
                     all_labels.append(labels.detach().cpu())
 
-            avg_loss = torch.stack(loss_buffer).mean()
+            loss_sum = torch.stack(loss_buffer).sum()
+            loss_count = torch.tensor(len(loss_buffer), device=self.dist_env.device, dtype=loss_sum.dtype)
             if torch.distributed.is_initialized():
-                avg_loss = self._dp_allreduce(avg_loss, include_cp=True)
+                loss_sum = self._dp_allreduce(loss_sum, include_cp=True)
+                loss_count = self._dp_allreduce(loss_count, include_cp=True)
+            avg_loss = loss_sum / loss_count
 
             scores = torch.cat(all_scores, dim=0)
             labels = torch.cat(all_labels, dim=0)
+            n_samples = labels.size(0)
 
             # Accuracy@1
             _, predicted_indices = torch.topk(scores, k=1, dim=1)
-            correct = (predicted_indices.squeeze(-1) == labels).float()
-            acc1 = correct.mean().item()
+            num_correct = (predicted_indices.squeeze(-1) == labels).float().sum()
 
             # MRR
             _, sorted_indices = torch.sort(scores, dim=1, descending=True)
             ranks = (sorted_indices == labels.unsqueeze(1)).nonzero(as_tuple=True)[1] + 1
-            mrr = (1.0 / ranks.float()).mean().item()
+            rr_sum = (1.0 / ranks.float()).sum()
+
+            # Allreduce counts across DP ranks for global metrics
+            if torch.distributed.is_initialized():
+                counts = torch.tensor([num_correct, rr_sum, n_samples], device=self.dist_env.device, dtype=torch.float)
+                counts = self._dp_allreduce(counts, include_cp=False)
+                num_correct, rr_sum, n_samples = counts[0].item(), counts[1].item(), counts[2].item()
+
+            acc1 = num_correct / n_samples if n_samples > 0 else 0.0
+            mrr = rr_sum / n_samples if n_samples > 0 else 0.0
 
             metrics = {
                 "val_loss": avg_loss.item(),
