@@ -15,8 +15,7 @@
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -25,6 +24,142 @@ import torch.nn as nn
 TOOLS_DIR = Path(__file__).resolve().parents[3] / "tools"
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
+
+
+# ---------------------------------------------------------------------------
+# _resolve_auto_cls
+# ---------------------------------------------------------------------------
+
+
+class TestResolveAutoCls:
+    def test_explicit_model_class(self, tmp_path):
+        from transformers import AutoModel
+
+        from tools.merge_lora import _resolve_auto_cls
+
+        cls = _resolve_auto_cls(str(tmp_path), model_class="AutoModel")
+        assert cls is AutoModel
+
+    def test_explicit_model_class_causal_lm(self, tmp_path):
+        from transformers import AutoModelForCausalLM
+
+        from tools.merge_lora import _resolve_auto_cls
+
+        cls = _resolve_auto_cls(str(tmp_path), model_class="AutoModelForCausalLM")
+        assert cls is AutoModelForCausalLM
+
+    def test_explicit_invalid_class_raises(self, tmp_path):
+        from tools.merge_lora import _resolve_auto_cls
+
+        with pytest.raises(ValueError, match="Unknown model class"):
+            _resolve_auto_cls(str(tmp_path), model_class="NoSuchAutoModel")
+
+    def test_task_type_causal_lm(self, tmp_path):
+        from transformers import AutoModelForCausalLM
+
+        from tools.merge_lora import _resolve_auto_cls
+
+        config = {"task_type": "CAUSAL_LM", "r": 8}
+        (tmp_path / "adapter_config.json").write_text(json.dumps(config))
+
+        cls = _resolve_auto_cls(str(tmp_path))
+        assert cls is AutoModelForCausalLM
+
+    def test_task_type_feature_extraction(self, tmp_path):
+        from transformers import AutoModel
+
+        from tools.merge_lora import _resolve_auto_cls
+
+        config = {"task_type": "FEATURE_EXTRACTION", "r": 8}
+        (tmp_path / "adapter_config.json").write_text(json.dumps(config))
+
+        cls = _resolve_auto_cls(str(tmp_path))
+        assert cls is AutoModel
+
+    def test_task_type_seq_cls(self, tmp_path):
+        from transformers import AutoModelForSequenceClassification
+
+        from tools.merge_lora import _resolve_auto_cls
+
+        config = {"task_type": "SEQ_CLS", "r": 8}
+        (tmp_path / "adapter_config.json").write_text(json.dumps(config))
+
+        cls = _resolve_auto_cls(str(tmp_path))
+        assert cls is AutoModelForSequenceClassification
+
+    def test_task_type_seq_2_seq_lm(self, tmp_path):
+        from transformers import AutoModelForSeq2SeqLM
+
+        from tools.merge_lora import _resolve_auto_cls
+
+        config = {"task_type": "SEQ_2_SEQ_LM", "r": 8}
+        (tmp_path / "adapter_config.json").write_text(json.dumps(config))
+
+        cls = _resolve_auto_cls(str(tmp_path))
+        assert cls is AutoModelForSeq2SeqLM
+
+    def test_task_type_token_cls(self, tmp_path):
+        from transformers import AutoModelForTokenClassification
+
+        from tools.merge_lora import _resolve_auto_cls
+
+        config = {"task_type": "TOKEN_CLS", "r": 8}
+        (tmp_path / "adapter_config.json").write_text(json.dumps(config))
+
+        cls = _resolve_auto_cls(str(tmp_path))
+        assert cls is AutoModelForTokenClassification
+
+    def test_task_type_question_ans(self, tmp_path):
+        from transformers import AutoModelForQuestionAnswering
+
+        from tools.merge_lora import _resolve_auto_cls
+
+        config = {"task_type": "QUESTION_ANS", "r": 8}
+        (tmp_path / "adapter_config.json").write_text(json.dumps(config))
+
+        cls = _resolve_auto_cls(str(tmp_path))
+        assert cls is AutoModelForQuestionAnswering
+
+    def test_unknown_task_type_falls_back(self, tmp_path):
+        from transformers import AutoModelForCausalLM
+
+        from tools.merge_lora import _resolve_auto_cls
+
+        config = {"task_type": "SOME_FUTURE_TASK", "r": 8}
+        (tmp_path / "adapter_config.json").write_text(json.dumps(config))
+
+        cls = _resolve_auto_cls(str(tmp_path))
+        assert cls is AutoModelForCausalLM
+
+    def test_no_adapter_config_falls_back(self, tmp_path):
+        from transformers import AutoModelForCausalLM
+
+        from tools.merge_lora import _resolve_auto_cls
+
+        cls = _resolve_auto_cls(str(tmp_path))
+        assert cls is AutoModelForCausalLM
+
+    def test_no_task_type_key_falls_back(self, tmp_path):
+        from transformers import AutoModelForCausalLM
+
+        from tools.merge_lora import _resolve_auto_cls
+
+        config = {"r": 8, "lora_alpha": 16}
+        (tmp_path / "adapter_config.json").write_text(json.dumps(config))
+
+        cls = _resolve_auto_cls(str(tmp_path))
+        assert cls is AutoModelForCausalLM
+
+    def test_explicit_overrides_adapter_config(self, tmp_path):
+        from transformers import AutoModel
+
+        from tools.merge_lora import _resolve_auto_cls
+
+        config = {"task_type": "CAUSAL_LM", "r": 8}
+        (tmp_path / "adapter_config.json").write_text(json.dumps(config))
+
+        cls = _resolve_auto_cls(str(tmp_path), model_class="AutoModel")
+        assert cls is AutoModel
 
 
 # ---------------------------------------------------------------------------
@@ -117,11 +252,14 @@ class TestDequantizeModel:
         mock_bnb.nn.Linear4bit = _FakeLinear4bit
         mock_functional = MagicMock()
         mock_functional.dequantize_4bit = fake_dequant
-        return patch.dict("sys.modules", {
-            "bitsandbytes": mock_bnb,
-            "bitsandbytes.nn": mock_bnb.nn,
-            "bitsandbytes.functional": mock_functional,
-        })
+        return patch.dict(
+            "sys.modules",
+            {
+                "bitsandbytes": mock_bnb,
+                "bitsandbytes.nn": mock_bnb.nn,
+                "bitsandbytes.functional": mock_functional,
+            },
+        )
 
     def test_replaces_linear4bit_with_linear(self):
         from tools.merge_lora import dequantize_model
@@ -210,7 +348,8 @@ class TestParseArgs:
         from tools.merge_lora import parse_args
 
         monkeypatch.setattr(
-            sys, "argv",
+            sys,
+            "argv",
             ["prog", "--base-model", "my-model", "--adapter-path", "/a", "--output-dir", "/o"],
         )
         args = parse_args()
@@ -222,7 +361,8 @@ class TestParseArgs:
         from tools.merge_lora import parse_args
 
         monkeypatch.setattr(
-            sys, "argv",
+            sys,
+            "argv",
             ["prog", "-m", "m", "-a", "/a", "-o", "/o"],
         )
         args = parse_args()
@@ -231,16 +371,31 @@ class TestParseArgs:
         assert args.device == "auto"
         assert args.no_save_tokenizer is False
         assert args.trust_remote_code is False
+        assert args.model_class is None
 
     def test_all_flags(self, monkeypatch):
         from tools.merge_lora import parse_args
 
         monkeypatch.setattr(
-            sys, "argv",
+            sys,
+            "argv",
             [
-                "prog", "-m", "model", "-a", "/adapter", "-o", "/out",
-                "--qlora", "--dtype", "bfloat16", "--device", "cpu",
-                "--no-save-tokenizer", "--trust-remote-code",
+                "prog",
+                "-m",
+                "model",
+                "-a",
+                "/adapter",
+                "-o",
+                "/out",
+                "--qlora",
+                "--dtype",
+                "bfloat16",
+                "--device",
+                "cpu",
+                "--no-save-tokenizer",
+                "--trust-remote-code",
+                "--model-class",
+                "AutoModel",
             ],
         )
         args = parse_args()
@@ -249,12 +404,14 @@ class TestParseArgs:
         assert args.device == "cpu"
         assert args.no_save_tokenizer is True
         assert args.trust_remote_code is True
+        assert args.model_class == "AutoModel"
 
     def test_short_flags(self, monkeypatch):
         from tools.merge_lora import parse_args
 
         monkeypatch.setattr(
-            sys, "argv",
+            sys,
+            "argv",
             ["prog", "-m", "base", "-a", "adapter", "-o", "output"],
         )
         args = parse_args()
@@ -280,11 +437,25 @@ class TestMain:
         from tools import merge_lora as merge_mod
 
         monkeypatch.setattr(
-            sys, "argv",
+            sys,
+            "argv",
             [
-                "prog", "-m", "/model", "-a", "/adapter", "-o", "/out",
-                "--qlora", "--dtype", "bfloat16", "--device", "cpu",
-                "--no-save-tokenizer", "--trust-remote-code",
+                "prog",
+                "-m",
+                "/model",
+                "-a",
+                "/adapter",
+                "-o",
+                "/out",
+                "--qlora",
+                "--dtype",
+                "bfloat16",
+                "--device",
+                "cpu",
+                "--no-save-tokenizer",
+                "--trust-remote-code",
+                "--model-class",
+                "AutoModel",
             ],
         )
 
@@ -304,12 +475,14 @@ class TestMain:
         assert captured["device"] == "cpu"
         assert captured["save_tokenizer"] is False
         assert captured["trust_remote_code"] is True
+        assert captured["model_class"] == "AutoModel"
 
     def test_main_default_save_tokenizer_true(self, monkeypatch):
         from tools import merge_lora as merge_mod
 
         monkeypatch.setattr(
-            sys, "argv",
+            sys,
+            "argv",
             ["prog", "-m", "/m", "-a", "/a", "-o", "/o"],
         )
 
@@ -322,6 +495,7 @@ class TestMain:
         merge_mod.main()
 
         assert captured["save_tokenizer"] is True
+        assert captured["model_class"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -350,34 +524,30 @@ class TestMergeLoraFunction:
         mock_peft_model.merge_and_unload.return_value = mock_model
 
         mock_auto = MagicMock()
+        mock_auto.__name__ = "AutoModelForCausalLM"
         mock_auto.from_pretrained.return_value = mock_model
         mock_peft_cls = MagicMock()
         mock_peft_cls.from_pretrained.return_value = mock_peft_model
 
-        with patch.dict("sys.modules", {
-            "peft": MagicMock(PeftModel=mock_peft_cls),
-            "transformers": MagicMock(
-                AutoModelForCausalLM=mock_auto,
-                AutoTokenizer=MagicMock(),
-            ),
-        }):
-            monkeypatch.setattr("tools.merge_lora.AutoModelForCausalLM", mock_auto, raising=False)
-            monkeypatch.setattr("tools.merge_lora.PeftModel", mock_peft_cls, raising=False)
-            monkeypatch.setattr("tools.merge_lora.AutoTokenizer", MagicMock(), raising=False)
-
-            # We need to re-import to pick up the mocks in the function's local scope,
-            # so instead we patch at the import level inside merge_lora.
-            # The function does `from peft import PeftModel` etc. inside the body,
-            # so we just mock sys.modules.
-            merge_lora(
-                base_model="/fake/model",
-                adapter_path="/fake/adapter",
-                output_dir=str(tmp_path / "out"),
-                qlora=False,
-                dtype="float16",
-                device="cpu",
-                save_tokenizer=False,
-            )
+        with patch("tools.merge_lora._resolve_auto_cls", return_value=mock_auto):
+            with patch.dict(
+                "sys.modules",
+                {
+                    "peft": MagicMock(PeftModel=mock_peft_cls),
+                    "transformers": MagicMock(
+                        AutoTokenizer=MagicMock(),
+                    ),
+                },
+            ):
+                merge_lora(
+                    base_model="/fake/model",
+                    adapter_path="/fake/adapter",
+                    output_dir=str(tmp_path / "out"),
+                    qlora=False,
+                    dtype="float16",
+                    device="cpu",
+                    save_tokenizer=False,
+                )
 
         mock_auto.from_pretrained.assert_called_once()
         mock_peft_cls.from_pretrained.assert_called_once()
@@ -398,6 +568,7 @@ class TestMergeLoraFunction:
         mock_peft_model.merge_and_unload.return_value = mock_model
 
         mock_auto = MagicMock()
+        mock_auto.__name__ = "AutoModelForCausalLM"
         mock_auto.from_pretrained.return_value = mock_model
         mock_peft_cls = MagicMock()
         mock_peft_cls.from_pretrained.return_value = mock_peft_model
@@ -405,24 +576,27 @@ class TestMergeLoraFunction:
         mock_bnb_config_cls = MagicMock()
         mock_dequantize = MagicMock(return_value=mock_model)
 
-        with patch.dict("sys.modules", {
-            "peft": MagicMock(PeftModel=mock_peft_cls),
-            "transformers": MagicMock(
-                AutoModelForCausalLM=mock_auto,
-                AutoTokenizer=mock_tokenizer_cls,
-                BitsAndBytesConfig=mock_bnb_config_cls,
-            ),
-        }):
-            with patch("tools.merge_lora.dequantize_model", mock_dequantize):
-                merge_lora(
-                    base_model="/fake/model",
-                    adapter_path="/fake/adapter",
-                    output_dir=str(tmp_path / "out"),
-                    qlora=True,
-                    dtype="float16",
-                    device="cpu",
-                    save_tokenizer=False,
-                )
+        with patch("tools.merge_lora._resolve_auto_cls", return_value=mock_auto):
+            with patch.dict(
+                "sys.modules",
+                {
+                    "peft": MagicMock(PeftModel=mock_peft_cls),
+                    "transformers": MagicMock(
+                        AutoTokenizer=mock_tokenizer_cls,
+                        BitsAndBytesConfig=mock_bnb_config_cls,
+                    ),
+                },
+            ):
+                with patch("tools.merge_lora.dequantize_model", mock_dequantize):
+                    merge_lora(
+                        base_model="/fake/model",
+                        adapter_path="/fake/adapter",
+                        output_dir=str(tmp_path / "out"),
+                        qlora=True,
+                        dtype="float16",
+                        device="cpu",
+                        save_tokenizer=False,
+                    )
 
         mock_dequantize.assert_called_once()
         load_kwargs = mock_auto.from_pretrained.call_args
@@ -442,6 +616,7 @@ class TestMergeLoraFunction:
         mock_peft_model.merge_and_unload.return_value = mock_model
 
         mock_auto = MagicMock()
+        mock_auto.__name__ = "AutoModelForCausalLM"
         mock_auto.from_pretrained.return_value = mock_model
         mock_peft_cls = MagicMock()
         mock_peft_cls.from_pretrained.return_value = mock_peft_model
@@ -449,21 +624,24 @@ class TestMergeLoraFunction:
         mock_tokenizer = MagicMock()
         mock_tokenizer_cls.from_pretrained.return_value = mock_tokenizer
 
-        with patch.dict("sys.modules", {
-            "peft": MagicMock(PeftModel=mock_peft_cls),
-            "transformers": MagicMock(
-                AutoModelForCausalLM=mock_auto,
-                AutoTokenizer=mock_tokenizer_cls,
-            ),
-        }):
-            merge_lora(
-                base_model="/fake/model",
-                adapter_path="/fake/adapter",
-                output_dir=str(tmp_path / "out"),
-                dtype="float16",
-                device="cpu",
-                save_tokenizer=True,
-            )
+        with patch("tools.merge_lora._resolve_auto_cls", return_value=mock_auto):
+            with patch.dict(
+                "sys.modules",
+                {
+                    "peft": MagicMock(PeftModel=mock_peft_cls),
+                    "transformers": MagicMock(
+                        AutoTokenizer=mock_tokenizer_cls,
+                    ),
+                },
+            ):
+                merge_lora(
+                    base_model="/fake/model",
+                    adapter_path="/fake/adapter",
+                    output_dir=str(tmp_path / "out"),
+                    dtype="float16",
+                    device="cpu",
+                    save_tokenizer=True,
+                )
 
         mock_tokenizer_cls.from_pretrained.assert_called_once()
         mock_tokenizer.save_pretrained.assert_called_once()
@@ -481,27 +659,31 @@ class TestMergeLoraFunction:
         mock_peft_model.merge_and_unload.return_value = mock_model
 
         mock_auto = MagicMock()
+        mock_auto.__name__ = "AutoModelForCausalLM"
         mock_auto.from_pretrained.return_value = mock_model
         mock_peft_cls = MagicMock()
         mock_peft_cls.from_pretrained.return_value = mock_peft_model
         mock_tokenizer_cls = MagicMock()
         mock_tokenizer_cls.from_pretrained.side_effect = RuntimeError("no tokenizer")
 
-        with patch.dict("sys.modules", {
-            "peft": MagicMock(PeftModel=mock_peft_cls),
-            "transformers": MagicMock(
-                AutoModelForCausalLM=mock_auto,
-                AutoTokenizer=mock_tokenizer_cls,
-            ),
-        }):
-            merge_lora(
-                base_model="/fake/model",
-                adapter_path="/fake/adapter",
-                output_dir=str(tmp_path / "out"),
-                dtype="float16",
-                device="cpu",
-                save_tokenizer=True,
-            )
+        with patch("tools.merge_lora._resolve_auto_cls", return_value=mock_auto):
+            with patch.dict(
+                "sys.modules",
+                {
+                    "peft": MagicMock(PeftModel=mock_peft_cls),
+                    "transformers": MagicMock(
+                        AutoTokenizer=mock_tokenizer_cls,
+                    ),
+                },
+            ):
+                merge_lora(
+                    base_model="/fake/model",
+                    adapter_path="/fake/adapter",
+                    output_dir=str(tmp_path / "out"),
+                    dtype="float16",
+                    device="cpu",
+                    save_tokenizer=True,
+                )
 
     @patch("tools.merge_lora.gc")
     @patch("tools.merge_lora.torch")
@@ -518,6 +700,7 @@ class TestMergeLoraFunction:
 
         def fake_save(path, **kwargs):
             import os
+
             os.makedirs(path, exist_ok=True)
             config = {"hidden_size": 64, "quantization_config": {"bits": 4}}
             with open(os.path.join(path, "config.json"), "w") as f:
@@ -526,30 +709,34 @@ class TestMergeLoraFunction:
         mock_model.save_pretrained.side_effect = fake_save
 
         mock_auto = MagicMock()
+        mock_auto.__name__ = "AutoModelForCausalLM"
         mock_auto.from_pretrained.return_value = mock_model
         mock_peft_cls = MagicMock()
         mock_peft_cls.from_pretrained.return_value = mock_peft_model
         mock_bnb_config = MagicMock()
         mock_dequantize = MagicMock(return_value=mock_model)
 
-        with patch.dict("sys.modules", {
-            "peft": MagicMock(PeftModel=mock_peft_cls),
-            "transformers": MagicMock(
-                AutoModelForCausalLM=mock_auto,
-                AutoTokenizer=MagicMock(),
-                BitsAndBytesConfig=mock_bnb_config,
-            ),
-        }):
-            with patch("tools.merge_lora.dequantize_model", mock_dequantize):
-                merge_lora(
-                    base_model="/fake/model",
-                    adapter_path="/fake/adapter",
-                    output_dir=output_dir,
-                    qlora=True,
-                    dtype="float16",
-                    device="cpu",
-                    save_tokenizer=False,
-                )
+        with patch("tools.merge_lora._resolve_auto_cls", return_value=mock_auto):
+            with patch.dict(
+                "sys.modules",
+                {
+                    "peft": MagicMock(PeftModel=mock_peft_cls),
+                    "transformers": MagicMock(
+                        AutoTokenizer=MagicMock(),
+                        BitsAndBytesConfig=mock_bnb_config,
+                    ),
+                },
+            ):
+                with patch("tools.merge_lora.dequantize_model", mock_dequantize):
+                    merge_lora(
+                        base_model="/fake/model",
+                        adapter_path="/fake/adapter",
+                        output_dir=output_dir,
+                        qlora=True,
+                        dtype="float16",
+                        device="cpu",
+                        save_tokenizer=False,
+                    )
 
         config_path = Path(output_dir) / "config.json"
         result = json.loads(config_path.read_text())
@@ -567,26 +754,30 @@ class TestMergeLoraFunction:
         mock_peft_model.merge_and_unload.return_value = mock_model
 
         mock_auto = MagicMock()
+        mock_auto.__name__ = "AutoModelForCausalLM"
         mock_auto.from_pretrained.return_value = mock_model
         mock_peft_cls = MagicMock()
         mock_peft_cls.from_pretrained.return_value = mock_peft_model
 
-        with patch.dict("sys.modules", {
-            "peft": MagicMock(PeftModel=mock_peft_cls),
-            "transformers": MagicMock(
-                AutoModelForCausalLM=mock_auto,
-                AutoTokenizer=MagicMock(),
-            ),
-        }):
-            merge_lora(
-                base_model="/fake/model",
-                adapter_path="/fake/adapter",
-                output_dir=str(tmp_path / "out"),
-                dtype="float16",
-                device="cpu",
-                save_tokenizer=False,
-                trust_remote_code=True,
-            )
+        with patch("tools.merge_lora._resolve_auto_cls", return_value=mock_auto):
+            with patch.dict(
+                "sys.modules",
+                {
+                    "peft": MagicMock(PeftModel=mock_peft_cls),
+                    "transformers": MagicMock(
+                        AutoTokenizer=MagicMock(),
+                    ),
+                },
+            ):
+                merge_lora(
+                    base_model="/fake/model",
+                    adapter_path="/fake/adapter",
+                    output_dir=str(tmp_path / "out"),
+                    dtype="float16",
+                    device="cpu",
+                    save_tokenizer=False,
+                    trust_remote_code=True,
+                )
 
         call_kwargs = mock_auto.from_pretrained.call_args
         assert call_kwargs.kwargs.get("trust_remote_code") is True or call_kwargs[1].get("trust_remote_code") is True
@@ -603,25 +794,32 @@ class TestMergeLoraFunction:
         mock_peft_model.merge_and_unload.return_value = mock_model
 
         mock_auto = MagicMock()
+        mock_auto.__name__ = "AutoModelForCausalLM"
         mock_auto.from_pretrained.return_value = mock_model
         mock_peft_cls = MagicMock()
         mock_peft_cls.from_pretrained.return_value = mock_peft_model
 
-        with patch.dict("sys.modules", {
-            "peft": MagicMock(PeftModel=mock_peft_cls),
-            "transformers": MagicMock(
-                AutoModelForCausalLM=mock_auto,
-                AutoTokenizer=MagicMock(),
-            ),
-        }):
-            merge_lora(
-                base_model="/fake/model",
-                adapter_path="/fake/adapter",
-                output_dir=str(tmp_path / "out"),
-                dtype="bfloat16",
-                device="cpu",
-                save_tokenizer=False,
-            )
+        with patch("tools.merge_lora._resolve_auto_cls", return_value=mock_auto):
+            with patch.dict(
+                "sys.modules",
+                {
+                    "peft": MagicMock(PeftModel=mock_peft_cls),
+                    "transformers": MagicMock(
+                        AutoTokenizer=MagicMock(),
+                    ),
+                },
+            ):
+                merge_lora(
+                    base_model="/fake/model",
+                    adapter_path="/fake/adapter",
+                    output_dir=str(tmp_path / "out"),
+                    dtype="bfloat16",
+                    device="cpu",
+                    save_tokenizer=False,
+                )
 
         call_kwargs = mock_auto.from_pretrained.call_args
-        assert call_kwargs.kwargs.get("torch_dtype") == torch.bfloat16 or call_kwargs[1].get("torch_dtype") == torch.bfloat16
+        assert (
+            call_kwargs.kwargs.get("torch_dtype") == torch.bfloat16
+            or call_kwargs[1].get("torch_dtype") == torch.bfloat16
+        )
