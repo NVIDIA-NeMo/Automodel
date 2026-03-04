@@ -45,6 +45,62 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexToken
 _shared_experts_stream: Optional[torch.cuda.Stream] = None
 
 
+@torch.compile
+def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
+    """Apply per-expert bias to grouped GEMM output.
+
+    torch._grouped_mm does not support bias yet. Apply manually after each grouped GEMM.
+    """
+    if bias is None:
+        return value
+    shape = value.shape
+    if permuted_probs is not None:
+        output = (
+            torch.cat(
+                [
+                    t + b * p
+                    for t, b, p in zip(
+                        torch.split(value.view(-1, shape[-1]), tokens_per_expert.tolist()),
+                        bias,
+                        torch.split(permuted_probs, tokens_per_expert.tolist()),
+                    )
+                ]
+            )
+            .view(shape)
+            .to(value.dtype)
+        )
+    else:
+        output = (
+            torch.cat(
+                [
+                    t + b
+                    for t, b in zip(
+                        torch.split(
+                            value.view(-1, shape[-1]),
+                            tokens_per_expert.tolist()
+                            if isinstance(tokens_per_expert, torch.Tensor)
+                            else tokens_per_expert,
+                        ),
+                        bias,
+                    )
+                ]
+            )
+            .view(shape)
+            .to(value.dtype)
+        )
+    return output
+
+
+def _torch_mm_experts_fwd(
+    hidden_states, gate_and_up_projs, down_projs, tokens_per_expert, permuted_probs, activation_fn
+):
+    offs = tokens_per_expert.cumsum(dim=0).to(torch.int32)
+    output1 = torch._grouped_mm(hidden_states, gate_and_up_projs, offs=offs)
+    output1 = activation_fn(output1, permuted_probs)
+    output2 = torch._grouped_mm(output1, down_projs, offs=offs)
+    return output2
+
+
 @dataclass(kw_only=True)
 class MoEConfig:
     n_routed_experts: int
@@ -460,50 +516,22 @@ class GroupedExpertsDeepEP(nn.Module):
         down_projs (nn.Parameter): Linear layer for hidden-to-output transformation.
     """
 
-    @staticmethod
-    def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
-        if bias is None:
-            return value
-        shape = value.shape
-        if permuted_probs is not None:
-            output = (
-                torch.cat(
-                    [
-                        t + b * p
-                        for t, b, p in zip(
-                            torch.split(value.view(-1, shape[-1]), tokens_per_expert.tolist()),
-                            bias,
-                            torch.split(permuted_probs, tokens_per_expert.tolist()),
-                        )
-                    ]
-                )
-                .view(shape)
-                .to(value.dtype)
-            )
-        else:
-            output = (
-                torch.cat(
-                    [t + b for t, b in zip(torch.split(value.view(-1, shape[-1]), tokens_per_expert.tolist()), bias)]
-                )
-                .view(shape)
-                .to(value.dtype)
-            )
-
-        return output
-
-    def __init__(self, config: MoEConfig):
+    def __init__(self, config: MoEConfig, backend=None):
         """
         Initializes the GroupedExperts module.
 
         Args:
-            args (MoEArgs): Model arguments containing the number of routed experts,
+            config (MoEConfig): Model arguments containing the number of routed experts,
                 model and intermediate dimension parameters.
+            backend: Backend configuration. When backend.experts == "torch_mm",
+                uses torch._grouped_mm instead of grouped_gemm.ops.gmm.
         """
         super().__init__()
 
         self.config = config
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
+        self.use_torch_mm = backend is not None and backend.experts == "torch_mm"
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -591,23 +619,46 @@ class GroupedExpertsDeepEP(nn.Module):
         down_projs = self.down_projs.to_local()
 
         if torch.count_nonzero(tokens_per_expert) > 0:
-            output1 = ops.gmm(
-                permuted_local_hidden_states,
-                gate_and_up_projs,
-                tokens_per_expert,
-                trans_b=False,
-            )
+            if self.use_torch_mm:
+                tokens_per_expert_gpu = tokens_per_expert.to(
+                    device=permuted_local_hidden_states.device, non_blocking=True
+                )
+                if self.expert_bias:
+                    offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
+                    output1 = torch._grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs=offs)
+                    gate_up_proj_bias = self.gate_up_proj_bias.to_local()
+                    output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
+                    output1 = self.expert_activation(output1, permuted_probs)
+                    output2 = torch._grouped_mm(output1, down_projs, offs=offs)
+                    down_bias = self.down_proj_bias.to_local()
+                    output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
+                else:
+                    output2 = _torch_mm_experts_fwd(
+                        permuted_local_hidden_states,
+                        gate_and_up_projs,
+                        down_projs,
+                        tokens_per_expert_gpu,
+                        permuted_probs,
+                        self.expert_activation,
+                    )
+            else:
+                output1 = ops.gmm(
+                    permuted_local_hidden_states,
+                    gate_and_up_projs,
+                    tokens_per_expert,
+                    trans_b=False,
+                )
 
-            if self.expert_bias:
-                gate_up_proj_bias = self.gate_up_proj_bias.to_local()
-                output1 = self._apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
+                if self.expert_bias:
+                    gate_up_proj_bias = self.gate_up_proj_bias.to_local()
+                    output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
 
-            output1 = self.expert_activation(output1, permuted_probs)
-            output2 = ops.gmm(output1, down_projs, tokens_per_expert, trans_b=False)
+                output1 = self.expert_activation(output1, permuted_probs)
+                output2 = ops.gmm(output1, down_projs, tokens_per_expert, trans_b=False)
 
-            if self.expert_bias:
-                down_bias = self.down_proj_bias.to_local()
-                output2 = self._apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
+                if self.expert_bias:
+                    down_bias = self.down_proj_bias.to_local()
+                    output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
         else:
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
             output1_ = self.expert_activation(output1, permuted_probs)
@@ -1015,7 +1066,7 @@ class MoE(nn.Module):
             )
             self.experts = GroupedExperts(config)
         elif backend.enable_deepep:
-            self.experts = GroupedExpertsDeepEP(config)
+            self.experts = GroupedExpertsDeepEP(config, backend=backend)
         else:
             self.experts = GroupedExperts(config)
 

@@ -54,6 +54,7 @@ class BackendConfig:
     enable_hf_state_dict_adapter: bool = True
     enable_fsdp_optimizations: bool = False
     gate_precision: str | torch.dtype | None = None
+    experts: Literal["gmm", "torch_mm"] = "gmm"
 
     def __post_init__(self):
         if isinstance(self.gate_precision, str):
