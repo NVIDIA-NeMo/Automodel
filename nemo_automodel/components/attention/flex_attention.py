@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, ClassVar
+from typing import Any, Callable, ClassVar
 
 import torch
 from torch.nn.attention.flex_attention import (
@@ -25,7 +25,7 @@ from torch.nn.attention.flex_attention import (
 # FlexAttention mask type. For each mask type, we initialize it at most once per
 # batch. To record what it is initialized, FLEX_ATTN_MASK_T is used as the key to
 # track the initialized mask.
-FLEX_ATTN_MASK_T = tuple[str, int | None]
+FLEX_ATTN_MASK_T = tuple[str, int | None] | tuple[int, int, int]
 
 
 # Adapted from https://github.com/pytorch/torchtitan/pull/1559
@@ -50,7 +50,8 @@ class FlexAttention(torch.nn.Module):
 
     # We registered flex_attention related attributes as class variables as we
     # need to amortize the cost of compilation.
-    flex_attn: ClassVar[Callable] = torch.compile(flex_attention, mode="max-autotune-no-cudagraphs")
+    flex_attn: ClassVar[Callable[..., Any]] = torch.compile(flex_attention, mode="max-autotune-no-cudagraphs")
+    mask_key: FLEX_ATTN_MASK_T
     # Attention mask type to the created BlockMask.
     # This allows us to keep track the created block masks for each
     # new batch. We will use this to update the block mask when a
@@ -70,7 +71,10 @@ class FlexAttention(torch.nn.Module):
     ) -> torch.Tensor:
         if sink_weights is None:
             block_mask = FlexAttention.block_masks[self.mask_key]
-            return FlexAttention.flex_attn(q, k, v, block_mask=block_mask, scale=scale, enable_gqa=enable_gqa)
+            result: torch.Tensor = FlexAttention.flex_attn(
+                q, k, v, block_mask=block_mask, scale=scale, enable_gqa=enable_gqa
+            )
+            return result
 
         B, H_q, S_q, D = q.shape
         _, H_kv, S_kv, _ = k.shape
@@ -101,21 +105,21 @@ class FlexAttention(torch.nn.Module):
         # rescale by sigma(lse - w[h]) and broadcast over D
         if sink_weights is not None:
             w = sink_weights  # [H]
-            scale = torch.sigmoid(lse - w.view(1, -1, 1)).unsqueeze(-1)  # [B,H,S,1]
-            out = out * scale
+            attn_scale = torch.sigmoid(lse - w.view(1, -1, 1)).unsqueeze(-1)  # [B,H,S,1]
+            out = out * attn_scale
 
-        out = out.to(q.dtype)
-        return out
+        out_tensor: torch.Tensor = out.to(q.dtype)
+        return out_tensor
 
     @staticmethod
-    def _get_sliding_window_mask_mod(window: int):
+    def _get_sliding_window_mask_mod(window: int) -> _mask_mod_signature:
         """
         Returns a mask_mod function that
         - only allows kv_idx ≤ q_idx (causal)
         - and only if (q_idx - kv_idx) ≤ window
         """
 
-        def sliding_mod(b, h, q_idx, kv_idx):
+        def sliding_mod(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
             # causal within window
             keep = (kv_idx <= q_idx) & (q_idx - kv_idx < window)
             return keep
@@ -124,7 +128,7 @@ class FlexAttention(torch.nn.Module):
 
     @staticmethod
     def _get_causal_mask_mod() -> _mask_mod_signature:
-        def causal_mask(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor):
+        def causal_mask(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
             return q_idx >= kv_idx
 
         return causal_mask
@@ -138,7 +142,9 @@ class FlexAttention(torch.nn.Module):
         seq_idx = torch.zeros_like(acc_mask, dtype=torch.int32)
         seq_idx[:, 1:] = acc_mask[:, :-1]
 
-        def block_causal_mask(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor):
+        def block_causal_mask(
+            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        ) -> torch.Tensor:
             return (seq_idx[b, q_idx] == seq_idx[b, kv_idx]) & (q_idx >= kv_idx)
 
         return block_causal_mask
@@ -155,7 +161,9 @@ class FlexAttention(torch.nn.Module):
         """
 
         # Credit to @drisspg.
-        def blocked_mask_mod(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor):
+        def blocked_mask_mod(
+            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        ) -> torch.Tensor:
             # Get the block index of the query and key
             q_block = q_idx // fixed_block_size
             kv_block = kv_idx // fixed_block_size

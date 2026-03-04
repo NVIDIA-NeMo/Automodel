@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import importlib
+from types import ModuleType
+from typing import Any
 
 from .package_info import __package_name__, __version__
 
@@ -39,7 +41,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
 __all__ = sorted([*_SUBMODULES, "__version__", "__package_name__", *_LAZY_ATTRS.keys()])
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> ModuleType | Any:
     """
     Lazily import and cache selected submodules / exported symbols when accessed.
 
@@ -59,7 +61,7 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def __dir__():
+def __dir__() -> list[str]:
     """
     Expose the names of all available submodules for auto-completion.
     """
