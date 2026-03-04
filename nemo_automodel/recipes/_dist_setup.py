@@ -76,7 +76,14 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     strategy_cls = STRATEGY_MAP[strategy_name]
 
     # -- parallelism sizes --------------------------------------------------
-    parallelism = {k: cfg.pop(k, default) for k, default in _PARALLELISM_DEFAULTS.items()}
+    # Use `val if val is not None` so that explicit YAML nulls (``ep_size:``
+    # or ``ep_size: null``) fall back to the default instead of propagating
+    # None — dict.pop only returns the default when the key is *absent*.
+    parallelism = {
+        k: (v if v is not None else default)
+        for k, default in _PARALLELISM_DEFAULTS.items()
+        for v in [cfg.pop(k, default)]
+    }
 
     # -- sub-configs --------------------------------------------------------
     pipeline_dict: Optional[dict] = cfg.pop("pipeline", None)
@@ -98,12 +105,12 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     # Route activation_checkpointing: for non-EP configs it goes on the
     # strategy config; for EP configs it stays only on MeshContext
     # (the MoE infra reads it from there).
-    ep_size: int = parallelism.get("ep_size", 1)
+    ep_size: int = parallelism.get("ep_size") or 1
 
     # YAML-level sanity: silently discard sub-configs that don't apply to the
     # current parallelism sizes (e.g. pipeline section present but pp_size=1,
     # which is common when a YAML template is overridden via CLI).
-    pp_size: int = parallelism.get("pp_size", 1)
+    pp_size: int = parallelism.get("pp_size") or 1
     if pipeline_dict is not None and pp_size <= 1:
         pipeline_dict = None
     if moe_dict is not None and ep_size <= 1:
