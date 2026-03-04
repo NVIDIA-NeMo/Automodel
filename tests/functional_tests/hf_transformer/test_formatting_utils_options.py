@@ -17,8 +17,8 @@ from __future__ import annotations
 import os
 
 import pytest
-from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 
+from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.datasets.llm.formatting_utils import (
     _add_pad_token,
     format_chat_template,
@@ -68,42 +68,41 @@ def test_format_prompt_completion_options(seq_length, padding, truncation):
         answer_only_loss_mask=True,
     )
 
+    input_ids = out["input_ids"]
+    labels = out["labels"]
+    attention_mask = out["attention_mask"]
+
     # Basic structure
     assert set(["input_ids", "labels", "attention_mask"]).issubset(out.keys())
-    assert len(out["input_ids"]) == len(out["labels"]) == len(out["attention_mask"]) > 0
+    assert len(input_ids) == len(labels) == len(attention_mask) > 0
 
-    # seq_length enforcement (either by HF padding or our packager)
+    # seq_length enforcement
     if isinstance(seq_length, int) and padding != "do_not_pad":
-        assert len(out["input_ids"]) == seq_length
-        assert len(out["labels"]) == seq_length
-        # Trailing padding label must be masked
-        assert out["labels"][-1] == -100, (out, pad_token_id)
+        assert len(input_ids) == seq_length
+        assert len(labels) == seq_length
+        assert labels[-1] == -100, "Trailing padding label must be masked"
 
-    # EOS should be present in labels (supervised area) but not as last input_id
-    if getattr(tok, "eos_token_id", None) is not None and not truncation == True:
-        assert tok.eos_token_id in out["labels"], "EOS must appear in labels"
-        # find last non-pad input position and ensure it's not EOS
-        last_non_pad = len(out["input_ids"]) - 1
-        while last_non_pad >= 0 and out["input_ids"][last_non_pad] == pad_token_id:
-            last_non_pad -= 1
-        assert last_non_pad >= 0
-        assert out["input_ids"][last_non_pad] != tok.eos_token_id
+    # EOS should be present in supervised labels when not truncated
+    if getattr(tok, "eos_token_id", None) is not None and truncation is not True:
+        assert tok.eos_token_id in labels, "EOS must appear in labels"
 
     # There should be masked (prompt) and supervised (answer) tokens
-    assert any(l == -100 for l in out["labels"])  # masked prompt
-    if not truncation == True:
-        assert any(l != -100 for l in out["labels"])  # supervised answer
+    assert any(v== -100 for v in labels), "Must have masked prompt tokens"
+    if truncation is not True:
+        assert any(v!= -100 for v in labels), "Must have supervised answer tokens"
 
-    # Attention mask should have zeros only in padded tail (if any)
-    if isinstance(seq_length, int):
-        # From the end, once we see a non-zero, no zeros should appear (right padding)
-        seen_nonzero = False
-        for v in reversed(out["attention_mask"]):
-            if v != 0:
-                seen_nonzero = True
-            else:
-                if seen_nonzero:
-                    pytest.fail("Zero attention_mask value before non-padded tokens (padding not only in tail). ")
+    # Where attention_mask=0, labels must be -100
+    for i in range(len(labels)):
+        if attention_mask[i] == 0:
+            assert labels[i] == -100, f"Position {i}: attention_mask=0 but labels={labels[i]} (expected -100)"
+
+    # Attention mask must be contiguous: ones then zeros (right padding)
+    saw_zero = False
+    for i, v in enumerate(attention_mask):
+        if v == 0:
+            saw_zero = True
+        elif saw_zero:
+            pytest.fail(f"attention_mask has 1 at position {i} after a 0 (not right-padded)")
 
 
 @pytest.mark.parametrize(
@@ -122,7 +121,7 @@ def test_format_chat_template_options(seq_length, padding, truncation):
     tok = NeMoAutoTokenizer.from_pretrained(TOKENIZER_DIR)
     # Only applicable when tokenizer DOES define a chat template
     if not getattr(tok, "chat_template", None):
-        pytest.skip(f"Tokenizer qwen3_4b_instruct_2407 has no chat_template; skipping chat-template tests.")
+        pytest.skip("Tokenizer qwen3_4b_instruct_2407 has no chat_template; skipping chat-template tests.")
 
     eos_token_id = getattr(tok, "eos_token_id", 0)
     pad_token_id = _add_pad_token(tok) or eos_token_id
@@ -146,37 +145,39 @@ def test_format_chat_template_options(seq_length, padding, truncation):
         truncation=truncation,
     )
 
+    input_ids = out["input_ids"]
+    labels = out["labels"]
+    attention_mask = out["attention_mask"]
+
     # Basic structure
     assert set(["input_ids", "labels", "attention_mask"]).issubset(out.keys())
-    assert len(out["input_ids"]) == len(out["labels"]) == len(out["attention_mask"]) > 0
+    assert len(input_ids) == len(labels) == len(attention_mask) > 0
 
     # seq_length enforcement
     if isinstance(seq_length, int):
-        assert len(out["input_ids"]) == seq_length
-        assert len(out["labels"]) == seq_length
-        if truncation == False:
-            assert out["labels"][-1] == -100
-
-    # For chat templates, EOS should not be the last input id (unless it's all pad)
-    if getattr(tok, "eos_token_id", None) is not None:
-        last_non_pad = len(out["input_ids"]) - 1
-        while last_non_pad >= 0 and out["input_ids"][last_non_pad] == pad_token_id:
-            last_non_pad -= 1
-        if last_non_pad >= 0:
-            assert out["input_ids"][last_non_pad] != tok.eos_token_id
+        assert len(input_ids) == seq_length
+        assert len(labels) == seq_length
 
     # There must be at least some supervised tokens in labels
-    assert any(l != -100 for l in out["labels"])  # assistant tokens
+    assert any(v!= -100 for v in labels), "Must have supervised assistant tokens"
 
-    # Attention mask padded tail zeros, if padded
-    if isinstance(seq_length, int) and truncation == False:
-        # From the end, once we see a non-zero, no zeros should appear (right padding)
-        seen_nonzero = False
-        for v in reversed(out["attention_mask"]):
-            if v != 0:
-                seen_nonzero = True
-            else:
-                if seen_nonzero:
-                    pytest.fail("Zero attention_mask value before non-padded tokens (padding not only in tail).")
+    # Where attention_mask=0, labels must be -100
+    for i in range(len(labels)):
+        if attention_mask[i] == 0:
+            assert labels[i] == -100, f"Position {i}: attention_mask=0 but labels={labels[i]} (expected -100)"
 
+    # Attention mask must be contiguous: ones then zeros (right padding)
+    saw_zero = False
+    for i, v in enumerate(attention_mask):
+        if v == 0:
+            saw_zero = True
+        elif saw_zero:
+            pytest.fail(f"attention_mask has 1 at position {i} after a 0 (not right-padded)")
 
+    # Padded tail: all padding positions must have pad_token_id in input_ids
+    if isinstance(seq_length, int) and padding == "max_length":
+        content_end = sum(attention_mask)
+        for i in range(content_end, len(input_ids)):
+            assert input_ids[i] == pad_token_id, (
+                f"Position {i}: expected pad_token_id={pad_token_id} in padding region, got {input_ids[i]}"
+            )
