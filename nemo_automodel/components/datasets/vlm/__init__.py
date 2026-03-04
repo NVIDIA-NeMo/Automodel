@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .datasets import make_cord_v2_dataset, make_rdr_dataset, make_unimm_chat_dataset
+from .datasets import make_cord_v2_dataset, make_meta_dataset, make_rdr_dataset, make_unimm_chat_dataset
 from .samplers import LengthGroupedSampler
 
 __all__ = [
     "make_rdr_dataset",
     "make_cord_v2_dataset",
     "make_unimm_chat_dataset",
+    "make_meta_dataset",
     "LengthGroupedSampler",
 ]
