@@ -47,6 +47,9 @@ __all__ = sorted([*_SUBMODULES, "__version__", "__package_name__", *_LAZY_ATTRS.
 #
 # Implemented as a meta-path finder so it works regardless of whether a
 # physical nemo_automodel/models/ directory is shipped in the installation.
+# The actual import of the canonical module happens inside exec_module so
+# that _load_unlocked's pop-and-set pattern on sys.modules picks up the
+# replacement correctly.
 # ---------------------------------------------------------------------------
 
 _MODELS_ALIAS = "nemo_automodel.models"
@@ -56,16 +59,18 @@ _MODELS_TARGET_DOT = _MODELS_TARGET + "."
 
 
 class _AliasLoader(importlib.abc.Loader):
-    """Loader that returns a pre-resolved module unchanged."""
+    """Loader that replaces the placeholder module in sys.modules with the
+    canonical module during exec_module."""
 
-    def __init__(self):
-        self._pending: dict = {}
+    def __init__(self, real_name):
+        self._real_name = real_name
 
     def create_module(self, spec):
-        return self._pending.pop(spec.name, None)
+        return None
 
     def exec_module(self, module):
-        pass
+        real = importlib.import_module(self._real_name)
+        sys.modules[module.__name__] = real
 
 
 class _ModelsAliasFinder(importlib.abc.MetaPathFinder):
@@ -77,28 +82,18 @@ class _ModelsAliasFinder(importlib.abc.MetaPathFinder):
     objects, avoiding duplication.
     """
 
-    _loader = _AliasLoader()
-
     def find_spec(self, fullname, path, target=None):
         if fullname == _MODELS_ALIAS:
-            real_mod = importlib.import_module(_MODELS_TARGET)
-            sys.modules[fullname] = real_mod
-            self._loader._pending[fullname] = real_mod
             return importlib.machinery.ModuleSpec(
                 fullname,
-                self._loader,
-                origin=getattr(real_mod, "__file__", None),
+                _AliasLoader(_MODELS_TARGET),
                 is_package=True,
             )
         if fullname.startswith(_MODELS_ALIAS_DOT):
             real_name = _MODELS_TARGET_DOT + fullname[len(_MODELS_ALIAS_DOT) :]
-            real_mod = importlib.import_module(real_name)
-            sys.modules[fullname] = real_mod
-            self._loader._pending[fullname] = real_mod
             return importlib.machinery.ModuleSpec(
                 fullname,
-                self._loader,
-                origin=getattr(real_mod, "__file__", None),
+                _AliasLoader(real_name),
             )
         return None
 
