@@ -24,7 +24,7 @@ This script will download the dataset and prepare it for training.
 Run the model finetuning with the specified configuration using 8 GPUs:
 
 ```bash
-torchrun --nproc-per-node=8 examples/encoder/finetune.py \
+torchrun --nproc-per-node=8 examples/encoder/retriever_finetune.py \
     --config examples/encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml
 ```
 

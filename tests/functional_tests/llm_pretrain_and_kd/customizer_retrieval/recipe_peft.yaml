@@ -42,6 +42,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   dataset:
     _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset
+    model_type: encoder
     data_dir_list:
     - /home/TestData/automodel/embedding_testdata/training.jsonl
     data_type: train

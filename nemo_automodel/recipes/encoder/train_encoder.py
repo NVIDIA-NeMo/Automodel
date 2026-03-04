@@ -134,7 +134,7 @@ def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_wor
         return cfg_dl.instantiate(**dl_kwargs)
 
 
-class TrainEncoderRecipe(BaseRecipe):
+class TrainRetrieverEncoderRecipe(BaseRecipe):
     """Recipe for training encoder models with contrastive learning."""
 
     def __init__(self, cfg):
@@ -515,7 +515,7 @@ class TrainEncoderRecipe(BaseRecipe):
 
 def main(default_config_path="examples/encoder/llama3_2_1b_encoder.yaml"):
     cfg = parse_args_and_load_config(default_config_path)
-    recipe = TrainEncoderRecipe(cfg)
+    recipe = TrainRetrieverEncoderRecipe(cfg)
     recipe.setup()
     recipe.run_train_validation_loop()
 

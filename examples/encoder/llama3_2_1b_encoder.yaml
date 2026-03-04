@@ -13,9 +13,9 @@
 # limitations under the License.
 
 # To run this recipe, please use the following command:
-# python examples/encoder/finetune.py --config examples/encoder/llama3_2_1b_encoder.yaml
+# python examples/encoder/retriever_finetune.py --config examples/encoder/llama3_2_1b_encoder.yaml
 # Or with torchrun for multi-GPU:
-# torchrun --nproc-per-node=8 examples/encoder/finetune.py --config examples/encoder/llama3_2_1b_encoder.yaml
+# torchrun --nproc-per-node=8 examples/encoder/retriever_finetune.py --config examples/encoder/llama3_2_1b_encoder.yaml
 
 seed: 42
 
@@ -51,6 +51,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   dataset:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
+    model_type: encoder
     data_dir_list:
       - hf://nvidia/embed-nemotron-dataset-v1/FEVER
       - hf://nvidia/embed-nemotron-dataset-v1/SyntheticClassificationData
@@ -74,6 +75,7 @@ dataloader:
 #   _target_: torchdata.stateful_dataloader.StatefulDataLoader
 #   dataset:
 #     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
+#     model_type: encoder
 #     data_dir_list: training_datasets/validation.json
 #     data_type: eval
 #     train_n_passages: 5

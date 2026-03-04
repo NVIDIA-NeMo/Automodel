@@ -13,9 +13,9 @@
 # limitations under the License.
 
 # To run this recipe, please use the following command:
-# python examples/encoder/finetune.py --config examples/encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml
+# python examples/encoder/retriever_finetune.py --config examples/encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml
 # Or with torchrun for multi-GPU:
-# torchrun --nproc-per-node=8 examples/encoder/finetune.py --config examples/encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml
+# torchrun --nproc-per-node=8 examples/encoder/retriever_finetune.py --config examples/encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml
 
 seed: 125
 
@@ -43,6 +43,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   dataset:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
+    model_type: encoder
     data_dir_list:
       - ./embed_nemotron_dataset_v1/EmotionClassification/EmotionClassification.json
       - ./embed_nemotron_dataset_v1/FEVER/FEVER.json
