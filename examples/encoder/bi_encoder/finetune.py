@@ -18,14 +18,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.recipes.encoder import TrainRetrieverEncoderRecipe
 
 
-def main(default_config_path="examples/encoder/llama3_2_1b_encoder.yaml"):
-    """Main entry point for the encoder fine-tuning recipe.
-
-    Loads the configuration, sets up the recipe, and initiates the training loop.
-
-    Args:
-        default_config_path: Path to the default configuration file
-    """
+def main(default_config_path="examples/encoder/bi_encoder/llama3_2_1b.yaml"):
     cfg = parse_args_and_load_config(default_config_path)
     recipe = TrainRetrieverEncoderRecipe(cfg)
     recipe.setup()

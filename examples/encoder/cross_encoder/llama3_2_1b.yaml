@@ -13,9 +13,9 @@
 # limitations under the License.
 
 # To run this recipe, please use the following command:
-# python examples/encoder/retriever_finetune.py --config examples/encoder/llama3_2_1b_encoder.yaml
+# python examples/encoder/cross_encoder/finetune.py --config examples/encoder/cross_encoder/llama3_2_1b.yaml
 # Or with torchrun for multi-GPU:
-# torchrun --nproc-per-node=8 examples/encoder/retriever_finetune.py --config examples/encoder/llama3_2_1b_encoder.yaml
+# torchrun --nproc-per-node=8 examples/encoder/cross_encoder/finetune.py --config examples/encoder/cross_encoder/llama3_2_1b.yaml
 
 seed: 42
 
@@ -38,8 +38,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelEncoder.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
   pooling: avg
-  l2_normalize: true
-  task: embedding
+  task: classification
   use_liger_kernel: true
   use_sdpa_patching: true
   torch_dtype: bfloat16
@@ -123,13 +122,12 @@ optimizer:
   bias_correction: true
   master_weights: true
 
-# Learning rate scheduler
 lr_scheduler:
   lr_warmup_steps: 100
 
 checkpoint:
   enabled: true
-  checkpoint_dir: ./output/llama3_2_1b_encoder/checkpoints
+  checkpoint_dir: ./output/llama3_2_1b_cross_encoder/checkpoints
   model_save_format: safetensors
   save_consolidated: true
 

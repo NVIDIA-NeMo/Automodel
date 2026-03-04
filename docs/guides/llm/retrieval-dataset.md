@@ -2,7 +2,7 @@
 
 NeMo Automodel supports **encoder/embedding model fine-tuning** using a retrieval-style dataset: each training example is a **query** paired with **one positive** document and **one or more negative** documents.
 
-This dataset is used by the encoder recipes (see `examples/encoder/`) together with the `RetrievalEncoderCollator`.
+This dataset is used by the encoder recipes (see `examples/encoder/bi_encoder/` and `examples/encoder/cross_encoder/`) together with the `RetrievalEncoderCollator`.
 
 ## What the Encoder Consumes
 

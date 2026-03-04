@@ -17,8 +17,8 @@
 # so no model architecture config is needed here.
 #
 # Usage:
-# torchrun --nproc_per_node=8 ./examples/encoder/mine_hard_negatives.py \
-#     --config examples/encoder/mining_config.yaml \
+# torchrun --nproc_per_node=8 ./examples/encoder/data_utils/mine_hard_negatives.py \
+#     --config examples/encoder/data_utils/mining_config.yaml \
 #     --mining.model_name_or_path /path/to/encoder/checkpoint \
 #     --mining.train_qa_file_path /path/to/input.json \
 #     --mining.train_file_output_path /path/to/output.json

@@ -525,7 +525,7 @@ class TrainRetrieverEncoderRecipe(BaseRecipe):
         torch.cuda.reset_peak_memory_stats()
 
 
-def main(default_config_path="examples/encoder/llama3_2_1b_encoder.yaml"):
+def main(default_config_path="examples/encoder/bi_encoder/llama3_2_1b.yaml"):
     cfg = parse_args_and_load_config(default_config_path)
     recipe = TrainRetrieverEncoderRecipe(cfg)
     recipe.setup()
