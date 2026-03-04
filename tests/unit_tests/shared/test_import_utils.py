@@ -325,3 +325,4 @@ def test_null_decorator_as_factory():
 
 def test_bitsandbytes_importable():
     """bitsandbytes must be importable in the current environment."""
+    import bitsandbytes
