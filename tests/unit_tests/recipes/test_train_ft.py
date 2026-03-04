@@ -413,6 +413,7 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
             pp_enabled=False,
             device_mesh=None,
             moe_mesh=None,
+            cp_size=1,
         ),
     )
 
@@ -1711,3 +1712,77 @@ class TestRunTrainOptimStepSetsMoEScale:
 
         assert MoEAuxLossAutoScaler.main_loss_backward_scale is not None
         assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(float(dp_size))
+
+
+# -----------------------------------------------------------------------------
+# rope_fusion disabled when cp > 1
+# -----------------------------------------------------------------------------
+
+
+def _minimal_cfg_with_rope_fusion(cp_size: int, rope_fusion: bool):
+    """Helper to build a minimal ConfigNode for rope_fusion / CP tests."""
+    return ConfigNode(
+        {
+            "model": {"backend": {"rope_fusion": rope_fusion}},
+            "dataloader": {},
+            "dataset": {},
+            "validation_dataloader": {},
+            "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
+            "optimizer": {},
+            "loss_fn": {},
+            "checkpoint": {"best_metric_key": "default"},
+            "distributed": {"cp_size": cp_size},
+        }
+    )
+
+
+def _patch_setup_minimals_with_cp(monkeypatch, cp_size):
+    """Variant of _patch_setup_minimals that lets us control cp_size."""
+    _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
+    # Override setup_distributed to expose the desired cp_size
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.setup_distributed",
+        lambda cfg, world_size: SimpleNamespace(
+            strategy_config=None,
+            pipeline_config=None,
+            moe_config=None,
+            activation_checkpointing=False,
+            pp_enabled=False,
+            device_mesh=None,
+            moe_mesh=None,
+            cp_size=cp_size,
+        ),
+    )
+
+
+def test_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
+    """rope_fusion should be set to False during setup when cp_size > 1."""
+    cfg = _minimal_cfg_with_rope_fusion(cp_size=2, rope_fusion=True)
+    _patch_setup_minimals_with_cp(monkeypatch, cp_size=2)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert cfg.model.backend.rope_fusion is False
+
+
+def test_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):
+    """rope_fusion should remain True when cp_size == 1."""
+    cfg = _minimal_cfg_with_rope_fusion(cp_size=1, rope_fusion=True)
+    _patch_setup_minimals_with_cp(monkeypatch, cp_size=1)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert cfg.model.backend.rope_fusion is True
+
+
+def test_rope_fusion_stays_false_when_already_disabled(monkeypatch):
+    """rope_fusion=False should stay False regardless of cp_size."""
+    cfg = _minimal_cfg_with_rope_fusion(cp_size=4, rope_fusion=False)
+    _patch_setup_minimals_with_cp(monkeypatch, cp_size=4)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert cfg.model.backend.rope_fusion is False
