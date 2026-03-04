@@ -26,7 +26,6 @@ from contextlib import contextmanager
 
 import torch
 from huggingface_hub import snapshot_download
-
 from transformers import AutoConfig, PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
