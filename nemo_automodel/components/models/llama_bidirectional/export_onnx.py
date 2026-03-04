@@ -41,7 +41,6 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch import nn
-
 from transformers import AutoModel, AutoTokenizer
 
 logger = logging.getLogger(__name__)
