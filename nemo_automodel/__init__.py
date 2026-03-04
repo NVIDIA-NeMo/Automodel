@@ -13,6 +13,9 @@
 # limitations under the License.
 
 import importlib
+import importlib.abc
+import importlib.machinery
+import sys
 
 from .package_info import __package_name__, __version__
 
@@ -39,12 +42,76 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
 __all__ = sorted([*_SUBMODULES, "__version__", "__package_name__", *_LAZY_ATTRS.keys()])
 
 
+# ---------------------------------------------------------------------------
+# nemo_automodel.models → nemo_automodel.components.models alias
+#
+# Implemented as a meta-path finder so it works regardless of whether a
+# physical nemo_automodel/models/ directory is shipped in the installation.
+# ---------------------------------------------------------------------------
+
+_MODELS_ALIAS = "nemo_automodel.models"
+_MODELS_ALIAS_DOT = _MODELS_ALIAS + "."
+_MODELS_TARGET = "nemo_automodel.components.models"
+_MODELS_TARGET_DOT = _MODELS_TARGET + "."
+
+
+class _AliasLoader(importlib.abc.Loader):
+    """Loader that returns a pre-resolved module unchanged."""
+
+    def __init__(self):
+        self._pending: dict = {}
+
+    def create_module(self, spec):
+        return self._pending.pop(spec.name, None)
+
+    def exec_module(self, module):
+        pass
+
+
+class _ModelsAliasFinder(importlib.abc.MetaPathFinder):
+    """Redirect ``nemo_automodel.models`` and ``nemo_automodel.models.*``
+    to ``nemo_automodel.components.models`` and its subpackages.
+
+    Installed at the *front* of ``sys.meta_path`` so it intercepts before the
+    default ``PathFinder``.  Both import paths resolve to the exact same module
+    objects, avoiding duplication.
+    """
+
+    _loader = _AliasLoader()
+
+    def find_spec(self, fullname, path, target=None):
+        if fullname == _MODELS_ALIAS:
+            real_mod = importlib.import_module(_MODELS_TARGET)
+            sys.modules[fullname] = real_mod
+            self._loader._pending[fullname] = real_mod
+            return importlib.machinery.ModuleSpec(
+                fullname,
+                self._loader,
+                origin=getattr(real_mod, "__file__", None),
+                is_package=True,
+            )
+        if fullname.startswith(_MODELS_ALIAS_DOT):
+            real_name = _MODELS_TARGET_DOT + fullname[len(_MODELS_ALIAS_DOT) :]
+            real_mod = importlib.import_module(real_name)
+            sys.modules[fullname] = real_mod
+            self._loader._pending[fullname] = real_mod
+            return importlib.machinery.ModuleSpec(
+                fullname,
+                self._loader,
+                origin=getattr(real_mod, "__file__", None),
+            )
+        return None
+
+
+sys.meta_path.insert(0, _ModelsAliasFinder())
+
+
 def __getattr__(name: str):
     """
     Lazily import and cache selected submodules / exported symbols when accessed.
 
     Raises:
-        AttributeError if the name isn’t in __all__.
+        AttributeError if the name isn't in __all__.
     """
     if name in _SUBMODULES:
         module = importlib.import_module(f"{__name__}.{name}")

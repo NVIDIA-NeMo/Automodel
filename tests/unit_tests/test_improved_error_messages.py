@@ -15,7 +15,7 @@
 """Tests for user-friendly error messages when models are unavailable.
 
 Covers three scenarios:
-1. Importing a non-existent model submodule (e.g. ``nemo_automodel.components.models.qwen3_5``)
+1. Importing a non-existent model submodule (e.g. ``nemo_automodel.components.models.qwen3_1024``)
 2. Using ``get_hf_config`` / ``from_pretrained`` with a checkpoint whose model type
    is not recognized by the installed Transformers version.
 3. The ``nemo_automodel.models`` → ``nemo_automodel.components.models`` alias.
@@ -36,23 +36,23 @@ class TestModelsImportError:
     """Importing a non-existent model subpackage should raise a helpful error."""
 
     def test_import_nonexistent_model_raises_module_not_found(self):
-        """``import nemo_automodel.components.models.qwen3_5`` should give a helpful error."""
-        with pytest.raises(ModuleNotFoundError, match="has no submodule 'qwen3_5'"):
-            importlib.import_module("nemo_automodel.components.models.qwen3_5")
+        """``import nemo_automodel.components.models.qwen3_1024`` should give a helpful error."""
+        with pytest.raises(ModuleNotFoundError, match="has no submodule 'qwen3_1024'"):
+            importlib.import_module("nemo_automodel.components.models.qwen3_1024")
 
     def test_import_error_suggests_upgrade(self):
         with pytest.raises(ModuleNotFoundError, match="pip install --upgrade nemo_automodel"):
-            importlib.import_module("nemo_automodel.components.models.qwen3_5")
+            importlib.import_module("nemo_automodel.components.models.qwen3_1024")
 
     def test_import_error_suggests_install_from_source(self):
         with pytest.raises(
             ModuleNotFoundError, match=r"pip install git\+https://github\.com/NVIDIA-NeMo/Automodel\.git"
         ):
-            importlib.import_module("nemo_automodel.components.models.qwen3_5")
+            importlib.import_module("nemo_automodel.components.models.qwen3_1024")
 
     def test_import_error_lists_available_submodules(self):
         with pytest.raises(ModuleNotFoundError, match="Available model submodules in this installation"):
-            importlib.import_module("nemo_automodel.components.models.qwen3_5")
+            importlib.import_module("nemo_automodel.components.models.qwen3_1024")
 
     def test_import_error_mentions_requested_name(self):
         """The error message should contain the name the user asked for."""
@@ -75,7 +75,7 @@ class TestModelsImportError:
         import nemo_automodel.components.models as models_pkg
 
         with pytest.raises(ModuleNotFoundError, match="pip install --upgrade nemo_automodel"):
-            _ = models_pkg.qwen3_5
+            _ = models_pkg.qwen3_1024
 
 
 # ============================================================================
@@ -106,12 +106,12 @@ class TestModelsAlias:
 
     def test_alias_nonexistent_model_gives_helpful_error(self):
         """The nice error should also fire via the short path."""
-        with pytest.raises(ModuleNotFoundError, match="has no submodule 'qwen3_5'"):
-            importlib.import_module("nemo_automodel.models.qwen3_5")
+        with pytest.raises(ModuleNotFoundError, match="has no submodule 'qwen3_1024'"):
+            importlib.import_module("nemo_automodel.models.qwen3_1024")
 
     def test_alias_nonexistent_model_suggests_upgrade(self):
         with pytest.raises(ModuleNotFoundError, match="pip install --upgrade nemo_automodel"):
-            importlib.import_module("nemo_automodel.models.qwen3_5")
+            importlib.import_module("nemo_automodel.models.qwen3_1024")
 
     def test_alias_accessible_from_top_level(self):
         """``nemo_automodel.models`` should be accessible as an attribute."""
@@ -131,7 +131,7 @@ class TestModelsAlias:
 
 
 _HF_UNRECOGNIZED_ERROR = ValueError(
-    "The checkpoint you are trying to load has model type `qwen3_5` "
+    "The checkpoint you are trying to load has model type `qwen3_1024` "
     "but Transformers does not recognize this architecture. This could be "
     "because of an issue with the checkpoint, or because your version of "
     "Transformers is out of date."
@@ -149,7 +149,7 @@ class TestGetHfConfigUnrecognizedModelType:
             side_effect=_HF_UNRECOGNIZED_ERROR,
         ):
             with pytest.raises(ValueError, match="pip install --upgrade nemo_automodel"):
-                get_hf_config("fake/qwen3_5_model", attn_implementation="eager")
+                get_hf_config("fake/qwen3_1024_model", attn_implementation="eager")
 
     def test_message_does_not_mention_transformers(self):
         from nemo_automodel._transformers.model_init import get_hf_config
@@ -159,7 +159,7 @@ class TestGetHfConfigUnrecognizedModelType:
             side_effect=_HF_UNRECOGNIZED_ERROR,
         ):
             with pytest.raises(ValueError) as exc_info:
-                get_hf_config("fake/qwen3_5_model", attn_implementation="eager")
+                get_hf_config("fake/qwen3_1024_model", attn_implementation="eager")
             msg = str(exc_info.value)
             assert "pip install --upgrade nemo_automodel" in msg
             assert "pip install --upgrade nemo_automodel transformers" not in msg
@@ -168,7 +168,7 @@ class TestGetHfConfigUnrecognizedModelType:
         from nemo_automodel._transformers.model_init import get_hf_config
 
         hf_error = ValueError(
-            "The checkpoint you are trying to load has model type `qwen3_5` "
+            "The checkpoint you are trying to load has model type `qwen3_1024` "
             "but Transformers does not recognize this architecture."
         )
         with patch(
@@ -176,7 +176,7 @@ class TestGetHfConfigUnrecognizedModelType:
             side_effect=hf_error,
         ):
             with pytest.raises(ValueError, match=r"pip install git\+https://github\.com/NVIDIA-NeMo/Automodel\.git"):
-                get_hf_config("fake/qwen3_5_model", attn_implementation="eager")
+                get_hf_config("fake/qwen3_1024_model", attn_implementation="eager")
 
     def test_unrecognized_model_type_includes_checkpoint_name(self):
         from nemo_automodel._transformers.model_init import get_hf_config
@@ -197,7 +197,7 @@ class TestGetHfConfigUnrecognizedModelType:
         from nemo_automodel._transformers.model_init import get_hf_config
 
         original_msg = (
-            "The checkpoint you are trying to load has model type `qwen3_5` "
+            "The checkpoint you are trying to load has model type `qwen3_1024` "
             "but Transformers does not recognize this architecture."
         )
         hf_error = ValueError(original_msg)
@@ -206,7 +206,7 @@ class TestGetHfConfigUnrecognizedModelType:
             side_effect=hf_error,
         ):
             with pytest.raises(ValueError) as exc_info:
-                get_hf_config("fake/qwen3_5_model", attn_implementation="eager")
+                get_hf_config("fake/qwen3_1024_model", attn_implementation="eager")
             msg = str(exc_info.value)
             assert msg.startswith(original_msg)
 
