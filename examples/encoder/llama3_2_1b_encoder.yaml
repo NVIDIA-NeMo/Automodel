@@ -13,9 +13,9 @@
 # limitations under the License.
 
 # To run this recipe, please use the following command:
-# python examples/biencoder/finetune.py --config examples/biencoder/llama3_2_1b_biencoder.yaml
+# python examples/encoder/finetune.py --config examples/encoder/llama3_2_1b_encoder.yaml
 # Or with torchrun for multi-GPU:
-# torchrun --nproc-per-node=8 examples/biencoder/finetune.py --config examples/biencoder/llama3_2_1b_biencoder.yaml
+# torchrun --nproc-per-node=8 examples/encoder/finetune.py --config examples/encoder/llama3_2_1b_encoder.yaml
 
 seed: 42
 
@@ -35,9 +35,8 @@ dist_env:
   timeout_minutes: 1
 
 model:
-  _target_: nemo_automodel.NeMoAutoModelBiencoder.from_pretrained
+  _target_: nemo_automodel.NeMoAutoModelEncoder.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
-  share_encoder: true
   pooling: avg
   l2_normalize: true
   use_liger_kernel: true
@@ -61,7 +60,7 @@ dataloader:
     seed: 42
     do_shuffle: true
   collate_fn:
-    _target_: nemo_automodel.components.datasets.llm.RetrievalBiencoderCollator
+    _target_: nemo_automodel.components.datasets.llm.RetrievalEncoderCollator
     q_max_len: 512
     p_max_len: 512
     query_prefix: "query:"
@@ -84,7 +83,7 @@ dataloader:
 #     max_train_samples: 1000
 #     train_data_select_offset: 0
 #   collate_fn:
-#     _target_: nemo_automodel.components.datasets.llm.RetrievalBiencoderCollator
+#     _target_: nemo_automodel.components.datasets.llm.RetrievalEncoderCollator
 #     q_max_len: 512
 #     p_max_len: 512
 #     query_prefix: "query:"
@@ -127,7 +126,7 @@ lr_scheduler:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: ./output/llama3_2_1b_biencoder/checkpoints
+  checkpoint_dir: ./output/llama3_2_1b_encoder/checkpoints
   model_save_format: safetensors
   save_consolidated: true
 

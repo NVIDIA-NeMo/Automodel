@@ -313,7 +313,7 @@ def make_retrieval_dataset(
     use_dataset_instruction: bool = False,
 ):
     """
-    Load and return dataset in retrieval format for biencoder training.
+    Load and return dataset in retrieval format for encoder training.
 
     This function loads data from JSON files using the same method as
     RetrievalMultiModalDatasetLoader and returns it ready for training.
@@ -336,7 +336,7 @@ def make_retrieval_dataset(
         - 'doc_image': List of images or empty strings
 
     Note:
-        Tokenization should be handled by a collator (e.g., RetrievalBiencoderCollator)
+        Tokenization should be handled by a collator (e.g., RetrievalEncoderCollator)
         which is more efficient for batch padding and supports dynamic processing.
     """
 

@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
-from nemo_automodel.recipes.biencoder.train_biencoder import TrainBiencoderRecipe
+from nemo_automodel.recipes.encoder.train_encoder import TrainEncoderRecipe
 from nemo_automodel.recipes.llm.train_seq_cls import TrainFinetuneRecipeForSequenceClassification
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
@@ -60,8 +60,8 @@ def test_seq_cls_loop_calls_gc_hook():
     recipe._maybe_collect_garbage.assert_called_once()
 
 
-def test_biencoder_loop_calls_gc_hook():
-    recipe = TrainBiencoderRecipe.__new__(TrainBiencoderRecipe)
+def test_encoder_loop_calls_gc_hook():
+    recipe = TrainEncoderRecipe.__new__(TrainEncoderRecipe)
     recipe.model_parts = [MagicMock()]
     recipe.step_scheduler = _OneStepScheduler()
     recipe.max_grad_norm = 1.0

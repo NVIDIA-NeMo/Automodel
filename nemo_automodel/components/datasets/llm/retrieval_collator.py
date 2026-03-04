@@ -37,15 +37,15 @@ def _unpack_doc_values(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return doc_examples
 
 
-class RetrievalBiencoderCollator:
+class RetrievalEncoderCollator:
     """
-    Collator for biencoder retrieval training.
+    Collator for encoder retrieval training.
 
     This collator handles tokenization of queries and documents at batch time,
     which is more memory-efficient than pre-tokenization and allows for
     dynamic padding based on batch max length.
 
-    Based on BiencoderCollator from nemo-retriever-research but adapted for Automodel.
+    Based on EncoderCollator from nemo-retriever-research but adapted for Automodel.
     """
 
     def __init__(

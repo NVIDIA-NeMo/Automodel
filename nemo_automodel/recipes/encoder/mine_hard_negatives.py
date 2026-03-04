@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Hard negative mining recipe for biencoder models."""
+"""Hard negative mining recipe for encoder models."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from nemo_automodel._transformers.auto_model import NeMoAutoModelBiencoder
+from nemo_automodel._transformers.auto_model import NeMoAutoModelEncoder
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.datasets.llm.retrieval_dataset import load_datasets
 from nemo_automodel.components.distributed.init_utils import DistInfo, initialize_distributed
@@ -136,7 +136,7 @@ def _validate_shard_shape(shard_path: Path, expected_size: int, actual_size: int
 
 
 class MineHardNegativesRecipe:
-    """Recipe for mining hard negatives for biencoder training.
+    """Recipe for mining hard negatives for encoder training.
 
     This class orchestrates hard negative mining, from setup to mining execution.
     Hard negatives are documents that are semantically similar to the query but
@@ -233,8 +233,8 @@ class MineHardNegativesRecipe:
 
         # Load model directly from checkpoint path
         # This loads the saved model without requiring architecture config
-        logger.info(f"Loading biencoder model from {self.model_name_or_path}...")
-        self.model = NeMoAutoModelBiencoder.from_pretrained(
+        logger.info(f"Loading encoder model from {self.model_name_or_path}...")
+        self.model = NeMoAutoModelEncoder.from_pretrained(
             self.model_name_or_path,
             # Use inference-appropriate settings
             use_liger_kernel=False,  # Not needed for inference
@@ -474,7 +474,6 @@ class MineHardNegativesRecipe:
         batch_size: int,
         max_length: int,
         prefix: str = "",
-        encoder_type: str = "query",
     ) -> np.ndarray:
         """Encode texts into embeddings.
 
@@ -483,7 +482,6 @@ class MineHardNegativesRecipe:
             batch_size: Batch size for encoding.
             max_length: Maximum sequence length for tokenization.
             prefix: Optional prefix to prepend to each text.
-            encoder_type: "query" to use lm_q, "passage" to use lm_p.
 
         Returns:
             numpy array of embeddings [num_texts, embedding_dim].
@@ -492,7 +490,7 @@ class MineHardNegativesRecipe:
         num_texts = len(texts)
         num_batches = (num_texts + batch_size - 1) // batch_size
 
-        for i in tqdm(range(0, num_texts, batch_size), desc=f"Encoding {encoder_type}", total=num_batches):
+        for i in tqdm(range(0, num_texts, batch_size), desc="Encoding", total=num_batches):
             batch_texts = texts[i : i + batch_size]
 
             # Apply prefix if provided
@@ -519,9 +517,8 @@ class MineHardNegativesRecipe:
             )
             inputs = {k: v.to(self.dist_env.device) for k, v in inputs.items()}
 
-            # Encode using the appropriate encoder
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
-                batch_embeds = self.model.encode(inputs, encoder=encoder_type)
+                batch_embeds = self.model.encode(inputs)
 
             embeddings.append(batch_embeds.cpu().float().numpy())
 
@@ -540,7 +537,6 @@ class MineHardNegativesRecipe:
             batch_size=self.query_embedding_batch_size,
             max_length=self.query_max_length,
             prefix=self.query_prefix,
-            encoder_type="query",
         )
 
     def _encode_queries_sharded(self) -> np.ndarray:
@@ -582,7 +578,6 @@ class MineHardNegativesRecipe:
                 batch_size=self.query_embedding_batch_size,
                 max_length=self.query_max_length,
                 prefix=self.query_prefix,
-                encoder_type="query",
             )
             np.savez(shard_path, local_embeds)
 
@@ -664,7 +659,6 @@ class MineHardNegativesRecipe:
                 batch_size=self.document_embedding_batch_size,
                 max_length=self.passage_max_length,
                 prefix=self.passage_prefix,
-                encoder_type="passage",
             )
             np.savez(rank_cache_path, local_embeds)
 
@@ -712,7 +706,6 @@ class MineHardNegativesRecipe:
             batch_size=self.document_embedding_batch_size,
             max_length=self.passage_max_length,
             prefix=self.passage_prefix,
-            encoder_type="passage",
         )
         if cache_path is not None:
             np.savez(cache_path, embeddings)
@@ -993,7 +986,7 @@ class MineHardNegativesRecipe:
                 - neg_scores: Similarity scores for each hard negative
                 - pos_scores: Similarity scores for each positive document
         """
-        # Convert document embeddings to tensor once (biencoder embeddings are 2D)
+        # Convert document embeddings to tensor once (encoder embeddings are 2D)
         doc_embeddings_tensor = torch.tensor(document_embeddings, device="cuda")
 
         neg_indices_all = []

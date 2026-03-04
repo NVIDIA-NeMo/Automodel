@@ -707,12 +707,12 @@ class NeMoAutoModelForTextToWaveform(_BaseNeMoAutoModelClass, AutoModelForTextTo
     pass
 
 
-class NeMoAutoModelBiencoder:
-    """NeMo AutoModel for biencoder/embedding tasks with full infrastructure support.
+class NeMoAutoModelEncoder:
+    """NeMo AutoModel for encoder/embedding tasks with full infrastructure support.
 
-    This class provides a unified interface for loading biencoder models with
+    This class provides a unified interface for loading encoder models with
     support for PEFT, FSDP, TP, CP, FP8, QAT, and other infrastructure features.
-    It uses the BiencoderModel.build() method to create the model and then applies
+    It uses the EncoderModel.build() method to create the model and then applies
     all infrastructure through apply_model_infrastructure().
 
     This class properly integrates with the model registry and applies all
@@ -720,8 +720,8 @@ class NeMoAutoModelBiencoder:
 
     Examples:
     --------
-    >>> model = NeMoAutoModelBiencoder.from_pretrained("meta-llama/Llama-3.2-1B")
-    >>> model = NeMoAutoModelBiencoder.from_pretrained(
+    >>> model = NeMoAutoModelEncoder.from_pretrained("meta-llama/Llama-3.2-1B")
+    >>> model = NeMoAutoModelEncoder.from_pretrained(
     ...     "meta-llama/Llama-3.2-1B",
     ...     distributed_config=FSDP2Config(),
     ... )
@@ -731,7 +731,6 @@ class NeMoAutoModelBiencoder:
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        share_encoder: bool = True,
         pooling: str = "avg",
         l2_normalize: bool = True,
         attn_implementation: str = "flash_attention_2",
@@ -749,15 +748,14 @@ class NeMoAutoModelBiencoder:
         **kwargs,
     ) -> PreTrainedModel:
         """
-        Load a biencoder model from pretrained weights with full infrastructure support.
+        Load an encoder model from pretrained weights with full infrastructure support.
 
-        This method builds a biencoder using BiencoderModel.build(), applies kernel
+        This method builds an encoder using EncoderModel.build(), applies kernel
         patching, and then applies all infrastructure (FSDP, checkpointing, etc.)
         through apply_model_infrastructure().
 
         Args:
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
-            share_encoder: Whether to share encoder weights between query and passage.
             pooling: Pooling strategy ('avg', 'cls', 'last', etc.).
             l2_normalize: Whether to L2 normalize embeddings.
             attn_implementation: Attention implementation to use (e.g.,
@@ -773,23 +771,22 @@ class NeMoAutoModelBiencoder:
             distributed_config: Strategy-specific distributed training configuration.
             moe_config: MoE parallelizer configuration.
             compile_config: Configuration for torch.compile.
-            **kwargs: Additional arguments passed to BiencoderModel.build.
+            **kwargs: Additional arguments passed to EncoderModel.build.
 
         Returns:
-            BiencoderModel instance with loaded weights and all infrastructure applied.
+            EncoderModel instance with loaded weights and all infrastructure applied.
 
         Notes:
             If kernel patching fails, the method retries with adjusted parameters.
         """
-        from nemo_automodel._transformers.biencoder import BiencoderModel
+        from nemo_automodel._transformers.encoder import EncoderModel
 
-        logger.info(f"Loading NeMoAutoModelBiencoder from {pretrained_model_name_or_path}")
+        logger.info(f"Loading NeMoAutoModelEncoder from {pretrained_model_name_or_path}")
 
         def _retry(**override):
             """Internal helper to re-enter this function with patched parameters."""
             return cls.from_pretrained(
                 pretrained_model_name_or_path,
-                share_encoder=share_encoder,
                 pooling=pooling,
                 l2_normalize=l2_normalize,
                 attn_implementation=attn_implementation,
@@ -825,14 +822,11 @@ class NeMoAutoModelBiencoder:
             device=torch.device("cuda", torch.cuda.current_device()),
             mesh=mesh,
         )
-        loss_fn = None
 
-        is_meta_device = False
         device = torch.cuda.current_device()
 
-        model = BiencoderModel.build(
+        model = EncoderModel.build(
             model_name_or_path=pretrained_model_name_or_path,
-            share_encoder=share_encoder,
             pooling=pooling,
             l2_normalize=l2_normalize,
             attn_implementation=attn_implementation,
@@ -841,7 +835,7 @@ class NeMoAutoModelBiencoder:
 
         try:
             if use_liger_kernel:
-                logger.info("Applying Liger kernel patching to biencoder")
+                logger.info("Applying Liger kernel patching to encoder")
                 model = _patch_liger_kernel(model)
         except RuntimeError:
             logger.warning("Retrying without Liger kernels.")
@@ -851,7 +845,7 @@ class NeMoAutoModelBiencoder:
 
         try:
             if use_sdpa_patching:
-                logger.info("Applying SDPA patching to biencoder")
+                logger.info("Applying SDPA patching to encoder")
                 model = _patch_attention(model, sdpa_method)  # noqa: F821
         except Exception:
             logger.warning("Retrying without SDPA patching.")
@@ -860,9 +854,9 @@ class NeMoAutoModelBiencoder:
             return _retry(use_sdpa_patching=False)
 
         model = apply_model_infrastructure(
-            model=model,  # noqa: F821
+            model=model,
             pretrained_model_name_or_path=pretrained_model_name_or_path,
-            is_meta_device=is_meta_device,
+            is_meta_device=False,
             device=device,
             model_wrapper=model_wrapper,
             mesh=mesh,
@@ -870,11 +864,11 @@ class NeMoAutoModelBiencoder:
             quantization_config=None,
             fp8_config=None,
             qat_quantizer=qat_quantizer,
-            loss_fn=loss_fn,
+            loss_fn=None,
             autopipeline=autopipeline,
             parallelize_fn=parallelize_fn,
             compile_config=compile_config,
-            load_base_model=False,  # BiencoderModel.build already loads weights
+            load_base_model=False,  # EncoderModel.build already loads weights
             cache_dir=kwargs.get("cache_dir", hf_constants.HF_HUB_CACHE),
         )
 

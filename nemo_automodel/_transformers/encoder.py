@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generic Biencoder Model for embedding and retrieval tasks."""
+"""Generic Encoder Model for embedding and retrieval tasks."""
 
-import copy
 import inspect
 import os
 from typing import Optional
@@ -26,7 +25,7 @@ from transformers import AutoConfig, PreTrainedModel
 from transformers.utils import logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
-from nemo_automodel.components.models.common.bidirectional import BiencoderStateDictAdapter
+from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 
 logger = logging.get_logger(__name__)
 
@@ -76,28 +75,24 @@ SUPPORTED_BACKBONES = {
 }
 
 
-class BiencoderModel(nn.Module):
-    """Biencoder model that encodes queries and passages separately using bidirectional backbones."""
+class EncoderModel(nn.Module):
+    """Encoder model that produces embeddings using a bidirectional backbone."""
 
     def __init__(
         self,
         lm_q: PreTrainedModel,
-        lm_p: PreTrainedModel,
         pooling: str = "avg",
         l2_normalize: bool = True,
-        share_encoder: bool = True,
     ):
         super().__init__()
         self.lm_q = lm_q
-        self.lm_p = lm_p
         self.pooling = pooling
         self.l2_normalize = l2_normalize
-        self.share_encoder = share_encoder
         self.config = self.lm_q.config
 
         # HuggingFace consolidated checkpoint compatibility
         self.name_or_path = os.path.dirname(inspect.getfile(type(self.lm_q)))
-        self.state_dict_adapter = BiencoderStateDictAdapter()
+        self.state_dict_adapter = EncoderStateDictAdapter()
         encoder_class_name = self.lm_q.__class__.__name__
         self.config.architectures = [encoder_class_name]
         self.config.auto_map = {
@@ -105,35 +100,26 @@ class BiencoderModel(nn.Module):
             "AutoConfig": f"model.{encoder_class_name.replace('Model', 'Config')}",
         }
 
-    def forward(self, input_dict: dict, encoder: str = "query") -> Optional[torch.Tensor]:
-        """Forward pass — delegates to encode().
+    def forward(self, input_dict: dict) -> Optional[torch.Tensor]:
+        """Forward pass — going through __call__ ensures FSDP2 unshard hooks fire."""
+        return self.encode(input_dict)
 
-        Going through forward() ensures FSDP2 unshard hooks fire via __call__.
-        """
-        return self.encode(input_dict, encoder)
-
-    def encode(self, input_dict: dict, encoder: str = "query") -> Optional[torch.Tensor]:
-        """Encode inputs using the query or passage encoder.
+    def encode(self, input_dict: dict) -> Optional[torch.Tensor]:
+        """Encode inputs and return pooled embeddings.
 
         Args:
             input_dict: Tokenized inputs (input_ids, attention_mask, etc.)
-            encoder: "query" or "passage"
 
         Returns:
             Embeddings [batch_size, hidden_dim], or None if input_dict is empty.
         """
-        model = self.lm_q if encoder == "query" else self.lm_p
-        return self._encode(model, input_dict)
-
-    def _encode(self, encoder: PreTrainedModel, input_dict: dict) -> Optional[torch.Tensor]:
-        """Encode input using the encoder."""
         if not input_dict:
             return None
 
-        if "token_type_ids" not in inspect.getfullargspec(encoder.forward).args and "token_type_ids" in input_dict:
+        if "token_type_ids" not in inspect.getfullargspec(self.lm_q.forward).args and "token_type_ids" in input_dict:
             input_dict = {k: v for k, v in input_dict.items() if k != "token_type_ids"}
 
-        outputs = encoder(
+        outputs = self.lm_q(
             **{k: v for k, v in input_dict.items() if k not in ["kd_labels"]},
             return_dict=True,
             output_hidden_states=True,
@@ -158,15 +144,14 @@ class BiencoderModel(nn.Module):
     def build(
         cls,
         model_name_or_path: str,
-        share_encoder: bool = True,
         pooling: str = "avg",
         l2_normalize: bool = True,
         trust_remote_code: bool = False,
         **hf_kwargs,
     ):
-        """Build biencoder model from a pretrained backbone."""
+        """Build encoder model from a pretrained backbone."""
 
-        logger.info(f"Building BiencoderModel from {model_name_or_path}")
+        logger.info(f"Building EncoderModel from {model_name_or_path}")
 
         config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
         model_type = getattr(config, "model_type", "")
@@ -175,7 +160,7 @@ class BiencoderModel(nn.Module):
         if arch_name is None:
             supported = ", ".join(SUPPORTED_BACKBONES.keys())
             raise ValueError(
-                f"Unsupported model type '{model_type}' for biencoder. "
+                f"Unsupported model type '{model_type}' for encoder. "
                 f"Supported types: {supported}. "
                 f"To add support for a new backbone, update SUPPORTED_BACKBONES and "
                 "create a bidirectional model class with ModelClass export."
@@ -189,40 +174,14 @@ class BiencoderModel(nn.Module):
         BidirectionalModelClass = ModelRegistry.model_arch_name_to_cls[arch_name]
         logger.info(f"Using {arch_name} from registry")
 
-        if os.path.isdir(model_name_or_path):
-            if share_encoder:
-                lm_q = BidirectionalModelClass.from_pretrained(
-                    model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
-                )
-                lm_p = lm_q
-            else:
-                _qry_model_path = os.path.join(model_name_or_path, "query_model")
-                _psg_model_path = os.path.join(model_name_or_path, "passage_model")
-
-                if not os.path.exists(_qry_model_path):
-                    _qry_model_path = model_name_or_path
-                    _psg_model_path = model_name_or_path
-
-                lm_q = BidirectionalModelClass.from_pretrained(
-                    _qry_model_path, trust_remote_code=trust_remote_code, **hf_kwargs
-                )
-                lm_p = BidirectionalModelClass.from_pretrained(
-                    _psg_model_path, trust_remote_code=trust_remote_code, **hf_kwargs
-                )
-        else:
-            lm_q = BidirectionalModelClass.from_pretrained(model_name_or_path, **hf_kwargs)
-
-            if share_encoder:
-                lm_p = lm_q
-            else:
-                lm_p = copy.deepcopy(lm_q)
+        lm_q = BidirectionalModelClass.from_pretrained(
+            model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
+        )
 
         model = cls(
             lm_q=lm_q,
-            lm_p=lm_p,
             pooling=pooling,
             l2_normalize=l2_normalize,
-            share_encoder=share_encoder,
         )
         return model
 
@@ -243,12 +202,6 @@ class BiencoderModel(nn.Module):
 
             return
 
-        logger.info(f"Saving BiencoderModel to {save_directory}")
+        logger.info(f"Saving EncoderModel to {save_directory}")
 
-        if self.share_encoder:
-            self.lm_q.save_pretrained(save_directory)
-        else:
-            os.makedirs(os.path.join(save_directory, "query_model"), exist_ok=True)
-            os.makedirs(os.path.join(save_directory, "passage_model"), exist_ok=True)
-            self.lm_q.save_pretrained(os.path.join(save_directory, "query_model"))
-            self.lm_p.save_pretrained(os.path.join(save_directory, "passage_model"))
+        self.lm_q.save_pretrained(save_directory)

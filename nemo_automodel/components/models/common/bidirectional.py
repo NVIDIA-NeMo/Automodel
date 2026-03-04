@@ -15,8 +15,8 @@
 """
 Bidirectional model state dict adapter utilities.
 
-This module provides the BiencoderStateDictAdapter for converting between
-biencoder and HuggingFace state dict formats.
+This module provides the EncoderStateDictAdapter for converting between
+encoder and HuggingFace state dict formats.
 """
 
 from typing import Any, Optional
@@ -26,11 +26,11 @@ from torch.distributed.device_mesh import DeviceMesh
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 
 
-class BiencoderStateDictAdapter(StateDictAdapter):
-    """Adapter for converting BiencoderModel state dict to/from single-encoder HF format.
+class EncoderStateDictAdapter(StateDictAdapter):
+    """Adapter for converting EncoderModel state dict to/from HuggingFace format.
 
-    Extracts only the query encoder (lm_q) on save, mapping ``lm_q.`` to ``model.``.
-    On load, fans ``model.`` keys back out to both ``lm_q.`` and ``lm_p.``.
+    On save, maps ``lm_q.`` prefixed keys to ``model.`` prefixed keys.
+    On load, maps ``model.`` prefixed keys back to ``lm_q.`` prefixed keys.
     PEFT-prefixed keys (``base_model.model.``) are handled transparently.
     """
 
@@ -53,7 +53,7 @@ class BiencoderStateDictAdapter(StateDictAdapter):
         return None
 
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
-        """Convert biencoder state dict to HF format (lm_q -> model)."""
+        """Convert encoder state dict to HF format (lm_q -> model)."""
         hf_state_dict = {}
         for key, value in state_dict.items():
             new_key = self._swap_key(key, "lm_q.", "model.", self._PEFT_PREFIX)
@@ -67,23 +67,21 @@ class BiencoderStateDictAdapter(StateDictAdapter):
         device_mesh: Optional["DeviceMesh"] = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Convert HF state dict to biencoder format (model -> lm_q + lm_p)."""
-        biencoder_state_dict = {}
+        """Convert HF state dict to encoder format (model -> lm_q)."""
+        encoder_state_dict = {}
         for key, value in hf_state_dict.items():
             q_key = self._swap_key(key, "model.", "lm_q.", self._PEFT_PREFIX)
             if q_key is not None:
-                p_key = self._swap_key(key, "model.", "lm_p.", self._PEFT_PREFIX)
-                biencoder_state_dict[q_key] = value
-                biencoder_state_dict[p_key] = value
-        return biencoder_state_dict
+                encoder_state_dict[q_key] = value
+        return encoder_state_dict
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
-        """Convert a single tensor from biencoder to HF format. Skips non-lm_q tensors."""
+        """Convert a single tensor from encoder to HF format. Skips non-lm_q tensors."""
         if fqn.startswith("lm_q."):
             return [("model." + fqn[len("lm_q.") :], tensor)]
         return []
 
 
 __all__ = [
-    "BiencoderStateDictAdapter",
+    "EncoderStateDictAdapter",
 ]

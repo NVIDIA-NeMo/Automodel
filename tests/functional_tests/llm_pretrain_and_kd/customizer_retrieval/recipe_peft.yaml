@@ -17,10 +17,9 @@ step_scheduler:
   max_steps: 4
 
 model:
-  _target_: nemo_automodel._transformers.auto_model.NeMoAutoModelBiencoder.from_pretrained
+  _target_: nemo_automodel._transformers.auto_model.NeMoAutoModelEncoder.from_pretrained
   pretrained_model_name_or_path: /home/TestData/automodel/llama-nemotron-embed-1b-v2/
   trust_remote_code: true
-  share_encoder: true
   pooling: avg
   l2_normalize: true
   use_liger_kernel: false
@@ -50,7 +49,7 @@ dataloader:
     seed: 42
     do_shuffle: true
   collate_fn:
-    _target_: nemo_automodel.components.datasets.llm.RetrievalBiencoderCollator
+    _target_: nemo_automodel.components.datasets.llm.RetrievalEncoderCollator
     q_max_len: 1024
     p_max_len: 1024
     query_prefix: ""
@@ -78,7 +77,7 @@ lr_scheduler:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /workspace/output/biencoder_ckpt_restore_peft/checkpoints
+  checkpoint_dir: /workspace/output/encoder_ckpt_restore_peft/checkpoints
   model_save_format: safetensors
   save_consolidated: false
 

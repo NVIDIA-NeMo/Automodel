@@ -315,7 +315,7 @@ class ModelState:
         if self.is_tied_lm_head and not self.is_peft:
             # PP models don't have tied embeddings. Safe to pass in model[0] here.
             lm_head_weight, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
-            # Skip for Biencoder models as it doesn't have a lm_head at the top level
+            # Skip for Encoder models as it doesn't have a lm_head at the top level
             if lm_head_weight is not None and lm_head_param_name not in state_dict:
                 # weight tying guarantees this is identical to the embedding weight
                 state_dict[lm_head_param_name] = lm_head_weight.detach()

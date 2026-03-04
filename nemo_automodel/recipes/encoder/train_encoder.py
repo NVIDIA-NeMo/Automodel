@@ -97,7 +97,7 @@ def _unpack_qp(inputs: dict[str, torch.Tensor]) -> tuple:
 
 
 def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_world_size=1):
-    """Build a DataLoader for biencoder training."""
+    """Build a DataLoader for encoder training."""
     with ScopedRNG(seed=seed, ranked=True):
         with FirstRankPerNode():
             dataset = cfg_dl.dataset.instantiate()
@@ -134,8 +134,8 @@ def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_wor
         return cfg_dl.instantiate(**dl_kwargs)
 
 
-class TrainBiencoderRecipe(BaseRecipe):
-    """Recipe for training biencoder models with contrastive learning."""
+class TrainEncoderRecipe(BaseRecipe):
+    """Recipe for training encoder models with contrastive learning."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -161,7 +161,7 @@ class TrainBiencoderRecipe(BaseRecipe):
         self.pipeline_config = self.dist_setup.pipeline_config
 
         if self.pp_enabled:
-            raise NotImplementedError("Biencoder does not support pipeline parallelism")
+            raise NotImplementedError("Encoder does not support pipeline parallelism")
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -335,8 +335,8 @@ class TrainBiencoderRecipe(BaseRecipe):
         )
 
         with train_ctx, sync_ctx:
-            q_reps = model(query, encoder="query")
-            p_reps = model(passage, encoder="passage")
+            q_reps = model(query)
+            p_reps = model(passage)
 
             n_passages = self.train_n_passages
             scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
@@ -368,7 +368,7 @@ class TrainBiencoderRecipe(BaseRecipe):
             ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
-            num_label_tokens=None,  # Not applicable for biencoder
+            num_label_tokens=None,  # Not applicable for encoder
             dp_group_size=self._get_dp_group_size(include_cp=True),
         )
 
@@ -425,8 +425,8 @@ class TrainBiencoderRecipe(BaseRecipe):
                     query, passage = _unpack_qp(batch)
 
                     model = self.model_parts[0]
-                    q_reps = model(query, encoder="query")
-                    p_reps = model(passage, encoder="passage")
+                    q_reps = model(query)
+                    p_reps = model(passage)
 
                     n_passages = self.eval_negative_size + 1
                     scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
@@ -513,9 +513,9 @@ class TrainBiencoderRecipe(BaseRecipe):
         torch.cuda.reset_peak_memory_stats()
 
 
-def main(default_config_path="examples/biencoder/llama3_2_1b_biencoder.yaml"):
+def main(default_config_path="examples/encoder/llama3_2_1b_encoder.yaml"):
     cfg = parse_args_and_load_config(default_config_path)
-    recipe = TrainBiencoderRecipe(cfg)
+    recipe = TrainEncoderRecipe(cfg)
     recipe.setup()
     recipe.run_train_validation_loop()
 

@@ -15,7 +15,7 @@
 import pytest
 
 import nemo_automodel._transformers.auto_model as am
-from nemo_automodel._transformers.biencoder import BiencoderModel
+from nemo_automodel._transformers.encoder import EncoderModel
 
 
 class DummyModel:
@@ -59,14 +59,13 @@ def test_from_pretrained_happy_path(monkeypatch):
         return model
 
     _apply_common_mocks(monkeypatch)
-    monkeypatch.setattr(BiencoderModel, "build", staticmethod(fake_build))
+    monkeypatch.setattr(EncoderModel, "build", staticmethod(fake_build))
     monkeypatch.setattr(am, "_patch_liger_kernel", fake_liger)
     monkeypatch.setattr(am, "_patch_attention", fake_sdpa)
     monkeypatch.setattr(am, "apply_model_infrastructure", fake_apply_infrastructure)
 
-    model = am.NeMoAutoModelBiencoder.from_pretrained(
+    model = am.NeMoAutoModelEncoder.from_pretrained(
         pretrained_model_name_or_path="some/path",
-        share_encoder=True,
         pooling="avg",
         l2_normalize=True,
         use_liger_kernel=True,
@@ -101,12 +100,12 @@ def test_from_pretrained_retries_without_liger(monkeypatch):
         return model
 
     _apply_common_mocks(monkeypatch)
-    monkeypatch.setattr(BiencoderModel, "build", staticmethod(fake_build))
+    monkeypatch.setattr(EncoderModel, "build", staticmethod(fake_build))
     monkeypatch.setattr(am, "_patch_liger_kernel", fake_liger)
     monkeypatch.setattr(am, "_patch_attention", fake_sdpa)
     monkeypatch.setattr(am, "apply_model_infrastructure", fake_apply_infrastructure)
 
-    model = am.NeMoAutoModelBiencoder.from_pretrained("x", use_liger_kernel=True, use_sdpa_patching=True)
+    model = am.NeMoAutoModelEncoder.from_pretrained("x", use_liger_kernel=True, use_sdpa_patching=True)
     assert isinstance(model, DummyModel)
     # First attempt calls liger once, then retries without it (so only 1 liger call)
     assert calls["liger"] == 1
@@ -135,12 +134,12 @@ def test_from_pretrained_retries_without_sdpa(monkeypatch):
         return model
 
     _apply_common_mocks(monkeypatch)
-    monkeypatch.setattr(BiencoderModel, "build", staticmethod(fake_build))
+    monkeypatch.setattr(EncoderModel, "build", staticmethod(fake_build))
     monkeypatch.setattr(am, "_patch_liger_kernel", fake_liger)
     monkeypatch.setattr(am, "_patch_attention", fake_sdpa)
     monkeypatch.setattr(am, "apply_model_infrastructure", fake_apply_infrastructure)
 
-    model = am.NeMoAutoModelBiencoder.from_pretrained("x", use_liger_kernel=True, use_sdpa_patching=True)
+    model = am.NeMoAutoModelEncoder.from_pretrained("x", use_liger_kernel=True, use_sdpa_patching=True)
     assert isinstance(model, DummyModel)
     # SDPA attempted once then retried without it (no second SDPA call)
     assert calls["sdpa"] == 1

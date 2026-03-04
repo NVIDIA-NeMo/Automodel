@@ -543,7 +543,7 @@ def make_retrieval_dataset(
     use_dataset_instruction: bool = False,
 ):
     """
-    Load and return dataset in retrieval format for biencoder training.
+    Load and return dataset in retrieval format for encoder training.
 
     Entries in *data_dir_list* can be local JSON file paths **or** ``hf://`` URIs
     pointing to a HuggingFace dataset repository (e.g.
@@ -574,7 +574,7 @@ def make_retrieval_dataset(
         SyntheticClassificationData). For other HF dataset formats, implement a
         custom adapter/preprocessor before calling this loader.
 
-        Tokenization should be handled by a collator (e.g., RetrievalBiencoderCollator)
+        Tokenization should be handled by a collator (e.g., RetrievalEncoderCollator)
         which is more efficient for batch padding and supports dynamic processing.
     """
 

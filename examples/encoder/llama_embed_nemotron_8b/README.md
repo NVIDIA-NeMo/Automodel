@@ -13,7 +13,7 @@ This guide provides step-by-step instructions to reproduce the training pipeline
 Download and prepare the `nvidia/embed-nemotron-dataset-v1` dataset from [Hugging Face](https://huggingface.co/datasets/nvidia/embed-nemotron-dataset-v1). This dataset is a selected subset of the fine-tuning data used for training the `llama-embed-nemotron-8b` model:
 
 ```python
-python examples/biencoder/llama_embed_nemotron_8b/data_preparation.py \
+python examples/encoder/llama_embed_nemotron_8b/data_preparation.py \
     --download-path ./embed_nemotron_dataset_v1
 ```
 
@@ -24,8 +24,8 @@ This script will download the dataset and prepare it for training.
 Run the model finetuning with the specified configuration using 8 GPUs:
 
 ```bash
-torchrun --nproc-per-node=8 examples/biencoder/finetune.py \
-    --config examples/biencoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml
+torchrun --nproc-per-node=8 examples/encoder/finetune.py \
+    --config examples/encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml
 ```
 
 The final model checkpoint in Hugging Face format will be stored in `output/llama_embed_nemotron_8b/epoch_0_step_28614/model/consolidated`
