@@ -183,7 +183,11 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState) -> d
     model_part = model_state.model[0]
     target_modules = _extract_target_modules(model_part)
     try:
-        model_task = model_part.config.architectures[0].split("For")[-1]
+        arch_name = model_part.config.architectures[0]
+        # "LlamaForCausalLM".split("For") → ["Llama", "CausalLM"]
+        # "LlamaBidirectionalModel".split("For") → ["LlamaBidirectionalModel"]
+        parts = arch_name.split("For")
+        model_task = parts[-1] if len(parts) > 1 else "FeatureExtraction"
     except (AttributeError, IndexError, TypeError):
         model_task = "N/A"
 
