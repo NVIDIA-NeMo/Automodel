@@ -44,6 +44,21 @@ MoE model merge::
         --base-model deepseek-ai/DeepSeek-V2-Lite \
         --adapter-path checkpoints/adapter/ \
         --output-dir merged_model/
+
+Embedding / non-CausalLM model merge (auto-detected from adapter task_type)::
+
+    python tools/merge_lora.py \
+        --base-model BAAI/bge-base-en-v1.5 \
+        --adapter-path checkpoints/adapter/ \
+        --output-dir merged_model/
+
+Explicit model class override::
+
+    python tools/merge_lora.py \
+        --base-model BAAI/bge-base-en-v1.5 \
+        --adapter-path checkpoints/adapter/ \
+        --output-dir merged_model/ \
+        --model-class AutoModel
 """
 
 import argparse
@@ -57,6 +72,53 @@ import torch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+TASK_TYPE_TO_AUTO_CLASS = {
+    "CAUSAL_LM": "AutoModelForCausalLM",
+    "SEQ_CLS": "AutoModelForSequenceClassification",
+    "SEQ_2_SEQ_LM": "AutoModelForSeq2SeqLM",
+    "TOKEN_CLS": "AutoModelForTokenClassification",
+    "QUESTION_ANS": "AutoModelForQuestionAnswering",
+    "FEATURE_EXTRACTION": "AutoModel",
+}
+
+
+def _resolve_auto_cls(adapter_path: str, model_class: str | None = None):
+    """Return the ``transformers.AutoModel*`` class to use for loading.
+
+    Resolution order:
+    1. Explicit *model_class* string (e.g. ``"AutoModel"``).
+    2. ``task_type`` field in the adapter's ``adapter_config.json``.
+    3. Fall back to ``AutoModelForCausalLM``.
+    """
+    import transformers
+
+    if model_class is not None:
+        cls = getattr(transformers, model_class, None)
+        if cls is None:
+            raise ValueError(
+                f"Unknown model class '{model_class}'. "
+                f"Must be an attribute of the `transformers` package "
+                f"(e.g. AutoModelForCausalLM, AutoModel)."
+            )
+        return cls
+
+    config_path = os.path.join(adapter_path, "adapter_config.json")
+    if os.path.isfile(config_path):
+        with open(config_path, "r") as f:
+            adapter_cfg = json.load(f)
+        task_type = adapter_cfg.get("task_type")
+        if task_type and task_type in TASK_TYPE_TO_AUTO_CLASS:
+            cls_name = TASK_TYPE_TO_AUTO_CLASS[task_type]
+            logger.info("Detected task_type=%s → using %s", task_type, cls_name)
+            return getattr(transformers, cls_name)
+        if task_type:
+            logger.warning(
+                "Unrecognised task_type '%s' in adapter config; falling back to AutoModelForCausalLM.",
+                task_type,
+            )
+
+    return transformers.AutoModelForCausalLM
 
 
 def dequantize_model(model, dtype=torch.float16, device="cpu"):
@@ -131,6 +193,7 @@ def merge_lora(
     device: str = "auto",
     save_tokenizer: bool = True,
     trust_remote_code: bool = False,
+    model_class: str | None = None,
 ):
     """Load a base model, apply a LoRA adapter, merge, and save.
 
@@ -143,10 +206,14 @@ def merge_lora(
         device: ``auto``, ``cpu``, or ``cuda:N``.
         save_tokenizer: Whether to save the tokenizer alongside the model.
         trust_remote_code: Passed through to ``from_pretrained``.
+        model_class: Explicit ``transformers`` Auto class name (e.g.
+            ``"AutoModel"``, ``"AutoModelForCausalLM"``).  When ``None``
+            the class is inferred from the adapter's ``task_type``.
     """
     from peft import PeftModel
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
+    auto_cls = _resolve_auto_cls(adapter_path, model_class)
     torch_dtype = getattr(torch, dtype)
 
     # --- Load base model ---
@@ -165,13 +232,13 @@ def merge_lora(
         )
         load_kwargs["quantization_config"] = bnb_config
         load_kwargs["device_map"] = {"": 0}
-        logger.info("Loading base model in 4-bit for QLoRA merge: %s", base_model)
+        logger.info("Loading base model in 4-bit for QLoRA merge (%s): %s", auto_cls.__name__, base_model)
     else:
         load_kwargs["torch_dtype"] = torch_dtype
         load_kwargs["device_map"] = device
-        logger.info("Loading base model: %s", base_model)
+        logger.info("Loading base model (%s): %s", auto_cls.__name__, base_model)
 
-    model = AutoModelForCausalLM.from_pretrained(base_model, **load_kwargs)
+    model = auto_cls.from_pretrained(base_model, **load_kwargs)
 
     # --- Dequantize if QLoRA ---
     if qlora:
@@ -258,6 +325,14 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Trust remote code when loading the model.",
     )
+    parser.add_argument(
+        "--model-class",
+        default=None,
+        help=(
+            "Explicit transformers Auto class name (e.g. AutoModel, AutoModelForCausalLM). "
+            "When omitted, inferred from the adapter's task_type in adapter_config.json."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -272,6 +347,7 @@ def main():
         device=args.device,
         save_tokenizer=not args.no_save_tokenizer,
         trust_remote_code=args.trust_remote_code,
+        model_class=args.model_class,
     )
 
 
