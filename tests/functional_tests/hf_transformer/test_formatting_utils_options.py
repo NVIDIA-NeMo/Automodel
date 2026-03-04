@@ -30,7 +30,7 @@ from nemo_automodel.components.datasets.llm.formatting_utils import (
     "seq_length,padding,truncation",
     [
         (None, "do_not_pad", None),
-        (4, "max_length", True),
+        (128, "max_length", True),
     ],
 )
 def test_format_prompt_completion_options(seq_length, padding, truncation):
@@ -109,7 +109,7 @@ def test_format_prompt_completion_options(seq_length, padding, truncation):
     "seq_length,padding,truncation",
     [
         (None, "do_not_pad", None),
-        (4, "max_length", True),
+        (128, "max_length", True),
     ],
 )
 def test_format_chat_template_options(seq_length, padding, truncation):
@@ -159,7 +159,7 @@ def test_format_chat_template_options(seq_length, padding, truncation):
         assert len(labels) == seq_length
 
     # There must be at least some supervised tokens in labels
-    assert any(v!= -100 for v in labels), "Must have supervised assistant tokens"
+    assert any(v != -100 for v in labels), "Must have supervised assistant tokens"
 
     # Where attention_mask=0, labels must be -100
     for i in range(len(labels)):
