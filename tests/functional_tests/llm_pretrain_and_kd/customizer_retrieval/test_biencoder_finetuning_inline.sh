@@ -45,3 +45,11 @@ PEFT_RECIPE_YAML=tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval
 python3 -m coverage run --append ${COVERAGE_ARGS} \
     -m pytest -xvs \
     tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/test_biencoder_checkpoint_restoration.py
+
+# PEFT + biencoder + merge_lora tests
+# Verifies that merge_lora.py correctly handles embedding / biencoder models
+# (FEATURE_EXTRACTION task_type → AutoModel instead of AutoModelForCausalLM).
+BASE_MODEL_PATH=$TEST_DATA_DIR/llama-nemotron-embed-1b-v2 \
+python3 -m coverage run --append ${COVERAGE_ARGS} \
+    -m pytest -xvs \
+    tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/test_peft_merge_lora.py

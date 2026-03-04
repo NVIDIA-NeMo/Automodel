@@ -354,3 +354,36 @@ class TestIntegration:
     def test_backend_configuration(self, strategy):
         result = parse_distributed_section({"strategy": strategy, "backend": "gloo"})
         assert result["strategy_config"].backend == "gloo"
+
+
+# ---------------------------------------------------------------------------
+# None-value handling (YAML `key:` or `key: null`)
+# ---------------------------------------------------------------------------
+
+
+class TestNoneParallelismValues:
+    """Parallelism keys present with None values (e.g. ``ep_size: null`` in YAML)
+    must be treated identically to the key being absent."""
+
+    def test_ep_size_none_defaults_to_1(self):
+        result = parse_distributed_section({"strategy": "fsdp2", "ep_size": None})
+        assert result["ep_size"] == 1
+        assert result["moe_config"] is None
+
+    def test_pp_size_none_defaults_to_1(self):
+        result = parse_distributed_section({"strategy": "fsdp2", "pp_size": None})
+        assert result["pp_size"] == 1
+        assert result["pp_enabled"] is False
+        assert result["pipeline_config"] is None
+
+    def test_ep_size_none_routes_ac_to_strategy(self):
+        result = parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": True, "ep_size": None})
+        assert result["strategy_config"].activation_checkpointing is True
+
+    def test_pp_size_none_discards_pipeline_dict(self):
+        result = parse_distributed_section({"pp_size": None, "pipeline": {"pp_schedule": "1f1b"}})
+        assert result["pipeline_config"] is None
+
+    def test_ep_size_none_discards_moe_dict(self):
+        result = parse_distributed_section({"ep_size": None, "moe": {"ignore_router_for_ac": True}})
+        assert result["moe_config"] is None
