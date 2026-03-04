@@ -46,7 +46,9 @@ from transformers import AutoModel, AutoTokenizer
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
 # Thin nn.Module wrappers used to build a single trace-able graph for ONNX
+# ---------------------------------------------------------------------------
 
 
 class _Pooling(nn.Module):
@@ -185,7 +187,7 @@ def export_to_onnx(
     }
 
     logger.info("Exporting ONNX (opset=%d, dtype=%s) -> %s", opset, export_dtype, onnx_path)
-    with torch.no_grad(), torch.amp.autocast(device.type, dtype=torch_dtype):
+    with torch.no_grad():
         torch.onnx.export(
             model=export_model,
             args=(dummy_inputs["input_ids"], dummy_inputs["attention_mask"]),

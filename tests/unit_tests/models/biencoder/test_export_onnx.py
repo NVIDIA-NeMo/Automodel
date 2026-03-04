@@ -19,15 +19,14 @@ import numpy as np
 import pytest
 import torch
 
-from nemo_automodel.components.models.biencoder.export_onnx import (
+from nemo_automodel.components.models.llama_bidirectional.export_onnx import (
     EmbeddingModelForExport,
-    _Pooling,
     _parse_args,
+    _Pooling,
     export_to_onnx,
     main,
     verify_onnx,
 )
-
 
 # _Pooling
 
@@ -75,6 +74,7 @@ class TestPooling:
 
 
 # EmbeddingModelForExport
+
 
 class TestEmbeddingModelForExport:
     @pytest.fixture()
@@ -130,9 +130,9 @@ def _make_fake_base_model():
 
 
 class TestExportToOnnx:
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.torch.onnx.export")
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.AutoModel")
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.AutoTokenizer")
+    @patch("nemo_automodel.components.models.llama_bidirectional.export_onnx.torch.onnx.export")
+    @patch("nemo_automodel.components.models.llama_bidirectional.export_onnx.AutoModel")
+    @patch("nemo_automodel.components.models.llama_bidirectional.export_onnx.AutoTokenizer")
     def test_basic_export(self, mock_tokenizer_cls, mock_model_cls, mock_onnx_export, tmp_path):
         model_dir = tmp_path / "model"
         model_dir.mkdir()
@@ -151,9 +151,9 @@ class TestExportToOnnx:
         mock_onnx_export.assert_called_once()
         mock_tokenizer_cls.from_pretrained.return_value.save_pretrained.assert_called_once()
 
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.torch.onnx.export")
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.AutoModel")
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.AutoTokenizer")
+    @patch("nemo_automodel.components.models.llama_bidirectional.export_onnx.torch.onnx.export")
+    @patch("nemo_automodel.components.models.llama_bidirectional.export_onnx.AutoModel")
+    @patch("nemo_automodel.components.models.llama_bidirectional.export_onnx.AutoTokenizer")
     def test_explicit_tokenizer_path(self, mock_tokenizer_cls, mock_model_cls, mock_onnx_export, tmp_path):
         model_dir = tmp_path / "model"
         model_dir.mkdir()
@@ -175,9 +175,9 @@ class TestExportToOnnx:
         call_args = mock_tokenizer_cls.from_pretrained.call_args
         assert str(tok_dir.resolve()) in call_args[0][0]
 
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.torch.onnx.export")
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.AutoModel")
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.AutoTokenizer")
+    @patch("nemo_automodel.components.models.llama_bidirectional.export_onnx.torch.onnx.export")
+    @patch("nemo_automodel.components.models.llama_bidirectional.export_onnx.AutoModel")
+    @patch("nemo_automodel.components.models.llama_bidirectional.export_onnx.AutoTokenizer")
     def test_invalid_export_dtype(self, mock_tokenizer_cls, mock_model_cls, mock_onnx_export, tmp_path):
         model_dir = tmp_path / "model"
         model_dir.mkdir()
@@ -193,10 +193,10 @@ class TestExportToOnnx:
                 verify=False,
             )
 
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.verify_onnx")
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.torch.onnx.export")
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.AutoModel")
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.AutoTokenizer")
+    @patch("nemo_automodel.components.models.llama_bidirectional.export_onnx.verify_onnx")
+    @patch("nemo_automodel.components.models.llama_bidirectional.export_onnx.torch.onnx.export")
+    @patch("nemo_automodel.components.models.llama_bidirectional.export_onnx.AutoModel")
+    @patch("nemo_automodel.components.models.llama_bidirectional.export_onnx.AutoTokenizer")
     def test_verify_called_when_enabled(
         self, mock_tokenizer_cls, mock_model_cls, mock_onnx_export, mock_verify, tmp_path
     ):
@@ -214,9 +214,9 @@ class TestExportToOnnx:
 
         mock_verify.assert_called_once()
 
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.torch.onnx.export")
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.AutoModel")
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.AutoTokenizer")
+    @patch("nemo_automodel.components.models.llama_bidirectional.export_onnx.torch.onnx.export")
+    @patch("nemo_automodel.components.models.llama_bidirectional.export_onnx.AutoModel")
+    @patch("nemo_automodel.components.models.llama_bidirectional.export_onnx.AutoTokenizer")
     def test_fp16_export(self, mock_tokenizer_cls, mock_model_cls, mock_onnx_export, tmp_path):
         model_dir = tmp_path / "model"
         model_dir.mkdir()
@@ -268,7 +268,6 @@ class TestVerifyOnnx:
             verify_onnx(str(tmp_path / "model.onnx"), fake_tokenizer)
 
     def test_verify_skips_when_onnxruntime_missing(self, tmp_path, monkeypatch):
-        saved_modules = sys.modules.copy()
         monkeypatch.delitem(sys.modules, "onnxruntime", raising=False)
         monkeypatch.setattr(
             "builtins.__import__",
@@ -346,7 +345,7 @@ class TestParseArgs:
 
 
 class TestMain:
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.export_to_onnx")
+    @patch("nemo_automodel.components.models.llama_bidirectional.export_onnx.export_to_onnx")
     def test_main_invokes_export(self, mock_export, monkeypatch, capsys):
         mock_export.return_value = "/tmp/out/model.onnx"
         monkeypatch.setattr(
