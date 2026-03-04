@@ -170,7 +170,7 @@ test = [
     "pytest",
     "peft>=0.18.1",
     "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
-    "vllm>=0.16.0; python_version < '3.14'; (platform_machine == 'x86_64' and platform_system != 'Darwin')"
+    "vllm>=0.16.0; (python_version < '3.14' and platform_machine == 'x86_64' and platform_system != 'Darwin')"
 ]
 dev = ["cut-cross-entropy", "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')", "dion @ git+https://github.com/microsoft/dion.git; platform_machine == 'x86_64' and platform_system != 'Darwin'"]
 
