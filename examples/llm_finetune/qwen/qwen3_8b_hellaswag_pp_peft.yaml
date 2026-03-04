@@ -82,9 +82,7 @@ packed_sequence:
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 320
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
   shuffle: true
 
 validation_dataset:
@@ -97,7 +95,7 @@ validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn:
     _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 320
+    pad_seq_len_divisible: 168  # must match the training batch seq_len to avoid static PP shape mismatch
 
 optimizer:
   _target_: torch.optim.Adam
