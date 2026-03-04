@@ -106,6 +106,7 @@ class TestMergeLoraEmbeddingModel:
     def _apply_hf_peft_and_save(self, base_dir):
         """Apply HF PEFT LoRA (FEATURE_EXTRACTION) and save adapter."""
         from peft import LoraConfig, get_peft_model
+
         from transformers import AutoModel
 
         model = AutoModel.from_pretrained(base_dir)
@@ -130,6 +131,7 @@ class TestMergeLoraEmbeddingModel:
     def _reference_merge(self, base_dir, adapter_dir):
         """Merge using HF PEFT directly and return merged state dict."""
         from peft import PeftModel
+
         from transformers import AutoModel
 
         model = AutoModel.from_pretrained(base_dir)
@@ -139,9 +141,8 @@ class TestMergeLoraEmbeddingModel:
 
     def test_merge_produces_correct_weights(self):
         """Merged weights must match HF PEFT's merge_and_unload reference."""
-        from transformers import AutoModel
-
         from tools.merge_lora import merge_lora
+        from transformers import AutoModel
 
         base_dir = self._save_tiny_base_model()
         adapter_dir = self._apply_hf_peft_and_save(base_dir)
@@ -172,9 +173,8 @@ class TestMergeLoraEmbeddingModel:
 
     def test_auto_detects_feature_extraction_task_type(self):
         """merge_lora must auto-detect FEATURE_EXTRACTION and use AutoModel."""
-        from transformers import AutoModel
-
         from tools.merge_lora import _resolve_auto_cls
+        from transformers import AutoModel
 
         base_dir = self._save_tiny_base_model()
         adapter_dir = self._apply_hf_peft_and_save(base_dir)
@@ -184,9 +184,8 @@ class TestMergeLoraEmbeddingModel:
 
     def test_merged_weights_differ_from_base(self):
         """Merged model must have different weights from the base model."""
-        from transformers import AutoModel
-
         from tools.merge_lora import merge_lora
+        from transformers import AutoModel
 
         base_dir = self._save_tiny_base_model()
         adapter_dir = self._apply_hf_peft_and_save(base_dir)
@@ -213,9 +212,8 @@ class TestMergeLoraEmbeddingModel:
 
     def test_no_lora_params_remain(self):
         """After merge, no LoRA parameters should be present."""
-        from transformers import AutoModel
-
         from tools.merge_lora import merge_lora
+        from transformers import AutoModel
 
         base_dir = self._save_tiny_base_model()
         adapter_dir = self._apply_hf_peft_and_save(base_dir)
@@ -237,9 +235,9 @@ class TestMergeLoraEmbeddingModel:
     def test_merged_embeddings_match_reference(self):
         """Hidden states of the merged model must match the adapter-applied reference."""
         from peft import PeftModel
-        from transformers import AutoModel
 
         from tools.merge_lora import merge_lora
+        from transformers import AutoModel
 
         base_dir = self._save_tiny_base_model()
         adapter_dir = self._apply_hf_peft_and_save(base_dir)
@@ -281,9 +279,8 @@ class TestMergeLoraEmbeddingModel:
 
     def test_explicit_model_class_override(self):
         """merge_lora with explicit model_class='AutoModel' works correctly."""
-        from transformers import AutoModel
-
         from tools.merge_lora import merge_lora
+        from transformers import AutoModel
 
         base_dir = self._save_tiny_base_model()
         adapter_dir = self._apply_hf_peft_and_save(base_dir)
@@ -333,7 +330,7 @@ class TestMergeLoraRealBiencoder:
     def test_merge_lora_real_biencoder(self):
         from peft import LoraConfig, PeftModel, get_peft_model
 
-        from nemo_automodel._transformers.biencoder import BiencoderModel
+        from nemo_automodel.components.models.biencoder import BiencoderModel
         from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel
         from tools.merge_lora import merge_lora
 
