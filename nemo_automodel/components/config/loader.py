@@ -27,7 +27,7 @@ from pathlib import Path
 # Security/Policy configuration
 from typing import Any, Mapping
 
-import yaml  # type: ignore[import-untyped]
+import yaml
 
 # Only allow importing from these module prefixes by default
 ALLOWED_IMPORT_PREFIXES = ("nemo_automodel", "torch", "transformers", "torchdata", "torchao", "liger_kernel")

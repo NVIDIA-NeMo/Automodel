@@ -16,7 +16,7 @@ import json
 import os
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 import torch
@@ -38,7 +38,7 @@ class MetricsSample:
         } | self.metrics
 
     def __post_init__(self) -> None:
-        self.timestamp = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+        self.timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def stack_and_move_tensor_metrics_to_cpu(metric_vector: List[MetricsSample]) -> List[MetricsSample]:

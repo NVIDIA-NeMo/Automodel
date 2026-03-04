@@ -174,6 +174,6 @@ class FlexAttention(torch.nn.Module):
 
             return same_block & inner_mask
 
-        blocked_mask_mod.__name__ = f"blocked_mask_mod_{mask_mod.__name__}_fixed_block_size_{fixed_block_size}"
+        blocked_mask_mod.__name__ = f"blocked_mask_mod_{getattr(mask_mod, '__name__', type(mask_mod).__name__)}_fixed_block_size_{fixed_block_size}"
 
         return blocked_mask_mod

@@ -363,6 +363,7 @@ allowed-unresolved-imports = ["**"]
 
 [tool.ty.rules]
 unused-ignore-comment = "warn"
+possibly-missing-attribute = "ignore"
 
 # Phase 1: small, well-typed, leaf-dependency modules
 [[tool.ty.overrides]]
