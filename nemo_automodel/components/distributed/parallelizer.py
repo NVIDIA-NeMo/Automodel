@@ -237,12 +237,12 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         tp_mesh = device_mesh[tp_mesh_name]
         if tp_mesh.size() > 1:
             model_tp_plan: dict[str, ParallelStyle] = {
-                "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+                "lm_head": translate_to_lora(ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)),
             }
 
             mlp_tp_plan: dict[str, ParallelStyle] = {
-                "mixer.up_proj": ColwiseParallel(),
-                "mixer.down_proj": RowwiseParallel(),
+                "mixer.up_proj": translate_to_lora(ColwiseParallel()),
+                "mixer.down_proj": translate_to_lora(RowwiseParallel()),
             }
 
             parallelize_module(model, tp_mesh, model_tp_plan)
