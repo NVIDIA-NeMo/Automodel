@@ -17,9 +17,9 @@ set -exo pipefail
 
 COVERAGE_ARGS="--data-file=/workspace/.coverage --source=/workspace/ --parallel-mode"
 
-# Run the encoder recipe (uses nemo_automodel/recipes/encoder/train_encoder.py via module entrypoint).
+# Run the encoder recipe (uses nemo_automodel/recipes/encoder/train_retriever_encoder.py via module entrypoint).
 python3 -m coverage run ${COVERAGE_ARGS} \
-    -m nemo_automodel.recipes.encoder.train_encoder \
+    -m nemo_automodel.recipes.encoder.train_retriever_encoder \
     --config \
     tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/recipe.yaml \
     --model.pretrained_model_name_or_path $TEST_DATA_DIR/llama-nemotron-embed-1b-v2/ \

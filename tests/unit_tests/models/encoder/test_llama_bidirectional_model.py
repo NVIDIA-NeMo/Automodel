@@ -24,7 +24,7 @@ from nemo_automodel._transformers.encoder import (
     EncoderModel,
     pool,
 )
-from nemo_automodel.recipes.encoder.train_encoder import contrastive_scores_and_labels
+from nemo_automodel.recipes.encoder.train_retriever_encoder import contrastive_scores_and_labels
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,

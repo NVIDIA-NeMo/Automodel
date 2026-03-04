@@ -82,7 +82,7 @@ def _run_training() -> Path:
         "--data-file=/workspace/.coverage",
         "--source=/workspace/",
         "--parallel-mode",
-        "-m", "nemo_automodel.recipes.encoder.train_encoder",
+        "-m", "nemo_automodel.recipes.encoder.train_retriever_encoder",
         "--config", RECIPE_YAML,
     ]
     result = subprocess.run(cmd, cwd=str(_REPO_ROOT), check=True)
@@ -160,7 +160,7 @@ def _iter_batches(ds, batch_size: int, max_samples: int):
 @torch.no_grad()
 def _compute_pos_neg_diffs(model, collator, ds, device, batch_size, max_samples):
     """Compute per-sample (pos_score - neg_score) diffs."""
-    from nemo_automodel.recipes.encoder.train_encoder import contrastive_scores_and_labels
+    from nemo_automodel.recipes.encoder.train_retriever_encoder import contrastive_scores_and_labels
 
     model.eval()
     diffs: list[np.ndarray] = []

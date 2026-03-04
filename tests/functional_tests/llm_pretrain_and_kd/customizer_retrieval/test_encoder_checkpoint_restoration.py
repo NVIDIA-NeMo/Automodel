@@ -84,7 +84,7 @@ def _run_training(recipe_yaml: str, checkpoint_dir: str) -> Path:
         "--data-file=/workspace/.coverage",
         "--source=/workspace/",
         "--parallel-mode",
-        "-m", "nemo_automodel.recipes.encoder.train_encoder",
+        "-m", "nemo_automodel.recipes.encoder.train_retriever_encoder",
         "--config",
         recipe_yaml,
     ]
