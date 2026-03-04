@@ -77,7 +77,7 @@ dependencies = [
     "datasets>=4.0.0",
     "megatron-fsdp>=0.2.3",
     "mistral-common[image,audio,hf-hub,sentencepiece]",
-    "opencv-python-headless==4.10.0.84",
+    "opencv-python-headless>=4.10.0.84",
     "pybind11",
     "pyyaml",
     "torch>=2.6.0,<=2.10.0",
@@ -165,7 +165,13 @@ linting = [
     "ruff~=0.9.0",
     "import-linter~=2.4",
 ]
-test = ["coverage", "pytest", "peft>=0.18.1", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
+test = [
+    "coverage",
+    "pytest",
+    "peft>=0.18.1",
+    "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "vllm>=0.16.0; (python_version < '3.14' and platform_machine == 'x86_64' and platform_system != 'Darwin')"
+]
 dev = ["cut-cross-entropy", "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')", "dion @ git+https://github.com/microsoft/dion.git; platform_machine == 'x86_64' and platform_system != 'Darwin'"]
 
 [tool.uv]
@@ -179,6 +185,9 @@ no-build-isolation-package = [
     "nv-grouped-gemm",
     "transformer-engine",
     "transformer-engine-torch",
+]
+override-dependencies = [
+    "transformers>=5.0.0",  # Override vllm's transformers<5 pin until vllm-project/vllm#30566 is merged
 ]
 constraint-dependencies = [
     "aiohttp>=3.13.3", # Address CVE GHSA-6mq8-rvhq-8wgg
