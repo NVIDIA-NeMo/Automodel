@@ -734,7 +734,7 @@ class NeMoAutoModelBiencoder:
         share_encoder: bool = True,
         pooling: str = "avg",
         l2_normalize: bool = True,
-        attn_implementation: str = "flash_attention_2",
+        attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
         sdpa_method: Optional[List[SDPBackend]] = None,
@@ -762,7 +762,8 @@ class NeMoAutoModelBiencoder:
             l2_normalize: Whether to L2 normalize embeddings.
             attn_implementation: Attention implementation to use (e.g.,
                 ``"flash_attention_2"``, ``"sdpa"``, ``"eager"``).
-                Defaults to ``"flash_attention_2"``.
+                Defaults to ``DEFAULT_ATTN_IMPLEMENTATION``
+                (``"flash_attention_2"`` when flash-attn is installed, otherwise ``"sdpa"``).
             use_liger_kernel: Whether to apply Liger kernel optimizations.
             use_sdpa_patching: Whether to apply SDPA patching.
             sdpa_method: SDPA backend methods to use.
