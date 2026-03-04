@@ -182,22 +182,23 @@ def _package_tokenized_example(
         A dictionary with input_ids, labels, and attention_mask.
     """
     labels = input_ids.copy()
-    input_ids = input_ids[:-1]
-    # Compute content length before any padding so the attention mask is correct
-    # even when input_ids arrive already padded (e.g. from tokenizer() with
-    # padding="max_length" in format_prompt_completion).
+    # Compute content length on the original input_ids (before the next-token
+    # shift) so that pre-padded and non-padded inputs produce identical
+    # attention masks.  The shift removes one token; when the input is padded
+    # that token is a pad, but when unpadded it is the last real token.
+    # Computing on the original and subtracting 1 gives the same result in
+    # both cases.
     content_length = len(input_ids)
     if pad_token_id is not None and content_length > 0:
-        # Strip trailing pad tokens to find real content length.
-        # When pad_token_id == eos_token_id, keep one trailing eos as real content.
         end = content_length
         while end > 0 and input_ids[end - 1] == pad_token_id:
             end -= 1
         if pad_token_id == eos_token_id:
-            # Keep one trailing eos token as the real EOS
             content_length = min(end + 1, content_length)
         else:
             content_length = end
+    input_ids = input_ids[:-1]
+    content_length = max(0, min(content_length - 1, len(input_ids)))
     attention_mask = [1] * content_length + [0] * (len(input_ids) - content_length)
     # Labels: mask out prompt tokens
     labels[:] = [label if bool(m) else -100 for label, m in zip(labels, assistant_masks)]

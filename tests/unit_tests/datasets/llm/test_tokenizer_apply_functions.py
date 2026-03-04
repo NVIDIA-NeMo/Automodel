@@ -535,9 +535,9 @@ class TestPackageTokenizedExamplePrePaddedInput:
             seq_length=None,
             padding="do_not_pad",
         )
-        # After [:-1]: input_ids = [1, 10, 11, 2, 0, 0, 0]
-        # Content is [1, 10, 11, 2], pad positions are [0, 0, 0]
-        assert out["attention_mask"] == [1, 1, 1, 1, 0, 0, 0], (
+        # Content length is computed on the original input (4 real tokens),
+        # then reduced by 1 for the next-token shift → 3 ones.
+        assert out["attention_mask"] == [1, 1, 1, 0, 0, 0, 0], (
             f"Expected zeros at pre-padded positions, got {out['attention_mask']}"
         )
 
@@ -561,9 +561,9 @@ class TestPackageTokenizedExamplePrePaddedInput:
             seq_length=None,
             padding="do_not_pad",
         )
-        # After [:-1]: input_ids = [1, 10, 11, 2, 2, 2]
-        # Content is [1, 10, 11, 2] (keep one trailing eos), rest are pad
-        assert out["attention_mask"] == [1, 1, 1, 1, 0, 0], (
+        # Content length is computed on the original input (4 real tokens
+        # including one trailing EOS), then reduced by 1 for the shift → 3 ones.
+        assert out["attention_mask"] == [1, 1, 1, 0, 0, 0], (
             f"Expected one trailing EOS kept + zeros for pad, got {out['attention_mask']}"
         )
 
@@ -601,11 +601,11 @@ class TestPackageTokenizedExamplePrePaddedInput:
             seq_length=10,
             padding="max_length",
         )
-        # After [:-1]: [1, 10, 11, 2, 0], content_length=4
-        # _pad_to_seq_length extends to 10
+        # Content length computed on original (4 real), minus 1 for shift → 3 ones.
+        # _pad_to_seq_length extends to 10.
         assert len(out["attention_mask"]) == 10
-        assert out["attention_mask"][:4] == [1, 1, 1, 1]
-        assert all(v == 0 for v in out["attention_mask"][4:])
+        assert out["attention_mask"][:3] == [1, 1, 1]
+        assert all(v == 0 for v in out["attention_mask"][3:])
 
 
 class _StubTokPadEosPlain(_StubTokenizerPlain):
