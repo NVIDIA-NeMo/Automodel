@@ -34,7 +34,7 @@ Usage:
     torchrun --nproc_per_node=2 tests/functional_tests/llm_pretrain_and_kd/run_tp_output_parity_minified.py \\
         --models qwen3 qwen3_seq_cls ministral3 \\
         --sequence_parallel both \\
-        --kl_threshold 1e-6
+        --kl_threshold 2e-6
 """
 
 from __future__ import annotations
@@ -52,6 +52,8 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import parallelize_module
 from torch.distributed.tensor.placement_types import Replicate
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan
@@ -59,8 +61,6 @@ from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.models.llama.model import LlamaConfig, LlamaForCausalLM
 from nemo_automodel.components.models.mistral3.model import Ministral3Config, Ministral3ForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2Config, Qwen2ForCausalLM
-from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
-from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
 ModelKind = Literal["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2"]
 SPMode = Literal["true", "false", "both"]
@@ -132,6 +132,7 @@ def _kl_divergence_from_logits(*, reference_logits: torch.Tensor, candidate_logi
     cand_log_probs = F.log_softmax(candidate_logits.float(), dim=-1).reshape(-1, vocab_size)
     # F.kl_div expects input=log(q), target=log(p) when log_target=True → KL(p || q)
     return F.kl_div(cand_log_probs, ref_log_probs, reduction="none", log_target=True).sum(-1)
+
 
 @dataclass(frozen=True)
 class _Case:
@@ -224,8 +225,8 @@ def _build_minified_model(kind: ModelKind):
             use_cache=False,
             tie_word_embeddings=True,
             attention_bias=False,
-            attn_implementation="eager",
-            dtype=torch.float32,
+            attn_implementation="sdpa",
+            torch_dtype=torch.bfloat16,
         )
         return cfg, LlamaForCausalLM(cfg, backend=backend)
 
@@ -245,8 +246,8 @@ def _build_minified_model(kind: ModelKind):
             use_sliding_window=False,
             sliding_window=None,
             layer_types=["full_attention"] * num_layers,
-            attn_implementation="eager",
-            dtype=torch.float32,
+            attn_implementation="sdpa",
+            torch_dtype=torch.bfloat16,
         )
         model = Qwen2ForCausalLM(cfg, backend=backend)
         with torch.no_grad():
@@ -275,7 +276,7 @@ def _run_case(
         torch.cuda.manual_seed_all(1234)
 
     cfg, baseline = _build_minified_model(case.kind)
-    baseline = baseline.to(device=device, dtype=torch.float32)
+    baseline = baseline.to(device=device, dtype=torch.bfloat16)
     baseline.eval()
 
     # Deterministic inputs across ranks.
@@ -298,7 +299,7 @@ def _run_case(
     if device_type == "cuda":
         torch.cuda.manual_seed_all(1234)
     _, tp_model = _build_minified_model(case.kind)
-    tp_model = tp_model.to(device=device, dtype=torch.float32)
+    tp_model = tp_model.to(device=device, dtype=torch.bfloat16)
     tp_model.eval()
 
     tp_mesh = DeviceMesh(device_type, torch.arange(world_size, device="cpu"), mesh_dim_names=("tp",))
@@ -336,8 +337,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--kl_threshold",
         type=float,
-        default=1e-6,
-        help="Fail if KL(TP=1 || TP=2) exceeds this threshold (averaged per token).",
+        default=2e-6,
+        help="Fail if KL(TP=1 || TP=2) exceeds this threshold (per token). Default is bf16-appropriate.",
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -392,4 +393,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

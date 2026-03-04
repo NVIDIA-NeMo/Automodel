@@ -172,12 +172,26 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
     trust_remote_code = kwargs.pop("trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path))
     hf_config = kwargs.get("config", None)
     if hf_config is None:
-        hf_config = AutoConfig.from_pretrained(
-            pretrained_model_name_or_path,
-            **kwargs,
-            trust_remote_code=trust_remote_code,
-            attn_implementation=attn_implementation,
-        )
+        try:
+            hf_config = AutoConfig.from_pretrained(
+                pretrained_model_name_or_path,
+                **kwargs,
+                trust_remote_code=trust_remote_code,
+                attn_implementation=attn_implementation,
+            )
+        except ValueError as e:
+            if "does not recognize this architecture" in str(e):
+                raise ValueError(
+                    f"{e}\n\n"
+                    f"The checkpoint '{pretrained_model_name_or_path}' has a model type not "
+                    f"recognized by the installed version of NeMo Automodel. "
+                    f"This usually means your installed package is out of date.\n\n"
+                    f"To fix this, try upgrading:\n"
+                    f"  pip install --upgrade nemo_automodel\n"
+                    f"or install from source:\n"
+                    f"  pip install git+https://github.com/NVIDIA-NeMo/Automodel.git"
+                ) from e
+            raise
     return hf_config
 
 
