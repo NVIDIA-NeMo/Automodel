@@ -74,16 +74,22 @@ ONNX_OUTPUT_DIR = os.environ.get(
 # Helpers (thin wrappers around compare_biencoder_models logic)
 # ---------------------------------------------------------------------------
 
+
 def _run_training() -> Path:
     """Launch the biencoder training recipe as a subprocess and return the
     checkpoint directory produced by the run."""
     cmd = [
-        sys.executable, "-m", "coverage", "run",
+        sys.executable,
+        "-m",
+        "coverage",
+        "run",
         "--data-file=/workspace/.coverage",
         "--source=/workspace/",
         "--parallel-mode",
-        "-m", "nemo_automodel.recipes.biencoder.train_biencoder",
-        "--config", RECIPE_YAML,
+        "-m",
+        "nemo_automodel.recipes.biencoder.train_biencoder",
+        "--config",
+        RECIPE_YAML,
     ]
     result = subprocess.run(cmd, cwd=str(_REPO_ROOT), check=True)
     assert result.returncode == 0, f"Training failed with return code {result.returncode}"
@@ -99,16 +105,20 @@ def _build_eval_model(device: torch.device):
     """Build a NeMoAutoModelBiencoder for evaluation."""
     from nemo_automodel._transformers.auto_model import NeMoAutoModelBiencoder
 
-    return NeMoAutoModelBiencoder.from_pretrained(
-        pretrained_model_name_or_path=BASE_MODEL_PATH,
-        share_encoder=True,
-        pooling="avg",
-        l2_normalize=True,
-        use_liger_kernel=False,
-        use_sdpa_patching=False,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-    ).to(device).eval()
+    return (
+        NeMoAutoModelBiencoder.from_pretrained(
+            pretrained_model_name_or_path=BASE_MODEL_PATH,
+            share_encoder=True,
+            pooling="avg",
+            l2_normalize=True,
+            use_liger_kernel=False,
+            use_sdpa_patching=False,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        )
+        .to(device)
+        .eval()
+    )
 
 
 def _build_eval_dataset():
@@ -222,6 +232,7 @@ def _load_finetuned_weights(model, checkpoint_dir: Path):
 # Test class
 # ---------------------------------------------------------------------------
 
+
 class TestCustomizerRetrieval:
     """End-to-end: train biencoder with customizer-aligned recipe, then assert
     the fine-tuned model is not degraded vs baseline, and the ONNX export
@@ -264,15 +275,23 @@ class TestCustomizerRetrieval:
 
         # Compute baseline diffs.
         base_diffs = _compute_pos_neg_diffs(
-            model=model, collator=collator, ds=ds,
-            device=device, batch_size=EVAL_BATCH_SIZE, max_samples=max_samples,
+            model=model,
+            collator=collator,
+            ds=ds,
+            device=device,
+            batch_size=EVAL_BATCH_SIZE,
+            max_samples=max_samples,
         )
 
         # Load fine-tuned weights and recompute.
         model = _load_finetuned_weights(model, checkpoint_dir)
         ft_diffs = _compute_pos_neg_diffs(
-            model=model, collator=collator, ds=ds,
-            device=device, batch_size=EVAL_BATCH_SIZE, max_samples=max_samples,
+            model=model,
+            collator=collator,
+            ds=ds,
+            device=device,
+            batch_size=EVAL_BATCH_SIZE,
+            max_samples=max_samples,
         )
 
         # Statistical comparison.
@@ -294,37 +313,38 @@ class TestCustomizerRetrieval:
         # significant AND the fine-tuned model is *better* (cohen_d > 0).
         model_not_degraded = (p_value > 0.05) or (p_value < 0.05 and cohen_d > 0)
         assert model_not_degraded, (
-            f"Fine-tuned model appears degraded vs baseline "
-            f"(t={t_stat:.4f}, p={p_value:.6f}, CohenD={cohen_d:.4f})"
+            f"Fine-tuned model appears degraded vs baseline (t={t_stat:.4f}, p={p_value:.6f}, CohenD={cohen_d:.4f})"
         )
 
     # -- Test: ONNX export + verification -----------------------------------
 
-    def test_onnx_export_and_verify(self, checkpoint_dir):
-        """Export the fitests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/test_customizer_retrieval.pyne-tuned checkpoint to ONNX and verify the graph
+    @pytest.mark.parametrize("export_dtype", ["fp32", "bf16"])
+    def test_onnx_export_and_verify(self, checkpoint_dir, export_dtype):
+        """Export the fine-tuned checkpoint to ONNX and verify the graph
         produces valid, finite, correctly-shaped embeddings."""
         import onnxruntime
-        from transformers import AutoTokenizer
 
         from nemo_automodel.components.models.llama_bidirectional.export_onnx import export_to_onnx
+        from transformers import AutoTokenizer
 
         # The recipe sets save_consolidated=true, so the checkpoint has a
         # model/consolidated/ directory with standard HF-named safetensors
         # that AutoModel.from_pretrained can load directly.
         consolidated_dir = checkpoint_dir / "model" / "consolidated"
         assert consolidated_dir.is_dir(), (
-            f"Consolidated checkpoint not found at {consolidated_dir}. "
-            "Ensure the recipe sets save_consolidated: true."
+            f"Consolidated checkpoint not found at {consolidated_dir}. Ensure the recipe sets save_consolidated: true."
         )
+
+        onnx_output_dir = str(Path(ONNX_OUTPUT_DIR) / export_dtype)
 
         onnx_path = export_to_onnx(
             model_path=str(consolidated_dir),
-            output_dir=ONNX_OUTPUT_DIR,
+            output_dir=onnx_output_dir,
             tokenizer_path=BASE_MODEL_PATH,
             pooling="avg",
             normalize=True,
             opset=17,
-            export_dtype="fp32",
+            export_dtype=export_dtype,
             verify=False,  # we do our own checks below
         )
 
@@ -332,7 +352,7 @@ class TestCustomizerRetrieval:
         assert Path(onnx_path).exists(), f"ONNX model not found at {onnx_path}"
 
         # 2. Tokenizer was saved alongside.
-        tokenizer_dir = Path(ONNX_OUTPUT_DIR) / "tokenizer"
+        tokenizer_dir = Path(onnx_output_dir) / "tokenizer"
         assert tokenizer_dir.exists(), f"Tokenizer dir not found at {tokenizer_dir}"
 
         # 3. Load the ONNX model in onnxruntime.
@@ -357,7 +377,7 @@ class TestCustomizerRetrieval:
         outputs = session.run(output_names, feed)
         embeddings = outputs[0]
 
-        print(f"\nONNX output shape: {embeddings.shape}")
+        print(f"\nONNX output shape: {embeddings.shape} (dtype={export_dtype})")
         print(f"ONNX embedding[0][:8]: {embeddings[0][:8]}")
 
         # 5. Shape: [batch_size, hidden_dim].
@@ -370,8 +390,9 @@ class TestCustomizerRetrieval:
         assert np.isfinite(embeddings).all(), "ONNX output contains non-finite values"
 
         # 7. Embeddings are L2-normalised (norm ≈ 1.0 per row).
+        norm_atol = 1e-4 if export_dtype == "fp32" else 1e-2
         norms = np.linalg.norm(embeddings, axis=1)
-        np.testing.assert_allclose(norms, 1.0, atol=1e-4, err_msg="Embeddings are not L2-normalised")
+        np.testing.assert_allclose(norms, 1.0, atol=norm_atol, err_msg="Embeddings are not L2-normalised")
 
         # 8. Different sentences should produce different embeddings.
         cos_01 = float(np.dot(embeddings[0], embeddings[1]))
