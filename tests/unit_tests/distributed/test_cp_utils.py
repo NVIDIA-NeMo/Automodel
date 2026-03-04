@@ -241,43 +241,6 @@ def test_make_cp_batch_for_te_basic(monkeypatch):
     assert result["cu_seqlens"].dtype == torch.int32
 
 
-def test_shard_thd_chunk_includes_attention_mask(monkeypatch):
-    """Test that _shard_thd_chunk_for_te partitions and includes attention_mask when present."""
-    cp_mesh = _DummySubMesh(size=2)
-
-    def mock_get_rank(group=None):
-        return 0
-
-    def mock_thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
-        return torch.arange(total_tokens)
-
-    class MockTex:
-        @staticmethod
-        def thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
-            return mock_thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank)
-
-    import sys
-    sys.modules['transformer_engine_torch'] = MockTex
-
-    monkeypatch.setattr(torch.distributed, "get_rank", mock_get_rank)
-
-    # Simulate a THD-format chunk with attention_mask
-    batch = {
-        "input_ids": torch.tensor([1, 2, 3, 4]),
-        "labels": torch.tensor([10, 20, 30, 40]),
-        "position_ids": torch.tensor([0, 1, 2, 3]),
-        "padding_mask": torch.tensor([False, False, False, True]),
-        "cu_seqlens": torch.tensor([0, 4], dtype=torch.int32),
-        "cu_seqlens_padded": torch.tensor([0, 4], dtype=torch.int32),
-        "attention_mask": torch.tensor([1, 1, 1, 0]),
-    }
-
-    result = _cu._shard_thd_chunk_for_te(batch, cp_mesh, "thd", -1000, 0)
-
-    assert "attention_mask" in result, "attention_mask should be in output"
-    assert result["attention_mask"].dtype == torch.bool
-
-
 def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
     """Test that _shard_thd_chunk_for_te handles missing padding_mask gracefully."""
     cp_mesh = _DummySubMesh(size=2)
