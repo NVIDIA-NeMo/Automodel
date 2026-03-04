@@ -20,7 +20,7 @@ from .package_info import __package_name__, __version__
 # Heavy dependencies (e.g., torch/transformers) are intentionally imported lazily
 # via __getattr__ so importing tokenizers doesn't pull in the full training stack.
 
-_SUBMODULES = {"recipes", "shared", "components"}
+_SUBMODULES = {"recipes", "shared", "components", "models"}
 
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "NeMoAutoModelForCausalLM": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForCausalLM"),
