@@ -58,6 +58,7 @@ from nemo_automodel.components.utils.compile_utils import compile_model
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     apply_parameter_freezing,
+    count_model_parameters,
     init_empty_weights,
     print_trainable_parameters,
 )
@@ -105,7 +106,7 @@ def _apply_peft_and_lower_precision(
 
 #  Sharding helpers
 def _shard_pp(autopipeline, model, loss_fn, parallelize_fn):
-    trainable_params, total_params = print_trainable_parameters(model)
+    trainable_params, total_params = count_model_parameters(model)
     # Store param info on autopipeline before splitting so it can be accessed later
     # This captures the full model's param counts before PP shards it across ranks
     autopipeline.trainable_params_before_pp = trainable_params
@@ -497,15 +498,15 @@ def apply_model_infrastructure(
                     param.requires_grad_(False)
 
     if autopipeline is None:
-        print_trainable_parameters(model)  # Once model's been sharded
         # Ensure model is on the correct device; AutoPipeline takes care of it internally
         try:
-            model.to(device)
+            model.to(device, non_blocking=True)
         except NotImplementedError as e:
             if "Cannot copy out of meta tensor" in str(e):
                 logger.warning("model.to(device) failed (meta tensors); using model.to_empty(device=device) instead.")
                 model.to_empty(device=device)
             else:
                 raise
+        print_trainable_parameters(model)  # Once model's been sharded
 
     return model
