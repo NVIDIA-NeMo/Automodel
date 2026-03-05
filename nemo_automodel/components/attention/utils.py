@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import functools
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
@@ -31,8 +31,8 @@ def initialize_attn_module_and_func(
     attn_mask_type: str = "causal",
     qkv_format: str = "bshd",
     num_gqa_groups: int | None = None,
-    **kwargs,
-) -> tuple[nn.Module | None, Callable]:
+    **kwargs: Any,
+) -> tuple[nn.Module | None, Callable[..., torch.Tensor]]:
     if attn_impl == "te":
         from transformer_engine.pytorch.attention import DotProductAttention
 
@@ -66,8 +66,13 @@ def initialize_attn_module_and_func(
 
 
 def preprocess_args_and_kwargs_for_attn(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attention_mask: torch.Tensor | None, attn_impl: str, **kwargs
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    attn_impl: str,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
     """Preprocess attention inputs based on backend requirements."""
     # Create attention kwargs based on backend
     if attn_impl == "te":
