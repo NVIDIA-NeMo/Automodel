@@ -86,6 +86,7 @@ def _get_logical_numel(param) -> int:
     return param.numel()
 
 
+@torch.no_grad()
 def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
     """
     Get the number of trainable parameters and the L2 norm of the model.
@@ -108,10 +109,10 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
         if p.requires_grad:
             trainable_params += n
         try:
-            local_sq_norm += float(p.detach().float().norm(2).item() ** 2)
+            local_sq_norm += p.detach().float().norm(2) ** 2
         except Exception:
             pass
-    return total_params, trainable_params, local_sq_norm
+    return total_params, trainable_params, local_sq_norm.item()
 
 
 @contextmanager
@@ -147,6 +148,7 @@ def resolve_trust_remote_code(pretrained_model_name_or_path):
     return not os.path.isdir(pretrained_model_name_or_path) and pretrained_model_name_or_path.startswith("nvidia/")
 
 
+@torch.no_grad()
 def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
     """Print the number of trainable parameters in the model.
 

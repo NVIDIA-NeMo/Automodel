@@ -497,7 +497,6 @@ def apply_model_infrastructure(
                     param.requires_grad_(False)
 
     if autopipeline is None:
-        print_trainable_parameters(model)  # Once model's been sharded
         # Ensure model is on the correct device; AutoPipeline takes care of it internally
         try:
             model.to(device)
@@ -507,5 +506,6 @@ def apply_model_infrastructure(
                 model.to_empty(device=device)
             else:
                 raise
+        print_trainable_parameters(model)  # Once model's been sharded
 
     return model
