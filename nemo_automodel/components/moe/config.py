@@ -88,9 +88,10 @@ class MoEMetricsConfig:
             None means every step.
         top_k_experts: Number of top (highest) and bottom (lowest) utilization experts
             to emit per layer. Reduces wandb key count for models with many experts.
+            Set to 0 to disable per-expert utilization logging entirely.
     """
 
     enabled: bool = False
     mode: str = "brief"
     detailed_every_steps: Optional[int] = None
-    top_k_experts: int = 5
+    top_k_experts: int = 0

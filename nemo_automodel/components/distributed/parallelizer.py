@@ -24,6 +24,7 @@ import torch
 import transformers
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    CheckpointImpl,
     checkpoint_wrapper,
 )
 from torch.distributed.device_mesh import DeviceMesh
@@ -237,12 +238,12 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         tp_mesh = device_mesh[tp_mesh_name]
         if tp_mesh.size() > 1:
             model_tp_plan: dict[str, ParallelStyle] = {
-                "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+                "lm_head": translate_to_lora(ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)),
             }
 
             mlp_tp_plan: dict[str, ParallelStyle] = {
-                "mixer.up_proj": ColwiseParallel(),
-                "mixer.down_proj": RowwiseParallel(),
+                "mixer.up_proj": translate_to_lora(ColwiseParallel()),
+                "mixer.down_proj": translate_to_lora(RowwiseParallel()),
             }
 
             parallelize_module(model, tp_mesh, model_tp_plan)
@@ -374,10 +375,57 @@ class WanParallelizationStrategy(ParallelizationStrategy):
         )
 
 
+class HunyuanParallelizationStrategy(ParallelizationStrategy):
+    """Parallelization strategy for Hunyuan-style transformer modules used in HunyuanVideo."""
+
+    def parallelize(
+        self,
+        model: nn.Module,
+        device_mesh: DeviceMesh,
+        mp_policy: Optional[MixedPrecisionPolicy] = None,
+        offload_policy: Optional[OffloadPolicy] = None,
+        sequence_parallel: bool = False,
+        activation_checkpointing: bool = True,
+        tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        dp_replicate_mesh_name: str = "dp_replicate",
+        dp_shard_cp_mesh_name: str = "dp_shard_cp",
+        tp_mesh_name: str = "tp",
+    ) -> nn.Module:
+        dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
+        dp_mesh = device_mesh[dp_mesh_dim_names]
+
+        # Mixed precision default like Default strategy
+        if not mp_policy:
+            mp_policy = MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                output_dtype=torch.bfloat16,
+            )
+        # Apply activation checkpointing to transformer blocks if requested
+        if activation_checkpointing:
+            for idx in range(len(model.transformer_blocks)):
+                model.transformer_blocks[idx] = checkpoint_wrapper(
+                    model.transformer_blocks[idx],
+                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                )
+
+        # Apply FSDP sharding recursively and to root
+        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
+
+        return fully_shard(
+            model,
+            mesh=dp_mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            reshard_after_forward=False,
+        )
+
+
 # Strategy registry mapping model class names to parallelization strategies
 PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
     "WanTransformer3DModel": WanParallelizationStrategy(),
+    "HunyuanVideo15Transformer3DModel": HunyuanParallelizationStrategy(),
 }
 
 # Default strategy instance
