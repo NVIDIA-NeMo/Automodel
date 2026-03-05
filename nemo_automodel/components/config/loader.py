@@ -20,6 +20,7 @@ import os
 import pprint
 import re
 import sys
+import types
 from copy import deepcopy
 from pathlib import Path
 
@@ -117,7 +118,7 @@ def _redact(obj: Any) -> Any:
     return obj
 
 
-def translate_value(v):
+def translate_value(v: Any) -> Any:
     """
     Convert a string token into the corresponding Python object.
 
@@ -164,11 +165,12 @@ def translate_value(v):
 class _OrigValueStr(str):
     """String that keeps its original (unresolved) value for safe printing."""
 
-    def __new__(cls, value: str, orig_value: str):
+    _orig_value: str
+    _no_env_resolve: bool
+
+    def __new__(cls, value: str, orig_value: str) -> "_OrigValueStr":
         obj = super().__new__(cls, value)
         obj._orig_value = orig_value
-        # Mark values that already went through env resolution so we don't accidentally
-        # re-resolve `$FOO` sequences that happen to appear in secrets.
         obj._no_env_resolve = True
         return obj
 
@@ -236,7 +238,7 @@ def resolve_yaml_env_vars(obj: Any) -> Any:
     return obj
 
 
-def load_module_from_file(file_path):
+def load_module_from_file(file_path: str | Path) -> types.ModuleType:
     """Dynamically imports a module from a given file path.
 
     Intentionally permissive to support test/temporary modules. Caller is
@@ -246,23 +248,19 @@ def load_module_from_file(file_path):
     if p.suffix != ".py":
         raise ImportError(f"Refusing to load non-Python file as module: {p}")
 
-    # Create a module specification object from the file location
-    # Ensure the dynamic name ends with the file stem (e.g., 'plugin') and is unique
     unique_part = str(abs(hash(str(p.resolve()))) % (10**8))
     name = f"cfgmod_{unique_part}_{p.stem}"
     spec = importlib.util.spec_from_file_location(name, str(p.resolve()))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot create module spec for {p}")
 
-    # Create a module object from the specification
     module = importlib.util.module_from_spec(spec)
-
-    # Execute the module's code
-    assert spec is not None and spec.loader is not None  # narrow mypy and ensure loader exists
     spec.loader.exec_module(module)
 
     return module
 
 
-def _resolve_target(dotted_path: str):
+def _resolve_target(dotted_path: str) -> Any:
     """
     Resolve a dotted path to a Python object with safety checks.
 
@@ -330,7 +328,7 @@ class ConfigNode:
     provides functionality to instantiate objects from configuration.
     """
 
-    def __init__(self, d, raise_on_missing_attr=True):
+    def __init__(self, d: dict[str, Any], raise_on_missing_attr: bool = True) -> None:
         """Initialize the ConfigNode.
 
         Args:
@@ -341,12 +339,12 @@ class ConfigNode:
         # original config for checkpointing.
         self._raw_config = deepcopy(d)
         # Store original string values before resolution (for _fn and _target_ keys)
-        self._original_strings = {}
+        self._original_strings: dict[str, str] = {}
         # Update instead of overwrite, so other instance attributes survive.
         self.__dict__.update({k: self._wrap(k, v) for k, v in d.items()})
         self.raise_on_missing_attr = raise_on_missing_attr
 
-    def __getattr__(self, key):
+    def __getattr__(self, key: str) -> Any:
         try:
             return self.__dict__[key]
         except:
@@ -355,7 +353,7 @@ class ConfigNode:
             else:
                 return None
 
-    def _wrap(self, k, v):
+    def _wrap(self, k: str, v: Any) -> Any:
         """Wrap a configuration value based on its type.
 
         Args:
@@ -389,7 +387,7 @@ class ConfigNode:
             return translate_value(v)
 
     @property
-    def raw_config(self):
+    def raw_config(self) -> dict[str, Any]:
         """
         Get the raw configuration dictionary.
 
@@ -398,7 +396,7 @@ class ConfigNode:
         """
         return self._raw_config
 
-    def instantiate_path(self, dotted_path, default=None, *args, **kwargs):
+    def instantiate_path(self, dotted_path: str, default: Any = None, *args: Any, **kwargs: Any) -> Any:
         """
         Instantiate the target object specified in the configuration by path.
 
@@ -430,7 +428,7 @@ class ConfigNode:
             return default
         return item.instantiate(*args, **kwargs)
 
-    def instantiate(self, *args, **kwargs):
+    def instantiate(self, *args: Any, **kwargs: Any) -> Any:
         """Instantiate the target object specified in the configuration.
 
         This method looks for the "_target_" attribute in the configuration and resolves
@@ -493,7 +491,7 @@ class ConfigNode:
             print(traceback.format_exc())
             raise e
 
-    def _instantiate_value(self, v):
+    def _instantiate_value(self, v: Any) -> Any:
         """
         Recursively instantiate configuration values.
 
@@ -514,7 +512,7 @@ class ConfigNode:
             # Resolve leaf env vars (strings) before attempting to cast.
             return translate_value(resolve_yaml_env_vars(v))
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         """
         Convert the configuration node back to a dictionary.
 
@@ -527,7 +525,7 @@ class ConfigNode:
             if k not in ("raise_on_missing_attr", "_raw_config", "_original_strings")
         }
 
-    def _to_dotted_path(self, obj):
+    def _to_dotted_path(self, obj: Any) -> str:
         """
         Convert a callable/class/method object to a dotted path string.
 
@@ -569,7 +567,9 @@ class ConfigNode:
             return repr(obj)
         return dotted
 
-    def to_yaml_dict(self, *, resolve_env: bool = False, redact_sensitive: bool = False, use_orig_values: bool = False):
+    def to_yaml_dict(
+        self, *, resolve_env: bool = False, redact_sensitive: bool = False, use_orig_values: bool = False
+    ) -> dict[str, Any]:
         """
         Convert configuration to a YAML-ready dictionary:
         - Preserves typed scalars (ints, floats, bools)
@@ -583,7 +583,7 @@ class ConfigNode:
             use_orig_values: If True, prefer `_orig_value` (when present) for safe printing/logging.
         """
 
-        def _convert(key, value):
+        def _convert(key: str | None, value: Any) -> Any:
             # Nested config
             if isinstance(value, ConfigNode):
                 return value.to_yaml_dict(
@@ -630,7 +630,7 @@ class ConfigNode:
             out = _redact(out)
         return out
 
-    def _unwrap(self, v):
+    def _unwrap(self, v: Any) -> Any:
         """
         Recursively convert wrapped configuration values to basic Python types.
 
@@ -647,7 +647,7 @@ class ConfigNode:
         else:
             return v
 
-    def get_as_string(self, key, default=None):
+    def get_as_string(self, key: str, default: str | None = None) -> str:
         """
         Get the string representation of a configuration value.
 
@@ -664,12 +664,11 @@ class ConfigNode:
         # Check if we stored the original string (for _fn and _target_ keys)
         if key in self._original_strings:
             return self._original_strings[key]
-        elif default is not None:
+        if default is not None:
             return default
-        else:
-            raise KeyError(f"Key {key} not found")
+        raise KeyError(f"Key {key} not found")
 
-    def get(self, key, default=None):
+    def get(self, key: str, default: Any = None) -> Any:
         """
         Retrieve a configuration value using a dotted key.
 
@@ -703,7 +702,7 @@ class ConfigNode:
                 return default
         return current
 
-    def set_by_dotted(self, dotted_key: str, value):
+    def set_by_dotted(self, dotted_key: str, value: Any) -> None:
         """
         Set (or append) a value in the config using a dotted key.
 
@@ -719,17 +718,13 @@ class ConfigNode:
         # wrap the final leaf value
         node.__dict__[parts[-1]] = node._wrap(parts[-1], value)
 
-    def __repr__(self, level: int = 0, *, use_orig_values: bool = True):
-        """
-        Return a string representation of the configuration node with indentation.
+    def _format(self, level: int = 0, *, use_orig_values: bool = True) -> str:
+        """Return a string representation of the configuration node with indentation.
 
         Args:
-            level (int): The current indentation level.
-            use_orig_values (bool): If True, prefer original placeholder strings (e.g. `${VAR}`)
-                stored on `_OrigValueStr` values for safe logging. If False, show resolved values.
-
-        Returns:
-            str: An indented string representation of the configuration.
+            level: The current indentation level.
+            use_orig_values: If True, prefer original placeholder strings (e.g. ``${VAR}``)
+                stored on ``_OrigValueStr`` values for safe logging.
         """
         indent = "  " * level
         lines = [
@@ -739,21 +734,12 @@ class ConfigNode:
         ]
         return "\n".join(lines) + f"\n{indent}"
 
-    def _repr_value(self, value, level, *, use_orig_values: bool = True):
-        """
-        Format a configuration value for the string representation.
+    def __repr__(self) -> str:
+        return self._format(level=0, use_orig_values=True)
 
-        Args:
-            value: The configuration value.
-            level (int): The indentation level.
-            use_orig_values (bool): If True, prefer original placeholder strings stored on
-                `_OrigValueStr` values for safe logging. If False, show resolved values.
-
-        Returns:
-            str: A formatted string representation of the value.
-        """
+    def _repr_value(self, value: Any, level: int, *, use_orig_values: bool = True) -> str:
         if isinstance(value, ConfigNode):
-            return value.__repr__(level + 1, use_orig_values=use_orig_values)
+            return value._format(level + 1, use_orig_values=use_orig_values)
         elif isinstance(value, list):
             return (
                 "[\n"
@@ -770,18 +756,10 @@ class ConfigNode:
                 return repr(getattr(value, "_orig_value"))
             return repr(value)
 
-    def __str__(self):
-        """
-        Return a string representation of the configuration node.
+    def __str__(self) -> str:
+        return self._format(level=0, use_orig_values=True)
 
-        Returns:
-            str: The string representation.
-        """
-        # Keep printing safe by default: preserve original placeholders (e.g. `${VAR}`) for any
-        # values that were resolved from environment variables.
-        return self.__repr__(level=0, use_orig_values=True)
-
-    def __contains__(self, key):
+    def __contains__(self, key: object) -> bool:
         """
         Check if a dotted key exists in the configuration.
 
@@ -791,18 +769,20 @@ class ConfigNode:
         Returns:
             bool: True if the key exists, False otherwise.
         """
+        if not isinstance(key, str):
+            return False
         parts = key.split(".")
-        current = self
+        current: Any = self
         for p in parts:
             if isinstance(current, ConfigNode):
                 if p in current.__dict__:
                     current = current.__dict__[p]
                 else:
                     return False
-        return current != self
+        return bool(current != self)
 
 
-def config_to_yaml_str(cfg_obj, *, use_orig_values: bool = True):
+def config_to_yaml_str(cfg_obj: Any, *, use_orig_values: bool = True) -> str:
     """
     Convert a config object to a YAML string suitable for logging/printing.
 
@@ -819,10 +799,11 @@ def config_to_yaml_str(cfg_obj, *, use_orig_values: bool = True):
         cfg_dict = cfg_obj.to_dict()
     else:
         cfg_dict = dict(cfg_obj)
-    return yaml.safe_dump(cfg_dict, sort_keys=False, default_flow_style=False).strip()
+    result: str = yaml.safe_dump(cfg_dict, sort_keys=False, default_flow_style=False).strip()
+    return result
 
 
-def load_yaml_config(path):
+def load_yaml_config(path: str | Path) -> "ConfigNode":
     """
     Load a YAML configuration file and convert it to a ConfigNode.
 

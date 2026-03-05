@@ -31,7 +31,7 @@ except Exception as e:  # pragma: no cover - handled at runtime
 logger = logging.getLogger(__name__)
 
 
-def is_dion_optimizer(cfg_opt) -> bool:
+def is_dion_optimizer(cfg_opt: Any) -> bool:
     target = getattr(cfg_opt, "_target_", None)
     name = getattr(target, "__name__", "")
     module = getattr(target, "__module__", "")
@@ -48,7 +48,7 @@ def _separate_param_groups(
     scalar_lr: float | None = None,
     embed_lr: float | None = None,
     lm_head_lr: float | None = None,
-):
+) -> list[dict[str, Any]]:
     """
     Separate model parameters into groups for Dion/Muon optimizers.
 
@@ -102,7 +102,7 @@ def _separate_param_groups(
     effective_scalar_lr = scalar_lr if scalar_lr is not None else base_lr
     effective_embed_lr = embed_lr if embed_lr is not None else effective_scalar_lr
 
-    param_groups = [
+    param_groups: list[dict[str, Any]] = [
         dict(params=matrix_params),
         dict(
             params=vector_params,
@@ -149,7 +149,7 @@ def _get_dion_mesh(distributed_mesh: Any) -> Any:
 
 
 def build_dion_optimizer(
-    cfg_opt,
+    cfg_opt: Any,
     model: nn.Module,
     distributed_mesh: Optional[Any] = None,
 ) -> Any:
