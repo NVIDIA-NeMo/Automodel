@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+from typing import Any
 
 
-def suppress_wandb_log_messages():
+def suppress_wandb_log_messages() -> None:
     """
     Patches wandb logger to suppress upload messages.
 
@@ -28,7 +29,7 @@ def suppress_wandb_log_messages():
     logging.getLogger("wandb").setLevel(logging.CRITICAL)
 
     # (2) monkey‐patch any of the internal "_footer…" functions to no‐ops
-    def _suppress_footer(*args, **kwargs):
+    def _suppress_footer(*args: Any, **kwargs: Any) -> None:
         return None
 
     # Depending on your wandb version these lives under sdk.internal.file_pusher

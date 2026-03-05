@@ -33,8 +33,8 @@ class MLflowLogger:
         tracking_uri: Optional[str] = None,
         tags: Optional[Dict[str, str]] = None,
         artifact_location: Optional[str] = None,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         """
         Initialize MLflow logger.
 
@@ -167,7 +167,7 @@ class MLflowLogger:
         model: torch.nn.Module,
         artifact_path: str = "model",
         registered_model_name: Optional[str] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         """Log a PyTorch model to MLflow.
 
@@ -184,15 +184,15 @@ class MLflowLogger:
             pytorch_model=model, artifact_path=artifact_path, registered_model_name=registered_model_name, **kwargs
         )
 
-    def __enter__(self):
+    def __enter__(self) -> "MLflowLogger":
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: Any) -> None:
         self.mlflow.end_run()
         logger.info("MLflow run ended successfully")
 
 
-def build_mlflow(cfg) -> MLflowLogger:
+def build_mlflow(cfg: Any) -> "MLflowLogger":
     """Build MLflow logger from configuration.
 
     Args:

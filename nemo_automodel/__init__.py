@@ -16,6 +16,8 @@ import importlib
 import importlib.abc
 import importlib.machinery
 import sys
+from types import ModuleType
+from typing import Any
 
 from .package_info import __package_name__, __version__
 
@@ -101,7 +103,7 @@ class _ModelsAliasFinder(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, _ModelsAliasFinder())
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> ModuleType | Any:
     """
     Lazily import and cache selected submodules / exported symbols when accessed.
 
@@ -121,7 +123,7 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def __dir__():
+def __dir__() -> list[str]:
     """
     Expose the names of all available submodules for auto-completion.
     """

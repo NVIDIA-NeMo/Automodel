@@ -103,8 +103,55 @@ jobs:
           source ./venv/bin/activate
           uv run lint-imports --debug --verbose --no-cache
 
+  type_checking:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Set up UV
+        uses: astral-sh/setup-uv@v1
+        with:
+          version: 0.8.22
+      - name: Install ty
+        env:
+          UV_PROJECT_ENVIRONMENT: ./venv
+        run: |
+          uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+          source ./venv/bin/activate
+
+          export PATH="./bin/:$PATH"
+
+          uv sync --link-mode copy --locked --group linting
+
+      - name: Run ty
+        run: |
+          source ./venv/bin/activate
+          uv run --active ty --version
+
+          uv pip install -q tomli
+          TY_DIRS=$(python3 -c "
+          try:
+              import tomllib
+          except ModuleNotFoundError:
+              import tomli as tomllib
+          from pathlib import Path
+          data = tomllib.loads(Path('pyproject.toml').read_text())
+          dirs = set()
+          for override in data.get('tool', {}).get('ty', {}).get('overrides', []):
+              for pattern in override.get('include', []):
+                  dirs.add(pattern.replace('/**', ''))
+          print(' '.join(sorted(dirs)))
+          ")
+
+          echo "ty check targets: $TY_DIRS"
+          uv run --active ty check --verbose $TY_DIRS
+
   Nemo_Linting_Test:
-    needs: [linting, import_linting]
+    needs: [linting, import_linting, type_checking]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -112,17 +159,20 @@ jobs:
         env:
           LINTING_RESULT: ${{ toJson(needs.linting) }}
           IMPORT_LINTING_RESULT: ${{ toJson(needs.import_linting) }}
+          TYPE_CHECKING_RESULT: ${{ toJson(needs.type_checking) }}
         run: |
           LINTING=$(echo "$LINTING_RESULT" | jq -r '.result')
           IMPORT_LINTING=$(echo "$IMPORT_LINTING_RESULT" | jq -r '.result')
+          TYPE_CHECKING=$(echo "$TYPE_CHECKING_RESULT" | jq -r '.result')
 
-          if [[ "$LINTING" == "success" ]] && [[ "$IMPORT_LINTING" == "success" ]]; then
+          if [[ "$LINTING" == "success" ]] && [[ "$IMPORT_LINTING" == "success" ]] && [[ "$TYPE_CHECKING" == "success" ]]; then
             echo "All linting checks passed."
             exit 0
           else
             echo "Some linting checks failed:"
             echo "  - linting: $LINTING"
             echo "  - import_linting: $IMPORT_LINTING"
+            echo "  - type_checking: $TYPE_CHECKING"
             exit 1
           fi
 

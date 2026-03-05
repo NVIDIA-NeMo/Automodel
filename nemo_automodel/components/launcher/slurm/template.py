@@ -26,9 +26,12 @@ python make_and_submit.py \
   --dry-run          # inspect only
 """
 
+from __future__ import annotations
+
 import getpass
 import socket
 from datetime import datetime
+from typing import Any
 
 HEADER = (
     "# -------------------------------------------------------------------\n"
@@ -88,7 +91,7 @@ srun \\
 )
 
 
-def render_script(opts: dict, job_dir) -> str:
+def render_script(opts: dict[str, Any], job_dir: str) -> str:
     # Add GPU directive if gpus_per_node is specified
     if opts.get("gpus_per_node"):
         opts["gpus_per_node_directive"] = f"\n#SBATCH --gpus-per-node={opts['gpus_per_node']}"

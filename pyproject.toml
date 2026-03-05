@@ -164,6 +164,7 @@ linting = [
     "pre-commit>=4.2.0",
     "ruff~=0.9.0",
     "import-linter~=2.4",
+    "ty>=0.0.20",
 ]
 test = ["coverage", "pytest", "peft>=0.18.1", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
 dev = ["cut-cross-entropy", "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')", "dion @ git+https://github.com/microsoft/dion.git; platform_machine == 'x86_64' and platform_system != 'Darwin'"]
@@ -316,7 +317,7 @@ convention = "google"
 
 
 [tool.ruff.lint.isort]
-known-third-party = ["datasets", "wandb"]
+known-third-party = ["datasets", "transformers", "wandb"]
 
 [tool.importlinter]
 root_package = "nemo_automodel"
@@ -341,3 +342,63 @@ modules = [
 ignore_imports = [
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.llama.model",
 ]
+
+# ty: type checking (https://github.com/astral-sh/ty)
+# Default: permissive. Strict checks are opt-in per-file via overrides below.
+# Phase 1 modules: launcher, attention, config, optim, loggers
+# To advance to the next phase, move module paths from the "Phase 2" comment
+# into the active overrides list and fix any new errors.
+[tool.ty.environment]
+python-version = "3.10"
+
+[tool.ty.src]
+include = ["nemo_automodel"]
+exclude = [
+    "tests/**",
+    "nemo_automodel/components/checkpoint/_backports/**",
+]
+
+[tool.ty.analysis]
+allowed-unresolved-imports = ["**"]
+
+[tool.ty.rules]
+unused-ignore-comment = "warn"
+possibly-missing-attribute = "ignore"
+
+# Phase 1: small, well-typed, leaf-dependency modules
+[[tool.ty.overrides]]
+include = [
+    "nemo_automodel/components/attention/**",
+    "nemo_automodel/components/config/**",
+    "nemo_automodel/components/launcher/**",
+    "nemo_automodel/components/loggers/**",
+    "nemo_automodel/components/optim/**",
+]
+
+[tool.ty.overrides.rules]
+# Stricter checking for Phase 1 modules
+possibly-unresolved-reference = "error"
+unresolved-import = "error"
+
+# Phase 2 (uncomment when ready):
+# [[tool.ty.overrides]]
+# include = [
+#     "nemo_automodel/components/loss/**",
+#     "nemo_automodel/components/quantization/**",
+# ]
+#
+# [tool.ty.overrides.rules]
+# possibly-unresolved-reference = "error"
+# unresolved-import = "error"
+
+# Phase 3 (uncomment when ready):
+# [[tool.ty.overrides]]
+# include = [
+#     "nemo_automodel/components/training/**",
+#     "nemo_automodel/components/distributed/**",
+#     "nemo_automodel/components/utils/**",
+# ]
+#
+# [tool.ty.overrides.rules]
+# possibly-unresolved-reference = "error"
+# unresolved-import = "error"

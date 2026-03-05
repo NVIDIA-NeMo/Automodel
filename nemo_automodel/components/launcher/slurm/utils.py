@@ -11,18 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import dataclasses
 import logging
 import os
 import subprocess
 from pathlib import Path
-from typing import Union
+from typing import Any
 
 from nemo_automodel.components.launcher.slurm.config import SlurmConfig, VolumeMapping
 from nemo_automodel.components.launcher.slurm.template import render_script
 
 
-def volume_map_to_str(val: Union[str, dict, VolumeMapping]) -> str:
+def volume_map_to_str(val: str | dict[str, Any] | VolumeMapping) -> str:
     if isinstance(val, dict):
         assert "source" in val
         assert "dest" in val
@@ -48,7 +50,7 @@ def volume_map_to_str(val: Union[str, dict, VolumeMapping]) -> str:
         raise ValueError(type(val))
 
 
-def make_container_mounts(opts: dict) -> list:
+def make_container_mounts(opts: dict[str, Any]) -> list[str]:
     container_mounts = []
     if (hf_home := opts.get("hf_home", None)) and not hf_home.startswith("~/") and not hf_home.startswith("/home"):
         # HF_HOME may require both mount and env-var export.
@@ -62,7 +64,7 @@ def make_container_mounts(opts: dict) -> list:
     return container_mounts
 
 
-def submit_slurm_job(config: SlurmConfig, job_dir) -> int:
+def submit_slurm_job(config: SlurmConfig, job_dir: str) -> int:
     os.makedirs(job_dir, exist_ok=True)
     # Render the sbatch script
     opts = dataclasses.asdict(config)

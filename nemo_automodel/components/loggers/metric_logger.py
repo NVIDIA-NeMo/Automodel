@@ -16,7 +16,7 @@ import json
 import os
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 import torch
@@ -27,8 +27,8 @@ import torch.distributed as dist
 class MetricsSample:
     step: int
     epoch: int
-    metrics: Dict[str, float] = field(default_factory=dict)
-    timestamp: str = None
+    metrics: Dict[str, Any] = field(default_factory=dict)
+    timestamp: str | None = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -37,14 +37,14 @@ class MetricsSample:
             "timestamp": self.timestamp,
         } | self.metrics
 
-    def __post_init__(self):
-        self.timestamp = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+    def __post_init__(self) -> None:
+        self.timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def stack_and_move_tensor_metrics_to_cpu(metric_vector: List[MetricsSample]) -> List[MetricsSample]:
     # Find all tensor metrics, stack them per metric name across samples, move to CPU,
     # then place CPU tensors back into the original metrics.
-    def extract_tensor_metric_names(metric: MetricsSample) -> tuple:
+    def extract_tensor_metric_names(metric: MetricsSample) -> tuple[str, ...]:
         names = [name for name, value in metric.metrics.items() if isinstance(value, torch.Tensor)]
         # Sort for stable grouping and use tuple as a hashable key
         return tuple(sorted(names))
@@ -53,7 +53,7 @@ def stack_and_move_tensor_metrics_to_cpu(metric_vector: List[MetricsSample]) -> 
         return metric_vector
 
     # Group sample indices by the exact set of tensor metric names they contain
-    grouped_indices_by_names = {}
+    grouped_indices_by_names: dict[tuple[str, ...], list[int]] = {}
     for sample_index, metric in enumerate(metric_vector):
         names_key = extract_tensor_metric_names(metric)
         if names_key not in grouped_indices_by_names:
@@ -94,7 +94,7 @@ class MetricLogger:
         self.filepath = os.path.abspath(filepath)
         self.flush = flush
         self.buffer_size = buffer_size
-        self.buffer = []
+        self.buffer: List[MetricsSample] = []
         self._lock = threading.Lock()
         os.makedirs(os.path.dirname(self.filepath) or ".", exist_ok=True)
         mode = "a" if append else "w"
@@ -109,8 +109,8 @@ class MetricLogger:
         with self._lock:
             self._save(lines)
 
-    def _move_to_cpu(self, buffer: List[MetricsSample]) -> List[MetricsSample]:
-        lines = []
+    def _move_to_cpu(self, buffer: List[MetricsSample]) -> List[str]:
+        lines: List[str] = []
         for record in stack_and_move_tensor_metrics_to_cpu(buffer):
             lines.append(json.dumps(record.to_dict(), ensure_ascii=False))
         return lines
@@ -138,7 +138,7 @@ class MetricLogger:
     def __enter__(self) -> "MetricLogger":
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: Any) -> None:
         self.close()
 
 
@@ -148,12 +148,24 @@ class MetricLoggerDist(MetricLogger):
         assert dist.is_initialized(), "torch.distributed must be initialized with MetricLoggerDist"
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
-        # if not main rank, set log and close to no-op
+
+    def log(self, record: MetricsSample) -> None:
         if self.rank != 0:
-            self.log = lambda *args, **kwargs: None
-            self.close = lambda: None
-            self.__enter__ = lambda: None
-            self.__exit__ = lambda: None
+            return
+        super().log(record)
+
+    def close(self) -> None:
+        if self.rank != 0:
+            return
+        super().close()
+
+    def __enter__(self) -> "MetricLoggerDist":
+        return self
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: Any) -> None:
+        if self.rank != 0:
+            return
+        self.close()
 
 
 def build_metric_logger(filepath: str, *, flush: bool = False, append: bool = True) -> MetricLogger:

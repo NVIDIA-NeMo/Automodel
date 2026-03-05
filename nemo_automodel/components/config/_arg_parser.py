@@ -14,10 +14,10 @@
 
 import sys
 
-from nemo_automodel.components.config.loader import load_yaml_config, translate_value
+from nemo_automodel.components.config.loader import ConfigNode, load_yaml_config, translate_value
 
 
-def parse_cli_argv(default_cfg_path=None):
+def parse_cli_argv(default_cfg_path: str | None = None) -> tuple[str, list[str]]:
     """
     Parses CLI args, pulls out --config and collects other --dotted.path options.
 
@@ -74,7 +74,7 @@ def parse_cli_argv(default_cfg_path=None):
     return cfg_path, overrides
 
 
-def parse_args_and_load_config(default_cfg_path=None):
+def parse_args_and_load_config(default_cfg_path: str | None = None) -> ConfigNode:
     """
     Loads YAML, applies overrides via ConfigNode.set_by_dotted.
     """
