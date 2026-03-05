@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from contextlib import nullcontext
 
 import torch
+import wandb
 import torch.nn.functional as F
 
 from nemo_automodel.components.distributed.utils import get_sync_ctx
@@ -59,6 +61,30 @@ class TrainCrossEncoderRecipe(TrainRetrieverEncoderRecipe):
         train_accuracy = total_correct.item() / total_samples.item() if total_samples > 0 else 0.0
         result.metrics["train_accuracy"] = train_accuracy
         return result
+
+    def log_train_metrics(self, log_data: MetricsSample):
+        if not self.dist_env.is_main:
+            return
+
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
+                wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+
+        self.metric_logger_train.log(log_data)
+
+        msg = "step {} | epoch {} | loss {:.4f} | train_acc {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | time {:.2f}s".format(
+            log_data.step,
+            log_data.epoch,
+            log_data.metrics["loss"],
+            log_data.metrics["train_accuracy"],
+            log_data.metrics["grad_norm"],
+            log_data.metrics["lr"],
+            log_data.metrics["mem"],
+            log_data.metrics["time_per_step"],
+        )
+        logging.info(msg)
+
+        torch.cuda.reset_peak_memory_stats()
 
     def _forward_backward_step(self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True):
         """Forward and backward pass for a single micro-batch."""
