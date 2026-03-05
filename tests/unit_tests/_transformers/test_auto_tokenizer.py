@@ -12,13 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
+import json
+import os
 from unittest.mock import patch
 
+import pytest
 from transformers.tokenization_utils_base import BatchEncoding
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
-from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import _add_token, _remap_system_role
+from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
+    _add_token,
+    _read_tokenizer_class,
+    _read_tokenizer_config,
+    _remap_system_role,
+    _restore_special_tokens_in_config,
+)
 
 
 class _StubHFTokenizer:
@@ -48,8 +56,10 @@ class _StubConfig:
 class TestNeMoAutoTokenizerFromPretrained:
     def test_patched_adds_bos_eos(self):
         stub = _StubHFTokenizer()
-        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub), \
-             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()):
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
+            patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
+        ):
             tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
             out = tok(["x"])
             assert isinstance(out, BatchEncoding)
@@ -78,8 +88,10 @@ class TestNeMoAutoTokenizerFromPretrained:
         stub.special_tokens_pattern = "cls_sep"
         stub.cls_token_id = None
         stub.sep_token_id = None
-        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub), \
-             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()):
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
+            patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
+        ):
             tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
             assert tok.special_tokens_pattern == "none"
 
@@ -89,8 +101,10 @@ class TestNeMoAutoTokenizerFromPretrained:
         stub.special_tokens_pattern = "cls_sep"
         stub.cls_token_id = 200
         stub.sep_token_id = 201
-        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub), \
-             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()):
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
+            patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
+        ):
             tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
             assert tok.special_tokens_pattern == "cls_sep"
 
@@ -110,6 +124,7 @@ class TestNeMoAutoTokenizerFromPretrained:
 
         class _StrictBosTokenizer(_StubHFTokenizer):
             """Tokenizer whose add_bos_token property raises on set."""
+
             bos_token = "<s>"
             eos_token = "</s>"
 
@@ -128,8 +143,10 @@ class TestNeMoAutoTokenizerFromPretrained:
                 raise ValueError("read-only in this tokenizer version")
 
         stub = _StrictBosTokenizer()
-        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub), \
-             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()):
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
+            patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
+        ):
             tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
             assert tok._add_bos_token is True
 
@@ -139,6 +156,7 @@ class TestNeMoAutoTokenizerFromPretrained:
 
         class _StrictEosTokenizer(_StubHFTokenizer):
             """Tokenizer whose add_eos_token property raises on set."""
+
             bos_token = "<s>"
             eos_token = "</s>"
 
@@ -157,8 +175,10 @@ class TestNeMoAutoTokenizerFromPretrained:
                 raise ValueError("read-only in this tokenizer version")
 
         stub = _StrictEosTokenizer()
-        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub), \
-             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()):
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
+            patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
+        ):
             tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
             assert tok._add_eos_token is True
 
@@ -295,3 +315,425 @@ class TestRemapSystemRole:
         ]
         result = _remap_system_role(conv)
         assert result[0]["content"] == "\nHello"
+
+
+class TestReadTokenizerClass:
+    """Unit tests for _read_tokenizer_class."""
+
+    def test_reads_from_local_directory(self, tmp_path):
+        config = {"tokenizer_class": "PreTrainedTokenizerFast", "model_type": "llama"}
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(config))
+        assert _read_tokenizer_class(str(tmp_path)) == "PreTrainedTokenizerFast"
+
+    def test_returns_none_when_key_missing(self, tmp_path):
+        config = {"model_type": "llama"}
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(config))
+        assert _read_tokenizer_class(str(tmp_path)) is None
+
+    def test_returns_none_for_nonexistent_directory(self, tmp_path):
+        assert _read_tokenizer_class(str(tmp_path / "does_not_exist")) is None
+
+    def test_returns_none_on_malformed_json(self, tmp_path):
+        (tmp_path / "tokenizer_config.json").write_text("{bad json")
+        assert _read_tokenizer_class(str(tmp_path)) is None
+
+
+class TestSavePretrainedPreservesTokenizerClass:
+    """Verify that save_pretrained writes the original tokenizer_class, not the
+    transformers-v5 runtime class name (e.g. TokenizersBackend)."""
+
+    def _make_stub_tokenizer(self, original_tokenizer_class, base_class_name="TokenizersBackend"):
+        """Create a minimal stub that mimics the attributes set by from_pretrained."""
+        stub = _StubHFTokenizer()
+        stub.bos_token = "<s>"
+        stub.eos_token = "</s>"
+
+        base_class = type(base_class_name, (), {})
+        stub._base_class = base_class
+        stub._original_tokenizer_class = original_tokenizer_class
+        return stub
+
+    def test_preserves_original_tokenizer_class_on_save(self, tmp_path):
+        """When the source config had 'PreTrainedTokenizerFast', save_pretrained
+        should write that same value even if the runtime class is different."""
+        src_dir = tmp_path / "source"
+        src_dir.mkdir()
+        src_config = {
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "model_max_length": 131072,
+        }
+        (src_dir / "tokenizer_config.json").write_text(json.dumps(src_config))
+
+        with patch("transformers.AutoTokenizer.from_pretrained") as mock_from:
+            stub = _StubHFTokenizer()
+            stub.bos_token = "<s>"
+            stub.eos_token = "</s>"
+            mock_from.return_value = stub
+
+            with patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()):
+                tok = NeMoAutoTokenizer.from_pretrained(str(src_dir))
+
+        assert tok._original_tokenizer_class == "PreTrainedTokenizerFast"
+
+    def test_save_pretrained_writes_original_class_name(self, tmp_path):
+        """End-to-end: save_pretrained should produce a tokenizer_config.json
+        whose tokenizer_class matches the original, not the v5 runtime class."""
+
+        save_dir = tmp_path / "saved"
+        save_dir.mkdir()
+
+        saved_config = {}
+
+        class _FakeSaveBase:
+            """Fake base class that records the class name used during save."""
+
+            def save_pretrained(self, save_directory, push_to_hub=False, **kwargs):
+                saved_config["tokenizer_class"] = type(self).__name__
+                config_path = os.path.join(save_directory, "tokenizer_config.json")
+                with open(config_path, "w") as f:
+                    json.dump(saved_config, f)
+
+        from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
+            NeMoAutoTokenizerWithBosEosEnforced,
+        )
+
+        tok = _StubHFTokenizer()
+        tok.bos_token = "<s>"
+        tok.eos_token = "</s>"
+        tok._base_class = _FakeSaveBase
+        tok._original_tokenizer_class = "PreTrainedTokenizerFast"
+        tok._original_tokenizer_config = {"tokenizer_class": "PreTrainedTokenizerFast"}
+
+        wrapper_cls = type(
+            NeMoAutoTokenizerWithBosEosEnforced.__name__,
+            (NeMoAutoTokenizerWithBosEosEnforced, _FakeSaveBase),
+            {},
+        )
+        tok.__class__ = wrapper_cls
+
+        tok.save_pretrained(str(save_dir))
+
+        with open(save_dir / "tokenizer_config.json") as f:
+            result = json.load(f)
+        assert result["tokenizer_class"] == "PreTrainedTokenizerFast"
+
+    def test_save_pretrained_falls_back_to_base_class_name(self, tmp_path):
+        """When _original_tokenizer_class is None, the base class name is used."""
+        save_dir = tmp_path / "saved"
+        save_dir.mkdir()
+
+        saved_config = {}
+
+        class _FakeSaveBase:
+            def save_pretrained(self, save_directory, push_to_hub=False, **kwargs):
+                saved_config["tokenizer_class"] = type(self).__name__
+                config_path = os.path.join(save_directory, "tokenizer_config.json")
+                with open(config_path, "w") as f:
+                    json.dump(saved_config, f)
+
+        from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
+            NeMoAutoTokenizerWithBosEosEnforced,
+        )
+
+        tok = _StubHFTokenizer()
+        tok.bos_token = "<s>"
+        tok.eos_token = "</s>"
+        tok._base_class = _FakeSaveBase
+        tok._original_tokenizer_class = None
+        tok._original_tokenizer_config = None
+
+        wrapper_cls = type(
+            NeMoAutoTokenizerWithBosEosEnforced.__name__,
+            (NeMoAutoTokenizerWithBosEosEnforced, _FakeSaveBase),
+            {},
+        )
+        tok.__class__ = wrapper_cls
+
+        tok.save_pretrained(str(save_dir))
+
+        with open(save_dir / "tokenizer_config.json") as f:
+            result = json.load(f)
+        assert result["tokenizer_class"] == "_FakeSaveBase"
+
+    def test_save_pretrained_restores_original_class_after_save(self, tmp_path):
+        """The __class__ must be restored even if save_pretrained raises."""
+        save_dir = tmp_path / "saved"
+        save_dir.mkdir()
+
+        class _ExplodingSaveBase:
+            def save_pretrained(self, save_directory, push_to_hub=False, **kwargs):
+                raise RuntimeError("boom")
+
+        from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
+            NeMoAutoTokenizerWithBosEosEnforced,
+        )
+
+        tok = _StubHFTokenizer()
+        tok.bos_token = "<s>"
+        tok.eos_token = "</s>"
+        tok._base_class = _ExplodingSaveBase
+        tok._original_tokenizer_class = "PreTrainedTokenizerFast"
+        tok._original_tokenizer_config = {"tokenizer_class": "PreTrainedTokenizerFast"}
+
+        wrapper_cls = type(
+            NeMoAutoTokenizerWithBosEosEnforced.__name__,
+            (NeMoAutoTokenizerWithBosEosEnforced, _ExplodingSaveBase),
+            {},
+        )
+        tok.__class__ = wrapper_cls
+        original_cls = tok.__class__
+
+        with pytest.raises(RuntimeError, match="boom"):
+            tok.save_pretrained(str(save_dir))
+
+        assert tok.__class__ is original_cls
+
+
+class TestReadTokenizerConfig:
+    """Unit tests for _read_tokenizer_config."""
+
+    def test_reads_full_config_from_local_directory(self, tmp_path):
+        config = {
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "bos_token": "<s>",
+            "eos_token": "</s>",
+            "model_max_length": 131072,
+        }
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(config))
+        result = _read_tokenizer_config(str(tmp_path))
+        assert result == config
+
+    def test_returns_none_for_nonexistent_directory(self, tmp_path):
+        assert _read_tokenizer_config(str(tmp_path / "does_not_exist")) is None
+
+    def test_returns_none_on_malformed_json(self, tmp_path):
+        (tmp_path / "tokenizer_config.json").write_text("{bad json")
+        assert _read_tokenizer_config(str(tmp_path)) is None
+
+    def test_read_tokenizer_class_delegates_to_config(self, tmp_path):
+        """_read_tokenizer_class should return the same value as reading from
+        _read_tokenizer_config directly."""
+        config = {"tokenizer_class": "LlamaTokenizerFast", "bos_token": "<s>"}
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(config))
+        assert _read_tokenizer_class(str(tmp_path)) == "LlamaTokenizerFast"
+
+
+class TestRestoreSpecialTokensInConfig:
+    """Unit tests for _restore_special_tokens_in_config."""
+
+    def test_restores_add_bos_eos_tokens(self, tmp_path):
+        """Runtime overrides (add_bos_token/add_eos_token forced True by the
+        wrapper) must be reverted to the original config values on save."""
+        saved = {
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "add_bos_token": True,
+            "add_eos_token": True,
+            "bos_token": "<s>",
+        }
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(saved))
+
+        original = {
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "bos_token": "<s>",
+        }
+        _restore_special_tokens_in_config(str(tmp_path), original)
+
+        with open(tmp_path / "tokenizer_config.json") as f:
+            result = json.load(f)
+        assert "add_bos_token" not in result
+        assert "add_eos_token" not in result
+        assert result["bos_token"] == "<s>"
+
+    def test_preserves_original_special_token_format(self, tmp_path):
+        """If v5 serialized bos_token as an object but the original had a
+        plain string, the plain string format should be restored."""
+        saved = {
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "bos_token": {"content": "<s>", "lstrip": False, "rstrip": False},
+            "eos_token": {"content": "</s>", "lstrip": False, "rstrip": False},
+        }
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(saved))
+
+        original = {
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "bos_token": "<s>",
+            "eos_token": "</s>",
+        }
+        _restore_special_tokens_in_config(str(tmp_path), original)
+
+        with open(tmp_path / "tokenizer_config.json") as f:
+            result = json.load(f)
+        assert result["bos_token"] == "<s>"
+        assert result["eos_token"] == "</s>"
+
+    def test_restores_special_tokens_pattern(self, tmp_path):
+        """special_tokens_pattern changed to 'none' at runtime should be
+        restored to the original value."""
+        saved = {
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "special_tokens_pattern": "none",
+        }
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(saved))
+
+        original = {
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "special_tokens_pattern": "cls_sep",
+        }
+        _restore_special_tokens_in_config(str(tmp_path), original)
+
+        with open(tmp_path / "tokenizer_config.json") as f:
+            result = json.load(f)
+        assert result["special_tokens_pattern"] == "cls_sep"
+
+    def test_no_op_when_config_matches(self, tmp_path):
+        """When saved config already matches the original, the file should not
+        be rewritten (content stays identical)."""
+        config = {
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "bos_token": "<s>",
+            "eos_token": "</s>",
+        }
+        config_path = tmp_path / "tokenizer_config.json"
+        config_path.write_text(json.dumps(config))
+        mtime_before = config_path.stat().st_mtime_ns
+
+        _restore_special_tokens_in_config(str(tmp_path), config)
+
+        mtime_after = config_path.stat().st_mtime_ns
+        assert mtime_before == mtime_after
+
+    def test_preserves_non_special_token_keys(self, tmp_path):
+        """Keys outside _PRESERVED_SPECIAL_TOKEN_KEYS must not be altered."""
+        saved = {
+            "tokenizer_class": "TokenizersBackend",
+            "model_max_length": 131072,
+            "backend": "tokenizers",
+            "add_bos_token": True,
+            "bos_token": {"content": "<s>", "lstrip": False},
+        }
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(saved))
+
+        original = {
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "model_max_length": 4096,
+            "bos_token": "<s>",
+        }
+        _restore_special_tokens_in_config(str(tmp_path), original)
+
+        with open(tmp_path / "tokenizer_config.json") as f:
+            result = json.load(f)
+        assert result["tokenizer_class"] == "TokenizersBackend"
+        assert result["model_max_length"] == 131072
+        assert result["backend"] == "tokenizers"
+        assert result["bos_token"] == "<s>"
+        assert "add_bos_token" not in result
+
+    def test_no_crash_when_config_file_missing(self, tmp_path):
+        """If tokenizer_config.json does not exist, the function should be a
+        silent no-op."""
+        _restore_special_tokens_in_config(str(tmp_path), {"bos_token": "<s>"})
+
+    def test_removes_additional_special_tokens_not_in_original(self, tmp_path):
+        """If the original had no additional_special_tokens but the save added
+        them, they should be removed."""
+        saved = {
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "additional_special_tokens": ["<extra_1>", "<extra_2>"],
+        }
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(saved))
+
+        original = {"tokenizer_class": "PreTrainedTokenizerFast"}
+        _restore_special_tokens_in_config(str(tmp_path), original)
+
+        with open(tmp_path / "tokenizer_config.json") as f:
+            result = json.load(f)
+        assert "additional_special_tokens" not in result
+
+
+class TestSavePretrainedPreservesSpecialTokens:
+    """Verify that save_pretrained restores original special token fields
+    in tokenizer_config.json after the base class writes it."""
+
+    def test_full_round_trip_preserves_special_tokens(self, tmp_path):
+        """Load from a config with specific special token values, save,
+        and verify the saved config matches the original tokens."""
+        save_dir = tmp_path / "saved"
+        save_dir.mkdir()
+
+        original_config = {
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "bos_token": "<s>",
+            "eos_token": "<SPECIAL_12>",
+            "unk_token": "<unk>",
+        }
+
+        class _FakeSaveBase:
+            def save_pretrained(self, save_directory, push_to_hub=False, **kwargs):
+                config_path = os.path.join(save_directory, "tokenizer_config.json")
+                with open(config_path, "w") as f:
+                    json.dump(
+                        {
+                            "tokenizer_class": type(self).__name__,
+                            "add_bos_token": True,
+                            "add_eos_token": True,
+                            "bos_token": {"content": "<s>", "lstrip": False},
+                            "eos_token": {"content": "<SPECIAL_12>", "lstrip": False},
+                            "unk_token": {"content": "<unk>", "lstrip": False},
+                        },
+                        f,
+                    )
+
+        from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
+            NeMoAutoTokenizerWithBosEosEnforced,
+        )
+
+        tok = _StubHFTokenizer()
+        tok.bos_token = "<s>"
+        tok.eos_token = "<SPECIAL_12>"
+        tok._base_class = _FakeSaveBase
+        tok._original_tokenizer_class = "PreTrainedTokenizerFast"
+        tok._original_tokenizer_config = original_config
+
+        wrapper_cls = type(
+            NeMoAutoTokenizerWithBosEosEnforced.__name__,
+            (NeMoAutoTokenizerWithBosEosEnforced, _FakeSaveBase),
+            {},
+        )
+        tok.__class__ = wrapper_cls
+
+        tok.save_pretrained(str(save_dir))
+
+        with open(save_dir / "tokenizer_config.json") as f:
+            result = json.load(f)
+
+        assert result["bos_token"] == "<s>"
+        assert result["eos_token"] == "<SPECIAL_12>"
+        assert result["unk_token"] == "<unk>"
+        assert "add_bos_token" not in result
+        assert "add_eos_token" not in result
+
+    def test_from_pretrained_stores_original_config(self, tmp_path):
+        """from_pretrained should store the full original tokenizer_config
+        on the tokenizer instance."""
+        src_dir = tmp_path / "source"
+        src_dir.mkdir()
+        src_config = {
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "bos_token": "<s>",
+            "eos_token": "<SPECIAL_12>",
+            "unk_token": "<unk>",
+            "model_max_length": 131072,
+        }
+        (src_dir / "tokenizer_config.json").write_text(json.dumps(src_config))
+
+        with patch("transformers.AutoTokenizer.from_pretrained") as mock_from:
+            stub = _StubHFTokenizer()
+            stub.bos_token = "<s>"
+            stub.eos_token = "<SPECIAL_12>"
+            mock_from.return_value = stub
+
+            with patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()):
+                tok = NeMoAutoTokenizer.from_pretrained(str(src_dir))
+
+        assert tok._original_tokenizer_config == src_config
+        assert tok._original_tokenizer_class == "PreTrainedTokenizerFast"
