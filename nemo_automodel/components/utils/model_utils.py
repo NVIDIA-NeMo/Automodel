@@ -112,7 +112,9 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
             local_sq_norm += p.detach().norm(2) ** 2
         except Exception:
             pass
-    return total_params, trainable_params, local_sq_norm.item()
+    if isinstance(local_sq_norm, torch.Tensor):
+        local_sq_norm = local_sq_norm.item()
+    return total_params, trainable_params, local_sq_norm
 
 
 @contextmanager
@@ -146,6 +148,26 @@ def resolve_trust_remote_code(pretrained_model_name_or_path):
         return False
     # pretrained_model_name_or_path can be something like nvidia/NVIDIA-Nemotron-Nano-9B-v2
     return not os.path.isdir(pretrained_model_name_or_path) and pretrained_model_name_or_path.startswith("nvidia/")
+
+
+def count_model_parameters(model: nn.Module) -> tuple[int, int]:
+    """Count total and trainable parameters. Safe to call on meta-device models.
+
+    Args:
+        model: Model to analyze
+
+    Returns:
+        trainable_params: int
+        total_params: int
+    """
+    total_params = 0
+    trainable_params = 0
+    for p in model.parameters():
+        n = _get_logical_numel(p)
+        total_params += n
+        if p.requires_grad:
+            trainable_params += n
+    return trainable_params, total_params
 
 
 @torch.no_grad()
