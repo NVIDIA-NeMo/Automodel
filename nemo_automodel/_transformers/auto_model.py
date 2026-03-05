@@ -729,7 +729,7 @@ class NeMoAutoModelEncoder:
         pooling: str = "avg",
         l2_normalize: bool = True,
         task: str = "embedding",
-        attn_implementation: str = "flash_attention_2",
+        attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
         sdpa_method: Optional[List[SDPBackend]] = None,
@@ -745,8 +745,37 @@ class NeMoAutoModelEncoder:
     ) -> PreTrainedModel:
         """Load an encoder model with infrastructure (FSDP, PEFT, kernel patching, etc.).
 
-        Builds via ``EncoderModel.build()``, then applies infrastructure through
-        ``apply_model_infrastructure()``. Retries with degraded kernel settings on failure.
+        This method builds an encoder using EncoderModel.build(), applies kernel
+        patching, and then applies all infrastructure (FSDP, checkpointing, etc.)
+        through apply_model_infrastructure().
+
+        Args:
+            pretrained_model_name_or_path: Path to pretrained model or model identifier.
+            pooling: Pooling strategy ('avg', 'cls', 'last', etc.).
+            l2_normalize: Whether to L2 normalize embeddings.
+            task: Task type for the encoder model (e.g., 'embedding').
+            attn_implementation: Attention implementation to use (e.g.,
+                ``"flash_attention_2"``, ``"sdpa"``, ``"eager"``).
+                Defaults to ``DEFAULT_ATTN_IMPLEMENTATION``
+                (``"flash_attention_2"`` when flash-attn is installed, otherwise ``"sdpa"``).
+            use_liger_kernel: Whether to apply Liger kernel optimizations.
+            use_sdpa_patching: Whether to apply SDPA patching.
+            sdpa_method: SDPA backend methods to use.
+            torch_dtype: Data type passed to the underlying model initialization.
+            device_mesh: Pre-created device mesh for distributed training.
+            moe_mesh: Device mesh for expert parallelism (FSDP2 only).
+            tp_plan: Custom tensor parallel plan; overrides distributed_config.tp_plan.
+            distributed_config: Strategy-specific distributed training configuration.
+            moe_config: MoE parallelizer configuration.
+            compile_config: Configuration for torch.compile.
+            peft_config: PEFT/LoRA configuration dictionary.
+            **kwargs: Additional arguments passed to EncoderModel.build.
+
+        Returns:
+            EncoderModel instance with loaded weights and all infrastructure applied.
+
+        Notes:
+            If kernel patching fails, the method retries with adjusted parameters.
         """
         from nemo_automodel._transformers.encoder import EncoderModel
 
