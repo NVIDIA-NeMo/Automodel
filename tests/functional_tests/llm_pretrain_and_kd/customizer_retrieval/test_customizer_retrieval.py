@@ -245,6 +245,7 @@ class TestCustomizerRetrieval:
         """Run training once for all tests in this class and return the
         checkpoint path.  Clean up after all tests complete."""
         ckpt = _run_training()
+        print(f"ONNX_OUTPUT_DIR: {ONNX_OUTPUT_DIR}")
         yield ckpt
         # Cleanup after all tests in the class.
         ckpt_root = Path(CHECKPOINT_DIR)
@@ -323,9 +324,9 @@ class TestCustomizerRetrieval:
         """Export the fine-tuned checkpoint to ONNX and verify the graph
         produces valid, finite, correctly-shaped embeddings."""
         import onnxruntime
+        from transformers import AutoTokenizer
 
         from nemo_automodel.components.models.llama_bidirectional.export_onnx import export_to_onnx
-        from transformers import AutoTokenizer
 
         # The recipe sets save_consolidated=true, so the checkpoint has a
         # model/consolidated/ directory with standard HF-named safetensors
@@ -350,13 +351,20 @@ class TestCustomizerRetrieval:
 
         # 1. File exists.
         assert Path(onnx_path).exists(), f"ONNX model not found at {onnx_path}"
+        print(f"ONNX model found at {onnx_path}")
 
         # 2. Tokenizer was saved alongside.
         tokenizer_dir = Path(onnx_output_dir) / "tokenizer"
         assert tokenizer_dir.exists(), f"Tokenizer dir not found at {tokenizer_dir}"
 
         # 3. Load the ONNX model in onnxruntime.
-        session = onnxruntime.InferenceSession(onnx_path)
+        session = onnxruntime.InferenceSession(onnx_path, providers=["CUDAExecutionProvider"])
+
+        active_providers = session.get_providers()
+        assert "CUDAExecutionProvider" in active_providers, (
+            f"CUDAExecutionProvider not loaded (active: {active_providers})"
+        )
+
         input_names = [inp.name for inp in session.get_inputs()]
         output_names = [out.name for out in session.get_outputs()]
 
