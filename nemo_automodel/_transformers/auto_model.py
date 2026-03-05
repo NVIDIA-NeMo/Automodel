@@ -233,7 +233,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # incompatible with FSDP2, and their custom forward doesn't compose with
         # LoRA patching. Setting dequantize=True tells transformers to convert
         # FP8 weights to bf16 during loading.
-        _hf_config = get_hf_config(pretrained_model_name_or_path_or_config, attn_implementation, **kwargs) if isinstance(pretrained_model_name_or_path_or_config, str) else pretrained_model_name_or_path_or_config
+        _hf_config = (
+            get_hf_config(pretrained_model_name_or_path_or_config, attn_implementation, **kwargs)
+            if isinstance(pretrained_model_name_or_path_or_config, str)
+            else pretrained_model_name_or_path_or_config
+        )
         _hf_native_quant_cfg = getattr(_hf_config, "quantization_config", None)
         if peft_config is not None and isinstance(pretrained_model_name_or_path_or_config, str):
             if isinstance(_hf_native_quant_cfg, dict) and _hf_native_quant_cfg.get("quant_method") == "fp8":
