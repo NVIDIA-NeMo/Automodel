@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from nemo_automodel._transformers.auto_model import NeMoAutoModelEncoder
+from nemo_automodel._transformers.auto_model import NeMoAutoModelBiEncoder
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.datasets.llm.retrieval_dataset import load_datasets
 from nemo_automodel.components.distributed.init_utils import DistInfo, initialize_distributed
@@ -243,7 +243,7 @@ class MineHardNegativesRecipe:
         }
         if self.attn_implementation is not None:
             model_kwargs["attn_implementation"] = self.attn_implementation
-        self.model = NeMoAutoModelEncoder.from_pretrained(
+        self.model = NeMoAutoModelBiEncoder.from_pretrained(
             self.model_name_or_path,
             **model_kwargs,
         )

@@ -17,12 +17,11 @@ step_scheduler:
   max_steps: 32
 
 model:
-  _target_: nemo_automodel._transformers.auto_model.NeMoAutoModelEncoder.from_pretrained
+  _target_: nemo_automodel._transformers.auto_model.NeMoAutoModelBiEncoder.from_pretrained
   pretrained_model_name_or_path: /home/TestData/automodel/llama-nemotron-embed-1b-v2/
   trust_remote_code: true
   pooling: avg
   l2_normalize: true
-  task: embedding
   use_liger_kernel: false
   use_sdpa_patching: false
   torch_dtype: bfloat16

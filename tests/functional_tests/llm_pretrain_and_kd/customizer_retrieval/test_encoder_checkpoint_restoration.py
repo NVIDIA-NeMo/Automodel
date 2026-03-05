@@ -173,7 +173,7 @@ class TestEncoderCheckpointRestoration:
         """Train encoder -> load trained model back in NeMo -> save ->
         restore with transformers -> verify state dicts match."""
 
-        from nemo_automodel._transformers.encoder import EncoderModel
+        from nemo_automodel._transformers.encoder import BiEncoderModel
         from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel
 
         # ---- Step 1: Train ------------------------------------------------
@@ -194,7 +194,7 @@ class TestEncoderCheckpointRestoration:
         lm_q = LlamaBidirectionalModel.from_pretrained(
             str(consolidated_dir), torch_dtype=torch.bfloat16
         )
-        nemo_model = EncoderModel(
+        nemo_model = BiEncoderModel(
             lm_q=lm_q,
             pooling="avg",
             l2_normalize=True,
@@ -234,7 +234,7 @@ class TestEncoderCheckpointRestoration:
         weights restored by transformers + LoRA weights by safetensors."""
 
         from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
-        from nemo_automodel._transformers.encoder import EncoderModel
+        from nemo_automodel._transformers.encoder import BiEncoderModel
         from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel
 
         # ---- Step 1: Train with PEFT -------------------------------------
@@ -255,7 +255,7 @@ class TestEncoderCheckpointRestoration:
         lm_q = LlamaBidirectionalModel.from_pretrained(
             BASE_MODEL_PATH, torch_dtype=torch.bfloat16
         )
-        nemo_model = EncoderModel(
+        nemo_model = BiEncoderModel(
             lm_q=lm_q,
             pooling="avg",
             l2_normalize=True,

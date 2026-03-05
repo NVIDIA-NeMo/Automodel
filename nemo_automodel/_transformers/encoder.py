@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generic Encoder Model for embedding and retrieval tasks."""
+"""Encoder models for biencoder and crossencoder tasks."""
 
 import inspect
 import os
@@ -71,7 +71,7 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
 # HuggingFace model_type -> task -> bidirectional architecture class name in ModelRegistry
 _LLAMA_TASKS = {
     "embedding": "LlamaBidirectionalModel",
-    "classification": "LlamaBidirectionalForSequenceClassification",
+    "score": "LlamaBidirectionalForSequenceClassification",
 }
 SUPPORTED_BACKBONES = {
     "llama": _LLAMA_TASKS,
@@ -80,20 +80,13 @@ SUPPORTED_BACKBONES = {
 
 
 class EncoderModel(nn.Module):
-    """Encoder model that produces embeddings using a bidirectional backbone."""
+    """Base encoder model with shared backbone loading and saving logic."""
 
-    def __init__(
-        self,
-        lm_q: PreTrainedModel,
-        pooling: str = "avg",
-        l2_normalize: bool = True,
-        task: str = "embedding",
-    ):
+    _TASK = None
+
+    def __init__(self, lm_q: PreTrainedModel):
         super().__init__()
         self.lm_q = lm_q
-        self.pooling = pooling
-        self.l2_normalize = l2_normalize
-        self.task = task
         self.config = self.lm_q.config
 
         # HuggingFace consolidated checkpoint compatibility
@@ -107,11 +100,97 @@ class EncoderModel(nn.Module):
         }
 
     def forward(self, input_dict: dict = None, **kwargs) -> Optional[torch.Tensor]:
-        """Forward pass -- going through __call__ ensures FSDP2 unshard hooks fire."""
-        if self.task == "classification":
-            inputs = input_dict if input_dict is not None else kwargs
-            return self.lm_q(**inputs, return_dict=True)
-        return self.encode(input_dict)
+        """Forward pass -- subclasses must implement."""
+        raise NotImplementedError
+
+    @classmethod
+    def build(
+        cls,
+        model_name_or_path: str,
+        task: str = None,
+        pooling: str = "avg",
+        l2_normalize: bool = True,
+        trust_remote_code: bool = False,
+        **hf_kwargs,
+    ):
+        """Build encoder model from a pretrained backbone."""
+        effective_task = cls._TASK if cls._TASK is not None else task
+        if effective_task is None:
+            raise ValueError("task must be specified when calling build() on EncoderModel directly")
+
+        # Resolve to correct subclass if called on base
+        if cls is EncoderModel:
+            _SUBCLASS_MAP = {"embedding": BiEncoderModel, "score": CrossEncoderModel}
+            target_cls = _SUBCLASS_MAP.get(effective_task)
+            if target_cls is None:
+                raise ValueError(f"Unknown task '{effective_task}'. Available: {list(_SUBCLASS_MAP)}")
+        else:
+            target_cls = cls
+
+        logger.info(f"Building EncoderModel from {model_name_or_path}")
+
+        config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+        model_type = getattr(config, "model_type", "")
+
+        task_map = SUPPORTED_BACKBONES.get(model_type.lower())
+        if task_map is None:
+            raise ValueError(
+                f"Unsupported model type '{model_type}' for encoder. "
+                f"Supported types: {', '.join(SUPPORTED_BACKBONES)}."
+            )
+
+        arch_name = task_map.get(effective_task)
+        if arch_name is None:
+            raise ValueError(
+                f"Unsupported task '{effective_task}' for model type '{model_type}'. "
+                f"Available tasks: {', '.join(task_map)}."
+            )
+
+        if arch_name not in ModelRegistry.model_arch_name_to_cls:
+            raise ValueError(f"Model class '{arch_name}' not found in ModelRegistry.")
+        BidirectionalModelClass = ModelRegistry.model_arch_name_to_cls[arch_name]
+        logger.info(f"Using {arch_name} from registry")
+
+        lm_q = BidirectionalModelClass.from_pretrained(
+            model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
+        )
+
+        # Subclass-specific construction
+        if issubclass(target_cls, BiEncoderModel):
+            return target_cls(lm_q=lm_q, pooling=pooling, l2_normalize=l2_normalize)
+        return target_cls(lm_q=lm_q)
+
+    def save_pretrained(self, save_directory: str, **kwargs):
+        """Save model to output directory.
+
+        If ``checkpointer`` is in kwargs, delegates to Checkpointer.save_model
+        for distributed/FSDP-safe saving. Otherwise falls back to HF-native save.
+        """
+        checkpointer = kwargs.get("checkpointer", None)
+        if checkpointer is not None:
+            checkpointer.save_model(
+                model=self,
+                weights_path=save_directory,
+                peft_config=kwargs.get("peft_config", None),
+                tokenizer=kwargs.get("tokenizer", None),
+            )
+
+            return
+
+        logger.info(f"Saving EncoderModel to {save_directory}")
+
+        self.lm_q.save_pretrained(save_directory)
+
+
+class BiEncoderModel(EncoderModel):
+    """Bi-encoder model that produces embeddings using a bidirectional backbone."""
+
+    _TASK = "embedding"
+
+    def __init__(self, lm_q: PreTrainedModel, pooling: str = "avg", l2_normalize: bool = True):
+        super().__init__(lm_q)
+        self.pooling = pooling
+        self.l2_normalize = l2_normalize
 
     def encode(self, input_dict: dict) -> Optional[torch.Tensor]:
         """Encode inputs and return pooled embeddings.
@@ -149,71 +228,17 @@ class EncoderModel(nn.Module):
 
         return embeds.contiguous()
 
-    @classmethod
-    def build(
-        cls,
-        model_name_or_path: str,
-        pooling: str = "avg",
-        l2_normalize: bool = True,
-        trust_remote_code: bool = False,
-        task: str = "embedding",
-        **hf_kwargs,
-    ):
-        """Build encoder model from a pretrained backbone."""
+    def forward(self, input_dict: dict = None, **kwargs) -> Optional[torch.Tensor]:
+        """Forward pass -- going through __call__ ensures FSDP2 unshard hooks fire."""
+        return self.encode(input_dict)
 
-        logger.info(f"Building EncoderModel from {model_name_or_path}")
 
-        config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
-        model_type = getattr(config, "model_type", "")
+class CrossEncoderModel(EncoderModel):
+    """Cross-encoder model for scoring/classification tasks."""
 
-        task_map = SUPPORTED_BACKBONES.get(model_type.lower())
-        if task_map is None:
-            raise ValueError(
-                f"Unsupported model type '{model_type}' for encoder. "
-                f"Supported types: {', '.join(SUPPORTED_BACKBONES)}."
-            )
+    _TASK = "score"
 
-        arch_name = task_map.get(task)
-        if arch_name is None:
-            raise ValueError(
-                f"Unsupported task '{task}' for model type '{model_type}'. "
-                f"Available tasks: {', '.join(task_map)}."
-            )
-
-        if arch_name not in ModelRegistry.model_arch_name_to_cls:
-            raise ValueError(f"Model class '{arch_name}' not found in ModelRegistry.")
-        BidirectionalModelClass = ModelRegistry.model_arch_name_to_cls[arch_name]
-        logger.info(f"Using {arch_name} from registry")
-
-        lm_q = BidirectionalModelClass.from_pretrained(
-            model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
-        )
-
-        model = cls(
-            lm_q=lm_q,
-            pooling=pooling,
-            l2_normalize=l2_normalize,
-            task=task,
-        )
-        return model
-
-    def save_pretrained(self, save_directory: str, **kwargs):
-        """Save model to output directory.
-
-        If ``checkpointer`` is in kwargs, delegates to Checkpointer.save_model
-        for distributed/FSDP-safe saving. Otherwise falls back to HF-native save.
-        """
-        checkpointer = kwargs.get("checkpointer", None)
-        if checkpointer is not None:
-            checkpointer.save_model(
-                model=self,
-                weights_path=save_directory,
-                peft_config=kwargs.get("peft_config", None),
-                tokenizer=kwargs.get("tokenizer", None),
-            )
-
-            return
-
-        logger.info(f"Saving EncoderModel to {save_directory}")
-
-        self.lm_q.save_pretrained(save_directory)
+    def forward(self, input_dict: dict = None, **kwargs) -> Optional[torch.Tensor]:
+        """Forward pass -- going through __call__ ensures FSDP2 unshard hooks fire."""
+        inputs = input_dict if input_dict is not None else kwargs
+        return self.lm_q(**inputs, return_dict=True)

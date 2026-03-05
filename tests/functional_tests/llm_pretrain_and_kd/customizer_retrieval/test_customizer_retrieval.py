@@ -96,10 +96,10 @@ def _run_training() -> Path:
 
 
 def _build_eval_model(device: torch.device):
-    """Build a NeMoAutoModelEncoder for evaluation."""
-    from nemo_automodel._transformers.auto_model import NeMoAutoModelEncoder
+    """Build a NeMoAutoModelBiEncoder for evaluation."""
+    from nemo_automodel._transformers.auto_model import NeMoAutoModelBiEncoder
 
-    return NeMoAutoModelEncoder.from_pretrained(
+    return NeMoAutoModelBiEncoder.from_pretrained(
         pretrained_model_name_or_path=BASE_MODEL_PATH,
         pooling="avg",
         l2_normalize=True,

@@ -19,9 +19,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 
-# Import from the new canonical locations
 from nemo_automodel._transformers.encoder import (
-    EncoderModel,
+    BiEncoderModel,
     pool,
 )
 from nemo_automodel.recipes.encoder.train_retriever_encoder import contrastive_scores_and_labels
@@ -233,7 +232,7 @@ def test_encoder_encode_and_compute_scores_and_forward(monkeypatch):
             )
 
     lm_q = NoTTIDLm(hidden=8)
-    model = EncoderModel(
+    model = BiEncoderModel(
         lm_q=lm_q, pooling="avg", l2_normalize=True
     )
     # encode removes token_type_ids and normalizes
@@ -277,7 +276,7 @@ def test_encoder_encode_and_compute_scores_and_forward(monkeypatch):
             return OnlyHiddenOutputs(hidden_states)
 
     # Test with model using NoLastLM for query encoder
-    model_no_last = EncoderModel(
+    model_no_last = BiEncoderModel(
         lm_q=NoLastLM(hidden=8), pooling="avg", l2_normalize=True
     )
     v2 = model_no_last.encode(
@@ -302,12 +301,12 @@ def test_encoder_build_and_save(tmp_path, monkeypatch):
     model_dir.mkdir()
     (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
 
-    model = EncoderModel.build(
+    model = BiEncoderModel.build(
         model_name_or_path=str(model_dir),
         pooling="avg",
         l2_normalize=True,
     )
-    assert isinstance(model, EncoderModel)
+    assert isinstance(model, BiEncoderModel)
     outdir = tmp_path / "save1"
     outdir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(outdir))
@@ -399,12 +398,12 @@ def test_encoder_build_llama_bidirec_model_type_generic_path(tmp_path, monkeypat
 
     monkeypatch.setattr(encoder_module.AutoConfig, "from_pretrained", fake_auto_config_from_pretrained)
 
-    model = EncoderModel.build(
+    model = BiEncoderModel.build(
         model_name_or_path=str(model_dir),
         pooling="avg",
         l2_normalize=True,
     )
-    assert isinstance(model, EncoderModel)
+    assert isinstance(model, BiEncoderModel)
 
 
 def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
@@ -423,7 +422,7 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
     bad_dir.mkdir()
     (bad_dir / "config.json").write_text(json.dumps({"model_type": "bert"}))
     with pytest.raises(ValueError):
-        EncoderModel.build(model_name_or_path=str(bad_dir))
+        BiEncoderModel.build(model_name_or_path=str(bad_dir))
 
     # For hub path tests, we need to mock AutoConfig.from_pretrained since the new code
     # calls it first to determine model type before using the registry
@@ -438,5 +437,5 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
     monkeypatch.setattr(encoder_module.AutoConfig, "from_pretrained", fake_auto_config_from_pretrained)
 
     # Hub path
-    m1 = EncoderModel.build(model_name_or_path="llama-tiny")
-    assert isinstance(m1, EncoderModel)
+    m1 = BiEncoderModel.build(model_name_or_path="llama-tiny")
+    assert isinstance(m1, BiEncoderModel)
