@@ -31,29 +31,29 @@ class TestEncoderStateDictAdapter:
         assert adapter._uses_model_prefix is True
 
     def test_to_hf_basic(self, adapter):
-        """Test basic conversion from encoder to HuggingFace format."""
+        """Test basic conversion from encoder to HuggingFace format (identity)."""
         encoder_state_dict = {
-            "lm_q.layer1.weight": torch.randn(10, 10),
-            "lm_q.layer2.bias": torch.randn(10),
+            "model.layer1.weight": torch.randn(10, 10),
+            "model.layer2.bias": torch.randn(10),
         }
 
         hf_state_dict = adapter.to_hf(encoder_state_dict)
 
-        # Only lm_q keys should be converted
+        # model.* keys pass through unchanged (identity mapping)
         assert "model.layer1.weight" in hf_state_dict
         assert "model.layer2.bias" in hf_state_dict
         assert len(hf_state_dict) == 2
         # Verify tensors are the same
-        assert torch.equal(hf_state_dict["model.layer1.weight"], encoder_state_dict["lm_q.layer1.weight"])
-        assert torch.equal(hf_state_dict["model.layer2.bias"], encoder_state_dict["lm_q.layer2.bias"])
+        assert torch.equal(hf_state_dict["model.layer1.weight"], encoder_state_dict["model.layer1.weight"])
+        assert torch.equal(hf_state_dict["model.layer2.bias"], encoder_state_dict["model.layer2.bias"])
 
     def test_to_hf_empty_state_dict(self, adapter):
         """Test conversion with empty state dict."""
         hf_state_dict = adapter.to_hf({})
         assert hf_state_dict == {}
 
-    def test_to_hf_no_lm_q_keys(self, adapter):
-        """Test conversion when there are no lm_q keys."""
+    def test_to_hf_no_model_keys(self, adapter):
+        """Test conversion when there are no model.* keys."""
         encoder_state_dict = {
             "other.layer.weight": torch.randn(10, 10),
         }
@@ -61,12 +61,12 @@ class TestEncoderStateDictAdapter:
         hf_state_dict = adapter.to_hf(encoder_state_dict)
         assert hf_state_dict == {}
 
-    def test_to_hf_only_lm_q_keys(self, adapter):
-        """Test conversion with only lm_q keys."""
+    def test_to_hf_only_model_keys(self, adapter):
+        """Test conversion with only model.* keys (identity)."""
         encoder_state_dict = {
-            "lm_q.embedding.weight": torch.randn(50, 768),
-            "lm_q.layer1.weight": torch.randn(768, 768),
-            "lm_q.layer1.bias": torch.randn(768),
+            "model.embedding.weight": torch.randn(50, 768),
+            "model.layer1.weight": torch.randn(768, 768),
+            "model.layer1.bias": torch.randn(768),
         }
 
         hf_state_dict = adapter.to_hf(encoder_state_dict)
@@ -77,7 +77,7 @@ class TestEncoderStateDictAdapter:
         assert "model.layer1.bias" in hf_state_dict
 
     def test_from_hf_basic(self, adapter):
-        """Test basic conversion from HuggingFace to encoder format."""
+        """Test basic conversion from HuggingFace to encoder format (identity)."""
         hf_state_dict = {
             "model.layer1.weight": torch.randn(10, 10),
             "model.layer2.bias": torch.randn(10),
@@ -85,14 +85,14 @@ class TestEncoderStateDictAdapter:
 
         encoder_state_dict = adapter.from_hf(hf_state_dict)
 
-        # Only lm_q keys should be created
-        assert "lm_q.layer1.weight" in encoder_state_dict
-        assert "lm_q.layer2.bias" in encoder_state_dict
+        # model.* keys pass through unchanged (identity mapping)
+        assert "model.layer1.weight" in encoder_state_dict
+        assert "model.layer2.bias" in encoder_state_dict
         assert len(encoder_state_dict) == 2
 
         # Verify tensors are the same
-        assert torch.equal(encoder_state_dict["lm_q.layer1.weight"], hf_state_dict["model.layer1.weight"])
-        assert torch.equal(encoder_state_dict["lm_q.layer2.bias"], hf_state_dict["model.layer2.bias"])
+        assert torch.equal(encoder_state_dict["model.layer1.weight"], hf_state_dict["model.layer1.weight"])
+        assert torch.equal(encoder_state_dict["model.layer2.bias"], hf_state_dict["model.layer2.bias"])
 
     def test_from_hf_empty_state_dict(self, adapter):
         """Test conversion with empty state dict."""
@@ -118,19 +118,19 @@ class TestEncoderStateDictAdapter:
         # device_mesh parameter should be accepted but not affect the result
         encoder_state_dict = adapter.from_hf(hf_state_dict, device_mesh=None)
 
-        assert "lm_q.layer1.weight" in encoder_state_dict
+        assert "model.layer1.weight" in encoder_state_dict
 
-    def test_convert_single_tensor_to_hf_lm_q(self, adapter):
-        """Test converting a single lm_q tensor to HF format."""
+    def test_convert_single_tensor_to_hf_model(self, adapter):
+        """Test converting a single model.* tensor to HF format (identity)."""
         tensor = torch.randn(10, 10)
-        result = adapter.convert_single_tensor_to_hf("lm_q.layer1.weight", tensor)
+        result = adapter.convert_single_tensor_to_hf("model.layer1.weight", tensor)
 
         assert len(result) == 1
         assert result[0][0] == "model.layer1.weight"
         assert torch.equal(result[0][1], tensor)
 
     def test_convert_single_tensor_to_hf_other(self, adapter):
-        """Test converting a non-lm_q tensor (should return empty list)."""
+        """Test converting a non-model tensor (should return empty list)."""
         tensor = torch.randn(10, 10)
         result = adapter.convert_single_tensor_to_hf("other.layer.weight", tensor)
 
@@ -139,13 +139,13 @@ class TestEncoderStateDictAdapter:
     def test_convert_single_tensor_to_hf_with_kwargs(self, adapter):
         """Test that convert_single_tensor_to_hf accepts kwargs."""
         tensor = torch.randn(10, 10)
-        result = adapter.convert_single_tensor_to_hf("lm_q.layer1.weight", tensor, some_kwarg="value")
+        result = adapter.convert_single_tensor_to_hf("model.layer1.weight", tensor, some_kwarg="value")
 
         assert len(result) == 1
         assert result[0][0] == "model.layer1.weight"
 
     def test_roundtrip_conversion(self, adapter):
-        """Test that converting from HF to encoder and back preserves lm_q state."""
+        """Test that converting from HF to encoder and back preserves state (identity)."""
         original_hf_state = {
             "model.embedding.weight": torch.randn(100, 768),
             "model.layer1.weight": torch.randn(768, 768),
@@ -162,14 +162,13 @@ class TestEncoderStateDictAdapter:
         for key in original_hf_state.keys():
             assert torch.equal(recovered_hf_state[key], original_hf_state[key])
 
-    def test_prefix_replacement_accuracy(self, adapter):
-        """Test that prefix replacement is done correctly with nested names."""
+    def test_prefix_preservation_with_nested_names(self, adapter):
+        """Test that model.* keys with nested 'model' substrings are handled correctly."""
         encoder_state_dict = {
-            "lm_q.model.layer.sublayer.weight": torch.randn(5, 5),
+            "model.layers.0.sublayer.weight": torch.randn(5, 5),
         }
 
         hf_state_dict = adapter.to_hf(encoder_state_dict)
 
-        # Should only replace the first occurrence of lm_q.
-        assert "model.model.layer.sublayer.weight" in hf_state_dict
-        assert "lm_q.model.layer.sublayer.weight" not in hf_state_dict
+        # Identity mapping: key passes through unchanged
+        assert "model.layers.0.sublayer.weight" in hf_state_dict

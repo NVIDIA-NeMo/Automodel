@@ -195,7 +195,7 @@ class TestEncoderCheckpointRestoration:
             str(consolidated_dir), torch_dtype=torch.bfloat16
         )
         nemo_model = BiEncoderModel(
-            lm_q=lm_q,
+            model=lm_q,
             pooling="avg",
             l2_normalize=True,
         )
@@ -217,7 +217,7 @@ class TestEncoderCheckpointRestoration:
 
             # ---- Step 5: Compare state dicts ------------------------------
             _compare_state_dicts(
-                nemo_model.lm_q.state_dict(),
+                nemo_model.model.state_dict(),
                 hf_model.state_dict(),
                 prefix_a="NeMo",
                 prefix_b="HF-transformers",
@@ -256,7 +256,7 @@ class TestEncoderCheckpointRestoration:
             BASE_MODEL_PATH, torch_dtype=torch.bfloat16
         )
         nemo_model = BiEncoderModel(
-            lm_q=lm_q,
+            model=lm_q,
             pooling="avg",
             l2_normalize=True,
         )
@@ -276,7 +276,7 @@ class TestEncoderCheckpointRestoration:
             k[len(_PREFIX_TO_STRIP):] if k.startswith(_PREFIX_TO_STRIP) else k: v
             for k, v in raw_ckpt_sd.items()
         }
-        missing, unexpected = nemo_model.lm_q.load_state_dict(ckpt_sd, strict=False)
+        missing, unexpected = nemo_model.model.load_state_dict(ckpt_sd, strict=False)
         # lora_dropout has no parameters so it won't appear in the safetensors;
         # missing keys should only be non-persistent buffers (e.g. rotary_emb)
         # and base model weights (which are already loaded from BASE_MODEL_PATH).
@@ -317,7 +317,7 @@ class TestEncoderCheckpointRestoration:
             hf_model.load_state_dict(hf_full_sd, strict=False)
 
             # ---- Step 7: Compare ALL weights (base + LoRA) ----------------
-            nemo_sd = nemo_model.lm_q.state_dict()
+            nemo_sd = nemo_model.model.state_dict()
             hf_sd = hf_model.state_dict()
 
             def _is_comparable_key(k):

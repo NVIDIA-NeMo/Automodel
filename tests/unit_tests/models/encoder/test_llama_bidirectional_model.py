@@ -231,9 +231,9 @@ def test_encoder_encode_and_compute_scores_and_forward(monkeypatch):
                 output_hidden_states=output_hidden_states,
             )
 
-    lm_q = NoTTIDLm(hidden=8)
+    lm = NoTTIDLm(hidden=8)
     model = BiEncoderModel(
-        lm_q=lm_q, pooling="avg", l2_normalize=True
+        model=lm, pooling="avg", l2_normalize=True
     )
     # encode removes token_type_ids and normalizes
     q = {
@@ -277,7 +277,7 @@ def test_encoder_encode_and_compute_scores_and_forward(monkeypatch):
 
     # Test with model using NoLastLM for query encoder
     model_no_last = BiEncoderModel(
-        lm_q=NoLastLM(hidden=8), pooling="avg", l2_normalize=True
+        model=NoLastLM(hidden=8), pooling="avg", l2_normalize=True
     )
     v2 = model_no_last.encode(
         {"input_ids": torch.ones(2, 3, dtype=torch.long), "attention_mask": torch.ones(2, 3, dtype=torch.long)},
@@ -310,7 +310,7 @@ def test_encoder_build_and_save(tmp_path, monkeypatch):
     outdir = tmp_path / "save1"
     outdir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(outdir))
-    assert any("save1" in p for p in model.lm_q.saved)
+    assert any("save1" in p for p in model.model.saved)
 
 
 def test_llama_bidirectional_forward_paths(monkeypatch):

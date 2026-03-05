@@ -571,7 +571,7 @@ def test_transform_func_inline_text_docs_no_corpus():
         ],
     }
 
-    out = rdi._transform_func(examples, num_neg_docs=2, corpus_dict={}, use_dataset_instruction=True)
+    out = rdi._retrieval_transform_func(examples, num_neg_docs=2, corpus_dict={}, use_dataset_instruction=True)
     assert out["question"] == ["Q"]
     assert out["doc_text"][0] == ["P", "N1", "N2"]
     assert len(out["doc_image"][0]) == 3
@@ -726,7 +726,7 @@ def test_load_datasets_corpus_id_format_in_inline_module(tmp_path):
 def test_transform_func_inline_error_and_num_neg_docs_zero():
     # pos_doc empty should raise (batched)
     with pytest.raises(ValueError, match="pos_doc cannot be empty"):
-        rdi._transform_func(
+        rdi._retrieval_transform_func(
             {"question": ["Q"], "corpus_id": [rdi.INLINE_CORPUS_ID], "pos_doc": [[]], "neg_doc": [[{"text": "n"}]]},
             num_neg_docs=1,
             corpus_dict={},
@@ -734,7 +734,7 @@ def test_transform_func_inline_error_and_num_neg_docs_zero():
 
     # neg_doc empty with num_neg_docs>0 should raise
     with pytest.raises(ValueError, match="neg_doc must contain at least 1 document"):
-        rdi._transform_func(
+        rdi._retrieval_transform_func(
             {
                 "question": ["Q"],
                 "corpus_id": [rdi.INLINE_CORPUS_ID],
@@ -746,7 +746,7 @@ def test_transform_func_inline_error_and_num_neg_docs_zero():
         )
 
     # num_neg_docs=0 should succeed with only positive
-    out = rdi._transform_func(
+    out = rdi._retrieval_transform_func(
         {
             "question": ["Q"],
             "corpus_id": [rdi.INLINE_CORPUS_ID],
@@ -773,7 +773,7 @@ def test_transform_func_inline_with_dataset_instruction_from_corpus():
         "pos_doc": [[{"id": "", "text": "P", "image": "", "nr_ocr": ""}]],
         "neg_doc": [[{"id": "", "text": "N", "image": "", "nr_ocr": ""}]],
     }
-    out = rdi._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, use_dataset_instruction=True)
+    out = rdi._retrieval_transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, use_dataset_instruction=True)
     assert out["query_instruction"][0] == "QI"
     assert out["passage_instruction"][0] == "PI"
 

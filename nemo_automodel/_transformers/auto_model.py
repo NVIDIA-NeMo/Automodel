@@ -837,7 +837,7 @@ class _NeMoAutoModelEncoderBase:
             return _retry(use_sdpa_patching=False)
 
         model = apply_model_infrastructure(
-            model=model,
+            model=model,  # noqa: F821
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             is_meta_device=False,
             device=device,

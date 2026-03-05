@@ -84,15 +84,15 @@ class EncoderModel(nn.Module):
 
     _TASK = None
 
-    def __init__(self, lm_q: PreTrainedModel):
+    def __init__(self, model: PreTrainedModel):
         super().__init__()
-        self.lm_q = lm_q
-        self.config = self.lm_q.config
+        self.model = model
+        self.config = self.model.config
 
         # HuggingFace consolidated checkpoint compatibility
-        self.name_or_path = os.path.dirname(inspect.getfile(type(self.lm_q)))
+        self.name_or_path = os.path.dirname(inspect.getfile(type(self.model)))
         self.state_dict_adapter = EncoderStateDictAdapter()
-        encoder_class_name = self.lm_q.__class__.__name__
+        encoder_class_name = self.model.__class__.__name__
         self.config.architectures = [encoder_class_name]
         self.config.auto_map = {
             "AutoModel": f"model.{encoder_class_name}",
@@ -135,8 +135,7 @@ class EncoderModel(nn.Module):
         task_map = SUPPORTED_BACKBONES.get(model_type.lower())
         if task_map is None:
             raise ValueError(
-                f"Unsupported model type '{model_type}' for encoder. "
-                f"Supported types: {', '.join(SUPPORTED_BACKBONES)}."
+                f"Unsupported model type '{model_type}' for encoder. Supported types: {', '.join(SUPPORTED_BACKBONES)}."
             )
 
         arch_name = task_map.get(effective_task)
@@ -151,14 +150,14 @@ class EncoderModel(nn.Module):
         BidirectionalModelClass = ModelRegistry.model_arch_name_to_cls[arch_name]
         logger.info(f"Using {arch_name} from registry")
 
-        lm_q = BidirectionalModelClass.from_pretrained(
+        backbone = BidirectionalModelClass.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
         )
 
         # Subclass-specific construction
         if issubclass(target_cls, BiEncoderModel):
-            return target_cls(lm_q=lm_q, pooling=pooling, l2_normalize=l2_normalize)
-        return target_cls(lm_q=lm_q)
+            return target_cls(model=backbone, pooling=pooling, l2_normalize=l2_normalize)
+        return target_cls(model=backbone)
 
     def save_pretrained(self, save_directory: str, **kwargs):
         """Save model to output directory.
@@ -179,7 +178,7 @@ class EncoderModel(nn.Module):
 
         logger.info(f"Saving EncoderModel to {save_directory}")
 
-        self.lm_q.save_pretrained(save_directory)
+        self.model.save_pretrained(save_directory)
 
 
 class BiEncoderModel(EncoderModel):
@@ -187,8 +186,8 @@ class BiEncoderModel(EncoderModel):
 
     _TASK = "embedding"
 
-    def __init__(self, lm_q: PreTrainedModel, pooling: str = "avg", l2_normalize: bool = True):
-        super().__init__(lm_q)
+    def __init__(self, model: PreTrainedModel, pooling: str = "avg", l2_normalize: bool = True):
+        super().__init__(model)
         self.pooling = pooling
         self.l2_normalize = l2_normalize
 
@@ -204,10 +203,10 @@ class BiEncoderModel(EncoderModel):
         if not input_dict:
             return None
 
-        if "token_type_ids" not in inspect.getfullargspec(self.lm_q.forward).args and "token_type_ids" in input_dict:
+        if "token_type_ids" not in inspect.getfullargspec(self.model.forward).args and "token_type_ids" in input_dict:
             input_dict = {k: v for k, v in input_dict.items() if k != "token_type_ids"}
 
-        outputs = self.lm_q(
+        outputs = self.model(
             **{k: v for k, v in input_dict.items() if k not in ["kd_labels"]},
             return_dict=True,
             output_hidden_states=True,
@@ -241,4 +240,4 @@ class CrossEncoderModel(EncoderModel):
     def forward(self, input_dict: dict = None, **kwargs) -> Optional[torch.Tensor]:
         """Forward pass -- going through __call__ ensures FSDP2 unshard hooks fire."""
         inputs = input_dict if input_dict is not None else kwargs
-        return self.lm_q(**inputs, return_dict=True)
+        return self.model(**inputs, return_dict=True)
