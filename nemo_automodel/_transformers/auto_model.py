@@ -105,6 +105,19 @@ if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
 logger = logging.getLogger(__name__)
 
 
+def _maybe_dequantize_fp8_for_peft(hf_native_quant_cfg, peft_config, pretrained_path):
+    """Set ``dequantize=True`` on FP8 quantization configs when PEFT is requested.
+
+    Returns True if the config was mutated, False otherwise.
+    """
+    if peft_config is not None and isinstance(pretrained_path, str):
+        if isinstance(hf_native_quant_cfg, dict) and hf_native_quant_cfg.get("quant_method") == "fp8":
+            hf_native_quant_cfg["dequantize"] = True
+            logger.info("FP8 model with PEFT: setting dequantize=True for compatibility")
+            return True
+    return False
+
+
 class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     """
     Drop-in replacement for ``_BaseAutoModelClass`` that includes custom-kernels.
@@ -239,11 +252,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             else pretrained_model_name_or_path_or_config
         )
         _hf_native_quant_cfg = getattr(_hf_config, "quantization_config", None)
-        if peft_config is not None and isinstance(pretrained_model_name_or_path_or_config, str):
-            if isinstance(_hf_native_quant_cfg, dict) and _hf_native_quant_cfg.get("quant_method") == "fp8":
-                _hf_native_quant_cfg["dequantize"] = True
-                logger.info("FP8 model with PEFT: setting dequantize=True for compatibility")
-                kwargs["config"] = _hf_config
+        if _maybe_dequantize_fp8_for_peft(_hf_native_quant_cfg, peft_config, pretrained_model_name_or_path_or_config):
+            kwargs["config"] = _hf_config
 
         # Use meta device initialization when:
         # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)

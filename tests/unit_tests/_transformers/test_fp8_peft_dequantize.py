@@ -12,51 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for FP8 model + PEFT dequantization logic in _build_model."""
+"""Tests for FP8 model + PEFT dequantization logic."""
 
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
-from nemo_automodel._transformers.model_init import get_hf_config
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _make_hf_config(quantization_config=None):
-    """Create a mock HF config with optional quantization_config."""
-    cfg = SimpleNamespace()
-    if quantization_config is not None:
-        cfg.quantization_config = quantization_config
-    return cfg
-
-
-def _run_fp8_dequantize_logic(hf_config, peft_config, pretrained_path="some-model"):
-    """
-    Replicate the FP8 dequantization logic from _build_model in isolation.
-
-    Returns the (possibly mutated) hf_config and kwargs dict.
-    """
-    kwargs = {}
-    attn_implementation = "eager"
-
-    # Replicate the logic from _build_model
-    _hf_config = hf_config
-    _hf_native_quant_cfg = getattr(_hf_config, "quantization_config", None)
-    if peft_config is not None and isinstance(pretrained_path, str):
-        if isinstance(_hf_native_quant_cfg, dict) and _hf_native_quant_cfg.get("quant_method") == "fp8":
-            _hf_native_quant_cfg["dequantize"] = True
-            kwargs["config"] = _hf_config
-
-    return _hf_config, _hf_native_quant_cfg, kwargs
+from nemo_automodel._transformers.auto_model import _maybe_dequantize_fp8_for_peft
 
 
 # ---------------------------------------------------------------------------
 # Tests: FP8 + PEFT auto-dequantize
 # ---------------------------------------------------------------------------
+
 
 class TestFP8PeftDequantize:
     """Tests for auto-dequantization of FP8 models when PEFT is requested."""
@@ -68,14 +36,12 @@ class TestFP8PeftDequantize:
             "dequantize": False,
             "activation_scheme": "static",
         }
-        hf_config = _make_hf_config(quant_cfg)
         peft_config = MagicMock()
 
-        _, quant_result, kwargs = _run_fp8_dequantize_logic(hf_config, peft_config)
+        result = _maybe_dequantize_fp8_for_peft(quant_cfg, peft_config, "some-model")
 
-        assert quant_result["dequantize"] is True
-        assert "config" in kwargs
-        assert kwargs["config"] is hf_config
+        assert result is True
+        assert quant_cfg["dequantize"] is True
 
     def test_fp8_model_without_peft_does_not_dequantize(self):
         """When peft_config is None, FP8 model should NOT be dequantized."""
@@ -83,12 +49,11 @@ class TestFP8PeftDequantize:
             "quant_method": "fp8",
             "dequantize": False,
         }
-        hf_config = _make_hf_config(quant_cfg)
 
-        _, quant_result, kwargs = _run_fp8_dequantize_logic(hf_config, peft_config=None)
+        result = _maybe_dequantize_fp8_for_peft(quant_cfg, peft_config=None, pretrained_path="some-model")
 
-        assert quant_result["dequantize"] is False
-        assert "config" not in kwargs
+        assert result is False
+        assert quant_cfg["dequantize"] is False
 
     def test_non_fp8_model_with_peft_does_not_dequantize(self):
         """When model uses non-FP8 quantization (e.g. GPTQ), should NOT set dequantize."""
@@ -96,38 +61,33 @@ class TestFP8PeftDequantize:
             "quant_method": "gptq",
             "bits": 4,
         }
-        hf_config = _make_hf_config(quant_cfg)
         peft_config = MagicMock()
 
-        _, quant_result, kwargs = _run_fp8_dequantize_logic(hf_config, peft_config)
+        result = _maybe_dequantize_fp8_for_peft(quant_cfg, peft_config, "some-model")
 
-        assert "dequantize" not in quant_result
-        assert "config" not in kwargs
+        assert result is False
+        assert "dequantize" not in quant_cfg
 
-    def test_model_without_quantization_config_with_peft(self):
-        """When model has no quantization_config at all, should be a no-op."""
-        hf_config = _make_hf_config()  # no quantization_config
+    def test_no_quantization_config_with_peft(self):
+        """When quantization_config is None, should be a no-op."""
         peft_config = MagicMock()
 
-        _, quant_result, kwargs = _run_fp8_dequantize_logic(hf_config, peft_config)
+        result = _maybe_dequantize_fp8_for_peft(None, peft_config, "some-model")
 
-        assert quant_result is None
-        assert "config" not in kwargs
+        assert result is False
 
-    def test_qlora_model_with_peft_does_not_trigger_fp8_dequantize(self):
-        """QLoRA models (BNB quantized) should NOT trigger FP8 dequantization.
-
-        QLoRA models don't have quant_method='fp8' in their HF config.
-        The BNB quantization_config is a separate user-provided parameter.
-        """
-        # QLoRA model has no quantization_config in HF config
-        hf_config = _make_hf_config()
+    def test_non_string_pretrained_path_does_not_dequantize(self):
+        """When pretrained_path is not a string (e.g. a config object), should not dequantize."""
+        quant_cfg = {
+            "quant_method": "fp8",
+            "dequantize": False,
+        }
         peft_config = MagicMock()
 
-        _, quant_result, kwargs = _run_fp8_dequantize_logic(hf_config, peft_config)
+        result = _maybe_dequantize_fp8_for_peft(quant_cfg, peft_config, pretrained_path=MagicMock())
 
-        assert quant_result is None
-        assert "config" not in kwargs
+        assert result is False
+        assert quant_cfg["dequantize"] is False
 
     def test_fp8_dequantize_preserves_other_quant_fields(self):
         """Dequantize should only add/modify 'dequantize', not touch other fields."""
@@ -138,21 +98,21 @@ class TestFP8PeftDequantize:
             "modules_to_not_convert": ["lm_head", "vision_tower"],
             "weight_block_size": None,
         }
-        hf_config = _make_hf_config(quant_cfg)
         peft_config = MagicMock()
 
-        _, quant_result, _ = _run_fp8_dequantize_logic(hf_config, peft_config)
+        _maybe_dequantize_fp8_for_peft(quant_cfg, peft_config, "some-model")
 
-        assert quant_result["dequantize"] is True
-        assert quant_result["activation_scheme"] == "static"
-        assert quant_result["modules_to_not_convert"] == ["lm_head", "vision_tower"]
-        assert quant_result["weight_block_size"] is None
-        assert quant_result["quant_method"] == "fp8"
+        assert quant_cfg["dequantize"] is True
+        assert quant_cfg["activation_scheme"] == "static"
+        assert quant_cfg["modules_to_not_convert"] == ["lm_head", "vision_tower"]
+        assert quant_cfg["weight_block_size"] is None
+        assert quant_cfg["quant_method"] == "fp8"
 
 
 # ---------------------------------------------------------------------------
 # Tests: is_meta_device with native quantization config
 # ---------------------------------------------------------------------------
+
 
 class TestMetaDeviceWithNativeQuantConfig:
     """Tests for is_meta_device logic accounting for native HF quantization config."""
