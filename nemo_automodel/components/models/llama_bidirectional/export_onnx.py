@@ -87,7 +87,7 @@ class EmbeddingModelForExport(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs["last_hidden_state"].to(torch.float32)
+        hidden_states = outputs["last_hidden_state"]
         embeddings = self.pooling(hidden_states, attention_mask)
         if self.normalize:
             embeddings = F.normalize(embeddings, p=2, dim=1)
