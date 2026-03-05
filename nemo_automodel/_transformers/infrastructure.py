@@ -499,7 +499,7 @@ def apply_model_infrastructure(
     if autopipeline is None:
         # Ensure model is on the correct device; AutoPipeline takes care of it internally
         try:
-            model.to(device)
+            model.to(device, non_blocking=True)
         except NotImplementedError as e:
             if "Cannot copy out of meta tensor" in str(e):
                 logger.warning("model.to(device) failed (meta tensors); using model.to_empty(device=device) instead.")
