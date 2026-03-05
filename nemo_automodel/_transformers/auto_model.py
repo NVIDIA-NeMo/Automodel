@@ -228,6 +228,19 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             )
         device = torch.cuda.current_device()
 
+        # When PEFT is requested, force dequantization of FP8-quantized models.
+        # FP8 linear modules (e.g. transformers FP8Linear) have scalar parameters
+        # incompatible with FSDP2, and their custom forward doesn't compose with
+        # LoRA patching. Setting dequantize=True tells transformers to convert
+        # FP8 weights to bf16 during loading.
+        _hf_config = get_hf_config(pretrained_model_name_or_path_or_config, attn_implementation, **kwargs) if isinstance(pretrained_model_name_or_path_or_config, str) else pretrained_model_name_or_path_or_config
+        _hf_native_quant_cfg = getattr(_hf_config, "quantization_config", None)
+        if peft_config is not None and isinstance(pretrained_model_name_or_path_or_config, str):
+            if isinstance(_hf_native_quant_cfg, dict) and _hf_native_quant_cfg.get("quant_method") == "fp8":
+                _hf_native_quant_cfg["dequantize"] = True
+                logger.info("FP8 model with PEFT: setting dequantize=True for compatibility")
+                kwargs["config"] = _hf_config
+
         # Use meta device initialization when:
         # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)
         # - AND either multi-GPU (world_size > 1) or single-GPU custom model (not HF)
@@ -236,7 +249,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             [
                 not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)),
                 get_world_size_safe() > 1 or not is_hf_model,
-                quantization_config is None,
+                quantization_config is None and _hf_native_quant_cfg is None,
             ]
         )
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
