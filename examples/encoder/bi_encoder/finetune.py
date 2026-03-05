@@ -19,6 +19,13 @@ from nemo_automodel.recipes.encoder import TrainRetrieverEncoderRecipe
 
 
 def main(default_config_path="examples/encoder/bi_encoder/llama3_2_1b.yaml"):
+    """Main entry point for the biencoder fine-tuning recipe.
+
+    Loads the configuration, sets up the recipe, and initiates the training loop.
+
+    Args:
+        default_config_path: Path to the default configuration file
+    """
     cfg = parse_args_and_load_config(default_config_path)
     recipe = TrainRetrieverEncoderRecipe(cfg)
     recipe.setup()

@@ -36,6 +36,19 @@ from nemo_automodel.recipes.encoder import MineHardNegativesRecipe
 
 
 def main(default_config_path="examples/encoder/data_utils/mining_config.yaml"):
+    """Main entry point for hard negative mining.
+
+    Loads the configuration, sets up the recipe, and runs the mining pipeline.
+
+    The model is loaded directly from --mining.model_name_or_path, so a full
+    model architecture config is not required. The default config file only
+    contains mining parameters and dist_env settings.
+
+    Args:
+        default_config_path: Path to config file with mining parameters.
+                            The model architecture is not specified here -
+                            it's loaded directly from model_name_or_path.
+    """
     cfg = parse_args_and_load_config(default_config_path)
     recipe = MineHardNegativesRecipe(cfg)
     recipe.setup()
