@@ -109,7 +109,7 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
         if p.requires_grad:
             trainable_params += n
         try:
-            local_sq_norm += p.detach().float().norm(2) ** 2
+            local_sq_norm += p.detach().norm(2) ** 2
         except Exception:
             pass
     return total_params, trainable_params, local_sq_norm.item()
