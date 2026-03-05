@@ -23,7 +23,10 @@ from nemo_automodel.components.models.llama_bidirectional.model import (
 )
 
 try:
-    AutoConfig.register("llama_bidirec", LlamaBidirectionalConfig)
+    AutoConfig.register(LlamaBidirectionalConfig.model_type, LlamaBidirectionalConfig)
+except ValueError:
+    pass
+try:
     AutoModel.register(LlamaBidirectionalConfig, LlamaBidirectionalModel)
 except ValueError:
     pass

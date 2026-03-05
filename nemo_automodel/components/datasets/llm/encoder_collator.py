@@ -251,22 +251,30 @@ class CrossEncoderCollator(DataCollatorWithPadding):
     def __call__(self, features: List[Dict[str, Any]]) -> "BatchEncoding":
         query_examples = [x["question"] for x in features]
         doc_examples = [x["doc_text"] for x in features]
+        num_labels = features[0].get("num_labels") if features else None
 
         def format_text(q, p):
             return f"question:{q} \n \n passage:{p}"
 
         examples = [format_text(q, d) for q, d in zip(query_examples, doc_examples)]
 
-        batch_dict = self.tokenizer(
+        # Tokenize without tensors first (so NeMoAutoTokenizer BOS/EOS insertion works on lists),
+        # then pad and convert to tensors in a separate step.
+        encodings = self.tokenizer(
             examples,
             max_length=self.rerank_max_length,
-            padding=True,
+            padding=PaddingStrategy.DO_NOT_PAD,
             truncation=True,
+        )
+        tok_features = [{k: encodings[k][i] for k in encodings} for i in range(len(examples))]
+        batch_dict = self.tokenizer.pad(
+            tok_features,
+            padding=True,
             pad_to_multiple_of=self.pad_to_multiple_of,
             return_tensors=self.return_tensors,
         )
 
-        if "num_labels" in features[0]:
-            batch_dict["labels"] = torch.zeros(features[0]["num_labels"], dtype=torch.long)
+        if num_labels is not None:
+            batch_dict["labels"] = torch.zeros(num_labels, dtype=torch.long)
 
         return batch_dict

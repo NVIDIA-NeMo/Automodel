@@ -21,7 +21,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig, PreTrainedModel
+from transformers import AutoConfig, AutoModel, PreTrainedModel
 from transformers.utils import logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
@@ -77,6 +77,30 @@ SUPPORTED_BACKBONES = {
     "llama": _LLAMA_TASKS,
     "llama_bidirec": _LLAMA_TASKS,
 }
+
+
+def _register_bidirectional_models():
+    """Register bidirectional models with HuggingFace Auto classes.
+
+    This is needed so that AutoModel.from_config(LlamaBidirectionalConfig)
+    works inside LlamaForSequenceClassification.__init__.
+    """
+    from nemo_automodel.components.models.llama_bidirectional.model import (
+        LlamaBidirectionalConfig,
+        LlamaBidirectionalModel,
+    )
+
+    try:
+        AutoConfig.register(LlamaBidirectionalConfig.model_type, LlamaBidirectionalConfig)
+    except ValueError:
+        pass  # Already registered
+    try:
+        AutoModel.register(LlamaBidirectionalConfig, LlamaBidirectionalModel)
+    except ValueError:
+        pass  # Already registered
+
+
+_register_bidirectional_models()
 
 
 class EncoderModel(nn.Module):
@@ -240,4 +264,5 @@ class CrossEncoderModel(EncoderModel):
     def forward(self, input_dict: dict = None, **kwargs) -> Optional[torch.Tensor]:
         """Forward pass -- going through __call__ ensures FSDP2 unshard hooks fire."""
         inputs = input_dict if input_dict is not None else kwargs
-        return self.model(**inputs, return_dict=True)
+        inputs.setdefault("return_dict", True)
+        return self.model(**inputs)

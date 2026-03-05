@@ -287,12 +287,13 @@ def _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_i
     return result
 
 
-def _cross_encoder_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
+def flatten_biencoder_to_crossencoder(data: dict) -> dict:
+    """Flatten grouped biencoder output into cross-encoder format.
+
+    Takes biencoder-style data (queries with grouped doc lists) and flattens it
+    so each query-doc pair becomes a separate entry. Used by cross-encoder transforms
+    in both retrieval_dataset.py and retrieval_dataset_inline.py.
     """
-    Transform function to convert from raw format to training format.
-    Same as _format_process_data in CrossEncoderMultiModalDatasetLoader.
-    """
-    data = _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction)
     cur_pos_neg_image_batch = data["doc_image"]
     cur_pos_neg_text_batch = data["doc_text"]
     questions = data["question"]
@@ -314,6 +315,15 @@ def _cross_encoder_transform_func(examples, num_neg_docs, corpus_dict, use_datas
         # Only necessary for training. Collator might use it to create the labels with the right shape
         "num_labels": [num_labels] * len(questions_repeated_flatten),
     }
+
+
+def _cross_encoder_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
+    """
+    Transform function to convert from raw format to training format.
+    Same as _format_process_data in CrossEncoderMultiModalDatasetLoader.
+    """
+    data = _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction)
+    return flatten_biencoder_to_crossencoder(data)
 
 
 def _create_retrieval_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):

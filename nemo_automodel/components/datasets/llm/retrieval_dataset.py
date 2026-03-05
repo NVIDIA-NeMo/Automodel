@@ -517,6 +517,17 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
     return result
 
 
+def _cross_encoder_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
+    """
+    Transform function to convert from raw format to cross-encoder training format.
+    Same as _format_process_data in CrossEncoderMultiModalDatasetLoader.
+    """
+    from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import flatten_biencoder_to_crossencoder
+
+    data = _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction)
+    return flatten_biencoder_to_crossencoder(data)
+
+
 def _create_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
     """Create transform function with specified number of negative documents."""
 
@@ -531,8 +542,23 @@ def _create_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: b
     return transform
 
 
+def _create_cross_encoder_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
+    """Create cross-encoder transform function with specified number of negative documents."""
+
+    def transform(examples):
+        return _cross_encoder_transform_func(
+            examples,
+            num_neg_docs=num_neg_docs,
+            corpus_dict=corpus_dict,
+            use_dataset_instruction=use_dataset_instruction,
+        )
+
+    return transform
+
+
 def make_retrieval_dataset(
     data_dir_list: Union[List[str], str] = None,
+    model_type: str = "biencoder",
     data_type: str = "train",
     train_n_passages: int = 5,
     eval_negative_size: int = 10,
@@ -552,6 +578,7 @@ def make_retrieval_dataset(
 
     Args:
         data_dir_list: Path(s) to JSON file(s) or ``hf://`` URIs.
+        model_type: "biencoder" (default) or "crossencoder"
         data_type: Type of data ("train" or "eval")
         train_n_passages: Number of passages for training (1 positive + n-1 negatives)
         eval_negative_size: Number of negative documents for evaluation
@@ -577,6 +604,10 @@ def make_retrieval_dataset(
         Tokenization should be handled by a collator (e.g., RetrievalEncoderCollator)
         which is more efficient for batch padding and supports dynamic processing.
     """
+
+    _VALID_MODEL_TYPES = ("biencoder", "crossencoder")
+    if model_type not in _VALID_MODEL_TYPES:
+        raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
 
     if data_dir_list is None:
         raise ValueError("data_dir_list is required")
@@ -610,6 +641,11 @@ def make_retrieval_dataset(
 
     logging.info(f"Loaded dataset with {len(dataset)} examples")
 
+    if model_type == "crossencoder":
+        transform_factory = _create_cross_encoder_transform_func
+    else:
+        transform_factory = _create_transform_func
+
     # Apply same processing as _get_processed_dataset
     if data_type == "train":
         if max_train_samples is not None:
@@ -621,11 +657,11 @@ def make_retrieval_dataset(
 
         # Set transform for training (train_n_passages - 1 negatives)
         negative_size = train_n_passages - 1
-        dataset.set_transform(_create_transform_func(negative_size, corpus_dict, use_dataset_instruction))
+        dataset.set_transform(transform_factory(negative_size, corpus_dict, use_dataset_instruction))
 
     elif data_type == "eval":
         # Set transform for evaluation
-        dataset.set_transform(_create_transform_func(eval_negative_size, corpus_dict, use_dataset_instruction))
+        dataset.set_transform(transform_factory(eval_negative_size, corpus_dict, use_dataset_instruction))
 
     else:
         raise ValueError(f"Invalid data type: {data_type}")
