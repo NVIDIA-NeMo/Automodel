@@ -250,6 +250,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
         # Base model
         self.model = NemotronV3Model(config, backend=self.backend)
+        self.output_hidden_states = config.to_dict().get("output_hidden_states", False)
 
         # LM head
         dtype = get_dtype(config.torch_dtype, torch.bfloat16)
@@ -367,7 +368,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             loss=loss,
             logits=logits,
             past_key_values=past_key_values if use_cache else None,
-            hidden_states=None,
+            hidden_states=hidden_states if self.output_hidden_states else None,
             attentions=None,
         )
 
