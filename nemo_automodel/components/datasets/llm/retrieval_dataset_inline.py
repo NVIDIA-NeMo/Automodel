@@ -346,7 +346,7 @@ def _create_cross_encoder_transform_func(num_neg_docs, corpus_dict, use_dataset_
 
 def make_retrieval_dataset(
     data_dir_list: Union[List[str], str],
-    model_type: str = "encoder",
+    model_type: str = "biencoder",
     data_type: str = "train",
     train_n_passages: int = 5,
     eval_negative_size: int = 10,
@@ -365,7 +365,7 @@ def make_retrieval_dataset(
 
     Args:
         data_dir_list: Path(s) to JSON file(s) containing training data
-        model_type: "encoder" (bi-encoder, default) or "cross_encoder"
+        model_type: "biencoder" (default) or "crossencoder"
         data_type: Type of data ("train" or "eval")
         train_n_passages: Number of passages for training (1 positive + n-1 negatives)
         eval_negative_size: Number of negative documents for evaluation
@@ -385,6 +385,10 @@ def make_retrieval_dataset(
         which is more efficient for batch padding and supports dynamic processing.
     """
 
+    _VALID_MODEL_TYPES = ("biencoder", "crossencoder")
+    if model_type not in _VALID_MODEL_TYPES:
+        raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
+
     logging.info(f"Loading data from {data_dir_list if isinstance(data_dir_list, str) else len(data_dir_list)} file(s)")
 
     # Load datasets using the same method as RetrievalMultiModalDatasetLoader
@@ -392,7 +396,7 @@ def make_retrieval_dataset(
 
     logging.info(f"Loaded dataset with {len(dataset)} examples")
 
-    if model_type == "cross_encoder":
+    if model_type == "crossencoder":
         transform_factory = _create_cross_encoder_transform_func
     else:
         transform_factory = _create_retrieval_transform_func

@@ -51,7 +51,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   dataset:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
-    model_type: encoder
+    model_type: biencoder
     data_dir_list:
       - hf://nvidia/embed-nemotron-dataset-v1/FEVER
       - hf://nvidia/embed-nemotron-dataset-v1/SyntheticClassificationData
@@ -75,7 +75,7 @@ dataloader:
 #   _target_: torchdata.stateful_dataloader.StatefulDataLoader
 #   dataset:
 #     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
-#     model_type: encoder
+#     model_type: biencoder
 #     data_dir_list: training_datasets/validation.json
 #     data_type: eval
 #     train_n_passages: 5

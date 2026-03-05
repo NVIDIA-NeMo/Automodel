@@ -43,7 +43,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   dataset:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
-    model_type: encoder
+    model_type: biencoder
     data_dir_list:
       - ./embed_nemotron_dataset_v1/EmotionClassification/EmotionClassification.json
       - ./embed_nemotron_dataset_v1/FEVER/FEVER.json

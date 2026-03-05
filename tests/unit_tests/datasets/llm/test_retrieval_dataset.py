@@ -1129,3 +1129,52 @@ def test_retrieval_dataset_inline_smoke(tmp_path):
     assert ex["question"] == "Q"
     assert ex["doc_text"] == ["P", "N"]
     assert ex["doc_image"] == ["", ""]
+
+
+def test_make_retrieval_dataset_model_type_biencoder(tmp_path):
+    """Explicit model_type='biencoder' produces bi-encoder format."""
+    f = tmp_path / "data.jsonl"
+    f.write_text(json.dumps({"query": "Q", "pos_doc": "P", "neg_doc": ["N"]}))
+
+    ds = rdi.make_retrieval_dataset(
+        data_dir_list=str(f),
+        model_type="biencoder",
+        data_type="train",
+        train_n_passages=2,
+        do_shuffle=False,
+    )
+    ex = ds[0]
+    assert ex["question"] == "Q"
+    assert ex["doc_text"] == ["P", "N"]
+    assert ex["doc_image"] == ["", ""]
+
+
+def test_make_retrieval_dataset_model_type_crossencoder(tmp_path):
+    """model_type='crossencoder' produces cross-encoder (flattened) format."""
+    f = tmp_path / "data.jsonl"
+    f.write_text(json.dumps({"query": "Q", "pos_doc": "P", "neg_doc": ["N"]}))
+
+    ds = rdi.make_retrieval_dataset(
+        data_dir_list=str(f),
+        model_type="crossencoder",
+        data_type="train",
+        train_n_passages=2,
+        do_shuffle=False,
+    )
+    ex = ds[0]
+    # Cross-encoder flattens: question is repeated per doc, num_labels is present
+    assert "question" in ex
+    assert "doc_text" in ex
+    assert "num_labels" in ex
+
+
+def test_make_retrieval_dataset_model_type_invalid(tmp_path):
+    """Old value 'encoder' and other invalid values raise ValueError."""
+    f = tmp_path / "data.jsonl"
+    f.write_text(json.dumps({"query": "Q", "pos_doc": "P", "neg_doc": ["N"]}))
+
+    with pytest.raises(ValueError, match="model_type must be one of"):
+        rdi.make_retrieval_dataset(data_dir_list=str(f), model_type="encoder")
+
+    with pytest.raises(ValueError, match="model_type must be one of"):
+        rdi.make_retrieval_dataset(data_dir_list=str(f), model_type="foo")

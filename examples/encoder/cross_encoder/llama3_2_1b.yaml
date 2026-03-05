@@ -17,7 +17,7 @@
 # Or with torchrun for multi-GPU:
 # torchrun --nproc-per-node=8 examples/encoder/cross_encoder/finetune.py --config examples/encoder/cross_encoder/llama3_2_1b.yaml
 
-seed: 42
+seed: 0
 
 train_n_passages: 5
 eval_negative_size: 4
@@ -49,21 +49,19 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   dataset:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
-    model_type: encoder
+    model_type: crossencoder
     data_dir_list:
       - hf://nvidia/embed-nemotron-dataset-v1/FEVER
       - hf://nvidia/embed-nemotron-dataset-v1/SyntheticClassificationData
     data_type: train
     train_n_passages: 5
     eval_negative_size: 4
-    seed: 42
+    seed: 0
     do_shuffle: true
   collate_fn:
-    _target_: nemo_automodel.components.datasets.llm.RetrievalEncoderCollator
-    q_max_len: 512
-    p_max_len: 512
-    query_prefix: "query:"
-    passage_prefix: "passage:"
+    _target_: nemo_automodel.components.datasets.llm.CrossEncoderCollator
+    rerank_max_length: 512
+    train_n_passages: 5
     pad_to_multiple_of: 8
   shuffle: true
   num_workers: 0
@@ -73,22 +71,19 @@ dataloader:
 #   _target_: torchdata.stateful_dataloader.StatefulDataLoader
 #   dataset:
 #     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
-#     model_type: encoder
+#     model_type: crossencoder
 #     data_dir_list: training_datasets/validation.json
 #     data_type: eval
 #     train_n_passages: 5
 #     eval_negative_size: 4
-#     seed: 42
+#     seed: 0
 #     do_shuffle: false
 #     max_train_samples: 1000
 #     train_data_select_offset: 0
 #   collate_fn:
-#     _target_: nemo_automodel.components.datasets.llm.RetrievalEncoderCollator
-#     q_max_len: 512
-#     p_max_len: 512
-#     query_prefix: "query:"
-#     passage_prefix: "passage:"
-#     padding: longest
+#     _target_: nemo_automodel.components.datasets.llm.CrossEncoderCollator
+#     rerank_max_length: 512
+#     train_n_passages: 5
 #     pad_to_multiple_of: 8
 #   batch_size: 2
 #   shuffle: false
@@ -114,7 +109,7 @@ dataloader:
 
 optimizer:
   _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
-  lr: 5.0e-6
+  lr: 3.0e-6
   weight_decay: 0.01
   adam_w_mode: true
   bias_correction: true
