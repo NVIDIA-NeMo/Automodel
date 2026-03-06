@@ -169,10 +169,7 @@ def resolve_sdpa_method(
         for name in cfg_sdpa_method:
             key = name.upper()
             if key not in _NAME_TO_BACKEND:
-                raise ValueError(
-                    f"Unknown SDPA backend '{name}'. "
-                    f"Valid values: {sorted(_NAME_TO_BACKEND.keys())}"
-                )
+                raise ValueError(f"Unknown SDPA backend '{name}'. Valid values: {sorted(_NAME_TO_BACKEND.keys())}")
             backends.append(_NAME_TO_BACKEND[key])
         return backends
 
