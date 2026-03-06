@@ -55,6 +55,7 @@ class _DummyDeviceMesh(dict):
         self["tp"] = _DummySubMesh(tp_size)
         self.mesh_dim_names = ["cp", "tp"]
 
+
 def test_build_position_ids_adds_missing():
     """If ``position_ids`` is absent it should be generated correctly."""
     batch: dict[str, Any] = {"input_ids": torch.arange(6).view(1, -1)}
@@ -80,6 +81,7 @@ def test_build_position_ids_does_not_override_existing():
 
     _cu._build_position_ids(batch, torch.device("cpu"))
     assert torch.equal(batch["position_ids"], original_pos), "position_ids should not be modified"
+
 
 def test_make_cp_batch_and_ctx_no_mesh():
     """When *no* device mesh is provided the call should be a no-op."""
@@ -112,6 +114,7 @@ def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
     def _fake_create_ctx(**kwargs):  # noqa: D401
         """Return a sentinel object so we can verify it was passed through."""
         return dummy_cp_ctx
+
     monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
 
     def _fake_get_train_ctx(enable_loss_parallel, enable_compiled_autograd, cp_ctx):  # noqa: D401
@@ -292,7 +295,8 @@ def test_make_cp_batch_for_te_basic(monkeypatch):
 
     # Mock at the module level where it's imported
     import sys
-    sys.modules['transformer_engine_torch'] = MockTex
+
+    sys.modules["transformer_engine_torch"] = MockTex
 
     monkeypatch.setattr(torch.distributed, "get_rank", mock_get_rank)
 
