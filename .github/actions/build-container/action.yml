@@ -73,11 +73,6 @@ runs:
       with:
         python-version: 3.12
 
-    - name: Get PR info
-      id: get-pr-info
-      if: startsWith(github.ref, 'refs/heads/pull-request/')
-      uses: nv-gha-runners/get-pr-info@main
-
     - name: Install Azure CLI
       shell: bash
       run: |
