@@ -227,6 +227,29 @@ class TestQwen3_5MoeBlock:
         assert mock_trunc.call_count == 5
         mock_norm_reset.assert_called_once()
 
+    def test_init_weights_linear_attention_norm_without_reset_parameters(
+        self, text_config_with_linear, moe_config, backend_config
+    ):
+        """When norm lacks reset_parameters (e.g. HF Qwen3_5MoeRMSNormGated), weight is set to ones."""
+        block = Qwen3_5MoeBlock(1, text_config_with_linear, moe_config, backend_config)
+
+        # Remove reset_parameters to simulate HF Qwen3_5MoeRMSNormGated
+        if hasattr(block.linear_attn.norm, "reset_parameters"):
+            delattr(type(block.linear_attn.norm), "reset_parameters")
+
+        # Scramble norm weight so we can verify it gets reset to ones
+        block.linear_attn.norm.weight.data.fill_(42.0)
+
+        with (
+            patch.object(block.input_layernorm, "reset_parameters"),
+            patch.object(block.post_attention_layernorm, "reset_parameters"),
+            patch.object(block.mlp, "init_weights"),
+            patch("torch.nn.init.trunc_normal_"),
+        ):
+            block.init_weights(torch.device("cpu"))
+
+        assert torch.allclose(block.linear_attn.norm.weight.data, torch.ones_like(block.linear_attn.norm.weight.data))
+
 
 # ---------------------------------------------------------------------------
 # TextModelBackend tests
