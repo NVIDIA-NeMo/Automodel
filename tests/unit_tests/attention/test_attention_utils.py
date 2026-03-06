@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest import mock
+
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
@@ -104,6 +107,53 @@ class TestInitializeAttnModuleAndFunc:
                 num_v_channels=64,
                 softmax_scale=0.125,
             )
+
+    def test_sdpa_late_binding_picks_up_monkey_patch(self):
+        """Test that SDPA attn_func uses late-bound lookup of F.scaled_dot_product_attention.
+
+        Context Parallelism monkey-patches F.scaled_dot_product_attention at runtime.
+        The returned attn_func must resolve the function at call time (not init time)
+        so that CP's patched version is used.
+        """
+        _, attn_func = initialize_attn_module_and_func(
+            attn_impl="sdpa",
+            num_attention_heads=8,
+            num_qk_channels=64,
+            num_v_channels=64,
+            softmax_scale=0.125,
+            attn_mask_type="causal",
+            num_gqa_groups=4,
+        )
+
+        original_sdpa = F.scaled_dot_product_attention
+        sentinel = object()
+        wrapper = mock.MagicMock(return_value=sentinel)
+
+        # Simulate CP monkey-patching F.scaled_dot_product_attention
+        F.scaled_dot_product_attention = wrapper
+        try:
+            q = torch.randn(1, 1, 4, 8)
+            k = torch.randn(1, 1, 4, 8)
+            v = torch.randn(1, 1, 4, 8)
+            result = attn_func(q, k, v)
+
+            assert result is sentinel, "attn_func should call the patched function"
+            wrapper.assert_called_once()
+            args, kwargs = wrapper.call_args
+            assert torch.equal(args[0], q)
+            assert torch.equal(args[1], k)
+            assert torch.equal(args[2], v)
+        finally:
+            F.scaled_dot_product_attention = original_sdpa
+
+        # After restoring, verify original is called again
+        original_wrapper = mock.MagicMock(wraps=original_sdpa)
+        F.scaled_dot_product_attention = original_wrapper
+        try:
+            attn_func(q, k, v)
+            original_wrapper.assert_called_once()
+        finally:
+            F.scaled_dot_product_attention = original_sdpa
 
 
 class TestPreprocessArgsAndKwargsForAttn:
