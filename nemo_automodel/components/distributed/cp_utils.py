@@ -101,7 +101,7 @@ def create_context_parallel_ctx(
     )
 
 
-def _attach_context_parallel_hooks(model: torch.nn.Module):
+def attach_context_parallel_hooks(model: torch.nn.Module):
     """Attach forward pre-hooks to self_attn modules to fix attention masks for context parallelism.
 
     Context parallelism shards Q/K/V on the sequence dimension as DTensors,
@@ -178,7 +178,7 @@ def make_cp_batch_and_ctx(
     # Remove attention_mask from the batch so the model does not attempt to
     # build a 4D causal mask (which would have mismatched shapes with
     # DTensor-sharded Q/K/V).  Each self_attn module's forward_pre_hook
-    # (registered by _attach_context_parallel_hooks) will set is_causal=True
+    # (registered by attach_context_parallel_hooks) will set is_causal=True
     # so that SDPA handles causal masking internally.
     batch.pop("attention_mask", None)
 
