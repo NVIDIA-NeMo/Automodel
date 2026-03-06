@@ -2,11 +2,15 @@
 
 """Learning rate decay and weight decay incr functions."""
 
+from __future__ import annotations
+
 import logging
 import math
-from typing import Optional
+from typing import Any, Optional, TypeVar
 
 from torch.optim.optimizer import Optimizer
+
+_T = TypeVar("_T")
 
 logger = logging.getLogger(__name__)
 
@@ -178,15 +182,15 @@ class OptimizerParamScheduler:
 
         return self.start_wd + coeff * delta_wd
 
-    def get_lr(self, param_group: dict) -> float:
+    def get_lr(self, param_group: dict[str, Any]) -> float:
         """
         Learning rate decay functions from: https://openreview.net/pdf?id=BJYwwY9ll pg. 4.
 
         Argsa:
             param_group (dict): parameter group from the optimizer.
         """
-        max_lr = param_group.get("max_lr", self.max_lr)
-        min_lr = param_group.get("min_lr", self.min_lr)
+        max_lr = float(param_group.get("max_lr", self.max_lr))
+        min_lr = float(param_group.get("min_lr", self.min_lr))
 
         # Use linear warmup for the initial part.
         if self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps:
@@ -205,7 +209,7 @@ class OptimizerParamScheduler:
             warmup_steps = max(self.lr_warmup_steps, 1)
             num_steps = max(self.num_steps, 1)
             lr = max_lr * warmup_steps**0.5 / (num_steps**0.5)
-            return max(min_lr, lr)
+            return float(max(min_lr, lr))
 
         num_steps_ = self.num_steps - self.lr_warmup_steps
         decay_steps_ = self.lr_decay_steps - self.lr_warmup_steps
@@ -220,6 +224,7 @@ class OptimizerParamScheduler:
         elif self.lr_decay_style == "cosine":
             coeff = 0.5 * (math.cos(math.pi * decay_ratio) + 1.0)
         elif self.lr_decay_style == "WSD":
+            assert self.wsd_decay_steps is not None
             wsd_anneal_start_ = self.lr_decay_steps - self.wsd_decay_steps
             if self.num_steps <= wsd_anneal_start_:
                 coeff = 1.0
@@ -255,7 +260,7 @@ class OptimizerParamScheduler:
             param_group["lr"] = new_lr * param_group.get("lr_mult", 1.0)
             param_group["weight_decay"] = new_wd * param_group.get("wd_mult", 1.0)
 
-    def state_dict(self) -> dict:
+    def state_dict(self) -> dict[str, Any]:
         """
         Return the state dict.
         """
@@ -273,13 +278,13 @@ class OptimizerParamScheduler:
         }
         return state_dict
 
-    def _check_and_set(self, cls_value: float, sd_value: float, name: str) -> float:
+    def _check_and_set(self, cls_value: _T, sd_value: _T, name: str) -> _T:
         """
         Auxiliary function for checking the values in the checkpoint and setting them.
 
         Args:
-            cls_value (float): class value
-            sd_value (float): checkpoint value
+            cls_value: class value
+            sd_value: checkpoint value
             name (str): name of the parameter
         """
         if self.override_opt_param_scheduler:
@@ -295,7 +300,7 @@ class OptimizerParamScheduler:
         logger.info("using checkpoint value {} for {}".format(sd_value, name))
         return sd_value
 
-    def load_state_dict(self, state_dict: dict) -> None:
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """
         Load the state dict.
 

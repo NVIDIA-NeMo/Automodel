@@ -48,7 +48,7 @@ from nemo_automodel.components.datasets.llm.megatron.sampler import create_megat
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks, make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import (
     initialize_distributed,
 )
@@ -136,6 +136,62 @@ def _get_num_thd_chunks(pp_enabled, cfg):
     return 1
 
 
+def resolve_sdpa_method(
+    cfg_sdpa_method: list[str] | None = None,
+    device_mesh=None,
+    activation_checkpointing: bool = False,
+) -> list["SDPBackend"] | None:  # noqa: F821
+    """Resolve SDPA backend list from config strings or runtime constraints.
+
+    When *cfg_sdpa_method* is provided (e.g. from YAML), its string values are
+    converted to :class:`torch.nn.attention.SDPBackend` enum members.  When it
+    is ``None``, automatic defaults are applied based on context parallelism and
+    activation checkpointing settings.
+
+    Valid string values (case-insensitive): ``flash_attention``,
+    ``efficient_attention``, ``math``, ``cudnn_attention``.
+
+    Args:
+        cfg_sdpa_method: Explicit list of backend name strings from config, or
+            ``None`` to use automatic defaults.
+        device_mesh: Device mesh for distributed training.
+        activation_checkpointing: Whether activation checkpointing is enabled.
+
+    Returns:
+        Ordered list of :class:`SDPBackend` members, or ``None`` to use
+        PyTorch's default selection.
+    """
+    from torch.nn.attention import SDPBackend
+
+    _NAME_TO_BACKEND = dict(SDPBackend.__members__)
+
+    if cfg_sdpa_method is not None:
+        backends = []
+        for name in cfg_sdpa_method:
+            key = name.upper()
+            if key not in _NAME_TO_BACKEND:
+                raise ValueError(f"Unknown SDPA backend '{name}'. Valid values: {sorted(_NAME_TO_BACKEND.keys())}")
+            backends.append(_NAME_TO_BACKEND[key])
+        return backends
+
+    # Auto-select based on runtime constraints
+    cp_size = 1
+    if device_mesh is not None and "cp" in device_mesh.mesh_dim_names:
+        cp_size = device_mesh["cp"].size()
+
+    if cp_size > 1:
+        # CP with DTensor only supports flash and efficient backends;
+        # MATH is not compatible with DTensor.
+        return [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+    elif activation_checkpointing:
+        # For activation checkpointing, disable cudnn SDPA backend because
+        # it may not be selected during recomputation, causing:
+        # "Recomputed values have different metadata than during forward pass."
+        return [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+
+    return None
+
+
 def build_model(
     cfg_model,
     cfg_peft,
@@ -152,6 +208,7 @@ def build_model(
     cfg_moe=None,
     activation_checkpointing=False,
     unfreeze_modules: list[str] | None = None,
+    cfg_sdpa_method: list[str] | None = None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model.
 
@@ -171,7 +228,12 @@ def build_model(
         cfg_moe: MoEParallelizerConfig instance, or ConfigNode to be converted.
         activation_checkpointing: Whether to enable activation checkpointing.
         unfreeze_modules: List of module names/substrings to unfreeze.
+        cfg_sdpa_method: Explicit list of SDPA backend name strings (e.g.
+            ``["flash_attention", "efficient_attention"]``), or ``None`` to
+            auto-select based on CP / activation checkpointing.
     """
+    sdpa_method = resolve_sdpa_method(cfg_sdpa_method, device_mesh, activation_checkpointing)
+
     with ScopedRNG(seed=seed, ranked=True):
         kwargs = {
             "has_packed_sequence": has_packed_sequence,
@@ -180,6 +242,7 @@ def build_model(
             "moe_mesh": moe_mesh,
             "distributed_config": distributed_config,
             "pipeline_config": pipeline_config,
+            "sdpa_method": sdpa_method,
         }
 
         if cfg_qat is not None and cfg_qat.get("enabled", False):
@@ -972,6 +1035,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_qat=self.cfg.get("qat", None),
             cfg_moe=self.dist_setup.moe_config,
             activation_checkpointing=self.dist_setup.activation_checkpointing,
+            cfg_sdpa_method=self.cfg.get("sdpa_method", None),
         )
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 
@@ -996,6 +1060,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 autonvtx.patch(model, name=model.__class__.__name__)
             self.model_parts = [model]
             self.pp = None
+
+        # Attach CP attention-mask hooks for dense (non-TE) context parallelism
+        if self.dist_setup.cp_size > 1 and not _uses_te_dot_product_attention(self.cfg.model):
+            for mp in self.model_parts:
+                attach_context_parallel_hooks(mp)
 
         # Extract TE FP8 config from model backend (set after model construction)
         self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
