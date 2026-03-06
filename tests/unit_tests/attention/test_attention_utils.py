@@ -225,7 +225,13 @@ class TestPreprocessArgsAndKwargsForAttn:
         v_gpu = self.v.to(device)
 
         q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
-            q_gpu, k_gpu, v_gpu, attention_mask=None, attn_impl="te", cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv
+            q_gpu,
+            k_gpu,
+            v_gpu,
+            attention_mask=None,
+            attn_impl="te",
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
         )
 
         assert "cu_seqlens_q" in attn_kwargs
