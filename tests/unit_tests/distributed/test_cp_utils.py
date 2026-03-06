@@ -166,7 +166,7 @@ def test_make_cp_batch_and_ctx_pops_attention_mask_when_cp_enabled(monkeypatch):
 
 
 # ============================================================================
-# Tests for _attach_context_parallel_hooks
+# Tests for attach_context_parallel_hooks
 # ============================================================================
 
 
@@ -203,7 +203,7 @@ def test_attach_context_parallel_hooks_registers_on_self_attn():
         name: len(mod._forward_pre_hooks) for name, mod in model.named_modules() if name.endswith("self_attn")
     }
 
-    _cu._attach_context_parallel_hooks(model)
+    _cu.attach_context_parallel_hooks(model)
 
     for name, mod in model.named_modules():
         if name.endswith("self_attn"):
@@ -213,7 +213,7 @@ def test_attach_context_parallel_hooks_registers_on_self_attn():
 def test_attach_context_parallel_hooks_strips_attention_mask():
     """The hook should replace attention_mask with None and set is_causal=True."""
     model = _FakeModel()
-    _cu._attach_context_parallel_hooks(model)
+    _cu.attach_context_parallel_hooks(model)
 
     dummy_input = torch.randn(1, 4, 8)
     attn_mask = torch.ones(1, 1, 4, 4)
@@ -228,7 +228,7 @@ def test_attach_context_parallel_hooks_strips_attention_mask():
 def test_attach_context_parallel_hooks_no_mask_passthrough():
     """When no attention_mask kwarg is passed, the hook should be a no-op."""
     model = _FakeModel()
-    _cu._attach_context_parallel_hooks(model)
+    _cu.attach_context_parallel_hooks(model)
 
     dummy_input = torch.randn(1, 4, 8)
     model.layers[0].self_attn(dummy_input, some_other_kwarg=42)
@@ -242,7 +242,7 @@ def test_attach_context_parallel_hooks_no_mask_passthrough():
 def test_attach_context_parallel_hooks_skips_non_self_attn():
     """Modules not ending with 'self_attn' should have no hooks added."""
     model = _FakeModel()
-    _cu._attach_context_parallel_hooks(model)
+    _cu.attach_context_parallel_hooks(model)
 
     # The top-level model and the layers list should not get hooks
     assert len(model._forward_pre_hooks) == 0
