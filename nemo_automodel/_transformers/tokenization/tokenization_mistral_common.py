@@ -1906,6 +1906,17 @@ class MistralCommonBackend(PushToHubMixin):
                 force_download=force_download,
                 local_files_only=local_files_only,
             )
+            tokenizer = cls(
+                tokenizer_path=tokenizer_path,
+                mode=mode,
+                model_max_length=model_max_length,
+                padding_side=padding_side,
+                truncation_side=truncation_side,
+                model_input_names=model_input_names,
+                clean_up_tokenization_spaces=clean_up_tokenization_spaces,
+            )
+            tokenizer._source_dir = Path(tokenizer_path).parent
+            return tokenizer
         else:
             valid_tokenizer_files = []
             tokenizer_file: str
@@ -1937,7 +1948,7 @@ class MistralCommonBackend(PushToHubMixin):
 
             tokenizer_path = os.path.join(pretrained_model_name_or_path, tokenizer_file)
 
-        return cls(
+        tokenizer = cls(
             tokenizer_path=tokenizer_path,
             mode=mode,
             model_max_length=model_max_length,
@@ -1946,6 +1957,25 @@ class MistralCommonBackend(PushToHubMixin):
             model_input_names=model_input_names,
             clean_up_tokenization_spaces=clean_up_tokenization_spaces,
         )
+        tokenizer._source_dir = Path(pretrained_model_name_or_path)
+        return tokenizer
+
+    # File patterns to preserve from the source directory for v4 compatibility.
+    # See the module-level comment in ``nemo_auto_tokenizer.py`` for details.
+    _TOKENIZER_FILE_PATTERNS = (
+        "tokenizer*",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "vocab.*",
+        "merges.txt",
+        "spiece.model",
+    )
+
+    @staticmethod
+    def _is_tokenizer_file(filename: str) -> bool:
+        import fnmatch
+
+        return any(fnmatch.fnmatch(filename, pat) for pat in MistralCommonBackend._TOKENIZER_FILE_PATTERNS)
 
     def save_pretrained(
         self,
@@ -1993,6 +2023,19 @@ class MistralCommonBackend(PushToHubMixin):
 
         shutil.copy(self._tokenizer_path, save_directory)
 
+        saved_files = [str(save_directory / self._tokenizer_path.name)]
+
+        source_dir = getattr(self, "_source_dir", None)
+        if source_dir is not None:
+            for fname in os.listdir(str(source_dir)):
+                src = os.path.join(str(source_dir), fname)
+                dst = save_directory / fname
+                if not os.path.isfile(src) or not self._is_tokenizer_file(fname):
+                    continue
+                if not dst.exists():
+                    shutil.copy2(src, str(dst))
+                    saved_files.append(str(dst))
+
         if push_to_hub:
             repo_id = repo_id or str(save_directory).split(os.path.sep)[-1]
             repo_id = create_repo(repo_id, token=token, private=private, exist_ok=True).repo_id
@@ -2006,7 +2049,7 @@ class MistralCommonBackend(PushToHubMixin):
                 token=token,
             )
 
-        return (str(save_directory / self._tokenizer_path.name),)
+        return tuple(saved_files)
 
     @staticmethod
     def _get_validation_mode(mode: Union[str, ValidationMode]) -> ValidationMode:
