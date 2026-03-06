@@ -45,10 +45,26 @@ env:
 runs:
   using: "composite"
   steps:
+    - name: Get merge commit sha
+      shell: bash -x -e -u -o pipefail {0}
+      id: sha
+      env:
+        IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+        IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
+      run: |
+        if [[ "$IS_PR" == "true" ]]; then
+          SHA=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
+        elif [[ "$IS_MERGE_GROUP" == "true" ]]; then
+          SHA=${{ github.event.merge_group.head_sha }}
+        else
+          SHA=${GITHUB_SHA}
+        fi
+        echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
+
     - name: Checkout
       uses: actions/checkout@v4
       with:
-        path: NeMo-Automodel
+        ref: ${{ steps.sha.outputs.main }}
 
     - name: Setup python
       uses: actions/setup-python@v5
