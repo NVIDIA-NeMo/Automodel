@@ -37,6 +37,7 @@ from nemo_automodel.recipes.llm.train_ft import (
     build_optimizer,
     build_validation_dataloader,
     compute_trust_remote_code_from_model,
+    resolve_sdpa_method,
 )
 
 
@@ -1786,3 +1787,58 @@ def test_rope_fusion_stays_false_when_already_disabled(monkeypatch):
     trainer.setup()
 
     assert cfg.model.backend.rope_fusion is False
+
+
+# ============================================================================
+# Tests for resolve_sdpa_method
+# ============================================================================
+
+
+class TestResolveSdpaMethod:
+    """Tests for resolve_sdpa_method helper."""
+
+    def test_explicit_strings_converted_to_backends(self):
+        from torch.nn.attention import SDPBackend
+
+        result = resolve_sdpa_method(["flash_attention", "math"])
+        assert result == [SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]
+
+    def test_case_insensitive(self):
+        from torch.nn.attention import SDPBackend
+
+        result = resolve_sdpa_method(["Flash_Attention", "EFFICIENT_ATTENTION"])
+        assert result == [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+
+    def test_invalid_backend_raises(self):
+        with pytest.raises(ValueError, match="Unknown SDPA backend 'bogus'"):
+            resolve_sdpa_method(["bogus"])
+
+    def test_none_with_no_constraints_returns_none(self):
+        assert resolve_sdpa_method(None) is None
+
+    def test_auto_cp_restricts_backends(self):
+        from torch.nn.attention import SDPBackend
+
+        mesh = MagicMock()
+        mesh.mesh_dim_names = ("dp", "cp")
+        mesh.__getitem__ = lambda self, key: MagicMock(size=lambda: 2) if key == "cp" else MagicMock(size=lambda: 1)
+
+        result = resolve_sdpa_method(None, device_mesh=mesh)
+        assert result == [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+
+    def test_auto_activation_checkpointing_restricts_backends(self):
+        from torch.nn.attention import SDPBackend
+
+        result = resolve_sdpa_method(None, activation_checkpointing=True)
+        assert result == [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+
+    def test_explicit_overrides_auto(self):
+        """When cfg_sdpa_method is provided, auto-selection is bypassed."""
+        from torch.nn.attention import SDPBackend
+
+        mesh = MagicMock()
+        mesh.mesh_dim_names = ("dp", "cp")
+        mesh.__getitem__ = lambda self, key: MagicMock(size=lambda: 2) if key == "cp" else MagicMock(size=lambda: 1)
+
+        result = resolve_sdpa_method(["math"], device_mesh=mesh, activation_checkpointing=True)
+        assert result == [SDPBackend.MATH]
