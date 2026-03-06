@@ -1961,11 +1961,7 @@ class MistralCommonBackend(PushToHubMixin):
         return tokenizer
 
     # File patterns to preserve from the source directory for v4 compatibility.
-    # See the module-level comment in ``nemo_auto_tokenizer.py`` for why
-    # ``config.json`` (a model config) is included: transformers v5 uses
-    # ``model_type`` from ``config.json`` to initialise the correct tokenizer
-    # backend and SentencePiece normalizer; without it the normalizer stored
-    # in ``tokenizer.json`` is silently ignored, changing whitespace encoding.
+    # See the module-level comment in ``nemo_auto_tokenizer.py`` for details.
     _TOKENIZER_FILE_PATTERNS = (
         "tokenizer*",
         "special_tokens_map.json",
@@ -1973,7 +1969,6 @@ class MistralCommonBackend(PushToHubMixin):
         "vocab.*",
         "merges.txt",
         "spiece.model",
-        "config.json",
     )
 
     @staticmethod

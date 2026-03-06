@@ -113,16 +113,12 @@ def _resolve_source_dir(pretrained_model_name_or_path, **kwargs):
 # copied verbatim into the save directory so that downstream v4 consumers see
 # exactly the same assets the original model shipped.
 #
-# NOTE: ``config.json`` is the *model* config, not a tokenizer file.  It is
-# included here as a workaround for a transformers v5 behaviour where
-# ``AutoTokenizer.from_pretrained`` uses ``config.json`` → ``model_type`` to
-# select the tokenizer backend.  For SentencePiece-based models (Llama, Phi-3,
-# Mistral, …) the backend initialisation sets up a whitespace normalizer
-# (Prepend("▁") + Replace(" ", "▁")).  Without ``config.json`` the loader
-# falls back to a generic backend that **ignores** the normalizer already
-# present in ``tokenizer.json``, producing different token IDs for whitespace
-# inputs.  Copying ``config.json`` is the pragmatic fix until upstream
-# transformers honours the normalizer stored in the tokenizer file.
+# NOTE: ``config.json`` (the *model* config) is intentionally excluded.
+# While transformers v5 uses ``model_type`` from ``config.json`` to select the
+# tokenizer backend and SentencePiece normalizer, copying it here would be
+# fragile — the user may have modified the model, making the original
+# ``config.json`` stale or incorrect.  The caller is responsible for ensuring
+# ``config.json`` is present alongside the saved tokenizer if needed.
 _TOKENIZER_FILE_PATTERNS = (
     "tokenizer*",
     "special_tokens_map.json",
@@ -130,7 +126,6 @@ _TOKENIZER_FILE_PATTERNS = (
     "vocab.*",
     "merges.txt",
     "spiece.model",
-    "config.json",
 )
 
 
