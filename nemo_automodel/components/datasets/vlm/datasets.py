@@ -166,8 +166,8 @@ def _preload_media(example, processor=None, preserve_video_metadata=False):
     When *preserve_video_metadata* is ``True``, the original video fps and
     the sampled frame indices are stored on each video content item as
     ``_video_fps`` and ``_frame_indices``.  This allows downstream code
-    (e.g. :func:`_fix_video_timestamps`) to compute accurate per-frame
-    timestamps even though the video has already been decoded to PIL frames.
+    (e.g. :func:`_build_video_metadata`) to construct ``VideoMetadata``
+    for the processor so it inserts correct timestamps.
     """
     conversation = example.get("conversation")
     if not conversation:
@@ -207,26 +207,18 @@ def _preload_media(example, processor=None, preserve_video_metadata=False):
     return example
 
 
-def _fix_video_timestamps(text, conversation, merge_size=2):
-    """Replace default-fps timestamps in *text* with values computed from preserved metadata.
+def _build_video_metadata(conversation):
+    """Build a list of ``VideoMetadata`` from preserved ``_video_fps`` / ``_frame_indices``.
 
-    ``_preload_media(preserve_video_metadata=True)`` stores ``_video_fps``
-    and ``_frame_indices`` on each video content item.  This function uses
-    that metadata to recompute the ``<X.X seconds>`` markers that
-    ``apply_chat_template(tokenize=False)`` inserted with a default fps.
+    ``_preload_media(preserve_video_metadata=True)`` stores these on each
+    video content item.  Passing the resulting metadata to the processor
+    ensures correct timestamps and prevents double frame-sampling.
 
-    The timestamp algorithm mirrors
-    ``Qwen3VLProcessor._calculate_timestamps``:
-
-    1. ``raw_ts[i] = frame_index[i] / original_fps``
-    2. Pad to ``merge_size`` alignment.
-    3. Average each group of ``merge_size`` consecutive raw timestamps.
-
-    If no video metadata is found or the number of markers doesn't match,
-    the text is returned unchanged.
+    Returns an empty list if no video metadata is found.
     """
-    # Collect preserved metadata from all video items in the conversation.
-    video_metas = []
+    from transformers.video_utils import VideoMetadata
+
+    metadata_list = []
     for msg in conversation:
         content = msg.get("content")
         if not isinstance(content, list):
@@ -236,42 +228,14 @@ def _fix_video_timestamps(text, conversation, merge_size=2):
                 continue
             fps = item.get("_video_fps")
             indices = item.get("_frame_indices")
-            if fps is not None and indices is not None:
-                video_metas.append((fps, indices))
-
-    if not video_metas:
-        return text  # nothing to fix
-
-    # Compute correct timestamps for every video.
-    correct_timestamps = []
-    for fps, indices in video_metas:
-        raw_ts = [idx / fps for idx in indices]
-        # Pad to merge_size alignment (same as processor).
-        while len(raw_ts) % merge_size != 0:
-            raw_ts.append(raw_ts[-1])
-        grouped_ts = [
-            (raw_ts[i] + raw_ts[i + merge_size - 1]) / 2
-            for i in range(0, len(raw_ts), merge_size)
-        ]
-        correct_timestamps.extend(grouped_ts)
-
-    # Find all <X.X seconds> markers produced by the processor.
-    pattern = re.compile(r"<(\d+\.?\d*)\s*seconds>")
-    matches = list(pattern.finditer(text))
-
-    if len(matches) != len(correct_timestamps):
-        # Count mismatch — cannot safely patch; return unchanged.
-        logger.debug(
-            "Timestamp marker count (%d) != computed count (%d); skipping fix.",
-            len(matches), len(correct_timestamps),
-        )
-        return text
-
-    # Replace right-to-left so character offsets remain valid.
-    for match, ts in zip(reversed(matches), reversed(correct_timestamps)):
-        text = text[: match.start()] + f"<{ts:.1f} seconds>" + text[match.end() :]
-
-    return text
+            video = item.get("video")
+            if fps is not None and indices is not None and video is not None:
+                metadata_list.append(VideoMetadata(
+                    total_num_frames=len(video),
+                    fps=fps,
+                    frames_indices=list(indices),
+                ))
+    return metadata_list
 
 
 def make_rdr_dataset(path_or_dataset="quintend/rdr-items", split="train", **kwargs):
@@ -1137,31 +1101,33 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                             ):
                                 item["image"] = item["image"].convert("RGB")
 
-                # --- Two-step tokenization for correct video timestamps ---
-                # Step 1: render template text (may have wrong timestamps
-                # because the processor falls back to fps=24 for pre-loaded
-                # frames).
+                # Render template text.
                 text = self.processor.apply_chat_template(
                     [conversation], tokenize=False,
                 )
                 if isinstance(text, list):
                     text = text[0]
 
-                # Step 2: fix timestamps using preserved metadata.
-                text = _fix_video_timestamps(text, conversation)
-
-                # Step 3: extract pre-loaded media for the processor.
+                # Extract pre-loaded media for the processor.
                 images, videos = _extract_media_from_conversations(
                     [conversation],
                 )
 
-                # Step 4: tokenize the corrected text and process media.
-                result = self.processor(
-                    text=[text],
-                    images=images,
-                    videos=videos,
-                    return_tensors="pt",
-                )
+                # Build video_metadata from preserved _video_fps / _frame_indices
+                # so the processor inserts correct timestamps and skips re-sampling.
+                video_metadata = _build_video_metadata(conversation)
+
+                processor_kwargs = {
+                    "text": [text],
+                    "images": images,
+                    "videos": videos,
+                    "return_tensors": "pt",
+                    "do_sample_frames": False,
+                }
+                if video_metadata:
+                    processor_kwargs["video_metadata"] = [video_metadata]
+
+                result = self.processor(**processor_kwargs)
 
                 input_ids = result["input_ids"][0]  # (seq_len,)
                 seq_len = input_ids.shape[0]
@@ -1190,7 +1156,8 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
 
                 # Copy media tensors (these don't have a sample batch dim)
                 for key in ("pixel_values", "pixel_values_videos",
-                            "image_grid_thw", "video_grid_thw"):
+                            "image_grid_thw", "video_grid_thw",
+                            "second_per_grid_ts"):
                     if key in result and result[key] is not None:
                         output[key] = result[key]
 
