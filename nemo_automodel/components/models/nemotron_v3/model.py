@@ -119,7 +119,7 @@ class NemotronV3Model(nn.Module):
             inputs_embeds: Input embeddings [batch_size, seq_len, hidden_size] (optional)
             past_key_values: Optional NemotronHybridCache for incremental decoding.
             cache_position: Token position indices for cache updates.
-            **kwargs: Additional arguments (ignored)
+            **kwargs: Forwarded to attention layers (e.g. CP kwargs).
 
         Returns:
             Hidden states tensor [batch_size, seq_len, hidden_size]
@@ -141,8 +141,10 @@ class NemotronV3Model(nn.Module):
         for layer in self.layers.values():
             # Pass appropriate mask based on layer type
             if layer.block_type == "attention":
-                # Attention layers use 4D causal mask
-                mask = causal_mask
+                # Attention layers use 4D causal mask; fall back to 2D attention_mask
+                # when causal_mask is None (e.g. during TE+CP training where CP split
+                # removes the precomputed 4D mask) so TE can use padding_causal mode.
+                mask = causal_mask if causal_mask is not None else attention_mask
             elif layer.block_type == "mamba":
                 # Mamba layers use 2D padding mask during prefill, None during decode
                 mask = None if (past_key_values is not None and past_key_values.has_previous_state) else attention_mask
@@ -155,6 +157,7 @@ class NemotronV3Model(nn.Module):
                 attention_mask=mask,
                 past_key_values=past_key_values,
                 cache_position=cache_position,
+                **kwargs,
             )
 
         # Final norm
