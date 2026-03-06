@@ -32,6 +32,7 @@ from torch import Tensor
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers import PreTrainedModel
 from transformers.cache_utils import Cache, DynamicCache
+from transformers.masking_utils import create_bidirectional_mask
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     ModelOutput,
@@ -43,7 +44,7 @@ from transformers.models.llama.modeling_llama import (
     LlamaModel,
 )
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring, logging
+from transformers.utils import TransformersKwargs, logging
 
 try:
     from nemo_automodel.components.models.biencoder.state_dict_adapter import BiencoderStateDictAdapter
@@ -178,28 +179,7 @@ class LlamaBidirectionalModel(LlamaModel):
         for layer in self.layers:
             layer.self_attn.is_causal = False
 
-    def _update_causal_mask(self, attention_mask: torch.Tensor, **kwargs):
-        """Override causal mask to allow bidirectional attention.
-
-        For flash_attention_2 the raw 2-D padding mask (or None) is returned
-        because FA2 computes cu_seqlens from it internally.
-
-        For eager / sdpa the 2-D mask is expanded to a 4-D float tensor
-        ``(batch, 1, seq, seq)`` with 0 for attended and ``-inf`` for padding.
-
-        All paths use only pointwise tensor ops (no ``.any()`` / ``.all()``)
-        so the method is compatible with ``torch.export`` / ONNX tracing.
-        """
-        if attention_mask is None:
-            return None
-        if getattr(self.config, "_attn_implementation", None) == "flash_attention_2":
-            return attention_mask
-        bsz, src_len = attention_mask.shape
-        expanded = attention_mask[:, None, None, :].expand(bsz, 1, src_len, src_len).to(torch.float32)
-        return (1.0 - expanded) * torch.finfo(torch.float32).min
-
     @check_model_inputs
-    @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -229,8 +209,11 @@ class LlamaBidirectionalModel(LlamaModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(attention_mask=attention_mask)
-        kwargs["is_causal"] = False
+        bidirectional_mask = create_bidirectional_mask(
+            config=self.config,
+            input_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -238,7 +221,7 @@ class LlamaBidirectionalModel(LlamaModel):
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask,
+                attention_mask=bidirectional_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 cache_position=cache_position,
