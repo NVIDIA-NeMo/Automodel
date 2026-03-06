@@ -17,7 +17,7 @@
 This module contains both CPU and GPU tests for:
 - SequentialBucketSampler
 - collate_fn_production
-- build_multiresolution_dataloader
+- _build_multiresolution_dataloader_core
 
 GPU tests are skipped when CUDA is not available.
 """
@@ -30,10 +30,12 @@ from typing import Dict, List
 import pytest
 import torch
 
+from nemo_automodel.components.datasets.diffusion.collate_fns import (
+    _build_multiresolution_dataloader_core,
+    collate_fn_production,
+)
 from nemo_automodel.components.datasets.diffusion.sampler import (
     SequentialBucketSampler,
-    build_multiresolution_dataloader,
-    collate_fn_production,
 )
 from nemo_automodel.components.datasets.diffusion.text_to_image_dataset import (
     TextToImageDataset,
@@ -182,7 +184,7 @@ class TestSequentialBucketSamplerCPU:
         """Test basic sampler initialization."""
         sampler = SequentialBucketSampler(
             simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             num_replicas=1,
             rank=0,
         )
@@ -196,7 +198,7 @@ class TestSequentialBucketSamplerCPU:
         """Test sampler __len__ returns correct batch count."""
         sampler = SequentialBucketSampler(
             simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             num_replicas=1,
             rank=0,
         )
@@ -209,7 +211,7 @@ class TestSequentialBucketSamplerCPU:
         """Test sampler iteration yields batches of indices."""
         sampler = SequentialBucketSampler(
             simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             num_replicas=1,
             rank=0,
         )
@@ -226,7 +228,7 @@ class TestSequentialBucketSamplerCPU:
         batch_size = 4
         sampler = SequentialBucketSampler(
             simple_dataset,
-            base_batch_size=batch_size,
+            batch_size=batch_size,
             num_replicas=1,
             rank=0,
             drop_last=True,
@@ -241,7 +243,7 @@ class TestSequentialBucketSamplerCPU:
         """Test sampler with drop_last=False includes all samples."""
         sampler = SequentialBucketSampler(
             simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             num_replicas=1,
             rank=0,
             drop_last=False,
@@ -257,7 +259,7 @@ class TestSequentialBucketSamplerCPU:
         """Test set_epoch changes sampler state."""
         sampler = SequentialBucketSampler(
             simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             num_replicas=1,
             rank=0,
         )
@@ -270,7 +272,7 @@ class TestSequentialBucketSamplerCPU:
         """Test same seed produces same batch order."""
         sampler1 = SequentialBucketSampler(
             simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             num_replicas=1,
             rank=0,
             seed=42,
@@ -278,7 +280,7 @@ class TestSequentialBucketSamplerCPU:
 
         sampler2 = SequentialBucketSampler(
             simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             num_replicas=1,
             rank=0,
             seed=42,
@@ -293,7 +295,7 @@ class TestSequentialBucketSamplerCPU:
         """Test different seeds produce different batch orders."""
         sampler1 = SequentialBucketSampler(
             simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             num_replicas=1,
             rank=0,
             seed=42,
@@ -302,7 +304,7 @@ class TestSequentialBucketSamplerCPU:
 
         sampler2 = SequentialBucketSampler(
             simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             num_replicas=1,
             rank=0,
             seed=123,
@@ -321,7 +323,7 @@ class TestSequentialBucketSamplerCPU:
         """Test sampler without shuffling."""
         sampler = SequentialBucketSampler(
             simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             num_replicas=1,
             rank=0,
             shuffle_buckets=False,
@@ -335,7 +337,7 @@ class TestSequentialBucketSamplerCPU:
         """Test that bucket and element order differs across epochs."""
         sampler = SequentialBucketSampler(
             large_dataset,
-            base_batch_size=8,
+            batch_size=8,
             num_replicas=1,
             rank=0,
             seed=42,
@@ -380,7 +382,7 @@ class TestSequentialBucketSamplerCPU:
         batch_size = 4
         sampler = SequentialBucketSampler(
             multi_resolution_dataset,
-            base_batch_size=batch_size,
+            batch_size=batch_size,
             dynamic_batch_size=False,
             num_replicas=1,
             rank=0,
@@ -396,7 +398,7 @@ class TestSequentialBucketSamplerCPU:
         """Test sampler with dynamic_batch_size=True varies batch size."""
         sampler = SequentialBucketSampler(
             multi_resolution_dataset,
-            base_batch_size=8,
+            batch_size=8,
             base_resolution=(512, 512),
             dynamic_batch_size=True,
             num_replicas=1,
@@ -417,7 +419,7 @@ class TestSequentialBucketSamplerCPU:
         """Test get_batch_info returns bucket information."""
         sampler = SequentialBucketSampler(
             simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             num_replicas=1,
             rank=0,
         )
@@ -442,7 +444,7 @@ class TestSequentialBucketSamplerDistributedCPU:
         for rank in range(world_size):
             sampler = SequentialBucketSampler(
                 large_dataset,
-                base_batch_size=8,
+                batch_size=8,
                 num_replicas=world_size,
                 rank=rank,
             )
@@ -457,7 +459,7 @@ class TestSequentialBucketSamplerDistributedCPU:
 
         sampler0 = SequentialBucketSampler(
             large_dataset,
-            base_batch_size=8,
+            batch_size=8,
             num_replicas=world_size,
             rank=0,
             seed=42,
@@ -465,7 +467,7 @@ class TestSequentialBucketSamplerDistributedCPU:
 
         sampler1 = SequentialBucketSampler(
             large_dataset,
-            base_batch_size=8,
+            batch_size=8,
             num_replicas=world_size,
             rank=1,
             seed=42,
@@ -486,7 +488,7 @@ class TestSequentialBucketSamplerDistributedCPU:
         """Test single rank (world_size=1) processes all data."""
         sampler = SequentialBucketSampler(
             simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             num_replicas=1,
             rank=0,
         )
@@ -570,18 +572,19 @@ class TestCollateFnProductionCPU:
 
 
 # ============================================================================
-# CPU Tests - build_multiresolution_dataloader
+# CPU Tests - _build_multiresolution_dataloader_core
 # ============================================================================
 
 
-class TestBuildMultiresolutionDataloaderCPU:
-    """CPU tests for build_multiresolution_dataloader."""
+class TestBuildMultiresolutionDataloaderCoreCPU:
+    """CPU tests for _build_multiresolution_dataloader_core."""
 
     def test_build_dataloader_returns_tuple(self, simple_dataset):
         """Test function returns dataloader and sampler."""
-        dataloader, sampler = build_multiresolution_dataloader(
+        dataloader, sampler = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             num_workers=0,
@@ -593,9 +596,10 @@ class TestBuildMultiresolutionDataloaderCPU:
 
     def test_dataloader_iteration(self, simple_dataset):
         """Test dataloader can be iterated."""
-        dataloader, sampler = build_multiresolution_dataloader(
+        dataloader, sampler = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             num_workers=0,
@@ -613,9 +617,10 @@ class TestBuildMultiresolutionDataloaderCPU:
 
     def test_dataloader_batch_content(self, simple_dataset):
         """Test dataloader batches have correct content."""
-        dataloader, _ = build_multiresolution_dataloader(
+        dataloader, _ = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             num_workers=0,
@@ -628,9 +633,10 @@ class TestBuildMultiresolutionDataloaderCPU:
 
     def test_dataloader_with_shuffle(self, simple_dataset):
         """Test dataloader with shuffle enabled."""
-        dataloader, _ = build_multiresolution_dataloader(
+        dataloader, _ = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             shuffle=True,
@@ -643,9 +649,10 @@ class TestBuildMultiresolutionDataloaderCPU:
 
     def test_dataloader_without_shuffle(self, simple_dataset):
         """Test dataloader with shuffle disabled."""
-        dataloader, _ = build_multiresolution_dataloader(
+        dataloader, _ = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             shuffle=False,
@@ -658,9 +665,10 @@ class TestBuildMultiresolutionDataloaderCPU:
 
     def test_dataloader_with_dynamic_batch(self, multi_resolution_dataset):
         """Test dataloader with dynamic batch sizing."""
-        dataloader, _ = build_multiresolution_dataloader(
+        dataloader, _ = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=multi_resolution_dataset,
-            base_batch_size=8,
+            batch_size=8,
             base_resolution=(512, 512),
             dp_rank=0,
             dp_world_size=1,
@@ -687,7 +695,7 @@ class TestSequentialBucketSamplerGPU:
 
         sampler = SequentialBucketSampler(
             simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             num_replicas=1,
             rank=0,
         )
@@ -747,20 +755,21 @@ class TestCollateFnProductionGPU:
 
 
 # ============================================================================
-# GPU Tests - build_multiresolution_dataloader
+# GPU Tests - _build_multiresolution_dataloader_core
 # ============================================================================
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
-class TestBuildMultiresolutionDataloaderGPU:
-    """GPU tests for build_multiresolution_dataloader."""
+class TestBuildMultiresolutionDataloaderCoreGPU:
+    """GPU tests for _build_multiresolution_dataloader_core."""
 
     def test_dataloader_with_pin_memory(self, simple_dataset):
         """Test dataloader with pin_memory for faster GPU transfer."""
 
-        dataloader, _ = build_multiresolution_dataloader(
+        dataloader, _ = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             pin_memory=True,
@@ -775,9 +784,10 @@ class TestBuildMultiresolutionDataloaderGPU:
 
     def test_dataloader_batch_to_gpu(self, simple_dataset):
         """Test full batch transfer to GPU."""
-        dataloader, _ = build_multiresolution_dataloader(
+        dataloader, _ = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             num_workers=0,
@@ -814,9 +824,10 @@ class TestBuildMultiresolutionDataloaderGPU:
         torch.cuda.empty_cache()
         initial_memory = torch.cuda.memory_allocated()
 
-        dataloader, _ = build_multiresolution_dataloader(
+        dataloader, _ = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             num_workers=0,
@@ -846,9 +857,9 @@ class TestBuildMultiresolutionDataloaderGPU:
         # Create dataloaders for each GPU (simulated)
         dataloaders = []
         for rank in range(min(gpu_count, 2)):  # Use up to 2 GPUs for test
-            dl, _ = build_multiresolution_dataloader(
+            dl, _ = _build_multiresolution_dataloader_core(
                 dataset=large_dataset,
-                base_batch_size=8,
+                batch_size=8,
                 dp_rank=rank,
                 dp_world_size=min(gpu_count, 2),
                 num_workers=0,
@@ -867,9 +878,10 @@ class TestBuildMultiresolutionDataloaderGPU:
 
     def test_gpu_operations_on_batch(self, simple_dataset):
         """Test performing GPU operations on loaded batch."""
-        dataloader, _ = build_multiresolution_dataloader(
+        dataloader, _ = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             num_workers=0,
@@ -902,9 +914,10 @@ class TestDataloaderIntegration:
 
     def test_full_epoch_iteration_cpu(self, simple_dataset):
         """Test iterating through a full epoch on CPU."""
-        dataloader, sampler = build_multiresolution_dataloader(
+        dataloader, sampler = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             num_workers=0,
@@ -919,9 +932,10 @@ class TestDataloaderIntegration:
 
     def test_multiple_epochs_cpu(self, simple_dataset):
         """Test iterating through multiple epochs."""
-        dataloader, sampler = build_multiresolution_dataloader(
+        dataloader, sampler = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             num_workers=0,
@@ -937,9 +951,10 @@ class TestDataloaderIntegration:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
     def test_full_epoch_iteration_gpu(self, simple_dataset):
         """Test iterating through a full epoch with GPU transfer."""
-        dataloader, sampler = build_multiresolution_dataloader(
+        dataloader, sampler = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             pin_memory=True,
@@ -964,7 +979,7 @@ class TestDataloaderIntegration:
         # Create samplers for two ranks
         sampler0 = SequentialBucketSampler(
             large_dataset,
-            base_batch_size=8,
+            batch_size=8,
             num_replicas=world_size,
             rank=0,
             seed=seed,
@@ -972,7 +987,7 @@ class TestDataloaderIntegration:
 
         sampler1 = SequentialBucketSampler(
             large_dataset,
-            base_batch_size=8,
+            batch_size=8,
             num_replicas=world_size,
             rank=1,
             seed=seed,

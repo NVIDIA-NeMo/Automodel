@@ -58,7 +58,7 @@ step_scheduler:
 
 data:
   dataloader:
-    _target_: nemo_automodel.components.datasets.diffusion.build_flux_multiresolution_dataloader
+    _target_: nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader
     cache_dir: PATH_TO_YOUR_DATA
     train_text_encoder: false
     num_workers: 1
