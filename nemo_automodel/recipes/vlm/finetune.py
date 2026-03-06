@@ -47,6 +47,7 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample, build
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -563,6 +564,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
+        # Disable fused RoPE when context parallelism is enabled (cp > 1)
+        if self.dist_setup.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", False):
+            logging.info("Disabling rope_fusion because cp_size=%d > 1", self.dist_setup.cp_size)
+            self.cfg.model.backend.rope_fusion = False
+
         model = build_model(
             self.cfg.model,
             self.cfg.get("freeze_config", None),
@@ -621,6 +627,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self._get_dp_group_size(),
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
         )
+        self._setup_garbage_collection(self.step_scheduler)
 
         # Build learning rate scheduler
         self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
@@ -681,6 +688,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         val_loss,
                         best_metric_key=self.best_metric_key,
                     )
+                self._maybe_collect_garbage()
 
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
@@ -838,6 +846,27 @@ class FinetuneRecipeForVLM(BaseRecipe):
             sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+
+        # MoE aux loss gradients are injected via MoEAuxLossAutoScaler, which
+        # multiplies them by main_loss_backward_scale during backward.  This
+        # counteracts the unwanted scaling that FSDP and PP post-hoc rescaling
+        # apply to *all* gradients (including aux loss):
+        #
+        #   Non-PP: FSDP allreduce divides grads by dp_group_size.
+        #           Scale = dp_group_size  →  net = 1.
+        #
+        #   PP:     FSDP divides by dp_group_size, then
+        #           scale_grads_and_clip_grad_norm divides by
+        #           (num_label_tokens / dp_group_size).  The dp_group_size
+        #           factors cancel, leaving net 1/num_label_tokens.
+        #           Scale = num_label_tokens  →  net = 1.
+        if self.pp_enabled:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(float(num_label_tokens))
+        else:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+                float(self._get_dp_group_size(include_cp=True))
+            )
+
         loss_buffer = []
 
         # number of tokens in the batch, excluding any tail padding.

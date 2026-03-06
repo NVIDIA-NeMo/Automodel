@@ -27,6 +27,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.cache_utils import Cache, DynamicCache
+from transformers.masking_utils import create_bidirectional_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaForSequenceClassification, LlamaModel
@@ -94,15 +95,9 @@ class LlamaBidirectionalModel(LlamaModel):
             config: Model configuration
         """
         super().__init__(config)
-
-    def _update_causal_mask(
-        self,
-        attention_mask: torch.Tensor,
-    ):
-        """Override causal mask to allow bidirectional attention."""
-        if attention_mask is not None and (attention_mask == 0.0).any():
-            return attention_mask
-        return None
+        # Disable causal attention for all layers
+        for layer in self.layers:
+            layer.self_attn.is_causal = False
 
     @check_model_inputs
     def forward(
@@ -134,9 +129,11 @@ class LlamaBidirectionalModel(LlamaModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        # enforce bidirectional attention by disabling causal masking
-        causal_mask = self._update_causal_mask(attention_mask=attention_mask)
-        kwargs["is_causal"] = False
+        bidirectional_mask = create_bidirectional_mask(
+            config=self.config,
+            input_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -144,7 +141,7 @@ class LlamaBidirectionalModel(LlamaModel):
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask,
+                attention_mask=bidirectional_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 cache_position=cache_position,

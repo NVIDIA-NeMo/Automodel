@@ -284,6 +284,10 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
             cp_comm_type=cp_comm_type,
         )
 
+        moe_module = block.moe if hasattr(block, "moe") else block.mlp
+        if isinstance(moe_module, MoE):
+            moe_module.cp_mesh = cp_mesh
+
 
 def parallelize_model(
     model: torch.nn.Module,
@@ -300,6 +304,7 @@ def parallelize_model(
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
+    mp_policy: MixedPrecisionPolicy | None = None,
 ):
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
         "Tensor parallelism not supported for custom MoE models"
@@ -335,6 +340,7 @@ def parallelize_model(
             ep_enabled=ep_enabled,
             ep_shard_enabled=ep_shard_mesh is not None and ep_shard_mesh.size() > 1,
             ep_shard_mesh=ep_shard_mesh,
+            mp_policy=mp_policy,
             reshard_after_forward=reshard_after_forward,
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,

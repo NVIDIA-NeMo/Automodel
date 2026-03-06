@@ -14,11 +14,19 @@
 
 """Llama Bidirectional model for embedding and retrieval tasks."""
 
+from transformers import AutoConfig, AutoModel
+
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
     LlamaBidirectionalForSequenceClassification,
     LlamaBidirectionalModel,
 )
+
+try:
+    AutoConfig.register("llama_bidirec", LlamaBidirectionalConfig)
+    AutoModel.register(LlamaBidirectionalConfig, LlamaBidirectionalModel)
+except ValueError:
+    pass
 
 __all__ = [
     "LlamaBidirectionalModel",

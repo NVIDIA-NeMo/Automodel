@@ -91,6 +91,55 @@ def test_llama_bidirectional_config_fields():
     assert isinstance(cfg.temperature, float)
 
 
+def test_llama_bidirectional_model_init_and_mask():
+    cfg = LlamaBidirectionalConfig(
+        vocab_size=128, hidden_size=32, num_hidden_layers=1, num_attention_heads=1, intermediate_size=64, pad_token_id=0
+    )
+    model = LlamaBidirectionalModel(cfg)
+    model.eval()
+
+    # All attention layers should be non-causal
+    assert all(getattr(layer.self_attn, "is_causal", True) is False for layer in model.layers)
+
+    # Forward with padding mask produces valid output
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 3))
+    mask = torch.tensor([[1, 1, 0]])
+    out = model(input_ids=input_ids, attention_mask=mask)
+    assert out.last_hidden_state is not None and out.last_hidden_state.shape == (1, 3, 32)
+
+    # Forward without attention mask also works
+    out_no_mask = model(input_ids=input_ids)
+    assert out_no_mask.last_hidden_state is not None and out_no_mask.last_hidden_state.shape == (1, 3, 32)
+
+
+def test_bidirectional_attention_is_symmetric():
+    """Verify that the bidirectional model produces symmetric attention behavior:
+    changing a token at position i should affect the hidden state at position j
+    and vice versa (unlike causal models where earlier tokens can't see later ones)."""
+    cfg = LlamaBidirectionalConfig(
+        vocab_size=128, hidden_size=32, num_hidden_layers=1, num_attention_heads=1, intermediate_size=64, pad_token_id=0
+    )
+    model = LlamaBidirectionalModel(cfg)
+    model.eval()
+
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    attn = torch.ones(1, 4, dtype=torch.long)
+
+    with torch.no_grad():
+        out_base = model(input_ids=input_ids, attention_mask=attn).last_hidden_state.clone()
+
+        # Change last token — in a bidirectional model, this should affect ALL positions
+        modified = input_ids.clone()
+        modified[0, -1] = (input_ids[0, -1] + 1) % cfg.vocab_size
+        out_modified = model(input_ids=modified, attention_mask=attn).last_hidden_state
+
+    # Position 0 should be different because it can attend to the changed last token
+    assert not torch.allclose(out_base[0, 0], out_modified[0, 0], atol=1e-6), (
+        "Bidirectional model: changing last token should affect first token's hidden state"
+    )
+
+
+
 
 # --- Fakes for classification and biencoder tests ---
 class FakeOutputs:
