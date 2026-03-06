@@ -95,7 +95,11 @@ class Qwen3_5MoeBlock(Block):
             ]
             for linear in linear_list:
                 nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-            self.linear_attn.norm.reset_parameters()
+            if hasattr(self.linear_attn.norm, "reset_parameters"):
+                self.linear_attn.norm.reset_parameters()
+            else:
+                # HF Qwen3_5MoeRMSNormGated has no reset_parameters; manually reset weight to ones
+                self.linear_attn.norm.weight.data.fill_(1.0)
         self.mlp.init_weights(buffer_device)
 
 
