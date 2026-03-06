@@ -92,9 +92,16 @@ def test_format_prompt_completion_options(seq_length, padding, truncation):
         assert any(v!= -100 for v in labels), "Must have supervised answer tokens"
 
     # Where attention_mask=0, labels must be -100
-    for i in range(len(labels)):
-        if attention_mask[i] == 0:
-            assert labels[i] == -100, f"Position {i}: attention_mask=0 but labels={labels[i]} (expected -100)"
+    if padding == "do_not_pad":
+        for i in range(len(labels)):
+            if attention_mask[i] == 0:
+                assert labels[i] == -100, f"Position {i}: attention_mask=0 but labels={labels[i]} (expected -100)"
+    else:
+        # The boundary position (content_end) has attention_mask=0 by design
+        # (intentional equivalence with non-padded). Check true padding after it.
+        content_end = sum(attention_mask)
+        for i in range(content_end + 1, len(labels)):
+            assert labels[i] == -100, f"Position {i}: label in padding region should be -100, got {labels[i]}"
 
     # Attention mask must be contiguous: ones then zeros (right padding)
     saw_zero = False
@@ -162,9 +169,16 @@ def test_format_chat_template_options(seq_length, padding, truncation):
     assert any(v != -100 for v in labels), "Must have supervised assistant tokens"
 
     # Where attention_mask=0, labels must be -100
-    for i in range(len(labels)):
-        if attention_mask[i] == 0:
-            assert labels[i] == -100, f"Position {i}: attention_mask=0 but labels={labels[i]} (expected -100)"
+    if padding == "do_not_pad":
+        for i in range(len(labels)):
+            if attention_mask[i] == 0:
+                assert labels[i] == -100, f"Position {i}: attention_mask=0 but labels={labels[i]} (expected -100)"
+    else:
+        # The boundary position (content_end) has attention_mask=0 by design
+        # (intentional equivalence with non-padded). Check true padding after it.
+        content_end = sum(attention_mask)
+        for i in range(content_end + 1, len(labels)):
+            assert labels[i] == -100, f"Position {i}: label in padding region should be -100, got {labels[i]}"
 
     # Attention mask must be contiguous: ones then zeros (right padding)
     saw_zero = False
@@ -177,7 +191,7 @@ def test_format_chat_template_options(seq_length, padding, truncation):
     # Padded tail: all padding positions must have pad_token_id in input_ids
     if isinstance(seq_length, int) and padding == "max_length":
         content_end = sum(attention_mask)
-        for i in range(content_end, len(input_ids)):
+        for i in range(content_end + 1, len(input_ids)):
             assert input_ids[i] == pad_token_id, (
                 f"Position {i}: expected pad_token_id={pad_token_id} in padding region, got {input_ids[i]}"
             )

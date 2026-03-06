@@ -267,15 +267,24 @@ def format_prompt_completion(
     else:
         len_prompt_ids = 0
     # Tokenize full text
-    input_ids = tokenizer(
+    tokenized = tokenizer(
         full_text,
         padding=padding,
         truncation=truncation,
         max_length=seq_length,
-    )["input_ids"]
+    )
+    input_ids = tokenized["input_ids"]
 
     # Create assistant_masks: 0 for prompt tokens, 1 for answer tokens
     assistant_masks = [0] * len_prompt_ids + [1] * (len(input_ids) - len_prompt_ids)
+
+    # Zero out the loss mask at padding positions using the tokenizer's
+    # own attention_mask so pad tokens are never treated as supervised.
+    tokenizer_attn_mask = tokenized.get("attention_mask")
+    if tokenizer_attn_mask is not None:
+        for i in range(min(len(assistant_masks), len(tokenizer_attn_mask))):
+            if not tokenizer_attn_mask[i]:
+                assistant_masks[i] = 0
 
     return _package_tokenized_example(
         tokenizer=tokenizer,

@@ -32,8 +32,10 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --dataset.limit_dataset_samples 1000 \
     --dataset.seq_length 512 \
     --dataset.padding true \
+    --dataset.pad_seq_len_divisible 512 \
     --validation_dataset.seq_length 512 \
     --validation_dataset.padding true \
+    --validation_dataset.pad_seq_len_divisible 512 \
     --step_scheduler.ckpt_every_steps 10 \
     --checkpoint.enabled true \
     --checkpoint.checkpoint_dir checkpoints/ \
