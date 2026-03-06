@@ -25,7 +25,7 @@ from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
     _read_tokenizer_class,
     _read_tokenizer_config,
     _remap_system_role,
-    _restore_special_tokens_in_config,
+    _restore_tokenizer_config,
 )
 
 
@@ -518,35 +518,55 @@ class TestReadTokenizerConfig:
         assert _read_tokenizer_class(str(tmp_path)) == "LlamaTokenizerFast"
 
 
-class TestRestoreSpecialTokensInConfig:
-    """Unit tests for _restore_special_tokens_in_config."""
+class TestRestoreTokenizerConfig:
+    """Unit tests for _restore_tokenizer_config."""
 
-    def test_restores_add_bos_eos_tokens(self, tmp_path):
-        """Runtime overrides (add_bos_token/add_eos_token forced True by the
-        wrapper) must be reverted to the original config values on save."""
+    def test_replaces_config_with_original(self, tmp_path):
+        """The saved config should be replaced wholesale by the original."""
         saved = {
             "tokenizer_class": "PreTrainedTokenizerFast",
             "add_bos_token": True,
             "add_eos_token": True,
-            "bos_token": "<s>",
+            "bos_token": {"content": "<s>", "lstrip": False},
+            "backend": "tokenizers",
         }
         (tmp_path / "tokenizer_config.json").write_text(json.dumps(saved))
 
         original = {
             "tokenizer_class": "PreTrainedTokenizerFast",
             "bos_token": "<s>",
+            "model_max_length": 131072,
         }
-        _restore_special_tokens_in_config(str(tmp_path), original)
+        _restore_tokenizer_config(str(tmp_path), original)
 
         with open(tmp_path / "tokenizer_config.json") as f:
             result = json.load(f)
-        assert "add_bos_token" not in result
-        assert "add_eos_token" not in result
-        assert result["bos_token"] == "<s>"
+        assert result == original
 
-    def test_preserves_original_special_token_format(self, tmp_path):
+    def test_preserves_v5_tokenizer_class_when_original_lacks_it(self, tmp_path):
+        """When the original config has no tokenizer_class, the v5-written
+        value should be carried over."""
+        saved = {
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "bos_token": {"content": "<s>", "lstrip": False},
+        }
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(saved))
+
+        original = {
+            "bos_token": "<s>",
+            "model_max_length": 4096,
+        }
+        _restore_tokenizer_config(str(tmp_path), original)
+
+        with open(tmp_path / "tokenizer_config.json") as f:
+            result = json.load(f)
+        assert result["tokenizer_class"] == "PreTrainedTokenizerFast"
+        assert result["bos_token"] == "<s>"
+        assert result["model_max_length"] == 4096
+
+    def test_restores_original_special_token_format(self, tmp_path):
         """If v5 serialized bos_token as an object but the original had a
-        plain string, the plain string format should be restored."""
+        plain string, the original format should be restored."""
         saved = {
             "tokenizer_class": "PreTrainedTokenizerFast",
             "bos_token": {"content": "<s>", "lstrip": False, "rstrip": False},
@@ -559,31 +579,12 @@ class TestRestoreSpecialTokensInConfig:
             "bos_token": "<s>",
             "eos_token": "</s>",
         }
-        _restore_special_tokens_in_config(str(tmp_path), original)
+        _restore_tokenizer_config(str(tmp_path), original)
 
         with open(tmp_path / "tokenizer_config.json") as f:
             result = json.load(f)
         assert result["bos_token"] == "<s>"
         assert result["eos_token"] == "</s>"
-
-    def test_restores_special_tokens_pattern(self, tmp_path):
-        """special_tokens_pattern changed to 'none' at runtime should be
-        restored to the original value."""
-        saved = {
-            "tokenizer_class": "PreTrainedTokenizerFast",
-            "special_tokens_pattern": "none",
-        }
-        (tmp_path / "tokenizer_config.json").write_text(json.dumps(saved))
-
-        original = {
-            "tokenizer_class": "PreTrainedTokenizerFast",
-            "special_tokens_pattern": "cls_sep",
-        }
-        _restore_special_tokens_in_config(str(tmp_path), original)
-
-        with open(tmp_path / "tokenizer_config.json") as f:
-            result = json.load(f)
-        assert result["special_tokens_pattern"] == "cls_sep"
 
     def test_no_op_when_config_matches(self, tmp_path):
         """When saved config already matches the original, the file should not
@@ -597,57 +598,33 @@ class TestRestoreSpecialTokensInConfig:
         config_path.write_text(json.dumps(config))
         mtime_before = config_path.stat().st_mtime_ns
 
-        _restore_special_tokens_in_config(str(tmp_path), config)
+        _restore_tokenizer_config(str(tmp_path), config)
 
         mtime_after = config_path.stat().st_mtime_ns
         assert mtime_before == mtime_after
 
-    def test_preserves_non_special_token_keys(self, tmp_path):
-        """Keys outside _PRESERVED_SPECIAL_TOKEN_KEYS must not be altered."""
+    def test_removes_keys_not_in_original(self, tmp_path):
+        """Keys present in the saved config but absent from the original
+        should be removed after restoration."""
         saved = {
-            "tokenizer_class": "TokenizersBackend",
-            "model_max_length": 131072,
-            "backend": "tokenizers",
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "additional_special_tokens": ["<extra_1>", "<extra_2>"],
             "add_bos_token": True,
-            "bos_token": {"content": "<s>", "lstrip": False},
         }
         (tmp_path / "tokenizer_config.json").write_text(json.dumps(saved))
 
-        original = {
-            "tokenizer_class": "PreTrainedTokenizerFast",
-            "model_max_length": 4096,
-            "bos_token": "<s>",
-        }
-        _restore_special_tokens_in_config(str(tmp_path), original)
+        original = {"tokenizer_class": "PreTrainedTokenizerFast"}
+        _restore_tokenizer_config(str(tmp_path), original)
 
         with open(tmp_path / "tokenizer_config.json") as f:
             result = json.load(f)
-        assert result["tokenizer_class"] == "TokenizersBackend"
-        assert result["model_max_length"] == 131072
-        assert result["backend"] == "tokenizers"
-        assert result["bos_token"] == "<s>"
+        assert "additional_special_tokens" not in result
         assert "add_bos_token" not in result
 
     def test_no_crash_when_config_file_missing(self, tmp_path):
         """If tokenizer_config.json does not exist, the function should be a
         silent no-op."""
-        _restore_special_tokens_in_config(str(tmp_path), {"bos_token": "<s>"})
-
-    def test_removes_additional_special_tokens_not_in_original(self, tmp_path):
-        """If the original had no additional_special_tokens but the save added
-        them, they should be removed."""
-        saved = {
-            "tokenizer_class": "PreTrainedTokenizerFast",
-            "additional_special_tokens": ["<extra_1>", "<extra_2>"],
-        }
-        (tmp_path / "tokenizer_config.json").write_text(json.dumps(saved))
-
-        original = {"tokenizer_class": "PreTrainedTokenizerFast"}
-        _restore_special_tokens_in_config(str(tmp_path), original)
-
-        with open(tmp_path / "tokenizer_config.json") as f:
-            result = json.load(f)
-        assert "additional_special_tokens" not in result
+        _restore_tokenizer_config(str(tmp_path), {"bos_token": "<s>"})
 
 
 class TestSavePretrainedPreservesSpecialTokens:
