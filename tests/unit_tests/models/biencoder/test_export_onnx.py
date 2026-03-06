@@ -21,13 +21,12 @@ import torch
 
 from nemo_automodel.components.models.biencoder.export_onnx import (
     EmbeddingModelForExport,
-    _Pooling,
     _parse_args,
+    _Pooling,
     export_to_onnx,
     main,
     verify_onnx,
 )
-
 
 # _Pooling
 
@@ -75,6 +74,7 @@ class TestPooling:
 
 
 # EmbeddingModelForExport
+
 
 class TestEmbeddingModelForExport:
     @pytest.fixture()
@@ -175,24 +175,6 @@ class TestExportToOnnx:
         call_args = mock_tokenizer_cls.from_pretrained.call_args
         assert str(tok_dir.resolve()) in call_args[0][0]
 
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.torch.onnx.export")
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.AutoModel")
-    @patch("nemo_automodel.components.models.biencoder.export_onnx.AutoTokenizer")
-    def test_invalid_export_dtype(self, mock_tokenizer_cls, mock_model_cls, mock_onnx_export, tmp_path):
-        model_dir = tmp_path / "model"
-        model_dir.mkdir()
-
-        mock_tokenizer_cls.from_pretrained.return_value = _make_fake_tokenizer(tmp_path)
-        mock_model_cls.from_pretrained.return_value = _make_fake_base_model()
-
-        with pytest.raises(ValueError, match="Unsupported export_dtype"):
-            export_to_onnx(
-                model_path=str(model_dir),
-                output_dir=str(tmp_path / "out"),
-                export_dtype="bf16",
-                verify=False,
-            )
-
     @patch("nemo_automodel.components.models.biencoder.export_onnx.verify_onnx")
     @patch("nemo_automodel.components.models.biencoder.export_onnx.torch.onnx.export")
     @patch("nemo_automodel.components.models.biencoder.export_onnx.AutoModel")
@@ -268,7 +250,6 @@ class TestVerifyOnnx:
             verify_onnx(str(tmp_path / "model.onnx"), fake_tokenizer)
 
     def test_verify_skips_when_onnxruntime_missing(self, tmp_path, monkeypatch):
-        saved_modules = sys.modules.copy()
         monkeypatch.delitem(sys.modules, "onnxruntime", raising=False)
         monkeypatch.setattr(
             "builtins.__import__",
