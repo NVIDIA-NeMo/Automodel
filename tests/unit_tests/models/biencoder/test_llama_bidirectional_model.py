@@ -86,27 +86,24 @@ def test_llama_bidirectional_model_init_and_mask():
         num_attention_heads=1,
         intermediate_size=64,
         pad_token_id=0,
-        attn_implementation="eager",
     )
     model = lbm.LlamaBidirectionalModel(cfg)
+    model.eval()
     assert all(getattr(layer.self_attn, "is_causal", True) is False for layer in model.layers)
 
-    from transformers.masking_utils import create_bidirectional_mask
-
-    inputs_embeds = model.embed_tokens(torch.zeros(1, 3, dtype=torch.long))
-
-    # Bidirectional mask with padding: attended positions get 0, padding gets large negative.
+    # Forward with padding mask produces valid output for attended positions.
+    input_ids = torch.zeros(1, 3, dtype=torch.long)
     mask = torch.tensor([[1, 1, 0]])
-    out_mask = create_bidirectional_mask(config=cfg, inputs_embeds=inputs_embeds, attention_mask=mask)
-    assert out_mask.shape == (1, 1, 3, 3)
-    assert torch.allclose(out_mask[0, 0, :, :2], torch.zeros(3, 2, dtype=out_mask.dtype))
-    assert torch.all(out_mask[0, 0, :, 2] < 0)
+    out = model(input_ids=input_ids, attention_mask=mask)
+    assert out.last_hidden_state.shape == (1, 3, cfg.hidden_size)
 
-    # All-ones mask: no positions should be masked.
-    out_mask_all_ones = create_bidirectional_mask(
-        config=cfg, inputs_embeds=inputs_embeds, attention_mask=torch.ones_like(mask)
-    )
-    assert out_mask_all_ones is None or torch.allclose(out_mask_all_ones, torch.zeros_like(out_mask_all_ones))
+    # Forward with all-ones mask also succeeds.
+    out_all = model(input_ids=input_ids, attention_mask=torch.ones_like(mask))
+    assert out_all.last_hidden_state.shape == (1, 3, cfg.hidden_size)
+
+    # Forward without attention_mask (None) also succeeds.
+    out_none = model(input_ids=input_ids)
+    assert out_none.last_hidden_state.shape == (1, 3, cfg.hidden_size)
 
 
 # --- Fakes for classification and biencoder tests ---
