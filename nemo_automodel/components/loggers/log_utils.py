@@ -29,7 +29,7 @@ class RankFilter(logging.Filter):
     This filter allows log messages only for rank 0 by default.
     """
 
-    def filter(self, record):
+    def filter(self, record: LogRecord) -> bool:
         """Decide whether to log the provided record.
 
         Args:
@@ -40,7 +40,7 @@ class RankFilter(logging.Filter):
         """
         # TODO(@akoumparouli): make this PP aware.
         if "RANK" in os.environ:
-            rank = int(os.environ.get("RANK"))
+            rank = int(os.environ["RANK"])
             # permantly disable logging for rank != 0
             if rank > 0:
                 logging.disable(logging.CRITICAL)
@@ -160,11 +160,10 @@ def _ensure_root_handler_with_formatter(formatter: logging.Formatter) -> None:
         handler.addFilter(RankFilter())
         root.addHandler(handler)
     else:
-        for handler in root.handlers:
+        for h in root.handlers:
             try:
-                handler.setFormatter(formatter)
+                h.setFormatter(formatter)
             except Exception:
-                # Best-effort; skip handlers that don't accept formatters
                 pass
 
 

@@ -87,7 +87,7 @@ class EmbeddingModelForExport(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs["last_hidden_state"].to(torch.float32)
+        hidden_states = outputs["last_hidden_state"]
         embeddings = self.pooling(hidden_states, attention_mask)
         if self.normalize:
             embeddings = F.normalize(embeddings, p=2, dim=1)
@@ -124,7 +124,7 @@ def export_to_onnx(
                          states.  One of ``"avg"``, ``"cls"``, ``"last"``.
         normalize:       If *True*, L2-normalise the pooled embeddings.
         opset:           ONNX opset version (default 17).
-        export_dtype:    Export precision — ``"fp32"`` or ``"fp16"``.
+        export_dtype:    Export precision — ``"fp32"``, ``"fp16"``, or ``"bf16"``.
         verify:          Run a quick onnxruntime round-trip after export.
 
     Returns:
@@ -154,10 +154,10 @@ def export_to_onnx(
     pooling_module = _Pooling(pool_type=pooling)
     export_model = EmbeddingModelForExport(base_model, pooling_module, normalize=normalize)
 
-    dtype_map = {"fp32": torch.float32, "fp16": torch.float16}
+    dtype_map = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
     torch_dtype = dtype_map.get(export_dtype)
     if torch_dtype is None:
-        raise ValueError(f"Unsupported export_dtype={export_dtype!r}.  Choose fp32 or fp16.")
+        raise ValueError(f"Unsupported export_dtype={export_dtype!r}.  Choose fp32, fp16, or bf16.")
     export_model = export_model.to(torch_dtype)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -187,7 +187,7 @@ def export_to_onnx(
     }
 
     logger.info("Exporting ONNX (opset=%d, dtype=%s) -> %s", opset, export_dtype, onnx_path)
-    with torch.no_grad(), torch.amp.autocast(device.type, dtype=torch_dtype):
+    with torch.no_grad():
         torch.onnx.export(
             model=export_model,
             args=(dummy_inputs["input_ids"], dummy_inputs["attention_mask"]),
@@ -287,7 +287,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--no-normalize", action="store_false", dest="normalize", help="Disable L2 normalisation.")
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version (default: 17).")
     parser.add_argument(
-        "--dtype", type=str, default="fp32", choices=["fp32", "fp16"], help="Export precision (default: fp32)."
+        "--dtype", type=str, default="fp32", choices=["fp32", "fp16", "bf16"], help="Export precision (default: fp32)."
     )
     parser.add_argument(
         "--no-verify", action="store_true", default=False, help="Skip onnxruntime verification after export."
