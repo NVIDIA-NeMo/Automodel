@@ -119,10 +119,8 @@ def apply_ac(
     if hidden_size is None:
         cfg = getattr(model, "config", None)
         # VLM models nest language model config under text_config
-        text_cfg = getattr(cfg, "text_config", cfg)
-        if text_cfg is not None and hasattr(text_cfg, "hidden_size"):
-            hidden_size = text_cfg.hidden_size
-        else:
+        hidden_size = getattr(getattr(cfg, "text_config", None), "hidden_size", None) or getattr(cfg, "hidden_size", None)
+        if hidden_size is None:
             raise ValueError("hidden_size must be provided or model must have config.hidden_size attribute")
 
     if num_experts is None:
