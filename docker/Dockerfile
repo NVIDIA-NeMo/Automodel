@@ -129,13 +129,14 @@ COPY docker/common/update_pyproject_pytorch.sh /opt/Automodel/docker/common/
 # Install Automodel
 ARG BASE_IMAGE=cuda
 ARG AUTOMODEL_INSTALL=all
+ARG UV_SYNC_ARGS="--locked"
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     --mount=type=cache,target=/root/.cache/uv \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi && \
-    uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups && \
+    uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS && \
     uv cache prune --ci
 
 COPY . /opt/Automodel
