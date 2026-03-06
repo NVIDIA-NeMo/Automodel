@@ -142,6 +142,115 @@ def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
     assert new_batch is batch
 
 
+def test_make_cp_batch_and_ctx_pops_attention_mask_when_cp_enabled(monkeypatch):
+    """When CP is enabled, attention_mask should be removed from the batch."""
+
+    dummy_cp_ctx = object()
+    monkeypatch.setattr(_cu, "create_context_parallel_ctx", lambda **kwargs: dummy_cp_ctx)
+    monkeypatch.setattr(
+        _cu,
+        "get_train_context",
+        lambda enable_loss_parallel, enable_compiled_autograd, cp_ctx: "dummy_train_ctx",
+    )
+
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "labels": torch.tensor([[1, 2, 3]]),
+        "attention_mask": torch.ones(1, 3, dtype=torch.long),
+    }
+
+    _ctx, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch)
+
+    assert "attention_mask" not in new_batch, "attention_mask should be removed when CP > 1"
+
+
+# ============================================================================
+# Tests for _attach_context_parallel_hooks
+# ============================================================================
+
+
+class _FakeSelfAttn(torch.nn.Module):
+    """Minimal module that records the kwargs it receives."""
+
+    def forward(self, hidden_states, **kwargs):
+        self.last_kwargs = kwargs
+        return hidden_states
+
+
+class _FakeTransformerBlock(torch.nn.Module):
+    """A toy model with a ``self_attn`` sub-module to test hook attachment."""
+
+    def __init__(self):
+        super().__init__()
+        self.self_attn = _FakeSelfAttn()
+
+
+class _FakeModel(torch.nn.Module):
+    """Two-layer model with ``self_attn`` sub-modules."""
+
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([_FakeTransformerBlock(), _FakeTransformerBlock()])
+
+
+def test_attach_context_parallel_hooks_registers_on_self_attn():
+    """Hooks should be registered on every module whose name ends with 'self_attn'."""
+    model = _FakeModel()
+
+    # Count hooks before
+    hooks_before = {
+        name: len(mod._forward_pre_hooks) for name, mod in model.named_modules() if name.endswith("self_attn")
+    }
+
+    _cu._attach_context_parallel_hooks(model)
+
+    for name, mod in model.named_modules():
+        if name.endswith("self_attn"):
+            assert len(mod._forward_pre_hooks) == hooks_before[name] + 1
+
+
+def test_attach_context_parallel_hooks_strips_attention_mask():
+    """The hook should replace attention_mask with None and set is_causal=True."""
+    model = _FakeModel()
+    _cu._attach_context_parallel_hooks(model)
+
+    dummy_input = torch.randn(1, 4, 8)
+    attn_mask = torch.ones(1, 1, 4, 4)
+
+    model.layers[0].self_attn(dummy_input, attention_mask=attn_mask)
+
+    kwargs = model.layers[0].self_attn.last_kwargs
+    assert kwargs["attention_mask"] is None, "attention_mask should be set to None by the hook"
+    assert kwargs["is_causal"] is True, "is_causal should be set to True by the hook"
+
+
+def test_attach_context_parallel_hooks_no_mask_passthrough():
+    """When no attention_mask kwarg is passed, the hook should be a no-op."""
+    model = _FakeModel()
+    _cu._attach_context_parallel_hooks(model)
+
+    dummy_input = torch.randn(1, 4, 8)
+    model.layers[0].self_attn(dummy_input, some_other_kwarg=42)
+
+    kwargs = model.layers[0].self_attn.last_kwargs
+    assert "attention_mask" not in kwargs
+    assert "is_causal" not in kwargs
+    assert kwargs["some_other_kwarg"] == 42
+
+
+def test_attach_context_parallel_hooks_skips_non_self_attn():
+    """Modules not ending with 'self_attn' should have no hooks added."""
+    model = _FakeModel()
+    _cu._attach_context_parallel_hooks(model)
+
+    # The top-level model and the layers list should not get hooks
+    assert len(model._forward_pre_hooks) == 0
+    assert len(model.layers._forward_pre_hooks) == 0
+    for layer in model.layers:
+        assert len(layer._forward_pre_hooks) == 0
+
+
 # ============================================================================
 # Tests for make_cp_batch_for_te
 # ============================================================================

@@ -101,6 +101,29 @@ def create_context_parallel_ctx(
     )
 
 
+def _attach_context_parallel_hooks(model: torch.nn.Module):
+    """Attach forward pre-hooks to self_attn modules to fix attention masks for context parallelism.
+
+    Context parallelism shards Q/K/V on the sequence dimension as DTensors,
+    so explicit 4D attention masks would have mismatched shapes.  This function
+    registers a hook on every ``self_attn`` sub-module that strips the
+    ``attention_mask`` kwarg and sets ``is_causal=True`` instead, letting
+    SDPA handle causal masking internally.
+
+    Based on ``accelerate.big_modeling._attach_context_parallel_hooks``.
+    """
+
+    def _self_attn_pre_forward_hook(_module, module_args, module_kwargs):
+        if "attention_mask" in module_kwargs:
+            module_kwargs["attention_mask"] = None
+            module_kwargs["is_causal"] = True
+        return module_args, module_kwargs
+
+    for name, module in model.named_modules():
+        if name.endswith("self_attn"):
+            module.register_forward_pre_hook(_self_attn_pre_forward_hook, with_kwargs=True, prepend=True)
+
+
 def make_cp_batch_and_ctx(
     device_mesh,
     batch,
@@ -152,7 +175,11 @@ def make_cp_batch_and_ctx(
     if _get_mesh_size(cp_mesh) <= 1:
         return nullcontext, batch
 
-    # CP doesn't support packed sequence currently. Let torch SDPA handle attention mask.
+    # Remove attention_mask from the batch so the model does not attempt to
+    # build a 4D causal mask (which would have mismatched shapes with
+    # DTensor-sharded Q/K/V).  Each self_attn module's forward_pre_hook
+    # (registered by _attach_context_parallel_hooks) will set is_causal=True
+    # so that SDPA handles causal masking internally.
     batch.pop("attention_mask", None)
 
     if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
