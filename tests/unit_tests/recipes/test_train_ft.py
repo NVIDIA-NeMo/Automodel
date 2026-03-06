@@ -30,6 +30,7 @@ from nemo_automodel.components.config.loader import ConfigNode
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 from torch.utils.data import IterableDataset
 
+from nemo_automodel._transformers.model_init import resolve_sdpa_method
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     build_dataloader,
@@ -37,7 +38,6 @@ from nemo_automodel.recipes.llm.train_ft import (
     build_optimizer,
     build_validation_dataloader,
     compute_trust_remote_code_from_model,
-    resolve_sdpa_method,
 )
 
 
