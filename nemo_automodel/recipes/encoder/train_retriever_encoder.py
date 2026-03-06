@@ -43,6 +43,7 @@ from nemo_automodel.recipes.llm.train_ft import (
     build_step_scheduler,
     build_wandb,
 )
+from nemo_automodel.shared.te_patches import apply_te_patches
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +152,7 @@ class TrainRetrieverEncoderRecipe(BaseRecipe):
         setup_logging()
 
         apply_cache_compatibility_patches()
+        apply_te_patches()
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
         self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)

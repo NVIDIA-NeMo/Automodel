@@ -16,8 +16,8 @@ import logging
 from contextlib import nullcontext
 
 import torch
-import wandb
 import torch.nn.functional as F
+import wandb
 
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
