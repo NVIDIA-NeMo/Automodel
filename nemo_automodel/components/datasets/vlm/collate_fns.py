@@ -203,6 +203,7 @@ def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
         images=image_inputs,
         padding=True,
         return_tensors="pt",
+        do_sample_frames=False,
     )
     labels = build_labels(
         batch["input_ids"],
@@ -668,6 +669,123 @@ def default_collate_fn(
         if batch[key].shape == input_shape and key != "labels":
             batch[key] = batch[key][:, :-1]
     return batch
+
+
+def neat_packed_vlm_collater(
+    batch: list[dict],
+    padding_idx: int = 0,
+    max_length: int | None = None,
+    attn_implementation: str = "sdpa",
+) -> dict:
+    """Collater for neat-packed VLM sequences.
+
+    Packs arrive with **variable lengths** (no pre-padding).  This collater:
+
+    1. Pads all text tensors to a common length.
+    2. Converts the indexed ``attention_mask`` to the appropriate format:
+       - ``flash_attention_2``: keeps the indexed ``[B, S]`` mask (values
+         1, 2, … for documents, 0 for padding).  The monkey-patched
+         ``_get_unpad_data`` converts this to ``cu_seqlens`` for
+         ``flash_attn_varlen_func``.
+       - ``sdpa`` / ``eager``: converts to a 4D block-causal bool mask.
+    3. Concatenates media tensors across the batch dimension.
+
+    **No autoregressive shift** — it was already applied during packing.
+
+    Args:
+        batch: List of packed sample dicts from ``PackedDatasetWrapper``.
+        padding_idx: Token ID for padding ``input_ids`` (default 0).
+        max_length: If set, pad every batch to this fixed length.
+            If ``None`` (default), pad to the longest pack in the batch.
+            A fixed length avoids recompilation with ``torch.compile``
+            and ensures uniform tensor shapes across steps.
+        attn_implementation: Attention backend (``"flash_attention_2"``,
+            ``"sdpa"``, or ``"eager"``).
+
+    Returns:
+        Dict with batched tensors ready for model forward.
+    """
+    if not batch:
+        return {}
+
+    LABEL_PAD = -100
+    use_flash = attn_implementation == "flash_attention_2"
+
+    # Determine pad target: fixed max_length or batch-dynamic
+    batch_max = max(x["input_ids"].shape[-1] if isinstance(x["input_ids"], torch.Tensor)
+                    else len(x["input_ids"]) for x in batch)
+    max_len = max_length if max_length is not None else batch_max
+
+    def _pad_1d(tensor, pad_value, target_len):
+        """Pad a 1D tensor to target_len."""
+        t = torch.as_tensor(tensor)
+        pad_len = target_len - t.shape[0]
+        if pad_len > 0:
+            return torch.cat([t, torch.full((pad_len,), pad_value, dtype=t.dtype)])
+        return t
+
+    # Pad and stack text tensors
+    input_ids = torch.stack([_pad_1d(x["input_ids"], padding_idx, max_len) for x in batch])
+    labels = torch.stack([_pad_1d(x["labels"], LABEL_PAD, max_len) for x in batch])
+    attention_mask = torch.stack([_pad_1d(x["attention_mask"], 0, max_len) for x in batch])
+
+    if use_flash:
+        # Keep indexed [B, S] mask for flash_attn_varlen_func.
+        # The patched _get_unpad_data will extract per-document cu_seqlens.
+        attention_mask_out = attention_mask
+    else:
+        from nemo_automodel.components.datasets.utils import _indexed_mask_to_4d_block_causal
+        attention_mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
+
+    # Handle position_ids: 1D [seq_len] or 3D mRoPE [3, seq_len]
+    pos_sample = torch.as_tensor(batch[0]["position_ids"])
+    if pos_sample.ndim == 2:
+        # mRoPE: [3, seq_len] → pad to [3, max_len], stack to [3, B, max_len]
+        def _pad_mrope(pos, target_len):
+            t = torch.as_tensor(pos)  # [3, seq_len]
+            pad_len = target_len - t.shape[1]
+            if pad_len > 0:
+                return torch.cat([t, torch.zeros(3, pad_len, dtype=t.dtype)], dim=1)
+            return t
+        position_ids = torch.stack([_pad_mrope(x["position_ids"], max_len) for x in batch], dim=1)
+    else:
+        # Standard 1D: [seq_len] → pad to [max_len], stack to [B, max_len]
+        position_ids = torch.stack([_pad_1d(x["position_ids"], 0, max_len) for x in batch])
+
+    result: Dict[str, Any] = {
+        "input_ids": input_ids,
+        "labels": labels,
+        "position_ids": position_ids,
+        "attention_mask": attention_mask_out,
+    }
+
+    # Store indexed attention mask for loss functions that need per-sample
+    # boundaries (e.g. SqrtCrossEntropy).  The indexed mask [B, S] uses
+    # values 1,2,3,... per original sample and 0 for padding.  For SDPA the
+    # ``attention_mask_out`` is already converted to 4D, so keep a copy.
+    if attention_mask.max() > 1:
+        result["_packed_seq_ids"] = attention_mask
+
+    # Concatenate media tensors across batch (variable count, no padding needed)
+    for key in ("pixel_values", "pixel_values_videos"):
+        tensors = [x[key] for x in batch if key in x and x[key] is not None]
+        if tensors:
+            result[key] = torch.cat(tensors, dim=0).to(torch.bfloat16)
+
+    for key in ("image_grid_thw", "video_grid_thw", "second_per_grid_ts"):
+        tensors = [x[key] for x in batch if key in x and x[key] is not None]
+        if tensors:
+            result[key] = torch.cat(tensors, dim=0)
+
+    # Per-pack media counts
+    image_counts = [int(x.get("n_images", 0)) for x in batch]
+    video_counts = [int(x.get("n_videos", 0)) for x in batch]
+    if any(c > 0 for c in image_counts):
+        result["n_images_per_sample"] = torch.tensor(image_counts, dtype=torch.long)
+    if any(c > 0 for c in video_counts):
+        result["n_videos_per_sample"] = torch.tensor(video_counts, dtype=torch.long)
+
+    return result
 
 
 # Mapping of processor types to their collate functions
