@@ -282,6 +282,10 @@ In these scenarios, you can pass `is_meta_device: true` in the model config. The
 ## Run the Fine-Tune Recipe
 Assuming the above `yaml` is saved in a file named `sft_guide.yaml` (or `peft_guide.yaml` if you want to do PEFT), you can run the fine-tuning workflow either using the AutoModel CLI or by directly invoking the recipe Python script.
 
+:::{note}
+**Fine-tuning in Docker.** When you run inside the NeMo AutoModel container, checkpoints are lost when the container exits unless you save them on the host. Use a bind-mount for your checkpoint directory (see [Install with NeMo Docker Container](../installation.md#install-with-nemo-docker-container)) and set `checkpoint.checkpoint_dir` to that path. Full details: [Saving Checkpoints When Using Docker](../checkpointing.md#saving-checkpoints-when-using-docker).
+:::
+
 ### AutoModel CLI
 
 When NeMo AutoModel is installed on your system, it includes the `automodel` CLI program that you
