@@ -13,7 +13,7 @@
 # limitations under the License.
 
 ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:25.11-py3
+ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.02-py3
 ARG BASE_IMAGE=cuda
 
 FROM ${CUDA_IMAGE} AS cuda
@@ -91,6 +91,23 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     rm -rf DeepEP; \
     fi
 
+# Install Bitsandbytes
+ARG INSTALL_BITSANDBYTES=True
+ARG BITSANDBYTES_COMMIT=0.49.2
+RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
+    git clone https://github.com/bitsandbytes-foundation/bitsandbytes.git && \
+    cd bitsandbytes && \
+    git pull && \
+    git fetch origin $BITSANDBYTES_COMMIT && \
+    git checkout FETCH_HEAD && \
+    cmake -DCOMPUTE_BACKEND=cuda -DCOMPUTE_CAPABILITY="80;86;90;100;110" -S . && \
+    make && \
+    cmake -DCOMPUTE_BACKEND=cpu -S . && \
+    make && \
+    pip install . && \
+    cd ../ && rm -rf bitsandbytes; \
+    fi
+
 # Address base image CVE
 RUN pip install "aiohttp>=3.13.3" \
         "jaraco-context>=6.1.0" \
@@ -98,8 +115,7 @@ RUN pip install "aiohttp>=3.13.3" \
         "pillow>=12.1.1" \
         "protobuf>=6.33.5" \
         "setuptools>=80.10.2" \
-        "urllib3>=2.6.0" \
-        "wheel>=0.46.2"
+        "urllib3>=2.6.0"
 
 FROM automodel_dep as automodel_final
 
@@ -113,13 +129,14 @@ COPY docker/common/update_pyproject_pytorch.sh /opt/Automodel/docker/common/
 # Install Automodel
 ARG BASE_IMAGE=cuda
 ARG AUTOMODEL_INSTALL=all
+ARG UV_SYNC_ARGS="--locked"
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     --mount=type=cache,target=/root/.cache/uv \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi && \
-    uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups && \
+    uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS && \
     uv cache prune --ci
 
 COPY . /opt/Automodel

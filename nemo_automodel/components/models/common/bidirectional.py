@@ -12,22 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Bidirectional model state dict adapter utilities.
-
-This module provides the EncoderStateDictAdapter for converting between
-encoder and HuggingFace state dict formats.
-"""
-
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 
 
 class EncoderStateDictAdapter(StateDictAdapter):
-    """Identity adapter for EncoderModel state dicts.
+    """Adapter for EncoderModel state dicts.
 
-    Internal and HF formats both use ``model.`` prefix. The adapter filters
-    to ``model.``-prefixed keys (including PEFT-wrapped variants) and passes
-    them through unchanged.
+    Internal format uses a ``model.`` prefix on all keys.  HF format does not.
+    This adapter strips or adds the ``model.`` prefix as needed, including
+    for PEFT-wrapped keys (``base_model.model.model.X`` <-> ``base_model.model.X``).
     """
 
     _PEFT_PREFIX = "base_model.model."
@@ -35,21 +28,36 @@ class EncoderStateDictAdapter(StateDictAdapter):
     def __init__(self):
         self._uses_model_prefix = True
 
+    _MODEL_PREFIX = "model."
+    _PEFT_MODEL_PREFIX = _PEFT_PREFIX + _MODEL_PREFIX
+
+    def _strip_model_prefix(self, key):
+        if key.startswith(self._PEFT_MODEL_PREFIX):
+            return self._PEFT_PREFIX + key[len(self._PEFT_MODEL_PREFIX):]
+        if key.startswith(self._MODEL_PREFIX):
+            return key[len(self._MODEL_PREFIX):]
+        return None
+
+    def _add_model_prefix(self, key):
+        if key.startswith(self._PEFT_PREFIX):
+            return self._PEFT_MODEL_PREFIX + key[len(self._PEFT_PREFIX):]
+        return self._MODEL_PREFIX + key
+
     def to_hf(self, state_dict, **kwargs):
-        return {
-            k: v for k, v in state_dict.items() if k.startswith("model.") or k.startswith(self._PEFT_PREFIX + "model.")
-        }
+        hf_state_dict = {}
+        for key, value in state_dict.items():
+            new_key = self._strip_model_prefix(key)
+            if new_key is not None:
+                hf_state_dict[new_key] = value
+        return hf_state_dict
 
     def from_hf(self, hf_state_dict, device_mesh=None, **kwargs):
-        return {
-            k: v
-            for k, v in hf_state_dict.items()
-            if k.startswith("model.") or k.startswith(self._PEFT_PREFIX + "model.")
-        }
+        return {self._add_model_prefix(key): value for key, value in hf_state_dict.items()}
 
     def convert_single_tensor_to_hf(self, fqn, tensor, **kwargs):
-        if fqn.startswith("model."):
-            return [(fqn, tensor)]
+        new_fqn = self._strip_model_prefix(fqn)
+        if new_fqn is not None:
+            return [(new_fqn, tensor)]
         return []
 
 
