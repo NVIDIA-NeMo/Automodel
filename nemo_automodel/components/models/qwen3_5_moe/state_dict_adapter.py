@@ -132,7 +132,18 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                             ep_group = None
 
                         if ep_group is not None:
-                            payload = (expert_ids, [w.cpu() for w in split_weights])
+                            # Materialize any DTensors to plain CPU tensors before pickling via all_gather_object.
+                            # In multi-node runs ep_shard_size > 1, so expert weights are sharded on BOTH
+                            # ep (Shard(0)) and ep_shard (Shard(1)).  After split_experts_weights_dtensor_aware
+                            # each element may still be a DTensor on the ep_shard dimension.
+                            # - .cpu()      → keeps DTensor wrapper              → mixed-tensor error on copy_
+                            # - .to_local() → only local ep_shard slice          → shape mismatch on copy_
+                            # - full_tensor() → all-gathers ALL shard dims → full plain CPU tensor  ✓
+                            plain_weights = [
+                                w.full_tensor().cpu() if state_dict_utils.is_dtensor(w) else w.cpu()
+                                for w in split_weights
+                            ]
+                            payload = (expert_ids, plain_weights)
                             gathered: list[tuple[list[int], list[torch.Tensor]]] = [None] * dist.get_world_size(
                                 ep_group
                             )
@@ -198,6 +209,18 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
             start_expert, end_expert = 0, n_experts
             rank = None
 
+        # Pre-compute ep_shard slice parameters once for all expert keys.
+        # In multi-node runs ep_shard_size > 1: FSDP shards expert weights along dim 1.
+        # from_hf must provide that dim-1 shard to create_dtensor_from_local so the
+        # resulting DTensor has the correct global shape.
+        ep_shard_rank = 0
+        ep_shard_size = 1
+        if device_mesh is not None and "ep_shard" in device_mesh.mesh_dim_names:
+            ep_shard_sub = state_dict_utils.get_submesh(device_mesh, ("ep_shard",))
+            if ep_shard_sub.size() > 1:
+                ep_shard_rank = ep_shard_sub.get_local_rank()
+                ep_shard_size = ep_shard_sub.size()
+
         state_dict: dict[str, Any] = {}
         for key, value in hf_state_dict.items():
             # --- Aggregated expert tensors ---
@@ -209,6 +232,13 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                 _, layer_num, which = match.groups()
                 # HF layout is transposed relative to NeMo (x @ weight), so transpose(1,2)
                 local_tensor = value[start_expert:end_expert].transpose(1, 2).to(self.dtype)
+                # Also slice along dim 1 for ep_shard: FSDP shards expert dim 1 across ep_shard ranks.
+                if ep_shard_size > 1:
+                    assert local_tensor.shape[1] % ep_shard_size == 0, (
+                        f"Expert dim 1 ({local_tensor.shape[1]}) must be divisible by ep_shard_size ({ep_shard_size})"
+                    )
+                    chunk = local_tensor.shape[1] // ep_shard_size
+                    local_tensor = local_tensor[:, ep_shard_rank * chunk : (ep_shard_rank + 1) * chunk, :]
                 native_key = f"{model_prefix}language_model.layers.{layer_num}.mlp.experts."
                 native_key += "gate_and_up_projs" if which == "gate_up_proj" else "down_projs"
                 state_dict[native_key] = state_dict_utils.create_dtensor_from_local(local_tensor, device_mesh, rank)
