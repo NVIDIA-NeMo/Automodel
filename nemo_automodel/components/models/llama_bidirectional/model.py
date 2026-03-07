@@ -82,7 +82,7 @@ class LlamaBidirectionalModel(LlamaModel):
     and retrieval tasks where bidirectional context is beneficial.
 
     The model is auto-discovered by ModelRegistry via the ModelClass export,
-    enabling it to be loaded via NeMoAutoModelBiencoder.from_pretrained().
+    enabling it to be loaded via NeMoAutoModelBiEncoder.from_pretrained().
     """
 
     config_class = LlamaBidirectionalConfig

@@ -98,7 +98,7 @@ def _unpack_qp(inputs: dict[str, torch.Tensor]) -> tuple:
 
 
 def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_world_size=1):
-    """Build a DataLoader for biencoder training."""
+    """Build a DataLoader for encoder training."""
     with ScopedRNG(seed=seed, ranked=True):
         with FirstRankPerNode():
             dataset = cfg_dl.dataset.instantiate()
@@ -135,8 +135,8 @@ def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_wor
         return cfg_dl.instantiate(**dl_kwargs)
 
 
-class TrainBiencoderRecipe(BaseRecipe):
-    """Recipe for training biencoder models with contrastive learning."""
+class TrainRetrieverEncoderRecipe(BaseRecipe):
+    """Recipe for training encoder models with contrastive learning."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -163,7 +163,7 @@ class TrainBiencoderRecipe(BaseRecipe):
         self.pipeline_config = self.dist_setup.pipeline_config
 
         if self.pp_enabled:
-            raise NotImplementedError("Biencoder does not support pipeline parallelism")
+            raise NotImplementedError("Encoder does not support pipeline parallelism")
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -337,8 +337,8 @@ class TrainBiencoderRecipe(BaseRecipe):
         )
 
         with train_ctx, sync_ctx:
-            q_reps = model(query, encoder="query")
-            p_reps = model(passage, encoder="passage")
+            q_reps = model(query)
+            p_reps = model(passage)
 
             n_passages = self.train_n_passages
             scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
@@ -370,7 +370,7 @@ class TrainBiencoderRecipe(BaseRecipe):
             ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
-            num_label_tokens=None,  # Not applicable for biencoder
+            num_label_tokens=None,  # Not applicable for encoder
             dp_group_size=self._get_dp_group_size(include_cp=True),
         )
 
@@ -427,8 +427,8 @@ class TrainBiencoderRecipe(BaseRecipe):
                     query, passage = _unpack_qp(batch)
 
                     model = self.model_parts[0]
-                    q_reps = model(query, encoder="query")
-                    p_reps = model(passage, encoder="passage")
+                    q_reps = model(query)
+                    p_reps = model(passage)
 
                     n_passages = self.eval_negative_size + 1
                     scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
@@ -440,22 +440,34 @@ class TrainBiencoderRecipe(BaseRecipe):
                     all_scores.append(scores.detach().cpu())
                     all_labels.append(labels.detach().cpu())
 
-            avg_loss = torch.stack(loss_buffer).mean()
+            loss_sum = torch.stack(loss_buffer).sum()
+            loss_count = torch.tensor(len(loss_buffer), device=self.dist_env.device, dtype=loss_sum.dtype)
             if torch.distributed.is_initialized():
-                avg_loss = self._dp_allreduce(avg_loss, include_cp=True)
+                loss_sum = self._dp_allreduce(loss_sum, include_cp=True)
+                loss_count = self._dp_allreduce(loss_count, include_cp=True)
+            avg_loss = loss_sum / loss_count
 
             scores = torch.cat(all_scores, dim=0)
             labels = torch.cat(all_labels, dim=0)
+            n_samples = labels.size(0)
 
             # Accuracy@1
             _, predicted_indices = torch.topk(scores, k=1, dim=1)
-            correct = (predicted_indices.squeeze(-1) == labels).float()
-            acc1 = correct.mean().item()
+            num_correct = (predicted_indices.squeeze(-1) == labels).float().sum()
 
             # MRR
             _, sorted_indices = torch.sort(scores, dim=1, descending=True)
             ranks = (sorted_indices == labels.unsqueeze(1)).nonzero(as_tuple=True)[1] + 1
-            mrr = (1.0 / ranks.float()).mean().item()
+            rr_sum = (1.0 / ranks.float()).sum()
+
+            # Allreduce counts across DP ranks for global metrics
+            if torch.distributed.is_initialized():
+                counts = torch.tensor([num_correct, rr_sum, n_samples], device=self.dist_env.device, dtype=torch.float)
+                counts = self._dp_allreduce(counts, include_cp=False)
+                num_correct, rr_sum, n_samples = counts[0].item(), counts[1].item(), counts[2].item()
+
+            acc1 = num_correct / n_samples if n_samples > 0 else 0.0
+            mrr = rr_sum / n_samples if n_samples > 0 else 0.0
 
             metrics = {
                 "val_loss": avg_loss.item(),
@@ -515,9 +527,9 @@ class TrainBiencoderRecipe(BaseRecipe):
         torch.cuda.reset_peak_memory_stats()
 
 
-def main(default_config_path="examples/biencoder/llama3_2_1b_biencoder.yaml"):
+def main(default_config_path="examples/encoder/bi_encoder/llama3_2_1b.yaml"):
     cfg = parse_args_and_load_config(default_config_path)
-    recipe = TrainBiencoderRecipe(cfg)
+    recipe = TrainRetrieverEncoderRecipe(cfg)
     recipe.setup()
     recipe.run_train_validation_loop()
 

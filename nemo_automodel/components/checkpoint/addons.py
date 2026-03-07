@@ -308,25 +308,19 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
                             final_target_modules.add(f"{expert_path}.{expert_id}.down_proj")
                     break
 
-    # When the model is a biencoder, LoRA target modules are discovered under
-    # the "lm_q." prefix (the biencoder query-encoder wrapper).  The standalone
-    # HF base model (LlamaBidirectionalModel) uses bare names without any
-    # wrapper prefix (e.g. "layers.0.self_attn.q_proj").  Strip "lm_q." so
-    # the saved adapter_config.json is compatible with merge_lora / HF PEFT.
+    # Strip "model." prefix for encoder adapters so adapter_config.json
+    # is compatible with HF PEFT / merge_lora.
     adapter = getattr(model, "state_dict_adapter", None)
     if adapter is not None:
-        from nemo_automodel.components.models.common.bidirectional import BiencoderStateDictAdapter
+        from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 
-        if isinstance(adapter, BiencoderStateDictAdapter):
-            remapped = set()
-            for name in final_target_modules:
-                if name.startswith("lm_q."):
-                    remapped.add(name[len("lm_q.") :])
-                else:
-                    remapped.add(name)
-            final_target_modules = remapped
+        if isinstance(adapter, EncoderStateDictAdapter):
+            final_target_modules = {
+                name[len("model."):] if name.startswith("model.") else name
+                for name in final_target_modules
+            }
 
-    return sorted(list(final_target_modules))
+    return sorted(final_target_modules)
 
 
 def _maybe_save_custom_model_code(original_model_path: str | None, hf_metadata_dir: str) -> None:

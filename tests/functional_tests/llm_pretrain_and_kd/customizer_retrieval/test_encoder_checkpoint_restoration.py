@@ -13,9 +13,9 @@
 # limitations under the License.
 
 """
-Functional tests for biencoder checkpoint restoration.
+Functional tests for encoder checkpoint restoration.
 
-  1. Full-model checkpoint: train a biencoder with NeMo Automodel, load the
+  1. Full-model checkpoint: train an encoder with NeMo Automodel, load the
      trained model back in NeMo, save, then restore using the transformers
      library (``LlamaBidirectionalModel.from_pretrained``) and verify the
      state dicts match exactly.
@@ -56,11 +56,11 @@ BASE_MODEL_PATH = os.environ.get(
 )
 CHECKPOINT_DIR = os.environ.get(
     "CHECKPOINT_DIR",
-    "/workspace/output/biencoder_ckpt_restore/checkpoints",
+    "/workspace/output/encoder_ckpt_restore/checkpoints",
 )
 PEFT_CHECKPOINT_DIR = os.environ.get(
     "PEFT_CHECKPOINT_DIR",
-    "/workspace/output/biencoder_ckpt_restore_peft/checkpoints",
+    "/workspace/output/encoder_ckpt_restore_peft/checkpoints",
 )
 RECIPE_YAML = os.environ.get(
     "RECIPE_YAML",
@@ -77,14 +77,14 @@ PEFT_RECIPE_YAML = os.environ.get(
 # ---------------------------------------------------------------------------
 
 def _run_training(recipe_yaml: str, checkpoint_dir: str) -> Path:
-    """Launch biencoder training as a subprocess and return the checkpoint dir."""
+    """Launch encoder training as a subprocess and return the checkpoint dir."""
     cmd = [
         sys.executable,
         "-m", "coverage", "run",
         "--data-file=/workspace/.coverage",
         "--source=/workspace/",
         "--parallel-mode",
-        "-m", "nemo_automodel.recipes.biencoder.train_biencoder",
+        "-m", "nemo_automodel.recipes.encoder.train_retriever_encoder",
         "--config",
         recipe_yaml,
     ]
@@ -152,8 +152,8 @@ def _compare_state_dicts(
 # Test class
 # ---------------------------------------------------------------------------
 
-class TestBiencoderCheckpointRestoration:
-    """Verify that biencoder checkpoints produced by NeMo Automodel training
+class TestEncoderCheckpointRestoration:
+    """Verify that encoder checkpoints produced by NeMo Automodel training
     can be restored by the transformers / safetensors libraries."""
 
     @pytest.fixture(autouse=True)
@@ -170,10 +170,10 @@ class TestBiencoderCheckpointRestoration:
     # ------------------------------------------------------------------ #
 
     def test_full_model_checkpoint_restoration(self):
-        """Train biencoder -> load trained model back in NeMo -> save ->
+        """Train encoder -> load trained model back in NeMo -> save ->
         restore with transformers -> verify state dicts match."""
 
-        from nemo_automodel._transformers.biencoder import BiencoderModel
+        from nemo_automodel._transformers.encoder import BiEncoderModel
         from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel
 
         # ---- Step 1: Train ------------------------------------------------
@@ -194,10 +194,8 @@ class TestBiencoderCheckpointRestoration:
         lm_q = LlamaBidirectionalModel.from_pretrained(
             str(consolidated_dir), torch_dtype=torch.bfloat16
         )
-        nemo_model = BiencoderModel(
-            lm_q=lm_q,
-            lm_p=lm_q,
-            share_encoder=True,
+        nemo_model = BiEncoderModel(
+            model=lm_q,
             pooling="avg",
             l2_normalize=True,
         )
@@ -219,7 +217,7 @@ class TestBiencoderCheckpointRestoration:
 
             # ---- Step 5: Compare state dicts ------------------------------
             _compare_state_dicts(
-                nemo_model.lm_q.state_dict(),
+                nemo_model.model.state_dict(),
                 hf_model.state_dict(),
                 prefix_a="NeMo",
                 prefix_b="HF-transformers",
@@ -232,11 +230,11 @@ class TestBiencoderCheckpointRestoration:
     # ------------------------------------------------------------------ #
 
     def test_peft_checkpoint_restoration(self):
-        """Train biencoder with LoRA -> load in NeMo -> save -> verify base
+        """Train encoder with LoRA -> load in NeMo -> save -> verify base
         weights restored by transformers + LoRA weights by safetensors."""
 
         from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
-        from nemo_automodel._transformers.biencoder import BiencoderModel
+        from nemo_automodel._transformers.encoder import BiEncoderModel
         from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel
 
         # ---- Step 1: Train with PEFT -------------------------------------
@@ -257,10 +255,8 @@ class TestBiencoderCheckpointRestoration:
         lm_q = LlamaBidirectionalModel.from_pretrained(
             BASE_MODEL_PATH, torch_dtype=torch.bfloat16
         )
-        nemo_model = BiencoderModel(
-            lm_q=lm_q,
-            lm_p=lm_q,
-            share_encoder=True,
+        nemo_model = BiEncoderModel(
+            model=lm_q,
             pooling="avg",
             l2_normalize=True,
         )
@@ -280,7 +276,7 @@ class TestBiencoderCheckpointRestoration:
             k[len(_PREFIX_TO_STRIP):] if k.startswith(_PREFIX_TO_STRIP) else k: v
             for k, v in raw_ckpt_sd.items()
         }
-        missing, unexpected = nemo_model.lm_q.load_state_dict(ckpt_sd, strict=False)
+        missing, unexpected = nemo_model.model.load_state_dict(ckpt_sd, strict=False)
         # lora_dropout has no parameters so it won't appear in the safetensors;
         # missing keys should only be non-persistent buffers (e.g. rotary_emb)
         # and base model weights (which are already loaded from BASE_MODEL_PATH).
@@ -321,7 +317,7 @@ class TestBiencoderCheckpointRestoration:
             hf_model.load_state_dict(hf_full_sd, strict=False)
 
             # ---- Step 7: Compare ALL weights (base + LoRA) ----------------
-            nemo_sd = nemo_model.lm_q.state_dict()
+            nemo_sd = nemo_model.model.state_dict()
             hf_sd = hf_model.state_dict()
 
             def _is_comparable_key(k):

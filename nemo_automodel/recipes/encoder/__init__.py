@@ -12,16 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Llama Bidirectional model for embedding and retrieval tasks."""
+from .mine_hard_negatives import MineHardNegativesRecipe
+from .train_cross_encoder import TrainCrossEncoderRecipe
+from .train_retriever_encoder import TrainRetrieverEncoderRecipe
 
-from nemo_automodel.components.models.llama_bidirectional.model import (
-    LlamaBidirectionalConfig,
-    LlamaBidirectionalForSequenceClassification,
-    LlamaBidirectionalModel,
-)
-
-__all__ = [
-    "LlamaBidirectionalModel",
-    "LlamaBidirectionalConfig",
-    "LlamaBidirectionalForSequenceClassification",
-]
+__all__ = ["MineHardNegativesRecipe", "TrainRetrieverEncoderRecipe", "TrainCrossEncoderRecipe"]

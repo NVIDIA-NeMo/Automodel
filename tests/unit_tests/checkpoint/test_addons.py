@@ -213,22 +213,22 @@ class TestExtractTargetModules:
         result = _extract_target_modules(model)
         assert result == sorted(result)
 
-    def test_biencoder_target_modules_remapped(self):
-        """Biencoder lm_q.* target modules have lm_q. prefix stripped."""
-        from nemo_automodel.components.models.common.bidirectional import BiencoderStateDictAdapter
+    def test_encoder_target_modules_remapped(self):
+        """Encoder model.* target modules have model. prefix stripped."""
+        from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 
         model = _make_model_with_named_modules(
             [
-                "lm_q.layers.0.self_attn.q_proj.lora_A",
-                "lm_q.layers.0.self_attn.k_proj.lora_A",
-                "lm_q.layers.0.mlp.down_proj.lora_A",
+                "model.layers.0.self_attn.q_proj.lora_A",
+                "model.layers.0.self_attn.k_proj.lora_A",
+                "model.layers.0.mlp.down_proj.lora_A",
             ]
         )
-        model.state_dict_adapter = BiencoderStateDictAdapter()
+        model.state_dict_adapter = EncoderStateDictAdapter()
         result = _extract_target_modules(model)
         assert "layers.0.self_attn.q_proj" in result
         assert "layers.0.self_attn.k_proj" in result
         assert "layers.0.mlp.down_proj" in result
-        assert all("lm_q" not in m for m in result)
+        assert all(not m.startswith("model.") for m in result)
 
 

@@ -40,9 +40,9 @@ Output:
     {"question_id": "q0_1", "question": "...", "pos_doc": [{"id": "d2"}]}
 
 Usage:
-    python scripts/unroll_pos_docs.py data/nv_pp_dd_sdg_train_eval/train.json
-    python scripts/unroll_pos_docs.py data/nv_pp_dd_sdg_train_eval/train.json --output data/nv_pp_dd_sdg_train_eval/train_unrolled.json
-    python scripts/unroll_pos_docs.py data/nv_pp_dd_sdg_train_eval/train.json --suffix _unrolled
+    python examples/encoder/data_utils/unroll_pos_docs.py data/nv_pp_dd_sdg_train_eval/train.json
+    python examples/encoder/data_utils/unroll_pos_docs.py data/nv_pp_dd_sdg_train_eval/train.json --output data/nv_pp_dd_sdg_train_eval/train_unrolled.json
+    python examples/encoder/data_utils/unroll_pos_docs.py data/nv_pp_dd_sdg_train_eval/train.json --suffix _unrolled
 """
 
 import argparse

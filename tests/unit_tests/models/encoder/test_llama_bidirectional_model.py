@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
-import os
 
 import pytest
 import torch
@@ -20,12 +19,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 
-# Import from the new canonical locations
-from nemo_automodel._transformers.biencoder import (
-    BiencoderModel,
+from nemo_automodel._transformers.encoder import (
+    BiEncoderModel,
     pool,
 )
-from nemo_automodel.recipes.biencoder.train_biencoder import contrastive_scores_and_labels
+from nemo_automodel.recipes.encoder.train_retriever_encoder import contrastive_scores_and_labels
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
@@ -140,8 +138,7 @@ def test_bidirectional_attention_is_symmetric():
 
 
 
-
-# --- Fakes for classification and biencoder tests ---
+# --- Fakes for classification and encoder tests ---
 class FakeOutputs:
     def __init__(self, last_hidden_state=None, hidden_states=None):
         self.last_hidden_state = last_hidden_state
@@ -223,7 +220,7 @@ def test_sequence_classification_forward_variants(monkeypatch):
     assert isinstance(ret, tuple) and torch.is_tensor(ret[0])
 
 
-def test_biencoder_encode_and_compute_scores_and_forward(monkeypatch):
+def test_encoder_encode_and_compute_scores_and_forward(monkeypatch):
     # Fake encoder that lacks token_type_ids argument, to exercise removal in _encode
     class NoTTIDLm(FakeLM):
         def forward(self, input_ids=None, attention_mask=None, return_dict=True, output_hidden_states=True, **kwargs):
@@ -234,10 +231,9 @@ def test_biencoder_encode_and_compute_scores_and_forward(monkeypatch):
                 output_hidden_states=output_hidden_states,
             )
 
-    lm_q = NoTTIDLm(hidden=8)
-    lm_p = NoTTIDLm(hidden=8)
-    model = BiencoderModel(
-        lm_q=lm_q, lm_p=lm_p, pooling="avg", l2_normalize=True
+    lm = NoTTIDLm(hidden=8)
+    model = BiEncoderModel(
+        model=lm, pooling="avg", l2_normalize=True
     )
     # encode removes token_type_ids and normalizes
     q = {
@@ -245,13 +241,13 @@ def test_biencoder_encode_and_compute_scores_and_forward(monkeypatch):
         "attention_mask": torch.ones(2, 3, dtype=torch.long),
         "token_type_ids": torch.zeros(2, 3, dtype=torch.long),
     }
-    v = model.encode(q, encoder="query")
+    v = model.encode(q)
     assert v.shape == (2, 8)
     assert torch.allclose(torch.linalg.norm(v, dim=-1), torch.ones(2), atol=1e-5)
     # Compute scores explicitly to avoid coupling to internal repeat implementation
     p = {"input_ids": torch.ones(4, 3, dtype=torch.long), "attention_mask": torch.ones(4, 3, dtype=torch.long)}
-    q_reps = model.encode(q, encoder="query")
-    p_reps = model.encode(p, encoder="passage")
+    q_reps = model.encode(q)
+    p_reps = model.encode(p)
     assert q_reps.shape == (2, 8) and p_reps.shape == (4, 8)
     scores, labels = contrastive_scores_and_labels(q_reps, p_reps, current_train_n_passages=2)
     assert scores.shape == (2, 2) and torch.all(labels == 0)
@@ -261,8 +257,8 @@ def test_biencoder_encode_and_compute_scores_and_forward(monkeypatch):
         "input_ids": torch.ones(4, 3, dtype=torch.long),
         "attention_mask": torch.ones(4, 3, dtype=torch.long),
     }
-    q_reps2 = model.encode(q, encoder="query")
-    p_reps2 = model.encode(p2, encoder="passage")
+    q_reps2 = model.encode(q)
+    p_reps2 = model.encode(p2)
     scores2, labels2 = contrastive_scores_and_labels(q_reps2, p_reps2, current_train_n_passages=2)
     loss2 = F.cross_entropy(scores2, labels2)
     assert loss2 is not None and torch.is_tensor(loss2)
@@ -280,17 +276,16 @@ def test_biencoder_encode_and_compute_scores_and_forward(monkeypatch):
             return OnlyHiddenOutputs(hidden_states)
 
     # Test with model using NoLastLM for query encoder
-    model_no_last = BiencoderModel(
-        lm_q=NoLastLM(hidden=8), lm_p=NoTTIDLm(hidden=8), pooling="avg", l2_normalize=True
+    model_no_last = BiEncoderModel(
+        model=NoLastLM(hidden=8), pooling="avg", l2_normalize=True
     )
     v2 = model_no_last.encode(
         {"input_ids": torch.ones(2, 3, dtype=torch.long), "attention_mask": torch.ones(2, 3, dtype=torch.long)},
-        encoder="query"
     )
     assert v2.shape == (2, 8)
 
 
-def test_biencoder_build_and_save(tmp_path, monkeypatch):
+def test_encoder_build_and_save(tmp_path, monkeypatch):
     # Patch ModelClass.from_pretrained to return FakeLM
     class FakeBidirectionalModel(FakeLM):
         @classmethod
@@ -306,28 +301,16 @@ def test_biencoder_build_and_save(tmp_path, monkeypatch):
     model_dir.mkdir()
     (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
 
-    model = BiencoderModel.build(
+    model = BiEncoderModel.build(
         model_name_or_path=str(model_dir),
-        share_encoder=True,
         pooling="avg",
         l2_normalize=True,
     )
-    assert isinstance(model, BiencoderModel)
+    assert isinstance(model, BiEncoderModel)
     outdir = tmp_path / "save1"
     outdir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(outdir))
-    assert any("save1" in p for p in model.lm_q.saved)
-
-    # build with share_encoder=False
-    model2 = BiencoderModel.build(
-        model_name_or_path=str(model_dir),
-        share_encoder=False,
-    )
-    outdir2 = tmp_path / "save2"
-    model2.save_pretrained(str(outdir2))
-    # separate subdirs created
-    assert os.path.isdir(outdir2 / "query_model")
-    assert os.path.isdir(outdir2 / "passage_model")
+    assert any("save1" in p for p in model.model.saved)
 
 
 def test_llama_bidirectional_forward_paths(monkeypatch):
@@ -382,7 +365,7 @@ def test_sequence_classification_regression_multi_output(monkeypatch):
     assert out.loss is not None
 
 
-def test_biencoder_build_llama_bidirec_model_type_generic_path(tmp_path, monkeypatch):
+def test_encoder_build_llama_bidirec_model_type_generic_path(tmp_path, monkeypatch):
     """Regression test: model_type 'llama_bidirec' at a generic path without 'llama' in it.
 
     When the customizer API downloads the model, the path is something like
@@ -405,7 +388,7 @@ def test_biencoder_build_llama_bidirec_model_type_generic_path(tmp_path, monkeyp
     (model_dir / "config.json").write_text(json.dumps({"model_type": "llama_bidirec"}))
 
     # Mock AutoConfig.from_pretrained to return a config with the llama_bidirec model_type
-    import nemo_automodel._transformers.biencoder as biencoder_module
+    import nemo_automodel._transformers.encoder as encoder_module
 
     class FakeConfig:
         model_type = "llama_bidirec"
@@ -413,19 +396,17 @@ def test_biencoder_build_llama_bidirec_model_type_generic_path(tmp_path, monkeyp
     def fake_auto_config_from_pretrained(*args, **kwargs):
         return FakeConfig()
 
-    monkeypatch.setattr(biencoder_module.AutoConfig, "from_pretrained", fake_auto_config_from_pretrained)
+    monkeypatch.setattr(encoder_module.AutoConfig, "from_pretrained", fake_auto_config_from_pretrained)
 
-    model = BiencoderModel.build(
+    model = BiEncoderModel.build(
         model_name_or_path=str(model_dir),
-        share_encoder=True,
         pooling="avg",
         l2_normalize=True,
-        t=0.5,
     )
-    assert isinstance(model, BiencoderModel)
+    assert isinstance(model, BiEncoderModel)
 
 
-def test_biencoder_build_hub_and_errors(tmp_path, monkeypatch):
+def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
     # Patch ModelClass.from_pretrained to return FakeLM for hub path
     class FakeBidirectionalModel(FakeLM):
         @classmethod
@@ -441,25 +422,20 @@ def test_biencoder_build_hub_and_errors(tmp_path, monkeypatch):
     bad_dir.mkdir()
     (bad_dir / "config.json").write_text(json.dumps({"model_type": "bert"}))
     with pytest.raises(ValueError):
-        BiencoderModel.build(model_name_or_path=str(bad_dir))
+        BiEncoderModel.build(model_name_or_path=str(bad_dir))
 
     # For hub path tests, we need to mock AutoConfig.from_pretrained since the new code
     # calls it first to determine model type before using the registry
-    import nemo_automodel._transformers.biencoder as biencoder_module
+    import nemo_automodel._transformers.encoder as encoder_module
 
     class FakeConfig:
         model_type = "llama"
 
-    original_auto_config = biencoder_module.AutoConfig
-
     def fake_auto_config_from_pretrained(*args, **kwargs):
         return FakeConfig()
 
-    monkeypatch.setattr(biencoder_module.AutoConfig, "from_pretrained", fake_auto_config_from_pretrained)
+    monkeypatch.setattr(encoder_module.AutoConfig, "from_pretrained", fake_auto_config_from_pretrained)
 
-    # Hub path with share_encoder True
-    m1 = BiencoderModel.build(model_name_or_path="llama-tiny", share_encoder=True)
-    assert isinstance(m1, BiencoderModel)
-    # Hub path with share_encoder False
-    m2 = BiencoderModel.build(model_name_or_path="llama-tiny", share_encoder=False)
-    assert isinstance(m2, BiencoderModel)
+    # Hub path
+    m1 = BiEncoderModel.build(model_name_or_path="llama-tiny")
+    assert isinstance(m1, BiEncoderModel)

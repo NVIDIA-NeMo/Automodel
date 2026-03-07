@@ -179,7 +179,7 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
     return (dataset, {})
 
 
-def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
+def _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
     """
     Transform function to convert from raw format to training format.
     Same as _format_process_data in RetrievalMultiModalDatasetLoader.
@@ -287,11 +287,64 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
     return result
 
 
-def _create_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
+def flatten_biencoder_to_crossencoder(data: dict) -> dict:
+    """Flatten grouped biencoder output into cross-encoder format.
+
+    Takes biencoder-style data (queries with grouped doc lists) and flattens it
+    so each query-doc pair becomes a separate entry. Used by cross-encoder transforms
+    in both retrieval_dataset.py and retrieval_dataset_inline.py.
+    """
+    cur_pos_neg_image_batch = data["doc_image"]
+    cur_pos_neg_text_batch = data["doc_text"]
+    questions = data["question"]
+
+    # Flattening query-grouped docs images and text and repeating queries
+    cur_pos_neg_image_batch_flatten = [y for x in cur_pos_neg_image_batch for y in x]
+    cur_pos_neg_text_batch_flatten = [y for x in cur_pos_neg_text_batch for y in x]
+    questions_repeated = [[q] * len(i) for q, i in zip(questions, cur_pos_neg_image_batch)]
+    questions_repeated_flatten = [y for x in questions_repeated for y in x]
+    num_labels = len(questions)
+
+    assert (
+        len(cur_pos_neg_image_batch_flatten) == len(cur_pos_neg_text_batch_flatten) == len(questions_repeated_flatten)
+    )
+    return {
+        "doc_image": cur_pos_neg_image_batch_flatten,
+        "doc_text": cur_pos_neg_text_batch_flatten,
+        "question": questions_repeated_flatten,
+        # Only necessary for training. Collator might use it to create the labels with the right shape
+        "num_labels": [num_labels] * len(questions_repeated_flatten),
+    }
+
+
+def _cross_encoder_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
+    """
+    Transform function to convert from raw format to training format.
+    Same as _format_process_data in CrossEncoderMultiModalDatasetLoader.
+    """
+    data = _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction)
+    return flatten_biencoder_to_crossencoder(data)
+
+
+def _create_retrieval_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
     """Create transform function with specified number of negative documents."""
 
     def transform(examples):
-        return _transform_func(
+        return _retrieval_transform_func(
+            examples,
+            num_neg_docs=num_neg_docs,
+            corpus_dict=corpus_dict,
+            use_dataset_instruction=use_dataset_instruction,
+        )
+
+    return transform
+
+
+def _create_cross_encoder_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
+    """Create transform function with specified number of negative documents."""
+
+    def transform(examples):
+        return _cross_encoder_transform_func(
             examples,
             num_neg_docs=num_neg_docs,
             corpus_dict=corpus_dict,
@@ -303,6 +356,7 @@ def _create_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: b
 
 def make_retrieval_dataset(
     data_dir_list: Union[List[str], str],
+    model_type: str = "biencoder",
     data_type: str = "train",
     train_n_passages: int = 5,
     eval_negative_size: int = 10,
@@ -313,7 +367,7 @@ def make_retrieval_dataset(
     use_dataset_instruction: bool = False,
 ):
     """
-    Load and return dataset in retrieval format for biencoder training.
+    Load and return dataset in retrieval format for encoder training.
 
     This function loads data from JSON files using the same method as
     RetrievalMultiModalDatasetLoader and returns it ready for training.
@@ -321,6 +375,7 @@ def make_retrieval_dataset(
 
     Args:
         data_dir_list: Path(s) to JSON file(s) containing training data
+        model_type: "biencoder" (default) or "crossencoder"
         data_type: Type of data ("train" or "eval")
         train_n_passages: Number of passages for training (1 positive + n-1 negatives)
         eval_negative_size: Number of negative documents for evaluation
@@ -336,9 +391,13 @@ def make_retrieval_dataset(
         - 'doc_image': List of images or empty strings
 
     Note:
-        Tokenization should be handled by a collator (e.g., RetrievalBiencoderCollator)
+        Tokenization should be handled by a collator (e.g., RetrievalEncoderCollator)
         which is more efficient for batch padding and supports dynamic processing.
     """
+
+    _VALID_MODEL_TYPES = ("biencoder", "crossencoder")
+    if model_type not in _VALID_MODEL_TYPES:
+        raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
 
     logging.info(f"Loading data from {data_dir_list if isinstance(data_dir_list, str) else len(data_dir_list)} file(s)")
 
@@ -346,6 +405,11 @@ def make_retrieval_dataset(
     dataset, corpus_dict = load_datasets(data_dir_list, concatenate=True)
 
     logging.info(f"Loaded dataset with {len(dataset)} examples")
+
+    if model_type == "crossencoder":
+        transform_factory = _create_cross_encoder_transform_func
+    else:
+        transform_factory = _create_retrieval_transform_func
 
     # Apply same processing as _get_processed_dataset
     if data_type == "train":
@@ -358,11 +422,11 @@ def make_retrieval_dataset(
 
         # Set transform for training (train_n_passages - 1 negatives)
         negative_size = train_n_passages - 1
-        dataset.set_transform(_create_transform_func(negative_size, corpus_dict, use_dataset_instruction))
+        dataset.set_transform(transform_factory(negative_size, corpus_dict, use_dataset_instruction))
 
     elif data_type == "eval":
         # Set transform for evaluation
-        dataset.set_transform(_create_transform_func(eval_negative_size, corpus_dict, use_dataset_instruction))
+        dataset.set_transform(transform_factory(eval_negative_size, corpus_dict, use_dataset_instruction))
 
     else:
         raise ValueError(f"Invalid data type: {data_type}")
