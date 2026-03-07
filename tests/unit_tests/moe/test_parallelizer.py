@@ -1816,3 +1816,53 @@ def test_parallelize_model_mp_policy_defaults_to_none(monkeypatch):
     apply_fsdp_mock.assert_called_once()
     _, kwargs = apply_fsdp_mock.call_args
     assert kwargs.get("mp_policy") is None
+
+
+def test_apply_ac_derives_hidden_size_and_num_experts_from_text_config(monkeypatch):
+    """Test that apply_ac resolves hidden_size/num_experts from model.config.text_config (VLM models)."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    captured_hidden_size = None
+    captured_num_experts = None
+
+    def fake_create_selective_checkpoint_contexts(policy_cb):
+        nonlocal captured_hidden_size, captured_num_experts
+        torch_stub = sys.modules["torch"]
+        for hs in [256, 512, 2048]:
+            for ne in [8, 16, 128]:
+                rhs = type("Mat", (), {"shape": (hs, ne)})()
+                result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs)
+                if result == P.CheckpointPolicy.MUST_SAVE:
+                    captured_hidden_size = hs
+                    captured_num_experts = ne
+                    break
+            if captured_hidden_size is not None:
+                break
+        return "CTX"
+
+    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+        if context_fn is not None:
+            context_fn()
+        return block
+
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
+
+    # VLM pattern: attrs nested under text_config, NOT at top level
+    class TextConfig:
+        hidden_size = 2048
+        num_experts = 128
+
+    class VLMConfig:
+        text_config = TextConfig()
+
+    class VLMModel:
+        def __init__(self):
+            self.config = VLMConfig()
+            self.layers = LayerContainer([DummyBlock()])
+
+    model = VLMModel()
+    P.apply_ac(model, ignore_router=True)
+
+    assert captured_hidden_size == 2048
+    assert captured_num_experts == 128
