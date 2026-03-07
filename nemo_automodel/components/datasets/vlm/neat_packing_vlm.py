@@ -37,7 +37,6 @@ import torch
 import torch.utils.data
 
 from nemo_automodel.components.datasets.llm.neat_packing import (
-    CROSS_ENTROPY_IGNORE_IDX,
     greedy_knapsack,
 )
 from nemo_automodel.components.datasets.vlm.samplers import (
@@ -93,8 +92,6 @@ def greedy_knapsack_vt_balanced(
     vt_sums = [sum(visual_tokens[i] for i in b) for b in bins]
     sorted_idx = sorted(range(len(bins)), key=lambda i: vt_sums[i])
     result = [bins[i] for i in sorted_idx]
-
-    t2 = time.perf_counter()
 
     # Log VT balance statistics
     if result:
