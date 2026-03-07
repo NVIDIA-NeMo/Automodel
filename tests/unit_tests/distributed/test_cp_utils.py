@@ -145,7 +145,6 @@ def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
     assert new_batch is batch
 
 
-<<<<<<< HEAD
 def test_make_cp_batch_and_ctx_3d_mrope_position_ids(monkeypatch):
     """Verify that 3D mRoPE position_ids [3, B, S] are sharded on dim 2 (sequence), not dim 1 (batch)."""
 
