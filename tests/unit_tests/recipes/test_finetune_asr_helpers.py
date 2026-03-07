@@ -143,32 +143,8 @@ def test_build_model_byom_calls_infrastructure():
     assert apply_kwargs["qat_quantizer"] is fake_infra[3]
 
 
-def test_build_model_byom_loss_fn_from_pipeline_config():
-    """When a pipeline_config is provided, its loss_fn is passed to apply_model_infrastructure."""
-    fake_loss_fn = MagicMock(name="loss_fn")
-    pipeline_config = SimpleNamespace(loss_fn=fake_loss_fn)
-
-    with (
-        patch("nemo_automodel.recipes.asr.finetune.MeshContext"),
-        patch("nemo_automodel.recipes.asr.finetune.instantiate_infrastructure") as mock_infra,
-        patch("nemo_automodel.recipes.asr.finetune.apply_model_infrastructure") as mock_apply,
-    ):
-        mock_infra.return_value = (None, None, None, None)
-        mock_apply.return_value = DummyASRModel()
-
-        build_model(
-            cfg_model=_BYOMConfig(),
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=42,
-            pipeline_config=pipeline_config,
-        )
-
-    assert mock_apply.call_args.kwargs["loss_fn"] is fake_loss_fn
-
-
-def test_build_model_byom_no_pipeline_config_loss_fn_is_none():
-    """Without a pipeline_config, loss_fn passed to apply_model_infrastructure is None."""
+def test_build_model_byom_loss_fn_is_none():
+    """loss_fn passed to apply_model_infrastructure is always None (PP removed)."""
     with (
         patch("nemo_automodel.recipes.asr.finetune.MeshContext"),
         patch("nemo_automodel.recipes.asr.finetune.instantiate_infrastructure") as mock_infra,

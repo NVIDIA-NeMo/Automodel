@@ -43,7 +43,6 @@ from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -96,8 +95,7 @@ def build_model(
     device_mesh=None,
     moe_mesh=None,
     distributed_config=None,
-    pipeline_config=None,
-) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
+) -> nn.Module:
     """Build and initialize a model for ASR.
 
     Returns:
@@ -110,7 +108,6 @@ def build_model(
             "device_mesh": device_mesh,
             "moe_mesh": moe_mesh,
             "distributed_config": distributed_config,
-            "pipeline_config": pipeline_config,
             "freeze_config": cfg_freeze.to_dict() if cfg_freeze is not None else None,
         }
         if cfg_fp8 is not None:
@@ -138,12 +135,10 @@ def build_model(
             mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
             model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
                 distributed_config=distributed_config,
-                pipeline_config=pipeline_config,
                 activation_checkpointing=False,
                 device=torch.device("cuda", torch.cuda.current_device()),
                 mesh=mesh,
             )
-            loss_fn = pipeline_config.loss_fn if pipeline_config is not None else None
 
             model = apply_model_infrastructure(
                 model,
@@ -154,7 +149,7 @@ def build_model(
                 autopipeline=autopipeline,
                 parallelize_fn=parallelize_fn,
                 qat_quantizer=qat_quantizer,
-                loss_fn=loss_fn,
+                loss_fn=None,
                 peft_config=kwargs.get("peft_config"),
                 fp8_config=kwargs.get("fp8_config"),
                 compile_config=kwargs.get("compile_config"),
@@ -527,7 +522,6 @@ class FinetuneRecipeForASR(BaseRecipe):
                 dp_size=self.cfg.get("distributed.dp_size", None),
                 dp_replicate_size=self.cfg.get("distributed.dp_replicate_size", None),
                 tp_size=self.cfg.get("distributed.tp_size", 1),
-                pp_size=self.cfg.get("distributed.pp_size", 1),
                 cp_size=self.cfg.get("distributed.cp_size", 1),
                 ep_size=self.cfg.get("distributed.ep_size", 1),
                 world_size=self.dist_env.world_size,
@@ -542,38 +536,7 @@ class FinetuneRecipeForASR(BaseRecipe):
         self._log_experiment_details()
         self._log_library_versions()
 
-        self.pp_enabled: bool = self.cfg.get("distributed.pp_size", 1) > 1
-
-        # Build pipeline config if PP enabled
-        self.pipeline_config = None
-        if self.pp_enabled:
-            pp_size = self.cfg.get("distributed.pp_size", 1)
-            pp_batch_size = self.cfg.step_scheduler.local_batch_size
-            pp_microbatch_size = self.cfg.autopipeline.pp_microbatch_size
-
-            assert pp_batch_size // pp_microbatch_size >= pp_size, (
-                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {pp_size}"
-            )
-
-            assert self.cfg.get("autopipeline", None) is not None, (
-                "AutoPipeline configuration is required when pipeline parallelism is enabled"
-            )
-            assert not isinstance(self.distributed_config, MegatronFSDPConfig), (
-                "MegatronFSDPConfig is not supported when pipeline parallelism is enabled"
-            )
-
-            # Build loss_fn first (needed for pipeline_config)
-            self.loss_fn = build_loss_fn(self.cfg.loss_fn)
-
-            # Instantiate PipelineConfig from YAML, override runtime-computed args
-            self.pipeline_config = self.cfg.autopipeline.instantiate(
-                pp_microbatch_size=pp_microbatch_size,
-                pp_batch_size=pp_batch_size,
-                patch_stage_backward_maybe_with_nosync=self.cfg.get("model.backend.enable_fsdp_optimizations", False),
-                loss_fn=self.loss_fn,
-            )
-        else:
-            self.loss_fn = build_loss_fn(self.cfg.loss_fn)
+        self.loss_fn = build_loss_fn(self.cfg.loss_fn)
 
         # Build components with ASR-specific functions
         self.peft_config = None
@@ -613,7 +576,6 @@ class FinetuneRecipeForASR(BaseRecipe):
             device_mesh=self.device_mesh,
             moe_mesh=self.moe_mesh,
             distributed_config=self.distributed_config,
-            pipeline_config=self.pipeline_config,
         )
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 
@@ -621,12 +583,7 @@ class FinetuneRecipeForASR(BaseRecipe):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
             self.loss_fn = MaskedCrossEntropy()
 
-        if isinstance(model, AutoPipeline):
-            self.model_parts = model.parts
-            self.pp = model
-        else:
-            self.model_parts = [model]
-            self.pp = None
+        self.model_parts = [model]
 
         self.dataloader, self.processor = build_dataloader(
             self.cfg.dataset,
@@ -702,12 +659,9 @@ class FinetuneRecipeForASR(BaseRecipe):
 
                 val_loss = {}
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                    if self.pp_enabled:
-                        logger.warning("Validation is not supported for pipeline parallelism")
-                    else:
-                        val_log_data = self._run_validation_epoch(self.val_dataloader)
-                        val_loss["val_loss"] = val_log_data.metrics["val_loss"]
-                        self.log_val_metrics(val_log_data)
+                    val_log_data = self._run_validation_epoch(self.val_dataloader)
+                    val_loss["val_loss"] = val_log_data.metrics["val_loss"]
+                    self.log_val_metrics(val_log_data)
                     for mp in self.model_parts:
                         mp.train()
 
@@ -750,7 +704,7 @@ class FinetuneRecipeForASR(BaseRecipe):
         labels = batch.pop("labels")
 
         # Determine model type
-        model = self.model_parts[0] if not self.pp_enabled else self.pp.model
+        model = self.model_parts[0]
         is_ctc_model = hasattr(model, "config") and hasattr(model.config, "ctc_loss_reduction")
 
         # Convert input_features to model dtype to avoid dtype mismatch errors during forward pass
@@ -759,75 +713,47 @@ class FinetuneRecipeForASR(BaseRecipe):
             model_dtype = next(model.parameters()).dtype
             batch["input_features"] = batch["input_features"].to(dtype=model_dtype)
 
-        if self.pp_enabled:
-            if not is_train:
-                logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")
-                return
-
-            with train_ctx():
-                losses = [] if self.pp.info.has_last_stage else None
-                if self.pp.info.has_last_stage:
-                    masked_labels = labels.clone()
-                    targets = masked_labels
-                else:
-                    targets = None
-
-                input_ids = batch.pop("input_ids")
-
-                if self.pp.info.has_first_stage:
-                    self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
-                else:
-                    self.pp.info.schedule.step(target=targets, losses=losses, **batch)
-
-            if self.pp.info.has_last_stage:
-                local_loss = torch.sum(torch.stack(losses))
+        sync_ctx = (
+            get_sync_ctx(
+                model,
+                idx == num_batches - 1,
+                defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
+            )
+            if is_train
+            else nullcontext()
+        )
+        with train_ctx(), sync_ctx:
+            if is_ctc_model:
+                # CTC models: Pass labels to model (loss computed internally)
+                out = model(labels=labels if is_train else None, **batch)
+                local_loss = out.loss if is_train else torch.tensor(0.0, device=self.dist_env.device)
             else:
-                local_loss = torch.tensor(0.0, device=self.dist_env.device)
+                # Seq2Seq models: Use external loss function
+                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                    # use num_logits_to_keep to avoid full logits matrix in memory
+                    out = model(logits_to_keep=1, **batch)
+                    if "hidden_states" not in out:
+                        raise ValueError(
+                            "FusedLinearCrossEntropy requires the model to output hidden states. "
+                            "Set `model.text_config.output_hidden_states=True` in the config."
+                        )
+                else:
+                    out = model(**batch)
+
+                local_loss = calculate_loss(
+                    self.loss_fn,
+                    logits=getattr(out, "logits", out),
+                    labels=labels,
+                    model=model,
+                    hidden_states=out.hidden_states[-1]
+                    if getattr(out, "hidden_states", None) is not None
+                    else None,
+                    num_label_tokens=num_label_tokens,
+                )
 
             loss_buffer.append(local_loss.clone().detach())
-        else:
-            model = self.model_parts[0]
-            sync_ctx = (
-                get_sync_ctx(
-                    model,
-                    idx == num_batches - 1,
-                    defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
-                )
-                if is_train
-                else nullcontext()
-            )
-            with train_ctx(), sync_ctx:
-                if is_ctc_model:
-                    # CTC models: Pass labels to model (loss computed internally)
-                    out = model(labels=labels if is_train else None, **batch)
-                    local_loss = out.loss if is_train else torch.tensor(0.0, device=self.dist_env.device)
-                else:
-                    # Seq2Seq models: Use external loss function
-                    if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                        # use num_logits_to_keep to avoid full logits matrix in memory
-                        out = model(logits_to_keep=1, **batch)
-                        if "hidden_states" not in out:
-                            raise ValueError(
-                                "FusedLinearCrossEntropy requires the model to output hidden states. "
-                                "Set `model.text_config.output_hidden_states=True` in the config."
-                            )
-                    else:
-                        out = model(**batch)
-
-                    local_loss = calculate_loss(
-                        self.loss_fn,
-                        logits=getattr(out, "logits", out),
-                        labels=labels,
-                        model=model,
-                        hidden_states=out.hidden_states[-1]
-                        if getattr(out, "hidden_states", None) is not None
-                        else None,
-                        num_label_tokens=num_label_tokens,
-                    )
-
-                loss_buffer.append(local_loss.clone().detach())
-                if is_train:
-                    (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+            if is_train:
+                (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
@@ -850,11 +776,11 @@ class FinetuneRecipeForASR(BaseRecipe):
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
         num_batches = len(batches)
-        prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+        prepare_for_grad_accumulation(self.model_parts, pp_enabled=False)
 
         for i, batch in enumerate(batches):
             if i == num_batches - 1:
-                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+                prepare_for_final_backward(self.model_parts, pp_enabled=False)
 
             self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
@@ -864,11 +790,11 @@ class FinetuneRecipeForASR(BaseRecipe):
             max_grad_norm=max_grad_norm,
             model_parts=self.model_parts,
             norm_type=2.0,
-            pp_enabled=self.pp_enabled,
+            pp_enabled=False,
             device_mesh=self.device_mesh,
             moe_mesh=self.moe_mesh,
             ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
-            pp_axis_name="pp" if self.pp_enabled else None,
+            pp_axis_name=None,
             foreach=True,
             num_label_tokens=num_label_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
@@ -911,30 +837,6 @@ class FinetuneRecipeForASR(BaseRecipe):
         tps = num_tokens_in_batch / time_delta
         reporting_loss = torch.sum(torch.stack(loss_buffer))
         reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
-        if self.pp_enabled:
-            # PP uses sum reduction per microbatch (no internal normalization).
-            # Divide by num_label_tokens to get the mean loss, same as non-PP.
-            reporting_loss = reporting_loss / num_label_tokens
-            reporting_loss = reporting_loss.float().to(self.dist_env.device)
-            # Send loss to first rank from the last PP stage of rank0's mesh coords.
-            # This avoids picking a global-rank sender from a different EP/PP group.
-            if self.device_mesh is not None and "pp" in self.device_mesh.mesh_dim_names:
-                dim_names = list(self.device_mesh.mesh_dim_names)
-                mesh = self.device_mesh.mesh
-                idx = []
-                for name in dim_names:
-                    if name == "pp":
-                        idx.append(-1)
-                    else:
-                        idx.append(0)
-                src_rank = mesh[tuple(idx)].item()
-            else:
-                src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
-            if self.dist_env.rank == src_rank:
-                torch.distributed.send(reporting_loss, dst=0)
-            elif self.dist_env.is_main:
-                torch.distributed.recv(reporting_loss, src=src_rank)
-
         reporting_loss = reporting_loss.item()
 
         return MetricsSample(
