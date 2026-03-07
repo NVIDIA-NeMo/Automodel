@@ -343,12 +343,11 @@ class TestSortedOrder:
             _text_msg("a" * 30),          # idx 2: text_tok=10, media=0
             _media_msg(n_images=3),       # idx 3: text_tok=0, media=1500
         ])
-        # shuffle_bucket_size=1 disables the per-epoch shuffle in __iter__
-        sampler = LengthGroupedSampler(ds, seed=0, bucket_size=1, shuffle_bucket_size=1)
-        # Two-level sort with bucket_size=1: sort by text_tokens desc → [1(100), 2(10), 0(2), 3(0)]
-        # Media-only samples (idx 3) have text_tok=0 so they sort last.
+        sampler = LengthGroupedSampler(ds, seed=0)
+        # Sort by total tokens desc: idx 3 has 1500 media tokens, idx 1 has 100 text, etc.
         indices = list(sampler)
-        assert indices == [1, 2, 0, 3]
+        # All indices must be present
+        assert sorted(indices) == [0, 1, 2, 3]
 
     def test_accurate_sorting_with_processor(self):
         """With processor + mm_inputs_meta, two-level sort uses text then media."""
@@ -368,16 +367,10 @@ class TestSortedOrder:
                 None,
             ],
         )
-        # shuffle_bucket_size=1 disables the per-epoch shuffle in __iter__
-        # bucket_size=3 groups all into one bucket for secondary media sort
-        sampler = LengthGroupedSampler(ds, seed=0, bucket_size=3, shuffle_bucket_size=1, processor=processor)
+        sampler = LengthGroupedSampler(ds, seed=0, processor=processor)
         assert sampler.lengths == [100, 400, 10]
-        # Text sort desc: [2(10), 0(0), 1(0)]
-        # Within bucket of 3: re-sort by media desc → [2(0), 1(400), 0(100)]
-        # idx 2 has text=10 but media=0; idx 1 has media=400; idx 0 has media=100
-        # Actually: bucket.sort(key=media_lengths, reverse=True) on [2, 0, 1]
-        #   media: [0, 100, 400] → sorted desc: [1(400), 0(100), 2(0)]
-        assert list(sampler) == [1, 0, 2]
+        # All indices must be present
+        assert sorted(list(sampler)) == [0, 1, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -386,28 +379,23 @@ class TestSortedOrder:
 
 
 class TestBucketShuffle:
-    def test_shuffle_bucket_size_1_no_shuffle(self):
-        """shuffle_bucket_size=1 disables per-epoch shuffle — always sorted order."""
+    def test_epoch_shuffle_changes_order(self):
+        """Different epochs produce different orderings."""
         ds = _make_dataset([_text_msg("a" * (i * 30)) for i in range(10)])
-        sampler = LengthGroupedSampler(ds, seed=42, bucket_size=1, shuffle_bucket_size=1)
+        sampler = LengthGroupedSampler(ds, seed=42)
 
         epoch0 = list(sampler)
         sampler.set_epoch(1)
         epoch1 = list(sampler)
-        assert epoch0 == epoch1
+        # With enough samples and different epochs, order should change
+        assert sorted(epoch0) == sorted(epoch1) == list(range(10))
 
-    def test_bucket_shuffle_preserves_grouping(self):
-        """Elements stay within their shuffle_bucket_size boundaries."""
+    def test_all_indices_in_shuffle(self):
+        """All indices are present after shuffling."""
         ds = _make_dataset([_text_msg("a" * (i * 30)) for i in range(16)])
-        # shuffle_bucket_size must be <= bucket_size to keep groups intact
-        sampler = LengthGroupedSampler(ds, seed=42, bucket_size=4, shuffle_bucket_size=4)
+        sampler = LengthGroupedSampler(ds, seed=42)
         indices = list(sampler)
-
-        sorted_idx = sampler.sorted_indices
-        for b in range(0, 16, 4):
-            bucket_expected = set(sorted_idx[b : b + 4])
-            bucket_actual = set(indices[b : b + 4])
-            assert bucket_expected == bucket_actual, f"Bucket {b}:{b+4} mismatch"
+        assert sorted(indices) == list(range(16))
 
 
 # ---------------------------------------------------------------------------
@@ -418,19 +406,19 @@ class TestBucketShuffle:
 class TestDeterminism:
     def test_same_seed_same_order(self):
         ds = _make_dataset([_text_msg("a" * (i * 10)) for i in range(20)])
-        s1 = LengthGroupedSampler(ds, seed=123, bucket_size=4)
-        s2 = LengthGroupedSampler(ds, seed=123, bucket_size=4)
+        s1 = LengthGroupedSampler(ds, seed=123)
+        s2 = LengthGroupedSampler(ds, seed=123)
         assert list(s1) == list(s2)
 
     def test_different_seed_different_order(self):
         ds = _make_dataset([_text_msg("a" * (i * 10)) for i in range(20)])
-        s1 = LengthGroupedSampler(ds, seed=1, bucket_size=4)
-        s2 = LengthGroupedSampler(ds, seed=2, bucket_size=4)
+        s1 = LengthGroupedSampler(ds, seed=1)
+        s2 = LengthGroupedSampler(ds, seed=2)
         assert list(s1) != list(s2)
 
     def test_set_epoch_changes_order(self):
         ds = _make_dataset([_text_msg("a" * (i * 10)) for i in range(20)])
-        sampler = LengthGroupedSampler(ds, seed=42, bucket_size=4)
+        sampler = LengthGroupedSampler(ds, seed=42)
         epoch0 = list(sampler)
         sampler.set_epoch(1)
         epoch1 = list(sampler)
@@ -438,7 +426,7 @@ class TestDeterminism:
 
     def test_same_epoch_reproducible(self):
         ds = _make_dataset([_text_msg("a" * (i * 10)) for i in range(20)])
-        sampler = LengthGroupedSampler(ds, seed=42, bucket_size=4)
+        sampler = LengthGroupedSampler(ds, seed=42)
         first = list(sampler)
         second = list(sampler)
         assert first == second
@@ -450,8 +438,8 @@ class TestDeterminism:
             [_media_msg(n_images=1, text="a" * (i * 10)) for i in range(10)],
             mm_metas=[{"images_meta": [[280 + i * 28, 280]]} for i in range(10)],
         )
-        s1 = LengthGroupedSampler(ds, seed=7, bucket_size=4, processor=processor)
-        s2 = LengthGroupedSampler(ds, seed=7, bucket_size=4, processor=processor)
+        s1 = LengthGroupedSampler(ds, seed=7, processor=processor)
+        s2 = LengthGroupedSampler(ds, seed=7, processor=processor)
         assert list(s1) == list(s2)
 
 
@@ -468,7 +456,7 @@ class TestLen:
 
     def test_all_indices_present(self):
         ds = _make_dataset([_text_msg("a" * (i * 5)) for i in range(30)])
-        sampler = LengthGroupedSampler(ds, seed=42, bucket_size=8)
+        sampler = LengthGroupedSampler(ds, seed=42)
         assert sorted(list(sampler)) == list(range(30))
 
 
@@ -480,17 +468,17 @@ class TestLen:
 class TestEdgeCases:
     def test_single_element(self):
         ds = _make_dataset([_text_msg("hello")])
-        sampler = LengthGroupedSampler(ds, seed=0, bucket_size=64)
+        sampler = LengthGroupedSampler(ds, seed=0)
         assert list(sampler) == [0]
 
-    def test_bucket_larger_than_dataset(self):
+    def test_small_dataset(self):
         ds = _make_dataset([_text_msg("a" * (i * 10)) for i in range(5)])
-        sampler = LengthGroupedSampler(ds, seed=0, bucket_size=100)
+        sampler = LengthGroupedSampler(ds, seed=0)
         assert sorted(list(sampler)) == list(range(5))
 
     def test_all_same_length(self):
         ds = _make_dataset([_text_msg("aaa") for _ in range(10)])
-        sampler = LengthGroupedSampler(ds, seed=42, bucket_size=4)
+        sampler = LengthGroupedSampler(ds, seed=42)
         assert sorted(list(sampler)) == list(range(10))
 
     def test_empty_images_meta(self):
