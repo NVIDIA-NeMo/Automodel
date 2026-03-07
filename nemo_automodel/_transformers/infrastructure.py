@@ -307,11 +307,13 @@ def _uses_te_attention(model) -> bool:
     except ImportError:
         return False
 
-    for name, module in model.named_modules():
-        if name.endswith("self_attn"):
-            attn_module = getattr(module, "attn_module", None)
-            if isinstance(attn_module, DotProductAttention):
-                return True
+    model_parts = model.parts if hasattr(model, "parts") else [model]
+    for part in model_parts:
+        for name, module in part.named_modules():
+            if name.endswith("self_attn"):
+                attn_module = getattr(module, "attn_module", None)
+                if isinstance(attn_module, DotProductAttention):
+                    return True
     return False
 
 
