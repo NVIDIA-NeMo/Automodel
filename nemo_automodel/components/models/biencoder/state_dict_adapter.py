@@ -37,10 +37,11 @@ class BiencoderStateDictAdapter(StateDictAdapter):
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
         """Convert from biencoder state dict to HuggingFace format.
 
-        Filters to only lm_q keys and converts "lm_q." prefix to "model." prefix.
-        Also handles the ``base_model.model.`` prefix that PEFT checkpointing adds
-        so that adapter weights are correctly converted (e.g.
-        ``base_model.model.lm_q.X`` → ``base_model.model.model.X``).
+        Filters to only lm_q keys and converts "lm_q." prefix to "model." prefix
+        for base-model weights.  For PEFT adapter weights (prefixed with
+        ``base_model.model.``), the ``lm_q.`` segment is stripped so that keys
+        match the standalone HF model's module names (e.g.
+        ``base_model.model.lm_q.X`` → ``base_model.model.X``).
 
         Args:
             state_dict: The biencoder model state dict
@@ -54,10 +55,10 @@ class BiencoderStateDictAdapter(StateDictAdapter):
 
         for key, value in state_dict.items():
             if key.startswith("lm_q."):
-                new_key = "model." + key[len("lm_q.") :]
+                new_key = "model." + key[len("lm_q."):]
                 hf_state_dict[new_key] = value
             elif key.startswith(peft_lm_q):
-                new_key = self._PEFT_PREFIX + "model." + key[len(peft_lm_q) :]
+                new_key = self._PEFT_PREFIX + key[len(peft_lm_q):]
                 hf_state_dict[new_key] = value
             elif key.startswith("linear_pooler.") or key.startswith(peft_pooler):
                 hf_state_dict[key] = value
@@ -74,7 +75,7 @@ class BiencoderStateDictAdapter(StateDictAdapter):
 
         Converts "model." prefix to "lm_q." prefix for loading into biencoder.
         Also handles the ``base_model.model.`` prefix used by PEFT checkpoints
-        (e.g. ``base_model.model.model.X`` → ``base_model.model.lm_q.X``).
+        (e.g. ``base_model.model.X`` → ``base_model.model.lm_q.X``).
 
         Args:
             hf_state_dict: The HuggingFace format state dict
@@ -84,20 +85,21 @@ class BiencoderStateDictAdapter(StateDictAdapter):
             The converted biencoder format state dict
         """
         biencoder_state_dict = {}
-        peft_model = self._PEFT_PREFIX + "model."
         peft_pooler = self._PEFT_PREFIX + "linear_pooler."
 
         for key, value in hf_state_dict.items():
-            if key.startswith("model."):
-                suffix = key[len("model.") :]
-                biencoder_state_dict["lm_q." + suffix] = value
-                biencoder_state_dict["lm_p." + suffix] = value
-            elif key.startswith(peft_model):
-                suffix = key[len(peft_model) :]
+            if key.startswith("linear_pooler.") or key.startswith(peft_pooler):
+                biencoder_state_dict[key] = value
+            elif key.startswith(self._PEFT_PREFIX):
+                # PEFT format: base_model.model.X → base_model.model.lm_q.X
+                suffix = key[len(self._PEFT_PREFIX):]
                 biencoder_state_dict[self._PEFT_PREFIX + "lm_q." + suffix] = value
                 biencoder_state_dict[self._PEFT_PREFIX + "lm_p." + suffix] = value
-            elif key.startswith("linear_pooler.") or key.startswith(peft_pooler):
-                biencoder_state_dict[key] = value
+            elif key.startswith("model."):
+                # Full checkpoint: model.X → lm_q.X
+                suffix = key[len("model."):]
+                biencoder_state_dict["lm_q." + suffix] = value
+                biencoder_state_dict["lm_p." + suffix] = value
 
         return biencoder_state_dict
 
