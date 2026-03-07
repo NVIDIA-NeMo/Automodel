@@ -16,7 +16,6 @@
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 from transformers import LlamaConfig
 
@@ -321,9 +320,7 @@ class TestLlamaLoRAFunctionalSplit:
         ]
         for fragment in forbidden_fragments:
             offending = [k for k in hf_sd if fragment in k]
-            assert offending == [], (
-                f"Found forbidden fragment '{fragment}' in converted state dict keys: {offending}"
-            )
+            assert offending == [], f"Found forbidden fragment '{fragment}' in converted state dict keys: {offending}"
 
     def test_split_qkv_lora_a_identical(self):
         """lora_A weights for q/k/v must be identical (replicated, not split)."""
@@ -437,3 +434,108 @@ class TestLlamaLoRAFunctionalSplit:
             assert f"{pre}.self_attn.v_proj" in target_modules
             assert f"{pre}.mlp.gate_proj" in target_modules
             assert f"{pre}.mlp.up_proj" in target_modules
+
+
+class TestCombinedProjectionBiasDTensorHelpers:
+    def test_gather_1d_bias_uses_full_tensor_for_sharded_dtensor(self, monkeypatch):
+        import torch.distributed.tensor as dtensor_mod
+        import torch.distributed.tensor.placement_types as placement_types
+
+        class FakeShard:
+            def __init__(self, dim):
+                self.dim = dim
+
+        class FakeReplicate:
+            pass
+
+        class FakeDTensor:
+            def __init__(self, tensor, device_mesh, placements):
+                self._tensor = tensor
+                self.device_mesh = device_mesh
+                self.placements = tuple(placements)
+                self.ndim = tensor.ndim
+                self.full_tensor_calls = 0
+                self.redistribute_calls = []
+
+            def full_tensor(self):
+                self.full_tensor_calls += 1
+                return self._tensor.clone()
+
+            def redistribute(self, device_mesh=None, placements=None):
+                self.redistribute_calls.append((device_mesh, placements))
+                return FakeDTensor(
+                    self._tensor.clone(),
+                    device_mesh if device_mesh is not None else self.device_mesh,
+                    placements if placements is not None else self.placements,
+                )
+
+        monkeypatch.setattr(dtensor_mod, "DTensor", FakeDTensor)
+        monkeypatch.setattr(placement_types, "Replicate", FakeReplicate)
+        monkeypatch.setattr(placement_types, "Shard", FakeShard)
+
+        mesh = object()
+        dtensor = FakeDTensor(torch.arange(8.0), mesh, (FakeShard(0),))
+
+        gathered, orig = CombinedProjectionStateDictAdapter._gather_1d_bias(dtensor)
+
+        assert isinstance(gathered, torch.Tensor)
+        torch.testing.assert_close(gathered, torch.arange(8.0))
+        assert orig == (mesh, dtensor.placements)
+        assert dtensor.full_tensor_calls == 1
+        assert dtensor.redistribute_calls == []
+
+    def test_restore_1d_bias_rebuilds_replicated_dtensor_before_resharding(self, monkeypatch):
+        import torch.distributed.tensor as dtensor_mod
+        import torch.distributed.tensor.placement_types as placement_types
+
+        class FakeShard:
+            def __init__(self, dim):
+                self.dim = dim
+
+        class FakeReplicate:
+            pass
+
+        class FakeDTensor:
+            from_local_calls = []
+            redistribute_calls = []
+
+            def __init__(self, tensor, device_mesh, placements):
+                self._tensor = tensor
+                self.device_mesh = device_mesh
+                self.placements = tuple(placements)
+                self.ndim = tensor.ndim
+
+            @classmethod
+            def from_local(cls, local_tensor, device_mesh=None, placements=None, **kwargs):
+                cls.from_local_calls.append((local_tensor.clone(), device_mesh, tuple(placements), kwargs))
+                return cls(local_tensor.clone(), device_mesh, placements)
+
+            def redistribute(self, device_mesh=None, placements=None):
+                FakeDTensor.redistribute_calls.append((device_mesh, tuple(placements)))
+                return FakeDTensor(
+                    self._tensor.clone(),
+                    device_mesh if device_mesh is not None else self.device_mesh,
+                    placements if placements is not None else self.placements,
+                )
+
+        monkeypatch.setattr(dtensor_mod, "DTensor", FakeDTensor)
+        monkeypatch.setattr(placement_types, "Replicate", FakeReplicate)
+        monkeypatch.setattr(placement_types, "Shard", FakeShard)
+
+        mesh = object()
+        shard = FakeShard(0)
+        full_bias = torch.arange(8.0)
+
+        restored = CombinedProjectionStateDictAdapter._restore_1d_bias(full_bias, (mesh, (shard,)))
+
+        assert isinstance(restored, FakeDTensor)
+        assert restored.device_mesh is mesh
+        assert restored.placements == (shard,)
+        assert len(FakeDTensor.from_local_calls) == 1
+        gathered_bias, gathered_mesh, gathered_placements, kwargs = FakeDTensor.from_local_calls[0]
+        torch.testing.assert_close(gathered_bias, full_bias)
+        assert gathered_mesh is mesh
+        assert len(gathered_placements) == 1
+        assert isinstance(gathered_placements[0], FakeReplicate)
+        assert kwargs == {"run_check": False}
+        assert FakeDTensor.redistribute_calls == [(mesh, (shard,))]
