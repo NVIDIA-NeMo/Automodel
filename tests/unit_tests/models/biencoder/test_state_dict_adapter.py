@@ -190,3 +190,42 @@ class TestBiencoderStateDictAdapter:
         # Should only replace the first occurrence of lm_q.
         assert "model.model.layer.sublayer.weight" in hf_state_dict
         assert "lm_q.model.layer.sublayer.weight" not in hf_state_dict
+
+    def test_to_hf_peft_keys_strip_lm_q(self, adapter):
+        """PEFT keys should have lm_q. stripped without adding model. prefix."""
+        state_dict = {
+            "base_model.model.lm_q.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(8, 64),
+            "base_model.model.lm_q.layers.0.self_attn.q_proj.lora_B.weight": torch.randn(64, 8),
+        }
+
+        hf_state_dict = adapter.to_hf(state_dict)
+
+        assert "base_model.model.layers.0.self_attn.q_proj.lora_A.weight" in hf_state_dict
+        assert "base_model.model.layers.0.self_attn.q_proj.lora_B.weight" in hf_state_dict
+        # Should NOT have extra model. prefix
+        assert "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight" not in hf_state_dict
+
+    def test_from_hf_peft_keys_add_lm_q(self, adapter):
+        """PEFT keys should get lm_q./lm_p. inserted after base_model.model. prefix."""
+        hf_state_dict = {
+            "base_model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(8, 64),
+        }
+
+        biencoder_state_dict = adapter.from_hf(hf_state_dict)
+
+        assert "base_model.model.lm_q.layers.0.self_attn.q_proj.lora_A.weight" in biencoder_state_dict
+        assert "base_model.model.lm_p.layers.0.self_attn.q_proj.lora_A.weight" in biencoder_state_dict
+
+    def test_peft_roundtrip(self, adapter):
+        """PEFT keys should survive a to_hf → from_hf roundtrip."""
+        original = {
+            "base_model.model.lm_q.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(8, 64),
+            "base_model.model.lm_q.layers.0.mlp.down_proj.lora_B.weight": torch.randn(64, 8),
+        }
+
+        hf = adapter.to_hf(original)
+        restored = adapter.from_hf(hf)
+
+        for key in original:
+            assert key in restored, f"Missing key {key} after roundtrip"
+            torch.testing.assert_close(restored[key], original[key])
