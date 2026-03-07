@@ -274,15 +274,13 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
 
     for _, block in _model.layers.named_children():
         attn_module = block.self_attn.attn_module
-        assert isinstance(attn_module, DotProductAttention), (
-            "Context parallelism is only supported for TransformerEngine's DotProductAttention"
-        )
-        attn_module.set_context_parallel_group(
-            cp_mesh.get_group(),
-            torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
-            _get_cp_stream(),
-            cp_comm_type=cp_comm_type,
-        )
+        if isinstance(attn_module, DotProductAttention):
+            attn_module.set_context_parallel_group(
+                cp_mesh.get_group(),
+                torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
+                _get_cp_stream(),
+                cp_comm_type=cp_comm_type,
+            )
 
         moe_module = block.moe if hasattr(block, "moe") else block.mlp
         if isinstance(moe_module, MoE):

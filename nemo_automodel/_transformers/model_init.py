@@ -391,3 +391,59 @@ def _filter_kwargs_for_init(model_cls, kwargs: dict) -> dict:
     # We pass `config` positionally.
     allowed.discard("config")
     return {k: v for k, v in kwargs.items() if k in allowed}
+
+
+def resolve_sdpa_method(
+    cfg_sdpa_method: list[str] | None = None,
+    device_mesh=None,
+    activation_checkpointing: bool = False,
+) -> list["SDPBackend"] | None:  # noqa: F821
+    """Resolve SDPA backend list from config strings or runtime constraints.
+
+    When *cfg_sdpa_method* is provided (e.g. from YAML), its string values are
+    converted to :class:`torch.nn.attention.SDPBackend` enum members.  When it
+    is ``None``, automatic defaults are applied based on context parallelism and
+    activation checkpointing settings.
+
+    Valid string values (case-insensitive): ``flash_attention``,
+    ``efficient_attention``, ``math``, ``cudnn_attention``.
+
+    Args:
+        cfg_sdpa_method: Explicit list of backend name strings from config, or
+            ``None`` to use automatic defaults.
+        device_mesh: Device mesh for distributed training.
+        activation_checkpointing: Whether activation checkpointing is enabled.
+
+    Returns:
+        Ordered list of :class:`SDPBackend` members, or ``None`` to use
+        PyTorch's default selection.
+    """
+    from torch.nn.attention import SDPBackend
+
+    _NAME_TO_BACKEND = dict(SDPBackend.__members__)
+
+    if cfg_sdpa_method is not None:
+        backends = []
+        for name in cfg_sdpa_method:
+            key = name.upper()
+            if key not in _NAME_TO_BACKEND:
+                raise ValueError(f"Unknown SDPA backend '{name}'. Valid values: {sorted(_NAME_TO_BACKEND.keys())}")
+            backends.append(_NAME_TO_BACKEND[key])
+        return backends
+
+    # Auto-select based on runtime constraints
+    cp_size = 1
+    if device_mesh is not None and "cp" in device_mesh.mesh_dim_names:
+        cp_size = device_mesh["cp"].size()
+
+    if cp_size > 1:
+        # CP with DTensor only supports flash and efficient backends;
+        # MATH is not compatible with DTensor.
+        return [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+    elif activation_checkpointing:
+        # For activation checkpointing, disable cudnn SDPA backend because
+        # it may not be selected during recomputation, causing:
+        # "Recomputed values have different metadata than during forward pass."
+        return [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+
+    return None
