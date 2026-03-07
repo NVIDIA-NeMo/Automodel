@@ -188,10 +188,21 @@ def _rename_dora_keys_from_hf(sd: dict[str, Any]) -> None:
 
 
 def _get_lm_head_weight_and_name(model: torch.nn.Module) -> Optional[tuple[torch.Tensor, str]]:
-    for name, param in model.named_parameters(remove_duplicate=False):
+    # normalized name -> param map
+    params_by_name = {name.replace("_orig_mod.", ""): param for name, param in model.named_parameters(remove_duplicate=False)}
+
+    # Prefer _tied_weights_keys if defined (HuggingFace convention). Models like
+    tied_keys = getattr(model, "_tied_weights_keys", None)
+    if tied_keys:
+        for key in tied_keys:
+            if key in params_by_name:
+                return params_by_name[key], key
+
+    # Whisper use "proj_out.weight" instead of the conventional "lm_head.weight"
+    # Fall back to searching for lm_head.weight by name
+    for name, param in params_by_name.items():
         if "lm_head" in name and name.endswith(".weight"):
-            normalized_name = name.replace("_orig_mod.", "")
-            return param, normalized_name
+            return param, name
 
     return None, None
 
