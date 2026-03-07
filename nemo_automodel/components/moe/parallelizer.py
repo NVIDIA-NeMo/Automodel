@@ -117,9 +117,12 @@ def apply_ac(
     """
     # Derive hidden_size and num_experts from model.config if not provided
     if hidden_size is None:
-        if hasattr(model, "config") and hasattr(model.config, "hidden_size"):
-            hidden_size = model.config.hidden_size
-        else:
+        cfg = getattr(model, "config", None)
+        # VLM models nest language model config under text_config
+        hidden_size = getattr(getattr(cfg, "text_config", None), "hidden_size", None) or getattr(
+            cfg, "hidden_size", None
+        )
+        if hidden_size is None:
             raise ValueError("hidden_size must be provided or model must have config.hidden_size attribute")
 
     if num_experts is None:
@@ -127,9 +130,11 @@ def apply_ac(
         if hasattr(_inner, "moe_config") and hasattr(_inner.moe_config, "n_routed_experts"):
             num_experts = _inner.moe_config.n_routed_experts
         else:
+            cfg = getattr(model, "config", None)
+            text_cfg = getattr(cfg, "text_config", cfg)
             for attr in ["num_experts", "moe_num_experts", "n_routed_experts"]:
-                if hasattr(model, "config") and hasattr(model.config, attr):
-                    num_experts = getattr(model.config, attr)
+                if text_cfg is not None and hasattr(text_cfg, attr):
+                    num_experts = getattr(text_cfg, attr)
                     break
             else:
                 raise ValueError("num_experts must be provided or model must have config.num_experts attribute")

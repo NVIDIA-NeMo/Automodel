@@ -102,13 +102,15 @@ diffusion = [
 # https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
 # "flash-attn==2.8.1",
 cuda = [
-    "bitsandbytes",
     "causal-conv1d",
     "mamba-ssm",
     "nv-grouped-gemm",
     # This is required to prevent ONNX errors arising from TE
     "onnxscript>=0.5.6",
     "transformer-engine[pytorch]<=2.11.0",
+]
+cuda_source = [
+    "bitsandbytes",
 ]
 extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]

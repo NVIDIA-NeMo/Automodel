@@ -3226,7 +3226,6 @@ dependencies = [
 all = [
     { name = "albumentations" },
     { name = "backoff" },
-    { name = "bitsandbytes" },
     { name = "causal-conv1d" },
     { name = "databricks-sql-connector" },
     { name = "deltalake" },
@@ -3255,12 +3254,14 @@ all = [
     { name = "transformer-engine", marker = "sys_platform == 'never'" },
 ]
 cuda = [
-    { name = "bitsandbytes" },
     { name = "causal-conv1d" },
     { name = "mamba-ssm" },
     { name = "nv-grouped-gemm" },
     { name = "onnxscript" },
     { name = "transformer-engine", marker = "sys_platform == 'never'" },
+]
+cuda-source = [
+    { name = "bitsandbytes" },
 ]
 delta-databricks = [
     { name = "databricks-sql-connector" },
@@ -3282,7 +3283,6 @@ fa = [
     { name = "flash-attn", marker = "sys_platform == 'never'" },
 ]
 moe = [
-    { name = "bitsandbytes" },
     { name = "causal-conv1d" },
     { name = "deep-ep" },
     { name = "mamba-ssm" },
@@ -3347,7 +3347,7 @@ test = [
 requires-dist = [
     { name = "albumentations", marker = "extra == 'vlm'" },
     { name = "backoff", marker = "extra == 'vlm'" },
-    { name = "bitsandbytes", marker = "extra == 'cuda'" },
+    { name = "bitsandbytes", marker = "extra == 'cuda-source'" },
     { name = "causal-conv1d", marker = "extra == 'cuda'" },
     { name = "databricks-sql-connector", marker = "extra == 'delta-databricks'", specifier = ">=3.0.0" },
     { name = "datasets", specifier = ">=4.0.0" },
@@ -3395,7 +3395,7 @@ requires-dist = [
     { name = "transformers", specifier = ">=5.0.0" },
     { name = "wandb" },
 ]
-provides-extras = ["diffusion", "cuda", "extra", "fa", "delta-databricks", "moe", "vlm", "all"]
+provides-extras = ["diffusion", "cuda", "cuda-source", "extra", "fa", "delta-databricks", "moe", "vlm", "all"]
 
 [package.metadata.requires-dev]
 build = [
