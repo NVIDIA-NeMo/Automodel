@@ -321,7 +321,7 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
             remapped = set()
             for name in final_target_modules:
                 if name.startswith("lm_q."):
-                    remapped.add(name[len("lm_q."):])
+                    remapped.add(name[len("lm_q.") :])
                 else:
                     remapped.add(name)
             final_target_modules = remapped
