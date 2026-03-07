@@ -206,7 +206,7 @@ class TestBiencoderStateDictAdapter:
         assert "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight" not in hf_state_dict
 
     def test_from_hf_peft_keys_add_lm_q(self, adapter):
-        """PEFT keys should get lm_q./lm_p. inserted after base_model.model. prefix."""
+        """PEFT keys should get lm_q. inserted after base_model.model. prefix (not lm_p)."""
         hf_state_dict = {
             "base_model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(8, 64),
         }
@@ -214,10 +214,11 @@ class TestBiencoderStateDictAdapter:
         biencoder_state_dict = adapter.from_hf(hf_state_dict)
 
         assert "base_model.model.lm_q.layers.0.self_attn.q_proj.lora_A.weight" in biencoder_state_dict
-        assert "base_model.model.lm_p.layers.0.self_attn.q_proj.lora_A.weight" in biencoder_state_dict
+        # PEFT keys should NOT be fanned out to lm_p (shared encoder)
+        assert "base_model.model.lm_p.layers.0.self_attn.q_proj.lora_A.weight" not in biencoder_state_dict
 
     def test_peft_roundtrip(self, adapter):
-        """PEFT keys should survive a to_hf → from_hf roundtrip."""
+        """PEFT lm_q keys should survive a to_hf → from_hf roundtrip."""
         original = {
             "base_model.model.lm_q.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(8, 64),
             "base_model.model.lm_q.layers.0.mlp.down_proj.lora_B.weight": torch.randn(64, 8),
@@ -229,3 +230,5 @@ class TestBiencoderStateDictAdapter:
         for key in original:
             assert key in restored, f"Missing key {key} after roundtrip"
             torch.testing.assert_close(restored[key], original[key])
+        # lm_p should NOT appear in PEFT roundtrip
+        assert not any("lm_p" in k for k in restored)

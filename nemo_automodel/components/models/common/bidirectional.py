@@ -49,11 +49,11 @@ class BiencoderStateDictAdapter(StateDictAdapter):
         Returns ``None`` when *key* doesn't match *src* (bare or PEFT-wrapped).
         """
         if key.startswith(src):
-            return dst + key[len(src):]
+            return dst + key[len(src) :]
         peft_src = peft_prefix + src
         if key.startswith(peft_src):
             effective_dst = peft_dst if peft_dst is not None else dst
-            return peft_prefix + effective_dst + key[len(peft_src):]
+            return peft_prefix + effective_dst + key[len(peft_src) :]
         return None
 
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
@@ -84,10 +84,11 @@ class BiencoderStateDictAdapter(StateDictAdapter):
         biencoder_state_dict = {}
         for key, value in hf_state_dict.items():
             if key.startswith(self._PEFT_PREFIX):
-                # PEFT format: base_model.model.X → base_model.model.lm_q/lm_p.X
-                suffix = key[len(self._PEFT_PREFIX):]
+                # PEFT format: base_model.model.X → base_model.model.lm_q.X
+                # Only restore to lm_q; lm_p shares parameters in shared-encoder
+                # mode and loading into lm_p would fail with FSDP DTensors.
+                suffix = key[len(self._PEFT_PREFIX) :]
                 biencoder_state_dict[self._PEFT_PREFIX + "lm_q." + suffix] = value
-                biencoder_state_dict[self._PEFT_PREFIX + "lm_p." + suffix] = value
             else:
                 q_key = self._swap_key(key, "model.", "lm_q.", self._PEFT_PREFIX)
                 if q_key is not None:
