@@ -89,12 +89,12 @@ class CombinedProjectionStateDictAdapter:
     #   (e.g. hidden_size elements).
     #
     # The two helpers form a pair:
-    #   _gather_1d_bias  – all-gather to Replicate so reshape/split/cat work
-    #   _restore_1d_bias – redistribute back to the original Shard(0)
+    #   _gather_1d_bias  – materialize the full bias so reshape/split/cat work
+    #   _restore_1d_bias – re-create a DTensor and restore the original sharding
 
     @staticmethod
     def _gather_1d_bias(tensor: torch.Tensor) -> tuple[torch.Tensor, tuple | None]:
-        """All-gather a 1-D bias DTensor to ``Replicate``.
+        """Materialize a 1-D bias DTensor as a full tensor.
 
         Must only be called on 1-D bias tensors.  Returns
         ``(gathered, orig_placement)`` where *orig_placement* is a
@@ -113,7 +113,10 @@ class CombinedProjectionStateDictAdapter:
         new_placements = tuple(Replicate() if isinstance(p, Shard) and p.dim == 0 else p for p in tensor.placements)
         if new_placements == tensor.placements:
             return tensor, orig
-        return tensor.redistribute(tensor.device_mesh, new_placements), orig
+        # PyTorch 2.10 tightened DTensor shard-order validation during
+        # shard->replicate redistribute for some 1-D tensors. Bias tensors are
+        # tiny, so materializing the full value is the safest cross-version path.
+        return tensor.full_tensor(), orig
 
     @staticmethod
     def _restore_1d_bias(tensor: torch.Tensor, orig_placement: tuple | None) -> torch.Tensor:
@@ -124,7 +127,25 @@ class CombinedProjectionStateDictAdapter:
         assert tensor.ndim == 1, f"_restore_1d_bias expects a 1-D bias tensor, got ndim={tensor.ndim}"
         if orig_placement is None:
             return tensor
-        return tensor.redistribute(*orig_placement)
+        try:
+            from torch.distributed.tensor import DTensor
+            from torch.distributed.tensor.placement_types import Replicate
+        except ImportError:
+            return tensor
+
+        device_mesh, placements = orig_placement
+        if isinstance(tensor, DTensor):
+            if tensor.device_mesh == device_mesh and tensor.placements == placements:
+                return tensor
+            return tensor.redistribute(device_mesh, placements)
+
+        replicated = DTensor.from_local(
+            tensor,
+            device_mesh=device_mesh,
+            placements=tuple(Replicate() for _ in placements),
+            run_check=False,
+        )
+        return replicated.redistribute(device_mesh, placements)
 
     # ── Interleave / de-interleave ──────────────────────────────────────
 
