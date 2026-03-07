@@ -22,6 +22,7 @@ variants of:
 - Ministral3ForCausalLM (NeMo Automodel custom)
 - LlamaForCausalLM (NeMo Automodel custom, combined QKV + gate_up projections)
 - Qwen2ForCausalLM (NeMo Automodel custom, combined QKV + gate_up projections)
+- Nemotron Super (LlamaForCausalLM, 10-layer full-hidden, llama_nemotron_super_tp_plan)
 
 It also validates both tensor-parallel plans:
 - sequence_parallel=False
@@ -32,7 +33,7 @@ Usage:
 
     # Optional: select models / SP mode
     torchrun --nproc_per_node=2 tests/functional_tests/llm_pretrain_and_kd/run_tp_output_parity_minified.py \\
-        --models qwen3 qwen3_seq_cls ministral3 \\
+        --models qwen3 qwen3_seq_cls ministral3 nemotron \\
         --sequence_parallel both \\
         --kl_threshold 2e-6
 """
@@ -62,7 +63,7 @@ from nemo_automodel.components.models.llama.model import LlamaConfig, LlamaForCa
 from nemo_automodel.components.models.mistral3.model import Ministral3Config, Ministral3ForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2Config, Qwen2ForCausalLM
 
-ModelKind = Literal["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2"]
+ModelKind = Literal["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2", "nemotron"]
 SPMode = Literal["true", "false", "both"]
 
 
@@ -230,6 +231,25 @@ def _build_minified_model(kind: ModelKind):
         )
         return cfg, LlamaForCausalLM(cfg, backend=backend)
 
+    if kind == "nemotron":
+        num_layers = 10
+        backend = BackendConfig(rms_norm="torch")
+        cfg = LlamaConfig(
+            vocab_size=128,
+            hidden_size=8192,
+            intermediate_size=28672,
+            num_hidden_layers=num_layers,
+            num_attention_heads=64,
+            num_key_value_heads=8,
+            max_position_embeddings=2048,
+            use_cache=False,
+            tie_word_embeddings=True,
+            attention_bias=False,
+            attn_implementation="sdpa",
+            torch_dtype=torch.bfloat16,
+        )
+        return cfg, LlamaForCausalLM(cfg, backend=backend)
+
     if kind == "qwen2":
         num_layers = 2
         backend = BackendConfig(rms_norm="torch")
@@ -302,8 +322,9 @@ def _run_case(
     tp_model = tp_model.to(device=device, dtype=torch.bfloat16)
     tp_model.eval()
 
+    tp_shard_plan = "llama_nemotron_super_tp_plan" if case.kind == "nemotron" else None
     tp_mesh = DeviceMesh(device_type, torch.arange(world_size, device="cpu"), mesh_dim_names=("tp",))
-    plan = _get_parallel_plan(tp_model, sequence_parallel=case.sequence_parallel)
+    plan = _get_parallel_plan(tp_model, sequence_parallel=case.sequence_parallel, tp_shard_plan=tp_shard_plan)
     parallelize_module(tp_model, tp_mesh, plan)
 
     with torch.inference_mode():
@@ -324,9 +345,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--models",
         nargs="+",
-        default=["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2"],
-        choices=["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2"],
-        help="Which models to test.",
+        default=["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2", "nemotron"],
+        choices=["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2", "nemotron"],
+        help="Which models to test. 'nemotron' uses 10-layer full-hidden LlamaForCausalLM with llama_nemotron_super_tp_plan.",
     )
     parser.add_argument(
         "--sequence_parallel",
