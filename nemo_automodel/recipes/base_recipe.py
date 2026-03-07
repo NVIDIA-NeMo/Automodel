@@ -351,9 +351,24 @@ class BaseRecipe:
             # Unwrap DDP if present
             if isinstance(unwrapped_model, DistributedDataParallel):
                 unwrapped_model = unwrapped_model.module
-            unwrapped_model.save_pretrained(
-                save_directory=path, checkpointer=self.checkpointer, tokenizer=tokenizer, peft_config=self.peft_config
-            )
+            # Models with HFCheckpointingMixin route save_pretrained through checkpointer.save_model (DCP).
+            # Models without it (e.g. diffusers) would use their native save_pretrained which fails on
+            # FSDP2-sharded DTensors, so fall back to checkpointer.save_model directly.
+            if hasattr(unwrapped_model, 'save_pretrained') and hasattr(unwrapped_model.save_pretrained, '__func__'):
+                from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+
+                if isinstance(unwrapped_model, HFCheckpointingMixin):
+                    unwrapped_model.save_pretrained(
+                        save_directory=path, checkpointer=self.checkpointer, tokenizer=tokenizer, peft_config=self.peft_config
+                    )
+                else:
+                    self.checkpointer.save_model(
+                        model=unwrapped_model, weights_path=path, peft_config=self.peft_config, tokenizer=tokenizer
+                    )
+            else:
+                self.checkpointer.save_model(
+                    model=unwrapped_model, weights_path=path, peft_config=self.peft_config, tokenizer=tokenizer
+                )
 
         # Sync before checkpointing for Dion
         optimizers = optimizer if isinstance(optimizer, list) else [optimizer]

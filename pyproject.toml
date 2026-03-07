@@ -94,7 +94,9 @@ diffusion = [
     "ftfy",
     "imageio",
     "imageio-ffmpeg",
+    "kernels",
     "opencv-python-headless",
+    "torchvision",
 ]
 # nvidia-cudnn-cu12 pin: This is required for GPTOSS TE support + faster cudnn attention (only on Linux where CUDA is available)
 # "nvidia-cudnn-cu12>=9.18.0.0; sys_platform == 'linux'",
@@ -205,6 +207,11 @@ cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev
 liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" }
 onnxruntime-gpu = { index = "onnxruntime-cuda-13" }
 torch = [
+  { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
+  { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
+  { index = "pypi", marker = "sys_platform == 'darwin'" },
+]
+torchvision = [
   { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
   { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
