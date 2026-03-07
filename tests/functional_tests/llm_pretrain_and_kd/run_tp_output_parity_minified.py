@@ -22,6 +22,7 @@ variants of:
 - Ministral3ForCausalLM (NeMo Automodel custom)
 - LlamaForCausalLM (NeMo Automodel custom, combined QKV + gate_up projections)
 - Qwen2ForCausalLM (NeMo Automodel custom, combined QKV + gate_up projections)
+- Nemotron Super (LlamaForCausalLM, 10-layer full-hidden, llama_nemotron_super_tp_plan)
 
 It also validates both tensor-parallel plans:
 - sequence_parallel=False
@@ -32,7 +33,7 @@ Usage:
 
     # Optional: select models / SP mode
     torchrun --nproc_per_node=2 tests/functional_tests/llm_pretrain_and_kd/run_tp_output_parity_minified.py \\
-        --models qwen3 qwen3_seq_cls ministral3 \\
+        --models qwen3 qwen3_seq_cls ministral3 nemotron \\
         --sequence_parallel both \\
         --kl_threshold 2e-6
 """
@@ -56,13 +57,13 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan
+from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan, _update_attention_head_counts_for_tp
 from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.models.llama.model import LlamaConfig, LlamaForCausalLM
 from nemo_automodel.components.models.mistral3.model import Ministral3Config, Ministral3ForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2Config, Qwen2ForCausalLM
 
-ModelKind = Literal["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2"]
+ModelKind = Literal["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2", "nemotron"]
 SPMode = Literal["true", "false", "both"]
 
 
@@ -141,6 +142,84 @@ class _Case:
 
     def name(self) -> str:
         return f"{self.kind}/sequence_parallel={self.sequence_parallel}"
+
+
+def _nemotron_10l_config_dict() -> dict:
+    """Config dict for a 10-layer slice of nvidia/Llama-3_3-Nemotron-Super-49B-v1_5.
+
+    First 10 block_configs give a hybrid mix: 8 attention layers (GQA,
+    n_heads_in_group=8) and 2 no-op attention layers, with varying ffn_mult.
+    The auto_map repo prefixes let HF resolve the DeciLM remote code from its
+    local cache without hitting the hub.
+    """
+
+    def _block(attn_no_op: bool, n_heads_in_group: int | None, ffn_mult: float) -> dict:
+        return {
+            "attention": {
+                "n_heads_in_group": n_heads_in_group,
+                "no_op": attn_no_op,
+                "replace_with_linear": False,
+                "sparsify": None,
+                "num_sink_tokens": None,
+                "unshifted_sink": False,
+                "use_prefill_window_in_sink_attention": False,
+                "window_length": None,
+            },
+            "ffn": {
+                "ffn_mult": ffn_mult,
+                "no_op": False,
+                "replace_with_linear": False,
+                "sparsify": None,
+            },
+        }
+
+    return {
+        "architectures": ["DeciLMForCausalLM"],
+        "model_type": "nemotron-nas",
+        "auto_map": {
+            "AutoConfig": "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5--configuration_decilm.DeciLMConfig",
+            "AutoModelForCausalLM": "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5--modeling_decilm.DeciLMForCausalLM",
+        },
+        "hidden_size": 8192,
+        "num_attention_heads": 64,
+        "num_key_value_heads": None,
+        "intermediate_size": None,
+        "num_hidden_layers": 10,
+        "hidden_act": "silu",
+        "rms_norm_eps": 1e-05,
+        "vocab_size": 128256,
+        "max_position_embeddings": 131072,
+        "tie_word_embeddings": False,
+        "use_cache": False,
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "initializer_range": 0.02,
+        "mlp_bias": False,
+        "pretraining_tp": 1,
+        "rope_theta": 500000.0,
+        "rope_scaling": {
+            "factor": 16.0,
+            "high_freq_factor": 4.0,
+            "low_freq_factor": 1.0,
+            "original_max_position_embeddings": 8192,
+            "rope_type": "llama3",
+        },
+        "torch_dtype": "bfloat16",
+        "bos_token_id": 128000,
+        "eos_token_id": [128001, 128008, 128009],
+        "block_configs": [
+            _block(False, 8, 2.625),  # L0: attn, small FFN
+            _block(False, 8, 5.25),  # L1-5: attn, large FFN
+            _block(False, 8, 5.25),
+            _block(False, 8, 5.25),
+            _block(False, 8, 5.25),
+            _block(False, 8, 5.25),
+            _block(True, None, 2.625),  # L6-7: no-op attn, small FFN
+            _block(True, None, 2.625),
+            _block(False, 8, 5.25),  # L8-9: attn, large FFN
+            _block(False, 8, 5.25),
+        ],
+    }
 
 
 def _build_minified_model(kind: ModelKind):
@@ -230,6 +309,23 @@ def _build_minified_model(kind: ModelKind):
         )
         return cfg, LlamaForCausalLM(cfg, backend=backend)
 
+    if kind == "nemotron":
+        import json
+        import tempfile
+
+        from transformers import AutoConfig
+        from transformers import AutoModelForCausalLM as _HFAutoCausalLM
+
+        config_dict = _nemotron_10l_config_dict()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "config.json"), "w") as f:
+                json.dump(config_dict, f)
+            cfg = AutoConfig.from_pretrained(tmpdir, trust_remote_code=True)
+        cfg._attn_implementation = "eager"
+        cfg._name_or_path = "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5"
+        model = _HFAutoCausalLM.from_config(cfg, trust_remote_code=True)
+        return cfg, model
+
     if kind == "qwen2":
         num_layers = 2
         backend = BackendConfig(rms_norm="torch")
@@ -302,9 +398,12 @@ def _run_case(
     tp_model = tp_model.to(device=device, dtype=torch.bfloat16)
     tp_model.eval()
 
+    tp_shard_plan = "llama_nemotron_super_tp_plan" if case.kind == "nemotron" else None
     tp_mesh = DeviceMesh(device_type, torch.arange(world_size, device="cpu"), mesh_dim_names=("tp",))
-    plan = _get_parallel_plan(tp_model, sequence_parallel=case.sequence_parallel)
+    plan = _get_parallel_plan(tp_model, sequence_parallel=case.sequence_parallel, tp_shard_plan=tp_shard_plan)
     parallelize_module(tp_model, tp_mesh, plan)
+    if case.kind == "nemotron":
+        _update_attention_head_counts_for_tp(tp_model, tp_mesh.size())
 
     with torch.inference_mode():
         tp_logits = tp_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
@@ -324,9 +423,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--models",
         nargs="+",
-        default=["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2"],
-        choices=["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2"],
-        help="Which models to test.",
+        default=["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2", "nemotron"],
+        choices=["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2", "nemotron"],
+        help="Which models to test. 'nemotron' uses 10-layer full-hidden LlamaForCausalLM with llama_nemotron_super_tp_plan.",
     )
     parser.add_argument(
         "--sequence_parallel",
