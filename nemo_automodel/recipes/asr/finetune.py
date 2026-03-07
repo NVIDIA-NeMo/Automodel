@@ -700,7 +700,7 @@ class FinetuneRecipeForASR(BaseRecipe):
             for k, v in batch.items()
         }
 
-        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+        fwd_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
 
         # Determine model type
@@ -722,11 +722,11 @@ class FinetuneRecipeForASR(BaseRecipe):
             if is_train
             else nullcontext()
         )
-        with train_ctx(), sync_ctx:
+        with fwd_ctx(), sync_ctx:
             if is_ctc_model:
                 # CTC models: Pass labels to model (loss computed internally)
-                out = model(labels=labels if is_train else None, **batch)
-                local_loss = out.loss if is_train else torch.tensor(0.0, device=self.dist_env.device)
+                out = model(labels=labels, **batch)
+                local_loss = out.loss
             else:
                 # Seq2Seq models: Use external loss function
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
@@ -861,58 +861,22 @@ class FinetuneRecipeForASR(BaseRecipe):
             for mp in self.model_parts:
                 mp.eval()
 
-            model = self.model_parts[0]
-            is_ctc_model = hasattr(model, "config") and hasattr(model.config, "ctc_loss_reduction")
-
             total_loss = 0.0
             total_tokens = 0
             total_num_label_tokens = 0
             for batch in val_dataloader:
-                batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
-                labels = batch.pop("labels")
-                num_label_tokens = (labels != -100).sum().item()
-
-                # Convert input_features to model dtype to avoid dtype mismatch errors during forward pass
-                # (processors default to float32, but models may use bfloat16/float16 for training)
-                if "input_features" in batch:
-                    model_dtype = next(model.parameters()).dtype
-                    batch["input_features"] = batch["input_features"].to(dtype=model_dtype)
-
-                # Generate position_ids when using CP or TP, as some models require explicit position IDs
-                # for proper attention computation with sharded sequences
-                if (
-                    self.device_mesh
-                    and "position_ids" not in batch
-                    and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
-                ):
-                    batch["position_ids"] = (
-                        torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model_parts[0].device)
-                    )
-
-                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
-                with train_ctx():
-                    if is_ctc_model:
-                        # CTC models compute loss internally
-                        out = model(labels=labels, **batch)
-                        local_loss = out.loss
-                    else:
-                        # Seq2Seq models use external loss
-                        if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                            out = model(logits_to_keep=1, **batch)
-                        else:
-                            out = model(**batch)
-                        local_loss = calculate_loss(
-                            self.loss_fn,
-                            logits=getattr(out, "logits", out),
-                            labels=labels,
-                            model=model,
-                            hidden_states=out.hidden_states[-1]
-                            if getattr(out, "hidden_states", None) is not None
-                            else None,
-                            num_label_tokens=num_label_tokens,
-                        )
-                    total_num_label_tokens += num_label_tokens
-
+                num_label_tokens = (batch["labels"] != -100).sum().item()
+                loss_buffer = []
+                self._forward_backward_step(
+                    0,
+                    batch,
+                    loss_buffer=loss_buffer,
+                    num_label_tokens=num_label_tokens,
+                    num_batches=1,
+                    is_train=False,
+                )
+                local_loss = loss_buffer[0]
+                total_num_label_tokens += num_label_tokens
                 total_loss += local_loss.item() * num_label_tokens
                 total_tokens += num_label_tokens
 

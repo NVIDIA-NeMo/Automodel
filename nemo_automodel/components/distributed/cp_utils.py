@@ -152,6 +152,12 @@ def make_cp_batch_and_ctx(
     if _get_mesh_size(cp_mesh) <= 1:
         return nullcontext, batch
 
+    if "input_ids" not in batch:
+        # CP requires a token sequence (input_ids) to shard across ranks.
+        # Encoder-only or encoder-decoder ASR models (e.g. Whisper, Parakeet) use
+        # input_features instead and are not supported by CP yet.
+        return nullcontext, batch
+
     # CP doesn't support packed sequence currently. Let torch SDPA handle attention mask.
     batch.pop("attention_mask", None)
 
