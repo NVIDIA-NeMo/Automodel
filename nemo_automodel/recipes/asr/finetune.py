@@ -33,12 +33,14 @@ from transformers.processing_utils import ProcessorMixin
 from wandb import Settings
 
 from nemo_automodel._transformers import NeMoAutoModelForCTC, NeMoAutoModelForSpeechSeq2Seq
+from nemo_automodel._transformers.infrastructure import apply_model_infrastructure, instantiate_infrastructure
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.asr.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
@@ -129,9 +131,36 @@ def build_model(
             # NeMoAutoModel handles infrastructure internally
             model = cfg_model.instantiate(**kwargs)
         else:
-            raise ValueError(
-                f"ASR finetuning requires NeMoAutoModelForSpeechSeq2Seq or NeMoAutoModelForCTC. "
-                f"Got model target: {cfg_model.get('_target_', None)}"
+            # For non-NeMoAutoModel entry points (BYOM), instantiate the model
+            # first, then apply infrastructure separately.
+            model = cfg_model.instantiate()
+
+            mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+            model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
+                distributed_config=distributed_config,
+                pipeline_config=pipeline_config,
+                activation_checkpointing=False,
+                device=torch.device("cuda", torch.cuda.current_device()),
+                mesh=mesh,
+            )
+            loss_fn = pipeline_config.loss_fn if pipeline_config is not None else None
+
+            model = apply_model_infrastructure(
+                model,
+                is_meta_device=False,
+                device=torch.cuda.current_device(),
+                mesh=mesh,
+                model_wrapper=model_wrapper,
+                autopipeline=autopipeline,
+                parallelize_fn=parallelize_fn,
+                qat_quantizer=qat_quantizer,
+                loss_fn=loss_fn,
+                peft_config=kwargs.get("peft_config"),
+                fp8_config=kwargs.get("fp8_config"),
+                compile_config=kwargs.get("compile_config"),
+                pretrained_model_name_or_path=None,
+                load_base_model=False,
+                cache_dir=hf_constants.HF_HUB_CACHE,
             )
     return model
 
