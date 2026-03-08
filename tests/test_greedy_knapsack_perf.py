@@ -54,12 +54,12 @@ def _print_result(r: dict):
     print(f"  Bins:          {r['n_bins']:>10,}")
     print(f"  Time:          {r['time_s']:>10.3f}s")
     print(f"  Throughput:    {r['rate_samples_per_s']:>10,.0f} samples/s")
-    print(f"  ──────────────────────────────────────")
+    print("  ──────────────────────────────────────")
     print(f"  Utilization:   {r['utilization_pct']:>10.1f}%")
     print(f"  Avg fill:      {r['avg_fill']:>10.0f} / {r['max_length']}")
     print(f"  Min fill:      {r['min_fill']:>10,}")
     print(f"  Max fill:      {r['max_fill']:>10,}")
-    print(f"  ──────────────────────────────────────")
+    print("  ──────────────────────────────────────")
     print(f"  Samples/bin:   avg={r['avg_samples_per_bin']:.1f}  min={r['min_samples_per_bin']}  max={r['max_samples_per_bin']}")
     print(f"  Sample length: avg={r['avg_length']:.0f}  median={r['median_length']:.0f}")
 
@@ -102,7 +102,7 @@ def main():
 
     # Heavy tail (log-normal-ish)
     lengths = [min(pack_size, int(rng.lognormvariate(6, 1.2))) for _ in range(N)]
-    lengths = [max(10, l) for l in lengths]
+    lengths = [max(10, x) for x in lengths]
     r = _run_benchmark("Heavy-tail (lognormal)", lengths, pack_size)
     benchmarks.append(r)
     _print_result(r)
@@ -115,7 +115,7 @@ def main():
 
     # ── Summary table ─────────────────────────────────────────
     print(f"\n\n{'=' * 90}")
-    print(f"  SUMMARY")
+    print("  SUMMARY")
     print(f"{'=' * 90}")
     print(f"  {'Name':<35} {'N':>10} {'Bins':>8} {'Time':>8} {'Rate':>12} {'Util%':>7}")
     print(f"  {'-'*35} {'-'*10} {'-'*8} {'-'*8} {'-'*12} {'-'*7}")
