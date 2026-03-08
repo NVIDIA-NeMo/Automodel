@@ -7,7 +7,6 @@ model:
     transformer_cls: "FluxTransformer2DModel"
     subfolder: "transformer"
     load_full_pipeline: false
-    enable_gradient_checkpointing: false
 
 optim:
   learning_rate: 2e-5
@@ -22,7 +21,7 @@ lr_scheduler:
   min_lr: 1e-6
 
 fsdp:
-  dp_size: 32
+  dp_size: 8
   tp_size: 1
   cp_size: 1
   pp_size: 1
@@ -61,7 +60,7 @@ data:
     _target_: nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader
     cache_dir: PATH_TO_YOUR_DATA
     train_text_encoder: false
-    num_workers: 1
+    num_workers: 0
     # Supported resolutions include [256x256], [512x512], and [1024x1024].
     # While a 1:1 aspect ratio is currently used as a proxy for the closest image size,
     # the implementation is designed to support multiple aspect ratios.

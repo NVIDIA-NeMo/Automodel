@@ -44,10 +44,11 @@ class TextToImageDataset(BaseMultiresolutionDataset):
         # Load cached data
         data = torch.load(cache_file, map_location="cpu")
 
-        # Prepare output
+        # Prepare output - support both bucket_resolution and crop_resolution keys
+        resolution_key = "bucket_resolution" if "bucket_resolution" in item else "crop_resolution"
         output = {
             "latent": data["latent"],
-            "crop_resolution": torch.tensor(item["crop_resolution"]),
+            "crop_resolution": torch.tensor(item[resolution_key]),
             "original_resolution": torch.tensor(item["original_resolution"]),
             "crop_offset": torch.tensor(data["crop_offset"]),
             "prompt": data["prompt"],

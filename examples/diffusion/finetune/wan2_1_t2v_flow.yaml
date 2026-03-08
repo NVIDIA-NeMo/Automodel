@@ -29,7 +29,7 @@ data:
     dynamic_batch_size: false
     shuffle: true
     drop_last: false
-    num_workers: 2
+    num_workers: 0
 
 optim:
   learning_rate: 5e-6

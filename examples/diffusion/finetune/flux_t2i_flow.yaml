@@ -2,13 +2,12 @@ model:
   pretrained_model_name_or_path: "black-forest-labs/FLUX.1-dev"
   mode: "finetune"
   cache_dir: null
-  attention_backend: "_flash_3_hub"
+  attention_backend: "flash"
 
   pipeline_spec:
     transformer_cls: "FluxTransformer2DModel"
     subfolder: "transformer"
     load_full_pipeline: false
-    enable_gradient_checkpointing: false
 
 optim:
   learning_rate: 1e-5
@@ -57,7 +56,7 @@ data:
     _target_: nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader
     cache_dir: PATH_TO_YOUR_DATA
     train_text_encoder: false
-    num_workers: 10
+    num_workers: 0
     # Supported resolutions include [256x256], [512x512], and [1024x1024].
     # While a 1:1 aspect ratio is currently used as a proxy for the closest image size,
     # the implementation is designed to support multiple aspect ratios.
