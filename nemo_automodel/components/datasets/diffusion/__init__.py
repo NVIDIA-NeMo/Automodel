@@ -31,7 +31,10 @@ _LAZY_ATTRS = {
     "collate_fn_video": (".collate_fns", "collate_fn_video"),
     "collate_fn_production": (".collate_fns", "collate_fn_production"),
     # Dataloader builders
-    "build_text_to_image_multiresolution_dataloader": (".collate_fns", "build_text_to_image_multiresolution_dataloader"),
+    "build_text_to_image_multiresolution_dataloader": (
+        ".collate_fns",
+        "build_text_to_image_multiresolution_dataloader",
+    ),
     "build_video_multiresolution_dataloader": (".collate_fns", "build_video_multiresolution_dataloader"),
     # Legacy (non-multiresolution)
     "build_dataloader": (".meta_files_dataset", "build_dataloader"),
