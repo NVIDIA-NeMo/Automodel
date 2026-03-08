@@ -712,8 +712,9 @@ def neat_packed_vlm_collater(
     use_flash = attn_implementation == "flash_attention_2"
 
     # Determine pad target: fixed max_length or batch-dynamic
-    batch_max = max(x["input_ids"].shape[-1] if isinstance(x["input_ids"], torch.Tensor)
-                    else len(x["input_ids"]) for x in batch)
+    batch_max = max(
+        x["input_ids"].shape[-1] if isinstance(x["input_ids"], torch.Tensor) else len(x["input_ids"]) for x in batch
+    )
     max_len = max_length if max_length is not None else batch_max
 
     def _pad_1d(tensor, pad_value, target_len):
@@ -735,6 +736,7 @@ def neat_packed_vlm_collater(
         attention_mask_out = attention_mask
     else:
         from nemo_automodel.components.datasets.utils import _indexed_mask_to_4d_block_causal
+
         attention_mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
 
     # Handle position_ids: 1D [seq_len] or 3D mRoPE [3, seq_len]
@@ -747,6 +749,7 @@ def neat_packed_vlm_collater(
             if pad_len > 0:
                 return torch.cat([t, torch.zeros(3, pad_len, dtype=t.dtype)], dim=1)
             return t
+
         position_ids = torch.stack([_pad_mrope(x["position_ids"], max_len) for x in batch], dim=1)
     else:
         # Standard 1D: [seq_len] → pad to [max_len], stack to [B, max_len]

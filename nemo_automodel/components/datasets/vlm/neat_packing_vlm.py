@@ -54,6 +54,7 @@ MEDIA_KEYS = ("pixel_values", "image_grid_thw", "pixel_values_videos", "video_gr
 # Visual-token-balanced greedy knapsack
 # ---------------------------------------------------------------------------
 
+
 def greedy_knapsack_vt_balanced(
     lengths: list[int],
     max_length: int,
@@ -82,7 +83,9 @@ def greedy_knapsack_vt_balanced(
     t1 = time.perf_counter()
     logger.info(
         "  VT-balanced knapsack: FFD packed %d samples -> %d bins in %.1fs",
-        len(lengths), len(bins), t1 - t0,
+        len(lengths),
+        len(bins),
+        t1 - t0,
     )
 
     # Phase 2: Sort bins by VT sum so consecutive packs have similar VT.
@@ -96,6 +99,7 @@ def greedy_knapsack_vt_balanced(
     # Log VT balance statistics
     if result:
         import statistics
+
         vt_sums_sorted = [vt_sums[i] for i in sorted_idx]
         vt_mean = statistics.mean(vt_sums_sorted)
         vt_std = statistics.stdev(vt_sums_sorted) if len(vt_sums_sorted) > 1 else 0
@@ -103,16 +107,20 @@ def greedy_knapsack_vt_balanced(
         vt_max = max(vt_sums_sorted)
         logger.info(
             "  VT balance: %d packs | VT per pack: mean=%.0f, std=%.0f, min=%d, max=%d, ratio=%.1fx",
-            len(result), vt_mean, vt_std, vt_min, vt_max,
+            len(result),
+            vt_mean,
+            vt_std,
+            vt_min,
+            vt_max,
             vt_max / max(vt_min, 1),
         )
         # Log consecutive-pair balance (simulates DP=2 scenario)
         if len(vt_sums_sorted) > 1:
-            pair_diffs = [abs(vt_sums_sorted[i] - vt_sums_sorted[i+1])
-                          for i in range(0, len(vt_sums_sorted) - 1, 2)]
+            pair_diffs = [abs(vt_sums_sorted[i] - vt_sums_sorted[i + 1]) for i in range(0, len(vt_sums_sorted) - 1, 2)]
             logger.info(
                 "  VT consecutive-pair diff: mean=%.0f, max=%d (lower=better DP balance)",
-                statistics.mean(pair_diffs), max(pair_diffs),
+                statistics.mean(pair_diffs),
+                max(pair_diffs),
             )
 
     return result
@@ -122,11 +130,13 @@ def greedy_knapsack_vt_balanced(
 # Length estimation (no tokenization, no media loading)
 # ---------------------------------------------------------------------------
 
+
 def _estimate_image_tokens(img_meta, image_cfg: dict) -> int:
     """Estimate token count for one image from its ``[height, width]`` metadata."""
     height, width = int(img_meta[0]), int(img_meta[1])
     resized_h, resized_w = _smart_resize_image(
-        height, width,
+        height,
+        width,
         factor=image_cfg["factor"],
         min_pixels=image_cfg["min_pixels"],
         max_pixels=image_cfg["max_pixels"],
@@ -161,7 +171,9 @@ def _estimate_video_tokens(vid_meta, video_cfg: dict) -> int:
         nframes = ((nframes + tp - 1) // tp) * tp
 
     resized_h, resized_w = _smart_resize_video(
-        nframes, height, width,
+        nframes,
+        height,
+        width,
         temporal_factor=tp,
         factor=video_cfg["factor"],
         min_pixels=video_cfg["min_pixels"],
@@ -240,6 +252,7 @@ def _estimate_sample_length(
 # ---------------------------------------------------------------------------
 # Per-sample helpers (called inside __getitem__, in worker processes)
 # ---------------------------------------------------------------------------
+
 
 def _compute_mrope_position_ids(
     sample: dict,
@@ -377,6 +390,7 @@ def _build_packed_vlm_sample(
 # PackedDatasetWrapper — lazy packing via __getitem__
 # ---------------------------------------------------------------------------
 
+
 class PackedDatasetWrapper(torch.utils.data.Dataset):
     """A Dataset that materializes packs lazily in ``__getitem__``.
 
@@ -436,7 +450,10 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
             if seq_len > self.pack_size:
                 logger.warning(
                     "Pack %d: sample %d has %d tokens (> pack_size %d), skipping.",
-                    pack_idx, sample_idx, seq_len, self.pack_size,
+                    pack_idx,
+                    sample_idx,
+                    seq_len,
+                    self.pack_size,
                 )
                 continue
 
@@ -453,13 +470,15 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
             else:
                 logger.debug(
                     "Pack %d: dropping overflow sample (%d tokens, %d/%d used).",
-                    pack_idx, slen, total, self.pack_size,
+                    pack_idx,
+                    slen,
+                    total,
+                    self.pack_size,
                 )
 
         if not kept:
             # Fallback: return a padding-only pack
-            kept = [{"input_ids": torch.tensor([], dtype=torch.long),
-                     "labels": torch.tensor([], dtype=torch.long)}]
+            kept = [{"input_ids": torch.tensor([], dtype=torch.long), "labels": torch.tensor([], dtype=torch.long)}]
 
         return _build_packed_vlm_sample(kept, self.pack_size, self.padding_idx, has_mrope=self.has_mrope)
 
@@ -473,6 +492,7 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def neat_pack_dataset_vlm(
     dataset,
@@ -543,7 +563,10 @@ def neat_pack_dataset_vlm(
         logger.info(
             "Neat packing VLM: estimating lengths for %d samples "
             "(pack_size=%d, packing_ratio=%.2f, knapsack_capacity=%d)...",
-            N, pack_size, packing_ratio, knapsack_capacity,
+            N,
+            pack_size,
+            packing_ratio,
+            knapsack_capacity,
         )
 
         estimated_lengths: list[int] = []
@@ -554,7 +577,10 @@ def neat_pack_dataset_vlm(
 
         for i in range(N):
             est_len, media_toks = _estimate_sample_length(
-                ds_raw[i], image_cfg=image_cfg, video_cfg=video_cfg, return_media_tokens=True,
+                ds_raw[i],
+                image_cfg=image_cfg,
+                video_cfg=video_cfg,
+                return_media_tokens=True,
             )
             est_len -= 1  # -1 for shift
             if est_len > pack_size:
@@ -572,14 +598,21 @@ def neat_pack_dataset_vlm(
                 rate = (i + 1) / elapsed if elapsed > 0 else 0
                 logger.info(
                     "  Length estimation: %d/%d (%.0f%%) | %.0f samples/s | dropped %d",
-                    i + 1, N, 100.0 * (i + 1) / N, rate, dropped_count,
+                    i + 1,
+                    N,
+                    100.0 * (i + 1) / N,
+                    rate,
+                    dropped_count,
                 )
 
         est_elapsed = time.perf_counter() - t0
         n_visual = sum(1 for vt in estimated_media_tokens if vt > 0)
         logger.info(
             "  Length estimation done in %.1fs (%d valid, %d dropped, %d visual).",
-            est_elapsed, len(valid_indices), dropped_count, n_visual,
+            est_elapsed,
+            len(valid_indices),
+            dropped_count,
+            n_visual,
         )
     else:
         # No raw dataset — use dataset length, assume uniform distribution
@@ -600,7 +633,9 @@ def neat_pack_dataset_vlm(
         )
         t1 = time.perf_counter()
         bins_local = greedy_knapsack_vt_balanced(
-            estimated_lengths, knapsack_capacity, estimated_media_tokens,
+            estimated_lengths,
+            knapsack_capacity,
+            estimated_media_tokens,
         )
         knapsack_elapsed = time.perf_counter() - t1
         logger.info("  VT-balanced knapsack done in %.1fs.", knapsack_elapsed)
@@ -635,17 +670,22 @@ def neat_pack_dataset_vlm(
     max_len = max(est_arr) if est_arr else 0
 
     logger.info(
-        "Neat packing VLM: %d samples -> %d packs "
-        "(estimated utilization: %.1f%%)",
-        len(valid_indices), n_packs, utilization,
+        "Neat packing VLM: %d samples -> %d packs (estimated utilization: %.1f%%)",
+        len(valid_indices),
+        n_packs,
+        utilization,
     )
     logger.info(
         "  Samples per pack: avg=%.1f, min=%d, max=%d",
-        avg_samples, min_samples, max_samples,
+        avg_samples,
+        min_samples,
+        max_samples,
     )
     logger.info(
         "  Estimated token lengths: avg=%.0f, min=%d, max=%d",
-        avg_len, min_len, max_len,
+        avg_len,
+        min_len,
+        max_len,
     )
 
     # ── Return lazy dataset ──────────────────────────────────────

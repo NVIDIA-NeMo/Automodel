@@ -13,10 +13,12 @@ import torch
 def test_get_seqlens_in_batch():
     from nemo_automodel.components.models.common.packing import get_seqlens_in_batch
 
-    mask = torch.tensor([
-        [1, 1, 2, 2, 2, 0],
-        [1, 2, 2, 3, 3, 3],
-    ])
+    mask = torch.tensor(
+        [
+            [1, 1, 2, 2, 2, 0],
+            [1, 2, 2, 3, 3, 3],
+        ]
+    )
     seqlens = get_seqlens_in_batch(mask)
     assert seqlens.tolist() == [2, 3, 1, 2, 3]
 
@@ -24,10 +26,12 @@ def test_get_seqlens_in_batch():
 def test_get_unpad_data():
     from nemo_automodel.components.models.common.packing import get_unpad_data
 
-    mask = torch.tensor([
-        [1, 1, 2, 2, 2, 0],
-        [1, 2, 2, 3, 3, 3],
-    ])
+    mask = torch.tensor(
+        [
+            [1, 1, 2, 2, 2, 0],
+            [1, 2, 2, 3, 3, 3],
+        ]
+    )
     indices, cu_seqlens, max_seqlen = get_unpad_data(mask)
 
     assert indices.tolist() == [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11]
@@ -135,7 +139,9 @@ def test_flash_varlen_with_indexed_mask():
 
     # Should not raise
     out = flash_attn_varlen_func(
-        q, k, v,
+        q,
+        k,
+        v,
         cu_seqlens_q=cu_seqlens.to("cuda"),
         cu_seqlens_k=cu_seqlens.to("cuda"),
         max_seqlen_q=max_seqlen,

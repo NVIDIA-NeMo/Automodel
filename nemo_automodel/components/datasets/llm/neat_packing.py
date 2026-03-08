@@ -80,13 +80,19 @@ def greedy_knapsack(lengths: list[int], max_length: int) -> list[list[int]]:
             elapsed = time.perf_counter() - t0
             logger.info(
                 "  Greedy knapsack: %d/%d (%.0f%%) | %d bins | %.1fs",
-                count + 1, N, 100.0 * (count + 1) / N, len(bins), elapsed,
+                count + 1,
+                N,
+                100.0 * (count + 1) / N,
+                len(bins),
+                elapsed,
             )
 
     elapsed = time.perf_counter() - t0
     logger.info(
         "  Greedy knapsack: done %d samples -> %d bins in %.1fs",
-        N, len(bins), elapsed,
+        N,
+        len(bins),
+        elapsed,
     )
 
     return bins
@@ -188,8 +194,7 @@ def neat_pack_dataset(
                 n_dropped += 1
                 continue
             raise ValueError(
-                f"Sample is too long ({seq_len} > {pack_size}). "
-                "Set drop_long_samples=True or increase pack_size."
+                f"Sample is too long ({seq_len} > {pack_size}). Set drop_long_samples=True or increase pack_size."
             )
 
         # Apply loss_mask to labels if present
@@ -197,10 +202,7 @@ def neat_pack_dataset(
             labels = sample["labels"]
             loss_mask = sample["loss_mask"]
             if isinstance(labels, list):
-                labels = [
-                    lab if mask else CROSS_ENTROPY_IGNORE_IDX
-                    for lab, mask in zip(labels, loss_mask)
-                ]
+                labels = [lab if mask else CROSS_ENTROPY_IGNORE_IDX for lab, mask in zip(labels, loss_mask)]
                 sample["labels"] = labels
             else:
                 labels = labels.clone()
@@ -236,6 +238,4 @@ def neat_pack_dataset(
 
     logger.info("Total number of packs created: %d", len(packs))
 
-    return Dataset.from_dict(
-        {key: [pack[key] for pack in packs] for key in packs[0].keys()}
-    )
+    return Dataset.from_dict({key: [pack[key] for pack in packs] for key in packs[0].keys()})

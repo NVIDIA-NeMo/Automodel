@@ -101,10 +101,12 @@ class TestBuildPackedSample:
 
 class TestNeatPackDataset:
     def _make_dataset(self, samples):
-        return Dataset.from_dict({
-            "input_ids": [s["input_ids"] for s in samples],
-            "labels": [s["labels"] for s in samples],
-        })
+        return Dataset.from_dict(
+            {
+                "input_ids": [s["input_ids"] for s in samples],
+                "labels": [s["labels"] for s in samples],
+            }
+        )
 
     def test_end_to_end(self):
         samples = [
@@ -183,7 +185,11 @@ class TestNeatPackDataset:
         ds = self._make_dataset(samples)
 
         packed = neat_pack_dataset(
-            ds, split="train", pack_size=4, padding_idx=0, drop_long_samples=True,
+            ds,
+            split="train",
+            pack_size=4,
+            padding_idx=0,
+            drop_long_samples=True,
         )
         # Only the short sample should remain
         assert len(packed) == 1
@@ -198,24 +204,27 @@ class TestNeatPackDataset:
             neat_pack_dataset(ds, split="train", pack_size=3, padding_idx=0)
 
     def test_max_packs(self):
-        samples = [
-            {"input_ids": [i], "labels": [i * 10]}
-            for i in range(20)
-        ]
+        samples = [{"input_ids": [i], "labels": [i * 10]} for i in range(20)]
         ds = self._make_dataset(samples)
 
         packed = neat_pack_dataset(
-            ds, split="train", pack_size=3, padding_idx=0, max_packs=2,
+            ds,
+            split="train",
+            pack_size=3,
+            padding_idx=0,
+            max_packs=2,
         )
         assert len(packed) == 2
 
     def test_loss_mask(self):
         """loss_mask should set corresponding labels to -100."""
-        ds = Dataset.from_dict({
-            "input_ids": [[1, 2, 3]],
-            "labels": [[10, 20, 30]],
-            "loss_mask": [[0, 1, 1]],
-        })
+        ds = Dataset.from_dict(
+            {
+                "input_ids": [[1, 2, 3]],
+                "labels": [[10, 20, 30]],
+                "loss_mask": [[0, 1, 1]],
+            }
+        )
 
         packed = neat_pack_dataset(ds, split="train", pack_size=4, padding_idx=0)
         labels = packed[0]["labels"]
@@ -233,11 +242,13 @@ class TestIndexedMaskTo4dBlockCausal:
         result = _indexed_mask_to_4d_block_causal(mask)
         assert result.shape == (1, 1, 3, 3)
 
-        expected = torch.tensor([
-            [True, False, False],
-            [True, True, False],
-            [True, True, True],
-        ])
+        expected = torch.tensor(
+            [
+                [True, False, False],
+                [True, True, False],
+                [True, True, True],
+            ]
+        )
         assert torch.equal(result[0, 0], expected)
 
     def test_two_sequences_with_padding(self):
@@ -267,10 +278,12 @@ class TestIndexedMaskTo4dBlockCausal:
         assert r[:, 4].sum() == 0
 
     def test_batch(self):
-        mask = torch.tensor([
-            [1, 1, 2, 0],
-            [1, 1, 1, 1],
-        ])
+        mask = torch.tensor(
+            [
+                [1, 1, 2, 0],
+                [1, 1, 1, 1],
+            ]
+        )
         result = _indexed_mask_to_4d_block_causal(mask)
         assert result.shape == (2, 1, 4, 4)
 
@@ -297,8 +310,7 @@ class TestIndexedMaskTo4dBlockCausal:
                 for i in range_q:
                     for j in range_k:
                         assert r[i, j] == False, (
-                            f"Position {i} ({name_q}) should NOT attend to "
-                            f"position {j} ({name_k}), but mask is True"
+                            f"Position {i} ({name_q}) should NOT attend to position {j} ({name_k}), but mask is True"
                         )
 
         # Within-sample: causal holds (i can attend to j iff j <= i)
@@ -308,9 +320,7 @@ class TestIndexedMaskTo4dBlockCausal:
             for i in rng:
                 for j in rng:
                     if j <= i:
-                        assert r[i, j] == True, (
-                            f"Position {i} ({name}) should attend to {j}, but mask is False"
-                        )
+                        assert r[i, j] == True, f"Position {i} ({name}) should attend to {j}, but mask is False"
                     else:
                         assert r[i, j] == False
 
@@ -320,10 +330,12 @@ class TestIndexedMaskTo4dBlockCausal:
             {"input_ids": [10, 20, 30], "labels": [-100, -100, 100]},
             {"input_ids": [40, 50], "labels": [200, 300]},
         ]
-        ds = Dataset.from_dict({
-            "input_ids": [s["input_ids"] for s in samples],
-            "labels": [s["labels"] for s in samples],
-        })
+        ds = Dataset.from_dict(
+            {
+                "input_ids": [s["input_ids"] for s in samples],
+                "labels": [s["labels"] for s in samples],
+            }
+        )
         packed = neat_pack_dataset(ds, split="train", pack_size=7, padding_idx=0)
 
         pos = packed[0]["position_ids"]
