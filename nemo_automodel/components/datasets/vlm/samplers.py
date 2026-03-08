@@ -46,8 +46,9 @@ def _smart_resize_image(height, width, factor=28, min_pixels=56 * 56, max_pixels
     return h_bar, w_bar
 
 
-def _smart_resize_video(num_frames, height, width, temporal_factor=2, factor=32,
-                         min_pixels=128 * 128, max_pixels=16 * 16 * 2 * 2 * 2 * 6144):
+def _smart_resize_video(
+    num_frames, height, width, temporal_factor=2, factor=32, min_pixels=128 * 128, max_pixels=16 * 16 * 2 * 2 * 2 * 6144
+):
     """Compute the resized (height, width) for a video, matching
     ``transformers.models.qwen3_vl.video_processing_qwen3_vl.smart_resize``.
     """
@@ -123,7 +124,10 @@ class LengthGroupedSampler(Sampler):
                 logger.info(
                     "LengthGroupedSampler: pre-filtered %d/%d samples with "
                     "estimated length > %.0f tokens (1.2 * max_length %d).",
-                    n_dropped, len(dataset), filter_threshold, max_length,
+                    n_dropped,
+                    len(dataset),
+                    filter_threshold,
+                    max_length,
                 )
         else:
             kept = list(all_indices)
@@ -131,7 +135,9 @@ class LengthGroupedSampler(Sampler):
         # Sort by total tokens (descending), then shuffle within small
         # buckets each epoch to add randomness while preserving grouping.
         self.sorted_indices = sorted(
-            kept, key=lambda i: self.lengths[i], reverse=True,
+            kept,
+            key=lambda i: self.lengths[i],
+            reverse=True,
         )
 
         # Cross-rank count alignment: with shard_data=True each rank owns a
@@ -141,6 +147,7 @@ class LengthGroupedSampler(Sampler):
         # same number of steps (we drop the tail — the shortest samples).
         if max_length is not None:
             import torch.distributed as dist
+
             if dist.is_initialized():
                 count = torch.tensor(len(self.sorted_indices), dtype=torch.long).cuda()
                 dist.all_reduce(count, op=dist.ReduceOp.MIN)
@@ -149,7 +156,8 @@ class LengthGroupedSampler(Sampler):
                     logger.info(
                         "LengthGroupedSampler: truncating from %d to %d samples "
                         "to align with the rank that filtered the most.",
-                        len(self.sorted_indices), min_count,
+                        len(self.sorted_indices),
+                        min_count,
                     )
                     self.sorted_indices = self.sorted_indices[:min_count]
 
@@ -189,7 +197,10 @@ class LengthGroupedSampler(Sampler):
                 rate = (i + 1) / max(elapsed, 1e-6)
                 logger.info(
                     "  %d/%d samples (%.1fs elapsed, %.0f samples/s)",
-                    i + 1, n, elapsed, rate,
+                    i + 1,
+                    n,
+                    elapsed,
+                    rate,
                 )
 
         elapsed = time.monotonic() - t0
@@ -212,7 +223,9 @@ class LengthGroupedSampler(Sampler):
         # fall back to ip.size dict with both Qwen-style and HF-style keys.
         size = getattr(ip, "size", {}) or {}
         min_pixels = getattr(ip, "min_pixels", None) or size.get("min_pixels") or size.get("shortest_edge") or 56 * 56
-        max_pixels = getattr(ip, "max_pixels", None) or size.get("max_pixels") or size.get("longest_edge") or 14 * 14 * 4 * 1280
+        max_pixels = (
+            getattr(ip, "max_pixels", None) or size.get("max_pixels") or size.get("longest_edge") or 14 * 14 * 4 * 1280
+        )
         return {
             "patch_size": patch_size,
             "merge_size": merge_size,
@@ -233,7 +246,12 @@ class LengthGroupedSampler(Sampler):
         # fall back to vp.size dict with both Qwen-style and HF-style keys.
         size = getattr(vp, "size", {}) or {}
         min_pixels = getattr(vp, "min_pixels", None) or size.get("min_pixels") or size.get("shortest_edge") or 128 * 128
-        max_pixels = getattr(vp, "max_pixels", None) or size.get("max_pixels") or size.get("longest_edge") or 16 * 16 * 2 * 2 * 2 * 6144
+        max_pixels = (
+            getattr(vp, "max_pixels", None)
+            or size.get("max_pixels")
+            or size.get("longest_edge")
+            or 16 * 16 * 2 * 2 * 2 * 6144
+        )
         fps = getattr(vp, "fps", 2.0)
         min_frames = getattr(vp, "min_frames", 4)
         max_frames = getattr(vp, "max_frames", 768)
@@ -258,7 +276,8 @@ class LengthGroupedSampler(Sampler):
         cfg = self._image_cfg
         height, width = int(img_meta[0]), int(img_meta[1])
         resized_h, resized_w = _smart_resize_image(
-            height, width,
+            height,
+            width,
             factor=cfg["factor"],
             min_pixels=cfg["min_pixels"],
             max_pixels=cfg["max_pixels"],
@@ -294,7 +313,9 @@ class LengthGroupedSampler(Sampler):
             nframes = ((nframes + tp - 1) // tp) * tp
 
         resized_h, resized_w = _smart_resize_video(
-            nframes, height, width,
+            nframes,
+            height,
+            width,
             temporal_factor=tp,
             factor=cfg["factor"],
             min_pixels=cfg["min_pixels"],
@@ -383,10 +404,7 @@ class LengthGroupedSampler(Sampler):
         # per-epoch randomness while preserving intra-batch length
         # similarity and cross-rank alignment.
         bs = self.batch_size
-        chunks = [
-            self.sorted_indices[i : i + bs]
-            for i in range(0, len(self.sorted_indices), bs)
-        ]
+        chunks = [self.sorted_indices[i : i + bs] for i in range(0, len(self.sorted_indices), bs)]
         chunk_perm = torch.randperm(len(chunks), generator=g)
         indices = []
         for ci in chunk_perm:
