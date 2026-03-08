@@ -211,13 +211,6 @@ class TestNeatPackDataset:
 
     def test_loss_mask(self):
         """loss_mask should set corresponding labels to -100."""
-        samples = [
-            {
-                "input_ids": [1, 2, 3],
-                "labels": [10, 20, 30],
-                "loss_mask": [0, 1, 1],
-            },
-        ]
         ds = Dataset.from_dict({
             "input_ids": [[1, 2, 3]],
             "labels": [[10, 20, 30]],

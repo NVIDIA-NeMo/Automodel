@@ -352,8 +352,8 @@ class TestTokenCountEndToEnd:
         if processor_path is None:
             pytest.skip("No --processor-path provided")
 
-        from transformers import AutoProcessor
         from PIL import Image
+        from transformers import AutoProcessor
 
         # Load processor with YAML overrides
         processor = AutoProcessor.from_pretrained(
@@ -446,7 +446,7 @@ class TestRegressionWrongDefaults:
         tokens_correct = (h_correct // 16) * (w_correct // 16) // 4
 
         ratio = tokens_correct / tokens_wrong
-        print(f"\n4096x4096 image token impact:")
+        print("\n4096x4096 image token impact:")
         print(f"  Wrong config (old bug):  {h_wrong}x{w_wrong} → {tokens_wrong} tokens")
         print(f"  Correct config (fixed):  {h_correct}x{w_correct} → {tokens_correct} tokens")
         print(f"  Ratio: {ratio:.1f}x")

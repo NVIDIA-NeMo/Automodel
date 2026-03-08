@@ -6,8 +6,8 @@ Verifies that:
 3. configure_packing patches the right functions
 """
 
-import torch
 import pytest
+import torch
 
 
 def test_get_seqlens_in_batch():

@@ -12,16 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
 import torch
 
+from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import (
     _build_packed_vlm_sample,
     _compute_mrope_position_ids,
     _shift_sample,
     neat_pack_dataset_vlm,
 )
-from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
 
 class _FakeDataset:
