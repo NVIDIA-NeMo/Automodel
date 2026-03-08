@@ -222,6 +222,24 @@ def _nemotron_10l_config_dict() -> dict:
     }
 
 
+def _is_nemotron_remote_code_available() -> bool:
+    """Return True if the DeciLM remote code is importable from the HF cache."""
+    try:
+        import json
+        import tempfile
+
+        from transformers import AutoConfig
+
+        config_dict = _nemotron_10l_config_dict()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "config.json"), "w") as f:
+                json.dump(config_dict, f)
+            AutoConfig.from_pretrained(tmpdir, trust_remote_code=True)
+        return True
+    except Exception:
+        return False
+
+
 def _build_minified_model(kind: ModelKind):
     if kind == "ministral3":
         cfg = Ministral3Config(
@@ -465,6 +483,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         sp_flags = [args.sequence_parallel == "true"]
 
     cases = [_Case(kind=cast(ModelKind, k), sequence_parallel=sp) for k in args.models for sp in sp_flags]
+
+    if any(c.kind == "nemotron" for c in cases) and not _is_nemotron_remote_code_available():
+        cases = [c for c in cases if c.kind != "nemotron"]
+        if rank == 0:
+            print("SKIP: nemotron (DeciLM remote code not cached; run once with HF_HUB_OFFLINE=0 to cache)")
 
     all_ok = True
 
