@@ -527,7 +527,9 @@ def apply_model_infrastructure(
                 model.to(device, non_blocking=True)
             except NotImplementedError as e:
                 if "Cannot copy out of meta tensor" in str(e):
-                    logger.warning("model.to(device) failed (meta tensors); using model.to_empty(device=device) instead.")
+                    logger.warning(
+                        "model.to(device) failed (meta tensors); using model.to_empty(device=device) instead."
+                    )
                     model.to_empty(device=device)
                 else:
                     raise
