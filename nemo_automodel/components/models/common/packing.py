@@ -111,6 +111,7 @@ def configure_packing(attn_implementation: str = "sdpa") -> None:
 
     # Patch 1: Replace _get_unpad_data to handle indexed attention masks
     import transformers.modeling_flash_attention_utils
+
     transformers.modeling_flash_attention_utils._get_unpad_data = get_unpad_data
 
     # Patch 2: Replace create_causal_mask for Qwen3-VL models
@@ -119,8 +120,9 @@ def configure_packing(attn_implementation: str = "sdpa") -> None:
     try:
         from transformers.models.qwen3_vl import modeling_qwen3_vl
 
-        def _create_causal_mask(config, input_embeds, attention_mask, cache_position,
-                                past_key_values, position_ids, **kwargs):
+        def _create_causal_mask(
+            config, input_embeds, attention_mask, cache_position, past_key_values, position_ids, **kwargs
+        ):
             return attention_mask
 
         modeling_qwen3_vl.create_causal_mask = _create_causal_mask
@@ -130,8 +132,9 @@ def configure_packing(attn_implementation: str = "sdpa") -> None:
     try:
         from transformers.models.qwen3_vl_moe import modeling_qwen3_vl_moe
 
-        def _create_causal_mask_moe(config, input_embeds, attention_mask, cache_position,
-                                    past_key_values, position_ids, **kwargs):
+        def _create_causal_mask_moe(
+            config, input_embeds, attention_mask, cache_position, past_key_values, position_ids, **kwargs
+        ):
             return attention_mask
 
         modeling_qwen3_vl_moe.create_causal_mask = _create_causal_mask_moe

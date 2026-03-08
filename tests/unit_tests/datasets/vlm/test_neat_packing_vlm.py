@@ -175,14 +175,12 @@ class TestNeatPackDatasetVlm:
         packed = neat_pack_dataset_vlm(ds, pack_size=8, padding_idx=0)
 
         # Check that pixel_values are present in the packed output
-        assert any(
-            packed[i].get("pixel_values") is not None for i in range(len(packed))
-        )
+        assert any(packed[i].get("pixel_values") is not None for i in range(len(packed)))
 
     def test_n_images_count(self):
         samples = [
             _make_vlm_sample(4, has_image=True),  # 2 images
-            _make_vlm_sample(3),                   # 0 images
+            _make_vlm_sample(3),  # 0 images
         ]
         ds = _FakeDataset(samples)
 
@@ -196,12 +194,15 @@ class TestNeatPackDatasetVlm:
     def test_drop_long(self):
         samples = [
             _make_vlm_sample(10),  # after shift -> 9 tokens, exceeds pack_size=6
-            _make_vlm_sample(3),   # after shift -> 2 tokens, fits
+            _make_vlm_sample(3),  # after shift -> 2 tokens, fits
         ]
         ds = _FakeDataset(samples)
 
         packed = neat_pack_dataset_vlm(
-            ds, pack_size=6, padding_idx=0, drop_long_samples=True,
+            ds,
+            pack_size=6,
+            padding_idx=0,
+            drop_long_samples=True,
         )
         assert len(packed) == 1
 
@@ -274,11 +275,13 @@ class TestMRoPESupport:
     def test_shift_with_mrope(self):
         """mRoPE position_ids are shifted correctly: [:, :-1]."""
         sample = _make_vlm_sample(5)
-        sample["position_ids"] = torch.stack([
-            torch.arange(5),           # temporal
-            torch.zeros(5, dtype=torch.long),  # height
-            torch.zeros(5, dtype=torch.long),  # width
-        ])  # [3, 5]
+        sample["position_ids"] = torch.stack(
+            [
+                torch.arange(5),  # temporal
+                torch.zeros(5, dtype=torch.long),  # height
+                torch.zeros(5, dtype=torch.long),  # width
+            ]
+        )  # [3, 5]
 
         shifted = _shift_sample(sample, has_mrope=True)
 
@@ -291,20 +294,24 @@ class TestMRoPESupport:
             {
                 "input_ids": torch.tensor([1, 2, 3]),
                 "labels": torch.tensor([10, 20, 30]),
-                "position_ids": torch.tensor([
-                    [0, 1, 2],  # temporal
-                    [0, 0, 0],  # height
-                    [0, 0, 0],  # width
-                ]),
+                "position_ids": torch.tensor(
+                    [
+                        [0, 1, 2],  # temporal
+                        [0, 0, 0],  # height
+                        [0, 0, 0],  # width
+                    ]
+                ),
             },
             {
                 "input_ids": torch.tensor([4, 5]),
                 "labels": torch.tensor([40, 50]),
-                "position_ids": torch.tensor([
-                    [0, 1],     # temporal (reset)
-                    [0, 0],     # height
-                    [0, 0],     # width
-                ]),
+                "position_ids": torch.tensor(
+                    [
+                        [0, 1],  # temporal (reset)
+                        [0, 0],  # height
+                        [0, 0],  # width
+                    ]
+                ),
             },
         ]
         result = _build_packed_vlm_sample(samples, pack_size=7, padding_idx=0, has_mrope=True)
@@ -325,7 +332,9 @@ class TestMRoPESupport:
         ds = _FakeDataset(samples)
 
         packed = neat_pack_dataset_vlm(
-            ds, pack_size=8, padding_idx=0,
+            ds,
+            pack_size=8,
+            padding_idx=0,
             get_rope_index=self._fake_get_rope_index,
         )
 
@@ -345,11 +354,13 @@ class TestMRoPESupport:
                 "input_ids": torch.tensor([1, 2, 3, 0]),
                 "labels": torch.tensor([10, 20, 30, -100]),
                 "attention_mask": torch.tensor([1, 1, 1, 0]),
-                "position_ids": torch.tensor([
-                    [0, 1, 2, 0],  # temporal
-                    [0, 0, 0, 0],  # height
-                    [0, 0, 0, 0],  # width
-                ]),  # [3, 4]
+                "position_ids": torch.tensor(
+                    [
+                        [0, 1, 2, 0],  # temporal
+                        [0, 0, 0, 0],  # height
+                        [0, 0, 0, 0],  # width
+                    ]
+                ),  # [3, 4]
                 "n_images": 0,
                 "n_videos": 0,
             },
@@ -357,11 +368,13 @@ class TestMRoPESupport:
                 "input_ids": torch.tensor([4, 5, 6, 7]),
                 "labels": torch.tensor([40, 50, 60, 70]),
                 "attention_mask": torch.tensor([1, 1, 1, 1]),
-                "position_ids": torch.tensor([
-                    [0, 1, 2, 3],
-                    [0, 0, 0, 0],
-                    [0, 0, 0, 0],
-                ]),  # [3, 4]
+                "position_ids": torch.tensor(
+                    [
+                        [0, 1, 2, 3],
+                        [0, 0, 0, 0],
+                        [0, 0, 0, 0],
+                    ]
+                ),  # [3, 4]
                 "n_images": 0,
                 "n_videos": 0,
             },

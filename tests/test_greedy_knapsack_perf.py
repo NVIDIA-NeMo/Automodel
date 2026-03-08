@@ -60,7 +60,9 @@ def _print_result(r: dict):
     print(f"  Min fill:      {r['min_fill']:>10,}")
     print(f"  Max fill:      {r['max_fill']:>10,}")
     print("  ──────────────────────────────────────")
-    print(f"  Samples/bin:   avg={r['avg_samples_per_bin']:.1f}  min={r['min_samples_per_bin']}  max={r['max_samples_per_bin']}")
+    print(
+        f"  Samples/bin:   avg={r['avg_samples_per_bin']:.1f}  min={r['min_samples_per_bin']}  max={r['max_samples_per_bin']}"
+    )
     print(f"  Sample length: avg={r['avg_length']:.0f}  median={r['median_length']:.0f}")
 
 
@@ -93,8 +95,7 @@ def main():
     _print_result(r)
 
     # Bimodal: 50% short + 50% long
-    lengths = ([rng.randint(50, 500) for _ in range(N // 2)]
-               + [rng.randint(4000, 7500) for _ in range(N // 2)])
+    lengths = [rng.randint(50, 500) for _ in range(N // 2)] + [rng.randint(4000, 7500) for _ in range(N // 2)]
     rng.shuffle(lengths)
     r = _run_benchmark("Bimodal (short+long)", lengths, pack_size)
     benchmarks.append(r)
@@ -118,7 +119,7 @@ def main():
     print("  SUMMARY")
     print(f"{'=' * 90}")
     print(f"  {'Name':<35} {'N':>10} {'Bins':>8} {'Time':>8} {'Rate':>12} {'Util%':>7}")
-    print(f"  {'-'*35} {'-'*10} {'-'*8} {'-'*8} {'-'*12} {'-'*7}")
+    print(f"  {'-' * 35} {'-' * 10} {'-' * 8} {'-' * 8} {'-' * 12} {'-' * 7}")
     for r in benchmarks:
         print(
             f"  {r['name']:<35} {r['N']:>10,} {r['n_bins']:>8,} "

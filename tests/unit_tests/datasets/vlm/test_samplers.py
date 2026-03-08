@@ -186,8 +186,10 @@ class TestEstimateLengthAccurate:
     def test_image_tokens_simple(self):
         """A 280x560 image with factor=28 needs no resize; tokens = (280/14)*(560/14)/4 = 20*40/4 = 200."""
         processor = _make_processor(
-            image_patch_size=14, image_merge_size=2,
-            image_min_pixels=100, image_max_pixels=10_000_000,
+            image_patch_size=14,
+            image_merge_size=2,
+            image_min_pixels=100,
+            image_max_pixels=10_000_000,
         )
         example = {
             "conversation": _media_msg(n_images=1),
@@ -199,8 +201,10 @@ class TestEstimateLengthAccurate:
 
     def test_image_tokens_with_text(self):
         processor = _make_processor(
-            image_patch_size=14, image_merge_size=2,
-            image_min_pixels=100, image_max_pixels=10_000_000,
+            image_patch_size=14,
+            image_merge_size=2,
+            image_min_pixels=100,
+            image_max_pixels=10_000_000,
         )
         example = {
             "conversation": _media_msg(n_images=1, text="a" * 30),
@@ -212,8 +216,10 @@ class TestEstimateLengthAccurate:
 
     def test_multiple_images(self):
         processor = _make_processor(
-            image_patch_size=14, image_merge_size=2,
-            image_min_pixels=100, image_max_pixels=10_000_000,
+            image_patch_size=14,
+            image_merge_size=2,
+            image_min_pixels=100,
+            image_max_pixels=10_000_000,
         )
         example = {
             "conversation": _media_msg(n_images=2),
@@ -226,10 +232,14 @@ class TestEstimateLengthAccurate:
     def test_video_tokens(self):
         """Video with known dimensions — verify token count."""
         processor = _make_processor(
-            video_patch_size=16, video_merge_size=2,
+            video_patch_size=16,
+            video_merge_size=2,
             video_temporal_patch_size=2,
-            video_min_pixels=100, video_max_pixels=100_000_000,
-            video_fps=2.0, video_min_frames=4, video_max_frames=128,
+            video_min_pixels=100,
+            video_max_pixels=100_000_000,
+            video_fps=2.0,
+            video_min_frames=4,
+            video_max_frames=128,
         )
         # Video: 100 frames at 25fps → sampled = int(100/25*2) = 8 frames
         # 8 % 2 == 0, so nframes = 8, grid_t = 8/2 = 4
@@ -246,12 +256,18 @@ class TestEstimateLengthAccurate:
 
     def test_mixed_image_and_video(self):
         processor = _make_processor(
-            image_patch_size=14, image_merge_size=2,
-            image_min_pixels=100, image_max_pixels=10_000_000,
-            video_patch_size=16, video_merge_size=2,
+            image_patch_size=14,
+            image_merge_size=2,
+            image_min_pixels=100,
+            image_max_pixels=10_000_000,
+            video_patch_size=16,
+            video_merge_size=2,
             video_temporal_patch_size=2,
-            video_min_pixels=100, video_max_pixels=100_000_000,
-            video_fps=2.0, video_min_frames=4, video_max_frames=128,
+            video_min_pixels=100,
+            video_max_pixels=100_000_000,
+            video_fps=2.0,
+            video_min_frames=4,
+            video_max_frames=128,
         )
         example = {
             "conversation": _media_msg(n_images=1, n_videos=1, text="a" * 30),
@@ -274,8 +290,10 @@ class TestEstimateLengthAccurate:
     def test_none_entries_in_meta_skipped(self):
         """None entries in images_meta / videos_meta are skipped gracefully."""
         processor = _make_processor(
-            image_patch_size=14, image_merge_size=2,
-            image_min_pixels=100, image_max_pixels=10_000_000,
+            image_patch_size=14,
+            image_merge_size=2,
+            image_min_pixels=100,
+            image_max_pixels=10_000_000,
         )
         example = {
             "conversation": _media_msg(n_images=2),
@@ -288,10 +306,14 @@ class TestEstimateLengthAccurate:
     def test_video_min_frames_enforced(self):
         """Very short video gets clamped to min_frames."""
         processor = _make_processor(
-            video_patch_size=16, video_merge_size=2,
+            video_patch_size=16,
+            video_merge_size=2,
             video_temporal_patch_size=2,
-            video_min_pixels=100, video_max_pixels=100_000_000,
-            video_fps=2.0, video_min_frames=4, video_max_frames=128,
+            video_min_pixels=100,
+            video_max_pixels=100_000_000,
+            video_fps=2.0,
+            video_min_frames=4,
+            video_max_frames=128,
         )
         # 2 frames at 30fps → sampled = int(2/30*2) = 0 → max(1,0)=1 → clamped to min_frames=4
         # 4 % 2 == 0, nframes = 4, grid_t = 2
@@ -308,10 +330,14 @@ class TestEstimateLengthAccurate:
     def test_video_max_frames_enforced(self):
         """Long video gets clamped to max_frames."""
         processor = _make_processor(
-            video_patch_size=16, video_merge_size=2,
+            video_patch_size=16,
+            video_merge_size=2,
             video_temporal_patch_size=2,
-            video_min_pixels=100, video_max_pixels=100_000_000,
-            video_fps=2.0, video_min_frames=4, video_max_frames=16,
+            video_min_pixels=100,
+            video_max_pixels=100_000_000,
+            video_fps=2.0,
+            video_min_frames=4,
+            video_max_frames=16,
         )
         # 3000 frames at 30fps → sampled = int(3000/30*2) = 200 → clamped to max_frames=16
         # 16 % 2 == 0, nframes=16, grid_t=8
@@ -333,12 +359,14 @@ class TestEstimateLengthAccurate:
 class TestSortedOrder:
     def test_indices_sorted_by_text_length_descending(self):
         """Two-level sort: primary key is text tokens (descending)."""
-        ds = _make_dataset([
-            _text_msg("short"),           # idx 0: text_tok=2, media=0
-            _text_msg("a" * 300),         # idx 1: text_tok=100, media=0
-            _text_msg("a" * 30),          # idx 2: text_tok=10, media=0
-            _media_msg(n_images=3),       # idx 3: text_tok=0, media=1500
-        ])
+        ds = _make_dataset(
+            [
+                _text_msg("short"),  # idx 0: text_tok=2, media=0
+                _text_msg("a" * 300),  # idx 1: text_tok=100, media=0
+                _text_msg("a" * 30),  # idx 2: text_tok=10, media=0
+                _media_msg(n_images=3),  # idx 3: text_tok=0, media=1500
+            ]
+        )
         sampler = LengthGroupedSampler(ds, seed=0)
         # Sort by total tokens desc: idx 3 has 1500 media tokens, idx 1 has 100 text, etc.
         indices = list(sampler)
@@ -348,18 +376,20 @@ class TestSortedOrder:
     def test_accurate_sorting_with_processor(self):
         """With processor + mm_inputs_meta, two-level sort uses text then media."""
         processor = _make_processor(
-            image_patch_size=14, image_merge_size=2,
-            image_min_pixels=100, image_max_pixels=10_000_000,
+            image_patch_size=14,
+            image_merge_size=2,
+            image_min_pixels=100,
+            image_max_pixels=10_000_000,
         )
         ds = _make_dataset(
             [
                 _media_msg(n_images=1),  # idx 0: text_tok=0, media=100
                 _media_msg(n_images=1),  # idx 1: text_tok=0, media=400
-                _text_msg("a" * 30),     # idx 2: text_tok=10, media=0
+                _text_msg("a" * 30),  # idx 2: text_tok=10, media=0
             ],
             mm_metas=[
-                {"images_meta": [[280, 280]]},   # (280/14)*(280/14)/4 = 100
-                {"images_meta": [[560, 560]]},   # (560/14)*(560/14)/4 = 400
+                {"images_meta": [[280, 280]]},  # (280/14)*(280/14)/4 = 100
+                {"images_meta": [[560, 560]]},  # (560/14)*(560/14)/4 = 400
                 None,
             ],
         )
@@ -491,10 +521,14 @@ class TestEdgeCases:
     def test_video_zero_fps(self):
         """When source fps=0, duration is used to compute nframes."""
         processor = _make_processor(
-            video_patch_size=16, video_merge_size=2,
+            video_patch_size=16,
+            video_merge_size=2,
             video_temporal_patch_size=2,
-            video_min_pixels=100, video_max_pixels=100_000_000,
-            video_fps=2.0, video_min_frames=4, video_max_frames=128,
+            video_min_pixels=100,
+            video_max_pixels=100_000_000,
+            video_fps=2.0,
+            video_min_frames=4,
+            video_max_frames=128,
         )
         # total_frames=0, fps=0 → total_frames stays 0
         # nframes from duration: max(1, int(5*2)) = 10
