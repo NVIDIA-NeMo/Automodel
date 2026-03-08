@@ -190,6 +190,68 @@ class TestApplyModelInfrastructurePostShardInit:
 
         mock_ckpt.initialize_model_weights.assert_not_called()
 
+    def test_skips_model_to_device_when_checkpoint_loaded(self):
+        """model.to(device) should be skipped when should_load_checkpoint is True (tied params + FSDP fix)."""
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+        model = _DummyModel()
+
+        with (
+            patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+            patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+            patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+            patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+            patch.object(model, "to", wraps=model.to) as mock_to,
+        ):
+            mock_ckpt = MockCheckpointer.return_value
+            mock_ckpt.config = MagicMock()
+            mock_ckpt.config.dequantize_base_checkpoint = False
+
+            # from_pretrained on meta device: should_load_checkpoint = True
+            apply_model_infrastructure(
+                model=model,
+                is_meta_device=True,
+                device=torch.device("cpu"),
+                load_base_model=True,
+                pretrained_model_name_or_path="test/model",
+            )
+
+            # model.to(device) should NOT have been called — checkpoint loading
+            # already placed params on device, and calling to() would trigger
+            # FSDP's reset_sharded_param failure on tied parameters.
+            mock_to.assert_not_called()
+
+    def test_calls_model_to_device_when_no_checkpoint(self):
+        """model.to(device) should be called when no checkpoint is loaded (from_config path)."""
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+        model = _DummyModel()
+
+        with (
+            patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+            patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+            patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+            patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+            patch.object(model, "to", wraps=model.to) as mock_to,
+        ):
+            mock_ckpt = MockCheckpointer.return_value
+            mock_ckpt.config = MagicMock()
+            mock_ckpt.config.dequantize_base_checkpoint = False
+
+            # from_config on meta device: should_load_checkpoint = False
+            apply_model_infrastructure(
+                model=model,
+                is_meta_device=True,
+                device=torch.device("cpu"),
+                load_base_model=False,
+                pretrained_model_name_or_path="",
+            )
+
+            # model.to(device) SHOULD be called since no checkpoint was loaded
+            mock_to.assert_called_once()
+
     def test_peft_init_method_forwarded_to_initialize_model_weights(self):
         """peft_config.lora_A_init should be forwarded as peft_init_method."""
         from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
