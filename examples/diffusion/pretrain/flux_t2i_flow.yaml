@@ -2,6 +2,7 @@ model:
   pretrained_model_name_or_path: "black-forest-labs/FLUX.1-dev"
   mode: "pretrain"
   cache_dir: null
+  attention_backend: "flash"
 
   pipeline_spec:
     transformer_cls: "FluxTransformer2DModel"
@@ -50,8 +51,8 @@ flow_matching:
 
 step_scheduler:
   num_epochs: 500000
-  local_batch_size: 2
-  global_batch_size: 64
+  local_batch_size: 1
+  global_batch_size: 8
   ckpt_every_steps: 1000
   log_every: 1
 
