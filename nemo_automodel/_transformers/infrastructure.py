@@ -458,7 +458,10 @@ def apply_model_infrastructure(
 
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
-        # Ensure model is on the correct device; AutoPipeline takes care of it internally
-        model.to(device)
+        # Ensure model is on the correct device; AutoPipeline takes care of it internally.
+        # Skip if checkpoint was loaded (params are already on device) to avoid triggering
+        # FSDP's reset_sharded_param which fails on tied parameters after parallelization.
+        if not should_load_checkpoint:
+            model.to(device)
 
     return model
