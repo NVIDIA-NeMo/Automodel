@@ -16,6 +16,7 @@ import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from nemo_automodel.components.checkpoint.checkpointing import (
@@ -529,6 +530,23 @@ class TestInitializeModelWeights:
         Checkpointer.initialize_model_weights(model, torch.device("cpu"))
 
         model.initialize_weights.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "architecture",
+        ["Gemma3ForCausalLM", "Gemma3ForConditionalGeneration"],
+        ids=["causal_lm", "conditional_generation"],
+    )
+    def test_skips_for_gemma3(self, architecture):
+        """Gemma3 models should skip init — _init_weights zeros embedding padding_idx which fails with DTensors."""
+        model = self._make_meta_model()
+        model.config = SimpleNamespace(architectures=[architecture])
+        model._is_hf_initialized = True
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_not_called()
+        assert model._is_hf_initialized is True
 
     def test_handles_missing_config_gracefully(self):
         """Model without config.architectures should not raise."""
