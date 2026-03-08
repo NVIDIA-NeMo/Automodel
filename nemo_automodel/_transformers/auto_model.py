@@ -257,12 +257,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # Use meta device initialization when:
         # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)
         # - AND either multi-GPU (world_size > 1) or single-GPU custom model (not HF)
-        # - AND not using quantization (we let HF handle BitsAndBytes; don't init meta device)
+        # - AND not using quantization (we let HF handle BitsAndBytes/FP8; don't init meta device)
+        #   For non-HF models, native quant config is ignored.
         is_meta_device = all(
             [
                 not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)),
                 get_world_size_safe() > 1 or not is_hf_model,
-                quantization_config is None and _hf_native_quant_cfg is None,
+                quantization_config is None and (_hf_native_quant_cfg is None or not is_hf_model),
             ]
         )
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
