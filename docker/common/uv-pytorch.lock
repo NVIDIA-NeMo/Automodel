@@ -3399,7 +3399,7 @@ requires-dist = [
     { name = "transformers", specifier = ">=5.0.0" },
     { name = "wandb" },
 ]
-provides-extras = ["diffusion", "cuda", "extra", "fa", "delta-databricks", "moe", "vlm", "cli", "all"]
+provides-extras = ["diffusion", "cuda", "cuda-source", "extra", "fa", "delta-databricks", "moe", "vlm", "cli", "all"]
 
 [package.metadata.requires-dev]
 build = [
