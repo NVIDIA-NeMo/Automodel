@@ -518,16 +518,19 @@ def apply_model_infrastructure(
                     param.requires_grad_(False)
 
     if autopipeline is None:
-        # Ensure model is on the correct device; AutoPipeline takes care of it internally
-        try:
-            model.to(device, non_blocking=True)
-        except NotImplementedError as e:
-            if "Cannot copy out of meta tensor" in str(e):
-                logger.warning("model.to(device) failed (meta tensors); using model.to_empty(device=device) instead.")
-                model.to_empty(device=device)
-            else:
-                raise
         print_trainable_parameters(model)  # Once model's been sharded
+        # Ensure model is on the correct device; AutoPipeline takes care of it internally.
+        # Skip if checkpoint was loaded (params are already on device) to avoid triggering
+        # FSDP's reset_sharded_param which fails on tied parameters after parallelization.
+        if not should_load_checkpoint:
+            try:
+                model.to(device, non_blocking=True)
+            except NotImplementedError as e:
+                if "Cannot copy out of meta tensor" in str(e):
+                    logger.warning("model.to(device) failed (meta tensors); using model.to_empty(device=device) instead.")
+                    model.to_empty(device=device)
+                else:
+                    raise
 
     # Attach CP attention-mask hooks for dense (non-TE) context parallelism.
     # These hooks strip attention_mask and set is_causal=True on self_attn modules
