@@ -14,15 +14,11 @@
 
 from types import SimpleNamespace
 
-import pytest
-import torch
-
 from nemo_automodel.components.datasets.vlm.samplers import (
     LengthGroupedSampler,
     _smart_resize_image,
     _smart_resize_video,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
