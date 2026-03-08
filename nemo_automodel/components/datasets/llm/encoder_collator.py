@@ -239,9 +239,8 @@ class RetrievalEncoderCollator:
 
 
 class CrossEncoderCollator(DataCollatorWithPadding):
-    def __init__(self, rerank_max_length: int, train_n_passages: int, *args, **kwargs):
+    def __init__(self, rerank_max_length: int, *args, **kwargs):
         self.rerank_max_length = rerank_max_length
-        self.train_n_passages = train_n_passages
         # Call Base with all args and kwargs
         self.args = None
         if "args" in kwargs:

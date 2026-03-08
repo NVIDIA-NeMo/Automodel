@@ -19,7 +19,6 @@
 
 seed: 125
 
-train_n_passages: 5
 temperature: 0.02
 
 step_scheduler:
@@ -60,7 +59,7 @@ dataloader:
       - ./embed_nemotron_dataset_v1/SyntheticClassificationData/SyntheticClassificationData.json
       - ./embed_nemotron_dataset_v1/TriviaQA/TriviaQA.json
     data_type: train
-    train_n_passages: 5
+    n_passages: 5
     seed: 125
     do_shuffle: true
     use_dataset_instruction: true

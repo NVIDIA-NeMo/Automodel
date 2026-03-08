@@ -187,11 +187,9 @@ def main() -> int:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
 
-    # Load all data first (max_train_samples=None -> no cap inside the dataset loader).
     ds = rdi.make_retrieval_dataset(
         data_dir_list=str(dataset_path),
         data_type="eval",
-        train_n_passages=2,
         eval_negative_size=1,
         do_shuffle=False,
         max_train_samples=args.max_samples,

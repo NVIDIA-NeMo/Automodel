@@ -233,7 +233,7 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
   data_dir_list: /abs/path/to/train.jsonl
   data_type: train
-  train_n_passages: 5
+  n_passages: 5
 collate_fn:
   _target_: nemo_automodel.components.datasets.llm.RetrievalEncoderCollator
   q_max_len: 512

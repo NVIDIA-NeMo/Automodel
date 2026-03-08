@@ -19,8 +19,6 @@
 
 seed: 42
 
-train_n_passages: 5
-eval_negative_size: 4
 temperature: 0.02
 
 step_scheduler:
@@ -56,8 +54,7 @@ dataloader:
       - hf://nvidia/embed-nemotron-dataset-v1/FEVER
       - hf://nvidia/embed-nemotron-dataset-v1/SyntheticClassificationData
     data_type: train
-    train_n_passages: 5
-    eval_negative_size: 4
+    n_passages: 5
     seed: 42
     do_shuffle: true
   collate_fn:
@@ -78,8 +75,7 @@ dataloader:
 #     model_type: biencoder
 #     data_dir_list: training_datasets/validation.json
 #     data_type: eval
-#     train_n_passages: 5
-#     eval_negative_size: 4
+#     n_passages: 5
 #     seed: 42
 #     do_shuffle: false
 #     max_train_samples: 1000

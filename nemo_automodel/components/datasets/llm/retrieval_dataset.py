@@ -452,7 +452,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         if num_neg_docs > 0 and len(negatives) == 0:
             raise ValueError(
                 f"neg_doc is empty for example {i_example} but {num_neg_docs} negative(s) requested "
-                f"(train_n_passages > 1). Provide negatives or set train_n_passages=1."
+                f"(n_passages > 1). Provide negatives or set n_passages=1."
             )
         if num_neg_docs > 0:
             neg_ids = [i for i in range(len(negatives))]
@@ -560,7 +560,7 @@ def make_retrieval_dataset(
     data_dir_list: Union[List[str], str] = None,
     model_type: str = "biencoder",
     data_type: str = "train",
-    train_n_passages: int = 5,
+    n_passages: int = 5,
     eval_negative_size: int = 10,
     seed: int = 42,
     do_shuffle: bool = False,
@@ -580,7 +580,7 @@ def make_retrieval_dataset(
         data_dir_list: Path(s) to JSON file(s) or ``hf://`` URIs.
         model_type: "biencoder" (default) or "crossencoder"
         data_type: Type of data ("train" or "eval")
-        train_n_passages: Number of passages for training (1 positive + n-1 negatives)
+        n_passages: Number of passages (1 positive + n-1 negatives)
         eval_negative_size: Number of negative documents for evaluation
         seed: Random seed for reproducibility (for shuffling if needed)
         do_shuffle: Whether to shuffle the dataset
@@ -646,7 +646,6 @@ def make_retrieval_dataset(
     else:
         transform_factory = _create_transform_func
 
-    # Apply same processing as _get_processed_dataset
     if data_type == "train":
         if max_train_samples is not None:
             if do_shuffle:
@@ -655,12 +654,10 @@ def make_retrieval_dataset(
                 range(train_data_select_offset, min(train_data_select_offset + max_train_samples, len(dataset)))
             )
 
-        # Set transform for training (train_n_passages - 1 negatives)
-        negative_size = train_n_passages - 1
+        negative_size = n_passages - 1
         dataset.set_transform(transform_factory(negative_size, corpus_dict, use_dataset_instruction))
 
     elif data_type == "eval":
-        # Set transform for evaluation
         dataset.set_transform(transform_factory(eval_negative_size, corpus_dict, use_dataset_instruction))
 
     else:
@@ -686,7 +683,7 @@ if __name__ == "__main__":
         "--data_type", type=str, default="train", choices=["train", "eval"], help="Type of data (train or eval)"
     )
     parser.add_argument(
-        "--train_n_passages", type=int, default=5, help="Number of passages for training (1 positive + n-1 negatives)"
+        "--n_passages", type=int, default=5, help="Number of passages (1 positive + n-1 negatives)"
     )
     parser.add_argument(
         "--eval_negative_size", type=int, default=10, help="Number of negative documents for evaluation"
@@ -702,7 +699,7 @@ if __name__ == "__main__":
     dataset = make_retrieval_dataset(
         data_dir_list=args.data_dir_list,
         data_type=args.data_type,
-        train_n_passages=args.train_n_passages,
+        n_passages=args.n_passages,
         eval_negative_size=args.eval_negative_size,
         seed=args.seed,
         do_shuffle=args.do_shuffle,

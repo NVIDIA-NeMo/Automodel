@@ -141,8 +141,6 @@ class TrainRetrieverEncoderRecipe(BaseRecipe):
     def __init__(self, cfg):
         self.cfg = cfg
 
-        self.train_n_passages = self.cfg.get("train_n_passages", 1)
-        self.eval_negative_size = self.cfg.get("eval_negative_size", 0)
         self.temperature = self.cfg.get("temperature", 1.0)
 
     def setup(self):
@@ -245,6 +243,7 @@ class TrainRetrieverEncoderRecipe(BaseRecipe):
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
         )
+        self.train_n_passages = self.cfg.get("dataloader.dataset.n_passages", 1)
 
         self.val_dataloader = None
         if "validation_dataloader" in self.cfg:
@@ -259,6 +258,7 @@ class TrainRetrieverEncoderRecipe(BaseRecipe):
                 dp_rank=self._get_dp_rank(),
                 dp_world_size=self._get_dp_group_size(),
             )
+            self.val_n_passages = self.cfg.get("validation_dataloader.dataset.n_passages", self.train_n_passages)
 
         self.step_scheduler = build_step_scheduler(
             self.cfg.get("step_scheduler", None),
@@ -430,8 +430,7 @@ class TrainRetrieverEncoderRecipe(BaseRecipe):
                     q_reps = model(query)
                     p_reps = model(passage)
 
-                    n_passages = self.eval_negative_size + 1
-                    scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
+                    scores, labels = contrastive_scores_and_labels(q_reps, p_reps, self.val_n_passages)
                     if model.l2_normalize:
                         scores = scores / self.temperature
                     loss = F.cross_entropy(scores, labels)

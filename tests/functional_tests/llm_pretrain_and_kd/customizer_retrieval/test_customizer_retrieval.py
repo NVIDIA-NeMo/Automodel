@@ -127,7 +127,6 @@ def _build_eval_dataset():
     return rdi.make_retrieval_dataset(
         data_dir_list=TEST_DATA_JSONL,
         data_type="eval",
-        train_n_passages=2,
         eval_negative_size=1,
         do_shuffle=False,
     )

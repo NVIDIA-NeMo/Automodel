@@ -19,10 +19,6 @@
 
 seed: 42
 
-train_n_passages: 5
-eval_negative_size: 4
-temperature: 0.02
-
 step_scheduler:
   global_batch_size: 128
   local_batch_size: 4
@@ -56,14 +52,12 @@ dataloader:
       - retriever_models_research/training_datasets/mldr_en_perc95_small.json
       - retriever_models_research/training_datasets/miracl_train_es_llama3_1b_4m_512len.json
     data_type: train
-    train_n_passages: 5
-    eval_negative_size: 4
+    n_passages: 5
     seed: 42
     do_shuffle: true
   collate_fn:
     _target_: nemo_automodel.components.datasets.llm.CrossEncoderCollator
     rerank_max_length: 512
-    train_n_passages: 5
     pad_to_multiple_of: 8
   shuffle: true
   num_workers: 0
@@ -76,8 +70,7 @@ dataloader:
 #     model_type: crossencoder
 #     data_dir_list: training_datasets/validation.json
 #     data_type: eval
-#     train_n_passages: 5
-#     eval_negative_size: 4
+#     n_passages: 5
 #     seed: 42
 #     do_shuffle: false
 #     max_train_samples: 1000
@@ -85,7 +78,6 @@ dataloader:
 #   collate_fn:
 #     _target_: nemo_automodel.components.datasets.llm.CrossEncoderCollator
 #     rerank_max_length: 512
-#     train_n_passages: 5
 #     pad_to_multiple_of: 8
 #   batch_size: 2
 #   shuffle: false

@@ -88,7 +88,7 @@ dataloader:
     data_dir_list:
       - /abs/path/to/train.jsonl   # or train.json (corpus-id format)
     data_type: train
-    train_n_passages: 5           # 1 positive + 4 negatives
+    n_passages: 5                 # 1 positive + 4 negatives
     do_shuffle: true
     use_dataset_instruction: false
   collate_fn:
@@ -103,4 +103,4 @@ dataloader:
 ## Requirements
 
 - `pos_doc` must be **non-empty**.
-- If training requests negatives (e.g., `train_n_passages > 1`), `neg_doc` must contain **at least one** document (the loader will cycle negatives if you provide fewer than needed).
+- If training requests negatives (e.g., `n_passages > 1`), `neg_doc` must contain **at least one** document (the loader will cycle negatives if you provide fewer than needed).

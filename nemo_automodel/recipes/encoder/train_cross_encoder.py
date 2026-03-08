@@ -143,7 +143,7 @@ class TrainCrossEncoderRecipe(TrainRetrieverEncoderRecipe):
                     )
                     with train_ctx:
                         outputs = model(**batch, return_dict=True)
-                        logits = outputs.logits.view(-1, self.train_n_passages)
+                        logits = outputs.logits.view(-1, self.val_n_passages)
                         loss = F.cross_entropy(logits, labels)
 
                     loss_buffer.append(loss.clone().detach())

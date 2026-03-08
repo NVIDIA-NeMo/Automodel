@@ -1,7 +1,5 @@
 seed: 42
 
-train_n_passages: 2
-eval_negative_size: 1
 temperature: 1.0
 
 dist_env:
@@ -39,7 +37,7 @@ dataloader:
     data_dir_list:
     - /home/TestData/automodel/embedding_testdata/training.jsonl
     data_type: train
-    train_n_passages: 2
+    n_passages: 2
     seed: 42
     do_shuffle: true
   collate_fn:
