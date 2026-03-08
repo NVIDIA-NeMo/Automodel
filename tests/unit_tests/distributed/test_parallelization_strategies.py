@@ -15,28 +15,28 @@
 """Tests for the parallelization strategy pattern."""
 
 import logging
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch, call
 from abc import ABC
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call, patch
 
 import pytest
-import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.parallel import ColwiseParallel
 
+from nemo_automodel.components.distributed import parallelizer as parallelizer_mod
+
 # Import the components under test
 from nemo_automodel.components.distributed.parallelizer import (
-    ParallelizationStrategy,
+    _DEFAULT_STRATEGY,
+    PARALLELIZATION_STRATEGIES,
     DefaultParallelizationStrategy,
     NemotronHParallelizationStrategy,
+    ParallelizationStrategy,
     WanParallelizationStrategy,
-    PARALLELIZATION_STRATEGIES,
-    _DEFAULT_STRATEGY,
-    get_parallelization_strategy,
     fsdp2_strategy_parallelize,
+    get_parallelization_strategy,
 )
-from nemo_automodel.components.distributed import parallelizer as parallelizer_mod
 
 
 class MockModel(nn.Module):
@@ -47,15 +47,14 @@ class MockModel(nn.Module):
         self.config = SimpleNamespace(
             num_attention_heads=num_attention_heads,
             num_key_value_heads=num_key_value_heads,
+            hidden_size=num_attention_heads * 8,
         )
 
         # Create mock model structure
         class MockInnerModel(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.layers = nn.ModuleList([
-                    self._create_mock_layer() for _ in range(2)
-                ])
+                self.layers = nn.ModuleList([self._create_mock_layer() for _ in range(2)])
 
             def _create_mock_layer(self):
                 """Create a mock transformer layer."""
@@ -86,14 +85,12 @@ class MockNemotronHModel(nn.Module):
         class MockBackbone(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.layers = nn.ModuleList([
-                    self._create_mock_layer() for _ in range(2)
-                ])
+                self.layers = nn.ModuleList([self._create_mock_layer() for _ in range(2)])
 
             def _create_mock_layer(self):
                 layer = nn.Module()
                 # Use setattr to avoid linter issues with dynamic attributes
-                setattr(layer, 'block_type', "mlp")  # Set block type for NemotronH
+                setattr(layer, "block_type", "mlp")  # Set block type for NemotronH
                 layer.mixer = nn.Module()
                 layer.mixer.up_proj = nn.Linear(10, 10)
                 layer.mixer.down_proj = nn.Linear(10, 10)
@@ -142,50 +139,45 @@ def mock_distributed_env(monkeypatch):
     # Mock FSDP functions
     fully_shard_mock = MagicMock(side_effect=lambda model, **kwargs: model)
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer.fully_shard",
-        fully_shard_mock, raising=False
+        "nemo_automodel.components.distributed.parallelizer.fully_shard", fully_shard_mock, raising=False
     )
 
     # Mock tensor parallel functions
     parallelize_module_mock = MagicMock()
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer.parallelize_module",
-        parallelize_module_mock, raising=False
+        "nemo_automodel.components.distributed.parallelizer.parallelize_module", parallelize_module_mock, raising=False
     )
 
     # Mock checkpoint wrapper
     checkpoint_wrapper_mock = MagicMock(side_effect=lambda x: x)
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper",
-        checkpoint_wrapper_mock, raising=False
+        "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper", checkpoint_wrapper_mock, raising=False
     )
 
     # Mock apply_fsdp2_sharding_recursively
     apply_fsdp_mock = MagicMock()
     monkeypatch.setattr(
         "nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively",
-        apply_fsdp_mock, raising=False
+        apply_fsdp_mock,
+        raising=False,
     )
 
     # Mock _extract_model_layers
     extract_layers_mock = MagicMock(return_value=[])
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer._extract_model_layers",
-        extract_layers_mock, raising=False
+        "nemo_automodel.components.distributed.parallelizer._extract_model_layers", extract_layers_mock, raising=False
     )
 
     # Mock _get_parallel_plan
     get_plan_mock = MagicMock(return_value={"test.layer": ColwiseParallel()})
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer._get_parallel_plan",
-        get_plan_mock, raising=False
+        "nemo_automodel.components.distributed.parallelizer._get_parallel_plan", get_plan_mock, raising=False
     )
 
     # Mock validate_tp_mesh
     validate_tp_mock = MagicMock()
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer.validate_tp_mesh",
-        validate_tp_mock, raising=False
+        "nemo_automodel.components.distributed.parallelizer.validate_tp_mesh", validate_tp_mock, raising=False
     )
 
     return {
@@ -209,8 +201,8 @@ class TestParallelizationStrategy:
 
     def test_has_abstract_parallelize_method(self):
         """Test that the parallelize method is abstract."""
-        assert hasattr(ParallelizationStrategy, 'parallelize')
-        assert getattr(ParallelizationStrategy.parallelize, '__isabstractmethod__', False)
+        assert hasattr(ParallelizationStrategy, "parallelize")
+        assert getattr(ParallelizationStrategy.parallelize, "__isabstractmethod__", False)
 
     def test_inherits_from_abc(self):
         """Test that ParallelizationStrategy inherits from ABC."""
@@ -237,11 +229,19 @@ class TestDefaultParallelizationStrategy:
 
         # Check that all required parameters are supported
         import inspect
+
         sig = inspect.signature(method)
         required_params = [
-            'model', 'device_mesh', 'mp_policy', 'offload_policy',
-            'sequence_parallel', 'activation_checkpointing', 'tp_shard_plan',
-            'dp_replicate_mesh_name', 'dp_shard_cp_mesh_name', 'tp_mesh_name'
+            "model",
+            "device_mesh",
+            "mp_policy",
+            "offload_policy",
+            "sequence_parallel",
+            "activation_checkpointing",
+            "tp_shard_plan",
+            "dp_replicate_mesh_name",
+            "dp_shard_cp_mesh_name",
+            "tp_mesh_name",
         ]
 
         for param in required_params:
@@ -275,7 +275,7 @@ class TestDefaultParallelizationStrategy:
 
         model = MockModel()
 
-        result = strategy.parallelize(
+        strategy.parallelize(
             model=model,
             device_mesh=mesh,
             sequence_parallel=False,
@@ -301,7 +301,7 @@ class TestDefaultParallelizationStrategy:
 
         model = MockModel()
 
-        result = strategy.parallelize(
+        strategy.parallelize(
             model=model,
             device_mesh=mesh,
             sequence_parallel=False,
@@ -334,7 +334,7 @@ class TestDefaultParallelizationStrategy:
 
         model = MockModel()
 
-        result = strategy.parallelize(
+        strategy.parallelize(
             model=model,
             device_mesh=mesh,
             dp_replicate_mesh_name="custom_dp_replicate",
@@ -381,14 +381,25 @@ class TestNemotronHParallelizationStrategy:
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
-    def test_custom_tp_plan_not_supported(self, fully_shard, fully_shard_by_dtype, strategy, mock_device_mesh, nemotron_model, monkeypatch, mock_distributed_env):
+    def test_custom_tp_plan_not_supported(
+        self,
+        fully_shard,
+        fully_shard_by_dtype,
+        strategy,
+        mock_device_mesh,
+        nemotron_model,
+        monkeypatch,
+        mock_distributed_env,
+    ):
         """Test that passing a custom plan logs info and proceeds (no exception)."""
         mesh, _, _, _ = mock_device_mesh
         fully_shard.side_effect = lambda model, **kwargs: model
         fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
         # Ensure logger is enabled; capture logs
         import logging
+
         from nemo_automodel.components.distributed import parallelizer as parallelizer_mod
+
         logger = parallelizer_mod.logging.getLogger(parallelizer_mod.__name__)
         old_level = logger.level
         logger.setLevel(logging.DEBUG)
@@ -406,15 +417,23 @@ class TestNemotronHParallelizationStrategy:
     @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
-    def test_nemotron_specific_parallelization(self, fully_shard, fully_shard_by_dtype, mock_parallelize_module,
-                                             strategy, mock_device_mesh, nemotron_model, tp_size):
+    def test_nemotron_specific_parallelization(
+        self,
+        fully_shard,
+        fully_shard_by_dtype,
+        mock_parallelize_module,
+        strategy,
+        mock_device_mesh,
+        nemotron_model,
+        tp_size,
+    ):
         """Test NemotronH-specific parallelization logic for tp_size 1 and 2."""
         mesh, _, dp_shard_mesh, tp_mesh = mock_device_mesh
         fully_shard.side_effect = lambda model, **kwargs: model
         fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
         tp_mesh.size.return_value = tp_size
 
-        result = strategy.parallelize(
+        strategy.parallelize(
             model=nemotron_model,
             device_mesh=mesh,
             activation_checkpointing=False,
@@ -425,7 +444,9 @@ class TestNemotronHParallelizationStrategy:
             assert mock_parallelize_module.call_count == 0
         else:
             # Should call parallelize_module for model-level TP plan
-            expected_calls = len([layer for layer in nemotron_model.backbone.layers if layer.block_type == "mlp"]) + 1  # +1 for model level
+            expected_calls = (
+                len([layer for layer in nemotron_model.backbone.layers if layer.block_type == "mlp"]) + 1
+            )  # +1 for model level
             assert mock_parallelize_module.call_count == expected_calls
 
         # Should call fully_shard for each layer and the root model regardless of TP size
@@ -436,8 +457,16 @@ class TestNemotronHParallelizationStrategy:
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
     @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
-    def test_activation_checkpointing(self, mock_parallelize, mock_fully_shard, mock_fully_shard_by_dtype, mock_checkpoint,
-                                    strategy, mock_device_mesh, nemotron_model):
+    def test_activation_checkpointing(
+        self,
+        mock_parallelize,
+        mock_fully_shard,
+        mock_fully_shard_by_dtype,
+        mock_checkpoint,
+        strategy,
+        mock_device_mesh,
+        nemotron_model,
+    ):
         """Test activation checkpointing for NemotronH models."""
         mesh, _, dp_shard_mesh, tp_mesh = mock_device_mesh
         mock_fully_shard.side_effect = lambda model, **kwargs: model
@@ -446,10 +475,10 @@ class TestNemotronHParallelizationStrategy:
 
         # Add a mamba layer to test mamba checkpointing
         mamba_layer = nn.Module()
-        setattr(mamba_layer, 'block_type', "mamba")
+        setattr(mamba_layer, "block_type", "mamba")
         nemotron_model.backbone.layers.append(mamba_layer)
 
-        result = strategy.parallelize(
+        strategy.parallelize(
             model=nemotron_model,
             device_mesh=mesh,
             activation_checkpointing=True,
@@ -603,12 +632,15 @@ class TestWanParallelizationStrategy:
         assert env["parallelize_module"].call_count == 6
         # FSDP applied
         from unittest.mock import ANY
+
         env["apply_fsdp"].assert_called_once_with(wan_model, dp_mesh, ANY, None)
         env["fully_shard"].assert_called()
         assert result is wan_model
 
-    def test_exceptions_in_tp_paths_are_logged_and_ignored(self, wan_strategy, wan_model, mesh_tp2, monkeypatch, caplog):
-        env = self._mock_env(monkeypatch)
+    def test_exceptions_in_tp_paths_are_logged_and_ignored(
+        self, wan_strategy, wan_model, mesh_tp2, monkeypatch, caplog
+    ):
+        self._mock_env(monkeypatch)
         mesh, dp_mesh, tp_mesh = mesh_tp2
 
         # Make parallelize_module raise once to hit logging branches
@@ -639,7 +671,8 @@ class TestWanParallelizationStrategy:
         env = self._mock_env(monkeypatch)
 
         mesh = MagicMock()
-        tp_mesh = MagicMock(); tp_mesh.size.return_value = 2
+        tp_mesh = MagicMock()
+        tp_mesh.size.return_value = 2
         dp_mesh = MagicMock()
         mesh.__getitem__.side_effect = lambda key: {
             "custom_tp": tp_mesh,
@@ -656,6 +689,7 @@ class TestWanParallelizationStrategy:
 
         # Ensure FSDP used the dp_mesh we provided via custom names
         from unittest.mock import ANY
+
         env["apply_fsdp"].assert_called_once_with(wan_model, dp_mesh, ANY, None)
         assert result is wan_model
 
@@ -684,12 +718,17 @@ class TestFsdp2StrategyParallelizeIntegration:
     @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
-    def test_delegates_to_nemotron_strategy(self, fully_shard, fully_shard_by_dtype, mock_parallelize_module, mock_device_mesh):
+    def test_delegates_to_nemotron_strategy(
+        self, fully_shard, fully_shard_by_dtype, mock_parallelize_module, mock_device_mesh
+    ):
         """Test that fsdp2_strategy_parallelize uses NemotronH strategy for NemotronH models."""
         mesh, _, _, _ = mock_device_mesh
 
         with patch("nemo_automodel.components.distributed.parallelizer.parallelize_module"):
-            with patch("nemo_automodel.components.distributed.parallelizer.fully_shard", side_effect=lambda model, **kwargs: model):
+            with patch(
+                "nemo_automodel.components.distributed.parallelizer.fully_shard",
+                side_effect=lambda model, **kwargs: model,
+            ):
                 model = MockNemotronHModel()
 
                 result = fsdp2_strategy_parallelize(
@@ -730,20 +769,27 @@ class TestFsdp2StrategyParallelizeIntegration:
 
         # Check that all expected parameters are present
         expected_params = [
-            'model', 'device_mesh', 'mp_policy', 'offload_policy',
-            'sequence_parallel', 'activation_checkpointing', 'tp_shard_plan',
-            'dp_replicate_mesh_name', 'dp_shard_cp_mesh_name', 'tp_mesh_name'
+            "model",
+            "device_mesh",
+            "mp_policy",
+            "offload_policy",
+            "sequence_parallel",
+            "activation_checkpointing",
+            "tp_shard_plan",
+            "dp_replicate_mesh_name",
+            "dp_shard_cp_mesh_name",
+            "tp_mesh_name",
         ]
 
         for param in expected_params:
             assert param in sig.parameters
 
         # Check default values are preserved
-        assert sig.parameters['sequence_parallel'].default is False
-        assert sig.parameters['activation_checkpointing'].default is False
-        assert sig.parameters['dp_replicate_mesh_name'].default == "dp_replicate"
-        assert sig.parameters['dp_shard_cp_mesh_name'].default == "dp_shard_cp"
-        assert sig.parameters['tp_mesh_name'].default == "tp"
+        assert sig.parameters["sequence_parallel"].default is False
+        assert sig.parameters["activation_checkpointing"].default is False
+        assert sig.parameters["dp_replicate_mesh_name"].default == "dp_replicate"
+        assert sig.parameters["dp_shard_cp_mesh_name"].default == "dp_shard_cp"
+        assert sig.parameters["tp_mesh_name"].default == "tp"
 
 
 class TestStrategyExtensibility:
@@ -751,6 +797,7 @@ class TestStrategyExtensibility:
 
     def test_can_add_new_strategy_to_registry(self):
         """Test that new strategies can be added to the registry."""
+
         # Create a custom strategy
         class CustomStrategy(ParallelizationStrategy):
             def parallelize(self, model, device_mesh, **kwargs):
@@ -796,9 +843,15 @@ class TestStrategyExtensibility:
 class TestDeciLMNemotronNASValidation:
     """Tests for DeciLM nemotron-nas special validation path in validate_tp_mesh."""
 
-    def _make_decilm_nas_model(self, *, num_attention_heads=8, num_hidden_layers=3,
-                               block_kinds=("linear", "group", "noop"),
-                               n_heads_in_group=2, num_key_value_heads=3):
+    def _make_decilm_nas_model(
+        self,
+        *,
+        num_attention_heads=8,
+        num_hidden_layers=3,
+        block_kinds=("linear", "group", "noop"),
+        n_heads_in_group=2,
+        num_key_value_heads=3,
+    ):
         """Create a minimal mock model/config for DeciLM nemotron-nas branch.
 
         num_key_value_heads is intentionally allowed to be incompatible with TP so
