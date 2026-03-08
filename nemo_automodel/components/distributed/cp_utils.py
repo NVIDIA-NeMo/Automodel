@@ -155,20 +155,25 @@ def make_cp_batch_and_ctx(
     # CP doesn't support packed sequence currently. Let torch SDPA handle attention mask.
     batch.pop("attention_mask", None)
 
+    # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed)
     if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
         batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(batch["input_ids"].device)
 
     input_ids = batch["input_ids"]
     position_ids = batch["position_ids"]
 
+    # Determine correct seq dim for CP sharding
+    # mRoPE: [3, B, S] → shard on dim 2; standard: [B, S] → shard on dim 1
+    pos_seq_dim = 2 if position_ids.ndim == 3 else 1
+
     labels = batch["labels"]
     if loss_mask is not None:
         cp_buffers = [input_ids, labels, position_ids, loss_mask]
-        cp_seq_dims = [1, 1, 1, 1]
+        cp_seq_dims = [1, 1, pos_seq_dim, 1]
         cp_no_restore_buffers = {input_ids, labels, loss_mask}
     else:
         cp_buffers = [input_ids, labels, position_ids]
-        cp_seq_dims = [1, 1, 1]
+        cp_seq_dims = [1, 1, pos_seq_dim]
         cp_no_restore_buffers = {input_ids, labels}
 
     cp_ctx = create_context_parallel_ctx(
