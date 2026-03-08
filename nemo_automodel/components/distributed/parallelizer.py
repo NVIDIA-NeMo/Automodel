@@ -14,6 +14,7 @@
 
 import importlib
 import logging
+import warnings
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from functools import lru_cache, reduce
@@ -76,7 +77,13 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 )
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
-from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS, VocabParallelEmbedding
+from nemo_automodel.components.distributed.optimized_tp_plans import (
+    LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
+    PARALLELIZE_FUNCTIONS,
+    VocabParallelEmbedding,
+    get_decilm_nemotron_tp_plan,
+    get_llama_nemotron_super_tp_plan,
+)
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
 
 # TODO(boxiangw): Change to MegatronFSDP once it got published
@@ -160,7 +167,14 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
 
             # Apply tensor parallelism
             if model_parallel_plan:
-                parallelize_module(model, tp_mesh, model_parallel_plan)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=".*could not be resolved.*",
+                        category=UserWarning,
+                    )
+                    parallelize_module(model, tp_mesh, model_parallel_plan)
+                _update_attention_head_counts_for_tp(model, tp_mesh.size())
 
         # Apply activation checkpointing to linear layers if requested
         if activation_checkpointing:
@@ -687,6 +701,64 @@ def translate_to_torch_parallel_style(style: str):
         raise ValueError(f"Unknown parallel style: {style}")
 
 
+def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None:
+    """
+    After TP sharding, the Q/K/V outputs are split across ranks (each rank has
+    num_heads/tp_size heads). Update the config and each attention layer's
+    num_heads / num_key_value_heads so the forward uses the local head count
+    instead of the global one (avoids shape mismatches in .view()).
+    """
+    if tp_size <= 1:
+        return
+    config = getattr(model, "config", None)
+    if config is None or not hasattr(config, "num_attention_heads"):
+        return
+    model_arch = None
+    if hasattr(config, "architectures") and config.architectures:
+        try:
+            model_arch = config.architectures[0]
+        except Exception:
+            model_arch = None
+    inner = getattr(model, "model", model)
+    layers = getattr(inner, "layers", None)
+    if layers is None and hasattr(model, "language_model"):
+        inner = model.language_model
+        layers = getattr(inner, "layers", None)
+    if layers is None:
+        return
+    # Preserve the true head_dim before dividing num_attention_heads.
+    # RoPE utilities derive head_dim via getattr(config, "head_dim",
+    # config.hidden_size // config.num_attention_heads).  Without an
+    # explicit head_dim, the division would compute a wrong (too large)
+    # head_dim after we halve num_attention_heads for TP.
+    if not hasattr(config, "head_dim") or config.head_dim is None:
+        config.head_dim = config.hidden_size // config.num_attention_heads
+    local_num_attention_heads = config.num_attention_heads // tp_size
+    local_num_key_value_heads = None
+    if hasattr(config, "num_key_value_heads") and config.num_key_value_heads is not None:
+        local_num_key_value_heads = config.num_key_value_heads // tp_size
+
+    is_decilm_nemotron_nas = model_arch == "DeciLMForCausalLM" and getattr(config, "model_type", None) == "nemotron-nas"
+    if not is_decilm_nemotron_nas:
+        config.num_attention_heads = local_num_attention_heads
+        if local_num_key_value_heads is not None:
+            config.num_key_value_heads = local_num_key_value_heads
+
+    for layer in layers:
+        if hasattr(layer, "self_attn"):
+            attn = layer.self_attn
+            if hasattr(attn, "num_heads"):
+                attn.num_heads = local_num_attention_heads
+            if hasattr(attn, "num_key_value_heads"):
+                # Use config's value if set, else derive from local num_heads and num_key_value_groups (e.g. DeciLM)
+                if local_num_key_value_heads is not None:
+                    attn.num_key_value_heads = local_num_key_value_heads
+                elif hasattr(attn, "num_key_value_groups"):
+                    attn.num_key_value_heads = local_num_attention_heads // attn.num_key_value_groups
+                else:
+                    attn.num_key_value_heads = local_num_attention_heads
+
+
 def validate_tp_mesh_for_nemotron_nas(model, tp_size):
     num_attention_heads = model.config.num_attention_heads
     assert num_attention_heads % tp_size == 0, "num_attention_heads in config does not match the TP size"
@@ -931,6 +1003,23 @@ def _get_parallel_plan(
     if isinstance(tp_shard_plan, dict):
         model_parallel_plan = tp_shard_plan
         logger.info(f"Using parallel plan (dictionary). {tp_shard_plan}")
+    elif tp_shard_plan == LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME:
+        model_arch = None
+        if hasattr(model, "config") and hasattr(model.config, "architectures") and model.config.architectures:
+            try:
+                model_arch = model.config.architectures[0]
+            except Exception:
+                model_arch = None
+
+        if model_arch == "DeciLMForCausalLM" and getattr(model.config, "model_type", None) == "nemotron-nas":
+            model_parallel_plan = get_decilm_nemotron_tp_plan(sequence_parallel=sequence_parallel)
+            logger.info(
+                "Using DeciLM/Nemotron-NAS TP plan for named plan %s",
+                LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
+            )
+        else:
+            model_parallel_plan = get_llama_nemotron_super_tp_plan(sequence_parallel=sequence_parallel)
+            logger.info(f"Using named parallel plan: {LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME}")
     elif tp_shard_plan is not None:
         try:
             plan_obj = import_class_from_path(tp_shard_plan)
