@@ -12,13 +12,218 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import fnmatch
+import json
 import logging
+import os
+import shutil
 
 from jinja2.exceptions import TemplateError
 from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import BatchEncoding
 
 logger = logging.getLogger(__name__)
+
+
+_PRESERVED_SPECIAL_TOKEN_KEYS = frozenset(
+    {
+        "add_bos_token",
+        "add_eos_token",
+        "bos_token",
+        "eos_token",
+        "unk_token",
+        "pad_token",
+        "sep_token",
+        "cls_token",
+        "mask_token",
+        "additional_special_tokens",
+        "special_tokens_pattern",
+    }
+)
+
+
+def _read_tokenizer_config(pretrained_model_name_or_path, **kwargs):
+    """Read the full ``tokenizer_config.json`` as a dict.
+
+    Works for local directories and HF Hub model IDs (cache lookup only).
+    Returns ``None`` when the file cannot be read.
+    """
+    config_path = os.path.join(str(pretrained_model_name_or_path), "tokenizer_config.json")
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path) as f:
+                return json.load(f)
+        except Exception:
+            return None
+    try:
+        from huggingface_hub import hf_hub_download
+
+        hub_kwargs = {k: kwargs[k] for k in ("cache_dir", "revision", "token") if k in kwargs}
+        resolved = hf_hub_download(
+            repo_id=str(pretrained_model_name_or_path),
+            filename="tokenizer_config.json",
+            local_files_only=True,
+            **hub_kwargs,
+        )
+        with open(resolved) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _read_tokenizer_class(pretrained_model_name_or_path, **kwargs):
+    """Read the ``tokenizer_class`` value from an existing ``tokenizer_config.json``.
+
+    Works for local directories and HF Hub model IDs (cache lookup only).
+    Returns ``None`` when the value cannot be determined.
+    """
+    config = _read_tokenizer_config(pretrained_model_name_or_path, **kwargs)
+    if config is None:
+        return None
+    return config.get("tokenizer_class")
+
+
+def _resolve_source_dir(pretrained_model_name_or_path, **kwargs):
+    """Return the local directory that contains the original tokenizer files.
+
+    For local paths this is the path itself.  For Hub model IDs we look up
+    the HF cache (``local_files_only``) so we never trigger a download.
+    Returns ``None`` when the directory cannot be determined.
+    """
+    path = str(pretrained_model_name_or_path)
+    if os.path.isdir(path):
+        return path
+    try:
+        from huggingface_hub import hf_hub_download
+
+        hub_kwargs = {k: kwargs[k] for k in ("cache_dir", "revision", "token") if k in kwargs}
+        resolved = hf_hub_download(
+            repo_id=path,
+            filename="tokenizer_config.json",
+            local_files_only=True,
+            **hub_kwargs,
+        )
+        return os.path.dirname(resolved)
+    except Exception:
+        return None
+
+
+# File patterns that should be preserved from the original source directory
+# during ``save_pretrained``.  If a matching file exists in the source, it is
+# copied verbatim into the save directory so that downstream v4 consumers see
+# exactly the same assets the original model shipped.
+#
+# NOTE: ``config.json`` (the *model* config) is intentionally excluded.
+# While transformers v5 uses ``model_type`` from ``config.json`` to select the
+# tokenizer backend and SentencePiece normalizer, copying it here would be
+# fragile — the user may have modified the model, making the original
+# ``config.json`` stale or incorrect.  The caller is responsible for ensuring
+# ``config.json`` is present alongside the saved tokenizer if needed.
+_TOKENIZER_FILE_PATTERNS = (
+    "tokenizer*",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "vocab.*",
+    "merges.txt",
+    "spiece.model",
+)
+
+
+def _is_tokenizer_file(filename):
+    """Return True if *filename* matches a known tokenizer file pattern."""
+    return any(fnmatch.fnmatch(filename, pat) for pat in _TOKENIZER_FILE_PATTERNS)
+
+
+def _restore_original_assets(save_directory, source_dir, original_config):
+    """Restore original tokenizer assets that were present in the source.
+
+    For every tokenizer-related file found in *source_dir*, copy it into
+    *save_directory* (overwriting the v5-written version if one exists).
+    Files that were **not** present in the source are left untouched, so
+    anything ``save_pretrained`` generated is kept as a fallback.
+
+    This ensures byte-for-byte v4 compatibility for all files the original
+    model shipped, while still benefiting from v5-generated files (e.g.
+    ``chat_template.jinja``) that the original may not have had.
+    """
+    save_directory = str(save_directory)
+    source_dir = str(source_dir)
+
+    saved_config_path = os.path.join(save_directory, "tokenizer_config.json")
+    v5_tokenizer_class = None
+    if os.path.isfile(saved_config_path):
+        try:
+            with open(saved_config_path) as f:
+                v5_tokenizer_class = json.load(f).get("tokenizer_class")
+        except Exception:
+            pass
+
+    for fname in os.listdir(source_dir):
+        src = os.path.join(source_dir, fname)
+        if not os.path.isfile(src) or not _is_tokenizer_file(fname):
+            continue
+        shutil.copy2(src, os.path.join(save_directory, fname))
+
+    _ensure_tokenizer_class(save_directory, original_config, v5_tokenizer_class)
+
+
+def _ensure_tokenizer_class(save_directory, original_config, v5_tokenizer_class):
+    """Make sure ``tokenizer_config.json`` contains a ``tokenizer_class`` field.
+
+    Some older HF models (GPT-2, BERT, etc.) ship without ``tokenizer_class``
+    in their original config.  After restoring the original file we inject the
+    value that the v5 save produced so v4 consumers can identify the class.
+    """
+    config_path = os.path.join(str(save_directory), "tokenizer_config.json")
+    if not os.path.isfile(config_path):
+        if original_config:
+            _restore_tokenizer_config(save_directory, original_config)
+        return
+    try:
+        with open(config_path) as f:
+            cfg = json.load(f)
+        if "tokenizer_class" in cfg:
+            return
+        tokenizer_class = v5_tokenizer_class
+        if tokenizer_class:
+            cfg["tokenizer_class"] = tokenizer_class
+            with open(config_path, "w") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+    except Exception:
+        pass
+
+
+def _restore_tokenizer_config(save_directory, original_config):
+    """Replace the saved ``tokenizer_config.json`` with the original version.
+
+    Transformers v5 may alter many fields during ``save_pretrained`` — special
+    tokens, ``added_tokens_decoder``, ``chat_template``, backend markers, etc.
+    Restoring the original config wholesale is the safest way to guarantee that
+    downstream v4 consumers see the exact same configuration.
+
+    The only field carried over from the v5-written config is
+    ``tokenizer_class`` when it was not present in the original, so the saved
+    config always advertises a loadable class name.
+    """
+    config_path = os.path.join(str(save_directory), "tokenizer_config.json")
+    if not os.path.isfile(config_path):
+        return
+    try:
+        with open(config_path) as f:
+            saved_config = json.load(f)
+
+        restored = dict(original_config)
+
+        if "tokenizer_class" not in restored and "tokenizer_class" in saved_config:
+            restored["tokenizer_class"] = saved_config["tokenizer_class"]
+
+        if restored != saved_config:
+            with open(config_path, "w") as f:
+                json.dump(restored, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+    except Exception:
+        pass
 
 
 def _remap_system_role(conversation):
@@ -95,6 +300,11 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
         # so we can save an HF-compatible `tokenizer_class` in `save_pretrained()`.
         base_tokenizer_cls = type(tokenizer)
         tokenizer._base_class = base_tokenizer_cls
+        tokenizer._original_tokenizer_config = _read_tokenizer_config(pretrained_model_name_or_path, **kwargs)
+        tokenizer._original_tokenizer_class = (tokenizer._original_tokenizer_config or {}).get("tokenizer_class")
+
+        tokenizer._source_dir = _resolve_source_dir(pretrained_model_name_or_path, **kwargs)
+
         tokenizer.__class__ = type(cls.__name__, (cls, base_tokenizer_cls), {})
         return tokenizer
 
@@ -153,19 +363,39 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
         return encoded
 
     def save_pretrained(self, save_directory, push_to_hub: bool = False, **kwargs):
-        # HF writes `tokenizer_class` using `self.__class__.__name__`. Our runtime class name is
-        # the NeMo wrapper, but for portability we want to save the original HF tokenizer class.
-        # base_name = getattr(self, "_nemo_base_tokenizer_class_name", None)
+        # HF writes ``tokenizer_class`` using ``self.__class__.__name__``.
+        # In transformers v5 the runtime class is ``TokenizersBackend``, but
+        # downstream v4 consumers still need the original class name (e.g.
+        # ``PreTrainedTokenizerFast``).  We temporarily swap ``self.__class__``
+        # to a dynamic subclass whose ``__name__`` matches the original value.
         base_class = getattr(self, "_base_class", None)
         if not base_class:
             return super().save_pretrained(save_directory, push_to_hub=push_to_hub, **kwargs)
 
+        original_tokenizer_class = getattr(self, "_original_tokenizer_class", None)
+        save_cls_name = original_tokenizer_class or base_class.__name__
+
+        if save_cls_name != base_class.__name__:
+            save_class = type(save_cls_name, (base_class,), {})
+        else:
+            save_class = base_class
+
         original_cls = self.__class__
         try:
-            self.__class__ = base_class
-            return base_class.save_pretrained(self, save_directory, push_to_hub=push_to_hub, **kwargs)
+            self.__class__ = save_class
+            result = save_class.save_pretrained(self, save_directory, push_to_hub=push_to_hub, **kwargs)
         finally:
             self.__class__ = original_cls
+
+        source_dir = getattr(self, "_source_dir", None)
+        original_config = getattr(self, "_original_tokenizer_config", None)
+
+        if source_dir:
+            _restore_original_assets(save_directory, source_dir, original_config)
+        elif original_config:
+            _restore_tokenizer_config(save_directory, original_config)
+
+        return result
 
 
 def _add_token(tokenized, value, position, key):

@@ -2,7 +2,7 @@
 
 In this guide, you will learn how to submit distributed training jobs on Slurm clusters (single- or multi-node), Kubernetes clusters, or via NeMo-Run. For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.md). For setup details, refer to our [Installation Guide](../guides/installation.md).
 
-NeMo Automodel uses recipes to run end-to-end workflows. If you're new to recipes, see the [Repository Structure](../repository-structure.md) guide.
+NeMo AutoModel uses recipes to run end-to-end workflows. If you're new to recipes, see the [Repository Structure](../repository-structure.md) guide.
 
 
 ## Quickstart: Choose Your Job Launch Option
@@ -97,7 +97,7 @@ The CLI will automatically submit the job to Slurm and handle the distributed se
 
 ### Launch a Batch Job on Slurm with Modified Code
 
-If the command is executed from within a Git repository accessible to Slurm workers, the generated SBATCH script will prioritize the repository source over the Automodel installation inside the container image.
+If the command is executed from within a Git repository accessible to Slurm workers, the generated SBATCH script will prioritize the repository source over the AutoModel installation inside the container image.
 
 For example:
 ```bash
@@ -207,7 +207,7 @@ pip install nemo-run
 
 ## Standalone Slurm Script (Advanced)
 
-If you prefer to submit with your own Slurm script, here is a standalone bash script adapted from the Automodel launcher template. See the upstream template for the authoritative reference: [Automodel Slurm template](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/launcher/slurm/template.py).
+If you prefer to submit with your own Slurm script, here is a standalone bash script adapted from the AutoModel launcher template. See the upstream template for the authoritative reference: [AutoModel Slurm template](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/launcher/slurm/template.py).
 
 ```bash
 #!/bin/bash
@@ -268,7 +268,7 @@ For example, if you want to fine-tune `Qwen/Qwen3-0.6B` instead of `meta-llama/L
 
 ## When to Use Which Approach
 
-**Use the Automodel CLI when:**
+**Use the AutoModel CLI when:**
 - You want a simple, unified interface
 - You are submitting jobs to production clusters (Slurm, Kubernetes)
 

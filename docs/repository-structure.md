@@ -1,9 +1,9 @@
 # Repository Structure
 
-This introductory guide presents the structure of the NeMo Automodel repository, provides a brief overview of its parts, introduces concepts such as components and recipes, and explains how everything fits together.
+This introductory guide presents the structure of the NeMo AutoModel repository, provides a brief overview of its parts, introduces concepts such as components and recipes, and explains how everything fits together.
 
-## What is NeMo Automodel?
-NeMo Automodel is a PyTorch library for fine-tuning and pre-training large scale models. In particular, it provides:
+## What is NeMo AutoModel?
+NeMo AutoModel is a PyTorch library for fine-tuning and pretraining large-scale models. In particular, it provides:
 - **Optimized implementations** for training efficiency, including fused kernels and memory-saving techniques.
 - [**Day-0 support**](model-coverage/overview.md) for LLMs and VLMs available on the Hugging Face Hub.
 - **Seamless integration** with Hugging Face datasets, tokenizers, and related tools.
@@ -12,7 +12,7 @@ NeMo Automodel is a PyTorch library for fine-tuning and pre-training large scale
 
 
 ## Repository Structure
-The Automodel source code is available under the [`nemo_automodel`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel) directory. It is organized into three directories:
+The AutoModel source code is available under the [`nemo_automodel`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel) directory. It is organized into three directories:
 - [`components/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel/components)  - Self-contained modules
 - [`recipes/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel/recipes) - End-to-end training workflows
 - [`cli/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/cli) - CLI entry-point and job launcher dispatch.
@@ -31,7 +31,7 @@ $ tree -L 1 nemo_automodel/components/
 ├── checkpoint/     - Checkpoint save and load-related logic.
 ├── config/         - Utils to load YAML files and CLI-parsing helpers.
 ├── datasets/       - LLM and VLM datasets and utils (collate functions, preprocessing).
-├── distributed/    - Distributed processing primitives (DDP, FSDP2, MegatronFSDP).
+├── distributed/    - Distributed processing primitives (DDP, FSDP2, MegatronFSDP) and pipeline parallelism (AutoPipeline).
 ├── launcher/       - Job launcher for interactive and batch (Slurm, K8s) processing.
 ├── loggers/        - Metric/event logging for Weights & Biases and other tools.
 ├── loss/           - Loss functions (such as cross-entropy and linear cross-entropy, etc.).
@@ -50,7 +50,7 @@ $ tree -L 1 nemo_automodel/components/
 
 ### Recipes Directory
 Recipes define **end-to-end workflows** (data and model loading → training with custom loop → saving the output checkpoint)
-for a variety of tasks, such as, training, fine-tuning, knowledge distillation, and combining components into usable pipelines.
+for a variety of tasks, such as training, fine-tuning, and knowledge distillation.
 
 #### Available Recipes
 The following directory listing shows all components along with explanations of their contents.
@@ -77,7 +77,7 @@ For a single-GPU run, simply omit `--nproc-per-node`:
 automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
-Each recipe, imports the components it needs from the `nemo_automodel/components/` catalog.
+Each recipe imports the components it needs from the `nemo_automodel/components/` catalog.
 The recipe/components structure enables you to:
 - Decouple individual components and replace them with custom implementations when needed.
 - Avoid rigid, class-based trainer structures by using linear scripts that expose training logic for maximum flexibility and control.
@@ -112,7 +112,7 @@ Kubernetes (Kubeflow PyTorchJob), and NeMo-Run launchers. The CLI lives at the r
 `cli/` package, separate from the core `nemo_automodel` library.
 
 
-## Next steps
+## Next Steps
 
 Learn how to train models with NeMo AutoModel on:
 - **Your local workstation**: See [`docs/launcher/local-workstation.md`](launcher/local-workstation.md).

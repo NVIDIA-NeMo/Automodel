@@ -10,6 +10,7 @@
 [![codecov](https://codecov.io/github/NVIDIA-NeMo/Automodel/graph/badge.svg?token=4NMKZVOW2Z)](https://codecov.io/github/NVIDIA-NeMo/Automodel)
 [![CICD NeMo](https://github.com/NVIDIA-NeMo/Automodel/actions/workflows/cicd-main.yml/badge.svg)](https://github.com/NVIDIA-NeMo/Automodel/actions/workflows/cicd-main.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/release/python-3100/)
+[![Contributions Welcome](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![GitHub Stars](https://img.shields.io/github/stars/NVIDIA-NeMo/Automodel.svg?style=social&label=Star)](https://github.com/NVIDIA-NeMo/Automodel/stargazers/)
 
 <!-- **Day-0 integration with Hugging Face models automating fine-tuning and pretraining with pytorch-native parallelism, custom-kernels and optimized recipes**
@@ -55,12 +56,12 @@ Nemo AutoModel is a Pytorch DTensor‑native SPMD open-source training library u
 
 What you can expect:
 
-- **Hackable** with a modular design that allows easy integration, customization and quick research prototypes.
-- **Minimal ceremony**: YAML‑driven recipes; override any field via CLI.
+- **Hackable** with a modular design that allows easy integration, customization, and quick research prototypes.
+- **Minimal ceremony**: YAML-driven recipes; override any field using CLI.
 - **High performance and flexibility** with custom kernels and DTensor support.
 - **Seamless integration** with Hugging Face for day-0 model support, ease of use, and wide range of supported models.
-- **Efficient resource management** using k8s and Slurm, enabling scalable and flexible deployment across configurations.
-- **Comprehensive documentation** that is both detailed and user-friendly, with practical examples.
+- **Efficient resource management** using Kubernetes and Slurm, enabling scalable and flexible deployment across configurations.
+- **Documentation** with step-by-step guides and runnable examples.
 
 <!-- Please refer to our design documents for more details on the architecture and design philosophy. -->
 
@@ -141,13 +142,21 @@ What you can expect:
 We recommend using **uv** for reproducible Python environments.
 
 ```bash
-# Setup environment before running any commands
+# Setup environment before running any recipes
 uv venv
-uv sync --frozen --all-extras
 
-uv pip install nemo_automodel # latest release
-# or: uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
-uv run python -c "import nemo_automodel; print('AutoModel ready')"
+# Choose ONE:
+uv sync --frozen  # LLM recipes (default)
+# uv sync --frozen --extra vlm  # VLM recipes (fixes: ImportError: qwen_vl_utils is not installed)
+# uv sync --frozen --extra cuda  # Optional CUDA deps (e.g., Transformer Engine, bitsandbytes)
+# uv sync --frozen --extra all  # Most optional deps (includes `vlm` and `cuda`)
+# uv sync --frozen --all-extras  # Everything (includes `fa`, `moe`, etc.)
+
+# One-off runs (examples):
+# uv run --extra vlm <command>
+# uv run --extra cuda <command>
+
+uv run python -c "import nemo_automodel; print('NeMo AutoModel ready')"
 ```
 
 
@@ -170,7 +179,7 @@ uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml --npr
 
 ## LLM Pre-training
 ### LLM Pre-training Single Node
-We provide an example SFT experiment using the [Fineweb dataset](https://arxiv.org/abs/2406.17557/) with a nano-GPT model, ideal for quick experimentation on a single node.
+We provide an example SFT experiment using the [FineWeb dataset](https://arxiv.org/abs/2406.17557/) with a nano-GPT model, ideal for quick experimentation on a single node.
 ```sh
 automodel examples/llm_pretrain/nanogpt_pretrain.yaml --nproc-per-node 8
 ```
@@ -243,7 +252,7 @@ automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml \
 
 ## VLM Supervised Fine-Tuning (SFT)
 
-We provide a VLM SFT example using Qwen2.5‑VL for end‑to‑end fine‑tuning on image‑text data.
+We provide a VLM SFT example using Qwen2.5-VL for end-to-end fine-tuning on image-text data.
 
 ### VLM SFT Single Node
 ```bash
@@ -253,7 +262,7 @@ automodel examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml --nproc-per-node 
 
 ## VLM Parameter-Efficient Fine-Tuning (PEFT)
 
-We provide a VLM PEFT (LoRA) example for memory‑efficient adaptation with Gemma3 VLM.
+We provide a VLM PEFT (LoRA) example for memory-efficient adaptation with Gemma3 VLM.
 
 ### VLM PEFT Single Node
 ```bash
@@ -263,7 +272,7 @@ automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix_peft.yaml --nproc-per
 
 
 ## Supported Models
-NeMo AutoModel provides native support for a wide range of models available on the Hugging Face Hub, enabling efficient fine-tuning for various domains. Below is a small sample of ready‑to‑use families (train as‑is or swap any compatible 🤗 causal LM), you can specify nearly any LLM/VLM model available on 🤗 hub:
+NeMo AutoModel provides native support for a wide range of models available on the Hugging Face Hub, enabling efficient fine-tuning for various domains. Below is a small sample of ready-to-use families (train as-is or swap any compatible 🤗 causal LM), you can specify nearly any LLM/VLM model available on 🤗 hub:
 
 | Domain | Model Family | Model ID | Recipes |
 |--------|--------------|----------|---------|
@@ -381,7 +390,7 @@ NeMo-Automodel/
 If you use NeMo AutoModel in your research, please cite it using the following BibTeX entry:
 ```
 @misc{nemo-automodel,
-title = {NeMo AutoModel: DTensor‑native SPMD library for scalable and efficient training},
+title = {NeMo AutoModel: DTensor-native SPMD library for scalable and efficient training},
 howpublished = {\url{https://github.com/NVIDIA-NeMo/Automodel}},
 year = {2025--2026},
 note = {GitHub repository},

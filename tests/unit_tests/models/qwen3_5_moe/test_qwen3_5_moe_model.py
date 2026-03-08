@@ -31,6 +31,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeModelOutputWithPast,
 )
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.model import (
     Fp32SafeQwen3_5MoeTextRotaryEmbedding,
     Fp32SafeQwen3_5MoeVisionRotaryEmbedding,
@@ -41,7 +42,6 @@ from nemo_automodel.components.models.qwen3_5_moe.model import (
     Qwen3_5MoeTextModelBackend,
 )
 from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.models.common import BackendConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -226,6 +226,25 @@ class TestQwen3_5MoeBlock:
         # 5 linear projections should be initialized: in_proj_qkv, in_proj_z, in_proj_b, in_proj_a, out_proj
         assert mock_trunc.call_count == 5
         mock_norm_reset.assert_called_once()
+
+    def test_init_weights_linear_attention_norm_without_reset_parameters(self, text_config_with_linear, moe_config, backend_config):
+        """Fallback path when norm (e.g. HF Qwen3_5MoeRMSNormGated) lacks reset_parameters."""
+        block = Qwen3_5MoeBlock(1, text_config_with_linear, moe_config, backend_config)
+
+        # Replace norm with a simple module that has weight but NO reset_parameters
+        fake_norm = torch.nn.Module()
+        fake_norm.weight = torch.nn.Parameter(torch.zeros(block.linear_attn.norm.weight.shape))
+        block.linear_attn.norm = fake_norm
+
+        with (
+            patch.object(block.input_layernorm, "reset_parameters"),
+            patch.object(block.post_attention_layernorm, "reset_parameters"),
+            patch.object(block.mlp, "init_weights"),
+            patch("torch.nn.init.trunc_normal_"),
+        ):
+            block.init_weights(torch.device("cpu"))
+
+        assert torch.all(fake_norm.weight.data == 1.0)
 
 
 # ---------------------------------------------------------------------------

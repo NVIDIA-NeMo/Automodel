@@ -18,21 +18,20 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.modeling_outputs import SequenceClassifierOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
 
 # Import from the new canonical locations
 from nemo_automodel._transformers.biencoder import (
     BiencoderModel,
     pool,
 )
-from nemo_automodel.recipes.biencoder.train_biencoder import contrastive_scores_and_labels
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
     LlamaBidirectionalForSequenceClassification,
     LlamaBidirectionalModel,
 )
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from nemo_automodel.recipes.biencoder.train_biencoder import contrastive_scores_and_labels
 
 
 def test_contrastive_scores_and_labels_shapes_and_labels():
@@ -96,67 +95,47 @@ def test_llama_bidirectional_model_init_and_mask():
         vocab_size=128, hidden_size=32, num_hidden_layers=1, num_attention_heads=1, intermediate_size=64, pad_token_id=0
     )
     model = LlamaBidirectionalModel(cfg)
-#    assert all(getattr(layer.self_attn, "is_causal", True) is False for layer in model.layers)
-    assert model._update_causal_mask(None) is None
+    model.eval()
+
+    # All attention layers should be non-causal
+    assert all(getattr(layer.self_attn, "is_causal", True) is False for layer in model.layers)
+
+    # Forward with padding mask produces valid output
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 3))
     mask = torch.tensor([[1, 1, 0]])
-    input_tensor = torch.randn(1, 3, 32)
-    out_mask = model._update_causal_mask(mask, input_tensor=input_tensor)
-    assert out_mask is not None and out_mask.dim() == 4
-    all_ones_out = model._update_causal_mask(torch.ones_like(mask), input_tensor=input_tensor)
-    assert all_ones_out is not None and (all_ones_out == 0.0).all()
+    out = model(input_ids=input_ids, attention_mask=mask)
+    assert out.last_hidden_state is not None and out.last_hidden_state.shape == (1, 3, 32)
+
+    # Forward without attention mask also works
+    out_no_mask = model(input_ids=input_ids)
+    assert out_no_mask.last_hidden_state is not None and out_no_mask.last_hidden_state.shape == (1, 3, 32)
 
 
-def test_update_causal_mask_equivalence_with_old_impl():
-    """The old _update_causal_mask used a data-dependent `(mask == 0).any()` branch
-    that is incompatible with torch.export / ONNX.  The new implementation delegates
-    to _prepare_4d_attention_mask.  This test checks semantic equivalence: the same
-    positions are masked/unmasked when the 4D output is applied as an additive bias
-    to attention scores."""
-
-    def old_update_causal_mask(attention_mask):
-        """Original implementation (pre-ONNX fix)."""
-        if attention_mask is not None and (attention_mask == 0.0).any():
-            return attention_mask
-        return None
-
+def test_bidirectional_attention_is_symmetric():
+    """Verify that the bidirectional model produces symmetric attention behavior:
+    changing a token at position i should affect the hidden state at position j
+    and vice versa (unlike causal models where earlier tokens can't see later ones)."""
     cfg = LlamaBidirectionalConfig(
         vocab_size=128, hidden_size=32, num_hidden_layers=1, num_attention_heads=1, intermediate_size=64, pad_token_id=0
     )
     model = LlamaBidirectionalModel(cfg)
+    model.eval()
 
-    assert old_update_causal_mask(None) is None
-    assert model._update_causal_mask(None) is None
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    attn = torch.ones(1, 4, dtype=torch.long)
 
-    all_ones = torch.ones(2, 4, dtype=torch.long)
-    input_tensor = torch.randn(2, 4, 32)
-    assert old_update_causal_mask(all_ones) is None
-    new_out = model._update_causal_mask(all_ones, input_tensor=input_tensor)
-    assert new_out is not None and (new_out == 0.0).all(), "all-ones mask must produce all-zero 4D mask (no masking)"
+    with torch.no_grad():
+        out_base = model(input_ids=input_ids, attention_mask=attn).last_hidden_state.clone()
 
-    masks = [
-        torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]]),
-        torch.tensor([[1, 0, 1, 0]]),
-        torch.tensor([[0, 0, 0, 0]]),
-    ]
-    for mask_2d in masks:
-        bsz, seq_len = mask_2d.shape
-        inp = torch.randn(bsz, seq_len, 32)
-        old_out = old_update_causal_mask(mask_2d)
-        new_out = model._update_causal_mask(mask_2d, input_tensor=inp)
+        # Change last token — in a bidirectional model, this should affect ALL positions
+        modified = input_ids.clone()
+        modified[0, -1] = (input_ids[0, -1] + 1) % cfg.vocab_size
+        out_modified = model(input_ids=modified, attention_mask=attn).last_hidden_state
 
-        assert old_out is not None, "old impl should return mask when zeros present"
-        assert new_out is not None and new_out.shape == (bsz, 1, seq_len, seq_len)
-
-        for b in range(bsz):
-            for s in range(seq_len):
-                if mask_2d[b, s] == 1:
-                    assert (new_out[b, :, :, s] == 0.0).all(), (
-                        f"non-padded position [{b},{s}] must be attend-able (0.0)"
-                    )
-                else:
-                    assert (new_out[b, :, :, s] < -1e9).all(), (
-                        f"padded position [{b},{s}] must be masked (large negative)"
-                    )
+    # Position 0 should be different because it can attend to the changed last token
+    assert not torch.allclose(out_base[0, 0], out_modified[0, 0], atol=1e-6), (
+        "Bidirectional model: changing last token should affect first token's hidden state"
+    )
 
 
 

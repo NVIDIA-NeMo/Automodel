@@ -1,17 +1,15 @@
-# Knowledge Distillation with NeMo-AutoModel
+# Knowledge Distillation with NeMo AutoModel
 
 This guide walks through fine-tuning a **student** LLM with the help of a
-larger **teacher** model using the new `knowledge_distillation` recipe.
+larger **teacher** model using the `kd` (knowledge distillation) recipe.
 
 In particular, we will show how to distill a 3B (`meta-llama/Llama-3.2-3B`) model into a 1B (`meta-llama/Llama-3.2-1B`) model.
 
----
-
-## 1. What is Knowledge Distillation?
+## What is Knowledge Distillation?
 
 Knowledge distillation (KD) transfers the *dark knowledge* of a high-capacity
 teacher model to a smaller student by minimizing the divergence between their
-predicted distributions.  The student learns from both the ground-truth labels
+predicted distributions. The student learns from both the ground-truth labels
 (Cross-Entropy loss, **CE**) and the soft targets of the teacher (Kullback-Leibler
 loss, **KD**):
 
@@ -23,9 +21,7 @@ $$
 where $\(\alpha\)$ is the `kd_ratio`, $\(T\)$ softmax `temperature` and $y$ the labels. For the arguments p:
 $$p^{s} = softmax(z^{s}, T)$$.
 
----
-
-## 2. Prepare the YAML config
+## Prepare the YAML Config
 
 A ready-to-use example is provided at
 `examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml`.  Important sections:
@@ -81,8 +77,8 @@ checkpoint:
   save_consolidated: false
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-  dp_size: none
+  strategy: fsdp2
+  dp_size: null
   tp_size: 1
   cp_size: 1
   pp_size: 1
@@ -137,24 +133,22 @@ validation_dataloader:
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
 ```
 
-### Current limitations
+### Current Limitations
 
 * Pipeline parallelism (`pp_size > 1`) is not yet supported – planned for a future release.
 * Distilling Vision-Language models (`vlm` recipe) is currently not supported.
 * Student and teacher models must share the same tokenizer for now; support for different tokenizers will be added in the future.
 
----
+## Launch Training
 
-## 3. Launch training
-
-### Single-GPU quick run
+### Single-GPU Quick Run
 
 ```bash
 # Runs on a single device of the current host
 automodel examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml
 ```
 
-### Multi-GPU (single node)
+### Multi-GPU (Single Node)
 
 ```bash
 # Leverage all GPUs on the local machine
@@ -163,21 +157,17 @@ torchrun --nproc-per-node $(nvidia-smi -L | wc -l) \
     -c examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml
 ```
 
-### SLURM cluster
+### Slurm Cluster
 
-The CLI seamlessly submits SLURM jobs when a `slurm` section is added to the
+The CLI seamlessly submits Slurm jobs when a `slurm` section is added to the
 YAML.  Refer to `docs/guides/installation.md` for cluster instructions.
 
----
-
-## 4. Monitoring
+## Monitoring
 
 Metrics such as *train_loss*, *kd_loss*, *learning_rate* and *tokens/sec* are
 logged to **WandB** when the corresponding section is enabled.
 
----
-
-## 5. Checkpoints & Inference
+## Checkpoints and Inference
 
 - Checkpoints are written under the directory configured in the `checkpoint.checkpoint_dir` field at every `ckpt_every_steps`.
 - The final student model is saved according to the `checkpoint` section (e.g., `model_save_format: safetensors`, consolidated weights if `save_consolidated: true`).
