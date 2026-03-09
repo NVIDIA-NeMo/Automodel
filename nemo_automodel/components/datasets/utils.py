@@ -69,7 +69,7 @@ def pad_within_micro(batch, pad_token_id, pad_seq_len_divisible=None):
     """
     max_len = max(map(len, batch))
     if pad_seq_len_divisible:
-        max_len = (pad_seq_len_divisible - max_len % pad_seq_len_divisible) + max_len
+        max_len = math.ceil(max_len / pad_seq_len_divisible) * pad_seq_len_divisible
     if pad_token_id is None:
         # if it's none, extend the last token
         pad_token_id = batch[0][-1]
