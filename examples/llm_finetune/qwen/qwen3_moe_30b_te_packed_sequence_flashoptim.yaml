@@ -55,6 +55,7 @@ model:
     rms_norm: torch_fp32
     experts: torch_mm
     dispatcher: deepep
+    rope_fusion: false
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
@@ -117,7 +118,6 @@ optimizer:
   eps: 1e-7
   weight_decay: 0
   master_weight_bits: 24
-  foreach: false
 
 # # Uncomment and configure for W&B logging
 # wandb:
