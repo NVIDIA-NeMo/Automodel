@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tests.utils.test_utils import run_test_script
 import shutil
+
 import pytest
+
+from tests.utils.test_utils import run_test_script
 
 try:
     import qwen_vl_utils  # noqa: F401
+
     _has_qwen_vl_utils = True
 except ImportError:
     _has_qwen_vl_utils = False
@@ -38,6 +41,7 @@ HF_CONSOLIDATED_FSDP2_LLM_FILENAME = "L2_HF_Consolidated_FSDP2_LLM_Checkpoint.sh
 HF_CONSOLIDATED_FSDP2_VLM_FILENAME = "L2_HF_Consolidated_FSDP2_VLM_Checkpoint.sh"
 HF_CONSOLIDATED_FSDP2_LLM_SCALAR_WEIGHT_FILENAME = "L2_HF_Consolidated_FSDP2_LLM_Checkpoint_Scalar_Param.sh"
 HF_CONSOLIDATED_PP2_LLM_FILENAME = "L2_HF_Consolidated_PP2_LLM_Checkpoint.sh"
+HF_CONSOLIDATED_GPTOSS_MXFP4_FILENAME = "L2_HF_Consolidated_GPTOSS_MXFP4_Checkpoint.sh"
 
 
 class TestHFDCP:
@@ -105,4 +109,10 @@ class TestHFDCP:
             run_test_script(TEST_FOLDER, HF_CONSOLIDATED_PP2_LLM_FILENAME)
         finally:
             # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_hf_consolidated_gptoss_mxfp4_checkpoint(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_CONSOLIDATED_GPTOSS_MXFP4_FILENAME)
+        finally:
             shutil.rmtree("checkpoints/", ignore_errors=True)

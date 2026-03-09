@@ -594,14 +594,17 @@ class TestInitializeModelWeights:
 
 
 class TestBuildConsolidatedIndexQuantizedBase:
-    """Verify that _maybe_build_consolidated_index filters stale quantized keys.
+    """Verify _maybe_build_consolidated_index handles stale quantized keys.
 
     When the base checkpoint uses mxfp4 quantization (e.g. GPT-OSS), the index
     contains ``_blocks`` and ``_scales`` tensor names.  After fine-tuning the
     model is saved with dequantized bf16 weights, so those names no longer
-    appear in the state dict.  The mapping must only contain keys that are
-    actually present in the state dict being saved; stale keys would cause the
-    consolidation step to produce safetensors files with empty dtype headers.
+    appear in the state dict.
+
+    Stale keys are intentionally kept in the mapping built here so that every
+    PP rank sees the full set of FQNs. The downstream consolidation step
+    (consolidate_hf_safetensors._parse_input_metadata) strips orphaned FQNs
+    that have no matching data in any input shard file.
     """
 
     def _make_checkpointer(self, *, save_consolidated: bool = True):
@@ -617,15 +620,13 @@ class TestBuildConsolidatedIndexQuantizedBase:
         with patch("torch.distributed.is_initialized", return_value=False):
             return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
 
-    def test_stale_quantized_keys_are_filtered(self):
-        """Quantized _blocks/_scales keys from the base index must not leak into the mapping."""
+    def test_stale_quantized_keys_are_passed_through(self):
+        """Stale _blocks/_scales keys stay in the mapping (cleaned up during consolidation)."""
         checkpointer = self._make_checkpointer()
 
-        # Simulate a model with state_dict_adapter and quantized pre-shard keys.
         model = torch.nn.Module()
         model.config = SimpleNamespace(model_type="gpt_oss")
         model.layer = torch.nn.Linear(4, 4)
-        # Pre-shard keys include both quantized and regular variants
         model._pre_shard_hf_state_dict_keys = [
             "model.embed_tokens.weight",
             "model.layers.0.mlp.experts.gate_up_proj_blocks",
@@ -637,7 +638,6 @@ class TestBuildConsolidatedIndexQuantizedBase:
             "lm_head.weight",
         ]
 
-        # Base checkpoint index also has the quantized keys
         base_index_mapping = {
             "model.embed_tokens.weight": 1,
             "model.layers.0.mlp.experts.gate_up_proj_blocks": 1,
@@ -649,8 +649,6 @@ class TestBuildConsolidatedIndexQuantizedBase:
             "lm_head.weight": 1,
         }
 
-        # After fine-tuning and to_hf(quantization=False), state dict has
-        # dequantized tensors — no _blocks/_scales keys.
         state_dict = {
             "model.embed_tokens.weight": torch.randn(16, 4),
             "model.layers.0.mlp.experts.gate_up_proj": torch.randn(4, 8, 4),
@@ -677,12 +675,12 @@ class TestBuildConsolidatedIndexQuantizedBase:
         ):
             mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
 
-        # The mapping must only contain keys from the state dict.
-        assert set(mapping.keys()) == set(state_dict.keys())
-        # Specifically, no _blocks or _scales keys should remain.
-        for key in mapping:
-            assert "_blocks" not in key, f"Stale key leaked: {key}"
-            assert "_scales" not in key, f"Stale key leaked: {key}"
+        # The mapping must contain all state_dict keys.
+        assert set(state_dict.keys()).issubset(set(mapping.keys()))
+        # Stale quantized keys from pre_shard_hf_state_dict_keys remain in the
+        # mapping; they are removed later during safetensors consolidation.
+        assert "model.layers.0.mlp.experts.gate_up_proj_blocks" in mapping
+        assert "model.layers.0.mlp.experts.gate_up_proj_scales" in mapping
 
     def test_new_keys_assigned_to_last_shard(self):
         """Keys in the state dict but missing from the base index go to the default shard."""
