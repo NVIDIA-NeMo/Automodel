@@ -446,7 +446,9 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         # After prefill, send only the new token
         if past_key_values.has_previous_state:
             input_ids = input_ids[:, -1:]
-            if cache_position is None:
+            if cache_position is not None:
+                cache_position = cache_position[-1:]
+            else:
                 kv_len = past_key_values.get_seq_length()
                 cache_position = torch.tensor([kv_len], device=input_ids.device)
 
