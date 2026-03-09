@@ -31,12 +31,12 @@ from transformers.tokenization_utils_base import (
     BatchEncoding,
     EncodedInput,
     PreTokenizedInput,
+    PreTrainedTokenizerBase,
     TextInput,
     TruncationStrategy,
 )
 from transformers.utils import PaddingStrategy, TensorType, add_end_docstrings, logging, to_py_obj
 from transformers.utils.generic import is_torch_tensor
-from transformers.utils.hub import PushToHubMixin
 from transformers.utils.import_utils import is_mistral_common_available, is_torch_available, requires
 
 
@@ -167,7 +167,7 @@ class MistralTokenizerType(str, Enum):
 
 
 @requires(backends=("mistral-common",))
-class MistralCommonBackend(PushToHubMixin):
+class MistralCommonBackend(PreTrainedTokenizerBase):
     """
     Class to wrap `mistral-common` tokenizers.
 
