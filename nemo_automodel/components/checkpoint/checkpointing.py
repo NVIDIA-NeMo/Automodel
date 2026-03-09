@@ -745,15 +745,6 @@ class Checkpointer:
         for fqn in list(state_dict.keys()):
             fqn_to_file_index_mapping[fqn] = fqn_to_file_index_mapping.get(fqn, default_index)
 
-        # Remove stale keys that exist in the base checkpoint index but are absent
-        # from the current state dict.  This happens when the base checkpoint uses a
-        # different weight representation (e.g. mxfp4 _blocks/_scales tensors) than
-        # the fine-tuned model being saved (dequantized bf16 tensors).  Keeping these
-        # phantom keys causes the consolidation step to write empty-dtype entries in
-        # the safetensors header, producing files that downstream loaders reject.
-        state_dict_keys = set(state_dict.keys())
-        fqn_to_file_index_mapping = {k: v for k, v in fqn_to_file_index_mapping.items() if k in state_dict_keys}
-
         return fqn_to_file_index_mapping
 
     def _get_storage_writer(
