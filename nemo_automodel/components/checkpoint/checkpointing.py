@@ -744,7 +744,6 @@ class Checkpointer:
         # add any additional keys that are not in the base checkpoint
         for fqn in list(state_dict.keys()):
             fqn_to_file_index_mapping[fqn] = fqn_to_file_index_mapping.get(fqn, default_index)
-
         return fqn_to_file_index_mapping
 
     def _get_storage_writer(
