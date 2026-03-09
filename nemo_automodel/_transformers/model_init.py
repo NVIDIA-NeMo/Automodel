@@ -71,10 +71,10 @@ def _filter_meta_device_from_init_context(contexts):
     return [c for c in contexts if not (isinstance(c, torch.device) and getattr(c, "type", None) == "meta")]
 
 
-def _patched_get_init_context(cls, dtype, is_quantized, _is_ds_init_called):
+def _patched_get_init_context(cls, dtype, is_quantized, _is_ds_init_called, *args, **kwargs):
     """Wrapper around PreTrainedModel.get_init_context that strips meta device when requested."""
     original = _patched_get_init_context.__wrapped__
-    contexts = original(cls, dtype, is_quantized, _is_ds_init_called)
+    contexts = original(cls, dtype, is_quantized, _is_ds_init_called, *args, **kwargs)
     if _get_hf_meta_device_disabled():
         return _filter_meta_device_from_init_context(contexts)
     return contexts
