@@ -1873,7 +1873,7 @@ class TestResolveSdpaMethod:
         assert result == [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
     def test_explicit_overrides_auto(self):
-        """When cfg_sdpa_method is provided, auto-selection is bypassed."""
+        """When sdpa_method is provided, auto-selection is bypassed."""
         from torch.nn.attention import SDPBackend
 
         mesh = MagicMock()
@@ -1882,3 +1882,17 @@ class TestResolveSdpaMethod:
 
         result = resolve_sdpa_method(["math"], device_mesh=mesh, activation_checkpointing=True)
         assert result == [SDPBackend.MATH]
+
+    def test_sdp_backend_enums_passed_through(self):
+        """SDPBackend enum values should be passed through unchanged."""
+        from torch.nn.attention import SDPBackend
+
+        result = resolve_sdpa_method([SDPBackend.FLASH_ATTENTION, SDPBackend.MATH])
+        assert result == [SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]
+
+    def test_mixed_strings_and_enums(self):
+        """Mix of string and SDPBackend values should work."""
+        from torch.nn.attention import SDPBackend
+
+        result = resolve_sdpa_method([SDPBackend.FLASH_ATTENTION, "efficient_attention"])
+        assert result == [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]

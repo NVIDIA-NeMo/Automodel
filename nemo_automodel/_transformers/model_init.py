@@ -394,23 +394,24 @@ def _filter_kwargs_for_init(model_cls, kwargs: dict) -> dict:
 
 
 def resolve_sdpa_method(
-    cfg_sdpa_method: list[str] | None = None,
+    sdpa_method: list | None = None,
     device_mesh=None,
     activation_checkpointing: bool = False,
 ) -> list["SDPBackend"] | None:  # noqa: F821
     """Resolve SDPA backend list from config strings or runtime constraints.
 
-    When *cfg_sdpa_method* is provided (e.g. from YAML), its string values are
-    converted to :class:`torch.nn.attention.SDPBackend` enum members.  When it
-    is ``None``, automatic defaults are applied based on context parallelism and
-    activation checkpointing settings.
+    When *sdpa_method* is provided (e.g. from YAML), string values are
+    converted to :class:`torch.nn.attention.SDPBackend` enum members.
+    Already-resolved ``SDPBackend`` values are passed through unchanged.
+    When ``None``, automatic defaults are applied based on context
+    parallelism and activation checkpointing settings.
 
     Valid string values (case-insensitive): ``flash_attention``,
     ``efficient_attention``, ``math``, ``cudnn_attention``.
 
     Args:
-        cfg_sdpa_method: Explicit list of backend name strings from config, or
-            ``None`` to use automatic defaults.
+        sdpa_method: List of backend name strings or SDPBackend enum values,
+            or ``None`` to use automatic defaults.
         device_mesh: Device mesh for distributed training.
         activation_checkpointing: Whether activation checkpointing is enabled.
 
@@ -422,13 +423,16 @@ def resolve_sdpa_method(
 
     _NAME_TO_BACKEND = dict(SDPBackend.__members__)
 
-    if cfg_sdpa_method is not None:
+    if sdpa_method is not None:
         backends = []
-        for name in cfg_sdpa_method:
-            key = name.upper()
-            if key not in _NAME_TO_BACKEND:
-                raise ValueError(f"Unknown SDPA backend '{name}'. Valid values: {sorted(_NAME_TO_BACKEND.keys())}")
-            backends.append(_NAME_TO_BACKEND[key])
+        for entry in sdpa_method:
+            if isinstance(entry, str):
+                key = entry.upper()
+                if key not in _NAME_TO_BACKEND:
+                    raise ValueError(f"Unknown SDPA backend '{entry}'. Valid values: {sorted(_NAME_TO_BACKEND.keys())}")
+                backends.append(_NAME_TO_BACKEND[key])
+            else:
+                backends.append(entry)
         return backends
 
     # Auto-select based on runtime constraints
