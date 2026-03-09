@@ -47,11 +47,9 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 
 from flashoptim import FlashAdamW
-
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -136,8 +134,6 @@ def build(model_name, mesh):
     m = AutoModelForCausalLM.from_pretrained(
         model_name, torch_dtype=torch.bfloat16, trust_remote_code=True
     ).to("cuda")
-    # Use Automodel's cast_model_to_dtype which respects _keep_in_fp32_modules
-    cast_model_to_dtype(m, torch.bfloat16)
     fully_shard(m, mesh=mesh)
     o = FlashAdamW(
         [p for p in m.parameters() if p.requires_grad],
@@ -182,9 +178,16 @@ def main():
     torch.cuda.set_device(rank)
     mesh = init_device_mesh("cuda", (dist.get_world_size(),))
 
-    # Get vocab size from tokenizer for synthetic data generation
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    vocab_size = tokenizer.vocab_size
+    # Clean checkpoint dir
+    if rank == 0:
+        shutil.rmtree(args.ckpt_dir, ignore_errors=True)
+    dist.barrier()
+
+    # --- Phase 1: train + save ---
+    model, optim = build(model_name, mesh)
+
+    # Get vocab size from loaded model config for synthetic data generation
+    vocab_size = model.config.vocab_size
     total_batches = 2 * args.steps
     batches = generate_synthetic_batches(vocab_size, total_batches)
 
@@ -193,14 +196,6 @@ def main():
         print(f"Batches: {len(batches)} (synthetic, seq_len={SEQ_LEN})")
         print(f"Steps:   {args.steps} per phase")
         print()
-
-    # Clean checkpoint dir
-    if rank == 0:
-        shutil.rmtree(args.ckpt_dir, ignore_errors=True)
-    dist.barrier()
-
-    # --- Phase 1: train + save ---
-    model, optim = build(model_name, mesh)
     losses1 = train(model, optim, batches, args.steps, start=0)
     if rank == 0:
         print("Phase 1 - train")
