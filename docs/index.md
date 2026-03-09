@@ -65,6 +65,7 @@ Select a modality and task to find the right guide.
 |------------|-----|-------------|--------------|-----|------------------------|----------|
 | **LLM**    | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/finetune.md#recipe-config) | [Guide](guides/llm/toolcalling.md) | [Guide](guides/quantization-aware-training.md) | [Guide](guides/llm/knowledge-distillation.md) | [Guide](guides/llm/pretraining.md) |
 | **VLM**    | [Guide](guides/overview.md) | [Guide](guides/omni/gemma3-3n.md) | -- | -- | -- | -- |
+| **Diffusion** | [Guide](guides/diffusion/finetune.md) | -- | -- | -- | -- | [Guide](guides/diffusion/finetune.md#pretraining-vs-fine-tuning) |
 
 ## Performance
 
@@ -225,6 +226,7 @@ performance-summary.md
 model-coverage/overview.md
 model-coverage/llm.md
 model-coverage/vlm.md
+model-coverage/diffusion.md
 model-coverage/troubleshooting.md
 ::::
 
@@ -240,6 +242,7 @@ guides/llm/nanogpt-pretraining.md
 guides/llm/sequence-classification.md
 guides/omni/gemma3-3n.md
 guides/vlm/qwen3_5.md
+guides/diffusion/finetune.md
 guides/quantization-aware-training.md
 guides/llm/databricks.md
 ::::
@@ -255,6 +258,7 @@ guides/llm/retrieval-dataset.md
 guides/llm/column-mapped-text-instruction-dataset.md
 guides/llm/column-mapped-text-instruction-iterable-dataset.md
 guides/vlm/dataset.md
+guides/diffusion/dataset.md
 ::::
 
 ::::{toctree}
