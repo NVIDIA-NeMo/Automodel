@@ -15,21 +15,17 @@
 """FlashOptim + DCP checkpoint roundtrip test.
 
 Trains a model for N steps with FlashAdamW, saves optimizer + model state via
-DCP (using Automodel's OptimizerState/ModelState wrappers), loads into a fresh
-optimizer, and compares continued-training losses to verify checkpoint fidelity.
+DCP, loads into a fresh optimizer, and compares continued-training losses to
+verify checkpoint fidelity.
 
 FlashOptim >= 0.1.3 includes native DTensor support for DCP compatibility.
 
-Usage (small model, quick sanity check):
-    torchrun --nproc-per-node=2 tests/functional_tests/checkpoint/test_flashoptim_dcp_roundtrip.py
+Usage (L2 CI via shell script wrapper):
+    See tests/functional_tests/hf_dcp/L2_FlashOptim_DCP_Roundtrip.sh
 
-    # Custom model:
+Manual usage:
     torchrun --nproc-per-node=2 tests/functional_tests/checkpoint/test_flashoptim_dcp_roundtrip.py \
-        --model Qwen/Qwen3-0.6B
-
-    # With a full Automodel config (uses model from config):
-    torchrun --nproc-per-node=8 tests/functional_tests/checkpoint/test_flashoptim_dcp_roundtrip.py \
-        --config examples/llm_finetune/qwen/qwen3_moe_30b_te_packed_sequence_flashoptim.yaml
+        --model $TEST_DATA_DIR/hf_mixtral_2l/
 """
 
 from __future__ import annotations
@@ -42,7 +38,6 @@ import sys
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from datasets import load_dataset
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -62,7 +57,6 @@ from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 # Defaults
 # ---------------------------------------------------------------------------
 DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
-DEFAULT_DATASET = "allenai/tulu-3-sft-mixture"
 DEFAULT_CKPT_DIR = "/tmp/flashoptim_dcp_roundtrip"
 SEQ_LEN = 512
 BATCH_SIZE = 8
@@ -76,39 +70,16 @@ LOSS_DELTA_THRESHOLD = 0.05
 
 
 # ---------------------------------------------------------------------------
-# Data loading
+# Synthetic data generation
 # ---------------------------------------------------------------------------
-def load_batches(tokenizer, num_batches, seq_len=SEQ_LEN, batch_size=BATCH_SIZE):
-    """Load and tokenize real chat data into pre-built batches."""
-    ds = load_dataset(DEFAULT_DATASET, split=f"train[:{num_batches * batch_size}]")
-
+def generate_synthetic_batches(vocab_size, num_batches, seq_len=SEQ_LEN, batch_size=BATCH_SIZE):
+    """Generate synthetic random token batches for training."""
     batches = []
-    buffer = []
-    for row in ds:
-        messages = row["messages"]
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
-        )
-        enc = tokenizer(
-            text,
-            truncation=True,
-            max_length=seq_len,
-            padding="max_length",
-            return_tensors="pt",
-        )
-
-        input_ids = enc["input_ids"].squeeze(0)
+    g = torch.Generator().manual_seed(42)
+    for _ in range(num_batches):
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), generator=g)
         labels = input_ids.clone()
-        labels[labels == tokenizer.pad_token_id] = -100
-
-        buffer.append((input_ids, labels))
-
-        if len(buffer) == batch_size:
-            ids = torch.stack([b[0] for b in buffer])
-            labs = torch.stack([b[1] for b in buffer])
-            batches.append({"input_ids": ids, "labels": labs})
-            buffer = []
-
+        batches.append({"input_ids": input_ids, "labels": labels})
     return batches
 
 
@@ -189,11 +160,6 @@ def main():
         help=f"HuggingFace model name or path (default: {DEFAULT_MODEL})",
     )
     parser.add_argument(
-        "--config",
-        default=None,
-        help="Automodel YAML config to extract model name from",
-    )
-    parser.add_argument(
         "--ckpt-dir",
         default=DEFAULT_CKPT_DIR,
         help=f"Checkpoint directory (default: {DEFAULT_CKPT_DIR})",
@@ -209,31 +175,22 @@ def main():
     )
     args = parser.parse_args()
 
-    # Extract model name from config if provided
     model_name = args.model
-    if args.config is not None:
-        import yaml
-
-        with open(args.config) as f:
-            cfg = yaml.safe_load(f)
-        model_name = cfg.get("model", {}).get(
-            "pretrained_model_name_or_path", model_name
-        )
 
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     torch.cuda.set_device(rank)
     mesh = init_device_mesh("cuda", (dist.get_world_size(),))
 
-    # Load tokenizer and data
+    # Get vocab size from tokenizer for synthetic data generation
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    vocab_size = tokenizer.vocab_size
     total_batches = 2 * args.steps
-    batches = load_batches(tokenizer, total_batches)
+    batches = generate_synthetic_batches(vocab_size, total_batches)
+
     if rank == 0:
         print(f"Model:   {model_name}")
-        print(f"Batches: {len(batches)} (seq_len={SEQ_LEN})")
+        print(f"Batches: {len(batches)} (synthetic, seq_len={SEQ_LEN})")
         print(f"Steps:   {args.steps} per phase")
         print()
 
