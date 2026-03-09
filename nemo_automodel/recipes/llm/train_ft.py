@@ -234,6 +234,10 @@ def build_model(
         else:
             # For non-NemoAutoModel entry points (e.g., build_gpt2_model),
             # instantiate the model first, then apply infrastructure separately.
+            # Note: sdpa_method is not supported here — SDPA patching only runs
+            # inside NeMoAutoModel._build_model.
+            if sdpa_method is not None:
+                logger.warning("sdpa_method is ignored for non-NeMoAutoModel targets.")
             # We must convert config objects into runtime objects (model_wrapper,
             # autopipeline, parallelize_fn, etc.) via instantiate_infrastructure,
             # exactly as from_pretrained/from_config do internally.
