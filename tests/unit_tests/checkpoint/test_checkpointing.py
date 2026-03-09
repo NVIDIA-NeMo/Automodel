@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
+import json
+import os
+import struct
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +24,7 @@ import torch
 
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
+    CheckpointingConfig,
     _equally_divide_layers,
     _is_custom_model,
     _model_has_dtensors,
@@ -267,7 +271,6 @@ class TestIsCustomModel:
 
     def test_module_from_custom_namespace_is_custom(self):
         """A class whose __module__ starts with nemo_automodel.components.models. is custom."""
-        model = torch.nn.Module()
         # Simulate a custom model by patching __module__ on the class's MRO
         FakeCustom = type("FakeCustom", (torch.nn.Module,), {})
         FakeCustom.__module__ = "nemo_automodel.components.models.deepseek_v3.model"
@@ -358,7 +361,7 @@ class TestLoadModelCustomModelGuard:
 
     def _make_checkpointer(self):
         """Create a minimally configured Checkpointer for testing."""
-        from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig, Checkpointer
+        from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
         config = CheckpointingConfig(
             enabled=True,
@@ -418,9 +421,7 @@ class TestLoadModelCustomModelGuard:
 
         with (
             patch("os.path.exists", return_value=True),
-            patch(
-                "nemo_automodel.components.checkpoint.checkpointing.ModelState"
-            ) as MockModelState,
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as MockModelState,
             patch(
                 "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
                 side_effect=lambda m, sd, **kw: sd,
@@ -585,3 +586,289 @@ class TestInitializeModelWeights:
 
         sig = inspect.signature(Checkpointer.load_base_model)
         assert "peft_init_method" not in sig.parameters
+
+
+# =============================================================================
+# Tests for _maybe_build_consolidated_index: quantized base checkpoint
+# =============================================================================
+
+
+class TestBuildConsolidatedIndexQuantizedBase:
+    """Verify that _maybe_build_consolidated_index filters stale quantized keys.
+
+    When the base checkpoint uses mxfp4 quantization (e.g. GPT-OSS), the index
+    contains ``_blocks`` and ``_scales`` tensor names.  After fine-tuning the
+    model is saved with dequantized bf16 weights, so those names no longer
+    appear in the state dict.  The mapping must only contain keys that are
+    actually present in the state dict being saved; stale keys would cause the
+    consolidation step to produce safetensors files with empty dtype headers.
+    """
+
+    def _make_checkpointer(self, *, save_consolidated: bool = True):
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir="/tmp/test",
+            model_save_format="safetensors",
+            model_cache_dir="/tmp/cache",
+            model_repo_id="test/gptoss-model",
+            save_consolidated=save_consolidated,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    def test_stale_quantized_keys_are_filtered(self):
+        """Quantized _blocks/_scales keys from the base index must not leak into the mapping."""
+        checkpointer = self._make_checkpointer()
+
+        # Simulate a model with state_dict_adapter and quantized pre-shard keys.
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(model_type="gpt_oss")
+        model.layer = torch.nn.Linear(4, 4)
+        # Pre-shard keys include both quantized and regular variants
+        model._pre_shard_hf_state_dict_keys = [
+            "model.embed_tokens.weight",
+            "model.layers.0.mlp.experts.gate_up_proj_blocks",
+            "model.layers.0.mlp.experts.gate_up_proj_scales",
+            "model.layers.0.mlp.experts.down_proj_blocks",
+            "model.layers.0.mlp.experts.down_proj_scales",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+        ]
+
+        # Base checkpoint index also has the quantized keys
+        base_index_mapping = {
+            "model.embed_tokens.weight": 1,
+            "model.layers.0.mlp.experts.gate_up_proj_blocks": 1,
+            "model.layers.0.mlp.experts.gate_up_proj_scales": 1,
+            "model.layers.0.mlp.experts.down_proj_blocks": 1,
+            "model.layers.0.mlp.experts.down_proj_scales": 1,
+            "model.layers.0.self_attn.q_proj.weight": 1,
+            "model.norm.weight": 1,
+            "lm_head.weight": 1,
+        }
+
+        # After fine-tuning and to_hf(quantization=False), state dict has
+        # dequantized tensors — no _blocks/_scales keys.
+        state_dict = {
+            "model.embed_tokens.weight": torch.randn(16, 4),
+            "model.layers.0.mlp.experts.gate_up_proj": torch.randn(4, 8, 4),
+            "model.layers.0.mlp.experts.down_proj": torch.randn(4, 4, 8),
+            "model.layers.0.self_attn.q_proj.weight": torch.randn(4, 4),
+            "model.norm.weight": torch.randn(4),
+            "lm_head.weight": torch.randn(16, 4),
+        }
+
+        model_state = MagicMock()
+        model_state.model = [model]
+        model_state.is_tied_lm_head = False
+
+        with (
+            patch.object(checkpointer, "_should_write_hf_metadata", return_value=True),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing.get_safetensors_index_path",
+                return_value="/fake/snapshot",
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+                return_value=base_index_mapping,
+            ),
+        ):
+            mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+
+        # The mapping must only contain keys from the state dict.
+        assert set(mapping.keys()) == set(state_dict.keys())
+        # Specifically, no _blocks or _scales keys should remain.
+        for key in mapping:
+            assert "_blocks" not in key, f"Stale key leaked: {key}"
+            assert "_scales" not in key, f"Stale key leaked: {key}"
+
+    def test_new_keys_assigned_to_last_shard(self):
+        """Keys in the state dict but missing from the base index go to the default shard."""
+        checkpointer = self._make_checkpointer()
+
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(model_type="gpt_oss")
+        model._pre_shard_hf_state_dict_keys = ["model.layer.weight"]
+
+        base_index_mapping = {"model.layer.weight": 2}
+
+        state_dict = {
+            "model.layer.weight": torch.randn(4, 4),
+            "model.new_layer.weight": torch.randn(4, 4),
+        }
+
+        model_state = MagicMock()
+        model_state.model = [model]
+        model_state.is_tied_lm_head = False
+
+        with (
+            patch.object(checkpointer, "_should_write_hf_metadata", return_value=True),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing.get_safetensors_index_path",
+                return_value="/fake/snapshot",
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+                return_value=base_index_mapping,
+            ),
+        ):
+            mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+
+        assert mapping["model.layer.weight"] == 2
+        assert mapping["model.new_layer.weight"] == 2  # default = max existing
+
+
+# =============================================================================
+# Tests for consolidation: safetensors with phantom keys must still be loadable
+# =============================================================================
+
+
+def _write_dcp_safetensors_shard(path: str, tensors: dict[str, torch.Tensor]) -> None:
+    """Write a single DCP-style safetensors shard file with sharding metadata."""
+    from nemo_automodel.components.checkpoint._backports.filesystem import _to_safetensors_dtype_str
+
+    header: dict[str, object] = {}
+    data_offset = 0
+    raw_parts: list[bytes] = []
+    sharding_info: dict[str, object] = {}
+
+    for fqn, tensor in tensors.items():
+        t = tensor.contiguous()
+        nbytes = t.numel() * t.element_size()
+        raw = t.view(torch.uint8).numpy().tobytes()
+        raw_parts.append(raw)
+
+        header[fqn] = {
+            "dtype": _to_safetensors_dtype_str(t.dtype),
+            "shape": list(t.shape),
+            "data_offsets": [data_offset, data_offset + nbytes],
+        }
+        sharding_info[fqn] = {"saved_offsets": [0] * t.dim()}
+        data_offset += nbytes
+
+    header["__metadata__"] = {
+        "DCP_SHARDING_INFO": json.dumps(sharding_info),
+        "DCP_VERSION": "1.0",
+        "format": "pt",
+    }
+
+    header_json = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    pad_len = (8 - (len(header_json) % 8)) % 8
+    if pad_len:
+        header_json += b" " * pad_len
+
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(header_json)))
+        f.write(header_json)
+        for part in raw_parts:
+            f.write(part)
+
+
+class TestConsolidationWithPhantomKeys:
+    """End-to-end: consolidated safetensors must be loadable by safe_open.
+
+    Simulates the GPT-OSS scenario where the consolidation mapping contains
+    phantom FQNs (e.g. mxfp4 _blocks/_scales) that don't exist in the DCP
+    shard files.  Before the fix, this produced safetensors with ``dtype: ""``
+    in the header, which safe_open would reject.
+    """
+
+    def test_consolidated_safetensors_loadable_with_phantom_keys(self):
+        """Phantom FQNs must be stripped; output must be loadable by safe_open."""
+        from safetensors import safe_open
+
+        from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
+            consolidate_safetensors_files,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = os.path.join(tmpdir, "shards")
+            output_dir = os.path.join(tmpdir, "consolidated")
+            os.makedirs(input_dir)
+            os.makedirs(output_dir)
+
+            # Create a DCP shard with real tensors (simulating post-SFT bf16 weights)
+            real_tensors = {
+                "model.embed_tokens.weight": torch.randn(32, 16, dtype=torch.bfloat16),
+                "model.layers.0.mlp.experts.gate_up_proj": torch.randn(4, 8, 16, dtype=torch.bfloat16),
+                "model.layers.0.mlp.experts.down_proj": torch.randn(4, 16, 8, dtype=torch.bfloat16),
+                "model.layers.0.self_attn.q_proj.weight": torch.randn(16, 16, dtype=torch.bfloat16),
+                "model.norm.weight": torch.randn(16, dtype=torch.bfloat16),
+                "lm_head.weight": torch.randn(32, 16, dtype=torch.bfloat16),
+            }
+            shard_path = os.path.join(input_dir, "shard-00001-model-00001-of-00001.safetensors")
+            _write_dcp_safetensors_shard(shard_path, real_tensors)
+
+            # Build a mapping that includes phantom quantized keys (simulating
+            # stale entries from the base checkpoint's index).
+            fqn_to_index_mapping = {fqn: 1 for fqn in real_tensors}
+            fqn_to_index_mapping["model.layers.0.mlp.experts.gate_up_proj_blocks"] = 1
+            fqn_to_index_mapping["model.layers.0.mlp.experts.gate_up_proj_scales"] = 1
+            fqn_to_index_mapping["model.layers.0.mlp.experts.down_proj_blocks"] = 1
+            fqn_to_index_mapping["model.layers.0.mlp.experts.down_proj_scales"] = 1
+
+            # Run consolidation — before the fix this would write dtype: ""
+            consolidate_safetensors_files(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                fqn_to_index_mapping=fqn_to_index_mapping,
+                num_threads=1,
+            )
+
+            # The consolidated file must be loadable by safe_open
+            consolidated_file = os.path.join(output_dir, "model-00001-of-00001.safetensors")
+            assert os.path.exists(consolidated_file), "Consolidated safetensors file was not created"
+
+            loaded = {}
+            with safe_open(consolidated_file, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    loaded[key] = f.get_tensor(key)
+
+            # Only real tensors should be present — no phantom keys
+            assert set(loaded.keys()) == set(real_tensors.keys())
+
+            # Values must match
+            for fqn, original in real_tensors.items():
+                torch.testing.assert_close(loaded[fqn], original, msg=f"Mismatch for {fqn}")
+
+    def test_consolidated_safetensors_no_phantom_keys(self):
+        """When no phantom keys exist, consolidation must work as before."""
+        from safetensors import safe_open
+
+        from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
+            consolidate_safetensors_files,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = os.path.join(tmpdir, "shards")
+            output_dir = os.path.join(tmpdir, "consolidated")
+            os.makedirs(input_dir)
+            os.makedirs(output_dir)
+
+            tensors = {
+                "model.weight": torch.randn(8, 4, dtype=torch.bfloat16),
+                "model.bias": torch.randn(8, dtype=torch.bfloat16),
+            }
+            shard_path = os.path.join(input_dir, "shard-00001-model-00001-of-00001.safetensors")
+            _write_dcp_safetensors_shard(shard_path, tensors)
+
+            fqn_to_index_mapping = {fqn: 1 for fqn in tensors}
+
+            consolidate_safetensors_files(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                fqn_to_index_mapping=fqn_to_index_mapping,
+                num_threads=1,
+            )
+
+            consolidated_file = os.path.join(output_dir, "model-00001-of-00001.safetensors")
+            loaded = {}
+            with safe_open(consolidated_file, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    loaded[key] = f.get_tensor(key)
+
+            assert set(loaded.keys()) == set(tensors.keys())
+            for fqn, original in tensors.items():
+                torch.testing.assert_close(loaded[fqn], original)

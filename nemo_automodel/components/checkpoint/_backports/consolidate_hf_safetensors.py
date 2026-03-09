@@ -160,6 +160,18 @@ def _parse_input_metadata(
                     dtype_str=dtype_str,
                 )
 
+    # Remove FQNs that were in the output mapping but not found in any input file.
+    # These retain the default empty dtype_str and would produce invalid safetensors.
+    for output_data in output_files_data.values():
+        orphaned = [fqn for fqn, fd in output_data.fqn_data.items() if not fd.dtype_str]
+        for fqn in orphaned:
+            logger.warning(
+                "Tensor '%s' is in the consolidation mapping but was not found in any "
+                "input shard file; removing it from the output.",
+                fqn,
+            )
+            del output_data.fqn_data[fqn]
+
 
 def _write_metadata(
     output_files_data: dict[str, _OutputFileData],
