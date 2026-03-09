@@ -233,6 +233,7 @@ model-coverage/troubleshooting.md
 :caption: Recipes & E2E Examples
 guides/overview.md
 guides/llm/finetune.md
+guides/llm/finetuning-guide.md
 guides/llm/toolcalling.md
 guides/llm/knowledge-distillation.md
 guides/llm/pretraining.md
