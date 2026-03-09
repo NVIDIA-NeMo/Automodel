@@ -23,7 +23,7 @@ pip3 install nemo-automodel
 For additional options, see the [Installation Guide](../installation.md).
 :::
 
-Data must be preprocessed into `.meta` files before training. See the [Diffusion Dataset Preparation](dataset.md) guide for instructions.
+Data must be preprocessed into cache files before training using the built-in preprocessing tool at `tools/diffusion/preprocessing_multiprocess.py`. See the [Diffusion Dataset Preparation](dataset.md) guide for instructions.
 
 ## Model and Dataset Context
 

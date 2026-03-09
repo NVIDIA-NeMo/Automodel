@@ -487,7 +487,7 @@ See [Gemma-3n](omni/gemma3-3n.md) and [VLM dataset](vlm/dataset.md) for end-to-e
 
 ## Diffusion Datasets
 
-Diffusion models in NeMo AutoModel use pre-encoded `.meta` files rather than raw images or videos. During preprocessing, a VAE encodes visual data into latent representations and a text encoder produces text embeddings. These are saved as `.meta` files so that training operates entirely in latent space.
+Diffusion models in NeMo AutoModel use pre-encoded cache files rather than raw images or videos. The built-in preprocessing tool at `tools/diffusion/preprocessing_multiprocess.py` uses model-specific processors to encode visual data into VAE latents and text embeddings, organized into resolution-bucketed cache directories compatible with the multiresolution dataloader.
 
 ### Dataloader Builders
 
