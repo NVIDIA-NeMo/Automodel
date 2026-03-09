@@ -167,14 +167,24 @@ def make_cp_batch_and_ctx(
     pos_seq_dim = 2 if position_ids.ndim == 3 else 1
 
     labels = batch["labels"]
+
+    # Collect all available tensors for context parallel
+    cp_buffers = [input_ids, labels, position_ids]
+    cp_seq_dims = [1, 1, pos_seq_dim]
+    cp_no_restore_buffers = {input_ids, labels}
+
+    # Add loss_mask if available
     if loss_mask is not None:
-        cp_buffers = [input_ids, labels, position_ids, loss_mask]
-        cp_seq_dims = [1, 1, pos_seq_dim, 1]
-        cp_no_restore_buffers = {input_ids, labels, loss_mask}
-    else:
-        cp_buffers = [input_ids, labels, position_ids]
-        cp_seq_dims = [1, 1, pos_seq_dim]
-        cp_no_restore_buffers = {input_ids, labels}
+        cp_buffers.append(loss_mask)
+        cp_seq_dims.append(1)
+        cp_no_restore_buffers.add(loss_mask)
+
+    # Add padding_mask if available in batch
+    if "padding_mask" in batch:
+        padding_mask = batch["padding_mask"]
+        cp_buffers.append(padding_mask)
+        cp_seq_dims.append(1)
+        cp_no_restore_buffers.add(padding_mask)
 
     cp_ctx = create_context_parallel_ctx(
         cp_mesh=cp_mesh,
@@ -285,7 +295,7 @@ def make_cp_batch_for_te(
             _shard_thd_chunk_for_te(chunk_batch, cp_mesh, qkv_format, seq_lens_padding_value, padding_token_id)
         )
 
-    return {
+    return_dict = {
         "input_ids": torch.stack([chunk["input_ids"] for chunk in chunks]),
         "labels": torch.stack([chunk["labels"] for chunk in chunks]),
         "position_ids": torch.stack([chunk["position_ids"] for chunk in chunks]),
@@ -296,6 +306,8 @@ def make_cp_batch_for_te(
         "cp_size": cp_mesh.size() if cp_mesh is not None else 1,
         "cp_rank": torch.distributed.get_rank(group=cp_mesh.get_group()) if cp_mesh is not None else 0,
     }
+
+    return return_dict
 
 
 def _shard_thd_chunk_for_te(
@@ -321,11 +333,16 @@ def _shard_thd_chunk_for_te(
     cp_size = cp_mesh.size()
 
     cp_rank = torch.distributed.get_rank(group=cp_mesh.get_group()) if cp_mesh is not None else 0
-    for key in ["input_ids", "labels", "position_ids", "padding_mask"]:
-        val = batch[key]
-        index = tex.thd_get_partitioned_indices(filtered_cu_seqlens_padded, val.size(0), cp_size, cp_rank)
-        val = val.index_select(0, index)
-        batch[key] = val
+
+    # Handle all mask keys that may be present in the batch
+    mask_keys = ["input_ids", "labels", "position_ids", "padding_mask"]
+
+    for key in mask_keys:
+        if key in batch:
+            val = batch[key]
+            index = tex.thd_get_partitioned_indices(filtered_cu_seqlens_padded, val.size(0), cp_size, cp_rank)
+            val = val.index_select(0, index)
+            batch[key] = val
 
     max_seqlen = (filtered_cu_seqlens_padded[1:] - filtered_cu_seqlens_padded[:-1]).max().item()
     output_batch = {
@@ -339,4 +356,5 @@ def _shard_thd_chunk_for_te(
         "cp_size": cp_size,
         "cp_rank": cp_rank,
     }
+
     return output_batch
