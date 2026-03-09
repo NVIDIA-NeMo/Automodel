@@ -35,7 +35,7 @@ model:
   torch_dtype: bf16
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    rms_norm: "torch"
+    rms_norm: "torch_fp32"
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig

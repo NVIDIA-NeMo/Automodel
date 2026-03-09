@@ -29,6 +29,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_moe.model import Block
 from nemo_automodel.components.models.qwen3_omni_moe.state_dict_adapter import Qwen3OmniMoeStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
@@ -439,7 +440,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
         with buffer_device:
             # Ensure rotary embedding uses correct device after dtype move
             self.model.rotary_emb.device = buffer_device

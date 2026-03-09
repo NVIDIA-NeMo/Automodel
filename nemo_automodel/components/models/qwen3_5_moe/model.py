@@ -58,6 +58,7 @@ except ModuleNotFoundError:
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.model import Block
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -545,7 +546,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
 
         with buffer_device:
             self.model.language_model.rotary_emb.device = buffer_device

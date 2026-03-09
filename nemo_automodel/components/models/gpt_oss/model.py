@@ -26,6 +26,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
@@ -192,6 +193,8 @@ class GptOssModel(nn.Module):
 
 
 class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    _keep_in_fp32_modules = ["post_attention_layernorm", "input_layernorm", "norm"]
+
     @classmethod
     def from_config(
         cls,
@@ -278,7 +281,7 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
         with buffer_device:
             # Ensure rotary embedding uses correct device after dtype move
             self.model.rotary_emb.device = buffer_device

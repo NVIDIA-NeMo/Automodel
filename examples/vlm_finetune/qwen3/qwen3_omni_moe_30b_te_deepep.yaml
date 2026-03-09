@@ -37,7 +37,7 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
     linear: te
-    rms_norm: te
+    rms_norm: torch_fp32
     rope_fusion: false
     experts: te
     enable_deepep: true

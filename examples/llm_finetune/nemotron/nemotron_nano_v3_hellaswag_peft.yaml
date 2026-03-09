@@ -39,7 +39,7 @@ model:
   trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    rms_norm: torch
+    rms_norm: torch_fp32
     linear: torch
 
 # torch.compile configuration

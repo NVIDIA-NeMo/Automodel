@@ -20,6 +20,7 @@ import torch.nn as nn
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
+    cast_model_to_dtype,
     get_rope_config,
     initialize_linear_module,
     initialize_rms_norm_module,
@@ -203,6 +204,8 @@ class Glm4MoeLiteModel(nn.Module):
 
 
 class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
+
     @classmethod
     def from_config(
         cls,
@@ -300,7 +303,7 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
         for layer in self.model.layers.values():
             if isinstance(layer.mlp, MoE):
                 layer.mlp.gate.e_score_correction_bias = torch.zeros(
