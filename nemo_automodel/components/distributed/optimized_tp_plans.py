@@ -211,8 +211,64 @@ def _parallelize_gemma3(
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
+def get_llama_nemotron_super_tp_plan(
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """Return the tensor parallel plan for Llama / Llama-3.3-Nemotron Super.
+
+    Same topology as Llama-3.3-Nemotron (e.g. nvidia/Llama-3_3-Nemotron-Super-49B-v1_5):
+    fused QKV, fused gate+up, VocabParallelEmbedding, Row/ColwiseParallel for attention and MLP.
+
+    Use this plan explicitly by passing it as tp_shard_plan (dict) or by name
+    ``llama_nemotron_super_tp_plan`` when calling fsdp2_strategy_parallelize / _get_parallel_plan.
+    """
+    return _parallelize_llama(None, sequence_parallel)  # type: ignore[arg-type]
+
+
+def get_decilm_nemotron_tp_plan(
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """Return a TP plan for remote-code DeciLM Nemotron-NAS checkpoints.
+
+    DeciLM/Nemotron-NAS is close to Llama structurally, but its remote-code forward
+    path performs model-level rotary embedding setup and per-layer block-config
+    dispatch. In practice, the generic base-style plan is a safer match than the
+    Llama-optimized named plan for this architecture.
+    """
+    base_model_tp_plan: dict[str, ParallelStyle] = {
+        "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+        "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+        "model.layers.*.mlp.up_proj": ColwiseParallel(),
+        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+        "model.layers.*.mlp.down_proj": RowwiseParallel(),
+        "lm_head": ColwiseParallel(output_layouts=Replicate()),
+    }
+
+    base_model_sp_plan = {
+        "model.embed_tokens": VocabParallelEmbedding(
+            input_layouts=Replicate(),
+            output_layouts=Shard(1),
+            use_local_output=False,
+        ),
+        "model.norm": SequenceParallel(),
+        "model.layers.*.input_layernorm": SequenceParallel(),
+        "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+        "model.layers.*.post_attention_layernorm": SequenceParallel(),
+        "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+        "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
+    }
+
+    if sequence_parallel:
+        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
+
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
+
 def _parallelize_llama(
-    model: LlamaForCausalLM,
+    model: LlamaForCausalLM | None,
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """Parallelizes a LlamaForCausalLM model across data and tensor parallel dimensions."""
@@ -401,6 +457,9 @@ def _parallelize_phi3(
         base_model_tp_plan,
     )
 
+
+# Named TP plan for use with tp_shard_plan="llama_nemotron_super_tp_plan" in parallelizer
+LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME = "llama_nemotron_super_tp_plan"
 
 # Create the model-specific parallel plan mapping
 PARALLELIZE_FUNCTIONS: Dict[type, Callable[..., Dict[str, ParallelStyle]]] = {

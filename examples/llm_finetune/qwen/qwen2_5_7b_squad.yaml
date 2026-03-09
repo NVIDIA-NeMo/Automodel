@@ -33,6 +33,9 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen2.5-7B
   torch_dtype: bf16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    rms_norm: "torch"
 
 checkpoint:
   enabled: true
