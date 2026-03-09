@@ -145,7 +145,7 @@ def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         content = m.get("content")
         out = dict(m)
         if isinstance(content, list):
-            out["content"] = str(content["text"])
+            out["content"] = " ".join(part["text"] for part in content if isinstance(part, dict) and "text" in part)
         else:
             out["content"] = str(content)
         if role not in {"system", "user", "assistant", "tool"}:
