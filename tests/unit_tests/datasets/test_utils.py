@@ -163,12 +163,12 @@ def test_default_collater_shapes() -> None:
     ]
 
     collated = sftp.default_collater(raw_batch)
-    # Keys preserved
-    assert set(collated) == {"input_ids", "attention_mask", "labels", "loss_mask"}
+    # Keys preserved (padding_mask is added by the collater)
+    assert set(collated) == {"input_ids", "attention_mask", "labels", "loss_mask", "padding_mask"}
 
     # Batch dimension added
     assert collated["input_ids"].shape[0] == 2
-    # Same seq length for all keys
+    # Same seq length for all tensor keys (excluding padding_mask which is bool)
     lens = {v.shape[1] for v in collated.values()}
     assert len(lens) == 1
     lens.pop()
@@ -183,6 +183,10 @@ def test_default_collater_shapes() -> None:
     assert torch.equal(collated["input_ids"], input_ids)
     assert torch.equal(collated["labels"], labels)
     assert torch.equal(collated["loss_mask"], loss_mask)
+
+    # padding_mask should be True where input_ids == pad_token (0)
+    expected_padding_mask = torch.tensor([[False, False], [False, True]])
+    assert torch.equal(collated["padding_mask"], expected_padding_mask)
     # (torch.Tensor([[1,1,2],[1,2,3]]) == torch.Tensor([[1,1,2],[1,2,3]])).all().item()
     # assert collated["input_ids"][1, 1:].eq(0).all(), collated
     # assert collated["attention_mask"][1, 1:].eq(0).all()
@@ -633,3 +637,121 @@ class TestPackedSequenceTHDCollater:
 
         # Check qkv_format is present
         assert result["qkv_format"] == "thd"
+
+    def test_non_packed_single_example_with_attention_mask(self):
+        """Test that non-packed data (no seq_lens) synthesizes THD fields from attention_mask."""
+        batch = [
+            {
+                "input_ids": [1, 2, 3, 0, 0],
+                "labels": [10, 20, 30, -100, -100],
+                "attention_mask": [1, 1, 1, 0, 0],
+            }
+        ]
+
+        result = sftp.packed_sequence_thd_collater(batch)
+
+        assert result["qkv_format"] == "thd"
+        assert result["input_ids"].shape == (1, 5)
+        assert result["labels"].shape == (1, 5)
+        assert result["position_ids"].shape == (1, 5)
+        assert torch.equal(result["position_ids"], torch.tensor([[0, 1, 2, 3, 4]]))
+        assert torch.equal(result["seq_lens"], torch.tensor([[3]]))
+        assert torch.equal(result["seq_lens_padded"], torch.tensor([[5]]))
+        assert "attention_mask" not in result
+
+    def test_non_packed_variable_length_sequences(self):
+        """Test that non-packed variable-length sequences are padded to max batch length."""
+        batch = [
+            {
+                "input_ids": [1, 2, 3],
+                "labels": [10, 20, 30],
+                "attention_mask": [1, 1, 1],
+            },
+            {
+                "input_ids": [4, 5, 6, 7, 8],
+                "labels": [40, 50, 60, 70, 80],
+                "attention_mask": [1, 1, 1, 1, 1],
+            },
+        ]
+
+        result = sftp.packed_sequence_thd_collater(batch)
+
+        assert result["input_ids"].shape == (2, 5)
+        assert result["labels"].shape == (2, 5)
+        assert result["position_ids"].shape == (2, 5)
+        # First item padded from 3 to 5
+        assert torch.equal(result["input_ids"][0], torch.tensor([1, 2, 3, 0, 0]))
+        assert torch.equal(result["labels"][0], torch.tensor([10, 20, 30, -100, -100]))
+        assert torch.equal(result["position_ids"][0], torch.tensor([0, 1, 2, 3, 4]))
+        # Second item unchanged
+        assert torch.equal(result["input_ids"][1], torch.tensor([4, 5, 6, 7, 8]))
+        # seq_lens reflects actual lengths, seq_lens_padded reflects padded length
+        assert torch.equal(result["seq_lens"], torch.tensor([[3], [5]]))
+        assert torch.equal(result["seq_lens_padded"], torch.tensor([[5], [5]]))
+
+    def test_non_packed_without_attention_mask(self):
+        """Test non-packed data without attention_mask uses input_ids length as seq_len."""
+        batch = [
+            {
+                "input_ids": [1, 2, 3, 4],
+                "labels": [10, 20, 30, 40],
+            }
+        ]
+
+        result = sftp.packed_sequence_thd_collater(batch)
+
+        assert result["qkv_format"] == "thd"
+        assert torch.equal(result["seq_lens"], torch.tensor([[4]]))
+        assert torch.equal(result["seq_lens_padded"], torch.tensor([[4]]))
+        assert torch.equal(result["position_ids"], torch.tensor([[0, 1, 2, 3]]))
+
+    def test_non_packed_with_pad_token_ids_metadata(self):
+        """Test non-packed data uses ___PAD_TOKEN_IDS___ for correct pad token."""
+        batch = [
+            {
+                "input_ids": [1, 2],
+                "labels": [10, 20],
+                "attention_mask": [1, 1],
+                "___PAD_TOKEN_IDS___": {"input_ids": 99, "labels": -100},
+            },
+            {
+                "input_ids": [3, 4, 5, 6],
+                "labels": [30, 40, 50, 60],
+                "attention_mask": [1, 1, 1, 1],
+                "___PAD_TOKEN_IDS___": {"input_ids": 99, "labels": -100},
+            },
+        ]
+
+        result = sftp.packed_sequence_thd_collater(batch)
+
+        # First item padded with pad_token_id=99
+        assert result["input_ids"][0, 2] == 99
+        assert result["input_ids"][0, 3] == 99
+        assert result["labels"][0, 2] == -100
+        assert result["labels"][0, 3] == -100
+
+    def test_non_packed_cu_seqlens_padded_covers_total_tokens(self):
+        """Test that seq_lens_padded sums to the tensor length per item for correct cu_seqlens."""
+        batch = [
+            {
+                "input_ids": [1, 2, 3],
+                "labels": [10, 20, 30],
+                "attention_mask": [1, 1, 1],
+            },
+            {
+                "input_ids": [4, 5, 6, 7, 8, 9],
+                "labels": [40, 50, 60, 70, 80, 90],
+                "attention_mask": [1, 1, 1, 1, 1, 1],
+            },
+        ]
+
+        result = sftp.packed_sequence_thd_collater(batch)
+
+        max_len = 6  # max(3, 6)
+        batch_size = 2
+        # Each item's seq_lens_padded should equal max_len
+        assert result["seq_lens_padded"][0, 0].item() == max_len
+        assert result["seq_lens_padded"][1, 0].item() == max_len
+        # Sum across batch should equal total_tokens
+        total_tokens = batch_size * max_len
+        assert result["seq_lens_padded"].sum().item() == total_tokens
