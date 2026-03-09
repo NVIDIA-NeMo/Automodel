@@ -26,6 +26,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
@@ -487,7 +488,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             self.model.initialize_weights(buffer_device=buffer_device)
             nn.init.normal_(self.lm_head.weight, mean=0.0, std=self.config.initializer_range)
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
 
 
 ModelClass = NemotronHForCausalLM
