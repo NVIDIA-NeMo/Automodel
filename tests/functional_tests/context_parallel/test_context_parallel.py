@@ -23,6 +23,8 @@ from tests.utils.test_utils import run_test_script
 TEST_FOLDER = "context_parallel"
 CP_QWEN3_MOE_ATTENTION_TEST_FILENAME = "L2_CP_Qwen3MoE_Attention_Test.sh"
 CP_DEEPSEEK_V3_MLA_TEST_FILENAME = "L2_CP_DeepSeekV3_MLA_Test.sh"
+CP_NEMOTRON_V3_MAMBA_TEST_FILENAME = "L2_CP_NemotronV3_Mamba_Test.sh"
+CP_NEMOTRON_V3_ATTENTION_TEST_FILENAME = "L2_CP_NemotronV3_Attention_Test.sh"
 
 
 class TestContextParallelAttention:
@@ -35,3 +37,11 @@ class TestContextParallelAttention:
     def test_cp_deepseek_v3_mla(self):
         """Test DeepSeek V3 MLA layer with CP=1 vs CP=2."""
         run_test_script(TEST_FOLDER, CP_DEEPSEEK_V3_MLA_TEST_FILENAME)
+
+    def test_cp_nemotron_v3_mamba(self):
+        """Test NemotronV3Mamba2Mixer layer with CP=1 vs CP=2."""
+        run_test_script(TEST_FOLDER, CP_NEMOTRON_V3_MAMBA_TEST_FILENAME)
+
+    def test_cp_nemotron_v3_attention(self):
+        """Test NemotronV3Attention layer with CP=1 vs CP=2."""
+        run_test_script(TEST_FOLDER, CP_NEMOTRON_V3_ATTENTION_TEST_FILENAME)
