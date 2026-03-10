@@ -42,6 +42,7 @@ HF_CONSOLIDATED_FSDP2_VLM_FILENAME = "L2_HF_Consolidated_FSDP2_VLM_Checkpoint.sh
 HF_CONSOLIDATED_FSDP2_LLM_SCALAR_WEIGHT_FILENAME = "L2_HF_Consolidated_FSDP2_LLM_Checkpoint_Scalar_Param.sh"
 HF_CONSOLIDATED_PP2_LLM_FILENAME = "L2_HF_Consolidated_PP2_LLM_Checkpoint.sh"
 HF_CONSOLIDATED_GPTOSS_MXFP4_FILENAME = "L2_HF_Consolidated_GPTOSS_MXFP4_Checkpoint.sh"
+FLASHOPTIM_DCP_ROUNDTRIP_FILENAME = "L2_FlashOptim_DCP_Roundtrip.sh"
 
 
 class TestHFDCP:
@@ -115,4 +116,13 @@ class TestHFDCP:
         try:
             run_test_script(TEST_FOLDER, HF_CONSOLIDATED_GPTOSS_MXFP4_FILENAME)
         finally:
+            # remove the checkpoint directory
             shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_flashoptim_dcp_roundtrip(self):
+        try:
+            run_test_script(TEST_FOLDER, FLASHOPTIM_DCP_ROUNDTRIP_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
