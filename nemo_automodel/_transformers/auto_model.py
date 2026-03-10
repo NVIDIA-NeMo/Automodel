@@ -104,6 +104,8 @@ if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
 
 logger = logging.getLogger(__name__)
 
+_MAX_BUILD_RETRIES = 5
+
 
 def _maybe_dequantize_fp8_for_peft(hf_native_quant_cfg, peft_config, pretrained_path):
     """Set ``dequantize=True`` on FP8 quantization configs when PEFT is requested.
@@ -145,8 +147,20 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         name = cls.__name__
         if name.startswith("NeMo"):
             cls.__name__ = name[4:]
-        model = super().from_pretrained(*args, **kwargs)
-        cls.__name__ = name
+        try:
+            model = super().from_pretrained(*args, **kwargs)
+        except OSError:
+            if kwargs.get("use_safetensors") is not False:
+                logger.warning(
+                    "Checkpoint resolution failed; retrying with use_safetensors=False "
+                    "(the model may only provide .bin checkpoints)."
+                )
+                kwargs["use_safetensors"] = False
+                model = super().from_pretrained(*args, **kwargs)
+            else:
+                raise
+        finally:
+            cls.__name__ = name
         return model
 
     @classmethod
@@ -181,6 +195,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         fp8_config,
         compile_config,
         load_base_model,
+        _retry_depth=0,
         **kwargs,
     ):
         """Shared model building logic for ``from_pretrained`` and ``from_config``.
@@ -201,6 +216,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         def _retry(**override):
             """Re-enter ``_build_model`` with overridden parameters."""
+            if _retry_depth >= _MAX_BUILD_RETRIES:
+                raise
             retry_kwargs = {
                 **kwargs,
                 "has_packed_sequence": has_packed_sequence,
@@ -228,6 +245,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 fp8_config=fp8_config,
                 compile_config=compile_config,
                 load_base_model=load_base_model,
+                _retry_depth=_retry_depth + 1,
                 **retry_kwargs,
             )
 

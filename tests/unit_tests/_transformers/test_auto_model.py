@@ -35,6 +35,7 @@ class TestPatchAttention:
 
     def test__patch_attention_basic(self):
         """Test basic _patch_attention functionality."""
+
         # Create a real object with a forward method to test the actual wrapping
         class DummyModule:
             def forward(self, x):
@@ -133,15 +134,18 @@ class TestUtilityFunctions:
         assert _get_next_fallback_attn("none") == "eager"
         assert _get_next_fallback_attn("legacy_attention") == "eager"
 
-    @pytest.mark.parametrize("attn_impl,expected", [
-        ("flash_attention_3", "flash_attention_2"),
-        ("flash_attention_2", "sdpa"),
-        ("sdpa", "eager"),
-        ("eager", "eager"),
-        ("invalid", "eager"),
-        ("custom_impl", "eager"),
-        ("", "eager"),
-    ])
+    @pytest.mark.parametrize(
+        "attn_impl,expected",
+        [
+            ("flash_attention_3", "flash_attention_2"),
+            ("flash_attention_2", "sdpa"),
+            ("sdpa", "eager"),
+            ("eager", "eager"),
+            ("invalid", "eager"),
+            ("custom_impl", "eager"),
+            ("", "eager"),
+        ],
+    )
     def test_get_next_fallback_attn_parametrized(self, attn_impl, expected):
         """Parametrized test for _get_next_fallback_attn covering all scenarios."""
         assert _get_next_fallback_attn(attn_impl) == expected
@@ -227,7 +231,6 @@ def test_patch_liger_kernel_success(monkeypatch):
     attn_mock.assert_not_called()
 
 
-
 def test_liger_not_available(monkeypatch):
     """
     Asked for Liger but HAS_LIGER_KERNEL is False.
@@ -305,11 +308,13 @@ def test_patch_liger_kernel_skips_non_nn_module(monkeypatch, caplog):
 # Tests for _get_mixin_wrapped_class
 # =============================================================================
 
+
 class TestGetMixinWrappedClass:
     """Test cases for _get_mixin_wrapped_class function."""
 
     def test_returns_original_if_already_has_mixin(self):
         """When model class already inherits from HFCheckpointingMixin, return it unchanged."""
+
         class ModelWithMixin(HFCheckpointingMixin, torch.nn.Module):
             pass
 
@@ -318,6 +323,7 @@ class TestGetMixinWrappedClass:
 
     def test_creates_wrapper_for_hf_class_with_correct_attributes(self):
         """For HF model classes, create a wrapper inheriting from both and preserving attributes."""
+
         class PlainModel(torch.nn.Module):
             pass
 
@@ -337,6 +343,7 @@ class TestGetMixinWrappedClass:
 # Tests for _apply_peft_and_lower_precision
 # =============================================================================
 
+
 class TestApplyPeftAndLowerPrecision:
     """Test cases for _apply_peft_and_lower_precision function."""
 
@@ -350,7 +357,7 @@ class TestApplyPeftAndLowerPrecision:
             patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules") as mock_apply_lora,
             caplog.at_level(logging.INFO),
         ):
-            result = _apply_peft_and_lower_precision(
+            _apply_peft_and_lower_precision(
                 mock_model,
                 tp_size=2,  # TP > 1
                 autopipeline=None,
@@ -372,10 +379,10 @@ class TestApplyPeftAndLowerPrecision:
         mock_autopipeline = MagicMock()
 
         with (
-            patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules") as mock_apply_lora,
+            patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules"),
             caplog.at_level(logging.INFO),
         ):
-            result = _apply_peft_and_lower_precision(
+            _apply_peft_and_lower_precision(
                 mock_model,
                 tp_size=1,
                 autopipeline=mock_autopipeline,  # PP enabled
@@ -396,7 +403,7 @@ class TestApplyPeftAndLowerPrecision:
         with patch("nemo_automodel._transformers.infrastructure.apply_fp8_to_model") as mock_apply_fp8:
             mock_apply_fp8.return_value = mock_model
 
-            result = _apply_peft_and_lower_precision(
+            _apply_peft_and_lower_precision(
                 mock_model,
                 tp_size=1,
                 autopipeline=None,
@@ -436,11 +443,10 @@ class TestApplyPeftAndLowerPrecision:
             assert hasattr(result, "_qat_mode")
 
 
-
-
 # =============================================================================
 # Tests for _consume_config_overrides and _filter_kwargs_for_init
 # =============================================================================
+
 
 class TestConsumeConfigOverrides:
     """Test cases for _consume_config_overrides function."""
@@ -478,6 +484,7 @@ class TestFilterKwargsForInit:
 
     def test_filter_kwargs_for_init_removes_unknown_kwargs(self):
         """Filters out kwargs not in model __init__ signature."""
+
         class ModelWithSpecificInit:
             def __init__(self, config, a, b):
                 pass
@@ -492,6 +499,7 @@ class TestFilterKwargsForInit:
 
     def test_filter_kwargs_for_init_keeps_all_with_var_keyword(self):
         """If __init__ has **kwargs, returns all kwargs unchanged."""
+
         class ModelWithVarKwargs:
             def __init__(self, config, **kwargs):
                 pass
@@ -521,6 +529,7 @@ class TestNeedSetupCacheClassesMapping:
 
         # Re-import to trigger the shim code
         import nemo_automodel._transformers.auto_model as mod
+
         importlib.reload(mod)
 
         # The sentinel should still be there (shim didn't overwrite)
@@ -541,6 +550,7 @@ class TestNeedSetupCacheClassesMapping:
 
         # Re-import to trigger the shim
         import nemo_automodel._transformers.auto_model as mod
+
         importlib.reload(mod)
 
         assert hasattr(gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING")
