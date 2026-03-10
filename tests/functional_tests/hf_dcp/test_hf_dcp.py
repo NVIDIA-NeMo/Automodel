@@ -116,13 +116,10 @@ class TestHFDCP:
         try:
             run_test_script(TEST_FOLDER, HF_CONSOLIDATED_GPTOSS_MXFP4_FILENAME)
         finally:
-            # remove the checkpoint directory
             shutil.rmtree("checkpoints/", ignore_errors=True)
 
     def test_flashoptim_dcp_roundtrip(self):
         try:
             run_test_script(TEST_FOLDER, FLASHOPTIM_DCP_ROUNDTRIP_FILENAME)
         finally:
-            # remove the checkpoint directory
             shutil.rmtree("checkpoints/", ignore_errors=True)
-

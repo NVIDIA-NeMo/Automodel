@@ -81,7 +81,6 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         consolidated_output_path: Optional[str] = None,
         num_threads_consolidation: Optional[int] = None,
         staging_dir: Optional[str] = None,
-        expected_phantom_fqns: Optional[set[str]] = None,
     ) -> None:
         """
         Initialize the huggingface writer pointing to path.
@@ -102,8 +101,6 @@ class _HuggingFaceStorageWriter(FsspecWriter):
             num_threads_consolidation: Number of threads to use for parallel processing of saving data to output files. If not provided, the default value is the number of output files.
             staging_dir: Optional directory for staging files during consolidation. If provided,
                         temp files will be created here instead of system temp.
-            expected_phantom_fqns: FQN names that may legitimately be absent from
-                        input shard files (e.g. stale quantisation keys).
         """
         if token is not None:
             super().__init__(
@@ -120,7 +117,6 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         self._save_sharded = save_sharded
         self._consolidated_output_path = consolidated_output_path
         self._staging_dir = staging_dir
-        self._expected_phantom_fqns = expected_phantom_fqns
 
         if num_threads_consolidation:
             self._num_threads_consolidation = num_threads_consolidation
@@ -186,7 +182,6 @@ class _HuggingFaceStorageWriter(FsspecWriter):
                 fqn_to_index_mapping=self._fqn_to_index_mapping,
                 use_staging=True,
                 staging_dir=self._staging_dir,
-                expected_phantom_fqns=self._expected_phantom_fqns,
             )
 
         metadata_to_write = {}
