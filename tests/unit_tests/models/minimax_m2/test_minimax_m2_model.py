@@ -149,7 +149,7 @@ class TestRopeParametersFallback:
         assert cfg.rope_parameters["partial_rotary_factor"] == pytest.approx(1.0)
 
     def test_defaults_when_rope_theta_missing(self, backend):
-        """When rope_theta is absent, it should default to 10000.0."""
+        """When rope_theta is absent, it should default to 5000000.0."""
         cfg = SimpleNamespace(
             vocab_size=128, hidden_size=64, intermediate_size=32, num_hidden_layers=2,
             num_attention_heads=4, num_key_value_heads=2, head_dim=16, rotary_dim=8,
@@ -158,7 +158,7 @@ class TestRopeParametersFallback:
             use_qk_norm=True, torch_dtype="bfloat16",
         )
         model = MiniMaxM2Model(cfg, backend)
-        assert cfg.rope_parameters["rope_theta"] == 10000.0
+        assert cfg.rope_parameters["rope_theta"] == 5000000.0
 
 
 class TestMiniMaxM2Block:

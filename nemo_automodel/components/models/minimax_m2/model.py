@@ -131,7 +131,7 @@ class MiniMaxM2Model(nn.Module):
         if not hasattr(config, "rope_parameters") or config.rope_parameters is None:
             rotary_dim = getattr(config, "rotary_dim", self.head_dim)
             config.rope_parameters = {
-                "rope_theta": getattr(config, "rope_theta", 10000.0),
+                "rope_theta": getattr(config, "rope_theta", 5000000.0),
                 "rope_type": "default",
                 "partial_rotary_factor": rotary_dim / self.head_dim,
             }
