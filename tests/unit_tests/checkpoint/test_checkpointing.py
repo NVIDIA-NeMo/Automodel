@@ -441,6 +441,100 @@ class TestLoadModelCustomModelGuard:
 
 
 # =============================================================================
+# Tests for load_optimizer: missing optimizer keys should fall back to partial load
+# =============================================================================
+
+
+class TestLoadOptimizerFallback:
+    """Verify optimizer checkpoint load degrades gracefully on missing optimizer keys."""
+
+    def _make_checkpointer(self):
+        from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig, Checkpointer
+
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir="/tmp/test",
+            model_save_format="safetensors",
+            model_cache_dir="/tmp/cache",
+            model_repo_id="test/model",
+            save_consolidated=False,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    def test_missing_optimizer_key_requires_opt_in_for_partial_restore(self):
+        """Without opt-in, missing optimizer slots should still abort resume."""
+        checkpointer = self._make_checkpointer()
+        fake_state_dict = {"optim": {"state": {}}}
+        missing_key_error = RuntimeError("Missing key in checkpoint state_dict: optim.state.foo.step.")
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.OptimizerState") as MockOptimizerState,
+            patch.object(checkpointer, "_do_load", side_effect=missing_key_error) as mock_do_load,
+            patch("nemo_automodel.components.checkpoint.checkpointing.logging") as mock_logging,
+        ):
+            optimizer_state = MockOptimizerState.return_value
+            optimizer_state.state_dict.return_value = fake_state_dict
+
+            with pytest.raises(RuntimeError, match="Missing key in checkpoint state_dict"):
+                checkpointer.load_optimizer(MagicMock(), MagicMock(), "/fake/weights", scheduler=None)
+
+        assert mock_do_load.call_count == 1
+        mock_logging.error.assert_called_once()
+        optimizer_state.load_state_dict.assert_not_called()
+
+    def test_missing_optimizer_key_retries_with_partial_load_when_enabled(self):
+        """A missing optimizer slot should trigger a partial-load retry only when explicitly enabled."""
+        checkpointer = self._make_checkpointer()
+        fake_state_dict = {"optim": {"state": {}}}
+        missing_key_error = RuntimeError("Missing key in checkpoint state_dict: optim.state.foo.step.")
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.OptimizerState") as MockOptimizerState,
+            patch.object(checkpointer, "_do_load", side_effect=[missing_key_error, None]) as mock_do_load,
+            patch("nemo_automodel.components.checkpoint.checkpointing.logging") as mock_logging,
+            patch.dict("os.environ", {"NEMO_AUTOMODEL_ALLOW_PARTIAL_OPTIMIZER_RESTORE": "1"}, clear=False),
+        ):
+            optimizer_state = MockOptimizerState.return_value
+            optimizer_state.state_dict.return_value = fake_state_dict
+
+            checkpointer.load_optimizer(MagicMock(), MagicMock(), "/fake/weights", scheduler=None)
+
+        assert mock_do_load.call_count == 2
+        assert mock_do_load.call_args_list[0].args == (fake_state_dict, "/fake/weights/optim")
+        assert mock_do_load.call_args_list[1].args == (fake_state_dict, "/fake/weights/optim")
+        assert mock_do_load.call_args_list[1].kwargs == {"allow_partial_load": True}
+        mock_logging.warning.assert_called_once()
+        optimizer_state.load_state_dict.assert_called_once_with(fake_state_dict)
+
+    def test_non_missing_key_error_is_not_suppressed(self):
+        """Unrelated optimizer load failures should still abort resume."""
+        checkpointer = self._make_checkpointer()
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.OptimizerState") as MockOptimizerState,
+            patch.object(checkpointer, "_do_load", side_effect=RuntimeError("boom")),
+        ):
+            optimizer_state = MockOptimizerState.return_value
+            optimizer_state.state_dict.return_value = {"optim": {"state": {}}}
+
+            with pytest.raises(RuntimeError, match="boom"):
+                checkpointer.load_optimizer(MagicMock(), MagicMock(), "/fake/weights", scheduler=None)
+
+    def test_do_load_uses_partial_load_planner_when_requested(self):
+        """_do_load(allow_partial_load=True) should install the non-strict planner."""
+        checkpointer = self._make_checkpointer()
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing.dcp.load") as mock_dcp_load:
+            checkpointer._do_load({"optim": {"state": {}}}, "/fake/optim", allow_partial_load=True)
+
+        planner = mock_dcp_load.call_args.kwargs["planner"]
+        assert planner is not None
+        assert planner.allow_partial_load is True
+
+
+# =============================================================================
 # Tests for Checkpointer.initialize_model_weights
 # =============================================================================
 

@@ -16,6 +16,7 @@
 
 import functools
 import logging
+import os
 
 import torch
 import torch.nn as nn
@@ -276,16 +277,48 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
         _model = model.model
     else:
         _model = model
+    # Prefer nested text modules when present (VLM models)
+    _model = get_text_module(_model)
+
+    # Set model-level flag so the forward pass can null out attention_mask.
+    # With CP the mask is not sharded along the sequence dim and TE asserts
+    # "Padding mask not supported with context parallelism!".
+    _model._cp_enabled = True
 
     for _, block in _model.layers.named_children():
-        attn_module = block.self_attn.attn_module
-        if isinstance(attn_module, DotProductAttention):
+        layer_type = getattr(block, "layer_type", "full_attention")
+
+        if layer_type == "full_attention":
+            attn_module = block.self_attn.attn_module
+            assert isinstance(attn_module, DotProductAttention), (
+                "Context parallelism is only supported for TransformerEngine's DotProductAttention"
+            )
             attn_module.set_context_parallel_group(
                 cp_mesh.get_group(),
                 torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
                 _get_cp_stream(),
                 cp_comm_type=cp_comm_type,
             )
+        elif layer_type == "linear_attention":
+            # FLA-based CP: store CP mesh on the linear attention module
+            # so it can build FLACPContext during forward
+            if hasattr(block, "linear_attn") and hasattr(block.linear_attn, "_cp_mesh"):
+                block.linear_attn._cp_mesh = cp_mesh
+                if os.getenv("NEMO_QWEN35_CP_DEBUG", "").strip().lower() not in ("", "0", "false", "off"):
+                    msg = (
+                        "Attached CP mesh to Qwen3.5 linear-attn "
+                        f"layer={getattr(block, 'layer_idx', '?')} "
+                        f"module={type(block.linear_attn).__name__} "
+                        f"module_file={type(block.linear_attn).__module__}"
+                    )
+                    logger.warning(msg)
+                    print(msg, flush=True)
+            else:
+                logger.warning(
+                    "Block %s has linear_attention but no CP-aware linear_attn module; "
+                    "skipping CP setup for this layer.",
+                    getattr(block, "layer_idx", "?"),
+                )
 
         moe_module = block.moe if hasattr(block, "moe") else block.mlp
         if isinstance(moe_module, MoE):
