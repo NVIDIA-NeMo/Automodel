@@ -159,8 +159,14 @@ class FirstRankPerNode(ContextDecorator):
                 if not success:
                     logger.warning("Barrier timed out during exit, continuing anyway")
                 if exc_type is not None:
-                    # TODO: propagate failure to the entire job
-                    quit(1)
+                    # Log the exception and make the error visible
+                    logger.error(
+                        "Exception inside FirstRankPerNode: %s: %s",
+                        exc_type.__name__,
+                        exc_val,
+                        exc_info=(exc_type, exc_val, exc_tb),
+                    )
+                    raise SystemExit(1) from exc_val
         finally:
             if self._created_pg:
                 dist.destroy_process_group()
