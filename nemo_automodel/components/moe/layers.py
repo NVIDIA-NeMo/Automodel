@@ -207,7 +207,7 @@ class Gate(nn.Module):
         topk (int): Number of top experts activated for each input.
         n_groups (int): Number of groups for routing.
         topk_groups (int): Number of groups to route inputs to.
-        score_func (str): Scoring function ('softmax' or 'sigmoid').
+        score_func (str): Scoring function ('softmax', 'sigmoid', or 'softmax_with_bias').
         route_scale (float): Scaling factor for routing weights.
         weight (torch.nn.Parameter): Learnable weights for the gate.
         bias (Optional[torch.nn.Parameter]): Optional bias term for the gate.
@@ -317,6 +317,29 @@ class Gate(nn.Module):
                 values, indices = torch.topk(scores, k=self.topk, dim=-1)
                 weights = values.softmax(dim=1, dtype=self.gate_precision or torch.float32)
                 original_scores = scores
+        elif self.score_func == "softmax_with_bias":
+            # softmax first, then add bias for expert selection,
+            # group routing on biased scores, final weights from unbiased softmax scores.
+            scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
+            original_scores = scores
+
+            # Add correction bias for expert SELECTION only
+            if self.e_score_correction_bias is not None:
+                scores_for_choice = scores + self.e_score_correction_bias
+            else:
+                scores_for_choice = scores
+
+            if self.n_groups > 1:
+                scores_for_choice = scores_for_choice.view(x.size(0), self.n_groups, -1)
+                group_scores = scores_for_choice.topk(2, dim=-1)[0].sum(dim=-1)
+
+                group_idx = group_scores.topk(self.topk_groups, dim=-1)[1]
+                mask = torch.zeros_like(scores_for_choice[..., 0]).scatter_(1, group_idx, True)
+                scores_for_choice = (scores_for_choice * mask.unsqueeze(-1)).flatten(1)
+
+            indices = torch.topk(scores_for_choice, self.topk, dim=-1)[1]
+            # Final weights gathered from UNBIASED softmax scores
+            weights = original_scores.gather(1, indices)
         else:
             scores = scores.sigmoid()
             original_scores = scores
