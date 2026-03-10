@@ -151,6 +151,7 @@ def build_model(
     cfg_moe=None,
     activation_checkpointing=False,
     unfreeze_modules: list[str] | None = None,
+    sdpa_method: list[str] | None = None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model.
 
@@ -170,6 +171,9 @@ def build_model(
         cfg_moe: MoEParallelizerConfig instance, or ConfigNode to be converted.
         activation_checkpointing: Whether to enable activation checkpointing.
         unfreeze_modules: List of module names/substrings to unfreeze.
+        sdpa_method: Explicit list of SDPA backend name strings (e.g.
+            ``["flash_attention", "efficient_attention"]``), or ``None`` to
+            auto-select based on CP / activation checkpointing.
     """
     with ScopedRNG(seed=seed, ranked=True):
         kwargs = {
@@ -179,6 +183,7 @@ def build_model(
             "moe_mesh": moe_mesh,
             "distributed_config": distributed_config,
             "pipeline_config": pipeline_config,
+            "sdpa_method": sdpa_method,
         }
 
         if cfg_qat is not None and cfg_qat.get("enabled", False):
@@ -229,6 +234,10 @@ def build_model(
         else:
             # For non-NemoAutoModel entry points (e.g., build_gpt2_model),
             # instantiate the model first, then apply infrastructure separately.
+            # Note: sdpa_method is not supported here — SDPA patching only runs
+            # inside NeMoAutoModel._build_model.
+            if sdpa_method is not None:
+                logger.warning("sdpa_method is ignored for non-NeMoAutoModel targets.")
             # We must convert config objects into runtime objects (model_wrapper,
             # autopipeline, parallelize_fn, etc.) via instantiate_infrastructure,
             # exactly as from_pretrained/from_config do internally.
@@ -965,6 +974,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_qat=self.cfg.get("qat", None),
             cfg_moe=self.dist_setup.moe_config,
             activation_checkpointing=self.dist_setup.activation_checkpointing,
+            sdpa_method=self.cfg.get("sdpa_method", None),
         )
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 

@@ -94,6 +94,7 @@ from nemo_automodel._transformers.model_init import (
     get_hf_config,
     get_is_hf_model,
     no_hf_meta_device,
+    resolve_sdpa_method,
 )
 
 if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
@@ -371,7 +372,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         *model_args,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: Optional[List[SDPBackend]] = None,
+        sdpa_method: Optional[List[Union[SDPBackend, str]]] = None,
         torch_dtype="auto",
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
@@ -408,8 +409,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 the model with Liger kernels for faster inference/training.
             use_sdpa_patching (bool, default=True): If `True`, patch the
                 model with SDPA-based attention optimizations.
-            sdpa_method (list[SDPBackend] | None, optional): Explicit list of
+            sdpa_method (list[SDPBackend | str] | None, optional): Explicit list of
                 SDPA back-ends to consider when `use_sdpa_patching=True`.
+                Accepts both SDPBackend enum values and string names (e.g.
+                ``["flash_attention", "efficient_attention"]``). When ``None``,
+                auto-selects based on CP and activation checkpointing.
             torch_dtype (str | torch.dtype | Literal["auto"], default="auto"):
                 Data type passed to the underlying `from_pretrained` call.
             attn_implementation (str, optional):
@@ -480,6 +484,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 raise
         is_hf_model = get_is_hf_model(hf_config, force_hf)
 
+        sdpa_method = resolve_sdpa_method(sdpa_method, device_mesh, activation_checkpointing)
+
         return cls._build_model(
             pretrained_model_name_or_path,
             *model_args,
@@ -511,7 +517,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         *model_args,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: Optional[List[SDPBackend]] = None,
+        sdpa_method: Optional[List[Union[SDPBackend, str]]] = None,
         torch_dtype: Union[str, torch.dtype] = "auto",
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
@@ -581,6 +587,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     raise
         _consume_config_overrides(config, kwargs)
         is_hf_model = get_is_hf_model(config, force_hf)
+
+        sdpa_method = resolve_sdpa_method(sdpa_method, device_mesh, activation_checkpointing)
 
         return cls._build_model(
             config,
