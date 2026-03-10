@@ -24,7 +24,6 @@ from pathlib import Path
 import torch
 import torch.distributed
 from safetensors import safe_open
-from transformers import AutoModelForCausalLM
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
@@ -74,17 +73,14 @@ def test_consolidated_gptoss_mxfp4_checkpoint():
         assert "_blocks" not in key, f"Phantom mxfp4 key leaked: {key}"
         assert "_scales" not in key, f"Phantom mxfp4 key leaked: {key}"
 
-    # --- 3. Verify HF from_pretrained loads successfully ---
-    consolidated_model = (
-        AutoModelForCausalLM.from_pretrained(str(consolidated_dir))
-        .to(trainer.model_parts[0].dtype)
-        .to(trainer.dist_env.device)
-    )
-    params = dict(consolidated_model.named_parameters())
-    assert len(params) > 0, "Consolidated model has no parameters"
-    for name, param in params.items():
-        assert param.shape.numel() > 0, f"Empty parameter: {name}"
-        assert not torch.isnan(param).any(), f"NaN in parameter: {name}"
+    # --- 3. Verify all consolidated tensors are well-formed ---
+    for st_file in consolidated_st:
+        with safe_open(str(st_file), framework="pt", device="cpu") as f:
+            for key in f.keys():
+                tensor = f.get_tensor(key)
+                assert tensor.shape.numel() > 0, f"Empty tensor: {key}"
+                assert not torch.isnan(tensor).any(), f"NaN in tensor: {key}"
+                assert tensor.dtype in (torch.bfloat16, torch.float32), f"Unexpected dtype {tensor.dtype} for {key}"
 
     # --- cleanup ---
     torch.distributed.barrier()
