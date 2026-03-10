@@ -214,7 +214,7 @@ script by setting the `custom_script` field:
 
 ```yaml
 slurm:
-  custom_script: scripts/slurm/automodel.sub   # your script
+  custom_script: slurm.sub   # your script
   nodes: 2
   ntasks_per_node: 8
 ```
@@ -240,13 +240,13 @@ But instead of rendering its built-in template, it submits **your** script via
 ### Getting Started
 
 A reference script is provided at
-[`scripts/slurm/automodel.sub`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/slurm.sub).
+[`slurm.sub`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/slurm.sub).
 Copy it, adapt the `#SBATCH` directives and launch block for your cluster, then
 point to your copy:
 
 ```bash
-cp scripts/slurm/automodel.sub my_cluster.sub
-# edit my_cluster.sub — change partition, account, container runtime, etc.
+cp slurm.sub my_cluster.sub
+# edit my_cluster.sub - change partition, account, container runtime, etc.
 automodel my_config.yaml   # with slurm.custom_script: my_cluster.sub
 ```
 

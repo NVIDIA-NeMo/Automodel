@@ -41,7 +41,7 @@
 #
 # HOW TO ADAPT THIS SCRIPT
 # ~~~~~~~~~~~~~~~~~~~~~~~~
-# 1. Copy this file:          cp scripts/slurm/automodel.sub my_cluster.sub
+# 1. Copy this file:          cp slurm.sub my_cluster.sub
 # 2. Edit the #SBATCH block:  account, partition, nodes, time, output paths
 # 3. Edit the container/env:  image path, mounts, modules, secrets
 # 4. (Optional) Replace the srun command with your own launch logic.
