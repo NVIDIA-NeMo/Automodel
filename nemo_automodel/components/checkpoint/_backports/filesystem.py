@@ -14,6 +14,11 @@
 # taken and edited from
 # https://github.com/pytorch/pytorch/pull/155707
 # pylint: disable=missing-function-docstring, missing-class-docstring
+#
+# NOTE: pickle usage in this file is inherited from upstream PyTorch's
+# distributed checkpoint implementation. The Metadata serialization format
+# is defined by PyTorch and cannot be changed without breaking checkpoint
+# compatibility. Pickle removal here depends on upstream PyTorch migration.
 import collections
 import dataclasses
 import io

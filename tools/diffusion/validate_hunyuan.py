@@ -14,7 +14,6 @@
 
 import argparse
 import os
-import pickle
 from pathlib import Path
 
 import torch
@@ -74,8 +73,7 @@ def load_prompts_from_meta_files(meta_folder: str):
 
     for meta_file in meta_files:
         try:
-            with open(meta_file, "rb") as f:
-                data = pickle.load(f)
+            data = torch.load(meta_file, weights_only=False)
 
             # Extract prompt from metadata
             metadata = data.get("metadata", {})
