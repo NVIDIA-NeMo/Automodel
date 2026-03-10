@@ -585,6 +585,75 @@ class TestGate:
         weights_detached = weights.detach()
         assert (weights_detached >= 0).all() and (weights_detached <= 1).all()
 
+    def test_gate_forward_softmax_with_bias_mode(self, moe_config, device):
+        """Test Gate forward pass in softmax_with_bias mode (no groups)."""
+        moe_config.score_func = "softmax_with_bias"
+        moe_config.force_e_score_correction_bias = True
+        gate = Gate(moe_config)
+        gate = gate.to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+            if gate.bias is not None:
+                gate.bias.zero_()
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        assert weights.shape == (num_tokens, moe_config.n_activated_experts)
+        assert indices.shape == (num_tokens, moe_config.n_activated_experts)
+        # Weights should be gathered from unbiased softmax scores, so all >= 0
+        weights_detached = weights.detach()
+        assert (weights_detached >= 0).all()
+
+    def test_gate_forward_softmax_with_bias_groups(self, moe_config, device):
+        """Test Gate forward pass in softmax_with_bias mode with group routing."""
+        moe_config.score_func = "softmax_with_bias"
+        moe_config.n_routed_experts = 16
+        moe_config.n_expert_groups = 4
+        moe_config.n_limited_groups = 2
+        moe_config.n_activated_experts = 4
+        moe_config.force_e_score_correction_bias = True
+        gate = Gate(moe_config)
+        gate = gate.to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        assert weights.shape == (num_tokens, moe_config.n_activated_experts)
+        assert indices.shape == (num_tokens, moe_config.n_activated_experts)
+        # All selected expert indices should be valid
+        assert (indices >= 0).all() and (indices < moe_config.n_routed_experts).all()
+
+    def test_gate_forward_softmax_with_bias_no_correction_bias(self, moe_config, device):
+        """Test softmax_with_bias without e_score_correction_bias falls back to unbiased selection."""
+        moe_config.score_func = "softmax_with_bias"
+        moe_config.gate_bias_update_factor = 0
+        moe_config.force_e_score_correction_bias = False
+        gate = Gate(moe_config)
+        gate = gate.to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        assert weights.shape == (num_tokens, moe_config.n_activated_experts)
+        assert indices.shape == (num_tokens, moe_config.n_activated_experts)
+
     def test_gate_forward_with_aux_loss(self, moe_config, device):
         """Test Gate forward pass with auxiliary loss computation."""
         moe_config.aux_loss_coeff = 0.01
