@@ -1,0 +1,121 @@
+#!/bin/bash
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# =============================================================================
+# NeMo AutoModel — Reference SLURM submission script
+# =============================================================================
+#
+# This is a reference sbatch script for use with AutoModel's custom_script
+# feature.  Copy this file, adapt it to your cluster, and point to it from
+# your YAML config:
+#
+#   slurm:
+#     custom_script: /path/to/your/copy.sub
+#     nodes: 8
+#     ntasks_per_node: 8
+#
+# When you run `automodel config.yaml`, the CLI exports these env vars before
+# calling sbatch on your script:
+#
+#   AUTOMODEL_COMMAND          – Full torchrun invocation (ready to eval)
+#   AUTOMODEL_CONFIG           – Absolute path to job_config.yaml
+#   AUTOMODEL_JOB_DIR          – Directory where job artifacts are stored
+#   AUTOMODEL_NNODES           – Number of nodes
+#   AUTOMODEL_NPROC_PER_NODE   – Workers (GPUs) per node
+#   AUTOMODEL_REPO_ROOT        – Path to the AutoModel source repo
+#
+# Your script can use $AUTOMODEL_COMMAND directly, or ignore it entirely and
+# build your own torchrun invocation.
+#
+# HOW TO ADAPT THIS SCRIPT
+# ~~~~~~~~~~~~~~~~~~~~~~~~
+# 1. Copy this file:          cp scripts/slurm/automodel.sub my_cluster.sub
+# 2. Edit the #SBATCH block:  account, partition, nodes, time, output paths
+# 3. Edit the container/env:  image path, mounts, modules, secrets
+# 4. (Optional) Replace the srun command with your own launch logic.
+#    The last line uses $AUTOMODEL_COMMAND which the CLI populates for you,
+#    but you can hardcode a torchrun command instead if you prefer.
+# 5. Reference it from YAML:  slurm: { custom_script: my_cluster.sub, ... }
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# SLURM directives — change these for your cluster
+# ---------------------------------------------------------------------------
+#SBATCH -A <your_account>           # account
+#SBATCH -p batch                    # partition
+#SBATCH -t 01:00:00                 # wall time limit, hr:min:sec
+#SBATCH -N 8                        # number of nodes
+#SBATCH --gpus-per-node=8
+#SBATCH --ntasks-per-node=1
+#SBATCH -J automodel-job            # job name
+#SBATCH --output=slurm_jobs/%x_%j.out
+#SBATCH --error=slurm_jobs/%x_%j.err
+#SBATCH --dependency=singleton
+
+echo "Running on hosts: $(echo $(scontrol show hostname))"
+
+# ---------------------------------------------------------------------------
+# Container image and mounts — edit paths for your environment
+# ---------------------------------------------------------------------------
+CONT=/lustre/fsw/portfolios/<team>/users/$USER/automodel.sqsh
+CONT_NAME=automodel-training
+CONT_MOUNT="\
+/lustre/fsw/portfolios/<team>/users/$USER/:/$USER/,\
+/home/$USER/.ssh:/root/.ssh,\
+/home/$USER/.gitconfig:/root/.gitconfig,\
+/home/$USER/Automodel:/opt/Automodel"
+
+# ---------------------------------------------------------------------------
+# Multi-node environment
+# ---------------------------------------------------------------------------
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=${MASTER_PORT:-13742}
+export NUM_GPUS=${SLURM_GPUS_PER_NODE:-8}
+export WORLD_SIZE=$(($NUM_GPUS * $SLURM_NNODES))
+
+# ---------------------------------------------------------------------------
+# Secrets — set these or export them in your shell before sbatch
+# ---------------------------------------------------------------------------
+export WANDB_API_KEY=${WANDB_API_KEY:-}
+export HF_TOKEN=${HF_TOKEN:-}
+
+# ---------------------------------------------------------------------------
+# Launch
+# ---------------------------------------------------------------------------
+# $AUTOMODEL_COMMAND is populated by `automodel config.yaml` and contains a
+# full torchrun invocation like:
+#
+#   PYTHONPATH=/opt/Automodel:$PYTHONPATH \
+#   torchrun --nproc_per_node=8 --nnodes=8 \
+#            --rdzv_backend=c10d --rdzv_endpoint=${MASTER_ADDR}:13742 \
+#            nemo_automodel/recipes/llm/train_ft.py -c /path/to/job_config.yaml
+#
+# If you prefer to write the torchrun command yourself, replace the last line.
+# For example, to hardcode a benchmark run:
+#
+#   bash -c "cd /opt/Automodel/ && torchrun \
+#       --nproc_per_node=8 --nnodes=8 \
+#       --rdzv_backend=c10d --rdzv_endpoint=\${MASTER_ADDR}:13742 \
+#       nemo_automodel/recipes/llm/benchmark.py \
+#       --config examples/benchmark/configs/your_config.yaml"
+
+srun \
+    --container-name="${CONT_NAME}" \
+    --container-image="${CONT}" \
+    --container-mounts="${CONT_MOUNT}" \
+    --container-entrypoint \
+    --no-container-mount-home \
+    --export=ALL \
+    bash -c "cd /opt/Automodel && ${AUTOMODEL_COMMAND}"

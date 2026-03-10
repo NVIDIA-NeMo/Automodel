@@ -76,6 +76,18 @@ class SlurmConfig:
     chdir: str | None = field(default=None, metadata=dict(help="Working directory of the job"))
     nsys_enabled: bool = field(default=False, metadata=dict(help="Enable nsys profiling"))
 
+    # Custom sbatch script (overrides the built-in template)
+    custom_script: str | None = field(
+        default=None,
+        metadata=dict(
+            help=(
+                "Path to a user-provided sbatch script. When set, the built-in "
+                "template is bypassed and this script is submitted instead. "
+                "The generated torchrun command is exported as $AUTOMODEL_COMMAND."
+            )
+        ),
+    )
+
     def __post_init__(self) -> None:
         if isinstance(self.extra_mounts, list):
             for i, item in enumerate(self.extra_mounts):
