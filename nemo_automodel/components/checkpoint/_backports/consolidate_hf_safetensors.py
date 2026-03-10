@@ -96,6 +96,7 @@ class _InputFileData:
 def _parse_input_metadata(
     input_files_data: dict[str, _InputFileData],
     output_files_data: dict[str, _OutputFileData],
+    expected_phantom_fqns: Optional[set[str]] = None,
 ) -> None:
     """
     Parse metadata from input safetensors files to determine the full tensor shapes and types.
@@ -162,9 +163,21 @@ def _parse_input_metadata(
 
     # Remove FQNs that were in the output mapping but not found in any input file.
     # These retain the default empty dtype_str and would produce invalid safetensors.
+    #
+    # When expected_phantom_fqns is provided the removal is targeted: only the
+    # declared phantom keys (e.g. stale quantisation _blocks/_scales entries)
+    # are silently pruned; any *other* orphaned FQN is treated as a mapping bug
+    # and raises immediately.  When the set is not provided we fall back to
+    # permissive behaviour (warn-and-remove) for backward compatibility.
     for output_data in output_files_data.values():
         orphaned = [fqn for fqn, fd in output_data.fqn_data.items() if not fd.dtype_str]
         for fqn in orphaned:
+            if expected_phantom_fqns is not None and fqn not in expected_phantom_fqns:
+                raise ValueError(
+                    f"Tensor '{fqn}' is in the consolidation mapping but was not found "
+                    f"in any input shard file and is not an expected phantom key. "
+                    f"This likely indicates a bug in the FQN-to-file mapping."
+                )
             logger.warning(
                 "Tensor '%s' is in the consolidation mapping but was not found in any "
                 "input shard file; removing it from the output.",
@@ -636,6 +649,7 @@ def _consolidate_safetensors_files(
     num_threads: int,
     use_staging: bool = False,
     staging_dir: Optional[str] = None,
+    expected_phantom_fqns: Optional[set[str]] = None,
 ) -> dict[str, _OutputFileData]:
     # Build output paths
     output_files_data: dict[str, _OutputFileData] = {}
@@ -678,7 +692,7 @@ def _consolidate_safetensors_files(
                 temp_to_final_mapping[temp_path] = final_path
 
             # Step 1: Parse metadata to determine tensor shapes and types
-            _parse_input_metadata(input_files_data, temp_output_files_data)
+            _parse_input_metadata(input_files_data, temp_output_files_data, expected_phantom_fqns)
 
             # Step 2: Write metadata headers to temp output files
             _write_metadata(temp_output_files_data)
@@ -697,7 +711,7 @@ def _consolidate_safetensors_files(
     else:
         # Write directly to output directory
         # Step 1: Parse metadata to determine tensor shapes and types
-        _parse_input_metadata(input_files_data, output_files_data)
+        _parse_input_metadata(input_files_data, output_files_data, expected_phantom_fqns)
 
         # Step 2: Write metadata headers to output files
         _write_metadata(output_files_data)
@@ -715,6 +729,7 @@ def consolidate_safetensors_files(
     num_threads: int = 1,
     use_staging: bool = False,
     staging_dir: Optional[str] = None,
+    expected_phantom_fqns: Optional[set[str]] = None,
 ) -> None:
     """
     Main function to consolidate sharded safetensors files into one or more output files.
@@ -739,6 +754,12 @@ def consolidate_safetensors_files(
         staging_dir: Optional directory for staging files during consolidation. If provided,
                     temporary files will be created in this directory instead of the system temp.
                     Only used when use_staging=True. Useful when system temp has limited space.
+        expected_phantom_fqns: FQN names that may legitimately be absent from the
+                    input shard files (e.g. stale quantisation keys after
+                    dequantisation).  When provided, only these FQNs are
+                    silently pruned; any *other* orphaned FQN raises a
+                    ``ValueError``.  When ``None`` (the default) all orphaned
+                    FQNs are pruned with a warning for backward compatibility.
     """
     start_time = time.time()
     logger.info(
@@ -752,7 +773,7 @@ def consolidate_safetensors_files(
     fqn_to_file_mapping = {fqn: _gen_file_name(idx, max_index) for fqn, idx in fqn_to_index_mapping.items()}
 
     output_files_data = _consolidate_safetensors_files(
-        input_dir, output_dir, fqn_to_file_mapping, num_threads, use_staging, staging_dir
+        input_dir, output_dir, fqn_to_file_mapping, num_threads, use_staging, staging_dir, expected_phantom_fqns
     )
 
     # Step 4: Write overall model.index.safetensors.json file with weight map
@@ -769,6 +790,7 @@ def consolidate_safetensors_files_on_every_rank(
     process_group: Optional[dist.ProcessGroup] = None,
     use_staging: bool = False,
     staging_dir: Optional[str] = None,
+    expected_phantom_fqns: Optional[set[str]] = None,
 ) -> None:
     """
     Consolidate sharded safetensors files across multiple ranks, with each rank handling a subset of output files.
@@ -792,6 +814,12 @@ def consolidate_safetensors_files_on_every_rank(
         staging_dir: Optional directory for staging files during consolidation. If provided,
                     temporary files will be created in this directory instead of the system temp.
                     Only used when use_staging=True. Useful when system temp has limited space.
+        expected_phantom_fqns: FQN names that may legitimately be absent from the
+                    input shard files (e.g. stale quantisation keys after
+                    dequantisation).  When provided, only these FQNs are
+                    silently pruned; any *other* orphaned FQN raises a
+                    ``ValueError``.  When ``None`` (the default) all orphaned
+                    FQNs are pruned with a warning for backward compatibility.
     """
 
     start_time = time.time()
@@ -848,6 +876,7 @@ def consolidate_safetensors_files_on_every_rank(
             num_threads=num_threads,
             use_staging=use_staging,
             staging_dir=staging_dir,
+            expected_phantom_fqns=expected_phantom_fqns,
         )
 
     # Write overall model.index.safetensors.json file with weight map (rank 0 only)

@@ -602,9 +602,11 @@ class TestBuildConsolidatedIndexQuantizedBase:
     appear in the state dict.
 
     Stale keys are intentionally kept in the mapping built here so that every
-    PP rank sees the full set of FQNs. The downstream consolidation step
-    (consolidate_hf_safetensors._parse_input_metadata) strips orphaned FQNs
-    that have no matching data in any input shard file.
+    PP rank sees the full set of FQNs.  The caller (``save_model``) computes
+    ``expected_phantom_fqns = mapping_keys - state_dict_keys`` and passes
+    that set to the consolidation step, which performs targeted pruning: only
+    the declared phantom FQNs are removed, while any *other* orphaned FQN
+    raises immediately to surface mapping bugs.
     """
 
     def _make_checkpointer(self, *, save_consolidated: bool = True):
@@ -801,18 +803,22 @@ class TestConsolidationWithPhantomKeys:
 
             # Build a mapping that includes phantom quantized keys (simulating
             # stale entries from the base checkpoint's index).
+            phantom_keys = {
+                "model.layers.0.mlp.experts.gate_up_proj_blocks",
+                "model.layers.0.mlp.experts.gate_up_proj_scales",
+                "model.layers.0.mlp.experts.down_proj_blocks",
+                "model.layers.0.mlp.experts.down_proj_scales",
+            }
             fqn_to_index_mapping = {fqn: 1 for fqn in real_tensors}
-            fqn_to_index_mapping["model.layers.0.mlp.experts.gate_up_proj_blocks"] = 1
-            fqn_to_index_mapping["model.layers.0.mlp.experts.gate_up_proj_scales"] = 1
-            fqn_to_index_mapping["model.layers.0.mlp.experts.down_proj_blocks"] = 1
-            fqn_to_index_mapping["model.layers.0.mlp.experts.down_proj_scales"] = 1
+            for key in phantom_keys:
+                fqn_to_index_mapping[key] = 1
 
-            # Run consolidation — before the fix this would write dtype: ""
             consolidate_safetensors_files(
                 input_dir=input_dir,
                 output_dir=output_dir,
                 fqn_to_index_mapping=fqn_to_index_mapping,
                 num_threads=1,
+                expected_phantom_fqns=phantom_keys,
             )
 
             # The consolidated file must be loadable by safe_open
@@ -830,6 +836,36 @@ class TestConsolidationWithPhantomKeys:
             # Values must match
             for fqn, original in real_tensors.items():
                 torch.testing.assert_close(loaded[fqn], original, msg=f"Mismatch for {fqn}")
+
+    def test_unexpected_orphan_raises_with_expected_phantom_fqns(self):
+        """Orphaned FQNs NOT in expected_phantom_fqns must raise ValueError."""
+        from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
+            consolidate_safetensors_files,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = os.path.join(tmpdir, "shards")
+            output_dir = os.path.join(tmpdir, "consolidated")
+            os.makedirs(input_dir)
+            os.makedirs(output_dir)
+
+            real_tensors = {
+                "model.weight": torch.randn(8, 4, dtype=torch.bfloat16),
+            }
+            shard_path = os.path.join(input_dir, "shard-00001-model-00001-of-00001.safetensors")
+            _write_dcp_safetensors_shard(shard_path, real_tensors)
+
+            fqn_to_index_mapping = {fqn: 1 for fqn in real_tensors}
+            fqn_to_index_mapping["model.totally_bogus_key"] = 1
+
+            with pytest.raises(ValueError, match="not an expected phantom key"):
+                consolidate_safetensors_files(
+                    input_dir=input_dir,
+                    output_dir=output_dir,
+                    fqn_to_index_mapping=fqn_to_index_mapping,
+                    num_threads=1,
+                    expected_phantom_fqns=set(),
+                )
 
     def test_consolidated_safetensors_no_phantom_keys(self):
         """When no phantom keys exist, consolidation must work as before."""
@@ -859,6 +895,7 @@ class TestConsolidationWithPhantomKeys:
                 output_dir=output_dir,
                 fqn_to_index_mapping=fqn_to_index_mapping,
                 num_threads=1,
+                expected_phantom_fqns=set(),
             )
 
             consolidated_file = os.path.join(output_dir, "model-00001-of-00001.safetensors")

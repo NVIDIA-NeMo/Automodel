@@ -243,6 +243,15 @@ class Checkpointer:
         # Build the consolidated model.safetensors.index.json if needed
         fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
 
+        # FQNs present in the consolidation mapping but absent from the
+        # current state_dict are "phantom" keys (e.g. stale quantisation
+        # _blocks/_scales entries from the base checkpoint).  In PP mode this
+        # superset also includes real keys owned by other ranks, but those
+        # *will* appear in the input shard files and will never be orphaned.
+        expected_phantom_fqns: Optional[set[str]] = None
+        if fqn_to_file_index_mapping is not None:
+            expected_phantom_fqns = set(fqn_to_file_index_mapping.keys()) - set(state_dict.keys())
+
         # Run pre-saves for addons e.g., PEFT or consolidated HF safetensors
         for addon in self._addons:
             addon.pre_save(
@@ -257,7 +266,11 @@ class Checkpointer:
             )
 
         storage_writer = self._get_storage_writer(
-            consolidated_dir, fqn_to_file_index_mapping, model_dir, consolidate_on_all_ranks
+            consolidated_dir,
+            fqn_to_file_index_mapping,
+            model_dir,
+            consolidate_on_all_ranks,
+            expected_phantom_fqns=expected_phantom_fqns,
         )
         self._model_ctx.future = self._do_save(state_dict, model_dir, storage_writer)
 
@@ -272,6 +285,7 @@ class Checkpointer:
                 num_threads=5,
                 use_staging=self.config.staging_dir is not None,
                 staging_dir=self.config.staging_dir,
+                expected_phantom_fqns=expected_phantom_fqns,
             )
 
     @torch.no_grad()
@@ -752,6 +766,7 @@ class Checkpointer:
         fqn_to_index_mapping: Optional[dict[str, int]],
         model_path: str,
         consolidate_on_all_ranks: bool = False,
+        expected_phantom_fqns: Optional[set[str]] = None,
     ) -> Optional[_HuggingFaceStorageWriter]:
         """
         Construct a Hugging Face storage writer for sharded safetensors.
@@ -761,6 +776,7 @@ class Checkpointer:
             fqn_to_index_mapping: Optional mapping from FQN to shard index.
             model_path: Path where the model checkpoint is saved.
             consolidate_on_all_ranks: If True, consolidate on all ranks on the main process.
+            expected_phantom_fqns: FQN names that may be absent from input shards.
 
         Returns:
             Configured `_HuggingFaceStorageWriter` or None for non-safetensors.
@@ -772,6 +788,7 @@ class Checkpointer:
                 consolidated_output_path=consolidated_output_path if not consolidate_on_all_ranks else None,
                 fqn_to_index_mapping=fqn_to_index_mapping,
                 staging_dir=self.config.staging_dir,
+                expected_phantom_fqns=expected_phantom_fqns,
             )
 
     def _get_storage_reader(
