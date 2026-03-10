@@ -297,6 +297,20 @@ class MistralCommonBackend(PreTrainedTokenizerBase):
 
         self._cache_get_vocab: dict[str, int] | None = None
 
+    def __setattr__(self, key, value):
+        try:
+            super().__setattr__(key, value)
+        except AttributeError:
+            # PreTrainedTokenizerBase.__setattr__ routes special-token assignments
+            # through _special_tokens_map which this class does not use.
+            # Fall back to our own storage for pad token overrides.
+            if key == "pad_token_id":
+                object.__setattr__(self, "_pad_token_id_override", value)
+            elif key == "pad_token":
+                object.__setattr__(self, "_pad_token_override", value)
+            else:
+                object.__setattr__(self, key, value)
+
     @staticmethod
     def clean_up_tokenization(text: str) -> str:
         """
