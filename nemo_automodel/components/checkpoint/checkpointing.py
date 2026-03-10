@@ -39,6 +39,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
 )
+from nemo_automodel.components.checkpoint._backports.default_planner import DefaultLoadPlanner
 from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _HuggingFaceStorageReader,
@@ -56,6 +57,17 @@ from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
 if TYPE_CHECKING:
     from peft import PeftConfig
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+
+def _is_missing_checkpoint_key_error(exc: BaseException) -> bool:
+    """Return True when DCP failed because current state expects a key absent from the checkpoint."""
+    return "Missing key in checkpoint state_dict:" in str(exc)
+
+
+def _allow_partial_optimizer_restore() -> bool:
+    """Whether resume may fall back to partial optimizer-state restore."""
+    value = os.environ.get("NEMO_AUTOMODEL_ALLOW_PARTIAL_OPTIMIZER_RESTORE", "")
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _is_geq_torch_2_9() -> bool:
@@ -333,7 +345,31 @@ class Checkpointer:
         """
         optimizer_state = OptimizerState(model, optimizer, scheduler, is_peft=self.config.is_peft)
         state_dict = optimizer_state.state_dict()
-        self._do_load(state_dict, os.path.join(weights_path, "optim"))
+        optim_path = os.path.join(weights_path, "optim")
+        try:
+            self._do_load(state_dict, optim_path)
+        except Exception as exc:
+            if not _is_missing_checkpoint_key_error(exc):
+                raise
+            if not _allow_partial_optimizer_restore():
+                logging.error(
+                    "Optimizer checkpoint at %s is missing one or more expected state entries. "
+                    "Exact optimizer resume is not possible from this checkpoint. "
+                    "If you want to continue with missing optimizer slots reinitialized, set "
+                    "NEMO_AUTOMODEL_ALLOW_PARTIAL_OPTIMIZER_RESTORE=1 and retry. "
+                    "Original error: %s",
+                    optim_path,
+                    exc,
+                )
+                raise
+            logging.warning(
+                "Optimizer checkpoint at %s is missing one or more expected state entries. "
+                "Retrying with partial optimizer restore; missing optimizer slots will be reinitialized. "
+                "Original error: %s",
+                optim_path,
+                exc,
+            )
+            self._do_load(state_dict, optim_path, allow_partial_load=True)
         optimizer_state.load_state_dict(state_dict)
 
     @torch.no_grad()
@@ -645,6 +681,7 @@ class Checkpointer:
         path: str,
         storage_reader: Optional[_HuggingFaceStorageReader] = None,
         is_init_step: bool = False,
+        allow_partial_load: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Load a state dictionary from `path` using DCP or PEFT special-case logic.
@@ -654,6 +691,7 @@ class Checkpointer:
             path: Checkpoint directory path.
             storage_reader: Optional HF storage reader for safetensors.
             is_init_step: True if loading from a base checkpoint during initialization.
+            allow_partial_load: If True, ignore current state keys that are absent from the checkpoint.
 
         Returns:
             The populated state dictionary (may be replaced for PEFT).
@@ -664,7 +702,8 @@ class Checkpointer:
         if self.config.is_peft and is_model and (not is_init_step):
             state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
         else:
-            dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
+            planner = DefaultLoadPlanner(allow_partial_load=True) if allow_partial_load else None
+            dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader, planner=planner)
         return state_dict
 
     def _do_save(
