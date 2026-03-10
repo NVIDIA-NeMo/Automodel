@@ -103,6 +103,8 @@ _OVERRIDES = [
     "qat.quantizer.groupsize",
     "qat.qat_config._target_",
     "qat.qat_config.groupsize",
+    "dataloader.collate_fn.pad_seq_len_divisible",
+    "validation_dataloader.collate_fn.pad_seq_len_divisible",
 ]
 
 
