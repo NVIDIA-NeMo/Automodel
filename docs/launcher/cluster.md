@@ -207,7 +207,7 @@ pip install nemo-run
 
 ## Use Your Own Slurm Script
 
-SLURM clusters vary widely in configuration — some use Pyxis containers, others use
+SLURM clusters vary widely in configuration: some use Pyxis containers, others use
 Singularity/Apptainer, and many run bare-metal with environment modules. The built-in
 template targets Pyxis-based NVIDIA clusters, but you can override it with any sbatch
 script by setting the `custom_script` field:
