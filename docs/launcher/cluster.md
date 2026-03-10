@@ -240,7 +240,7 @@ But instead of rendering its built-in template, it submits **your** script via
 ### Getting Started
 
 A reference script is provided at
-[`scripts/slurm/automodel.sub`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/scripts/slurm/automodel.sub).
+[`scripts/slurm/automodel.sub`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/slurm.sub).
 Copy it, adapt the `#SBATCH` directives and launch block for your cluster, then
 point to your copy:
 
