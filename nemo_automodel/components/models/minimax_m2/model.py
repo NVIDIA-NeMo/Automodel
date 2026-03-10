@@ -128,6 +128,14 @@ class MiniMaxM2Model(nn.Module):
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
 
+        if not hasattr(config, "rope_parameters") or config.rope_parameters is None:
+            rotary_dim = getattr(config, "rotary_dim", self.head_dim)
+            config.rope_parameters = {
+                "rope_theta": getattr(config, "rope_theta", 10000.0),
+                "rope_type": "default",
+                "partial_rotary_factor": rotary_dim / self.head_dim,
+            }
+
         base, rope_scaling, partial_rotary_factor = get_rope_config(config)
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
