@@ -64,6 +64,34 @@ def make_container_mounts(opts: dict[str, Any]) -> list[str]:
     return container_mounts
 
 
+def submit_custom_slurm_job(script_path: str, env_vars: dict[str, str], job_dir: str) -> int:
+    """Submit a user-provided sbatch script with AUTOMODEL_* environment variables."""
+    os.makedirs(job_dir, exist_ok=True)
+
+    env = {**os.environ, **env_vars}
+    logging.info("Submitting custom SLURM script: %s", script_path)
+    for key, val in env_vars.items():
+        logging.info("  %s=%s", key, val)
+
+    proc = subprocess.Popen(
+        ["sbatch", script_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    stdout, stderr = tuple(map(bytes.decode, proc.communicate()))
+    logging.info(stdout)
+    with open(Path(job_dir) / "subproc_sbatch.stdout", "w") as fp:
+        fp.write(stdout)
+
+    if proc.returncode != 0:
+        logging.error(stderr)
+    with open(Path(job_dir) / "subproc_sbatch.stderr", "w") as fp:
+        fp.write(stderr)
+
+    return proc.returncode
+
+
 def submit_slurm_job(config: SlurmConfig, job_dir: str) -> int:
     os.makedirs(job_dir, exist_ok=True)
     # Render the sbatch script

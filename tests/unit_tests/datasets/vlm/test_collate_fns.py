@@ -19,7 +19,6 @@ import pytest
 import torch
 from PIL import Image as PILImage
 
-
 CONVERSATION = [
     {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
     {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
