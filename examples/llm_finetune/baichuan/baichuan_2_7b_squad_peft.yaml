@@ -37,8 +37,12 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: baichuan-inc/Baichuan2-7B-Chat
-  trust_remote_code: true
   torch_dtype: bf16
+
+tokenizer:
+  _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: baichuan-inc/Baichuan2-7B-Chat
+  trust_remote_code: true
 
 checkpoint:
   enabled: false
