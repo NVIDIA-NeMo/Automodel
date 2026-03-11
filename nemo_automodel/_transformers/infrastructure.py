@@ -300,6 +300,23 @@ def instantiate_infrastructure(
     return model_wrapper, autopipeline, parallelize_fn, qat_quantizer
 
 
+def _uses_te_attention(model) -> bool:
+    """Return True if any self_attn module uses TE's DotProductAttention."""
+    try:
+        from transformer_engine.pytorch.attention import DotProductAttention
+    except ImportError:
+        return False
+
+    model_parts = model.parts if hasattr(model, "parts") else [model]
+    for part in model_parts:
+        for name, module in part.named_modules():
+            if name.endswith("self_attn"):
+                attn_module = getattr(module, "attn_module", None)
+                if isinstance(attn_module, DotProductAttention):
+                    return True
+    return False
+
+
 #  apply_model_infrastructure  --  the main post-init orchestration function
 def apply_model_infrastructure(
     model,
@@ -377,14 +394,11 @@ def apply_model_infrastructure(
     )
 
     # Handle checkpointer config updates if checkpointer is provided
-    dequantize_base_checkpoint = False
     if checkpointer is not None:
         if checkpointer.config.dequantize_base_checkpoint is None:
-            # try to infer whether the base weights are quantized
             checkpointer.config.dequantize_base_checkpoint = hasattr(
                 getattr(model, "config", None), "quantization_config"
             )
-        dequantize_base_checkpoint = checkpointer.config.dequantize_base_checkpoint
 
     # Apply PEFT and lower precision if configured
     # When on meta device, wrap in init_empty_weights() so new LoRA modules are also on meta device
@@ -427,7 +441,7 @@ def apply_model_infrastructure(
 
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
     pre_shard_hf_state_dict_keys = list(
-        _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=dequantize_base_checkpoint).keys()
+        _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=False).keys()
     )
 
     # Apply freezing before sharding
@@ -508,5 +522,15 @@ def apply_model_infrastructure(
             else:
                 raise
         print_trainable_parameters(model)  # Once model's been sharded
+
+    # Attach CP attention-mask hooks for dense (non-TE) context parallelism.
+    # These hooks strip attention_mask and set is_causal=True on self_attn modules
+    # so that SDPA handles causal masking internally (compatible with DTensor sharding).
+    if mesh.cp_size > 1 and not _uses_te_attention(model):
+        from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+
+        model_parts = model.parts if hasattr(model, "parts") else [model]
+        for mp in model_parts:
+            attach_context_parallel_hooks(mp)
 
     return model
