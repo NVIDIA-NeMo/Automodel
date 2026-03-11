@@ -986,7 +986,7 @@ class FileSystemReader(StorageReader):
     def read_metadata(self) -> Metadata:
         path = self.fs.concat_path(self.path, ".metadata")
         with self.fs.create_stream(path, "rb") as metadata_file:
-            metadata = pickle.load(metadata_file)
+            metadata = pickle.load(metadata_file)  # noqa: S301
 
         if getattr(metadata, "storage_meta", None) is None:
             metadata.storage_meta = StorageMeta()
