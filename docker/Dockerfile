@@ -76,8 +76,8 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
 
 # Install Deepep
 COPY docker/common/deepep.patch /opt/deepep.patch
-ARG INSTALL_DEEPEP=False
-ARG DEEPEP_COMMIT=1dddd194c26911c35b4f53a148617dd73de0ffc9
+ARG INSTALL_DEEPEP=True
+ARG DEEPEP_COMMIT=7febc6e25660af0f54d95dd781ecdcd62265ecca
 RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     git clone https://github.com/deepseek-ai/DeepEP.git && \
     cd DeepEP && \
