@@ -477,17 +477,16 @@ class Checkpointer:
         to_empty_parameters_only(model, device=device)
 
         # to_empty_parameters_only only materializes parameters, not buffers.
-        # Buffers (e.g. RoPE inv_freq) may still be on meta device.  Move them
-        # to *device* with uninitialized storage so that the subsequent
-        # initialize_weights() call can overwrite them with proper values
-        # (HF's _init_weights recomputes non-persistent buffers from config).
-        # Without this, meta buffers would survive until a later model.to_empty()
-        # call, which fills them with recycled GPU memory — values that may
-        # differ between successive model builds in the same process.
+        # Buffers may still be on the wrong device: meta-device buffers arise
+        # from accelerate/transformers init_empty_weights(), while CPU buffers
+        # arise from our own init_empty_weights() which only intercepts
+        # register_parameter (not register_buffer).  Move any buffer that is
+        # not already on the target device so that the subsequent
+        # initialize_weights() call can overwrite them with proper values.
         for module in model.modules():
             for key in list(module._buffers):
                 buf = module._buffers[key]
-                if buf is not None and buf.device.type == "meta":
+                if buf is not None and buf.device != device:
                     module._buffers[key] = torch.empty_like(buf, device=device)
 
         # HF models set _is_hf_initialized to True after initialization.
