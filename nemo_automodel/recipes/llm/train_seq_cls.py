@@ -279,7 +279,8 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         tps = num_tokens_in_batch / time_delta
 
         mfu = None
-        if batches:
+        mfu_calculator = getattr(self, "mfu_calculator", None)
+        if batches and mfu_calculator is not None:
             step_flops = 0.0
             flops_supported = True
             for batch in batches:
@@ -287,7 +288,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 if input_ids is None:
                     flops_supported = False
                     break
-                batch_flops = self.mfu_calculator.get_flops(input_ids)
+                batch_flops = mfu_calculator.get_flops(input_ids)
                 if batch_flops is None:
                     flops_supported = False
                     break

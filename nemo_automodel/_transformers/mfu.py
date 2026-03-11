@@ -104,6 +104,7 @@ class AutoMFU:
     This class provides a HuggingFace AutoModel-like interface for calculating
     Model FLOPs Utilization (MFU) during training.
     """
+
     def __init__(self, config: "PretrainedConfig", device: str = "h100"):
         """Initialize AutoMFU with a model config.
 
