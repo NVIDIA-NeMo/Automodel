@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 MODEL_ARCH_MAPPING = OrderedDict(
     [
         (
+            "BaichuanForCausalLM",
+            ("nemo_automodel.components.models.baichuan.model", "BaichuanForCausalLM"),
+        ),
+        (
             "DeepseekV3ForCausalLM",
             ("nemo_automodel.components.models.deepseek_v3.model", "DeepseekV3ForCausalLM"),
         ),
@@ -121,6 +125,31 @@ MODEL_ARCH_MAPPING = OrderedDict(
         ),
     ]
 )
+
+
+# Custom model_type → config class for models that have auto_map in their
+# checkpoint config.json.  Registered eagerly with AutoConfig so that
+# AutoConfig.from_pretrained can resolve them without trust_remote_code.
+_CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
+    "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
+}
+
+
+def _register_custom_configs() -> None:
+    from transformers import AutoConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    for model_type, (module_path, cls_name) in _CUSTOM_CONFIG_REGISTRATIONS.items():
+        if model_type not in CONFIG_MAPPING:
+            try:
+                mod = importlib.import_module(module_path)
+                cfg_cls = getattr(mod, cls_name)
+                AutoConfig.register(model_type, cfg_cls)
+            except Exception:
+                logger.debug("Failed to register config for model_type=%s", model_type, exc_info=True)
+
+
+_register_custom_configs()
 
 
 class _LazyArchMapping:
