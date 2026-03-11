@@ -131,8 +131,7 @@ def _enable_skip_output_merge_if_supported(schedule: _PipelineSchedule) -> bool:
     # Keep a handle for debugging/reversion if needed.
     schedule._nemo_original_step = original_step
     logger.info(
-        "Enabled NEMOAUTOMODEL_PP_SKIP_OUTPUT_MERGE=1: replacing schedule.step output-merge path "
-        "(class=%s).",
+        "Enabled NEMOAUTOMODEL_PP_SKIP_OUTPUT_MERGE=1: replacing schedule.step output-merge path (class=%s).",
         schedule.__class__.__name__,
     )
     return True
@@ -565,7 +564,9 @@ def split_model_into_stages(
     prefer_backbone_attr = False
     if module_names_per_stage is not None:
         prefer_backbone_attr = any(
-            module_fqn.startswith("backbone.") for stage_modules in module_names_per_stage for module_fqn in stage_modules
+            module_fqn.startswith("backbone.")
+            for stage_modules in module_names_per_stage
+            for module_fqn in stage_modules
         )
 
     has_backbone_attr = model_has_backbone_attr and (prefer_backbone_attr or not model_has_model_attr)
@@ -792,9 +793,8 @@ def split_model_into_stages(
                         elif isinstance(module, nn.ModuleList):
                             setattr(parent_module, name, nn.ModuleDict())
 
-                elif (
-                    full_name not in modules_to_keep
-                    and not any(kept_name.startswith(full_name + ".") for kept_name in modules_to_keep)
+                elif full_name not in modules_to_keep and not any(
+                    kept_name.startswith(full_name + ".") for kept_name in modules_to_keep
                 ):
                     setattr(parent_module, name, None)
                 elif full_name not in modules_to_keep:
@@ -887,7 +887,9 @@ def split_model_into_stages(
         # Create a set of modules to keep
         modules_to_keep = set(module_names)
         logger.info(
-            f"PP Rank {pp_rank}: Stage {stage_idx}: Keeping modules: {sorted(modules_to_keep, key=lambda x: x.split('.')[-1])}"
+            f"PP Rank {pp_rank}: Stage {stage_idx}: Keeping modules: {sorted(modules_to_keep, key=lambda x: x.split(
+                    '.'
+                )[-1])}"
         )
 
         # Process the model
