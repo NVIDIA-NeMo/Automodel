@@ -454,7 +454,7 @@ class Checkpointer:
         for module in model.modules():
             for key in list(module._buffers):
                 buf = module._buffers[key]
-                if buf is not None and buf.device != device:
+                if buf is not None and (buf.device != device or buf.device == "meta"):
                     module._buffers[key] = torch.empty_like(buf, device=device)
 
         # HF models set _is_hf_initialized to True after initialization.
