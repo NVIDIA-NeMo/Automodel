@@ -25,10 +25,12 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
     SequenceParallel,
 )
+from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
 # Import the function under test
 from nemo_automodel.components.distributed.parallelizer import (
+    _attention_is_head_sharded,
     _get_parallel_plan,
     _update_attention_head_counts_for_tp,
     apply_fsdp2_sharding_recursively,
@@ -1073,3 +1075,55 @@ class TestUpdateAttentionHeadCountsForTP:
         model = nn.Module()
         model.config = SimpleNamespace(num_attention_heads=8, hidden_size=64)
         _update_attention_head_counts_for_tp(model, tp_size=2)
+
+
+class TestAttentionIsHeadSharded:
+    """Tests for _attention_is_head_sharded."""
+
+    def test_colwise_default_is_sharded(self):
+        """ColwiseParallel() with default output (Shard) → heads are sharded."""
+        plan = {
+            "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+        }
+        assert _attention_is_head_sharded(plan) is True
+
+    def test_colwise_explicit_shard_is_sharded(self):
+        plan = {
+            "model.layers.*.self_attn.q_proj": ColwiseParallel(output_layouts=Shard(-1)),
+        }
+        assert _attention_is_head_sharded(plan) is True
+
+    def test_rowwise_replicate_is_not_sharded(self):
+        """Phi-3 style: RowwiseParallel with Replicate output → not sharded."""
+        plan = {
+            "model.layers.*.self_attn.qkv_proj": RowwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=Replicate(),
+            ),
+            "model.layers.*.self_attn.o_proj": ColwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=Replicate(),
+            ),
+        }
+        assert _attention_is_head_sharded(plan) is False
+
+    def test_colwise_replicate_output_is_not_sharded(self):
+        """ColwiseParallel with explicit Replicate output → not sharded."""
+        plan = {
+            "model.layers.*.self_attn.q_proj": ColwiseParallel(output_layouts=Replicate()),
+        }
+        assert _attention_is_head_sharded(plan) is False
+
+    def test_no_attn_keys_is_not_sharded(self):
+        """Plan with only MLP entries → not sharded."""
+        plan = {
+            "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),
+            "model.layers.*.mlp.down_proj": RowwiseParallel(),
+        }
+        assert _attention_is_head_sharded(plan) is False
+
+    def test_empty_plan_is_not_sharded(self):
+        assert _attention_is_head_sharded({}) is False
