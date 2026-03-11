@@ -36,6 +36,7 @@ from nemo_automodel._transformers import NeMoAutoModelForImageTextToText, NeMoAu
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
@@ -271,6 +272,12 @@ def build_dataloader(
                     # Some models do not provide an AutoProcessor
                     processor = None
                     logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
+
+            chat_template_raw = cfg_ds.__dict__.pop("chat_template", None)
+            # Update chat_template if chat_template is given
+            if chat_template_raw is not None and processor is not None:
+                processor.chat_template = _resolve_chat_template(chat_template_raw)
+                processor.tokenizer.chat_template = processor.chat_template
 
             ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
 
