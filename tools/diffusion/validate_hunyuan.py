@@ -73,7 +73,7 @@ def load_prompts_from_meta_files(meta_folder: str):
 
     for meta_file in meta_files:
         try:
-            data = torch.load(meta_file, weights_only=False)
+            data = torch.load(meta_file, weights_only=True)
 
             # Extract prompt from metadata
             metadata = data.get("metadata", {})

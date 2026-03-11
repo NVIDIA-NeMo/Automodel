@@ -99,7 +99,7 @@ class VideoDecoder:
         """
         logger.info(f"Loading .meta file: {meta_path}")
 
-        data = torch.load(meta_path, weights_only=False)
+        data = torch.load(meta_path, weights_only=True)
 
         # Log information about the loaded data
         logger.info(f"Loaded data keys: {list(data.keys())}")
