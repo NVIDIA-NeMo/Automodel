@@ -1,8 +1,8 @@
 # Dataset Overview: LLM, VLM, and Retrieval Datasets in NeMo Automodel
 
-This page summarizes the datasets supported in NeMo Automodel for LLM, VLM, and retrieval/embedding (biencoder) training and shows how to plug in your own datasets using Python functions or the YAML `_target_` mechanism.
+This page summarizes the datasets supported in NeMo Automodel for LLM, VLM, and retrieval/embedding (encoder) training and shows how to plug in your own datasets using Python functions or the YAML `_target_` mechanism.
 
-- See also: [LLM datasets](llm/dataset.md), [VLM datasets](vlm/dataset.md), and [Biencoder retrieval dataset](llm/retrieval-dataset.md) for deeper, task-specific guides.
+- See also: [LLM datasets](llm/dataset.md), [VLM datasets](vlm/dataset.md), and [Encoder retrieval dataset](llm/retrieval-dataset.md) for deeper, task-specific guides.
 
 - If a dataset you need is missing, please open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) with a short description and example schema so we can prioritize support.
 ---
@@ -220,9 +220,9 @@ dataset:
 ```
 See the [Function Calling guide](llm/toolcalling.md) for an end-to-end example with FunctionGemma.
 
-### Retrieval/Biencoder (Embedding Fine-Tuning)
+### Retrieval/Encoder (Embedding Fine-Tuning)
 - Factory: `nemo_automodel.components.datasets.llm.make_retrieval_dataset`
-- Collator: `nemo_automodel.components.datasets.llm.RetrievalBiencoderCollator`
+- Collator: `nemo_automodel.components.datasets.llm.RetrievalEncoderCollator`
 - Use case: embedding model fine-tuning with (query, positive doc, negative docs) contrastive learning
 - Supported schemas:
   - Corpus-ID JSON (Merlin/NeMo-retriever style)
@@ -233,13 +233,13 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
   data_dir_list: /abs/path/to/train.jsonl
   data_type: train
-  train_n_passages: 5
+  n_passages: 5
 collate_fn:
-  _target_: nemo_automodel.components.datasets.llm.RetrievalBiencoderCollator
+  _target_: nemo_automodel.components.datasets.llm.RetrievalEncoderCollator
   q_max_len: 512
   p_max_len: 512
 ```
-See the detailed guide, [Biencoder retrieval dataset](llm/retrieval-dataset.md), for more information.
+See the detailed guide, [Encoder retrieval dataset](llm/retrieval-dataset.md), for more information.
 
 - **NanoGPT Binary Shards (pretraining)**
   - Class: `nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset`

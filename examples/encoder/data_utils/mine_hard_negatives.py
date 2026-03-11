@@ -13,9 +13,9 @@
 # limitations under the License.
 
 # To run this script, use the following command:
-# torchrun --nproc_per_node=8 --master_port=29500 ./examples/biencoder/mine_hard_negatives.py \
-#     --config examples/biencoder/mining_config.yaml \
-#     --mining.model_name_or_path /path/to/biencoder/checkpoint \
+# torchrun --nproc_per_node=8 --master_port=29500 ./examples/encoder/data_utils/mine_hard_negatives.py \
+#     --config examples/encoder/data_utils/mining_config.yaml \
+#     --mining.model_name_or_path /path/to/encoder/checkpoint \
 #     --mining.train_qa_file_path /path/to/input.json \
 #     --mining.train_file_output_path /path/to/output.json \
 #     --mining.cache_embeddings_dir /path/to/cache \
@@ -23,7 +23,7 @@
 #
 # The model is loaded directly from the checkpoint path (--mining.model_name_or_path),
 # so no model architecture config is needed. This allows mining with any saved
-# biencoder checkpoint without requiring the original training config.
+# encoder checkpoint without requiring the original training config.
 #
 # The mining_config.yaml contains only mining parameters and dist_env settings,
 # not the model architecture. All mining parameters can also be overridden via
@@ -32,10 +32,10 @@
 from __future__ import annotations
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.biencoder import MineHardNegativesRecipe
+from nemo_automodel.recipes.encoder import MineHardNegativesRecipe
 
 
-def main(default_config_path="examples/biencoder/mining_config.yaml"):
+def main(default_config_path="examples/encoder/data_utils/mining_config.yaml"):
     """Main entry point for hard negative mining.
 
     Loads the configuration, sets up the recipe, and runs the mining pipeline.

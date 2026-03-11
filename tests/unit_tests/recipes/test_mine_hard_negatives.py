@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.recipes.biencoder.mine_hard_negatives import MINING_DEFAULTS, MineHardNegativesRecipe
+from nemo_automodel.recipes.encoder.mine_hard_negatives import MINING_DEFAULTS, MineHardNegativesRecipe
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -68,8 +68,8 @@ def _run_setup_and_capture_from_pretrained(mining_overrides=None):
     mock_model.to.return_value = mock_model
 
     with (
-        patch("nemo_automodel.recipes.biencoder.mine_hard_negatives.build_distributed") as mock_dist,
-        patch("nemo_automodel.recipes.biencoder.mine_hard_negatives.NeMoAutoModelBiencoder") as mock_auto,
+        patch("nemo_automodel.recipes.encoder.mine_hard_negatives.build_distributed") as mock_dist,
+        patch("nemo_automodel.recipes.encoder.mine_hard_negatives.NeMoAutoModelBiEncoder") as mock_auto,
         patch.object(recipe, "_configure_tokenizer"),
         patch.object(recipe, "_load_data"),
         patch.object(recipe, "_build_document_mappings"),

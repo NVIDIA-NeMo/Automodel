@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .mine_hard_negatives import MineHardNegativesRecipe
-from .train_biencoder import TrainBiencoderRecipe
+from __future__ import annotations
 
-__all__ = ["MineHardNegativesRecipe", "TrainBiencoderRecipe"]
+from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.recipes.encoder import TrainCrossEncoderRecipe
+
+
+def main(default_config_path="examples/encoder/cross_encoder/llama3_2_1b.yaml"):
+    cfg = parse_args_and_load_config(default_config_path)
+    recipe = TrainCrossEncoderRecipe(cfg)
+    recipe.setup()
+    recipe.run_train_validation_loop()
+
+
+if __name__ == "__main__":
+    main()

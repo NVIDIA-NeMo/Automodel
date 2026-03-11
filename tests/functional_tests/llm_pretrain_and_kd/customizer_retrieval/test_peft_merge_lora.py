@@ -323,7 +323,7 @@ class TestMergeLoraRealBiencoder:
 
     Loads ``llama-nemotron-embed-1b-v2``, applies HF PEFT LoRA, merges with
     ``merge_lora``, and verifies that the merged model produces valid
-    embeddings via the BiencoderModel wrapper.
+    embeddings via the BiEncoderModel wrapper.
     """
 
     @pytest.fixture(autouse=True)
@@ -333,7 +333,7 @@ class TestMergeLoraRealBiencoder:
     def test_merge_lora_real_biencoder(self):
         from peft import LoraConfig, PeftModel, get_peft_model
 
-        from nemo_automodel._transformers.biencoder import BiencoderModel
+        from nemo_automodel._transformers.encoder import BiEncoderModel
         from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel
         from tools.merge_lora import merge_lora
 
@@ -423,17 +423,13 @@ class TestMergeLoraRealBiencoder:
             )
 
         # 7. Verify embeddings via biencoder wrapper
-        biencoder_ref = BiencoderModel(
-            lm_q=ref_merged,
-            lm_p=ref_merged,
-            share_encoder=True,
+        biencoder_ref = BiEncoderModel(
+            model=ref_merged,
             pooling="avg",
             l2_normalize=True,
         ).eval()
-        biencoder_merged = BiencoderModel(
-            lm_q=merged_model,
-            lm_p=merged_model,
-            share_encoder=True,
+        biencoder_merged = BiEncoderModel(
+            model=merged_model,
             pooling="avg",
             l2_normalize=True,
         ).eval()
@@ -444,8 +440,8 @@ class TestMergeLoraRealBiencoder:
         input_dict = {"input_ids": input_ids, "attention_mask": attention_mask}
 
         with torch.no_grad():
-            emb_ref = biencoder_ref.encode(input_dict, encoder="query")
-            emb_merged = biencoder_merged.encode(input_dict, encoder="query")
+            emb_ref = biencoder_ref.encode(input_dict)
+            emb_merged = biencoder_merged.encode(input_dict)
 
         assert emb_ref is not None and emb_merged is not None
         assert torch.isfinite(emb_merged).all(), "Merged embeddings contain non-finite values"
