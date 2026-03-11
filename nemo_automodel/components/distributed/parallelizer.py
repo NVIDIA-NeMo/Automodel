@@ -15,6 +15,7 @@
 import importlib
 import logging
 import os
+import warnings
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from functools import lru_cache, reduce
@@ -175,7 +176,15 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
 
             # Apply tensor parallelism
             if model_parallel_plan:
-                parallelize_module(model, tp_mesh, model_parallel_plan)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=".*could not be resolved.*",
+                        category=UserWarning,
+                    )
+                    parallelize_module(model, tp_mesh, model_parallel_plan)
+                if _attention_is_head_sharded(model_parallel_plan):
+                    _update_attention_head_counts_for_tp(model, tp_mesh.size())
 
         # Apply activation checkpointing to linear layers if requested
         if activation_checkpointing:
@@ -882,10 +891,57 @@ class WanParallelizationStrategy(ParallelizationStrategy):
         )
 
 
+class HunyuanParallelizationStrategy(ParallelizationStrategy):
+    """Parallelization strategy for Hunyuan-style transformer modules used in HunyuanVideo."""
+
+    def parallelize(
+        self,
+        model: nn.Module,
+        device_mesh: DeviceMesh,
+        moe_mesh: Optional[DeviceMesh] = None,
+        mp_policy: Optional[MixedPrecisionPolicy] = None,
+        offload_policy: Optional[OffloadPolicy] = None,
+        sequence_parallel: bool = False,
+        activation_checkpointing: bool = True,
+        tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        dp_replicate_mesh_name: str = "dp_replicate",
+        dp_shard_cp_mesh_name: str = "dp_shard_cp",
+        tp_mesh_name: str = "tp",
+        ep_mesh_name: str = "ep",
+    ) -> nn.Module:
+        del moe_mesh, sequence_parallel, tp_shard_plan, tp_mesh_name, ep_mesh_name
+        dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
+        dp_mesh = device_mesh[dp_mesh_dim_names]
+
+        # Match diffusion defaults in mainline: BF16 params/output with FP32 reduction.
+        if not mp_policy:
+            mp_policy = MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                output_dtype=torch.bfloat16,
+            )
+
+        # Apply activation checkpointing to transformer blocks if requested.
+        if activation_checkpointing and hasattr(model, "transformer_blocks"):
+            for idx in range(len(model.transformer_blocks)):
+                model.transformer_blocks[idx] = checkpoint_wrapper(model.transformer_blocks[idx])
+
+        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
+
+        return fully_shard(
+            model,
+            mesh=dp_mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            reshard_after_forward=False,
+        )
+
+
 # Strategy registry mapping model class names to parallelization strategies
 PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
     "WanTransformer3DModel": WanParallelizationStrategy(),
+    "HunyuanVideo15Transformer3DModel": HunyuanParallelizationStrategy(),
 }
 
 # Default strategy instance
@@ -1234,6 +1290,12 @@ def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None
     config = getattr(model, "config", None)
     if config is None or not hasattr(config, "num_attention_heads"):
         return
+    model_arch = None
+    if hasattr(config, "architectures") and config.architectures:
+        try:
+            model_arch = config.architectures[0]
+        except Exception:
+            model_arch = None
     inner = getattr(model, "model", model)
     layers = getattr(inner, "layers", None)
     if layers is None and hasattr(model, "language_model"):
@@ -1252,6 +1314,12 @@ def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None
     local_num_key_value_heads = None
     if hasattr(config, "num_key_value_heads") and config.num_key_value_heads is not None:
         local_num_key_value_heads = config.num_key_value_heads // tp_size
+
+    is_decilm_nemotron_nas = model_arch == "DeciLMForCausalLM" and getattr(config, "model_type", None) == "nemotron-nas"
+    if not is_decilm_nemotron_nas:
+        config.num_attention_heads = local_num_attention_heads
+        if local_num_key_value_heads is not None:
+            config.num_key_value_heads = local_num_key_value_heads
 
     for layer in layers:
         if hasattr(layer, "self_attn"):
@@ -1513,6 +1581,28 @@ def _get_parallel_plan(
     if isinstance(tp_shard_plan, dict):
         model_parallel_plan = tp_shard_plan
         logger.info(f"Using parallel plan (dictionary). {tp_shard_plan}")
+    elif tp_shard_plan == LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME:
+        if get_decilm_nemotron_tp_plan is None or get_llama_nemotron_super_tp_plan is None:
+            raise ValueError(
+                f"Named parallel plan '{LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME}' is unavailable in this "
+                "optimized_tp_plans version. Please use a dict/path plan or update optimized_tp_plans."
+            )
+        model_arch = None
+        if hasattr(model, "config") and hasattr(model.config, "architectures") and model.config.architectures:
+            try:
+                model_arch = model.config.architectures[0]
+            except Exception:
+                model_arch = None
+
+        if model_arch == "DeciLMForCausalLM" and getattr(model.config, "model_type", None) == "nemotron-nas":
+            model_parallel_plan = get_decilm_nemotron_tp_plan(sequence_parallel=sequence_parallel)
+            logger.info(
+                "Using DeciLM/Nemotron-NAS TP plan for named plan %s",
+                LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
+            )
+        else:
+            model_parallel_plan = get_llama_nemotron_super_tp_plan(sequence_parallel=sequence_parallel)
+            logger.info(f"Using named parallel plan: {LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME}")
     elif tp_shard_plan is not None:
         try:
             plan_obj = import_class_from_path(tp_shard_plan)

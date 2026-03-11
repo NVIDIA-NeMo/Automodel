@@ -886,11 +886,8 @@ def split_model_into_stages(
             )
         # Create a set of modules to keep
         modules_to_keep = set(module_names)
-        logger.info(
-            f"PP Rank {pp_rank}: Stage {stage_idx}: Keeping modules: {sorted(modules_to_keep, key=lambda x: x.split(
-                    '.'
-                )[-1])}"
-        )
+        sorted_modules_to_keep = sorted(modules_to_keep, key=lambda x: x.split(".")[-1])
+        logger.info(f"PP Rank {pp_rank}: Stage {stage_idx}: Keeping modules: {sorted_modules_to_keep}")
 
         # Process the model
         _prune_model_to_modules(stage_model, modules_to_keep)
