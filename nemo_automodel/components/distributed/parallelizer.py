@@ -366,9 +366,8 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                 dispatcher = getattr(self, "_nemotron_ep_dispatcher", None)
                 physical_partition_local = getattr(self, "_nemotron_ep_physical_partition", False)
                 local_ids = self._nemotron_ep_local_expert_indices
-                sync_inactive_local_experts = (
-                    getattr(self, "_nemotron_ep_sync_inactive_experts", True)
-                    and getattr(self, "_nemotron_ep_nested_fsdp_wrapped", False)
+                sync_inactive_local_experts = getattr(self, "_nemotron_ep_sync_inactive_experts", True) and getattr(
+                    self, "_nemotron_ep_nested_fsdp_wrapped", False
                 )
 
                 def _local_expert(local_i: int) -> nn.Module:
@@ -414,11 +413,15 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                             expert_outputs[start:end] = chunk
                             any_active_local = True
                         elif sync_inactive_local_experts:
-                            expert_outputs = expert_outputs + expert(_dummy_input(permuted_hidden_states, expert)).sum() * 0.0
+                            expert_outputs = (
+                                expert_outputs + expert(_dummy_input(permuted_hidden_states, expert)).sum() * 0.0
+                            )
 
                     if not any_active_local and not sync_inactive_local_experts:
                         expert0 = _local_expert(0)
-                        expert_outputs = expert_outputs + expert0(_dummy_input(permuted_hidden_states, expert0)).sum() * 0.0
+                        expert_outputs = (
+                            expert_outputs + expert0(_dummy_input(permuted_hidden_states, expert0)).sum() * 0.0
+                        )
 
                     out = dispatcher.token_unpermutation(expert_outputs)
                     return out.type(hidden_states.dtype)

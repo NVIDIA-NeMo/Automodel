@@ -141,9 +141,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                 causal_mask = (
                     update_causal_mask(attention_mask, inputs_embeds, cache_position) if update_causal_mask else None
                 )
-                mamba_mask = (
-                    update_mamba_mask(attention_mask, cache_position) if update_mamba_mask else attention_mask
-                )
+                mamba_mask = update_mamba_mask(attention_mask, cache_position) if update_mamba_mask else attention_mask
             layer_iter = layers.values() if hasattr(layers, "values") else layers
             for mixer_block in layer_iter:
                 if mixer_block.block_type == "mamba":
