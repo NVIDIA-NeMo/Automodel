@@ -376,10 +376,11 @@ class Checkpointer:
         # local DTensor shard.  This avoids NCCL collectives entirely, side-stepping
         # the broadcast_from_rank0 hang where rank 0's synchronous CPU→GPU copies
         # fall behind other ranks' async allocations.
+        is_safetensors = _is_safetensors_checkpoint(model_path)
         if (
             is_init_step
             and len(model_state.model) == 1
-            and (_is_safetensors_checkpoint(model_path) or _is_bin_checkpoint(model_path))
+            and (_is_bin_checkpoint(model_path) or (is_safetensors and not _is_custom_model(model_state.model[0])))
         ):
             t0 = time.monotonic()
             weights_only = not _is_remote_code_model(model_state.model[0])
