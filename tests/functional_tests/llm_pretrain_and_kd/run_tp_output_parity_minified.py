@@ -51,19 +51,21 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.parallel import parallelize_module
+from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, parallelize_module
 from torch.distributed.tensor.placement_types import Replicate
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan, _update_attention_head_counts_for_tp
+from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
+from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
 from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.models.llama.model import LlamaConfig, LlamaForCausalLM
 from nemo_automodel.components.models.mistral3.model import Ministral3Config, Ministral3ForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2Config, Qwen2ForCausalLM
 
-ModelKind = Literal["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2", "nemotron"]
+ModelKind = Literal["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2", "nemotron", "baichuan"]
 SPMode = Literal["true", "false", "both"]
 
 
@@ -370,7 +372,39 @@ def _build_minified_model(kind: ModelKind):
                     torch.nn.init.normal_(module.bias, mean=0.1, std=0.1)
         return cfg, model
 
+    if kind == "baichuan":
+        cfg = BaichuanConfig(
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=256,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            max_position_embeddings=128,
+            use_cache=False,
+            tie_word_embeddings=False,
+        )
+        return cfg, BaichuanForCausalLM(cfg)
+
     raise ValueError(f"Unknown model kind: {kind}")
+
+
+def _baichuan_tp_plan() -> dict:
+    """TP plan for Baichuan2.
+
+    Only the MLP is sharded.  The attention path stays fully replicated
+    because W_pack uses a non-interleaved [Q|K|V] layout (ColwiseParallel
+    would split it incorrectly) and NormHead (lm_head) is not nn.Linear
+    (ColwiseParallel is unsupported).  Keeping the attention replicated
+    also avoids DTensor from_local misinterpretation at o_proj.
+    """
+    return {
+        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+        "model.layers.*.mlp.up_proj": ColwiseParallel(),
+        "model.layers.*.mlp.down_proj": RowwiseParallel(),
+    }
+
+
+_SP_UNSUPPORTED_MODELS: set[ModelKind] = {"baichuan"}
 
 
 def _run_case(
@@ -379,6 +413,7 @@ def _run_case(
     device: torch.device,
     device_type: str,
     kl_threshold: float,
+    dtype: torch.dtype,
 ) -> tuple[bool, float]:
     """Return (ok, kl_divergence)."""
     world_size = _world_size()
@@ -390,7 +425,7 @@ def _run_case(
         torch.cuda.manual_seed_all(1234)
 
     cfg, baseline = _build_minified_model(case.kind)
-    baseline = baseline.to(device=device, dtype=torch.bfloat16)
+    baseline = baseline.to(device=device, dtype=dtype)
     baseline.eval()
 
     # Deterministic inputs across ranks.
@@ -413,10 +448,15 @@ def _run_case(
     if device_type == "cuda":
         torch.cuda.manual_seed_all(1234)
     _, tp_model = _build_minified_model(case.kind)
-    tp_model = tp_model.to(device=device, dtype=torch.bfloat16)
+    tp_model = tp_model.to(device=device, dtype=dtype)
     tp_model.eval()
 
-    tp_shard_plan = "llama_nemotron_super_tp_plan" if case.kind == "nemotron" else None
+    if case.kind == "nemotron":
+        tp_shard_plan = "llama_nemotron_super_tp_plan"
+    elif case.kind == "baichuan":
+        tp_shard_plan = _baichuan_tp_plan()
+    else:
+        tp_shard_plan = None
     tp_mesh = DeviceMesh(device_type, torch.arange(world_size, device="cpu"), mesh_dim_names=("tp",))
     plan = _get_parallel_plan(tp_model, sequence_parallel=case.sequence_parallel, tp_shard_plan=tp_shard_plan)
     parallelize_module(tp_model, tp_mesh, plan)
@@ -442,7 +482,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--models",
         nargs="+",
         default=["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2", "nemotron"],
-        choices=["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2", "nemotron"],
+        choices=["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2", "nemotron", "baichuan"],
         help="Which models to test. 'nemotron' uses 10-layer full-hidden LlamaForCausalLM with llama_nemotron_super_tp_plan.",
     )
     parser.add_argument(
@@ -456,6 +496,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=float,
         default=2e-6,
         help="Fail if KL(TP=1 || TP=2) exceeds this threshold (per token). Default is bf16-appropriate.",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="bfloat16",
+        choices=["float32", "bfloat16"],
+        help="Data type to use for the models.",
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -477,12 +524,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         device = torch.device("cpu")
         device_type = "cpu"
 
+    dtype = torch.float32 if args.dtype == "float32" else torch.bfloat16
+
     if args.sequence_parallel == "both":
         sp_flags = [False, True]
     else:
         sp_flags = [args.sequence_parallel == "true"]
 
-    cases = [_Case(kind=cast(ModelKind, k), sequence_parallel=sp) for k in args.models for sp in sp_flags]
+    cases = [
+        _Case(kind=cast(ModelKind, k), sequence_parallel=sp)
+        for k in args.models
+        for sp in sp_flags
+        if not (sp and k in _SP_UNSUPPORTED_MODELS)
+    ]
 
     if any(c.kind == "nemotron" for c in cases) and not _is_nemotron_remote_code_available():
         cases = [c for c in cases if c.kind != "nemotron"]
@@ -494,7 +548,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     for case in cases:
         # Keep ranks roughly in sync for cleaner output.
         dist.barrier()
-        ok, kl = _run_case(case, device=device, device_type=device_type, kl_threshold=float(args.kl_threshold))
+        ok, kl = _run_case(
+            case, device=device, device_type=device_type, kl_threshold=float(args.kl_threshold), dtype=dtype
+        )
 
         ok_tensor = torch.tensor(1 if ok else 0, device=device, dtype=torch.int)
         dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN)
