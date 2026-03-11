@@ -76,7 +76,9 @@ class FSDP2Config:
             self.mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.bfloat16,
                 reduce_dtype=torch.bfloat16,
-                output_dtype=torch.bfloat16,
+                # output_dtype removed: casting FSDP output to bfloat16 can detach
+                # the autograd graph for models returning raw tensors (e.g. NemotronH),
+                # causing grad_norm=0.
                 cast_forward_inputs=True,
             )
 
