@@ -27,3 +27,9 @@ torchrun --nproc_per_node=2 --nnodes=1 \
     --sequence_parallel both \
     --kl_threshold "${KL_THRESHOLD}"
 
+torchrun --nproc_per_node=2 --nnodes=1 \
+    tests/functional_tests/llm_pretrain_and_kd/run_tp_output_parity_minified.py \
+    --models baichuan \
+    --dtype bfloat16 \
+    --sequence_parallel both \
+    --kl_threshold 1e-4
