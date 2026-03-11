@@ -15,29 +15,53 @@
 """Context-Parallel-aware wrapper for Qwen3.5 MoE GatedDeltaNet linear attention.
 
 When a CP mesh is attached (via ``apply_cp``), the forward pass:
-  1. Communicates conv1d boundary tokens between adjacent CP ranks so the
-     causal convolution produces correct results at rank boundaries.
-  2. Calls FLA's ``chunk_gated_delta_rule`` with ``cp_context`` to handle
-     cross-rank recurrent-state propagation for the delta rule.
+  1. Recovers dense sequence order from PyTorch's load-balanced CP layout using
+     ``seq_index`` or ``position_ids``.
+  2. Runs the causal conv1d and FLA gated delta rule on that dense ordering.
+  3. Restores the output back to the original load-balanced CP layout.
 
 When no CP mesh is set, the module delegates to the original HF forward.
 """
 
 from __future__ import annotations
 
-import logging
-import os
-
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 
-from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-    Qwen3_5MoeGatedDeltaNet,
-)
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGatedDeltaNet
 
-logger = logging.getLogger(__name__)
+
+class _AllGatherConcatFn(Function):
+    """All-gather + concat with autograd-safe backward.
+
+    The forward concatenates equal-sized local shards from all ranks along `dim`.
+    Backward all-reduces the concatenated gradient across ranks, then slices out
+    the local shard for the current rank.
+    """
+
+    @staticmethod
+    def forward(ctx, local_tensor: torch.Tensor, group: dist.ProcessGroup, dim: int):
+        dim = dim if dim >= 0 else local_tensor.ndim + dim
+        world_size = dist.get_world_size(group)
+        gathered = [torch.empty_like(local_tensor) for _ in range(world_size)]
+        dist.all_gather(gathered, local_tensor.contiguous(), group=group)
+
+        ctx.group = group
+        ctx.rank = dist.get_rank(group)
+        ctx.dim = dim
+        ctx.local_dim_size = local_tensor.size(dim)
+        return torch.cat(gathered, dim=dim)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_full = grad_output.contiguous()
+        dist.all_reduce(grad_full, op=dist.ReduceOp.SUM, group=ctx.group)
+        start = ctx.rank * ctx.local_dim_size
+        grad_local = grad_full.narrow(ctx.dim, start, ctx.local_dim_size).contiguous()
+        return grad_local, None, None
 
 
 class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
@@ -53,9 +77,6 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
     def __init__(self, config, layer_idx: int):
         super().__init__(config, layer_idx)
         self._cp_mesh = None
-        self._cp_debug_enter_logged = False
-        self._cp_debug_layout_logged = False
-        self._cp_debug_ref_logged = False
 
     def forward(
         self,
@@ -79,10 +100,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
 
         return self._forward_with_cp(
             hidden_states,
-            attention_mask,
             position_ids=position_ids,
-            qkv_format=qkv_format,
-            cu_seqlens=cu_seqlens,
             seq_index=seq_index,
         )
 
@@ -143,71 +161,29 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         # positions W-1 onward are the correct outputs for local tokens.
         return extended[:, :, W - 1:]
 
-    def _cp_debug_enabled(self) -> bool:
-        value = os.getenv("NEMO_QWEN35_CP_DEBUG", "").strip().lower()
-        return value not in ("", "0", "false", "off")
-
-    def _emit_debug(self, message: str, *args) -> None:
-        formatted = message % args if args else message
-        logger.warning(formatted)
-        print(formatted, flush=True)
-
-    def _cp_debug_ref_enabled(self) -> bool:
-        value = os.getenv("NEMO_QWEN35_CP_DEBUG_REF_LAYERS", "").strip().lower()
-        if not value:
-            return False
-        if value == "all":
-            return True
-        try:
-            layers = {int(item.strip()) for item in value.split(",") if item.strip()}
-        except ValueError:
-            logger.warning(
-                "Ignoring invalid NEMO_QWEN35_CP_DEBUG_REF_LAYERS=%r; expected 'all' or comma-separated ints.",
-                value,
-            )
-            return False
-        return self.layer_idx in layers
-
-    def _extract_debug_positions(
-        self,
-        position_ids: torch.Tensor | None,
-        seq_len: int,
-    ) -> torch.Tensor | None:
-        if position_ids is None:
-            return None
-
-        if position_ids.ndim == 1:
-            local_positions = position_ids
-        elif position_ids.ndim == 2:
-            local_positions = position_ids[0]
-        elif position_ids.ndim == 3:
-            local_positions = position_ids[0, 0]
-        else:
-            return None
-
-        if local_positions.shape[-1] != seq_len:
-            return None
-
-        return local_positions.to(dtype=torch.long)
-
-    def _extract_sequence_positions(
+    def _extract_local_positions(
         self,
         position_ids: torch.Tensor | None,
         seq_index: torch.Tensor | None,
         seq_len: int,
     ) -> torch.Tensor | None:
-        if seq_index is not None:
-            if seq_index.ndim == 1:
-                local_positions = seq_index
-            elif seq_index.ndim == 2:
-                local_positions = seq_index[0]
-            else:
-                local_positions = None
+        for positions in (seq_index, position_ids):
+            if positions is None:
+                continue
 
-            if local_positions is not None and local_positions.shape[-1] == seq_len:
+            if positions.ndim == 1:
+                local_positions = positions
+            elif positions.ndim == 2:
+                local_positions = positions[0]
+            elif positions.ndim == 3:
+                local_positions = positions[0, 0]
+            else:
+                continue
+
+            if local_positions.shape[-1] == seq_len:
                 return local_positions.to(dtype=torch.long)
 
-        return self._extract_debug_positions(position_ids, seq_len)
+        return None
 
     def _all_gather_concat(
         self,
@@ -215,7 +191,11 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         cp_group: dist.ProcessGroup,
         *,
         dim: int,
+        differentiable: bool = False,
     ) -> torch.Tensor:
+        if differentiable:
+            return _AllGatherConcatFn.apply(tensor, cp_group, dim)
+
         cp_world = dist.get_world_size(cp_group)
         gathered = [torch.empty_like(tensor) for _ in range(cp_world)]
         dist.all_gather(gathered, tensor.contiguous(), group=cp_group)
@@ -230,11 +210,21 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         cp_rank = dist.get_rank(cp_group)
         seq_len = hidden_states.shape[1]
 
-        cp_order_hidden = self._all_gather_concat(hidden_states, cp_group, dim=1)
+        cp_order_hidden = self._all_gather_concat(hidden_states, cp_group, dim=1, differentiable=True)
         cp_order_positions = self._all_gather_concat(original_positions, cp_group, dim=0)
 
         sort_order = torch.argsort(cp_order_positions)
         sorted_positions = cp_order_positions.index_select(0, sort_order)
+        expected_positions = torch.arange(
+            sorted_positions.numel(),
+            device=sorted_positions.device,
+            dtype=sorted_positions.dtype,
+        )
+        if not torch.equal(sorted_positions, expected_positions):
+            raise RuntimeError(
+                f"Qwen3.5 CP linear-attn layer {self.layer_idx} requires dense global token positions "
+                "covering 0..S-1 after gathering CP shards."
+            )
         full_hidden = cp_order_hidden.index_select(1, sort_order)
 
         start = cp_rank * seq_len
@@ -248,7 +238,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         sorted_positions: torch.Tensor,
         cp_group: dist.ProcessGroup,
     ) -> torch.Tensor:
-        full_output = self._all_gather_concat(output, cp_group, dim=1)
+        full_output = self._all_gather_concat(output, cp_group, dim=1, differentiable=True)
         restore_indices = torch.searchsorted(sorted_positions, original_positions)
         restored_positions = sorted_positions.index_select(0, restore_indices)
         if not torch.equal(restored_positions, original_positions):
@@ -258,194 +248,14 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
             )
         return full_output.index_select(1, restore_indices)
 
-    def _describe_position_ids(
-        self,
-        position_ids: torch.Tensor | None,
-        seq_len: int,
-    ) -> str:
-        if position_ids is None:
-            return "position_ids=None"
-
-        shape = tuple(position_ids.shape)
-        dtype = getattr(position_ids, "dtype", None)
-        device = getattr(position_ids, "device", None)
-        ndim = getattr(position_ids, "ndim", None)
-
-        if ndim not in (1, 2, 3):
-            return (
-                f"position_ids type={type(position_ids).__name__} shape={shape} dtype={dtype} "
-                f"device={device} unsupported_ndim={ndim} expected_seq_len={seq_len}"
-            )
-
-        last_dim = shape[-1] if len(shape) > 0 else None
-        if last_dim != seq_len:
-            return (
-                f"position_ids type={type(position_ids).__name__} shape={shape} dtype={dtype} "
-                f"device={device} last_dim={last_dim} expected_seq_len={seq_len}"
-            )
-
-        return (
-            f"position_ids type={type(position_ids).__name__} shape={shape} dtype={dtype} "
-            f"device={device} last_dim_matches_seq_len={seq_len}"
-        )
-
-    def _maybe_log_cp_layout(
-        self,
-        cp_group: dist.ProcessGroup,
-        local_positions: torch.Tensor | None,
-        *,
-        qkv_format: str | None,
-        cu_seqlens: torch.Tensor | None,
-        seq_index: torch.Tensor | None,
-    ) -> None:
-        if self._cp_debug_layout_logged or not self._cp_debug_enabled() or local_positions is None:
-            return
-
-        cp_rank = dist.get_rank(cp_group)
-        cp_world = dist.get_world_size(cp_group)
-        pos_cpu = local_positions.detach().to(device="cpu")
-        numel = pos_cpu.numel()
-        contiguous = bool(numel <= 1 or torch.all(pos_cpu[1:] - pos_cpu[:-1] == 1))
-        payload = {
-            "rank": cp_rank,
-            "numel": int(numel),
-            "head": pos_cpu[: min(8, numel)].tolist(),
-            "tail": pos_cpu[-min(8, numel) :].tolist(),
-            "min": int(pos_cpu.min().item()) if numel > 0 else None,
-            "max": int(pos_cpu.max().item()) if numel > 0 else None,
-            "contiguous": contiguous,
-        }
-        gathered = [None] * cp_world
-        dist.all_gather_object(gathered, payload, group=cp_group)
-
-        if cp_rank == 0:
-            self._emit_debug(
-                "Qwen3.5 CP linear-attn layer=%s qkv_format=%s cu_seqlens=%s seq_index_shape=%s local_position_layout=%s",
-                self.layer_idx,
-                qkv_format or "bshd",
-                None if cu_seqlens is None else tuple(cu_seqlens.shape),
-                None if seq_index is None else tuple(seq_index.shape),
-                gathered,
-            )
-            if any(not item["contiguous"] for item in gathered):
-                self._emit_debug(
-                    "Layer %s sees non-contiguous local positions before linear attention; "
-                    "CP likely needs undo/redo load-balancing before conv/recurrent state propagation.",
-                    self.layer_idx,
-                )
-            elif any(
-                gathered[idx]["max"] is not None
-                and gathered[idx + 1]["min"] is not None
-                and gathered[idx]["max"] + 1 != gathered[idx + 1]["min"]
-                for idx in range(cp_world - 1)
-            ):
-                self._emit_debug(
-                    "Layer %s rank-order local positions are not globally contiguous; "
-                    "build_cp_context([0, S]) is likely assuming the wrong CP layout.",
-                    self.layer_idx,
-                )
-
-        self._cp_debug_layout_logged = True
-
-    def _maybe_debug_full_reference(
-        self,
-        hidden_states: torch.Tensor,
-        output: torch.Tensor,
-        *,
-        attention_mask: torch.Tensor | None,
-        position_ids: torch.Tensor | None,
-        seq_index: torch.Tensor | None,
-        cp_group: dist.ProcessGroup,
-    ) -> None:
-        if self._cp_debug_ref_logged or not self._cp_debug_ref_enabled():
-            return
-
-        local_positions = self._extract_sequence_positions(
-            position_ids,
-            seq_index,
-            hidden_states.shape[1],
-        )
-        if local_positions is None:
-            return
-
-        cp_rank = dist.get_rank(cp_group)
-        cp_world = dist.get_world_size(cp_group)
-
-        with torch.no_grad():
-            gathered_hidden = [torch.empty_like(hidden_states) for _ in range(cp_world)]
-            dist.all_gather(gathered_hidden, hidden_states.contiguous(), group=cp_group)
-
-            gathered_out = [torch.empty_like(output) for _ in range(cp_world)]
-            dist.all_gather(gathered_out, output.contiguous(), group=cp_group)
-
-            gathered_pos = [torch.empty_like(local_positions) for _ in range(cp_world)]
-            dist.all_gather(gathered_pos, local_positions.contiguous(), group=cp_group)
-
-            cp_order_hidden = torch.cat(gathered_hidden, dim=1)
-            cp_order_out = torch.cat(gathered_out, dim=1)
-            cp_order_pos = torch.cat(gathered_pos, dim=0)
-            order = torch.argsort(cp_order_pos)
-            sorted_pos = cp_order_pos.index_select(0, order)
-            expected = torch.arange(
-                sorted_pos.numel(),
-                device=sorted_pos.device,
-                dtype=sorted_pos.dtype,
-            )
-
-            if not torch.equal(sorted_pos, expected):
-                if cp_rank == 0:
-                    self._emit_debug(
-                        "Skipping gathered linear-attn reference on layer %s because gathered positions are not a simple 0..S-1 range: head=%s tail=%s",
-                        self.layer_idx,
-                        sorted_pos[: min(8, sorted_pos.numel())].tolist(),
-                        sorted_pos[-min(8, sorted_pos.numel()) :].tolist(),
-                    )
-                self._cp_debug_ref_logged = True
-                return
-
-            full_hidden = cp_order_hidden.index_select(1, order)
-            full_cp_out = cp_order_out.index_select(1, order)
-
-            full_attention_mask = None
-            if attention_mask is not None and attention_mask.ndim == 2 and attention_mask.shape[1] == hidden_states.shape[1]:
-                gathered_mask = [torch.empty_like(attention_mask) for _ in range(cp_world)]
-                dist.all_gather(gathered_mask, attention_mask.contiguous(), group=cp_group)
-                cp_order_mask = torch.cat(gathered_mask, dim=1)
-                full_attention_mask = cp_order_mask.index_select(1, order)
-
-            ref_out = Qwen3_5MoeGatedDeltaNet.forward(
-                self,
-                full_hidden,
-                cache_params=None,
-                cache_position=None,
-                attention_mask=full_attention_mask,
-            )
-            diff = (full_cp_out - ref_out).abs()
-            max_abs = float(diff.max().item())
-            mean_abs = float(diff.mean().item())
-
-            if cp_rank == 0:
-                self._emit_debug(
-                    "Qwen3.5 CP linear-attn gathered reference layer=%s max_abs=%.6e mean_abs=%.6e full_seq_len=%s",
-                    self.layer_idx,
-                    max_abs,
-                    mean_abs,
-                    full_hidden.shape[1],
-                )
-
-        self._cp_debug_ref_logged = True
-
     # ------------------------------------------------------------------
     # CP-aware forward
     # ------------------------------------------------------------------
     def _forward_with_cp(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None,
         *,
         position_ids: torch.Tensor | None,
-        qkv_format: str | None,
-        cu_seqlens: torch.Tensor | None,
         seq_index: torch.Tensor | None,
     ) -> torch.Tensor:
         from fla.ops.cp import build_cp_context
@@ -455,9 +265,17 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
 
         cp_group = self._cp_mesh.get_group()
         cp_size = self._cp_mesh.size()
-        original_hidden_states = hidden_states
+
+        local_positions = self._extract_local_positions(position_ids, seq_index, seq_len)
+        if local_positions is None:
+            raise RuntimeError(
+                f"Qwen3.5 CP linear-attn layer {self.layer_idx} requires seq_index or position_ids "
+                "with local sequence length metadata to undo load-balanced CP sharding."
+            )
 
         # ---- Build FLA CP context (once, reused for every sequence) ----
+        # After undoing the load-balanced attention layout, each rank again owns a
+        # contiguous chunk of a dense global sequence of length seq_len * cp_size.
         global_seq_len = seq_len * cp_size
         cu_seqlens_single = torch.tensor(
             [0, global_seq_len], dtype=torch.long, device=hidden_states.device,
@@ -467,49 +285,13 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
             group=cp_group,
             conv1d_kernel_size=self.conv_kernel_size,
         )
-        if self._cp_debug_enabled() and not self._cp_debug_enter_logged:
-            cp_rank = dist.get_rank(cp_group)
-            self._emit_debug(
-                "Entered Qwen3.5 CP linear-attn debug layer=%s cp_rank=%s batch=%s seq_local=%s qkv_format=%s cu_seqlens_shape=%s seq_index_shape=%s",
-                self.layer_idx,
-                cp_rank,
-                batch_size,
-                seq_len,
-                qkv_format or "bshd",
-                None if cu_seqlens is None else tuple(cu_seqlens.shape),
-                None if seq_index is None else tuple(seq_index.shape),
-            )
-            self._emit_debug(
-                "Qwen3.5 CP linear-attn layer=%s cp_rank=%s %s",
-                self.layer_idx,
-                cp_rank,
-                self._describe_position_ids(position_ids, seq_len),
-            )
-            self._cp_debug_enter_logged = True
-        local_positions = self._extract_sequence_positions(position_ids, seq_index, seq_len)
-        if self._cp_debug_enabled() and local_positions is None and not self._cp_debug_layout_logged:
-            cp_rank = dist.get_rank(cp_group)
-            self._emit_debug(
-                "Qwen3.5 CP linear-attn layer=%s cp_rank=%s could not derive local positions from position_ids",
-                self.layer_idx,
-                cp_rank,
-            )
-        self._maybe_log_cp_layout(
-            cp_group,
+        # Attention runs on a load-balanced CP layout, but conv + recurrent state
+        # propagation require rank-order sequential tokens.
+        hidden_states, sorted_positions = self._undo_attention_load_balancing(
+            hidden_states,
             local_positions,
-            qkv_format=qkv_format,
-            cu_seqlens=cu_seqlens,
-            seq_index=seq_index,
+            cp_group,
         )
-        sorted_positions = None
-        if local_positions is not None:
-            # Attention runs on a load-balanced CP layout, but conv + recurrent state
-            # propagation require rank-order sequential tokens.
-            hidden_states, sorted_positions = self._undo_attention_load_balancing(
-                hidden_states,
-                local_positions,
-                cp_group,
-            )
 
         # ---- Projections (batched, pointwise) ----
         mixed_qkv = self.in_proj_qkv(hidden_states)  # [B, S_local, conv_dim]
@@ -568,19 +350,10 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
         output = self.out_proj(core_attn_out)
-        if local_positions is not None and sorted_positions is not None:
-            output = self._redo_attention_load_balancing(
-                output,
-                local_positions,
-                sorted_positions,
-                cp_group,
-            )
-        self._maybe_debug_full_reference(
-            original_hidden_states,
+        output = self._redo_attention_load_balancing(
             output,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            seq_index=seq_index,
+            local_positions,
+            sorted_positions,
             cp_group=cp_group,
         )
         return output
