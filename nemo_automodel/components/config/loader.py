@@ -712,7 +712,11 @@ class ConfigNode:
         # walk / create intermediate ConfigNodes
         for p in parts[:-1]:
             if p not in node.__dict__ or not isinstance(node.__dict__[p], ConfigNode):
-                node.__dict__[p] = ConfigNode({})
+                seed_dict = {}
+                orig = getattr(node, "_original_strings", {})
+                if p in orig:
+                    seed_dict["_target_"] = orig[p]
+                node.__dict__[p] = ConfigNode(seed_dict)
             node = node.__dict__[p]
         # wrap the final leaf value
         node.__dict__[parts[-1]] = node._wrap(parts[-1], value)
