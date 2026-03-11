@@ -1540,6 +1540,24 @@ wheels = [
 ]
 
 [[package]]
+name = "flashoptim"
+version = "0.1.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "1.26.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
+    { name = "numpy", version = "2.4.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
+    { name = "packaging" },
+    { name = "torch", version = "2.9.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform == 'linux'" },
+    { name = "torch", version = "2.10.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.10.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin' and sys_platform != 'linux'" },
+    { name = "triton", version = "3.5.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/97/f5/3f463bff2d9f86c230c0ef5c7632ae180e25e4523a4494ad8844ed704879/flashoptim-0.1.3.tar.gz", hash = "sha256:8dc7238224883aa3e8aca40f992d7432e76d5c641255a9dd29c5633741fbfdf1", size = 90240, upload-time = "2026-03-07T09:29:11.414Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/27/18/35403b3c0b03cbba3ae676590c534483b66aaa3486d391340d903fbb5c8e/flashoptim-0.1.3-py3-none-any.whl", hash = "sha256:6d5ff87ae9b25273443b25aab1335e02cef2abe791833b9d87c1a639649ec5f0", size = 45210, upload-time = "2026-03-07T09:29:12.574Z" },
+]
+
+[[package]]
 name = "flask"
 version = "3.1.2"
 source = { registry = "https://pypi.org/simple" }
@@ -3244,6 +3262,7 @@ name = "nemo-automodel"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
+    { name = "flashoptim" },
     { name = "megatron-fsdp" },
     { name = "mistral-common", extra = ["audio", "hf-hub", "image", "sentencepiece"] },
     { name = "mlflow" },
@@ -3395,6 +3414,7 @@ requires-dist = [
     { name = "diffusers", marker = "extra == 'diffusion'", specifier = ">=0.36.0" },
     { name = "flash-attn", marker = "extra == 'fa'", specifier = "<=2.8.3" },
     { name = "flash-linear-attention", marker = "extra == 'extra'" },
+    { name = "flashoptim", specifier = ">=0.1.3" },
     { name = "ftfy", marker = "extra == 'diffusion'" },
     { name = "imageio", marker = "extra == 'diffusion'" },
     { name = "imageio-ffmpeg", marker = "extra == 'diffusion'" },

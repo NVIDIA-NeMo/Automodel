@@ -36,7 +36,7 @@ model:
 
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    rms_norm: "torch"
+    rms_norm: "torch_fp32"
 
 checkpoint:
   enabled: true
