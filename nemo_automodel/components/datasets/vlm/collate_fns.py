@@ -203,7 +203,6 @@ def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
         images=image_inputs,
         padding=True,
         return_tensors="pt",
-        do_sample_frames=False,
     )
     labels = build_labels(
         batch["input_ids"],
