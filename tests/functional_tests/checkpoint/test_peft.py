@@ -384,6 +384,13 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
         restored_model = restored_model.model_parts[0]
         source_model_loss = get_validation_loss(trainer.model_parts[0], val_batch, trainer.loss_fn, trainer.dist_env.device)
         restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
+        for (source_name, source_p), (restore_name, restore_p) in zip(trainer.model_parts[0].named_parameters(), restored_model.named_parameters()):
+            assert source_name == restore_name, "Parameter name mismatch"
+            if isinstance(source_p, torch.distributed.tensor.DTensor):
+                source_p = source_p.to_local()
+            if isinstance(restore_p, torch.distributed.tensor.DTensor):
+                restore_p = restore_p.to_local()
+            assert torch.allclose(source_p, restore_p), "Parameter value mismatch for " + source_name
         assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
 
         # compare the recipe configs

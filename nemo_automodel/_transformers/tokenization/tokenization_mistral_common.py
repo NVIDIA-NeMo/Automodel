@@ -364,6 +364,32 @@ class MistralCommonBackend(PreTrainedTokenizerBase):
         """Set the padding token id, overriding the underlying tokenizer's value."""
         self._pad_token_id_override = value
 
+    def __setattr__(self, key, value):
+        """Route pad_token_id/pad_token through our overrides AND the parent.
+
+        PreTrainedTokenizerBase.__setattr__ intercepts special-token assignments
+        and stores them in _special_tokens_map, bypassing our @property setters.
+        We set _pad_token_id_override / _pad_token_override so our property
+        getters work, then also call super() so _special_tokens_map stays
+        consistent for any HF code that reads it directly.
+        """
+        if key == "pad_token_id":
+            object.__setattr__(self, "_pad_token_id_override", value)
+            # Also let the parent update _special_tokens_map for HF compat
+            try:
+                super().__setattr__(key, value)
+            except (AttributeError, IndexError, TypeError):
+                pass  # Parent may fail during early __init__ or with invalid ids
+            return
+        if key == "pad_token":
+            object.__setattr__(self, "_pad_token_override", value)
+            try:
+                super().__setattr__(key, value)
+            except (AttributeError, IndexError, TypeError):
+                pass
+            return
+        super().__setattr__(key, value)
+
     @property
     def bos_token(self) -> str:
         """
