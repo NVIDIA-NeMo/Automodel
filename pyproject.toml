@@ -304,6 +304,8 @@ select = [
     "I",    # isort
     "D101", # docstring
     "D103",
+    "S301", # no pickle
+    "S403", # no pickle
 ]
 
 ignore = [

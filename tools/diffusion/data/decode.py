@@ -14,7 +14,6 @@
 
 import logging
 import os
-import pickle
 from pathlib import Path
 from typing import Dict
 
@@ -100,8 +99,7 @@ class VideoDecoder:
         """
         logger.info(f"Loading .meta file: {meta_path}")
 
-        with open(meta_path, "rb") as f:
-            data = pickle.load(f)
+        data = torch.load(meta_path, weights_only=True)
 
         # Log information about the loaded data
         logger.info(f"Loaded data keys: {list(data.keys())}")
