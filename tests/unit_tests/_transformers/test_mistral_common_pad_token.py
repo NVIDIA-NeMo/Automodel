@@ -27,7 +27,6 @@ The fix makes:
   - Both properties settable so _add_pad_token() can override them.
 """
 
-import pytest
 from unittest.mock import MagicMock, patch
 
 from nemo_automodel._transformers.tokenization.tokenization_mistral_common import (
@@ -36,11 +35,11 @@ from nemo_automodel._transformers.tokenization.tokenization_mistral_common impor
 )
 from nemo_automodel.components.datasets.llm.formatting_utils import _add_pad_token
 
-
 # ---------------------------------------------------------------------------
 # Helpers: lightweight stub that mimics MistralCommonBackend without needing
 # a real SentencePiece file on disk.
 # ---------------------------------------------------------------------------
+
 
 def _make_stub_tokenizer(pad_id=-1, eos_id=2, bos_id=1, unk_id=0, vocab_size=32000):
     """
@@ -77,6 +76,7 @@ def _make_stub_tokenizer(pad_id=-1, eos_id=2, bos_id=1, unk_id=0, vocab_size=320
         backend = MistralCommonBackend.__new__(MistralCommonBackend)
 
     # Manually assign the attributes that __init__ would create
+    object.__setattr__(backend, "_special_tokens_map", {})
     backend.tokenizer = mistral_tok
     backend._pad_token_id_override = None
     backend._pad_token_override = None
@@ -89,6 +89,7 @@ def _make_stub_tokenizer(pad_id=-1, eos_id=2, bos_id=1, unk_id=0, vocab_size=320
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 class TestPadTokenIdProperty:
     """pad_token_id should return None for invalid underlying pad_id."""

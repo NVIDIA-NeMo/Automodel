@@ -267,6 +267,7 @@ class MistralCommonBackend(PreTrainedTokenizerBase):
         if kwargs:
             raise ValueError(f"Kwargs {list(kwargs.keys())} are not supported to init `MistralCommonBackend`.")
 
+        object.__setattr__(self, "_special_tokens_map", {})
         self._tokenizer_path = Path(tokenizer_path)
         self._mode = self._get_validation_mode(mode)
         self.tokenizer: MistralTokenizer = MistralTokenizer.from_file(str(self._tokenizer_path), mode=self._mode)
@@ -296,6 +297,15 @@ class MistralCommonBackend(PreTrainedTokenizerBase):
             self.model_input_names = model_input_names
 
         self._cache_get_vocab: dict[str, int] | None = None
+
+    def __setattr__(self, key, value):
+        if key == "pad_token_id":
+            object.__setattr__(self, "_pad_token_id_override", value)
+            return
+        if key == "pad_token":
+            object.__setattr__(self, "_pad_token_override", value)
+            return
+        super().__setattr__(key, value)
 
     @staticmethod
     def clean_up_tokenization(text: str) -> str:
