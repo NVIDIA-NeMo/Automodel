@@ -175,7 +175,8 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                         category=UserWarning,
                     )
                     parallelize_module(model, tp_mesh, model_parallel_plan)
-                _update_attention_head_counts_for_tp(model, tp_mesh.size())
+                if _attention_is_head_sharded(model_parallel_plan):
+                    _update_attention_head_counts_for_tp(model, tp_mesh.size())
 
         # Apply activation checkpointing to linear layers if requested
         if activation_checkpointing:
@@ -747,6 +748,33 @@ def translate_to_torch_parallel_style(style: str):
         return SequenceParallel()
     else:
         raise ValueError(f"Unknown parallel style: {style}")
+
+
+def _attention_is_head_sharded(model_parallel_plan: dict) -> bool:
+    """Return True when the TP plan column-wise shards any QKV attention projection.
+
+    When Q/K/V projections use ``ColwiseParallel`` with sharded output (the
+    default), each TP rank holds ``num_heads / tp_size`` heads and the model
+    config / layer attributes must be updated accordingly.
+
+    Plans that keep attention replicated (e.g. Phi-3 with ``RowwiseParallel``
+    on fused QKV and ``Replicate`` output) should *not* trigger a head-count
+    update.
+    """
+    attn_proj_suffixes = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.qkv_proj")
+    for key, style in model_parallel_plan.items():
+        if not any(key.endswith(s) for s in attn_proj_suffixes):
+            continue
+        if isinstance(style, ColwiseParallel):
+            out = getattr(style, "output_layouts", None)
+            if out is None:
+                return True
+            if isinstance(out, (list, tuple)):
+                if any(isinstance(p, Shard) for p in out):
+                    return True
+            elif isinstance(out, Shard):
+                return True
+    return False
 
 
 def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None:
