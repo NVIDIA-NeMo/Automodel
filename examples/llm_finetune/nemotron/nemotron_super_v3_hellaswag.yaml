@@ -13,18 +13,18 @@
 # limitations under the License.
 
 
-# To run this recipe, please use the following command. Replace --nproc-per-node=8 with the number of GPUs on your node:
-# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml
-# For multi-node, use the following:
-# torchrun --nproc-per-node=8 --nnodes=2 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml
+# To run this recipe, please use the following command:
+# torchrun --nproc-per-node=8 --nnodes=4 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml
+
+# This recipe requires 32x80GB of GPU memory.
 
 
 step_scheduler:
-  global_batch_size: 256
-  local_batch_size: 8
-  ckpt_every_steps: 1000
-  val_every_steps: 1000  # will run every x number of gradient steps
-  max_steps: 100
+  num_epochs: 1
+  global_batch_size: 32
+  local_batch_size: 1
+  ckpt_every_steps: 100
+  val_every_steps: 100  # will run every x number of gradient steps
 
 dist_env:
   backend: nccl
@@ -37,17 +37,14 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
-  trust_remote_code: true
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
 
 distributed:
   strategy: fsdp2
   dp_size: none
   tp_size: 1
   cp_size: 1
-  ep_size: 8
-
-  sequence_parallel: false
+  ep_size: 32
   defer_fsdp_grad_sync: false
 
 loss_fn:
