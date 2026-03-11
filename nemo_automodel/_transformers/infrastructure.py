@@ -394,14 +394,11 @@ def apply_model_infrastructure(
     )
 
     # Handle checkpointer config updates if checkpointer is provided
-    dequantize_base_checkpoint = False
     if checkpointer is not None:
         if checkpointer.config.dequantize_base_checkpoint is None:
-            # try to infer whether the base weights are quantized
             checkpointer.config.dequantize_base_checkpoint = hasattr(
                 getattr(model, "config", None), "quantization_config"
             )
-        dequantize_base_checkpoint = checkpointer.config.dequantize_base_checkpoint
 
     # Apply PEFT and lower precision if configured
     # When on meta device, wrap in init_empty_weights() so new LoRA modules are also on meta device
@@ -444,7 +441,7 @@ def apply_model_infrastructure(
 
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
     pre_shard_hf_state_dict_keys = list(
-        _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=dequantize_base_checkpoint).keys()
+        _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=False).keys()
     )
 
     # Apply freezing before sharding
