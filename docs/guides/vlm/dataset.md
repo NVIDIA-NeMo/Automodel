@@ -136,6 +136,24 @@ dataset:
 This will call `build_my_dataset()` from the specified file with the other keys (e.g., num_blocks) as arguments. This approach allows you to integrate custom datasets via config alone—no need to alter the codebase or package structure.
 
 
+## Custom Chat Template
+
+By default, VLM fine-tuning uses the chat template built into the model's `AutoProcessor`. To use a custom template, add `chat_template` under `dataset:` in your YAML config:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  split: train
+  chat_template: /path/to/template.jinja
+```
+
+Accepted values:
+- A Jinja template string (e.g., `"{% for msg in messages %}..."`)
+- A path to a `.jinja` template file
+- A path to a JSON file containing a `chat_template` key (e.g., `tokenizer_config.json`)
+
+The override is applied to both `processor.chat_template` and `processor.tokenizer.chat_template` before dataset loading.
+
 ## Troubleshooting Tips
 
 - **Tokenization Mismatch?** Ensure your tokenizer aligns with the model's expected inputs.
