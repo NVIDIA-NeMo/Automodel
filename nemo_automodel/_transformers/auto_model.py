@@ -37,28 +37,8 @@ from nemo_automodel.shared.torch_patches import apply_torch_patches
 apply_torch_patches()
 from huggingface_hub import constants as hf_constants  # noqa: E402
 from transformers import (  # noqa: E402
-    AutoModelForCausalLM,
-    AutoModelForSequenceClassification,
     PreTrainedModel,
 )
-
-# @akoumparouli: For backwards compatibility with older versions of transformers,
-# please do not import these classes directly from transformers.
-try:
-    from transformers import AutoModelForImageTextToText  # noqa: E402
-except ImportError:
-    AutoModelForImageTextToText = None
-
-try:
-    from transformers import AutoModelForMultimodalLM  # noqa: E402
-except ImportError:
-    AutoModelForMultimodalLM = None
-
-try:
-    from transformers import AutoModelForTextToWaveform  # noqa: E402
-except ImportError:
-    AutoModelForTextToWaveform = None
-
 from transformers.initialization import no_init_weights  # noqa: E402
 from transformers.models.auto.auto_factory import _BaseAutoModelClass  # noqa: E402
 from transformers.utils import ContextManagers  # noqa: E402
@@ -77,6 +57,7 @@ from nemo_automodel.components.utils.model_utils import (  # noqa: E402
     init_empty_weights,
     resolve_trust_remote_code,
 )
+from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str  # noqa: E402
 
 if TYPE_CHECKING:
@@ -121,7 +102,7 @@ if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
 logger = logging.getLogger(__name__)
 
 
-def _make_autoclass_stub(nemo_name: str, hf_auto_class):
+def _make_autoclass_stub(hf_name):
     """Build a NeMo Auto-Model class or, if the HF parent is unavailable, a helpful stub.
 
     When *hf_auto_class* is not ``None`` the returned class is equivalent to::
@@ -132,9 +113,10 @@ def _make_autoclass_stub(nemo_name: str, hf_auto_class):
     stand-in is returned whose ``from_pretrained`` / ``from_config`` raise
     ``ImportError`` with upgrade instructions.
     """
-    hf_name = nemo_name.removeprefix("NeMo")
+    nemo_name = f"NeMo{hf_name}"
+    HAS_AUTO, hf_auto_class = safe_import("transformers", hf_name)
 
-    if hf_auto_class is not None:
+    if HAS_AUTO:
         return type(
             nemo_name,
             (_BaseNeMoAutoModelClass, hf_auto_class),
@@ -676,19 +658,17 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
 
 #  Concrete Auto-Model classes
-NeMoAutoModelForCausalLM = _make_autoclass_stub("NeMoAutoModelForCausalLM", AutoModelForCausalLM)
+NeMoAutoModelForCausalLM = _make_autoclass_stub("AutoModelForCausalLM")
 
-NeMoAutoModelForImageTextToText = _make_autoclass_stub("NeMoAutoModelForImageTextToText", AutoModelForImageTextToText)
+NeMoAutoModelForImageTextToText = _make_autoclass_stub("AutoModelForImageTextToText")
 
-NeMoAutoModelForMultimodalLM = _make_autoclass_stub("NeMoAutoModelForMultimodalLM", AutoModelForMultimodalLM)
-
-
-NeMoAutoModelForTextToWaveform = _make_autoclass_stub("NeMoAutoModelForTextToWaveform", AutoModelForTextToWaveform)
+NeMoAutoModelForMultimodalLM = _make_autoclass_stub("AutoModelForMultimodalLM")
 
 
-NeMoAutoModelForSequenceClassification = _make_autoclass_stub(
-    "NeMoAutoModelForSequenceClassification", AutoModelForSequenceClassification
-)
+NeMoAutoModelForTextToWaveform = _make_autoclass_stub("AutoModelForTextToWaveform")
+
+
+NeMoAutoModelForSequenceClassification = _make_autoclass_stub("AutoModelForSequenceClassification")
 
 
 class NeMoAutoModelBiencoder:
