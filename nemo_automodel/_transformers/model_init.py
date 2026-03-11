@@ -71,10 +71,10 @@ def _filter_meta_device_from_init_context(contexts):
     return [c for c in contexts if not (isinstance(c, torch.device) and getattr(c, "type", None) == "meta")]
 
 
-def _patched_get_init_context(cls, dtype, is_quantized, _is_ds_init_called):
+def _patched_get_init_context(cls, *args, **kwargs):
     """Wrapper around PreTrainedModel.get_init_context that strips meta device when requested."""
     original = _patched_get_init_context.__wrapped__
-    contexts = original(cls, dtype, is_quantized, _is_ds_init_called)
+    contexts = original(cls, *args, **kwargs)
     if _get_hf_meta_device_disabled():
         return _filter_meta_device_from_init_context(contexts)
     return contexts
@@ -391,3 +391,63 @@ def _filter_kwargs_for_init(model_cls, kwargs: dict) -> dict:
     # We pass `config` positionally.
     allowed.discard("config")
     return {k: v for k, v in kwargs.items() if k in allowed}
+
+
+def resolve_sdpa_method(
+    sdpa_method: list | None = None,
+    device_mesh=None,
+    activation_checkpointing: bool = False,
+) -> list["SDPBackend"] | None:  # noqa: F821
+    """Resolve SDPA backend list from config strings or runtime constraints.
+
+    When *sdpa_method* is provided (e.g. from YAML), string values are
+    converted to :class:`torch.nn.attention.SDPBackend` enum members.
+    Already-resolved ``SDPBackend`` values are passed through unchanged.
+    When ``None``, automatic defaults are applied based on context
+    parallelism and activation checkpointing settings.
+
+    Valid string values (case-insensitive): ``flash_attention``,
+    ``efficient_attention``, ``math``, ``cudnn_attention``.
+
+    Args:
+        sdpa_method: List of backend name strings or SDPBackend enum values,
+            or ``None`` to use automatic defaults.
+        device_mesh: Device mesh for distributed training.
+        activation_checkpointing: Whether activation checkpointing is enabled.
+
+    Returns:
+        Ordered list of :class:`SDPBackend` members, or ``None`` to use
+        PyTorch's default selection.
+    """
+    from torch.nn.attention import SDPBackend
+
+    _NAME_TO_BACKEND = dict(SDPBackend.__members__)
+
+    if sdpa_method is not None:
+        backends = []
+        for entry in sdpa_method:
+            if isinstance(entry, str):
+                key = entry.upper()
+                if key not in _NAME_TO_BACKEND:
+                    raise ValueError(f"Unknown SDPA backend '{entry}'. Valid values: {sorted(_NAME_TO_BACKEND.keys())}")
+                backends.append(_NAME_TO_BACKEND[key])
+            else:
+                backends.append(entry)
+        return backends
+
+    # Auto-select based on runtime constraints
+    cp_size = 1
+    if device_mesh is not None and "cp" in device_mesh.mesh_dim_names:
+        cp_size = device_mesh["cp"].size()
+
+    if cp_size > 1:
+        # CP with DTensor only supports flash and efficient backends;
+        # MATH is not compatible with DTensor.
+        return [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+    elif activation_checkpointing:
+        # For activation checkpointing, disable cudnn SDPA backend because
+        # it may not be selected during recomputation, causing:
+        # "Recomputed values have different metadata than during forward pass."
+        return [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+
+    return None

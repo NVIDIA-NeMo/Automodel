@@ -14,21 +14,21 @@
 
 
 # To run this recipe, please use the following command. Replace --nproc-per-node=8 with the number of GPUs on your node:
-# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml
-# For multi-node, use the following:
-# torchrun --nproc-per-node=8 --nnodes=2 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml
+# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag_peft.yaml
+
+# This recipe requires 8x80GB of GPU memory.
 
 
 step_scheduler:
+  num_epochs: 1
   global_batch_size: 256
   local_batch_size: 8
-  ckpt_every_steps: 1000
-  val_every_steps: 1000  # will run every x number of gradient steps
-  max_steps: 100
+  ckpt_every_steps: 100
+  val_every_steps: 100  # will run every x number of gradient steps
 
 dist_env:
   backend: nccl
-  timeout_minutes: 1
+  timeout_minutes: 10
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
@@ -37,8 +37,22 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
-  trust_remote_code: true
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+
+# torch.compile configuration
+compile:
+  enabled: false
+  mode: "default"  # Options: "default", "reduce-overhead", "max-autotune"
+  fullgraph: false
+  dynamic: true  # Set to false for better performance with fixed shapes
+  backend: null  # Use default backend (inductor)
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  exclude_modules: ["*.out_proj"]  # mamba layers use custom kernels that take in the out_proj.weight directly, thus lora doesn't work here.
+  dim: 8
+  alpha: 32
+  use_triton: True
 
 distributed:
   strategy: fsdp2
@@ -46,9 +60,6 @@ distributed:
   tp_size: 1
   cp_size: 1
   ep_size: 8
-
-  sequence_parallel: false
-  defer_fsdp_grad_sync: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
