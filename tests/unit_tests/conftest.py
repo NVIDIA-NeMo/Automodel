@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
-import sys
 import os
 import sys
 import types
@@ -20,6 +19,9 @@ from pathlib import Path
 from shutil import rmtree
 
 import pytest
+
+os.environ.setdefault("HF_CACHE", "/home/TestData/lite/hf_cache")
+os.environ.setdefault("HF_HOME", "/home/TestData/HF_HOME")
 
 # ---------------------------------------------------------------------------
 # Shim: ``transformers.initialization`` was added in transformers >=4.48.
