@@ -484,29 +484,41 @@ def build_dataloader(
                 logging.warning("IterableDataset does not support sharding; Data may be duplicated across ranks.")
 
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
+        packing_strategy = getattr(cfg_ps, "packing_strategy", "thd")
 
-        # check if packed sequence is supported
+        # check if packed sequence is supported (only for thd strategy)
         supports_seq_lens = _supports_seq_lens(model)
-        if packed_sequence_size > 0 and not supports_seq_lens:
+        if packed_sequence_size > 0 and packing_strategy == "thd" and not supports_seq_lens:
             logging.warning("Packed sequence is not supported without seq_lens; disabling packed sequence")
             packed_sequence_size = 0
 
         # Apply packing if configured
-        # Apply packing if configured
         if packed_sequence_size > 0:
-            logger.info(f"Packing dataset with size: {packed_sequence_size}")
+            logger.info(f"Packing dataset with size: {packed_sequence_size}, strategy: {packing_strategy}")
             if hasattr(ds, "shuffle"):
                 ds = ds.shuffle(seed)
-            # Determine whether to include seq_lens/seq_lens_padded in packed samples.
-            # Priority: explicit config > model.forward signature detection > default False
-            ds = pack_dataset(
-                ds,
-                split=cfg_ds.split,  # Assumes split is defined in dataset config
-                packed_sequence_size=packed_sequence_size,
-                max_packs=getattr(cfg_ps, "max_packs", None),
-                padding_idx=getattr(tokenizer, "pad_token_id", 0),
-                cp_size=cp_size,
-            )
+
+            if packing_strategy == "neat":
+                from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
+
+                ds = neat_pack_dataset(
+                    ds,
+                    split=cfg_ds.split,
+                    pack_size=packed_sequence_size,
+                    max_packs=getattr(cfg_ps, "max_packs", None),
+                    padding_idx=getattr(tokenizer, "pad_token_id", 0),
+                    drop_long_samples=getattr(cfg_ps, "drop_long_samples", False),
+                )
+            else:
+                # "thd" — existing packing logic
+                ds = pack_dataset(
+                    ds,
+                    split=cfg_ds.split,
+                    packed_sequence_size=packed_sequence_size,
+                    max_packs=getattr(cfg_ps, "max_packs", None),
+                    padding_idx=getattr(tokenizer, "pad_token_id", 0),
+                    cp_size=cp_size,
+                )
 
         if isinstance(ds, MegatronPretraining):
             ds = ds.get_dataset(split=cfg_ds.splits_to_build)

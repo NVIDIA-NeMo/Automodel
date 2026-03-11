@@ -376,6 +376,69 @@ def packed_sequence_thd_collater(batch):
     }
 
 
+def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Convert an indexed attention mask to a 4D block-causal mask.
+
+    Args:
+        attention_mask: Integer tensor of shape ``[B, S]`` where each
+            position contains the 1-based index of the sub-sequence it
+            belongs to (0 = padding).
+
+    Returns:
+        Bool tensor of shape ``[B, 1, S, S]`` suitable for
+        ``eager`` / ``sdpa`` attention backends.  ``True`` means the
+        position is **allowed** to attend.
+    """
+    # attention_mask: [B, S]
+    B, S = attention_mask.shape
+
+    # same_doc[b, i, j] = True iff positions i and j belong to the same sub-sequence
+    mask_q = attention_mask.unsqueeze(2)  # [B, S, 1]
+    mask_k = attention_mask.unsqueeze(1)  # [B, 1, S]
+    same_doc = mask_q == mask_k  # [B, S, S]
+
+    # causal: position i can attend to position j only if j <= i
+    causal = torch.ones(S, S, dtype=torch.bool, device=attention_mask.device).tril()  # [S, S]
+
+    # not_padding: both positions must be non-padding (index > 0)
+    not_padding_q = (attention_mask > 0).unsqueeze(2)  # [B, S, 1]
+    not_padding_k = (attention_mask > 0).unsqueeze(1)  # [B, 1, S]
+
+    mask_4d = same_doc & causal.unsqueeze(0) & not_padding_q & not_padding_k  # [B, S, S]
+
+    return mask_4d.unsqueeze(1)  # [B, 1, S, S]
+
+
+def neat_packed_collater(batch: list[dict]) -> dict:
+    """Collater for neat-packed LLM sequences.
+
+    Stacks ``input_ids``, ``labels``, ``position_ids`` and converts the
+    indexed ``attention_mask`` into a 4D block-causal mask.
+
+    Args:
+        batch: List of sample dicts produced by ``neat_pack_dataset``.
+
+    Returns:
+        Dict with batched tensors ready for model forward.
+    """
+    if not batch:
+        return {}
+
+    input_ids = batchify(torch.stack([torch.as_tensor(x["input_ids"]) for x in batch]))
+    labels = batchify(torch.stack([torch.as_tensor(x["labels"]) for x in batch]))
+    position_ids = batchify(torch.stack([torch.as_tensor(x["position_ids"]) for x in batch]))
+    attention_mask = batchify(torch.stack([torch.as_tensor(x["attention_mask"]) for x in batch]))
+
+    attention_mask_4d = _indexed_mask_to_4d_block_causal(attention_mask)
+
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "position_ids": position_ids,
+        "attention_mask": attention_mask_4d,
+    }
+
+
 class SFTSingleTurnPreprocessor:
     """
     Generic single-turn text-to-text SFT (supervised-fine-tuning) pre-processor.
