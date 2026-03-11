@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import pytest
-
 # Ensure the repository root is importable so functional tests can do
 # `from tests.utils.test_utils import run_test_script` reliably across
 # different pytest import modes / runners.
@@ -21,6 +19,8 @@ import pytest
 # causing `ModuleNotFoundError: No module named 'tests.utils'` during collection.)
 import sys
 from pathlib import Path
+
+import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -103,6 +103,8 @@ _OVERRIDES = [
     "qat.quantizer.groupsize",
     "qat.qat_config._target_",
     "qat.qat_config.groupsize",
+    "dataloader.collate_fn.pad_seq_len_divisible",
+    "validation_dataloader.collate_fn.pad_seq_len_divisible",
 ]
 
 

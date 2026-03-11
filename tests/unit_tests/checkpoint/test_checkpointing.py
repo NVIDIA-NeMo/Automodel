@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -266,7 +265,6 @@ class TestIsCustomModel:
 
     def test_module_from_custom_namespace_is_custom(self):
         """A class whose __module__ starts with nemo_automodel.components.models. is custom."""
-        model = torch.nn.Module()
         # Simulate a custom model by patching __module__ on the class's MRO
         FakeCustom = type("FakeCustom", (torch.nn.Module,), {})
         FakeCustom.__module__ = "nemo_automodel.components.models.deepseek_v3.model"
@@ -357,7 +355,7 @@ class TestLoadModelCustomModelGuard:
 
     def _make_checkpointer(self):
         """Create a minimally configured Checkpointer for testing."""
-        from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig, Checkpointer
+        from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
         config = CheckpointingConfig(
             enabled=True,
@@ -417,9 +415,7 @@ class TestLoadModelCustomModelGuard:
 
         with (
             patch("os.path.exists", return_value=True),
-            patch(
-                "nemo_automodel.components.checkpoint.checkpointing.ModelState"
-            ) as MockModelState,
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as MockModelState,
             patch(
                 "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
                 side_effect=lambda m, sd, **kw: sd,
