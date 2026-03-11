@@ -1240,7 +1240,7 @@ def _convert_checkpoint_with_transformers(
         # Now apply all the conversions
         for first_param_name, mapping in param_name_to_mapping.items():
             try:
-                realized_value, _ = mapping.convert(first_param_name, model=model, config=model.config)
+                realized_value = mapping.convert(first_param_name, model=model, config=model.config)
                 for target_name, param in realized_value.items():
                     param = param[0] if isinstance(param, list) else param
                     converted_state_dict[target_name] = param
