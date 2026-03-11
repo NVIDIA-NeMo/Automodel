@@ -57,7 +57,7 @@ from nemo_automodel.components.utils.model_utils import (  # noqa: E402
     init_empty_weights,
     resolve_trust_remote_code,
 )
-from nemo_automodel.shared.import_utils import safe_import
+from nemo_automodel.shared.import_utils import safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str  # noqa: E402
 
 if TYPE_CHECKING:
@@ -114,7 +114,7 @@ def _make_autoclass_stub(hf_name):
     ``ImportError`` with upgrade instructions.
     """
     nemo_name = f"NeMo{hf_name}"
-    HAS_AUTO, hf_auto_class = safe_import(f"transformers.{hf_name}")
+    HAS_AUTO, hf_auto_class = safe_import_from("transformers", hf_name)
 
     if HAS_AUTO:
         return type(
