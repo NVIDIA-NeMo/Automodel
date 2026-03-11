@@ -81,6 +81,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.mistral3.model", "Ministral3ForCausalLM"),
         ),
         (
+            "MixtralForCausalLM",
+            ("nemo_automodel.components.models.mixtral.model", "MixtralForCausalLM"),
+        ),
+        (
             "NemotronHForCausalLM",
             ("nemo_automodel.components.models.nemotron_v3.model", "NemotronHForCausalLM"),
         ),
