@@ -68,6 +68,7 @@ class ConsolidatedHFAddon:
             _maybe_save_custom_model_code(original_model_path, hf_metadata_dir)
             # save the config.json file
             if hasattr(model_part, "config"):
+                _maybe_strip_quantization_config(model_part)
                 with open(os.path.join(hf_metadata_dir, "config.json"), "w") as f:
                     f.write(model_part.config.to_json_string())
             # save the generation_config.json file
@@ -327,6 +328,27 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
             final_target_modules = remapped
 
     return sorted(list(final_target_modules))
+
+
+def _maybe_strip_quantization_config(model_part: nn.Module) -> None:
+    """Remove ``quantization_config`` from the HF config when no parameters are quantized.
+
+    Models loaded from quantized checkpoints (e.g. mxfp4 GPT-OSS) carry a
+    ``quantization_config`` on their ``config`` object.  After dequantization
+    all parameters are standard floating-point, but the stale config entry would
+    still be written to the saved ``config.json``.  This strips it so the output
+    checkpoint is a clean bf16 checkpoint, consistent with e.g.
+    ``unsloth/gpt-oss-20b-BF16``.
+    """
+    config = getattr(model_part, "config", None)
+    if config is None or not hasattr(config, "quantization_config"):
+        return
+
+    _QUANTIZED_DTYPES = frozenset({torch.uint8, torch.int8})
+    if any(p.dtype in _QUANTIZED_DTYPES for p in model_part.parameters()):
+        return
+
+    delattr(config, "quantization_config")
 
 
 def _maybe_save_custom_model_code(original_model_path: str | None, hf_metadata_dir: str) -> None:
