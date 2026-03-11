@@ -379,7 +379,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             loss=loss,
             logits=logits,
             past_key_values=past_key_values if use_cache else None,
-            hidden_states=hidden_states if self.output_hidden_states else None,
+            hidden_states=(hidden_states,) if output_hidden_states else None,
             attentions=None,
         )
 
