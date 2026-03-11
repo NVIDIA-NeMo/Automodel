@@ -80,6 +80,9 @@ class MockNemotronV3Config:
         for key, value in overrides.items():
             setattr(self, key, value)
 
+    def to_dict(self):
+        return vars(self)
+
 
 class TestNemotronV3Model:
     """Test NemotronV3Model base model."""

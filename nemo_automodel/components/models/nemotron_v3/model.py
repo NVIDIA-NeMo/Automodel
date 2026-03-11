@@ -77,6 +77,7 @@ class NemotronV3Model(nn.Module):
             shared_expert_inter_dim=config.moe_shared_expert_intermediate_size,
             shared_expert_activation="relu2",  # Use ReLU² for shared experts
             force_e_score_correction_bias=True,  # NemotronV3 checkpoint has this buffer
+            moe_latent_size=getattr(config, "moe_latent_size", None),
         )
 
         # Embeddings
@@ -229,6 +230,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         # Base model
         self.model = NemotronV3Model(config, backend=self.backend)
+        self.output_hidden_states = config.to_dict().get("output_hidden_states", False)
 
         # LM head
         dtype = get_dtype(config.torch_dtype, torch.bfloat16)
