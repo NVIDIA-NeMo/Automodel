@@ -114,7 +114,7 @@ def _make_autoclass_stub(hf_name):
     ``ImportError`` with upgrade instructions.
     """
     nemo_name = f"NeMo{hf_name}"
-    HAS_AUTO, hf_auto_class = safe_import("transformers", hf_name)
+    HAS_AUTO, hf_auto_class = safe_import(f"transformers.{hf_name}")
 
     if HAS_AUTO:
         return type(
