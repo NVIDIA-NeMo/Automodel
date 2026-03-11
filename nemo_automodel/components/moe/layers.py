@@ -603,7 +603,7 @@ class MoE(nn.Module):
         else:
             self.shared_experts = None
             self.shared_expert_gate = None
-        
+
         # When enabled, input is projected to latent space before MoE and back after
         if config.moe_latent_size is not None:
             self.fc1_latent_proj = initialize_linear_module(
@@ -646,7 +646,7 @@ class MoE(nn.Module):
             token_mask = (~padding_mask).flatten()
         else:
             token_mask = torch.ones(x.size(0), dtype=torch.bool, device=x.device)
-        
+
         # Apply latent projection before MoE if enabled
         if self.fc1_latent_proj is not None:
             x_latent = self.fc1_latent_proj(x)

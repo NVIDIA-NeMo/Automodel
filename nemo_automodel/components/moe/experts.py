@@ -242,7 +242,9 @@ class GroupedExperts(nn.Module):
 
         if self.expert_bias:
             self.gate_up_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, up_proj_dim, dtype=config.dtype))
-            self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.expert_dim, dtype=config.dtype))
+            self.down_proj_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, config.expert_dim, dtype=config.dtype)
+            )
         else:
             self.gate_up_proj_bias = None
             self.down_proj_bias = None

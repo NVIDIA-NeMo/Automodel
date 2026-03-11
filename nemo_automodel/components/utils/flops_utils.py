@@ -540,9 +540,7 @@ def _nemotronh_moe_layer_flops(config, gbs, seq_len):
         latent_proj_flops = 0
 
     # Routed experts: num_experts_per_tok activated, each up_proj + down_proj
-    routed_expert_flops = (
-        6 * num_tokens * config.num_experts_per_tok * expert_dim * config.moe_intermediate_size * 2
-    )
+    routed_expert_flops = 6 * num_tokens * config.num_experts_per_tok * expert_dim * config.moe_intermediate_size * 2
 
     # Shared expert: always active on full hidden_size, up_proj + down_proj
     shared_expert_flops = 6 * num_tokens * hs * config.moe_shared_expert_intermediate_size * 2
