@@ -38,12 +38,27 @@ apply_torch_patches()
 from huggingface_hub import constants as hf_constants  # noqa: E402
 from transformers import (  # noqa: E402
     AutoModelForCausalLM,
-    AutoModelForImageTextToText,
-    AutoModelForMultimodalLM,
     AutoModelForSequenceClassification,
-    AutoModelForTextToWaveform,
     PreTrainedModel,
 )
+
+# @akoumparouli: For backwards compatibility with older versions of transformers,
+# please do not import these classes directly from transformers.
+try:
+    from transformers import AutoModelForImageTextToText  # noqa: E402
+except ImportError:
+    AutoModelForImageTextToText = None
+
+try:
+    from transformers import AutoModelForMultimodalLM  # noqa: E402
+except ImportError:
+    AutoModelForMultimodalLM = None
+
+try:
+    from transformers import AutoModelForTextToWaveform  # noqa: E402
+except ImportError:
+    AutoModelForTextToWaveform = None
+
 from transformers.initialization import no_init_weights  # noqa: E402
 from transformers.models.auto.auto_factory import _BaseAutoModelClass  # noqa: E402
 from transformers.utils import ContextManagers  # noqa: E402
@@ -104,6 +119,51 @@ if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
 
 
 logger = logging.getLogger(__name__)
+
+
+def _make_autoclass_stub(nemo_name: str, hf_auto_class):
+    """Build a NeMo Auto-Model class or, if the HF parent is unavailable, a helpful stub.
+
+    When *hf_auto_class* is not ``None`` the returned class is equivalent to::
+
+        class <nemo_name>(_BaseNeMoAutoModelClass, <hf_auto_class>): pass
+
+    When the HF class could not be imported (older transformers), a lightweight
+    stand-in is returned whose ``from_pretrained`` / ``from_config`` raise
+    ``ImportError`` with upgrade instructions.
+    """
+    hf_name = nemo_name.removeprefix("NeMo")
+
+    if hf_auto_class is not None:
+        return type(
+            nemo_name,
+            (_BaseNeMoAutoModelClass, hf_auto_class),
+            {
+                "__doc__": f"Drop-in replacement for ``transformers.{hf_name}`` with custom-kernels.",
+                "__module__": __name__,
+            },
+        )
+
+    import transformers
+
+    msg = (
+        f"{nemo_name} requires a newer version of transformers that provides "
+        f"transformers.{hf_name} (you have transformers=={transformers.__version__}). "
+        f"Please upgrade:\n  pip install -U transformers"
+    )
+
+    class _Stub:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            raise ImportError(msg)
+
+        @classmethod
+        def from_config(cls, *args, **kwargs):
+            raise ImportError(msg)
+
+    _Stub.__name__ = nemo_name
+    _Stub.__qualname__ = nemo_name
+    return _Stub
 
 
 def _maybe_dequantize_fp8_for_peft(hf_native_quant_cfg, peft_config, pretrained_path):
@@ -616,131 +676,19 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
 
 #  Concrete Auto-Model classes
-class NeMoAutoModelForCausalLM(_BaseNeMoAutoModelClass, AutoModelForCausalLM):
-    """
-    Drop-in replacement for ``transformers.AutoModelForCausalLM`` that includes custom-kernels.
+NeMoAutoModelForCausalLM = _make_autoclass_stub("NeMoAutoModelForCausalLM", AutoModelForCausalLM)
 
-    The class only overrides ``from_pretrained`` and ``from_config`` to add the
-    optional ``use_liger_kernel`` flag.  If the flag is ``True`` (default) and
-    the Liger kernel is available, the model's attention layers are
-    monkey-patched in place.  If patching fails for any reason, the call is
-    retried once with ``use_liger_kernel=False`` so that users still obtain a
-    functional model.
+NeMoAutoModelForImageTextToText = _make_autoclass_stub("NeMoAutoModelForImageTextToText", AutoModelForImageTextToText)
+
+NeMoAutoModelForMultimodalLM = _make_autoclass_stub("NeMoAutoModelForMultimodalLM", AutoModelForMultimodalLM)
 
 
-    TODO(@akoumpa): extend this beyond liger_kernel.
-
-    Notes:
-    -----
-    - No changes are made to the model's public API; forward signatures,
-      generation utilities, and weight shapes remain identical.
-    - Only decoder-style (causal) architectures are currently supported by the
-      Liger patch.  Unsupported models will silently fall back.
-
-    Examples:
-    --------
-    >>> model = NeMoAutoModelForCausalLM.from_pretrained("gpt2")            # try Liger
-    >>> model = NeMoAutoModelForCausalLM.from_pretrained(
-    ...     "gpt2", use_liger_kernel=False)                                 # skip Liger
-    """
-
-    pass
+NeMoAutoModelForTextToWaveform = _make_autoclass_stub("NeMoAutoModelForTextToWaveform", AutoModelForTextToWaveform)
 
 
-class NeMoAutoModelForImageTextToText(_BaseNeMoAutoModelClass, AutoModelForImageTextToText):
-    """Drop-in replacement for ``transformers.AutoModelForImageTextToText`` with custom-kernels.
-
-    The class only overrides ``from_pretrained`` and ``from_config`` to add the
-    optional ``use_liger_kernel`` flag.  If the flag is ``True`` (default) and
-    the Liger kernel is available, the model's attention layers are
-    monkey-patched in place.  If patching fails for any reason, the call is
-    retried once with ``use_liger_kernel=False`` so that users still obtain a
-    functional model.
-
-
-    @akoumpa: currently only supporting liger_kernel for demonstration purposes.
-
-    Notes:
-    -----
-    - No changes are made to the model's public API; forward signatures,
-      generation utilities, and weight shapes remain identical.
-    - Only decoder-style (causal) architectures are currently supported by the
-      Liger patch.  Unsupported models will silently fall back.
-
-    Examples:
-    --------
-    >>> model = NeMoAutoModelForImageTextToText.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct") # try Liger
-    >>> model = NeMoAutoModelForImageTextToText.from_pretrained(
-    ...     "Qwen/Qwen2.5-VL-3B-Instruct", use_liger_kernel=False)                            # skip Liger
-    """
-
-    pass
-
-
-class NeMoAutoModelForMultimodalLM(_BaseNeMoAutoModelClass, AutoModelForMultimodalLM):
-    """Drop-in replacement for ``transformers.AutoModelForMultimodalLM`` with custom-kernels."""
-
-    pass
-
-
-class NeMoAutoModelForSequenceClassification(_BaseNeMoAutoModelClass, AutoModelForSequenceClassification):
-    """Drop-in replacement for ``transformers.AutoModelForSequenceClassification`` with custom-kernels.
-
-    The class only overrides ``from_pretrained`` and ``from_config`` to add the
-    optional ``use_liger_kernel`` flag.  If the flag is ``True`` (default) and
-    the Liger kernel is available, the model's attention layers are
-    monkey-patched in place.  If patching fails for any reason, the call is
-    retried once with ``use_liger_kernel=False`` so that users still obtain a
-    functional model.
-
-
-    @akoumpa: currently only supporting liger_kernel for demonstration purposes.
-
-    Notes:
-    -----
-    - No changes are made to the model's public API; forward signatures,
-      generation utilities, and weight shapes remain identical.
-    - Only decoder-style (causal) architectures are currently supported by the
-      Liger patch.  Unsupported models will silently fall back.
-
-    Examples:
-    --------
-    >>> model = NeMoAutoModelForSequenceClassification.from_pretrained("bert-base-uncased") # try Liger
-    >>> model = NeMoAutoModelForSequenceClassification.from_pretrained(
-    ...     "bert-base-uncased", use_liger_kernel=False)                            # skip Liger
-    """
-
-    pass
-
-
-class NeMoAutoModelForTextToWaveform(_BaseNeMoAutoModelClass, AutoModelForTextToWaveform):
-    """Drop-in replacement for ``transformers.AutoModelForTextToWaveform`` with custom-kernels.
-
-    The class only overrides ``from_pretrained`` and ``from_config`` to add the
-    optional ``use_liger_kernel`` flag.  If the flag is ``True`` (default) and
-    the Liger kernel is available, the model's attention layers are
-    monkey-patched in place.  If patching fails for any reason, the call is
-    retried once with ``use_liger_kernel=False`` so that users still obtain a
-    functional model.
-
-
-    @akoumpa: currently only supporting liger_kernel for demonstration purposes.
-
-    Notes:
-    -----
-    - No changes are made to the model's public API; forward signatures,
-      generation utilities, and weight shapes remain identical.
-    - Only decoder-style (causal) architectures are currently supported by the
-      Liger patch.  Unsupported models will silently fall back.
-
-    Examples:
-    --------
-    >>> model = NeMoAutoModelForTextToWaveform.from_pretrained("facebook/musicgen-small") # try Liger
-    >>> model = NeMoAutoModelForTextToWaveform.from_pretrained(
-    ...     "facebook/musicgen-small", use_liger_kernel=False)                            # skip Liger
-    """
-
-    pass
+NeMoAutoModelForSequenceClassification = _make_autoclass_stub(
+    "NeMoAutoModelForSequenceClassification", AutoModelForSequenceClassification
+)
 
 
 class NeMoAutoModelBiencoder:
