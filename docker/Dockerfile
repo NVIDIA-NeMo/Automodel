@@ -74,7 +74,17 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     cd ../ && rm -rf TransformerEngine; \
     fi
 
-# Install Deepep
+# Install rdma-core for Hybrid EP multi-node RDMA
+RUN mkdir -p /workspace && cd /workspace && \
+    git clone https://github.com/linux-rdma/rdma-core.git && \
+    cd rdma-core && git checkout tags/v60.0 && sh build.sh
+ENV RDMA_CORE_HOME=/workspace/rdma-core/build
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libnvidia-ml-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Deepep (Hybrid EP)
 COPY docker/common/deepep.patch /opt/deepep.patch
 ARG INSTALL_DEEPEP=True
 ARG DEEPEP_COMMIT=7febc6e25660af0f54d95dd781ecdcd62265ecca
@@ -86,7 +96,7 @@ RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
     git checkout FETCH_HEAD && \
     patch -p1 < /opt/deepep.patch && \
     pip install --no-cache-dir nvidia-nvshmem-cu13==3.4.5 && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
+    HYBRID_EP_MULTINODE=1 TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
     rm -rf /opt/deepep.patch && \
     rm -rf DeepEP; \
     fi
