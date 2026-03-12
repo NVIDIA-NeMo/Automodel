@@ -165,7 +165,7 @@ docs = [
 ]
 linting = [
     "pre-commit>=4.2.0",
-    "ruff~=0.15.0",
+    "ruff~=0.9.0",
     "import-linter~=2.4",
     "ty>=0.0.20",
 ]
@@ -304,6 +304,8 @@ select = [
     "I",    # isort
     "D101", # docstring
     "D103",
+    "S301", # no pickle
+    "S403", # no pickle
 ]
 
 ignore = [
