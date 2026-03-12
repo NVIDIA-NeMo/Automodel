@@ -11,7 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+
 import pytest
+
+os.environ.setdefault("HF_CACHE", "/home/TestData/lite/hf_cache")
+os.environ.setdefault("HF_HOME", "/home/TestData/HF_HOME")
 
 # Ensure the repository root is importable so functional tests can do
 # `from tests.utils.test_utils import run_test_script` reliably across
