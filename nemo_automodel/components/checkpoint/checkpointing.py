@@ -138,10 +138,12 @@ class CheckpointingConfig:
         if self.save_consolidated or False:
             if not self.v4_compatible:
                 logging.warning(
-                    "save_consolidated=True but v4_compatible=False; checkpoint assets may be not compatible with transformers v4; set --checkpoint.v4_compatible=True to enable (experimental"
+                    "save_consolidated=True but v4_compatible=False; "
+                    "checkpoint assets may be not compatible with transformers v4; "
+                    "[experimental] set --checkpoint.v4_compatible=True to enable"
                 )
             else:
-                logging.warning("v4_compatible=True enables transformers v4 compatibility (experimental)")
+                logging.warning("[experimental] v4_compatible=True enables transformers v4 compatibility")
 
         # Async is only enabled for torch >= 2.9.0 currently because of large API changes in async DCP from 2.8.0 to 2.9.0
         if self.is_async and not _is_geq_torch_2_9():
