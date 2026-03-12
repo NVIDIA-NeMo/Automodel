@@ -14,12 +14,16 @@
 
 import logging
 import types
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
 from nemo_automodel._transformers.auto_model import (
+    _MAX_BUILD_RETRIES,
+    NeMoAutoModelForCausalLM,
+    _BaseNeMoAutoModelClass,
     _consume_config_overrides,
     _get_next_fallback_attn,
     _init_model,
@@ -42,6 +46,7 @@ class TestPatchAttention:
 
     def test__patch_attention_basic(self):
         """Test basic _patch_attention functionality."""
+
         # Create a real object with a forward method to test the actual wrapping
         class DummyModule:
             def forward(self, x):
@@ -140,15 +145,18 @@ class TestUtilityFunctions:
         assert _get_next_fallback_attn("none") == "eager"
         assert _get_next_fallback_attn("legacy_attention") == "eager"
 
-    @pytest.mark.parametrize("attn_impl,expected", [
-        ("flash_attention_3", "flash_attention_2"),
-        ("flash_attention_2", "sdpa"),
-        ("sdpa", "eager"),
-        ("eager", "eager"),
-        ("invalid", "eager"),
-        ("custom_impl", "eager"),
-        ("", "eager"),
-    ])
+    @pytest.mark.parametrize(
+        "attn_impl,expected",
+        [
+            ("flash_attention_3", "flash_attention_2"),
+            ("flash_attention_2", "sdpa"),
+            ("sdpa", "eager"),
+            ("eager", "eager"),
+            ("invalid", "eager"),
+            ("custom_impl", "eager"),
+            ("", "eager"),
+        ],
+    )
     def test_get_next_fallback_attn_parametrized(self, attn_impl, expected):
         """Parametrized test for _get_next_fallback_attn covering all scenarios."""
         assert _get_next_fallback_attn(attn_impl) == expected
@@ -234,7 +242,6 @@ def test_patch_liger_kernel_success(monkeypatch):
     attn_mock.assert_not_called()
 
 
-
 def test_liger_not_available(monkeypatch):
     """
     Asked for Liger but HAS_LIGER_KERNEL is False.
@@ -312,11 +319,13 @@ def test_patch_liger_kernel_skips_non_nn_module(monkeypatch, caplog):
 # Tests for _get_mixin_wrapped_class
 # =============================================================================
 
+
 class TestGetMixinWrappedClass:
     """Test cases for _get_mixin_wrapped_class function."""
 
     def test_returns_original_if_already_has_mixin(self):
         """When model class already inherits from HFCheckpointingMixin, return it unchanged."""
+
         class ModelWithMixin(HFCheckpointingMixin, torch.nn.Module):
             pass
 
@@ -325,6 +334,7 @@ class TestGetMixinWrappedClass:
 
     def test_creates_wrapper_for_hf_class_with_correct_attributes(self):
         """For HF model classes, create a wrapper inheriting from both and preserving attributes."""
+
         class PlainModel(torch.nn.Module):
             pass
 
@@ -344,6 +354,7 @@ class TestGetMixinWrappedClass:
 # Tests for _apply_peft_and_lower_precision
 # =============================================================================
 
+
 class TestApplyPeftAndLowerPrecision:
     """Test cases for _apply_peft_and_lower_precision function."""
 
@@ -357,7 +368,7 @@ class TestApplyPeftAndLowerPrecision:
             patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules") as mock_apply_lora,
             caplog.at_level(logging.INFO),
         ):
-            result = _apply_peft_and_lower_precision(
+            _apply_peft_and_lower_precision(
                 mock_model,
                 tp_size=2,  # TP > 1
                 autopipeline=None,
@@ -379,10 +390,10 @@ class TestApplyPeftAndLowerPrecision:
         mock_autopipeline = MagicMock()
 
         with (
-            patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules") as mock_apply_lora,
+            patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules"),
             caplog.at_level(logging.INFO),
         ):
-            result = _apply_peft_and_lower_precision(
+            _apply_peft_and_lower_precision(
                 mock_model,
                 tp_size=1,
                 autopipeline=mock_autopipeline,  # PP enabled
@@ -403,7 +414,7 @@ class TestApplyPeftAndLowerPrecision:
         with patch("nemo_automodel._transformers.infrastructure.apply_fp8_to_model") as mock_apply_fp8:
             mock_apply_fp8.return_value = mock_model
 
-            result = _apply_peft_and_lower_precision(
+            _apply_peft_and_lower_precision(
                 mock_model,
                 tp_size=1,
                 autopipeline=None,
@@ -443,11 +454,10 @@ class TestApplyPeftAndLowerPrecision:
             assert hasattr(result, "_qat_mode")
 
 
-
-
 # =============================================================================
 # Tests for _consume_config_overrides and _filter_kwargs_for_init
 # =============================================================================
+
 
 class TestConsumeConfigOverrides:
     """Test cases for _consume_config_overrides function."""
@@ -485,6 +495,7 @@ class TestFilterKwargsForInit:
 
     def test_filter_kwargs_for_init_removes_unknown_kwargs(self):
         """Filters out kwargs not in model __init__ signature."""
+
         class ModelWithSpecificInit:
             def __init__(self, config, a, b):
                 pass
@@ -499,6 +510,7 @@ class TestFilterKwargsForInit:
 
     def test_filter_kwargs_for_init_keeps_all_with_var_keyword(self):
         """If __init__ has **kwargs, returns all kwargs unchanged."""
+
         class ModelWithVarKwargs:
             def __init__(self, config, **kwargs):
                 pass
@@ -528,6 +540,7 @@ class TestNeedSetupCacheClassesMapping:
 
         # Re-import to trigger the shim code
         import nemo_automodel._transformers.auto_model as mod
+
         importlib.reload(mod)
 
         # The sentinel should still be there (shim didn't overwrite)
@@ -548,6 +561,7 @@ class TestNeedSetupCacheClassesMapping:
 
         # Re-import to trigger the shim
         import nemo_automodel._transformers.auto_model as mod
+
         importlib.reload(mod)
 
         assert hasattr(gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING")
@@ -707,6 +721,172 @@ class TestModelMappingKeyErrorFallback:
 
         assert is_custom is False
         mock_wrap.assert_called_once_with(FakeModel)
+
+
+class TestFromPretrainedSafetensorsFallback:
+    """Tests for the use_safetensors=False fallback in _from_pretrained_parent_class (issue #1511)."""
+
+    @staticmethod
+    @contextmanager
+    def _patch_parent_fp(side_effects):
+        """Inject from_pretrained into AutoModelForCausalLM so super() finds it in the MRO.
+
+        super() in _from_pretrained_parent_class (defined on _BaseNeMoAutoModelClass)
+        starts resolution at AutoModelForCausalLM, so we place the mock there.
+        """
+        from transformers import AutoModelForCausalLM as HFAutoModelForCausalLM
+
+        had_original = "from_pretrained" in HFAutoModelForCausalLM.__dict__
+        original = HFAutoModelForCausalLM.__dict__.get("from_pretrained")
+        calls = []
+        effects = list(side_effects)
+        idx = [0]
+
+        def fake_fp(cls_arg, *args, **kwargs):
+            calls.append(kwargs.copy())
+            i = idx[0]
+            idx[0] += 1
+            if i < len(effects):
+                val = effects[i]
+                if isinstance(val, Exception):
+                    raise val
+                return val
+            raise RuntimeError("Unexpected extra call to from_pretrained")
+
+        HFAutoModelForCausalLM.from_pretrained = classmethod(fake_fp)
+        try:
+            yield calls
+        finally:
+            if had_original:
+                HFAutoModelForCausalLM.from_pretrained = original
+            else:
+                del HFAutoModelForCausalLM.from_pretrained
+
+    def test_retries_with_use_safetensors_false_on_oserror(self):
+        """When super().from_pretrained raises OSError, retry with use_safetensors=False."""
+        sentinel = MagicMock()
+        with self._patch_parent_fp([OSError("model.safetensors not found"), sentinel]) as calls:
+            result = NeMoAutoModelForCausalLM._from_pretrained_parent_class("test-model")
+        assert result is sentinel
+        assert len(calls) == 2
+        assert calls[1].get("use_safetensors") is False
+
+    def test_reraises_oserror_when_safetensors_already_false(self):
+        """When use_safetensors is already False, the OSError is not swallowed."""
+        with self._patch_parent_fp([OSError("file not found")]) as calls:
+            with pytest.raises(OSError, match="file not found"):
+                NeMoAutoModelForCausalLM._from_pretrained_parent_class(
+                    "test-model",
+                    use_safetensors=False,
+                )
+        assert len(calls) == 1
+
+    def test_restores_class_name_after_success(self):
+        """cls.__name__ is restored after a successful load."""
+        original_name = NeMoAutoModelForCausalLM.__name__
+        with self._patch_parent_fp([MagicMock()]):
+            NeMoAutoModelForCausalLM._from_pretrained_parent_class("test-model")
+        assert NeMoAutoModelForCausalLM.__name__ == original_name
+
+    def test_restores_class_name_after_oserror_fallback(self):
+        """cls.__name__ is restored even when the OSError fallback path is taken."""
+        original_name = NeMoAutoModelForCausalLM.__name__
+        with self._patch_parent_fp([OSError("not found"), MagicMock()]):
+            NeMoAutoModelForCausalLM._from_pretrained_parent_class("test-model")
+        assert NeMoAutoModelForCausalLM.__name__ == original_name
+
+    def test_restores_class_name_after_unrecoverable_error(self):
+        """cls.__name__ is restored when the OSError cannot be recovered."""
+        original_name = NeMoAutoModelForCausalLM.__name__
+        with self._patch_parent_fp([OSError("permission denied")]):
+            with pytest.raises(OSError):
+                NeMoAutoModelForCausalLM._from_pretrained_parent_class(
+                    "test-model",
+                    use_safetensors=False,
+                )
+        assert NeMoAutoModelForCausalLM.__name__ == original_name
+
+
+class TestBuildModelRetryDepth:
+    """Tests for _build_model retry depth limiting (issue #1510)."""
+
+    @staticmethod
+    def _make_build_kwargs():
+        """Minimal kwargs for _build_model with all required parameters."""
+        mock_config = MagicMock()
+        mock_config.quantization_config = None
+        mesh = MagicMock()
+        mesh.tp_size = 1
+        mesh.cp_size = 1
+        return dict(
+            is_hf_model=True,
+            use_liger_kernel=False,
+            use_sdpa_patching=False,
+            sdpa_method=None,
+            torch_dtype="auto",
+            attn_implementation="eager",
+            quantization_config=None,
+            force_hf=False,
+            model_wrapper=None,
+            autopipeline=None,
+            parallelize_fn=None,
+            qat_quantizer=None,
+            mesh=mesh,
+            loss_fn=None,
+            peft_config=None,
+            fp8_config=None,
+            compile_config=None,
+            load_base_model=True,
+        ), mock_config
+
+    def test_raises_after_max_retries_instead_of_recursion(self):
+        """Deterministic errors propagate after _MAX_BUILD_RETRIES (no RecursionError)."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
+            patch("nemo_automodel._transformers.auto_model._init_model") as mock_init,
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            mock_init.side_effect = ValueError("model does not support sdpa")
+            with pytest.raises(ValueError, match="does not support"):
+                _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+            assert mock_init.call_count == _MAX_BUILD_RETRIES + 1
+
+    def test_immediate_raise_when_already_at_max_depth(self):
+        """When _retry_depth is already at _MAX_BUILD_RETRIES, errors propagate on first attempt."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        build_kwargs["_retry_depth"] = _MAX_BUILD_RETRIES
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
+            patch("nemo_automodel._transformers.auto_model._init_model") as mock_init,
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            mock_init.side_effect = ValueError("model does not support sdpa")
+            with pytest.raises(ValueError, match="does not support"):
+                _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+            assert mock_init.call_count == 1
+
+    def test_retry_succeeds_within_limit(self):
+        """When the retried call succeeds, the model is returned normally."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        sentinel_model = MagicMock()
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
+            patch("nemo_automodel._transformers.auto_model._init_model") as mock_init,
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            mock_init.side_effect = [
+                ValueError("model does not support sdpa"),
+                (False, sentinel_model),
+            ]
+            result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+            assert result is sentinel_model
+            assert mock_init.call_count == 2
 
 
 class TestNeMoAutoModelForMultimodalLM:
