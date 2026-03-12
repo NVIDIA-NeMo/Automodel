@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import os
 import re
 import shutil
@@ -30,12 +31,12 @@ from transformers.tokenization_utils_base import (
     BatchEncoding,
     EncodedInput,
     PreTokenizedInput,
+    PreTrainedTokenizerBase,
     TextInput,
     TruncationStrategy,
 )
 from transformers.utils import PaddingStrategy, TensorType, add_end_docstrings, logging, to_py_obj
 from transformers.utils.generic import is_torch_tensor
-from transformers.utils.hub import PushToHubMixin
 from transformers.utils.import_utils import is_mistral_common_available, is_torch_available, requires
 
 
@@ -166,7 +167,7 @@ class MistralTokenizerType(str, Enum):
 
 
 @requires(backends=("mistral-common",))
-class MistralCommonBackend(PushToHubMixin):
+class MistralCommonBackend(PreTrainedTokenizerBase):
     """
     Class to wrap `mistral-common` tokenizers.
 
@@ -296,6 +297,20 @@ class MistralCommonBackend(PushToHubMixin):
 
         self._cache_get_vocab: dict[str, int] | None = None
 
+    def __setattr__(self, key, value):
+        try:
+            super().__setattr__(key, value)
+        except AttributeError:
+            # PreTrainedTokenizerBase.__setattr__ routes special-token assignments
+            # through _special_tokens_map which this class does not use.
+            # Fall back to our own storage for pad token overrides.
+            if key == "pad_token_id":
+                object.__setattr__(self, "_pad_token_id_override", value)
+            elif key == "pad_token":
+                object.__setattr__(self, "_pad_token_override", value)
+            else:
+                object.__setattr__(self, key, value)
+
     @staticmethod
     def clean_up_tokenization(text: str) -> str:
         """
@@ -362,6 +377,32 @@ class MistralCommonBackend(PushToHubMixin):
     def pad_token_id(self, value: int | None) -> None:
         """Set the padding token id, overriding the underlying tokenizer's value."""
         self._pad_token_id_override = value
+
+    def __setattr__(self, key, value):
+        """Route pad_token_id/pad_token through our overrides AND the parent.
+
+        PreTrainedTokenizerBase.__setattr__ intercepts special-token assignments
+        and stores them in _special_tokens_map, bypassing our @property setters.
+        We set _pad_token_id_override / _pad_token_override so our property
+        getters work, then also call super() so _special_tokens_map stays
+        consistent for any HF code that reads it directly.
+        """
+        if key == "pad_token_id":
+            object.__setattr__(self, "_pad_token_id_override", value)
+            # Also let the parent update _special_tokens_map for HF compat
+            try:
+                super().__setattr__(key, value)
+            except (AttributeError, IndexError, TypeError):
+                pass  # Parent may fail during early __init__ or with invalid ids
+            return
+        if key == "pad_token":
+            object.__setattr__(self, "_pad_token_override", value)
+            try:
+                super().__setattr__(key, value)
+            except (AttributeError, IndexError, TypeError):
+                pass
+            return
+        super().__setattr__(key, value)
 
     @property
     def bos_token(self) -> str:
@@ -1906,6 +1947,27 @@ class MistralCommonBackend(PushToHubMixin):
                 force_download=force_download,
                 local_files_only=local_files_only,
             )
+            source_dir = Path(tokenizer_path).parent
+            cls._fetch_supplementary_files(
+                repo_id=str(pretrained_model_name_or_path),
+                source_dir=source_dir,
+                cache_dir=cache_dir,
+                token=token,
+                revision=revision,
+                force_download=force_download,
+                local_files_only=local_files_only,
+            )
+            tokenizer = cls(
+                tokenizer_path=tokenizer_path,
+                mode=mode,
+                model_max_length=model_max_length,
+                padding_side=padding_side,
+                truncation_side=truncation_side,
+                model_input_names=model_input_names,
+                clean_up_tokenization_spaces=clean_up_tokenization_spaces,
+            )
+            tokenizer._source_dir = source_dir
+            return tokenizer
         else:
             valid_tokenizer_files = []
             tokenizer_file: str
@@ -1937,7 +1999,7 @@ class MistralCommonBackend(PushToHubMixin):
 
             tokenizer_path = os.path.join(pretrained_model_name_or_path, tokenizer_file)
 
-        return cls(
+        tokenizer = cls(
             tokenizer_path=tokenizer_path,
             mode=mode,
             model_max_length=model_max_length,
@@ -1946,6 +2008,106 @@ class MistralCommonBackend(PushToHubMixin):
             model_input_names=model_input_names,
             clean_up_tokenization_spaces=clean_up_tokenization_spaces,
         )
+        tokenizer._source_dir = Path(pretrained_model_name_or_path)
+        return tokenizer
+
+    # File patterns to preserve from the source directory for v4 compatibility.
+    # See the module-level comment in ``nemo_auto_tokenizer.py`` for details.
+    _TOKENIZER_FILE_PATTERNS = (
+        "tokenizer*",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "vocab.*",
+        "merges.txt",
+        "spiece.model",
+        "processor_config.json",
+        "chat_template*",
+    )
+
+    # Standard HF files that ``download_tokenizer_from_hf_hub`` (mistral-common)
+    # does *not* fetch.  We attempt to download these during ``from_pretrained``
+    # so that ``save_pretrained`` can produce a complete output directory.
+    _SUPPLEMENTARY_HF_FILES = (
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "processor_config.json",
+        "chat_template.jinja",
+    )
+
+    @staticmethod
+    def _is_tokenizer_file(filename: str) -> bool:
+        import fnmatch
+
+        return any(fnmatch.fnmatch(filename, pat) for pat in MistralCommonBackend._TOKENIZER_FILE_PATTERNS)
+
+    @classmethod
+    def _fetch_supplementary_files(
+        cls,
+        repo_id,
+        source_dir,
+        cache_dir=None,
+        token=None,
+        revision="main",
+        force_download=False,
+        local_files_only=False,
+    ):
+        """Best-effort download of standard HF files not fetched by mistral-common.
+
+        ``download_tokenizer_from_hf_hub`` only fetches the raw tokenizer file
+        (``tekken.json`` or ``.model``).  This helper downloads the remaining
+        standard files (``tokenizer_config.json``, ``tokenizer.json``, etc.)
+        into the same HF cache snapshot directory so that ``save_pretrained``
+        produces a complete output.
+        """
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            return
+
+        hub_kwargs = {}
+        if cache_dir is not None:
+            hub_kwargs["cache_dir"] = cache_dir
+        if token is not None:
+            hub_kwargs["token"] = token
+
+        for filename in cls._SUPPLEMENTARY_HF_FILES:
+            if (source_dir / filename).exists():
+                continue
+            try:
+                hf_hub_download(
+                    repo_id=str(repo_id),
+                    filename=filename,
+                    revision=revision,
+                    force_download=force_download,
+                    local_files_only=local_files_only,
+                    **hub_kwargs,
+                )
+            except Exception:
+                pass
+
+    def _build_tokenizer_config(self) -> dict:
+        """Build a ``tokenizer_config.json``-compatible dict from the live tokenizer state.
+
+        This is used by :meth:`save_pretrained` to generate a config file when
+        the original source directory did not contain one (e.g. when the
+        tokenizer was loaded from HF Hub via ``download_tokenizer_from_hf_hub``
+        which only fetches the raw tokenizer file).
+        """
+        config: dict = {"tokenizer_class": "MistralCommonBackend"}
+        for attr in ("bos_token", "eos_token", "unk_token"):
+            try:
+                val = getattr(self, attr, None)
+                if val is not None:
+                    config[attr] = val
+            except Exception:
+                pass
+        pad = self.pad_token
+        if pad is not None:
+            config["pad_token"] = pad
+        if self.model_max_length < VERY_LARGE_INTEGER:
+            config["model_max_length"] = self.model_max_length
+        config["clean_up_tokenization_spaces"] = self.cleanup_tokenization_spaces
+        return config
 
     def save_pretrained(
         self,
@@ -1993,6 +2155,27 @@ class MistralCommonBackend(PushToHubMixin):
 
         shutil.copy(self._tokenizer_path, save_directory)
 
+        saved_files = [str(save_directory / self._tokenizer_path.name)]
+
+        source_dir = getattr(self, "_source_dir", None)
+        if source_dir is not None:
+            for fname in os.listdir(str(source_dir)):
+                src = os.path.join(str(source_dir), fname)
+                dst = save_directory / fname
+                if not os.path.isfile(src) or not self._is_tokenizer_file(fname):
+                    continue
+                if not dst.exists():
+                    shutil.copy2(src, str(dst))
+                    saved_files.append(str(dst))
+
+        config_path = save_directory / "tokenizer_config.json"
+        if not config_path.exists():
+            config = self._build_tokenizer_config()
+            with open(config_path, "w") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            saved_files.append(str(config_path))
+
         if push_to_hub:
             repo_id = repo_id or str(save_directory).split(os.path.sep)[-1]
             repo_id = create_repo(repo_id, token=token, private=private, exist_ok=True).repo_id
@@ -2006,7 +2189,7 @@ class MistralCommonBackend(PushToHubMixin):
                 token=token,
             )
 
-        return (str(save_directory / self._tokenizer_path.name),)
+        return tuple(saved_files)
 
     @staticmethod
     def _get_validation_mode(mode: Union[str, ValidationMode]) -> ValidationMode:

@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,7 +26,7 @@ class VolumeMapping:
     source: Path = field(metadata={"help": "Absolute host path to mount"})
     dest: Path = field(metadata={"help": "Absolute container path"})
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         assert isinstance(self.source, Path)
         assert isinstance(self.dest, Path)
         if not self.source.exists():
@@ -35,7 +36,7 @@ class VolumeMapping:
         if not self.dest.is_absolute():
             raise ValueError(f"'dest' must be absolute: {self.dest}")
 
-    def to_str(self):
+    def to_str(self) -> str:
         return f"{self.source}:{self.dest}"
 
 
@@ -46,34 +47,36 @@ class SlurmConfig:
     nodes: int = field(default=1, metadata=dict(help="Number of nodes (synonym: -N)"))
     ntasks_per_node: int = field(default=8, metadata=dict(help="ntasks per node (synonym: --ntasks)"))
     time: str = field(default="00:05:00", metadata=dict(help="Wall-clock time limit. Default value: 00:05:00."))
-    account: str = field(default=None, metadata=dict(help="Slurm account (-A)"))
+    account: str | None = field(default=None, metadata=dict(help="Slurm account (-A)"))
     partition: str = field(default="batch", metadata=dict(help="Partition/queue (-p)"))
 
     # Container / mounts
     container_image: str = field(default="nvcr.io/nvidia/nemo:dev", metadata=dict(help="SquashFS / OCI image path"))
-    nemo_mount: VolumeMapping = field(default=None, metadata=dict(help="Host directory to mount inside container"))
-    hf_home: Path = field(default="~/.cache/huggingface", metadata=dict(help="Host HF cache directory"))
-    extra_mounts: VolumeMapping = field(
+    nemo_mount: VolumeMapping | None = field(
+        default=None, metadata=dict(help="Host directory to mount inside container")
+    )
+    hf_home: str = field(default="~/.cache/huggingface", metadata=dict(help="Host HF cache directory"))
+    extra_mounts: list[VolumeMapping | str] | None = field(
         default=None, metadata=dict(help="Additional mounts host:container (comma-separated)")
     )
 
     # Misc env / training specifics
     master_port: int = field(default=13742, metadata=dict(help="Port for multinode"))
-    gpus_per_node: Optional[int] = field(default=None, metadata=dict(help="GPUs per node"))
+    gpus_per_node: int | None = field(default=None, metadata=dict(help="GPUs per node"))
     wandb_key: str = field(default=os.environ.get("WANDB_API_KEY", ""), metadata=dict(help="W&B key or env reference"))
     hf_token: str = field(
         default=os.environ.get("HF_TOKEN", ""),
         metadata=dict(help="HF-TOKEN key to use for retrieving gated assets from HuggingFace Hub."),
     )
-    env_vars: dict = field(
+    env_vars: dict[str, str] = field(
         default_factory=dict, metadata=dict(help="Additional environment variables to set in the job")
     )
     # User command
     command: str = field(default="", metadata=dict(help="Shell command(s) to run inside container"))
-    chdir: str = field(default=None, metadata=dict(help="Working directory of the job"))
+    chdir: str | None = field(default=None, metadata=dict(help="Working directory of the job"))
     nsys_enabled: bool = field(default=False, metadata=dict(help="Enable nsys profiling"))
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if isinstance(self.extra_mounts, list):
             for i, item in enumerate(self.extra_mounts):
                 if isinstance(item, VolumeMapping):

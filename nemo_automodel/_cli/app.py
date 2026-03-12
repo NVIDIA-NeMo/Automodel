@@ -31,16 +31,21 @@ logging.getLogger().setLevel(logging.INFO)
 # │   ├── _cli
 # │   │   └── app.py
 # ├── examples
-#     ├── llm
-#     │   ├── finetune.py
-#     │   ├── llama_3_2_1b_hellaswag.yaml
-#     │   ├── ...
-#     │   └── llama_3_2_1b_squad_slurm.yaml
-#     └── vlm
-#         ├── finetune.py
-#         ├── gemma_3_vl_3b_cord_v2.yaml
-#         ├── ...
-#         └── qwen2_5_vl_3b_rdr.yaml
+# │   ├── llm_finetune
+# │   │   ├── finetune.py
+# │   │   └── llama3_2
+# │   │       └── llama3_2_1b_squad.yaml
+# │   ├── llm_pretrain
+# │   │   ├── pretrain.py
+# │   │   └── nanogpt_pretrain.yaml
+# │   ├── llm_kd
+# │   │   ├── kd.py
+# │   │   └── llama3_2
+# │   │       └── llama3_2_1b_kd.yaml
+# │   └── vlm_finetune
+# │       ├── finetune.py
+# │       └── gemma3
+# │           └── gemma3_vl_4b_cord_v2.yaml
 
 COMMAND_ALIASES = {"finetune": "train_ft", "pretrain": "train_ft", "benchmark": "benchmark"}
 
@@ -286,7 +291,7 @@ def run_interactive(args):
         torchrun_args, extra = torchrun_parser.parse_known_args()
         # overwrite the training script with the actual recipe path
         torchrun_args.training_script = str(script_path)
-        # training_script_args=['finetune', '--config', 'examples/llm/llama_3_2_1b_squad.yaml']
+        # training_script_args=['finetune', '--config', 'examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml']
         # remove the command (i.e., "finetune") part.
         torchrun_args.training_script_args.pop(0)
         tmp = str(args.config)

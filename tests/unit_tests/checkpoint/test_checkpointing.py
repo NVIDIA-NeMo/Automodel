@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from nemo_automodel.components.checkpoint.checkpointing import (
@@ -266,7 +266,6 @@ class TestIsCustomModel:
 
     def test_module_from_custom_namespace_is_custom(self):
         """A class whose __module__ starts with nemo_automodel.components.models. is custom."""
-        model = torch.nn.Module()
         # Simulate a custom model by patching __module__ on the class's MRO
         FakeCustom = type("FakeCustom", (torch.nn.Module,), {})
         FakeCustom.__module__ = "nemo_automodel.components.models.deepseek_v3.model"
@@ -357,7 +356,7 @@ class TestLoadModelCustomModelGuard:
 
     def _make_checkpointer(self):
         """Create a minimally configured Checkpointer for testing."""
-        from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig, Checkpointer
+        from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
         config = CheckpointingConfig(
             enabled=True,
@@ -417,9 +416,7 @@ class TestLoadModelCustomModelGuard:
 
         with (
             patch("os.path.exists", return_value=True),
-            patch(
-                "nemo_automodel.components.checkpoint.checkpointing.ModelState"
-            ) as MockModelState,
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as MockModelState,
             patch(
                 "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
                 side_effect=lambda m, sd, **kw: sd,
@@ -529,6 +526,23 @@ class TestInitializeModelWeights:
         Checkpointer.initialize_model_weights(model, torch.device("cpu"))
 
         model.initialize_weights.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "architecture",
+        ["Gemma3ForCausalLM", "Gemma3ForConditionalGeneration"],
+        ids=["causal_lm", "conditional_generation"],
+    )
+    def test_skips_for_gemma3(self, architecture):
+        """Gemma3 models should skip init — _init_weights zeros embedding padding_idx which fails with DTensors."""
+        model = self._make_meta_model()
+        model.config = SimpleNamespace(architectures=[architecture])
+        model._is_hf_initialized = True
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_not_called()
+        assert model._is_hf_initialized is True
 
     def test_handles_missing_config_gracefully(self):
         """Model without config.architectures should not raise."""

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import glob
 import logging
 import os
@@ -403,6 +404,8 @@ class Checkpointer:
                 f"({gb / total_s:.2f} GB/s overall | "
                 f"disk read {disk_s:.2f}s, distribute {dist_s:.2f}s)"
             )
+            del state_dict_from_disk
+            gc.collect()
             return
 
         # Standard loading path (DCP copies into model's existing tensors; dtypes follow the model)
@@ -425,6 +428,9 @@ class Checkpointer:
 
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
         model_state.load_state_dict(state_dict, strict=not (len(model_state.model) > 1 or has_state_dict_adapter))
+
+        del state_dict
+        gc.collect()
 
     @staticmethod
     def initialize_model_weights(
@@ -463,8 +469,9 @@ class Checkpointer:
         # We need to set them to False and call initialize_weights to re-initialize the weights.
 
         # Some models cannot call initialize_weights when sharded with DTensors:
-        # - Gemma3ForConditionalGeneration: requires setting a row to zeros in the embedding matrix,
-        #   which is not supported for DTensors in the pinned torch version.
+        # - Gemma3ForConditionalGeneration / Gemma3ForCausalLM: _init_weights() calls
+        #   init.zeros_(module.weight[module.padding_idx]) on the embedding layer, which
+        #   triggers DTensor redistribute and fails with sharded (TP) embeddings.
         # - NemotronHForCausalLM: the HF remote code's _init_weights uses dt_bias.copy_()
         #   which fails with DTensors. Note: v3 (MoE) has n_routed_experts and uses our custom
         #   implementation which handles this correctly.
@@ -473,7 +480,9 @@ class Checkpointer:
         except Exception:
             model_class = ""
         is_nemotron_v2 = model_class == "NemotronHForCausalLM" and not getattr(model.config, "n_routed_experts", None)
-        skip_initialize_weights = is_nemotron_v2
+        skip_initialize_weights = (
+            model_class in ["Gemma3ForConditionalGeneration", "Gemma3ForCausalLM"] or is_nemotron_v2
+        )
         if not skip_initialize_weights:
             for _, module in model.named_modules():
                 if hasattr(module, "_is_hf_initialized"):
@@ -1231,7 +1240,7 @@ def _convert_checkpoint_with_transformers(
         # Now apply all the conversions
         for first_param_name, mapping in param_name_to_mapping.items():
             try:
-                realized_value, _ = mapping.convert(first_param_name, model=model, config=model.config)
+                realized_value = mapping.convert(first_param_name, model=model, config=model.config)
                 for target_name, param in realized_value.items():
                     param = param[0] if isinstance(param, list) else param
                     converted_state_dict[target_name] = param

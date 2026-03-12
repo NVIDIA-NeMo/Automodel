@@ -46,6 +46,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.glm4_moe_lite.model", "Glm4MoeLiteForCausalLM"),
         ),
         (
+            "GlmMoeDsaForCausalLM",
+            ("nemo_automodel.components.models.glm_moe_dsa.model", "GlmMoeDsaForCausalLM"),
+        ),
+        (
             "GptOssForCausalLM",
             ("nemo_automodel.components.models.gpt_oss.model", "GptOssForCausalLM"),
         ),

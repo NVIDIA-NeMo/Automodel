@@ -26,6 +26,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
@@ -79,6 +80,7 @@ class NemotronV3Model(nn.Module):
             shared_expert_inter_dim=config.moe_shared_expert_intermediate_size,
             shared_expert_activation="relu2",  # Use ReLU² for shared experts
             force_e_score_correction_bias=True,  # NemotronV3 checkpoint has this buffer
+            moe_latent_size=getattr(config, "moe_latent_size", None),
         )
 
         # Embeddings
@@ -249,6 +251,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
         # Base model
         self.model = NemotronV3Model(config, backend=self.backend)
+        self.output_hidden_states = config.to_dict().get("output_hidden_states", False)
 
         # LM head
         dtype = get_dtype(config.torch_dtype, torch.bfloat16)
@@ -487,7 +490,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             self.model.initialize_weights(buffer_device=buffer_device)
             nn.init.normal_(self.lm_head.weight, mean=0.0, std=self.config.initializer_range)
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
 
 
 ModelClass = NemotronHForCausalLM

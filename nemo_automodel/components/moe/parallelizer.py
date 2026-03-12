@@ -117,9 +117,12 @@ def apply_ac(
     """
     # Derive hidden_size and num_experts from model.config if not provided
     if hidden_size is None:
-        if hasattr(model, "config") and hasattr(model.config, "hidden_size"):
-            hidden_size = model.config.hidden_size
-        else:
+        cfg = getattr(model, "config", None)
+        # VLM models nest language model config under text_config
+        hidden_size = getattr(getattr(cfg, "text_config", None), "hidden_size", None) or getattr(
+            cfg, "hidden_size", None
+        )
+        if hidden_size is None:
             raise ValueError("hidden_size must be provided or model must have config.hidden_size attribute")
 
     if num_experts is None:
@@ -127,9 +130,11 @@ def apply_ac(
         if hasattr(_inner, "moe_config") and hasattr(_inner.moe_config, "n_routed_experts"):
             num_experts = _inner.moe_config.n_routed_experts
         else:
+            cfg = getattr(model, "config", None)
+            text_cfg = getattr(cfg, "text_config", cfg)
             for attr in ["num_experts", "moe_num_experts", "n_routed_experts"]:
-                if hasattr(model, "config") and hasattr(model.config, attr):
-                    num_experts = getattr(model.config, attr)
+                if text_cfg is not None and hasattr(text_cfg, attr):
+                    num_experts = getattr(text_cfg, attr)
                     break
             else:
                 raise ValueError("num_experts must be provided or model must have config.num_experts attribute")
@@ -274,15 +279,13 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
 
     for _, block in _model.layers.named_children():
         attn_module = block.self_attn.attn_module
-        assert isinstance(attn_module, DotProductAttention), (
-            "Context parallelism is only supported for TransformerEngine's DotProductAttention"
-        )
-        attn_module.set_context_parallel_group(
-            cp_mesh.get_group(),
-            torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
-            _get_cp_stream(),
-            cp_comm_type=cp_comm_type,
-        )
+        if isinstance(attn_module, DotProductAttention):
+            attn_module.set_context_parallel_group(
+                cp_mesh.get_group(),
+                torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
+                _get_cp_stream(),
+                cp_comm_type=cp_comm_type,
+            )
 
         moe_module = block.moe if hasattr(block, "moe") else block.mlp
         if isinstance(moe_module, MoE):

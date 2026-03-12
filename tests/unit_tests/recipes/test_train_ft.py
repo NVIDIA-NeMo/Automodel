@@ -30,6 +30,7 @@ from nemo_automodel.components.config.loader import ConfigNode
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 from torch.utils.data import IterableDataset
 
+from nemo_automodel._transformers.model_init import resolve_sdpa_method
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     build_dataloader,
@@ -142,8 +143,10 @@ def test_build_validation_dataloader_no_validation_keys():
     assert result == {}
     mock_build.assert_not_called()
 
+
 class DummyLinear(nn.Module):
     """Simple linear layer for testing"""
+
     def __init__(self, in_features, out_features):
         super().__init__()
         self.weight = nn.Parameter(torch.randn(out_features, in_features))
@@ -153,6 +156,7 @@ class DummyLinear(nn.Module):
 
 class DummyModel(nn.Module):
     """Simple model for testing PEFT + PP"""
+
     def __init__(self):
         super().__init__()
         self.layer1 = DummyLinear(10, 10)
@@ -168,6 +172,7 @@ class DummyModel(nn.Module):
 
 class DummyPeftConfig:
     """Mock PEFT config"""
+
     def __init__(self):
         self.use_triton = True
         self.dim = 8
@@ -177,12 +182,14 @@ class DummyPeftConfig:
 
 class DummyOptConfig:
     """Mock optimizer config"""
+
     def instantiate(self, params):
         return torch.optim.SGD(params, lr=0.01)
 
 
 class DummyModelConfig:
     """Mock model config"""
+
     def __init__(self):
         self.pretrained_model_name_or_path = None
 
@@ -204,11 +211,16 @@ def test_peft_with_pipeline_parallelism_enabled(caplog):
     model = DummyModel()
     mock_autopipeline = MagicMock()
 
-    with patch('nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules') as mock_apply_lora:
+    with patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules") as mock_apply_lora:
         with caplog.at_level(logging.INFO):
             _apply_peft_and_lower_precision(
-                model, tp_size=1, autopipeline=mock_autopipeline,
-                peft_config=cfg_peft, quantization_config=None, fp8_config=None, qat_quantizer=None,
+                model,
+                tp_size=1,
+                autopipeline=mock_autopipeline,
+                peft_config=cfg_peft,
+                quantization_config=None,
+                fp8_config=None,
+                qat_quantizer=None,
             )
 
     assert mock_apply_lora.called, "apply_lora_to_linear_modules should be called"
@@ -226,17 +238,17 @@ def test_peft_without_pipeline_parallelism(caplog):
     cfg_peft = DummyPeftConfig()
 
     # Mock the apply_lora_to_linear_modules function (now inside apply_model_infrastructure)
-    with patch('nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules') as mock_apply_lora:
-        with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
-            with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-                with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
-                    with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                        with patch('nemo_automodel._transformers.infrastructure._shard_ep_fsdp') as mock_shard:
+    with patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules") as mock_apply_lora:
+        with patch("nemo_automodel._transformers.infrastructure.print_trainable_parameters"):
+            with patch("nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep", return_value=True):
+                with patch("nemo_automodel._transformers.infrastructure._supports_logits_to_keep", return_value=True):
+                    with patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"):
+                        with patch("nemo_automodel._transformers.infrastructure._shard_ep_fsdp") as mock_shard:
                             # Return a DummyModel with lora_dummy_param so freeze doesn't remove all trainable params
                             sharded_model = DummyModel()
                             sharded_model.register_parameter(
                                 "lora_dummy_param",
-                                nn.Parameter(torch.tensor(1.0, device=torch.device("cuda")), requires_grad=True)
+                                nn.Parameter(torch.tensor(1.0, device=torch.device("cuda")), requires_grad=True),
                             )
                             mock_shard.return_value = sharded_model
                             with caplog.at_level(logging.INFO):
@@ -263,11 +275,16 @@ def test_peft_with_tp_disables_triton(caplog):
     cfg_peft = DummyPeftConfig()
     model = DummyModel()
 
-    with patch('nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules'):
+    with patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules"):
         with caplog.at_level(logging.INFO):
             _apply_peft_and_lower_precision(
-                model, tp_size=2, autopipeline=None,
-                peft_config=cfg_peft, quantization_config=None, fp8_config=None, qat_quantizer=None,
+                model,
+                tp_size=2,
+                autopipeline=None,
+                peft_config=cfg_peft,
+                quantization_config=None,
+                fp8_config=None,
+                qat_quantizer=None,
             )
 
     assert cfg_peft.use_triton == False, "use_triton should be disabled for TP"
@@ -328,12 +345,15 @@ def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatc
 
 class _FlagCM(AbstractContextManager):
     """Simple context manager that flips a flag on enter/exit."""
+
     def __init__(self, flags, key):
         self.flags = flags
         self.key = key
+
     def __enter__(self):
         self.flags[self.key] = True
         return self
+
     def __exit__(self, exc_type, exc, tb):
         return False
 
@@ -413,6 +433,7 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
             pp_enabled=False,
             device_mesh=None,
             moe_mesh=None,
+            cp_size=1,
         ),
     )
 
@@ -469,18 +490,37 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._setup_qat",
         lambda *a, **k: (None, None, None),
     )
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction.load_checkpoint", lambda *a, **k: None)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._log_step_scheduler_details", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction.load_checkpoint",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._log_step_scheduler_details",
+        lambda *a, **k: None,
+    )
 
     # Avoid CUDA calls
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.torch.cuda.reset_peak_memory_stats", lambda: None)
 
     # Make group/rank helpers trivial
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_dp_rank", lambda self, include_cp=False: 0)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_dp_group_size", lambda self, include_cp=False: 1)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_cp_group_size", lambda self: 1)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_tp_rank", lambda self: 0)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_pp_rank", lambda self: 0)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_dp_rank",
+        lambda self, include_cp=False: 0,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_dp_group_size",
+        lambda self, include_cp=False: 1,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_cp_group_size",
+        lambda self: 1,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_tp_rank", lambda self: 0
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction._get_pp_rank", lambda self: 0
+    )
 
     # Provide a dummy autonvtx module to satisfy import and capture patch calls
     dummy_autonvtx = types.ModuleType("nemo_automodel.autonvtx")
@@ -552,7 +592,9 @@ def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
     parts = [DummyModel(), DummyModel()]
 
     def _build_model_stub(*args, **kwargs):
-        return DummyAutoPipeline(parts=parts, info=SimpleNamespace(has_last_stage=False, has_first_stage=False, schedule=None))
+        return DummyAutoPipeline(
+            parts=parts, info=SimpleNamespace(has_last_stage=False, has_first_stage=False, schedule=None)
+        )
 
     def _build_optimizer_stub(*args, **kwargs):
         dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
@@ -1040,17 +1082,16 @@ class DummyModelConfigWithAdapter:
 
 @requires_cuda
 def test_build_model_state_dict_keys_uses_adapter(caplog):
-    """Test that state_dict_keys are transformed using _maybe_adapt_state_dict_to_hf when adapter is present.
-    """
+    """Test that state_dict_keys are transformed using _maybe_adapt_state_dict_to_hf when adapter is present."""
 
     cfg_model = DummyModelConfigWithAdapter()
     cfg_opt = DummyOptConfig()
     cfg_peft = None
 
-    with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
-            with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
+    with patch("nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep", return_value=True):
+        with patch("nemo_automodel._transformers.infrastructure._supports_logits_to_keep", return_value=True):
+            with patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"):
+                with patch("nemo_automodel._transformers.infrastructure.print_trainable_parameters"):
                     model = build_model(
                         cfg_model=cfg_model,
                         cfg_peft=cfg_peft,
@@ -1071,10 +1112,10 @@ def test_build_model_state_dict_keys_without_adapter():
     cfg_opt = DummyOptConfig()
     cfg_peft = None
 
-    with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
-            with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
+    with patch("nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep", return_value=True):
+        with patch("nemo_automodel._transformers.infrastructure._supports_logits_to_keep", return_value=True):
+            with patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"):
+                with patch("nemo_automodel._transformers.infrastructure.print_trainable_parameters"):
                     model = build_model(
                         cfg_model=cfg_model,
                         cfg_peft=cfg_peft,
@@ -1110,10 +1151,10 @@ def test_build_model_with_quantized_model_config():
 
     cfg_model = DummyQuantizedModelConfig()
 
-    with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
-            with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
+    with patch("nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep", return_value=True):
+        with patch("nemo_automodel._transformers.infrastructure._supports_logits_to_keep", return_value=True):
+            with patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"):
+                with patch("nemo_automodel._transformers.infrastructure.print_trainable_parameters"):
                     model = build_model(
                         cfg_model=cfg_model,
                         cfg_peft=cfg_peft,
@@ -1134,10 +1175,10 @@ def test_build_model_without_quant_config():
     cfg_opt = DummyOptConfig()
     cfg_peft = None
 
-    with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
-            with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
+    with patch("nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep", return_value=True):
+        with patch("nemo_automodel._transformers.infrastructure._supports_logits_to_keep", return_value=True):
+            with patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"):
+                with patch("nemo_automodel._transformers.infrastructure.print_trainable_parameters"):
                     model = build_model(
                         cfg_model=cfg_model,
                         cfg_peft=cfg_peft,
@@ -1169,10 +1210,10 @@ def test_build_optimizer_disables_foreach_with_tp():
     mock_mesh.mesh_dim_names = ("dp", "tp")
     mock_mesh.__getitem__ = lambda self, key: mock_tp if key == "tp" else MagicMock()
 
-    with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
-            with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
+    with patch("nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep", return_value=True):
+        with patch("nemo_automodel._transformers.infrastructure._supports_logits_to_keep", return_value=True):
+            with patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"):
+                with patch("nemo_automodel._transformers.infrastructure.print_trainable_parameters"):
                     model = build_model(
                         cfg_model=cfg_model,
                         cfg_peft=None,
@@ -1191,10 +1232,10 @@ def test_build_model_and_optimizer_return_values():
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig()
 
-    with patch('nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep', return_value=True):
-        with patch('nemo_automodel._transformers.infrastructure._supports_logits_to_keep', return_value=True):
-            with patch('nemo_automodel._transformers.auto_model._verify_sdpa_support'):
-                with patch('nemo_automodel._transformers.infrastructure.print_trainable_parameters'):
+    with patch("nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep", return_value=True):
+        with patch("nemo_automodel._transformers.infrastructure._supports_logits_to_keep", return_value=True):
+            with patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"):
+                with patch("nemo_automodel._transformers.infrastructure.print_trainable_parameters"):
                     model = build_model(
                         cfg_model=cfg_model,
                         cfg_peft=None,
@@ -1449,14 +1490,17 @@ def test_build_dataloader_pp_autoconfig_success_chains_existing_collate():
     assert call_order == ["base", "masks"]
 
 
-@pytest.mark.parametrize("cfg_attrs,expected", [
-    # String config
-    ({"config": "org/model-name"}, "org/model-name"),
-    # Direct pretrained_model_name_or_path
-    ({"pretrained_model_name_or_path": "direct/model"}, "direct/model"),
-    # Not found - returns None
-    ({}, None),
-])
+@pytest.mark.parametrize(
+    "cfg_attrs,expected",
+    [
+        # String config
+        ({"config": "org/model-name"}, "org/model-name"),
+        # Direct pretrained_model_name_or_path
+        ({"pretrained_model_name_or_path": "direct/model"}, "direct/model"),
+        # Not found - returns None
+        ({}, None),
+    ],
+)
 def test_get_model_name(cfg_attrs, expected):
     """Test _get_model_name extracts model name from various config structures."""
     from nemo_automodel.recipes.llm.train_ft import _get_model_name
@@ -1564,9 +1608,7 @@ def test_log_moe_metrics_passes_top_k_from_config():
 def test_log_moe_metrics_detailed_mode():
     """Detailed mode should call compute_detailed_metrics (includes per-layer keys)."""
     loads = _make_moe_layer_loads([[100.0, 200.0], [300.0, 400.0]])
-    trainer = _make_trainer_for_moe(
-        {"enabled": True, "mode": "detailed", "top_k_experts": 2}, layer_loads=loads
-    )
+    trainer = _make_trainer_for_moe({"enabled": True, "mode": "detailed", "top_k_experts": 2}, layer_loads=loads)
     log_fn = MagicMock()
 
     trainer._log_moe_metrics(step=10, wandb_log_fn=log_fn)
@@ -1609,7 +1651,6 @@ class TestRunTrainOptimStepSetsMoEScale:
         MoEAuxLossAutoScaler.main_loss_backward_scale = None
 
     def _make_recipe(self, monkeypatch, pp_enabled, dp_group_size=4):
-
         from nemo_automodel.components.config.loader import ConfigNode
 
         cfg = ConfigNode(
@@ -1643,8 +1684,11 @@ class TestRunTrainOptimStepSetsMoEScale:
         object.__setattr__(recipe, "pp_enabled", pp_enabled)
         object.__setattr__(recipe, "te_fp8", None)
         object.__setattr__(recipe, "model_parts", [nn.Linear(4, 4)])
-        object.__setattr__(recipe, "optimizer", [SimpleNamespace(step=lambda: None, zero_grad=lambda: None,
-                                                                  param_groups=[{"lr": 0.01}])])
+        object.__setattr__(
+            recipe,
+            "optimizer",
+            [SimpleNamespace(step=lambda: None, zero_grad=lambda: None, param_groups=[{"lr": 0.01}])],
+        )
         object.__setattr__(recipe, "lr_schedulers", [])
         object.__setattr__(recipe, "step_scheduler", SimpleNamespace(step=1, epoch=0))
 
@@ -1656,7 +1700,11 @@ class TestRunTrainOptimStepSetsMoEScale:
             object.__setattr__(recipe, "device_mesh", SimpleNamespace(mesh=mock_mesh))
         object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
 
-        monkeypatch.setattr(recipe, "_dp_allreduce", lambda val, include_cp=False: val if isinstance(val, torch.Tensor) else torch.tensor(val))
+        monkeypatch.setattr(
+            recipe,
+            "_dp_allreduce",
+            lambda val, include_cp=False: val if isinstance(val, torch.Tensor) else torch.tensor(val),
+        )
         monkeypatch.setattr(recipe, "_get_dp_group_size", lambda include_cp=False: dp_group_size)
         monkeypatch.setattr(recipe, "_get_cp_group_size", lambda: 1)
 
@@ -1668,15 +1716,9 @@ class TestRunTrainOptimStepSetsMoEScale:
             "nemo_automodel.recipes.llm.train_ft.scale_grads_and_clip_grad_norm",
             lambda *a, **k: torch.tensor(1.0),
         )
-        monkeypatch.setattr(
-            "nemo_automodel.recipes.llm.train_ft.prepare_for_grad_accumulation", lambda *a, **k: None
-        )
-        monkeypatch.setattr(
-            "nemo_automodel.recipes.llm.train_ft.prepare_for_final_backward", lambda *a, **k: None
-        )
-        monkeypatch.setattr(
-            "nemo_automodel.recipes.llm.train_ft.prepare_after_first_microbatch", lambda *a, **k: None
-        )
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.prepare_for_grad_accumulation", lambda *a, **k: None)
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.prepare_for_final_backward", lambda *a, **k: None)
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.prepare_after_first_microbatch", lambda *a, **k: None)
         object.__setattr__(recipe, "checkpointer", SimpleNamespace(maybe_wait_for_staging=lambda: None))
         object.__setattr__(recipe, "lr_scheduler", None)
         object.__setattr__(recipe, "timestamp", 0.0)
@@ -1711,3 +1753,146 @@ class TestRunTrainOptimStepSetsMoEScale:
 
         assert MoEAuxLossAutoScaler.main_loss_backward_scale is not None
         assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(float(dp_size))
+
+
+# -----------------------------------------------------------------------------
+# rope_fusion disabled when cp > 1
+# -----------------------------------------------------------------------------
+
+
+def _minimal_cfg_with_rope_fusion(cp_size: int, rope_fusion: bool):
+    """Helper to build a minimal ConfigNode for rope_fusion / CP tests."""
+    return ConfigNode(
+        {
+            "model": {"backend": {"rope_fusion": rope_fusion}},
+            "dataloader": {},
+            "dataset": {},
+            "validation_dataloader": {},
+            "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
+            "optimizer": {},
+            "loss_fn": {},
+            "checkpoint": {"best_metric_key": "default"},
+            "distributed": {"cp_size": cp_size},
+        }
+    )
+
+
+def _patch_setup_minimals_with_cp(monkeypatch, cp_size):
+    """Variant of _patch_setup_minimals that lets us control cp_size."""
+    _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
+    # Override setup_distributed to expose the desired cp_size
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.setup_distributed",
+        lambda cfg, world_size: SimpleNamespace(
+            strategy_config=None,
+            pipeline_config=None,
+            moe_config=None,
+            activation_checkpointing=False,
+            pp_enabled=False,
+            device_mesh=None,
+            moe_mesh=None,
+            cp_size=cp_size,
+        ),
+    )
+
+
+def test_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
+    """rope_fusion should be set to False during setup when cp_size > 1."""
+    cfg = _minimal_cfg_with_rope_fusion(cp_size=2, rope_fusion=True)
+    _patch_setup_minimals_with_cp(monkeypatch, cp_size=2)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert cfg.model.backend.rope_fusion is False
+
+
+def test_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):
+    """rope_fusion should remain True when cp_size == 1."""
+    cfg = _minimal_cfg_with_rope_fusion(cp_size=1, rope_fusion=True)
+    _patch_setup_minimals_with_cp(monkeypatch, cp_size=1)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert cfg.model.backend.rope_fusion is True
+
+
+def test_rope_fusion_stays_false_when_already_disabled(monkeypatch):
+    """rope_fusion=False should stay False regardless of cp_size."""
+    cfg = _minimal_cfg_with_rope_fusion(cp_size=4, rope_fusion=False)
+    _patch_setup_minimals_with_cp(monkeypatch, cp_size=4)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert cfg.model.backend.rope_fusion is False
+
+
+# ============================================================================
+# Tests for resolve_sdpa_method
+# ============================================================================
+
+
+class TestResolveSdpaMethod:
+    """Tests for resolve_sdpa_method helper."""
+
+    def test_explicit_strings_converted_to_backends(self):
+        from torch.nn.attention import SDPBackend
+
+        result = resolve_sdpa_method(["flash_attention", "math"])
+        assert result == [SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]
+
+    def test_case_insensitive(self):
+        from torch.nn.attention import SDPBackend
+
+        result = resolve_sdpa_method(["Flash_Attention", "EFFICIENT_ATTENTION"])
+        assert result == [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+
+    def test_invalid_backend_raises(self):
+        with pytest.raises(ValueError, match="Unknown SDPA backend 'bogus'"):
+            resolve_sdpa_method(["bogus"])
+
+    def test_none_with_no_constraints_returns_none(self):
+        assert resolve_sdpa_method(None) is None
+
+    def test_auto_cp_restricts_backends(self):
+        from torch.nn.attention import SDPBackend
+
+        mesh = MagicMock()
+        mesh.mesh_dim_names = ("dp", "cp")
+        mesh.__getitem__ = lambda self, key: MagicMock(size=lambda: 2) if key == "cp" else MagicMock(size=lambda: 1)
+
+        result = resolve_sdpa_method(None, device_mesh=mesh)
+        assert result == [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+
+    def test_auto_activation_checkpointing_restricts_backends(self):
+        from torch.nn.attention import SDPBackend
+
+        result = resolve_sdpa_method(None, activation_checkpointing=True)
+        assert result == [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+
+    def test_explicit_overrides_auto(self):
+        """When sdpa_method is provided, auto-selection is bypassed."""
+        from torch.nn.attention import SDPBackend
+
+        mesh = MagicMock()
+        mesh.mesh_dim_names = ("dp", "cp")
+        mesh.__getitem__ = lambda self, key: MagicMock(size=lambda: 2) if key == "cp" else MagicMock(size=lambda: 1)
+
+        result = resolve_sdpa_method(["math"], device_mesh=mesh, activation_checkpointing=True)
+        assert result == [SDPBackend.MATH]
+
+    def test_sdp_backend_enums_passed_through(self):
+        """SDPBackend enum values should be passed through unchanged."""
+        from torch.nn.attention import SDPBackend
+
+        result = resolve_sdpa_method([SDPBackend.FLASH_ATTENTION, SDPBackend.MATH])
+        assert result == [SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]
+
+    def test_mixed_strings_and_enums(self):
+        """Mix of string and SDPBackend values should work."""
+        from torch.nn.attention import SDPBackend
+
+        result = resolve_sdpa_method([SDPBackend.FLASH_ATTENTION, "efficient_attention"])
+        assert result == [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]

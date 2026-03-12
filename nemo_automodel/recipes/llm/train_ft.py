@@ -151,6 +151,7 @@ def build_model(
     cfg_moe=None,
     activation_checkpointing=False,
     unfreeze_modules: list[str] | None = None,
+    sdpa_method: list[str] | None = None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model.
 
@@ -170,6 +171,9 @@ def build_model(
         cfg_moe: MoEParallelizerConfig instance, or ConfigNode to be converted.
         activation_checkpointing: Whether to enable activation checkpointing.
         unfreeze_modules: List of module names/substrings to unfreeze.
+        sdpa_method: Explicit list of SDPA backend name strings (e.g.
+            ``["flash_attention", "efficient_attention"]``), or ``None`` to
+            auto-select based on CP / activation checkpointing.
     """
     with ScopedRNG(seed=seed, ranked=True):
         kwargs = {
@@ -179,6 +183,7 @@ def build_model(
             "moe_mesh": moe_mesh,
             "distributed_config": distributed_config,
             "pipeline_config": pipeline_config,
+            "sdpa_method": sdpa_method,
         }
 
         if cfg_qat is not None and cfg_qat.get("enabled", False):
@@ -229,6 +234,10 @@ def build_model(
         else:
             # For non-NemoAutoModel entry points (e.g., build_gpt2_model),
             # instantiate the model first, then apply infrastructure separately.
+            # Note: sdpa_method is not supported here — SDPA patching only runs
+            # inside NeMoAutoModel._build_model.
+            if sdpa_method is not None:
+                logger.warning("sdpa_method is ignored for non-NeMoAutoModel targets.")
             # We must convert config objects into runtime objects (model_wrapper,
             # autopipeline, parallelize_fn, etc.) via instantiate_infrastructure,
             # exactly as from_pretrained/from_config do internally.
@@ -475,29 +484,45 @@ def build_dataloader(
                 logging.warning("IterableDataset does not support sharding; Data may be duplicated across ranks.")
 
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
+        packing_strategy = getattr(cfg_ps, "packing_strategy", "thd")
 
-        # check if packed sequence is supported
+        # check if packed sequence is supported (only for thd strategy)
         supports_seq_lens = _supports_seq_lens(model)
-        if packed_sequence_size > 0 and not supports_seq_lens:
+        if packed_sequence_size > 0 and packing_strategy == "thd" and not supports_seq_lens:
             logging.warning("Packed sequence is not supported without seq_lens; disabling packed sequence")
             packed_sequence_size = 0
 
         # Apply packing if configured
-        # Apply packing if configured
-        if packed_sequence_size > 0 and not getattr(ds, "is_pre_packed", False):
-            logger.info(f"Packing dataset with size: {packed_sequence_size}")
+        if packed_sequence_size > 0:
+            if not getattr(ds, "is_pre_packed", False):
+                logger.info(f"Packing dataset with size: {packed_sequence_size}")
+            else:
+                logger.info(f"Packing dataset with size: {packed_sequence_size}, strategy: {packing_strategy}")
+
             if hasattr(ds, "shuffle"):
                 ds = ds.shuffle(seed)
-            # Determine whether to include seq_lens/seq_lens_padded in packed samples.
-            # Priority: explicit config > model.forward signature detection > default False
-            ds = pack_dataset(
-                ds,
-                split=cfg_ds.split,  # Assumes split is defined in dataset config
-                packed_sequence_size=packed_sequence_size,
-                max_packs=getattr(cfg_ps, "max_packs", None),
-                padding_idx=getattr(tokenizer, "pad_token_id", 0),
-                cp_size=cp_size,
-            )
+
+            if packing_strategy == "neat":
+                from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
+
+                ds = neat_pack_dataset(
+                    ds,
+                    split=cfg_ds.split,
+                    pack_size=packed_sequence_size,
+                    max_packs=getattr(cfg_ps, "max_packs", None),
+                    padding_idx=getattr(tokenizer, "pad_token_id", 0),
+                    drop_long_samples=getattr(cfg_ps, "drop_long_samples", False),
+                )
+            else:
+                # "thd" — existing packing logic
+                ds = pack_dataset(
+                    ds,
+                    split=cfg_ds.split,
+                    packed_sequence_size=packed_sequence_size,
+                    max_packs=getattr(cfg_ps, "max_packs", None),
+                    padding_idx=getattr(tokenizer, "pad_token_id", 0),
+                    cp_size=cp_size,
+                )
 
         if isinstance(ds, MegatronPretraining):
             ds = ds.get_dataset(split=cfg_ds.splits_to_build)
@@ -945,6 +970,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
+        # Disable fused RoPE when context parallelism is enabled (cp > 1)
+        if self.dist_setup.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", False):
+            logging.info("Disabling rope_fusion because cp_size=%d > 1", self.dist_setup.cp_size)
+            self.cfg.model.backend.rope_fusion = False
+
         model = build_model(
             self.cfg.model,
             self.peft_config,
@@ -960,6 +990,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_qat=self.cfg.get("qat", None),
             cfg_moe=self.dist_setup.moe_config,
             activation_checkpointing=self.dist_setup.activation_checkpointing,
+            sdpa_method=self.cfg.get("sdpa_method", None),
         )
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 
