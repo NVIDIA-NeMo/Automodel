@@ -86,7 +86,7 @@ COPY docker/common/deepep.patch /opt/deepep.patch
 RUN git clone -b hybrid-ep https://github.com/deepseek-ai/DeepEP.git
 ENV HYBRID_EP_MULTINODE=1
 RUN cd DeepEP && \
-    patch -p1 < /opt/hybrid-ep.patch && \
+    patch -p1 < /opt/deepep.patch && \
     pip install --no-cache-dir nvidia-nvshmem-cu13==3.4.5 && \
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 pip install --no-build-isolation . && \
     apt-get purge -y libnvidia-ml-dev && \
