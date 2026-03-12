@@ -33,7 +33,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /workspace/eevee-4-e5b_vv1
+  pretrained_model_name_or_path: /workspace/eevee-4-e4b-it_vv2
   torch_dtype: torch.bfloat16
   use_liger_kernel: false
   use_sdpa_patching: false
@@ -94,9 +94,7 @@ freeze_config:
   freeze_audio_tower: true
   freeze_language_model: false
 
-# Uncomment and configure for W&B logging
-# logger:
-#   wandb_project:
-#   wandb_entity:
-#   wandb_exp_name:
-#   wandb_save_dir:
+wandb:
+  project: eevee-4
+  name: eevee4-e4b-it_vv2
+  dir: vlm_checkpoints/gemma4_4b/

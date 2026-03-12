@@ -13,7 +13,12 @@
 # limitations under the License.
 
 # Configuration for fine-tuning Gemma 4 2B with MedPix dataset for image description
+# export WANDB_API_KEY=xxxxx if you want to use wandb
 # python examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_2b.yaml
+# Multi GPU command:
+# torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_2b.yaml
+# On my local WS, run the following command:
+# NCCL_P2P_DISABLE=1 torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_2b.yaml
 
 step_scheduler:
   global_batch_size: 8
@@ -33,7 +38,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /workspace/eevee-4-e2b-it_vv1
+  pretrained_model_name_or_path: /workspace/eevee-4-e2b-it_vv2
   torch_dtype: torch.bfloat16
   use_liger_kernel: false
   use_sdpa_patching: false
@@ -96,9 +101,7 @@ freeze_config:
   freeze_audio_tower: true
   freeze_language_model: false
 
-# Uncomment and configure for W&B logging
-# logger:
-#   wandb_project:
-#   wandb_entity:
-#   wandb_exp_name:
-#   wandb_save_dir:
+wandb:
+  project: eevee-4
+  name: eevee4-e2b-it_vv2
+  dir: vlm_checkpoints/gemma4_2b_it/
