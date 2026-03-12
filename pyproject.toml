@@ -115,7 +115,8 @@ cuda = [
 cuda_source = [
     "bitsandbytes",
 ]
-extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
+# CP for linear attention (fla.ops.cp) requires fla > 0.4.1; pin to main until a release includes it.
+extra = ["flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@7cbe461b10bde60180c32c5f9381a04d41887514", "perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
 delta-databricks = [
     "deltalake>=1.0.0",  # For Delta Lake metadata
@@ -175,6 +176,27 @@ test = ["coverage", "pytest", "peft>=0.18.1", "onnxruntime-gpu; (platform_machin
 dev = ["cut-cross-entropy", "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')", "dion @ git+https://github.com/microsoft/dion.git; platform_machine == 'x86_64' and platform_system != 'Darwin'"]
 
 [tool.uv]
+override-dependencies = [
+    "flash-attn; sys_platform == 'never'",
+    "nvidia-cublas-cu12; sys_platform == 'never'",
+    "nvidia-cuda-cupti-cu12; sys_platform == 'never'",
+    "nvidia-cuda-nvrtc-cu12; sys_platform == 'never'",
+    "nvidia-cuda-runtime-cu12; sys_platform == 'never'",
+    "nvidia-cudnn-cu12; sys_platform == 'never'",
+    "nvidia-cufft-cu12; sys_platform == 'never'",
+    "nvidia-cufile-cu12; sys_platform == 'never'",
+    "nvidia-curand-cu12; sys_platform == 'never'",
+    "nvidia-cusolver-cu12; sys_platform == 'never'",
+    "nvidia-cusparse-cu12; sys_platform == 'never'",
+    "nvidia-cusparselt-cu12; sys_platform == 'never'",
+    "nvidia-nccl-cu12; sys_platform == 'never'",
+    "torch; sys_platform == 'never'",
+    "torchao; sys_platform == 'never'",
+    "torchvision; sys_platform == 'never'",
+    "transformer-engine; sys_platform == 'never'",
+    "transformer-engine-torch; sys_platform == 'never'",
+    "triton; sys_platform == 'never'",
+]
 default-groups = ["build", "docs", "test"]
 no-build-isolation-package = [
     "bitsandbytes",

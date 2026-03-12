@@ -30,7 +30,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
-
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGatedDeltaNet
 
 
@@ -254,7 +253,9 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         # contiguous chunk of a dense global sequence of length seq_len * cp_size.
         global_seq_len = seq_len * cp_size
         cu_seqlens_single = torch.tensor(
-            [0, global_seq_len], dtype=torch.long, device=hidden_states.device,
+            [0, global_seq_len],
+            dtype=torch.long,
+            device=hidden_states.device,
         )
         cp_context = build_cp_context(
             cu_seqlens=cu_seqlens_single,
@@ -271,14 +272,14 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
 
         # ---- Projections (batched, pointwise) ----
         mixed_qkv = self.in_proj_qkv(hidden_states)  # [B, S_local, conv_dim]
-        z = self.in_proj_z(hidden_states)             # [B, S_local, value_dim]
-        b = self.in_proj_b(hidden_states)             # [B, S_local, num_v_heads]
-        a = self.in_proj_a(hidden_states)             # [B, S_local, num_v_heads]
+        z = self.in_proj_z(hidden_states)  # [B, S_local, value_dim]
+        b = self.in_proj_b(hidden_states)  # [B, S_local, num_v_heads]
+        a = self.in_proj_a(hidden_states)  # [B, S_local, num_v_heads]
 
         # ---- Causal Conv1d with cross-rank boundary exchange ----
-        mixed_qkv = mixed_qkv.transpose(1, 2)                    # [B, D, S_local]
+        mixed_qkv = mixed_qkv.transpose(1, 2)  # [B, D, S_local]
         mixed_qkv = self._conv1d_with_cp(mixed_qkv, cp_context)  # [B, D, S_local]
-        mixed_qkv = mixed_qkv.transpose(1, 2)                    # [B, S_local, D]
+        mixed_qkv = mixed_qkv.transpose(1, 2)  # [B, S_local, D]
 
         # ---- Split QKV ----
         query, key, value = torch.split(
@@ -306,11 +307,11 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         attn_outs = []
         for bi in range(batch_size):
             out_bi, _ = fla_chunk_gated_delta_rule(
-                query[bi:bi+1],
-                key[bi:bi+1],
-                value[bi:bi+1],
-                g=g[bi:bi+1],
-                beta=beta[bi:bi+1],
+                query[bi : bi + 1],
+                key[bi : bi + 1],
+                value[bi : bi + 1],
+                g=g[bi : bi + 1],
+                beta=beta[bi : bi + 1],
                 initial_state=None,
                 output_final_state=False,
                 use_qk_l2norm_in_kernel=True,
