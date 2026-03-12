@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import glob
 import logging
 import os
@@ -403,6 +404,8 @@ class Checkpointer:
                 f"({gb / total_s:.2f} GB/s overall | "
                 f"disk read {disk_s:.2f}s, distribute {dist_s:.2f}s)"
             )
+            del state_dict_from_disk
+            gc.collect()
             return
 
         # Standard loading path (DCP copies into model's existing tensors; dtypes follow the model)
@@ -425,6 +428,9 @@ class Checkpointer:
 
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
         model_state.load_state_dict(state_dict, strict=not (len(model_state.model) > 1 or has_state_dict_adapter))
+
+        del state_dict
+        gc.collect()
 
     @staticmethod
     def initialize_model_weights(
