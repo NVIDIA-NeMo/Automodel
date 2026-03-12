@@ -135,14 +135,14 @@ def _build_eval_dataset():
 def _build_collator():
     """Build tokenizer and collator for evaluation."""
     from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
-    from nemo_automodel.components.datasets.llm import RetrievalEncoderCollator
+    from nemo_automodel.components.datasets.llm import BiEncoderCollator
 
     tokenizer = NeMoAutoTokenizer.from_pretrained(BASE_MODEL_PATH)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
 
-    collator = RetrievalEncoderCollator(
+    collator = BiEncoderCollator(
         tokenizer=tokenizer,
         q_max_len=EVAL_MAX_LENGTH,
         p_max_len=EVAL_MAX_LENGTH,

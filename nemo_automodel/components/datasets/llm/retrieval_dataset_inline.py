@@ -391,7 +391,7 @@ def make_retrieval_dataset(
         - 'doc_image': List of images or empty strings
 
     Note:
-        Tokenization should be handled by a collator (e.g., RetrievalEncoderCollator)
+        Tokenization should be handled by a collator (e.g., BiEncoderCollator)
         which is more efficient for batch padding and supports dynamic processing.
     """
 

@@ -601,7 +601,7 @@ def make_retrieval_dataset(
         SyntheticClassificationData). For other HF dataset formats, implement a
         custom adapter/preprocessor before calling this loader.
 
-        Tokenization should be handled by a collator (e.g., RetrievalEncoderCollator)
+        Tokenization should be handled by a collator (e.g., BiEncoderCollator)
         which is more efficient for batch padding and supports dynamic processing.
     """
 

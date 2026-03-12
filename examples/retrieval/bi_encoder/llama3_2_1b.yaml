@@ -58,7 +58,7 @@ dataloader:
     seed: 42
     do_shuffle: true
   collate_fn:
-    _target_: nemo_automodel.components.datasets.llm.RetrievalEncoderCollator
+    _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
     q_max_len: 512
     p_max_len: 512
     query_prefix: "query:"
@@ -81,7 +81,7 @@ dataloader:
 #     max_train_samples: 1000
 #     train_data_select_offset: 0
 #   collate_fn:
-#     _target_: nemo_automodel.components.datasets.llm.RetrievalEncoderCollator
+#     _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
 #     q_max_len: 512
 #     p_max_len: 512
 #     query_prefix: "query:"
