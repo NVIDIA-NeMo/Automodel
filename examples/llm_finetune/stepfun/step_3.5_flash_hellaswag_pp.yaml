@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Recipe validated using 64 H100 GPUs (8 nodes x 8)
+
 seed: 1234
 
 step_scheduler:
