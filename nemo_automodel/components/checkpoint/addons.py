@@ -68,9 +68,13 @@ class ConsolidatedHFAddon:
             _maybe_save_custom_model_code(original_model_path, hf_metadata_dir)
             # save the config.json file
             if hasattr(model_part, "config"):
-                _maybe_strip_quantization_config(model_part)
-                with open(os.path.join(hf_metadata_dir, "config.json"), "w") as f:
-                    f.write(model_part.config.to_json_string())
+                v4_compatible = kwargs.get("v4_compatible", False)
+                if v4_compatible and original_model_path is not None:
+                    _save_original_config_json(original_model_path, hf_metadata_dir)
+                else:
+                    _maybe_strip_quantization_config(model_part)
+                    with open(os.path.join(hf_metadata_dir, "config.json"), "w") as f:
+                        f.write(model_part.config.to_json_string())
             # save the generation_config.json file
             if getattr(model_part, "generation_config", None) is not None:
                 with open(os.path.join(hf_metadata_dir, "generation_config.json"), "w") as f:
@@ -349,6 +353,25 @@ def _maybe_strip_quantization_config(model_part: nn.Module) -> None:
         return
 
     delattr(config, "quantization_config")
+
+
+def _save_original_config_json(original_model_path: str, hf_metadata_dir: str) -> None:
+    """Copy the original pretrained ``config.json`` with ``quantization_config`` stripped.
+
+    This is used in v4-compatible mode so that downstream consumers (e.g. vLLM)
+    that expect a transformers-v4-style config receive the file verbatim from the
+    original checkpoint, minus any quantization metadata (since saved weights are
+    always bf16).
+    """
+    src = os.path.join(original_model_path, "config.json")
+    if not os.path.isfile(src):
+        return
+    with open(src) as f:
+        cfg = json.load(f)
+    cfg.pop("quantization_config", None)
+    dst = os.path.join(hf_metadata_dir, "config.json")
+    with open(dst, "w") as f:
+        json.dump(cfg, f, indent=2)
 
 
 def _maybe_save_custom_model_code(original_model_path: str | None, hf_metadata_dir: str) -> None:

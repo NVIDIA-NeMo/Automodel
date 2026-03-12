@@ -48,6 +48,7 @@ checkpoint:
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors # torch_save or safetensors
   save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  v4_compatible: true # saves the original pretrained config.json (v4 format) instead of the in-memory v5 config.
 
 distributed:
   strategy: fsdp2

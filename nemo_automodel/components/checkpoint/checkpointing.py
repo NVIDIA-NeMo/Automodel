@@ -123,6 +123,8 @@ class CheckpointingConfig:
     # This should be used for remote storage systems that don't support direct-append or non-sequential writes.
     staging_dir: str | None = None  # Optional directory for staging files during consolidation.
     # If provided, temp files will be created here instead of system temp. Useful when system temp has limited space.
+    v4_compatible: bool = False  # If True, save the original pretrained config.json (with quantization_config removed)
+    # instead of the in-memory v5 config.  Useful when downstream consumers (e.g. vLLM) expect a v4-format config.
 
     def __post_init__(self):
         """
@@ -255,6 +257,7 @@ class Checkpointer:
                 peft_config=peft_config,
                 fqn_to_file_index_mapping=fqn_to_file_index_mapping,
                 original_model_path=self._get_original_model_path(model_state),
+                v4_compatible=self.config.v4_compatible,
             )
 
         storage_writer = self._get_storage_writer(
