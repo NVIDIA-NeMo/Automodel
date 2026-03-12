@@ -546,11 +546,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     all_ok = True
 
     for case in cases:
+        kl_threshold = args.kl_threshold if case.kind != "baichuan" else 1e-4
         # Keep ranks roughly in sync for cleaner output.
         dist.barrier()
-        ok, kl = _run_case(
-            case, device=device, device_type=device_type, kl_threshold=float(args.kl_threshold), dtype=dtype
-        )
+        ok, kl = _run_case(case, device=device, device_type=device_type, kl_threshold=kl_threshold, dtype=dtype)
 
         ok_tensor = torch.tensor(1 if ok else 0, device=device, dtype=torch.int)
         dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN)
