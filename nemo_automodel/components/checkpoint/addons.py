@@ -69,27 +69,23 @@ class ConsolidatedHFAddon:
             # save the config.json file
             if hasattr(model_part, "config"):
                 v4_compatible = kwargs.get("v4_compatible", False)
-                if (
-                    v4_compatible
-                    and original_model_path is not None
-                    and _config_exists(original_model_path, "config.json")
-                ):
+                if v4_compatible and _config_exists(original_model_path, "config.json"):
                     _save_original_config_json(original_model_path, hf_metadata_dir, "config.json")
+                    config_name = "config.v5.json"
                 else:
-                    _maybe_strip_quantization_config(model_part)
-                    with open(os.path.join(hf_metadata_dir, "config.json"), "w") as f:
-                        f.write(model_part.config.to_json_string())
+                    config_name = "config.json"
+                _maybe_strip_quantization_config(model_part)
+                with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
+                    f.write(model_part.config.to_json_string())
             # save the generation_config.json file
             if getattr(model_part, "generation_config", None) is not None:
-                if (
-                    v4_compatible
-                    and original_model_path is not None
-                    and _config_exists(original_model_path, "generation_config.json")
-                ):
+                if v4_compatible and _config_exists(original_model_path, "generation_config.json"):
                     _save_original_config_json(original_model_path, hf_metadata_dir, "generation_config.json")
+                    config_name = "generation_config.v5.json"
                 else:
-                    with open(os.path.join(hf_metadata_dir, "generation_config.json"), "w") as f:
-                        f.write(model_part.generation_config.to_json_string())
+                    config_name = "generation_config.json"
+                with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
+                    f.write(model_part.generation_config.to_json_string())
 
             # save the tokenizer
             if tokenizer is not None:
@@ -366,7 +362,9 @@ def _maybe_strip_quantization_config(model_part: nn.Module) -> None:
     delattr(config, "quantization_config")
 
 
-def _config_exists(original_model_path: nn.Module, config_name: str) -> bool:
+def _config_exists(original_model_path: str, config_name: str) -> bool:
+    if original_model_path is None or not os.path.isdir(original_model_path):
+        return False
     src = os.path.join(original_model_path, config_name)
     return os.path.isfile(src)
 
