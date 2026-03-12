@@ -1187,7 +1187,7 @@ def _convert_checkpoint_with_transformers(
 
     try:
         # Get the weight conversion mapping from transformers
-        weight_mapping, _ = get_model_conversion_mapping(model, key_mapping=key_mapping, add_legacy=True)
+        weight_mapping = get_model_conversion_mapping(model, key_mapping=key_mapping, add_legacy=True)
         if not weight_mapping:
             logging.warning(
                 f"No conversion mapping found for model type {getattr(model.config, 'model_type', 'unknown')}"
