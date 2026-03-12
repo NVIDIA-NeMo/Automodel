@@ -33,6 +33,41 @@ from .registry import ProcessorRegistry
 logger = logging.getLogger(__name__)
 
 
+def _patch_t5_layer_norm():
+    """Replace apex's FusedRMSNorm with a native T5LayerNorm in the T5 module.
+
+    Apex's FusedRMSNorm doesn't support bfloat16, but the native T5LayerNorm
+    handles it correctly by upcasting to fp32 internally for numerical stability.
+    This must be called before loading any T5 models.
+    """
+    try:
+        from apex.normalization import FusedRMSNorm
+        from transformers.models.t5 import modeling_t5
+
+        if modeling_t5.T5LayerNorm is not FusedRMSNorm:
+            return
+
+        class _NativeT5LayerNorm(torch.nn.Module):
+            """RMS norm (no bias, no mean subtraction) that works with bf16."""
+
+            def __init__(self, hidden_size, eps=1e-6):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.ones(hidden_size))
+                self.variance_epsilon = eps
+
+            def forward(self, hidden_states):
+                variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+                hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+                if self.weight.dtype in [torch.float16, torch.bfloat16]:
+                    hidden_states = hidden_states.to(self.weight.dtype)
+                return self.weight * hidden_states
+
+        modeling_t5.T5LayerNorm = _NativeT5LayerNorm
+        logger.info("Replaced apex FusedRMSNorm with native T5LayerNorm for bf16 compatibility")
+    except ImportError:
+        pass
+
+
 @ProcessorRegistry.register("flux")
 class FluxProcessor(BaseModelProcessor):
     """
@@ -69,6 +104,9 @@ class FluxProcessor(BaseModelProcessor):
         from diffusers import FluxPipeline
 
         logger.info("[FLUX] Loading models from %s via FluxPipeline...", model_name)
+
+        # Patch T5 layer norm so it can run in bf16 (apex FusedRMSNorm doesn't support it)
+        _patch_t5_layer_norm()
 
         # Load pipeline without transformer (not needed for preprocessing)
         pipeline = FluxPipeline.from_pretrained(
@@ -172,7 +210,7 @@ class FluxProcessor(BaseModelProcessor):
         clip_hidden = clip_output.hidden_states[-2]
         pooled_prompt_embeds = clip_output.pooler_output
 
-        # T5 encoding
+        # T5 encoding (native T5LayerNorm patch allows running in bf16)
         t5_tokens = models["t5_tokenizer"](
             prompt,
             padding="max_length",
@@ -185,10 +223,10 @@ class FluxProcessor(BaseModelProcessor):
 
         return {
             "clip_tokens": clip_tokens["input_ids"].cpu(),
-            "clip_hidden": clip_hidden.detach().cpu(),
-            "pooled_prompt_embeds": pooled_prompt_embeds.detach().cpu(),
+            "clip_hidden": clip_hidden.detach().cpu().to(torch.bfloat16),
+            "pooled_prompt_embeds": pooled_prompt_embeds.detach().cpu().to(torch.bfloat16),
             "t5_tokens": t5_tokens["input_ids"].cpu(),
-            "prompt_embeds": prompt_embeds.detach().cpu(),
+            "prompt_embeds": prompt_embeds.detach().cpu().to(torch.bfloat16),
         }
 
     def verify_latent(

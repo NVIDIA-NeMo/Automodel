@@ -4,11 +4,6 @@ model:
   cache_dir: null
   attention_backend: "flash"
 
-  pipeline_spec:
-    transformer_cls: "FluxTransformer2DModel"
-    subfolder: "transformer"
-    load_full_pipeline: false
-
 optim:
   learning_rate: 1e-5
 

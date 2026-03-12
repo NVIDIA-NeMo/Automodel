@@ -7,7 +7,7 @@ inference:
   guidance_scale: 3.5
   height: 512
   width: 512
-  dtype: "float32"
+  dtype: "bfloat16"
   max_samples: 10
   prompts:
     - "A cat sitting on a windowsill watching the rain"

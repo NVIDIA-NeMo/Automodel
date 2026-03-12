@@ -98,6 +98,11 @@ def load_pipeline(cfg, dist_info):
     dtype_str = getattr(cfg.inference, "dtype", "bfloat16")
     torch_dtype = _resolve_dtype(dtype_str)
 
+    # FLUX uses a T5 text encoder whose apex FusedRMSNorm doesn't support bf16.
+    # Patch it before loading so the T5 model is created with the native norm.
+    if torch_dtype == torch.bfloat16 and "flux" in model_id.lower():
+        _patch_t5_layer_norm()
+
     if dist_info is not None and hasattr(cfg.distributed, "parallel_scheme"):
         # Distributed path: use NeMoAutoDiffusionPipeline with parallelization
         from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
@@ -117,6 +122,41 @@ def load_pipeline(cfg, dist_info):
 
     _fix_text_encoder_weight_tying(pipe)
     return pipe
+
+
+def _patch_t5_layer_norm():
+    """Replace apex's FusedRMSNorm with the native T5LayerNorm in the T5 module.
+
+    Apex's FusedRMSNorm doesn't support bfloat16, but the native T5LayerNorm
+    handles it correctly by upcasting to fp32 internally for numerical stability.
+    This must be called before loading any T5 models.
+    """
+    try:
+        from apex.normalization import FusedRMSNorm
+        from transformers.models.t5 import modeling_t5
+
+        if modeling_t5.T5LayerNorm is not FusedRMSNorm:
+            return
+
+        class _NativeT5LayerNorm(torch.nn.Module):
+            """RMS norm (no bias, no mean subtraction) that works with bf16."""
+
+            def __init__(self, hidden_size, eps=1e-6):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.ones(hidden_size))
+                self.variance_epsilon = eps
+
+            def forward(self, hidden_states):
+                variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+                hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+                if self.weight.dtype in [torch.float16, torch.bfloat16]:
+                    hidden_states = hidden_states.to(self.weight.dtype)
+                return self.weight * hidden_states
+
+        modeling_t5.T5LayerNorm = _NativeT5LayerNorm
+        logger.info("Replaced apex FusedRMSNorm with native T5LayerNorm for bf16 compatibility")
+    except ImportError:
+        pass
 
 
 def _fix_text_encoder_weight_tying(pipe):
