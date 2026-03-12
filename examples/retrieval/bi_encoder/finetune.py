@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.retrieval import TrainRetrieverEncoderRecipe
+from nemo_automodel.recipes.retrieval import TrainBiEncoderRecipe
 
 
 def main(default_config_path="examples/retrieval/bi_encoder/llama3_2_1b.yaml"):
@@ -27,7 +27,7 @@ def main(default_config_path="examples/retrieval/bi_encoder/llama3_2_1b.yaml"):
         default_config_path: Path to the default configuration file
     """
     cfg = parse_args_and_load_config(default_config_path)
-    recipe = TrainRetrieverEncoderRecipe(cfg)
+    recipe = TrainBiEncoderRecipe(cfg)
     recipe.setup()
     recipe.run_train_validation_loop()
 

@@ -22,7 +22,7 @@ import wandb
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.training.rng import ScopedRNG
-from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainRetrieverEncoderRecipe
+from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
 
 
 @torch.no_grad()
@@ -41,7 +41,7 @@ def batch_mrr(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (1.0 / rank.float()).sum()
 
 
-class TrainCrossEncoderRecipe(TrainRetrieverEncoderRecipe):
+class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
     def _run_train_optim_step(self, batches, max_grad_norm=None):
         self._acc_buffer = []
         result = super()._run_train_optim_step(batches, max_grad_norm)
