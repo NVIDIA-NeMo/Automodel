@@ -31,6 +31,7 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: openai/gpt-oss-20b
+  router_aux_loss_coef: 0
   # Customize this backend for fine grained control
   # backend:
   #   _target_: nemo_automodel.components.models.common.BackendConfig
@@ -44,7 +45,7 @@ model:
   #   enable_fsdp_optimizations: true
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors # torch_save or safetensors
   save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
