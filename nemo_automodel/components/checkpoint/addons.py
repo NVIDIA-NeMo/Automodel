@@ -69,7 +69,11 @@ class ConsolidatedHFAddon:
             # save the config.json file
             if hasattr(model_part, "config"):
                 v4_compatible = kwargs.get("v4_compatible", False)
-                if v4_compatible and original_model_path is not None:
+                if (
+                    v4_compatible
+                    and original_model_path is not None
+                    and _config_exists(original_model_path, "config.json")
+                ):
                     _save_original_config_json(original_model_path, hf_metadata_dir)
                 else:
                     _maybe_strip_quantization_config(model_part)
@@ -77,8 +81,15 @@ class ConsolidatedHFAddon:
                         f.write(model_part.config.to_json_string())
             # save the generation_config.json file
             if getattr(model_part, "generation_config", None) is not None:
-                with open(os.path.join(hf_metadata_dir, "generation_config.json"), "w") as f:
-                    f.write(model_part.generation_config.to_json_string())
+                if (
+                    v4_compatible
+                    and original_model_path is not None
+                    and _config_exists(original_model_path, "generation_config.json")
+                ):
+                    _save_original_config_json(original_model_path, hf_metadata_dir)
+                else:
+                    with open(os.path.join(hf_metadata_dir, "generation_config.json"), "w") as f:
+                        f.write(model_part.generation_config.to_json_string())
 
             # save the tokenizer
             if tokenizer is not None:
@@ -355,7 +366,12 @@ def _maybe_strip_quantization_config(model_part: nn.Module) -> None:
     delattr(config, "quantization_config")
 
 
-def _save_original_config_json(original_model_path: str, hf_metadata_dir: str) -> None:
+def _config_exists(original_model_path: nn.Module, config_name: str) -> bool:
+    src = os.path.join(original_model_path, config_name)
+    return os.path.isfile(src)
+
+
+def _save_original_config_json(original_model_path: str, hf_metadata_dir: str, config_name: str) -> None:
     """Copy the original pretrained ``config.json`` with ``quantization_config`` stripped.
 
     This is used in v4-compatible mode so that downstream consumers (e.g. vLLM)
@@ -363,13 +379,13 @@ def _save_original_config_json(original_model_path: str, hf_metadata_dir: str) -
     original checkpoint, minus any quantization metadata (since saved weights are
     always bf16).
     """
-    src = os.path.join(original_model_path, "config.json")
+    src = os.path.join(original_model_path, config_name)
     if not os.path.isfile(src):
         return
     with open(src) as f:
         cfg = json.load(f)
     cfg.pop("quantization_config", None)
-    dst = os.path.join(hf_metadata_dir, "config.json")
+    dst = os.path.join(hf_metadata_dir, config_name)
     with open(dst, "w") as f:
         json.dump(cfg, f, indent=2)
 
