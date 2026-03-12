@@ -69,7 +69,7 @@ lr_scheduler:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /workspace/output/encoder_ckpt_restore/checkpoints
+  checkpoint_dir: /workspace/output/biencoder_ckpt_restore/checkpoints
   model_save_format: safetensors
   save_consolidated: true
 

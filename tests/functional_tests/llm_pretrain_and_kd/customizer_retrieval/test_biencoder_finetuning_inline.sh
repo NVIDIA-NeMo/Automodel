@@ -17,7 +17,7 @@ set -exo pipefail
 
 COVERAGE_ARGS="--data-file=/workspace/.coverage --source=/workspace/ --parallel-mode"
 
-# Run the encoder recipe (uses nemo_automodel/recipes/encoder/train_retriever_encoder.py via module entrypoint).
+# Run the biencoder recipe (uses nemo_automodel/recipes/retrieval/train_bi_encoder.py via module entrypoint).
 python3 -m coverage run ${COVERAGE_ARGS} \
     -m nemo_automodel.recipes.retrieval.train_bi_encoder \
     --config \
@@ -26,11 +26,11 @@ python3 -m coverage run ${COVERAGE_ARGS} \
     --tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/llama-nemotron-embed-1b-v2/ \
     --dataloader.dataset.data_dir_list $TEST_DATA_DIR/embedding_testdata/training.jsonl \
 
-# Compare baseline vs finetuned encoder checkpoint (pos-neg separation should not degrade).
+# Compare baseline vs finetuned biencoder checkpoint (pos-neg separation should not degrade).
 python3 -m coverage run --append ${COVERAGE_ARGS} \
-    tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/compare_encoder_models.py \
+    tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/compare_biencoder_models.py \
     $TEST_DATA_DIR/llama-nemotron-embed-1b-v2 \
-    /workspace/output/encoder_inline/checkpoints/epoch_0_step_31/ \
+    /workspace/output/biencoder_inline/checkpoints/epoch_0_step_31/ \
     $TEST_DATA_DIR/embedding_testdata/testing.jsonl \
     true
 
@@ -38,16 +38,16 @@ python3 -m coverage run --append ${COVERAGE_ARGS} \
 # Test 1: Full-model checkpoint restoration (NeMo -> save -> transformers load)
 # Test 2: PEFT (LoRA) checkpoint restoration (NeMo -> save -> transformers + safetensors load)
 BASE_MODEL_PATH=$TEST_DATA_DIR/llama-nemotron-embed-1b-v2 \
-CHECKPOINT_DIR=/workspace/output/encoder_ckpt_restore/checkpoints \
-PEFT_CHECKPOINT_DIR=/workspace/output/encoder_ckpt_restore_peft/checkpoints \
+CHECKPOINT_DIR=/workspace/output/biencoder_ckpt_restore/checkpoints \
+PEFT_CHECKPOINT_DIR=/workspace/output/biencoder_ckpt_restore_peft/checkpoints \
 RECIPE_YAML=tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/recipe_ckpt_restore.yaml \
 PEFT_RECIPE_YAML=tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/recipe_peft.yaml \
 python3 -m coverage run --append ${COVERAGE_ARGS} \
     -m pytest -xvs \
-    tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/test_encoder_checkpoint_restoration.py
+    tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/test_biencoder_checkpoint_restoration.py
 
-# PEFT + encoder + merge_lora tests
-# Verifies that merge_lora.py correctly handles embedding / encoder models
+# PEFT + biencoder + merge_lora tests
+# Verifies that merge_lora.py correctly handles embedding / biencoder models
 # (FEATURE_EXTRACTION task_type → AutoModel instead of AutoModelForCausalLM).
 BASE_MODEL_PATH=$TEST_DATA_DIR/llama-nemotron-embed-1b-v2 \
 python3 -m coverage run --append ${COVERAGE_ARGS} \

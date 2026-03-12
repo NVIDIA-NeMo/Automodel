@@ -74,7 +74,7 @@ lr_scheduler:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /workspace/output/encoder_inline/checkpoints
+  checkpoint_dir: /workspace/output/biencoder_inline/checkpoints
   model_save_format: safetensors
   save_consolidated: true
 

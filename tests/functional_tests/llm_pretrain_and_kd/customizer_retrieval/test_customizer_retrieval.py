@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-Functional test: train an encoder with the customizer-aligned recipe, then
+Functional test: train a biencoder with the customizer-aligned recipe, then
 verify that the fine-tuned model does not degrade vs the baseline on held-out
 data (paired t-test + Cohen's D check).
 
@@ -48,7 +48,7 @@ BASE_MODEL_PATH = os.environ.get(
 )
 CHECKPOINT_DIR = os.environ.get(
     "CHECKPOINT_DIR",
-    "/workspace/output/encoder_inline/checkpoints",
+    "/workspace/output/biencoder_inline/checkpoints",
 )
 TEST_DATA_JSONL = os.environ.get(
     "TEST_DATA_JSONL",
@@ -66,17 +66,17 @@ EVAL_TEMPERATURE = 0.02  # native inference temperature for the model
 
 ONNX_OUTPUT_DIR = os.environ.get(
     "ONNX_OUTPUT_DIR",
-    "/workspace/output/encoder_inline/onnx",
+    "/workspace/output/biencoder_inline/onnx",
 )
 
 
 # ---------------------------------------------------------------------------
-# Helpers (thin wrappers around compare_encoder_models logic)
+# Helpers (thin wrappers around compare_biencoder_models logic)
 # ---------------------------------------------------------------------------
 
 
 def _run_training() -> Path:
-    """Launch the encoder training recipe as a subprocess and return the
+    """Launch the biencoder training recipe as a subprocess and return the
     checkpoint directory produced by the run."""
     cmd = [
         sys.executable,
@@ -232,7 +232,7 @@ def _load_finetuned_weights(model, checkpoint_dir: Path):
 
 
 class TestCustomizerRetrieval:
-    """End-to-end: train encoder with customizer-aligned recipe, then assert
+    """End-to-end: train biencoder with customizer-aligned recipe, then assert
     the fine-tuned model is not degraded vs baseline, and the ONNX export
     produces valid embeddings."""
 
@@ -263,7 +263,7 @@ class TestCustomizerRetrieval:
 
     # -- Test: finetuned model not degraded ---------------------------------
 
-    def test_encoder_finetuning_not_degraded(self, checkpoint_dir, dist_device):
+    def test_biencoder_finetuning_not_degraded(self, checkpoint_dir, dist_device):
         device = dist_device
 
         # Build eval infrastructure.

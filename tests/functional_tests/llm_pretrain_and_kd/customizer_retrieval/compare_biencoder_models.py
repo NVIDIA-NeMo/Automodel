@@ -136,7 +136,7 @@ def load_finetuned_model(model, ft_model_dir: Path):
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare baseline vs fine-tuned encoder models (pos-neg separation)."
+        description="Compare baseline vs fine-tuned biencoder models (pos-neg separation)."
     )
     parser.add_argument("base_model_path", type=str, help="Path to base/pretrained HF model")
     parser.add_argument("checkpoint_root", type=str, help="Path to fine-tuned model directory")
