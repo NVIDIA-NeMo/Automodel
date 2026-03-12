@@ -74,7 +74,7 @@ class ConsolidatedHFAddon:
                     and original_model_path is not None
                     and _config_exists(original_model_path, "config.json")
                 ):
-                    _save_original_config_json(original_model_path, hf_metadata_dir)
+                    _save_original_config_json(original_model_path, hf_metadata_dir, "config.json")
                 else:
                     _maybe_strip_quantization_config(model_part)
                     with open(os.path.join(hf_metadata_dir, "config.json"), "w") as f:
@@ -86,7 +86,7 @@ class ConsolidatedHFAddon:
                     and original_model_path is not None
                     and _config_exists(original_model_path, "generation_config.json")
                 ):
-                    _save_original_config_json(original_model_path, hf_metadata_dir)
+                    _save_original_config_json(original_model_path, hf_metadata_dir, "generation_config.json")
                 else:
                     with open(os.path.join(hf_metadata_dir, "generation_config.json"), "w") as f:
                         f.write(model_part.generation_config.to_json_string())
