@@ -33,14 +33,14 @@ class EncoderStateDictAdapter(StateDictAdapter):
 
     def _strip_model_prefix(self, key):
         if key.startswith(self._PEFT_MODEL_PREFIX):
-            return self._PEFT_PREFIX + key[len(self._PEFT_MODEL_PREFIX):]
+            return self._PEFT_PREFIX + key[len(self._PEFT_MODEL_PREFIX) :]
         if key.startswith(self._MODEL_PREFIX):
-            return key[len(self._MODEL_PREFIX):]
+            return key[len(self._MODEL_PREFIX) :]
         return None
 
     def _add_model_prefix(self, key):
         if key.startswith(self._PEFT_PREFIX):
-            return self._PEFT_MODEL_PREFIX + key[len(self._PEFT_PREFIX):]
+            return self._PEFT_MODEL_PREFIX + key[len(self._PEFT_PREFIX) :]
         return self._MODEL_PREFIX + key
 
     def to_hf(self, state_dict, **kwargs):

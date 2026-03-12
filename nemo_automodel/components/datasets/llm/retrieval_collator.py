@@ -40,7 +40,7 @@ def _unpack_doc_values(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return doc_examples
 
 
-class RetrievalEncoderCollator:
+class BiEncoderCollator:
     """
     Collator for encoder retrieval training.
 

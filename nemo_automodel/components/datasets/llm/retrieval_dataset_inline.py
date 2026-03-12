@@ -182,8 +182,6 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
 def _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
     """
     Transform function to convert from raw format to training format.
-    Same as _format_process_data in RetrievalMultiModalDatasetLoader.
-
     Args:
         examples: Batch of examples with question, corpus_id, pos_doc, neg_doc
         num_neg_docs: Number of negative documents to use
@@ -287,10 +285,10 @@ def _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_i
     return result
 
 
-def flatten_biencoder_to_crossencoder(data: dict) -> dict:
-    """Flatten grouped biencoder output into cross-encoder format.
+def flatten_bi_encoder_to_cross_encoder(data: dict) -> dict:
+    """Flatten grouped bi-encoder output into cross-encoder format.
 
-    Takes biencoder-style data (queries with grouped doc lists) and flattens it
+    Takes bi-encoder-style data (queries with grouped doc lists) and flattens it
     so each query-doc pair becomes a separate entry. Used by cross-encoder transforms
     in both retrieval_dataset.py and retrieval_dataset_inline.py.
     """
@@ -319,11 +317,10 @@ def flatten_biencoder_to_crossencoder(data: dict) -> dict:
 
 def _cross_encoder_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
     """
-    Transform function to convert from raw format to training format.
-    Same as _format_process_data in CrossEncoderMultiModalDatasetLoader.
+    Transform function to convert from raw format to cross-encoder training format.
     """
     data = _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction)
-    return flatten_biencoder_to_crossencoder(data)
+    return flatten_bi_encoder_to_cross_encoder(data)
 
 
 def _create_retrieval_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
@@ -356,7 +353,7 @@ def _create_cross_encoder_transform_func(num_neg_docs, corpus_dict, use_dataset_
 
 def make_retrieval_dataset(
     data_dir_list: Union[List[str], str],
-    model_type: str = "biencoder",
+    model_type: str = "bi_encoder",
     data_type: str = "train",
     n_passages: int = 5,
     eval_negative_size: int = 10,
@@ -369,13 +366,12 @@ def make_retrieval_dataset(
     """
     Load and return dataset in retrieval format for encoder training.
 
-    This function loads data from JSON files using the same method as
-    RetrievalMultiModalDatasetLoader and returns it ready for training.
+    This function loads data from JSON files and returns it ready for training.
     Uses set_transform() for lazy evaluation - tokenization is handled by collator.
 
     Args:
         data_dir_list: Path(s) to JSON file(s) containing training data
-        model_type: "biencoder" (default) or "crossencoder"
+        model_type: "bi_encoder" (default) or "cross_encoder"
         data_type: Type of data ("train" or "eval")
         n_passages: Number of passages (1 positive + n-1 negatives)
         eval_negative_size: Number of negative documents for evaluation
@@ -391,22 +387,22 @@ def make_retrieval_dataset(
         - 'doc_image': List of images or empty strings
 
     Note:
-        Tokenization should be handled by a collator (e.g., RetrievalEncoderCollator)
+        Tokenization should be handled by a collator (e.g., BiEncoderCollator)
         which is more efficient for batch padding and supports dynamic processing.
     """
 
-    _VALID_MODEL_TYPES = ("biencoder", "crossencoder")
+    _VALID_MODEL_TYPES = ("bi_encoder", "cross_encoder")
     if model_type not in _VALID_MODEL_TYPES:
         raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
 
     logging.info(f"Loading data from {data_dir_list if isinstance(data_dir_list, str) else len(data_dir_list)} file(s)")
 
-    # Load datasets using the same method as RetrievalMultiModalDatasetLoader
+    # Load datasets from JSON files
     dataset, corpus_dict = load_datasets(data_dir_list, concatenate=True)
 
     logging.info(f"Loaded dataset with {len(dataset)} examples")
 
-    if model_type == "crossencoder":
+    if model_type == "cross_encoder":
         transform_factory = _create_cross_encoder_transform_func
     else:
         transform_factory = _create_retrieval_transform_func

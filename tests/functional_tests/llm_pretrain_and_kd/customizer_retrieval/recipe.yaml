@@ -33,7 +33,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   dataset:
     _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset
-    model_type: biencoder
+    model_type: bi_encoder
     data_dir_list:
     - /home/TestData/automodel/embedding_testdata/training.jsonl
     data_type: train
@@ -41,7 +41,7 @@ dataloader:
     seed: 42
     do_shuffle: true
   collate_fn:
-    _target_: nemo_automodel.components.datasets.llm.RetrievalEncoderCollator
+    _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
     q_max_len: 1024
     p_max_len: 1024
     query_prefix: ""
@@ -74,7 +74,7 @@ lr_scheduler:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /workspace/output/encoder_inline/checkpoints
+  checkpoint_dir: /workspace/output/bi_encoder_inline/checkpoints
   model_save_format: safetensors
   save_consolidated: true
 

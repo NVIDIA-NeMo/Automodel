@@ -19,11 +19,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 
-from nemo_automodel._transformers.encoder import (
+from nemo_automodel._transformers.retrieval import (
     BiEncoderModel,
     pool,
 )
-from nemo_automodel.recipes.encoder.train_retriever_encoder import contrastive_scores_and_labels
+from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
@@ -388,7 +388,7 @@ def test_encoder_build_llama_bidirec_model_type_generic_path(tmp_path, monkeypat
     (model_dir / "config.json").write_text(json.dumps({"model_type": "llama_bidirec"}))
 
     # Mock AutoConfig.from_pretrained to return a config with the llama_bidirec model_type
-    import nemo_automodel._transformers.encoder as encoder_module
+    import nemo_automodel._transformers.retrieval as encoder_module
 
     class FakeConfig:
         model_type = "llama_bidirec"
@@ -426,7 +426,7 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
 
     # For hub path tests, we need to mock AutoConfig.from_pretrained since the new code
     # calls it first to determine model type before using the registry
-    import nemo_automodel._transformers.encoder as encoder_module
+    import nemo_automodel._transformers.retrieval as encoder_module
 
     class FakeConfig:
         model_type = "llama"

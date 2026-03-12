@@ -1131,14 +1131,14 @@ def test_retrieval_dataset_inline_smoke(tmp_path):
     assert ex["doc_image"] == ["", ""]
 
 
-def test_make_retrieval_dataset_model_type_biencoder(tmp_path):
-    """Explicit model_type='biencoder' produces bi-encoder format."""
+def test_make_retrieval_dataset_model_type_bi_encoder(tmp_path):
+    """Explicit model_type='bi_encoder' produces bi-encoder format."""
     f = tmp_path / "data.jsonl"
     f.write_text(json.dumps({"query": "Q", "pos_doc": "P", "neg_doc": ["N"]}))
 
     ds = rdi.make_retrieval_dataset(
         data_dir_list=str(f),
-        model_type="biencoder",
+        model_type="bi_encoder",
         data_type="train",
         n_passages=2,
         do_shuffle=False,
@@ -1149,14 +1149,14 @@ def test_make_retrieval_dataset_model_type_biencoder(tmp_path):
     assert ex["doc_image"] == ["", ""]
 
 
-def test_make_retrieval_dataset_model_type_crossencoder(tmp_path):
-    """model_type='crossencoder' produces cross-encoder (flattened) format."""
+def test_make_retrieval_dataset_model_type_cross_encoder(tmp_path):
+    """model_type='cross_encoder' produces cross-encoder (flattened) format."""
     f = tmp_path / "data.jsonl"
     f.write_text(json.dumps({"query": "Q", "pos_doc": "P", "neg_doc": ["N"]}))
 
     ds = rdi.make_retrieval_dataset(
         data_dir_list=str(f),
-        model_type="crossencoder",
+        model_type="cross_encoder",
         data_type="train",
         n_passages=2,
         do_shuffle=False,

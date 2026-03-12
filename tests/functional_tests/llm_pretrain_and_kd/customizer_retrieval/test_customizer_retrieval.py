@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-Functional test: train an encoder with the customizer-aligned recipe, then
+Functional test: train a bi-encoder with the customizer-aligned recipe, then
 verify that the fine-tuned model does not degrade vs the baseline on held-out
 data (paired t-test + Cohen's D check).
 
@@ -48,7 +48,7 @@ BASE_MODEL_PATH = os.environ.get(
 )
 CHECKPOINT_DIR = os.environ.get(
     "CHECKPOINT_DIR",
-    "/workspace/output/encoder_inline/checkpoints",
+    "/workspace/output/bi_encoder_inline/checkpoints",
 )
 TEST_DATA_JSONL = os.environ.get(
     "TEST_DATA_JSONL",
@@ -66,17 +66,17 @@ EVAL_TEMPERATURE = 0.02  # native inference temperature for the model
 
 ONNX_OUTPUT_DIR = os.environ.get(
     "ONNX_OUTPUT_DIR",
-    "/workspace/output/encoder_inline/onnx",
+    "/workspace/output/bi_encoder_inline/onnx",
 )
 
 
 # ---------------------------------------------------------------------------
-# Helpers (thin wrappers around compare_encoder_models logic)
+# Helpers (thin wrappers around compare_bi_encoder_models logic)
 # ---------------------------------------------------------------------------
 
 
 def _run_training() -> Path:
-    """Launch the encoder training recipe as a subprocess and return the
+    """Launch the bi-encoder training recipe as a subprocess and return the
     checkpoint directory produced by the run."""
     cmd = [
         sys.executable,
@@ -87,7 +87,7 @@ def _run_training() -> Path:
         "--source=/workspace/",
         "--parallel-mode",
         "-m",
-        "nemo_automodel.recipes.biencoder.train_biencoder",
+        "nemo_automodel.recipes.retrieval.train_bi_encoder",
         "--config",
         RECIPE_YAML,
     ]
@@ -135,14 +135,14 @@ def _build_eval_dataset():
 def _build_collator():
     """Build tokenizer and collator for evaluation."""
     from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
-    from nemo_automodel.components.datasets.llm import RetrievalEncoderCollator
+    from nemo_automodel.components.datasets.llm import BiEncoderCollator
 
     tokenizer = NeMoAutoTokenizer.from_pretrained(BASE_MODEL_PATH)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
 
-    collator = RetrievalEncoderCollator(
+    collator = BiEncoderCollator(
         tokenizer=tokenizer,
         q_max_len=EVAL_MAX_LENGTH,
         p_max_len=EVAL_MAX_LENGTH,
@@ -169,7 +169,7 @@ def _iter_batches(ds, batch_size: int, max_samples: int):
 @torch.no_grad()
 def _compute_pos_neg_diffs(model, collator, ds, device, batch_size, max_samples):
     """Compute per-sample (pos_score - neg_score) diffs."""
-    from nemo_automodel.recipes.encoder.train_retriever_encoder import contrastive_scores_and_labels
+    from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
 
     model.eval()
     diffs: list[np.ndarray] = []
@@ -232,7 +232,7 @@ def _load_finetuned_weights(model, checkpoint_dir: Path):
 
 
 class TestCustomizerRetrieval:
-    """End-to-end: train encoder with customizer-aligned recipe, then assert
+    """End-to-end: train bi-encoder with customizer-aligned recipe, then assert
     the fine-tuned model is not degraded vs baseline, and the ONNX export
     produces valid embeddings."""
 
@@ -263,7 +263,7 @@ class TestCustomizerRetrieval:
 
     # -- Test: finetuned model not degraded ---------------------------------
 
-    def test_encoder_finetuning_not_degraded(self, checkpoint_dir, dist_device):
+    def test_bi_encoder_finetuning_not_degraded(self, checkpoint_dir, dist_device):
         device = dist_device
 
         # Build eval infrastructure.

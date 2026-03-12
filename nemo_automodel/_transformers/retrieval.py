@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Encoder models for biencoder and crossencoder tasks."""
+"""Encoder models for bi-encoder and cross-encoder tasks."""
 
 import inspect
 import os
