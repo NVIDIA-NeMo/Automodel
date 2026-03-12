@@ -160,7 +160,7 @@ class TestUndoAttentionLoadBalancing:
 
     def test_reorders_to_dense(self, module, device):
         """Tokens in load-balanced order should be sorted to dense 0..S-1 order."""
-        B, S_local, D = 1, 4, module.config.hidden_size
+        B, S_local, D = 1, 4, module.hidden_size
         hidden = torch.randn(B, S_local, D, device=device)
         positions = torch.tensor([0, 3, 4, 7], device=device, dtype=torch.long)
 
@@ -184,7 +184,7 @@ class TestUndoAttentionLoadBalancing:
 
     def test_raises_on_non_dense_positions(self, module, device):
         """Should raise if gathered positions don't form a dense 0..S-1 sequence."""
-        B, S_local, D = 1, 4, module.config.hidden_size
+        B, S_local, D = 1, 4, module.hidden_size
         hidden = torch.randn(B, S_local, D, device=device)
         positions = torch.tensor([0, 2, 4, 8], device=device, dtype=torch.long)
 
@@ -211,7 +211,7 @@ class TestRedoAttentionLoadBalancing:
 
     def test_restores_original_layout(self, module, device):
         """Output gathered in dense order should be scattered back to load-balanced order."""
-        B, S_local, D = 1, 4, module.config.hidden_size
+        B, S_local, D = 1, 4, module.hidden_size
 
         # Dense-order output from the attention computation
         output = torch.arange(S_local, device=device, dtype=torch.float).unsqueeze(0).unsqueeze(-1).expand(B, S_local, D)
@@ -243,7 +243,7 @@ class TestRedoAttentionLoadBalancing:
 
     def test_raises_on_position_mismatch(self, module, device):
         """Should raise if sorted_positions don't cover the original_positions."""
-        B, S_local, D = 1, 4, module.config.hidden_size
+        B, S_local, D = 1, 4, module.hidden_size
         output = torch.randn(B, S_local, D, device=device)
 
         original_positions = torch.tensor([0, 3, 4, 10], device=device, dtype=torch.long)  # 10 out of range
@@ -274,7 +274,7 @@ class TestForwardFastPath:
     def test_no_cp_mesh_delegates_to_super(self, module, device):
         """When _cp_mesh is None, forward should delegate to the HF parent class."""
         assert module._cp_mesh is None
-        B, S, D = 1, 8, module.config.hidden_size
+        B, S, D = 1, 8, module.hidden_size
         hidden = torch.randn(B, S, D, device=device)
         with patch.object(
             type(module).__bases__[0], "forward", return_value=torch.randn(B, S, D, device=device)
@@ -288,7 +288,7 @@ class TestForwardFastPath:
         mesh.size.return_value = 1
         module._cp_mesh = mesh
 
-        B, S, D = 1, 8, module.config.hidden_size
+        B, S, D = 1, 8, module.hidden_size
         hidden = torch.randn(B, S, D, device=device)
         with patch.object(
             type(module).__bases__[0], "forward", return_value=torch.randn(B, S, D, device=device)
@@ -302,7 +302,7 @@ class TestForwardFastPath:
         mesh.size.return_value = 2
         module._cp_mesh = mesh
 
-        B, S, D = 1, 8, module.config.hidden_size
+        B, S, D = 1, 8, module.hidden_size
         hidden = torch.randn(B, S, D, device=device)
         with patch.object(
             module, "_forward_with_cp", return_value=torch.randn(B, S, D, device=device)
