@@ -123,6 +123,8 @@ class CheckpointingConfig:
     # This should be used for remote storage systems that don't support direct-append or non-sequential writes.
     staging_dir: str | None = None  # Optional directory for staging files during consolidation.
     # If provided, temp files will be created here instead of system temp. Useful when system temp has limited space.
+    v4_compatible: bool = False  # If True, save the original pretrained config.json (with quantization_config removed)
+    # instead of the in-memory v5 config.  Useful when downstream consumers (e.g. vLLM) expect a v4-format config.
 
     def __post_init__(self):
         """
@@ -133,6 +135,15 @@ class CheckpointingConfig:
             f"Unsupported model save format: {self.model_save_format}. Supported formats: {formats}"
         )
         self.model_save_format = SerializationFormat[self.model_save_format.upper()]
+        if self.save_consolidated or False:
+            if not self.v4_compatible:
+                logging.warning(
+                    "save_consolidated=True but v4_compatible=False; "
+                    "checkpoint assets may be not compatible with transformers v4; "
+                    "[experimental] set --checkpoint.v4_compatible=True to enable"
+                )
+            else:
+                logging.warning("[experimental] v4_compatible=True enables transformers v4 compatibility")
 
         # Async is only enabled for torch >= 2.9.0 currently because of large API changes in async DCP from 2.8.0 to 2.9.0
         if self.is_async and not _is_geq_torch_2_9():
@@ -255,6 +266,7 @@ class Checkpointer:
                 peft_config=peft_config,
                 fqn_to_file_index_mapping=fqn_to_file_index_mapping,
                 original_model_path=self._get_original_model_path(model_state),
+                v4_compatible=self.config.v4_compatible,
             )
 
         storage_writer = self._get_storage_writer(
