@@ -50,14 +50,14 @@ def _make_recipe(mining_overrides=None):
 def _run_setup_and_capture_from_pretrained(mining_overrides=None):
     """Run recipe.setup() with only the truly heavy pieces stubbed out.
 
-    build_distributed, NeMoAutoModelBiencoder, _configure_tokenizer,
+    build_distributed, NeMoAutoModelBiEncoder, _configure_tokenizer,
     _load_data, _build_document_mappings, and _prepare_data are mocked
     because they require GPU / filesystem / model weights.
 
     _extract_mining_params and _validate_mining_params run for real so
     we test the actual wiring end-to-end.
 
-    Returns the mock for NeMoAutoModelBiencoder so callers can inspect
+    Returns the mock for NeMoAutoModelBiEncoder so callers can inspect
     from_pretrained call args.
     """
     mining_dict = dict(_BASE_MINING, **(mining_overrides or {}))

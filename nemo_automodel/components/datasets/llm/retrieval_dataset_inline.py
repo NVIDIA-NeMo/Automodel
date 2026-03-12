@@ -182,8 +182,6 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
 def _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
     """
     Transform function to convert from raw format to training format.
-    Same as _format_process_data in RetrievalMultiModalDatasetLoader.
-
     Args:
         examples: Batch of examples with question, corpus_id, pos_doc, neg_doc
         num_neg_docs: Number of negative documents to use
@@ -319,8 +317,7 @@ def flatten_bi_encoder_to_cross_encoder(data: dict) -> dict:
 
 def _cross_encoder_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
     """
-    Transform function to convert from raw format to training format.
-    Same as _format_process_data in CrossEncoderMultiModalDatasetLoader.
+    Transform function to convert from raw format to cross-encoder training format.
     """
     data = _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction)
     return flatten_bi_encoder_to_cross_encoder(data)
@@ -369,8 +366,7 @@ def make_retrieval_dataset(
     """
     Load and return dataset in retrieval format for encoder training.
 
-    This function loads data from JSON files using the same method as
-    RetrievalMultiModalDatasetLoader and returns it ready for training.
+    This function loads data from JSON files and returns it ready for training.
     Uses set_transform() for lazy evaluation - tokenization is handled by collator.
 
     Args:
@@ -401,7 +397,7 @@ def make_retrieval_dataset(
 
     logging.info(f"Loading data from {data_dir_list if isinstance(data_dir_list, str) else len(data_dir_list)} file(s)")
 
-    # Load datasets using the same method as RetrievalMultiModalDatasetLoader
+    # Load datasets from JSON files
     dataset, corpus_dict = load_datasets(data_dir_list, concatenate=True)
 
     logging.info(f"Loaded dataset with {len(dataset)} examples")

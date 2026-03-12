@@ -4,7 +4,7 @@ NeMo Automodel supports **retrieval model fine-tuning** using a retrieval-style 
 
 This dataset is used by the retrieval recipes (see `examples/retrieval/bi_encoder/` and `examples/retrieval/cross_encoder/`) together with the `BiEncoderCollator`.
 
-## What the Encoder Consumes
+## What the Bi-Encoder Consumes
 
 The dataset factory `nemo_automodel.components.datasets.llm.make_retrieval_dataset` returns a Hugging Face `datasets.Dataset`. At runtime it transforms each raw record into the training-time schema:
 
@@ -78,7 +78,7 @@ This is convenient for custom fine-tuning pipelines where the documents are incl
 
 ## YAML Usage (Dataset + Collator)
 
-Use the dataset factory plus the encoder collator:
+Use the dataset factory plus the bi-encoder collator:
 
 ```yaml
 dataloader:

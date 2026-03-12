@@ -415,7 +415,6 @@ def _load_hf_sources(hf_uris: List[str]):
 def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
     """
     Transform function to convert from raw format to training format.
-    Same as _format_process_data in RetrievalMultiModalDatasetLoader.
 
     Args:
         examples: Batch of examples with question, corpus_id, pos_doc, neg_doc
@@ -520,7 +519,6 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
 def _cross_encoder_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
     """
     Transform function to convert from raw format to cross-encoder training format.
-    Same as _format_process_data in CrossEncoderMultiModalDatasetLoader.
     """
     from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import flatten_bi_encoder_to_cross_encoder
 
