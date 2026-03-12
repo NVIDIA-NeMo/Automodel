@@ -289,9 +289,12 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
 
         if layer_type == "full_attention":
             attn_module = block.self_attn.attn_module
-            assert isinstance(attn_module, DotProductAttention), (
-                "Context parallelism is only supported for TransformerEngine's DotProductAttention"
-            )
+            if not isinstance(attn_module, DotProductAttention):
+                logger.warning(
+                    "Skipping CP setup for block with non-TE attention module: %s",
+                    type(attn_module).__name__,
+                )
+                continue
             attn_module.set_context_parallel_group(
                 cp_mesh.get_group(),
                 torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
