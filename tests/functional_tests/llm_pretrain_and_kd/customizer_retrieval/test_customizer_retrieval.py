@@ -169,7 +169,7 @@ def _iter_batches(ds, batch_size: int, max_samples: int):
 @torch.no_grad()
 def _compute_pos_neg_diffs(model, collator, ds, device, batch_size, max_samples):
     """Compute per-sample (pos_score - neg_score) diffs."""
-    from nemo_automodel.recipes.encoder.train_retriever_encoder import contrastive_scores_and_labels
+    from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
 
     model.eval()
     diffs: list[np.ndarray] = []

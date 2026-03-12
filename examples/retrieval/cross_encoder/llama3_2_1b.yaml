@@ -13,9 +13,9 @@
 # limitations under the License.
 
 # To run this recipe, please use the following command:
-# python examples/encoder/cross_encoder/finetune.py --config examples/encoder/cross_encoder/llama3_2_1b.yaml
+# python examples/retrieval/cross_encoder/finetune.py --config examples/retrieval/cross_encoder/llama3_2_1b.yaml
 # Or with torchrun for multi-GPU:
-# torchrun --nproc-per-node=8 examples/encoder/cross_encoder/finetune.py --config examples/encoder/cross_encoder/llama3_2_1b.yaml
+# torchrun --nproc-per-node=8 examples/retrieval/cross_encoder/finetune.py --config examples/retrieval/cross_encoder/llama3_2_1b.yaml
 
 seed: 42
 

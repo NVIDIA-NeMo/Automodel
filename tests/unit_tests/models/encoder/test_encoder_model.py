@@ -15,7 +15,7 @@
 import pytest
 
 import nemo_automodel._transformers.auto_model as am
-from nemo_automodel._transformers.encoder import BiEncoderModel, CrossEncoderModel
+from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel
 
 
 class DummyModel:

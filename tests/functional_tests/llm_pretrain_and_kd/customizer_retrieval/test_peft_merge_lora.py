@@ -333,7 +333,7 @@ class TestMergeLoraRealBiencoder:
     def test_merge_lora_real_biencoder(self):
         from peft import LoraConfig, PeftModel, get_peft_model
 
-        from nemo_automodel._transformers.encoder import BiEncoderModel
+        from nemo_automodel._transformers.retrieval import BiEncoderModel
         from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel
         from tools.merge_lora import merge_lora
 

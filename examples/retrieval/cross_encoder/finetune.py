@@ -15,19 +15,12 @@
 from __future__ import annotations
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.encoder import TrainRetrieverEncoderRecipe
+from nemo_automodel.recipes.retrieval import TrainCrossEncoderRecipe
 
 
-def main(default_config_path="examples/encoder/bi_encoder/llama3_2_1b.yaml"):
-    """Main entry point for the biencoder fine-tuning recipe.
-
-    Loads the configuration, sets up the recipe, and initiates the training loop.
-
-    Args:
-        default_config_path: Path to the default configuration file
-    """
+def main(default_config_path="examples/retrieval/cross_encoder/llama3_2_1b.yaml"):
     cfg = parse_args_and_load_config(default_config_path)
-    recipe = TrainRetrieverEncoderRecipe(cfg)
+    recipe = TrainCrossEncoderRecipe(cfg)
     recipe.setup()
     recipe.run_train_validation_loop()
 

@@ -84,7 +84,7 @@ def _run_training(recipe_yaml: str, checkpoint_dir: str) -> Path:
         "--data-file=/workspace/.coverage",
         "--source=/workspace/",
         "--parallel-mode",
-        "-m", "nemo_automodel.recipes.encoder.train_retriever_encoder",
+        "-m", "nemo_automodel.recipes.retrieval.train_bi_encoder",
         "--config",
         recipe_yaml,
     ]
@@ -173,7 +173,7 @@ class TestEncoderCheckpointRestoration:
         """Train encoder -> load trained model back in NeMo -> save ->
         restore with transformers -> verify state dicts match."""
 
-        from nemo_automodel._transformers.encoder import BiEncoderModel
+        from nemo_automodel._transformers.retrieval import BiEncoderModel
         from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel
 
         # ---- Step 1: Train ------------------------------------------------
@@ -234,7 +234,7 @@ class TestEncoderCheckpointRestoration:
         weights restored by transformers + LoRA weights by safetensors."""
 
         from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
-        from nemo_automodel._transformers.encoder import BiEncoderModel
+        from nemo_automodel._transformers.retrieval import BiEncoderModel
         from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel
 
         # ---- Step 1: Train with PEFT -------------------------------------

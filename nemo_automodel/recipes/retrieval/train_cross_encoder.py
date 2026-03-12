@@ -22,7 +22,7 @@ import wandb
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.training.rng import ScopedRNG
-from nemo_automodel.recipes.encoder.train_retriever_encoder import TrainRetrieverEncoderRecipe
+from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainRetrieverEncoderRecipe
 
 
 @torch.no_grad()

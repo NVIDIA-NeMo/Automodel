@@ -25,7 +25,7 @@ from nemo_automodel.components.datasets.llm import retrieval_dataset_inline as r
 from nemo_automodel.components.datasets.llm import RetrievalEncoderCollator
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel._transformers.auto_model import NeMoAutoModelBiEncoder
-from nemo_automodel.recipes.encoder.train_retriever_encoder import contrastive_scores_and_labels
+from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
 
 
 def _resolve_latest_checkpoint_dir(ckpt_root: Path) -> Path:

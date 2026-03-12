@@ -739,7 +739,7 @@ class _NeMoAutoModelEncoderBase:
     """Private shared base for encoder auto-models.
 
     Subclasses set ``_ENCODER_CLS_NAME`` to select the concrete encoder class
-    from ``nemo_automodel._transformers.encoder``.
+    from ``nemo_automodel._transformers.retrieval``.
     """
 
     _ENCODER_CLS_NAME: Optional[str] = None  # "BiEncoderModel" or "CrossEncoderModel"
@@ -793,7 +793,7 @@ class _NeMoAutoModelEncoderBase:
         Notes:
             If kernel patching fails, the method retries with adjusted parameters.
         """
-        from nemo_automodel._transformers import encoder as _enc_mod
+        from nemo_automodel._transformers import retrieval as _enc_mod
 
         encoder_cls = getattr(_enc_mod, cls._ENCODER_CLS_NAME)
 
