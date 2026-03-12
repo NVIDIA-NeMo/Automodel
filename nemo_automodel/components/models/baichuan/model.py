@@ -40,7 +40,7 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from torch.nn import functional as F
-from transformers import PreTrainedModel
+from transformers import GenerationMixin, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.utils import logging
@@ -464,7 +464,7 @@ class BaichuanModel(BaichuanPreTrainedModel):
 # ---------------------------------------------------------------------------
 # Causal LM head
 # ---------------------------------------------------------------------------
-class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel):
+class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: BaichuanConfig, **model_kwargs):
