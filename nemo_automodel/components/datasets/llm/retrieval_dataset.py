@@ -522,10 +522,10 @@ def _cross_encoder_transform_func(examples, num_neg_docs, corpus_dict, use_datas
     Transform function to convert from raw format to cross-encoder training format.
     Same as _format_process_data in CrossEncoderMultiModalDatasetLoader.
     """
-    from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import flatten_biencoder_to_crossencoder
+    from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import flatten_bi_encoder_to_cross_encoder
 
     data = _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction)
-    return flatten_biencoder_to_crossencoder(data)
+    return flatten_bi_encoder_to_cross_encoder(data)
 
 
 def _create_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
@@ -558,7 +558,7 @@ def _create_cross_encoder_transform_func(num_neg_docs, corpus_dict, use_dataset_
 
 def make_retrieval_dataset(
     data_dir_list: Union[List[str], str] = None,
-    model_type: str = "biencoder",
+    model_type: str = "bi_encoder",
     data_type: str = "train",
     n_passages: int = 5,
     eval_negative_size: int = 10,
@@ -578,7 +578,7 @@ def make_retrieval_dataset(
 
     Args:
         data_dir_list: Path(s) to JSON file(s) or ``hf://`` URIs.
-        model_type: "biencoder" (default) or "crossencoder"
+        model_type: "bi_encoder" (default) or "cross_encoder"
         data_type: Type of data ("train" or "eval")
         n_passages: Number of passages (1 positive + n-1 negatives)
         eval_negative_size: Number of negative documents for evaluation
@@ -605,7 +605,7 @@ def make_retrieval_dataset(
         which is more efficient for batch padding and supports dynamic processing.
     """
 
-    _VALID_MODEL_TYPES = ("biencoder", "crossencoder")
+    _VALID_MODEL_TYPES = ("bi_encoder", "cross_encoder")
     if model_type not in _VALID_MODEL_TYPES:
         raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
 
@@ -641,7 +641,7 @@ def make_retrieval_dataset(
 
     logging.info(f"Loaded dataset with {len(dataset)} examples")
 
-    if model_type == "crossencoder":
+    if model_type == "cross_encoder":
         transform_factory = _create_cross_encoder_transform_func
     else:
         transform_factory = _create_transform_func
@@ -682,9 +682,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_type", type=str, default="train", choices=["train", "eval"], help="Type of data (train or eval)"
     )
-    parser.add_argument(
-        "--n_passages", type=int, default=5, help="Number of passages (1 positive + n-1 negatives)"
-    )
+    parser.add_argument("--n_passages", type=int, default=5, help="Number of passages (1 positive + n-1 negatives)")
     parser.add_argument(
         "--eval_negative_size", type=int, default=10, help="Number of negative documents for evaluation"
     )

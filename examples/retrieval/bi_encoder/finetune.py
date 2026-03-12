@@ -19,7 +19,7 @@ from nemo_automodel.recipes.retrieval import TrainBiEncoderRecipe
 
 
 def main(default_config_path="examples/retrieval/bi_encoder/llama3_2_1b.yaml"):
-    """Main entry point for the biencoder fine-tuning recipe.
+    """Main entry point for the bi-encoder fine-tuning recipe.
 
     Loads the configuration, sets up the recipe, and initiates the training loop.
 

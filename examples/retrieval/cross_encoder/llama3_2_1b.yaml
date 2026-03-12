@@ -46,7 +46,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   dataset:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
-    model_type: crossencoder
+    model_type: cross_encoder
     data_dir_list:
       - retriever_models_research/training_datasets/nqsh_shuffled_50k.json
       - retriever_models_research/training_datasets/mldr_en_perc95_small.json
@@ -67,7 +67,7 @@ dataloader:
 #   _target_: torchdata.stateful_dataloader.StatefulDataLoader
 #   dataset:
 #     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
-#     model_type: crossencoder
+#     model_type: cross_encoder
 #     data_dir_list: training_datasets/validation.json
 #     data_type: eval
 #     n_passages: 5

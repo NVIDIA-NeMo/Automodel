@@ -33,7 +33,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   dataset:
     _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset
-    model_type: biencoder
+    model_type: bi_encoder
     data_dir_list:
     - /home/TestData/automodel/embedding_testdata/training.jsonl
     data_type: train
@@ -69,7 +69,7 @@ lr_scheduler:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /workspace/output/biencoder_ckpt_restore/checkpoints
+  checkpoint_dir: /workspace/output/bi_encoder_ckpt_restore/checkpoints
   model_save_format: safetensors
   save_consolidated: true
 

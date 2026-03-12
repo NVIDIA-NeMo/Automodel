@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Functional tests: PEFT + biencoder + merge_lora end-to-end.
+"""Functional tests: PEFT + bi-encoder + merge_lora end-to-end.
 
 Verifies that ``tools/merge_lora.py`` correctly handles non-CausalLM models
 (embedding / feature-extraction models) by:
 
 1. Building a LlamaBidirectionalModel (the backbone used by the retrieval
-   customizer biencoder).
+   customizer bi-encoder).
 2. Applying HF PEFT LoRA with ``task_type=FEATURE_EXTRACTION``.
 3. Merging the adapter via ``merge_lora`` (which must auto-detect the task
    type and use ``AutoModel`` instead of ``AutoModelForCausalLM``).
@@ -29,7 +29,7 @@ Two test classes are provided:
 
 * ``TestMergeLoraEmbeddingModel`` – self-contained tiny model, no external
   data needed, validates the core merge_lora logic for FEATURE_EXTRACTION.
-* ``TestMergeLoraRealBiencoder`` – uses the real
+* ``TestMergeLoraRealBiEncoder`` – uses the real
   ``llama-nemotron-embed-1b-v2`` checkpoint when available in CI.
 """
 
@@ -83,7 +83,7 @@ LORA_TARGET_MODULES = [
 
 
 class TestMergeLoraEmbeddingModel:
-    """merge_lora with FEATURE_EXTRACTION task type (embedding / biencoder models).
+    """merge_lora with FEATURE_EXTRACTION task type (embedding / bi-encoder models).
 
     Uses a tiny randomly-initialised model so the test is fast and needs no
     external data or GPU.
@@ -309,7 +309,7 @@ class TestMergeLoraEmbeddingModel:
 
 
 # ---------------------------------------------------------------------------
-# Real biencoder tests (require CI model data + GPU)
+# Real bi-encoder tests (require CI model data + GPU)
 # ---------------------------------------------------------------------------
 
 _HAS_REAL_MODEL = os.path.isdir(BASE_MODEL_PATH)
@@ -318,8 +318,8 @@ _SKIP_REASON = "Requires real model at BASE_MODEL_PATH and CUDA" if not (_HAS_RE
 
 
 @pytest.mark.skipif(not (_HAS_REAL_MODEL and _HAS_CUDA), reason=_SKIP_REASON)
-class TestMergeLoraRealBiencoder:
-    """End-to-end merge_lora with the real biencoder model.
+class TestMergeLoraRealBiEncoder:
+    """End-to-end merge_lora with the real bi-encoder model.
 
     Loads ``llama-nemotron-embed-1b-v2``, applies HF PEFT LoRA, merges with
     ``merge_lora``, and verifies that the merged model produces valid
@@ -330,7 +330,7 @@ class TestMergeLoraRealBiencoder:
     def setup(self, tmp_path):
         self.tmp_path = str(tmp_path)
 
-    def test_merge_lora_real_biencoder(self):
+    def test_merge_lora_real_bi_encoder(self):
         from peft import LoraConfig, PeftModel, get_peft_model
 
         from nemo_automodel._transformers.retrieval import BiEncoderModel
@@ -422,13 +422,13 @@ class TestMergeLoraRealBiencoder:
                 msg=f"Weight mismatch at {name}",
             )
 
-        # 7. Verify embeddings via biencoder wrapper
-        biencoder_ref = BiEncoderModel(
+        # 7. Verify embeddings via bi-encoder wrapper
+        bi_encoder_ref = BiEncoderModel(
             model=ref_merged,
             pooling="avg",
             l2_normalize=True,
         ).eval()
-        biencoder_merged = BiEncoderModel(
+        bi_encoder_merged = BiEncoderModel(
             model=merged_model,
             pooling="avg",
             l2_normalize=True,
@@ -440,8 +440,8 @@ class TestMergeLoraRealBiencoder:
         input_dict = {"input_ids": input_ids, "attention_mask": attention_mask}
 
         with torch.no_grad():
-            emb_ref = biencoder_ref.encode(input_dict)
-            emb_merged = biencoder_merged.encode(input_dict)
+            emb_ref = bi_encoder_ref.encode(input_dict)
+            emb_merged = bi_encoder_merged.encode(input_dict)
 
         assert emb_ref is not None and emb_merged is not None
         assert torch.isfinite(emb_merged).all(), "Merged embeddings contain non-finite values"
@@ -465,6 +465,6 @@ class TestMergeLoraRealBiencoder:
             msg="Embedding mismatch between merge_lora output and reference",
         )
 
-        print("\n[PASS] merge_lora real biencoder: embeddings match reference")
+        print("\n[PASS] merge_lora real bi-encoder: embeddings match reference")
         print(f"  Embedding shape: {tuple(emb_merged.shape)}")
         print(f"  Cosine(0,1): {float(emb_merged[0] @ emb_merged[1]):.4f}")
