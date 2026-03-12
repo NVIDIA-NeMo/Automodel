@@ -110,56 +110,32 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
     def _conv1d_with_cp(
         self,
         mixed_qkv: torch.Tensor,
-        cp_group: dist.ProcessGroup,
+        cp_context,
     ) -> torch.Tensor:
-        """Run causal conv1d with cross-rank boundary token exchange.
+        """Run causal conv1d via FLA's CP-aware conv implementation.
 
         Args:
             mixed_qkv: [B, D, S_local] tensor (channels-first for conv).
-            cp_group: CP process group.
+            cp_context: FLA CP context built by ``build_cp_context``.
 
         Returns:
             [B, D, S_local] conv output with correct boundary handling.
         """
-        W = self.conv_kernel_size  # typically 4
-        cp_rank = dist.get_rank(cp_group)
-        cp_world = dist.get_world_size(cp_group)
-        B, D, S_local = mixed_qkv.shape
+        from fla.modules.convolution import causal_conv1d as fla_causal_conv1d
 
-        # Map group-local ranks → global ranks for P2POp.
-        group_ranks = dist.get_process_group_ranks(cp_group)
-
-        # Exchange last W-1 tokens with next rank so conv has correct context.
-        recv_buf = torch.zeros(B, D, W - 1, device=mixed_qkv.device, dtype=mixed_qkv.dtype)
-
-        ops = []
-        if cp_rank > 0:
-            ops.append(dist.P2POp(dist.irecv, recv_buf, group_ranks[cp_rank - 1], cp_group))
-        if cp_rank < cp_world - 1:
-            send_buf = mixed_qkv[:, :, -(W - 1):].contiguous()
-            ops.append(dist.P2POp(dist.isend, send_buf, group_ranks[cp_rank + 1], cp_group))
-        if ops:
-            reqs = dist.batch_isend_irecv(ops)
-            for req in reqs:
-                req.wait()
-
-        # Prepend received tokens (zeros for rank 0) to form extended input.
-        extended = torch.cat([recv_buf, mixed_qkv], dim=2)  # [B, D, W-1+S_local]
-
-        # Run causal conv on extended sequence, then take last S_local positions.
-        if self.causal_conv1d_fn is not None:
-            extended = self.causal_conv1d_fn(
-                x=extended,
+        conv_in = mixed_qkv.transpose(1, 2).contiguous()  # [B, S_local, D]
+        conv_outs = []
+        for bi in range(conv_in.shape[0]):
+            out_bi, _ = fla_causal_conv1d(
+                x=conv_in[bi : bi + 1],
                 weight=self.conv1d.weight.squeeze(1),
                 bias=self.conv1d.bias,
                 activation=self.activation,
+                cp_context=cp_context,
             )
-        else:
-            extended = F.silu(self.conv1d(extended)[:, :, : W - 1 + S_local])
+            conv_outs.append(out_bi)
 
-        # The first W-1 positions correspond to the received prefix;
-        # positions W-1 onward are the correct outputs for local tokens.
-        return extended[:, :, W - 1:]
+        return torch.cat(conv_outs, dim=0).transpose(1, 2).contiguous()
 
     def _extract_local_positions(
         self,
@@ -300,9 +276,9 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         a = self.in_proj_a(hidden_states)             # [B, S_local, num_v_heads]
 
         # ---- Causal Conv1d with cross-rank boundary exchange ----
-        mixed_qkv = mixed_qkv.transpose(1, 2)                  # [B, D, S_local]
-        mixed_qkv = self._conv1d_with_cp(mixed_qkv, cp_group)  # [B, D, S_local]
-        mixed_qkv = mixed_qkv.transpose(1, 2)                  # [B, S_local, D]
+        mixed_qkv = mixed_qkv.transpose(1, 2)                    # [B, D, S_local]
+        mixed_qkv = self._conv1d_with_cp(mixed_qkv, cp_context)  # [B, D, S_local]
+        mixed_qkv = mixed_qkv.transpose(1, 2)                    # [B, S_local, D]
 
         # ---- Split QKV ----
         query, key, value = torch.split(

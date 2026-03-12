@@ -20,4 +20,4 @@ export CUDA_VISIBLE_DEVICES="0,1"
 
 # Run Qwen3.5 MoE linear attention CP test with 2 GPUs
 torchrun --nproc_per_node=2 --nnodes=1 \
-    tests/functional_tests/context_parallel/run_linear_attn_cp.py
+    tests/functional_tests/context_parallel/run_qwen3_5_moe_linear_attn_cp.py
