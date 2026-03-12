@@ -444,3 +444,81 @@ jobs:
           path: |
             .coverage
           include-hidden-files: true
+
+  Coverage_File_Check:
+    runs-on: ubuntu-latest
+    needs: [pre-flight, Coverage]
+    if: |
+      (
+        (needs.pre-flight.outputs.is_ci_workload == 'true' && !failure())
+        || success()
+      )
+      && !cancelled()
+    env:
+      COVERAGE_FLOOR: "80"
+      PREVENT_REGRESSION: "false"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install coverage
+        run: pip install "coverage[toml]"
+
+      - name: Restore baseline coverage (PRs only)
+        if: github.ref != 'refs/heads/main'
+        id: restore-baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: baseline-coverage.json
+          key: coverage-baseline-main-never-exact-match
+          restore-keys: coverage-baseline-main-
+
+      - name: Download unit-test coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-unit-test-aggregated
+          path: cov-unit-test
+
+      - name: Download e2e coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-e2e-aggregated
+          path: cov-e2e
+
+      - name: Combine all coverage and generate JSON
+        run: |
+          coverage combine --keep cov-unit-test/.coverage cov-e2e/.coverage
+          coverage json -o head-coverage.json
+
+      - name: Prepare baseline for cache (main only)
+        if: github.ref == 'refs/heads/main'
+        run: cp head-coverage.json baseline-coverage.json
+
+      - name: Save baseline coverage (main only)
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: baseline-coverage.json
+          key: coverage-baseline-main-${{ github.sha }}
+
+      - name: Run file coverage check (PRs only)
+        if: github.ref != 'refs/heads/main'
+        run: |
+          if [ ! -f baseline-coverage.json ]; then
+            echo "No baseline coverage found (first run?). Skipping check."
+            exit 0
+          fi
+
+          ARGS="--base-json baseline-coverage.json --head-json head-coverage.json --floor $COVERAGE_FLOOR"
+          if [ "$PREVENT_REGRESSION" = "true" ]; then
+            ARGS="$ARGS --prevent-regression"
+          fi
+
+          python tools/check_file_coverage.py $ARGS

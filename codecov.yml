@@ -4,8 +4,8 @@ coverage:
     project: false
     patch:
       default:
+        informational: true
         target: 80%
-        threshold: 10%
         base: auto
         if_ci_failed: error
         if_not_found: success
