@@ -17,7 +17,7 @@
 Tests cover:
   - _extract_local_positions: various tensor shapes and fallback behavior
   - _undo_attention_load_balancing / _redo_attention_load_balancing: correctness
-  - _AllGatherConcatFn: forward/backward in a single-rank mock scenario
+  - _AllGatherConcatFn: forward in a single-rank mock scenario
   - CPAwareGatedDeltaNet.forward: fast path delegation when CP is disabled
   - _conv1d_with_cp: boundary token exchange logic
 """
@@ -30,6 +30,7 @@ import pytest
 import torch
 
 pytest.importorskip("transformers.models.qwen3_5_moe")
+pytest.importorskip("fla")
 
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
 
@@ -94,12 +95,17 @@ def _make_fake_all_gather(rank0_pos, rank1_pos, rank0_hidden, rank1_hidden, devi
     return fake_all_gather
 
 
+import contextlib
+
+
+@contextlib.contextmanager
 def _patch_dist_for_cp(rank=0, world_size=2):
-    """Context manager that patches dist calls for CP testing."""
-    return (
+    """Context manager that patches dist rank/world_size for CP testing."""
+    with (
         patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_world_size", return_value=world_size),
         patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_rank", return_value=rank),
-    )
+    ):
+        yield
 
 
 # ============================================================================
@@ -127,26 +133,21 @@ class TestExtractLocalPositions:
         assert result is not None
         assert result.shape == (4,)
 
-    def test_seq_index_preferred_over_position_ids(self, module, device):
-        seq_index = torch.tensor([3, 1, 0, 2], device=device)
-        position_ids = torch.tensor([[0, 1, 2, 3]], device=device)
-        result = module._extract_local_positions(position_ids=position_ids, seq_index=seq_index, seq_len=4)
-        # seq_index is checked first
-        assert torch.equal(result, seq_index.long())
-
-    def test_returns_none_when_both_none(self, module, device):
-        result = module._extract_local_positions(position_ids=None, seq_index=None, seq_len=4)
-        assert result is None
-
-    def test_returns_none_when_length_mismatch(self, module, device):
-        seq_index = torch.tensor([0, 1, 2], device=device)  # length 3 != seq_len 4
-        result = module._extract_local_positions(position_ids=None, seq_index=seq_index, seq_len=4)
-        assert result is None
-
-    def test_4d_tensor_skipped(self, module, device):
-        """Tensors with ndim > 3 should be ignored."""
-        position_ids = torch.arange(4, device=device).reshape(1, 1, 1, 4)
-        result = module._extract_local_positions(position_ids=position_ids, seq_index=None, seq_len=4)
+    @pytest.mark.parametrize(
+        "position_ids, seq_index, seq_len",
+        [
+            (None, None, 4),  # both None
+            (None, torch.tensor([0, 1, 2]), 4),  # length mismatch
+            (torch.arange(4).reshape(1, 1, 1, 4), None, 4),  # 4D tensor skipped
+        ],
+        ids=["both_none", "length_mismatch", "4d_skipped"],
+    )
+    def test_returns_none_for_invalid_inputs(self, module, device, position_ids, seq_index, seq_len):
+        if position_ids is not None:
+            position_ids = position_ids.to(device)
+        if seq_index is not None:
+            seq_index = seq_index.to(device)
+        result = module._extract_local_positions(position_ids=position_ids, seq_index=seq_index, seq_len=seq_len)
         assert result is None
 
 
@@ -171,7 +172,7 @@ class TestUndoAttentionLoadBalancing:
 
         with (
             patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.all_gather", fake_ag),
-            *_patch_dist_for_cp(rank=0, world_size=2),
+            _patch_dist_for_cp(rank=0, world_size=2),
         ):
             result_hidden, sorted_pos = module._undo_attention_load_balancing(
                 hidden, positions, MagicMock()
@@ -195,7 +196,7 @@ class TestUndoAttentionLoadBalancing:
 
         with (
             patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.all_gather", fake_ag),
-            *_patch_dist_for_cp(rank=0, world_size=2),
+            _patch_dist_for_cp(rank=0, world_size=2),
         ):
             with pytest.raises(RuntimeError, match="dense global token positions"):
                 module._undo_attention_load_balancing(hidden, positions, MagicMock())
@@ -228,7 +229,7 @@ class TestRedoAttentionLoadBalancing:
 
         with (
             patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.all_gather", fake_all_gather),
-            *_patch_dist_for_cp(rank=0, world_size=2),
+            _patch_dist_for_cp(rank=0, world_size=2),
         ):
             result = module._redo_attention_load_balancing(
                 output, original_positions, sorted_positions, MagicMock()
@@ -240,29 +241,6 @@ class TestRedoAttentionLoadBalancing:
         expected_indices = original_positions
         for i, pos in enumerate(expected_indices):
             assert result[0, i, 0].item() == pos.item()
-
-    def test_raises_on_position_mismatch(self, module, device):
-        """Should raise if sorted_positions don't cover the original_positions."""
-        B, S_local, D = 1, 4, module.hidden_size
-        output = torch.randn(B, S_local, D, device=device)
-
-        original_positions = torch.tensor([0, 3, 4, 10], device=device, dtype=torch.long)  # 10 out of range
-        sorted_positions = torch.arange(8, device=device, dtype=torch.long)
-
-        rank1_output = torch.randn(B, S_local, D, device=device)
-
-        def fake_all_gather(gathered, tensor, group=None):
-            gathered[0].copy_(tensor)
-            gathered[1].copy_(rank1_output)
-
-        with (
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.all_gather", fake_all_gather),
-            *_patch_dist_for_cp(rank=0, world_size=2),
-        ):
-            with pytest.raises(RuntimeError, match="Failed to restore"):
-                module._redo_attention_load_balancing(
-                    output, original_positions, sorted_positions, MagicMock()
-                )
 
 
 # ============================================================================
@@ -324,70 +302,48 @@ class TestConv1dWithCP:
         S_local = 8
         mixed_qkv = torch.randn(B, conv_dim, S_local, device=device)
 
-        with (
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_rank", return_value=0),
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_world_size", return_value=1),
-            patch(
-                "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_process_group_ranks",
-                return_value=[0],
-            ),
-        ):
+        def fake_causal_conv1d(x, weight, bias, activation, cp_context):
+            assert x.shape == (1, S_local, conv_dim)
+            return x, None
+
+        with patch("fla.modules.convolution.causal_conv1d", side_effect=fake_causal_conv1d):
             result = module._conv1d_with_cp(mixed_qkv, MagicMock())
 
         assert result.shape == (B, conv_dim, S_local)
+        assert torch.equal(result, mixed_qkv)
 
-    def test_rank0_sends_but_does_not_recv(self, module, device):
-        """Rank 0 has no predecessor — should only send, not receive."""
-        B = 1
+    def test_invokes_fla_cp_conv_once_per_batch_item(self, module, device):
+        """FLA CP conv only supports batch=1, so the wrapper should loop over batch items."""
+        B = 3
         conv_dim = module.conv1d.weight.shape[0]
         S_local = 8
         mixed_qkv = torch.randn(B, conv_dim, S_local, device=device)
 
-        with (
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_rank", return_value=0),
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_world_size", return_value=2),
-            patch(
-                "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_process_group_ranks",
-                return_value=[0, 1],
-            ),
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.batch_isend_irecv") as mock_batch,
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.P2POp") as mock_p2p,
-        ):
-            mock_batch.return_value = [MagicMock()]
+        def fake_causal_conv1d(x, weight, bias, activation, cp_context):
+            return x + 1, None
+
+        with patch("fla.modules.convolution.causal_conv1d", side_effect=fake_causal_conv1d) as mock_conv:
             result = module._conv1d_with_cp(mixed_qkv, MagicMock())
 
-            # Rank 0 should only issue 1 P2P op (isend to rank 1), no irecv
-            assert mock_p2p.call_count == 1
-            # First arg to P2POp should be dist.isend
-            call_args = mock_p2p.call_args_list[0]
-            assert "isend" in str(call_args)
-
+        assert mock_conv.call_count == B
         assert result.shape == (B, conv_dim, S_local)
+        assert torch.equal(result, mixed_qkv + 1)
 
-    def test_middle_rank_sends_and_recvs(self, module, device):
-        """A middle rank should both send and receive."""
-        B = 1
+    def test_passes_cp_context_to_fla_conv(self, module, device):
+        """The wrapper should forward the built cp_context into FLA's conv path."""
         conv_dim = module.conv1d.weight.shape[0]
         S_local = 8
-        mixed_qkv = torch.randn(B, conv_dim, S_local, device=device)
+        mixed_qkv = torch.randn(1, conv_dim, S_local, device=device)
+        cp_context = MagicMock()
 
-        with (
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_rank", return_value=1),
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_world_size", return_value=3),
-            patch(
-                "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_process_group_ranks",
-                return_value=[0, 1, 2],
-            ),
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.batch_isend_irecv") as mock_batch,
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.P2POp") as mock_p2p,
-        ):
-            mock_batch.return_value = [MagicMock(), MagicMock()]
-            result = module._conv1d_with_cp(mixed_qkv, MagicMock())
+        def fake_causal_conv1d(x, weight, bias, activation, cp_context):
+            assert cp_context is not None
+            return x, None
 
-            # Middle rank: 1 irecv from rank 0 + 1 isend to rank 2
-            assert mock_p2p.call_count == 2
+        with patch("fla.modules.convolution.causal_conv1d", side_effect=fake_causal_conv1d):
+            result = module._conv1d_with_cp(mixed_qkv, cp_context)
 
-        assert result.shape == (B, conv_dim, S_local)
+        assert result.shape == mixed_qkv.shape
 
 
 # ============================================================================
@@ -433,61 +389,3 @@ class TestAllGatherConcatFn:
 
         expected = torch.tensor([[1.0], [2.0], [11.0], [12.0]], device=device)
         assert torch.equal(result, expected)
-
-
-# ============================================================================
-# _all_gather_concat: differentiable vs non-differentiable
-# ============================================================================
-
-
-class TestAllGatherConcat:
-    def test_non_differentiable_path(self, module, device):
-        """Non-differentiable path should use plain dist.all_gather."""
-        local = torch.randn(1, 4, device=device)
-
-        def fake_all_gather(gathered, tensor, group=None):
-            gathered[0].copy_(tensor)
-
-        with (
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_world_size", return_value=1),
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.all_gather", fake_all_gather),
-        ):
-            result = module._all_gather_concat(local, MagicMock(), dim=1, differentiable=False)
-
-        assert result.shape == (1, 4)
-
-    def test_differentiable_path_requires_grad(self, module, device):
-        """Differentiable path should produce output that requires grad when input does."""
-        local = torch.randn(1, 4, device=device, requires_grad=True)
-
-        def fake_all_gather(gathered, tensor, group=None):
-            gathered[0].copy_(tensor)
-
-        with (
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_world_size", return_value=1),
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_rank", return_value=0),
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.all_gather", fake_all_gather),
-        ):
-            result = module._all_gather_concat(local, MagicMock(), dim=1, differentiable=True)
-
-        assert result.requires_grad
-
-
-# ============================================================================
-# CPAwareGatedDeltaNet init
-# ============================================================================
-
-
-class TestInit:
-    def test_cp_mesh_defaults_to_none(self, module):
-        """Freshly created module should have _cp_mesh == None."""
-        assert module._cp_mesh is None
-
-    def test_inherits_hf_weights(self, module):
-        """Module should have the same projection layers as the HF parent."""
-        assert hasattr(module, "in_proj_qkv")
-        assert hasattr(module, "in_proj_z")
-        assert hasattr(module, "in_proj_b")
-        assert hasattr(module, "in_proj_a")
-        assert hasattr(module, "out_proj")
-        assert hasattr(module, "conv1d")

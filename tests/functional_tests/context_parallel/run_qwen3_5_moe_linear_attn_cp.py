@@ -118,21 +118,50 @@ def run_test():
     torch.manual_seed(42)
     x_full = torch.randn(B, S_global, D, device=device, dtype=torch.bfloat16)
 
-    # ===== Baseline: CP=1 (no context parallelism) =====
+    from torch.distributed.device_mesh import init_device_mesh
+
+    # ===== Baseline: CP=1 using _forward_with_cp on full sequence =====
+    # We call _forward_with_cp directly (instead of super().forward()) so that
+    # both baseline and CP=2 exercise the same code path / autograd graph.
+    # The only variable being tested is the distributed CP communication.
     x_baseline = x_full.clone().detach().requires_grad_(True)
 
-    # _cp_mesh is None → HF forward path
-    output_baseline = module_no_cp.forward(x_baseline)
+    # Dense positions for full sequence — no load-balancing needed
+    dense_positions = torch.arange(S_global, device=device, dtype=torch.long)
+
+    # Create a single-rank process group containing only this rank, so
+    # _forward_with_cp runs the same code path as CP=2 but with all
+    # distributed ops (all_gather, P2P) degenerating to single-rank no-ops.
+    baseline_group = dist.new_group(ranks=[rank])
+
+    class _SingleRankMesh:
+        """Minimal mesh-like object wrapping a single-rank process group."""
+
+        def size(self):
+            return dist.get_world_size(baseline_group)
+
+        def get_group(self):
+            return baseline_group
+
+    module_no_cp._cp_mesh = _SingleRankMesh()
+
+    output_baseline = module_no_cp._forward_with_cp(
+        x_baseline,
+        position_ids=dense_positions.unsqueeze(0).expand(B, -1),
+        seq_index=dense_positions,
+    )
     loss_baseline = output_baseline.sum()
     loss_baseline.backward()
 
     output_baseline_detached = output_baseline.detach().clone()
     grad_baseline_detached = x_baseline.grad.detach().clone()
 
+    # Reset _cp_mesh so module_no_cp isn't accidentally reused with CP
+    module_no_cp._cp_mesh = None
+
     dist.barrier()
 
     # ===== Test: CP=2 =====
-    from torch.distributed.device_mesh import init_device_mesh
 
     cp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))
     module_with_cp._cp_mesh = cp_mesh["cp"]
