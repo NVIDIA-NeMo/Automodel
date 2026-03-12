@@ -254,6 +254,9 @@ jobs:
       )
       && !cancelled()
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
       - name: Get workflow result
         id: result
         shell: bash -x -e -u -o pipefail {0}
