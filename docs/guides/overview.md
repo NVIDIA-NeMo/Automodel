@@ -65,11 +65,39 @@ Simple generation script and configurations for VLMs.
 
 - Folder: [examples/vlm_generate](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/vlm_generate)
 
-## Diffusion Generation
+## Diffusion Models (Text-to-Image & Text-to-Video)
 
-WAN 2.2 example for diffusion-based image generation.
+This section provides practical recipes and configurations for training and generating with diffusion models using flow matching.
 
-- Folder: [examples/diffusion/wan2.2](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/diffusion/wan2.2)
+### Fine-Tuning
+
+Fine-tuning recipes for adapting pretrained diffusion models to your data.
+
+- Folder: [examples/diffusion/finetune](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/diffusion/finetune)
+- Representative models: FLUX.1-dev (T2I, 12B), Wan 2.1 T2V 1.3B, HunyuanVideo 1.5
+- How-to guide: [Diffusion fine-tuning](diffusion/finetune.md)
+
+### Pretraining
+
+Pretraining recipes for training diffusion models from scratch on large-scale datasets.
+
+- Folder: [examples/diffusion/pretrain](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/diffusion/pretrain)
+- Representative models: Wan 2.1 T2V 1.3B, FLUX.1-dev
+- How-to guide: [Diffusion fine-tuning (pretraining section)](diffusion/finetune.md#pretraining-vs-fine-tuning)
+
+### Generation
+
+Generation scripts and configs for running inference with pretrained or fine-tuned diffusion models.
+
+- Folder: [examples/diffusion/generate](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/diffusion/generate)
+- Representative models: Wan 2.1 1.3B, Wan 2.2 14B, FLUX.1-dev, HunyuanVideo
+- How-to guide: [Diffusion generation](diffusion/finetune.md#generation--inference)
+
+### Dataset Preparation
+
+Preprocessing pipeline to create `.meta` files containing VAE latents and text embeddings.
+
+- How-to guide: [Diffusion dataset preparation](diffusion/dataset.md)
 
 ---
 

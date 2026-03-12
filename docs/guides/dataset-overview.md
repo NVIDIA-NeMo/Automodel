@@ -485,6 +485,34 @@ See [Gemma-3n](omni/gemma3-3n.md) and [VLM dataset](vlm/dataset.md) for end-to-e
 
 ---
 
+## Diffusion Datasets
+
+Diffusion models in NeMo AutoModel use pre-encoded cache files rather than raw images or videos. The built-in preprocessing tool at `tools/diffusion/preprocessing_multiprocess.py` uses model-specific processors to encode visual data into VAE latents and text embeddings, organized into resolution-bucketed cache directories compatible with the multiresolution dataloader.
+
+### Dataloader Builders
+
+- **Video (T2V)**: `nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader` — for Wan 2.1 and HunyuanVideo
+- **Image (T2I)**: `nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader` — for FLUX.1-dev
+
+### Example YAML (Video Dataloader)
+
+```yaml
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
+    cache_dir: /path/to/processed_meta
+    model_type: wan
+    base_resolution: [512, 512]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+    num_workers: 0
+```
+
+See the [Diffusion Dataset Preparation](diffusion/dataset.md) guide for full preprocessing instructions and configuration details.
+
+---
+
 ## Bring Your Own Dataset
 You can integrate custom datasets with zero code changes to NeMo Automodel by using `_target_` in YAML. There are three approaches:
 
