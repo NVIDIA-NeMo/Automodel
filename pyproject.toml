@@ -73,6 +73,7 @@ classifiers = [
     'Natural Language :: English',
     'Operating System :: OS Independent',
 ]
+
 dependencies = [
     "datasets>=4.0.0",
     "megatron-fsdp>=0.2.3",
