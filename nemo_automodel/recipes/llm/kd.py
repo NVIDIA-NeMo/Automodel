@@ -362,8 +362,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         """Override the forward backward step to include knowledge distillation loss."""
         if self.pp_enabled:
             raise RuntimeError(
-                "_forward_backward_step should not be called when pp_enabled; "
-                "use _forward_backward_step_pp instead."
+                "_forward_backward_step should not be called when pp_enabled; use _forward_backward_step_pp instead."
             )
         batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
         labels = batch.pop("labels")
@@ -457,9 +456,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         )
         labels = batch.pop("labels")
         input_ids = batch.pop("input_ids")
-        batch_filtered = {
-            k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
-        }
+        batch_filtered = {k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)}
 
         # Only the last PP stage needs targets for the loss function.
         targets = labels.clone() if self.pp.info.has_last_stage else None
@@ -475,9 +472,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                         input_ids, target=targets, losses=teacher_losses, **batch_filtered
                     )
                 else:
-                    self.teacher_pp.info.schedule.eval(
-                        target=targets, losses=teacher_losses, **batch_filtered
-                    )
+                    self.teacher_pp.info.schedule.eval(target=targets, losses=teacher_losses, **batch_filtered)
                 # Transfer captured logits into the recipe so pp_kd_loss_fn can read them.
                 capture = getattr(self.teacher_model, "_teacher_logits_capture", None)
                 if capture is not None and capture[0] is not None:
@@ -606,9 +601,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
     def _run_train_optim_step_pp(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step when pipeline parallelism is enabled."""
-        num_label_tokens = torch.tensor(
-            sum((b["labels"] != -100).sum().item() for b in batches), dtype=torch.long
-        )
+        num_label_tokens = torch.tensor(sum((b["labels"] != -100).sum().item() for b in batches), dtype=torch.long)
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
         loss_buffer = []
 
