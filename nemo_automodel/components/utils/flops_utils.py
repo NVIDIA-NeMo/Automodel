@@ -551,7 +551,6 @@ def _nemotronh_moe_layer_flops(config, gbs, seq_len):
     return routed_expert_flops + shared_expert_flops + gate_flops + latent_proj_flops
 
 
-
 def _non_mla_attn_layer_flops(config, gbs, seq_len):
     """Model FLOPs for attention layer"""
     hs = config.hidden_size

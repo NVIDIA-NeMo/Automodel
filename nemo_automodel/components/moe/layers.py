@@ -550,7 +550,6 @@ class MoE(nn.Module):
         # Set during model parallelization (see parallelizer.apply_cp)
         self.cp_mesh: Optional[DeviceMesh] = None
 
-
     def forward(
         self,
         x: torch.Tensor,
