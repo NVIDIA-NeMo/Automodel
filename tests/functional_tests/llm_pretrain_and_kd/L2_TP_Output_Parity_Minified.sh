@@ -21,9 +21,10 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 # Override if needed, e.g. KL_THRESHOLD=1e-5 bash ...
 KL_THRESHOLD="${KL_THRESHOLD:-2e-6}"
 
-torchrun --nproc_per_node=2 --nnodes=1 \
+TRANSFORMERS_OFFLINE=1 python3 \
+-m torch.distributed.run --nproc_per_node=2 --nnodes=1 \
+-m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
     tests/functional_tests/llm_pretrain_and_kd/run_tp_output_parity_minified.py \
-    --models qwen3 qwen3_seq_cls ministral3 llama qwen2 \
+    --models qwen3 qwen3_seq_cls ministral3 llama qwen2 baichuan \
     --sequence_parallel both \
     --kl_threshold "${KL_THRESHOLD}"
-
