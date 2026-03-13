@@ -89,7 +89,6 @@ class PipelineSpec:
             pipeline_cls: "FluxPipeline"  # Optional
             subfolder: "transformer"
             load_full_pipeline: false
-            enable_gradient_checkpointing: true
     """
 
     # Required for from_config: transformer class name from diffusers
@@ -105,7 +104,6 @@ class PipelineSpec:
     load_full_pipeline: bool = False
 
     # Training optimizations
-    enable_gradient_checkpointing: bool = True
     low_cpu_mem_usage: bool = True
 
     @classmethod
@@ -367,7 +365,6 @@ class NeMoAutoDiffusionPipeline:
         move_to_device: bool = True,
         load_for_training: bool = False,
         components_to_load: Optional[Iterable[str]] = None,
-        enable_gradient_checkpointing: bool = True,
         **kwargs,
     ) -> Tuple[DiffusionPipeline, Dict[str, ParallelManager]]:
         """
@@ -387,7 +384,6 @@ class NeMoAutoDiffusionPipeline:
             move_to_device: Whether to move modules to device
             load_for_training: Whether to make parameters trainable
             components_to_load: Which components to process (default: all)
-            enable_gradient_checkpointing: Enable gradient checkpointing for transformer
             **kwargs: Additional arguments passed to DiffusionPipeline.from_pretrained
 
         Returns:
@@ -420,12 +416,6 @@ class NeMoAutoDiffusionPipeline:
                 if not components_to_load or name in components_to_load:
                     logger.info("[INFO] Moving module: %s to device/dtype", name)
                     _move_module_to_device(module, dev, torch_dtype)
-
-        # Enable gradient checkpointing if configured
-        if enable_gradient_checkpointing:
-            if hasattr(pipe, "transformer") and hasattr(pipe.transformer, "enable_gradient_checkpointing"):
-                pipe.transformer.enable_gradient_checkpointing()
-                logger.info("[INFO] Enabled gradient checkpointing for transformer")
 
         # If loading for training, ensure the target module parameters are trainable
         if load_for_training:
@@ -526,13 +516,6 @@ class NeMoAutoDiffusionPipeline:
             if move_to_device:
                 transformer = transformer.to(dev)
             pipe = cls(transformer=transformer)
-
-        # Enable gradient checkpointing if configured
-        if spec.enable_gradient_checkpointing:
-            target_transformer = getattr(pipe, "transformer", transformer)
-            if hasattr(target_transformer, "enable_gradient_checkpointing"):
-                target_transformer.enable_gradient_checkpointing()
-                logger.info("[INFO] Enabled gradient checkpointing for transformer")
 
         # Make parameters trainable (always true for from_config / pretraining)
         for name, module in _iter_pipeline_modules(pipe):
