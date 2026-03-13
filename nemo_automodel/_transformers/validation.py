@@ -222,6 +222,12 @@ class ModelCapabilitiesMixin:
             self._supports = ModelSupports(self, getattr(self, "_mesh", None))
         return self._supports
 
+    def __getattr__(self, name: str):
+        # @akoumparouli: avoid "model.supports.supports_cp_with_sequence_packing" -> "model.supports_cp_with_sequence_packing"
+        if name.startswith("supports_"):
+            return getattr(self.supports, name)
+        return getattr(self, name)
+
     def validate_for_mesh(self) -> None:
         """Validate *mesh* parallelism sizes against this model's capabilities.
 
