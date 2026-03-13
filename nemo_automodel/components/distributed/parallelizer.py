@@ -1336,7 +1336,6 @@ def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None
                     attn.num_key_value_heads = local_num_attention_heads
 
 
-
 def validate_tp_mesh_for_nemotron_nas(model, tp_size):
     num_attention_heads = model.config.num_attention_heads
     assert num_attention_heads % tp_size == 0, "num_attention_heads in config does not match the TP size"
