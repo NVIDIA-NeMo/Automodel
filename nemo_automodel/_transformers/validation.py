@@ -37,34 +37,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Helpers (kept module-private)
-# ---------------------------------------------------------------------------
-
-
 def _has_optimized_tp_plan(model_cls: type) -> bool:
     """Check if *model_cls* has an entry in ``PARALLELIZE_FUNCTIONS``."""
-    try:
-        from nemo_automodel.components.distributed.optimized_tp_plans import (
-            PARALLELIZE_FUNCTIONS,
-        )
+    from nemo_automodel.components.distributed.optimized_tp_plans import (
+        PARALLELIZE_FUNCTIONS,
+    )
 
-        return model_cls in PARALLELIZE_FUNCTIONS or model_cls.__name__ in {k.__name__ for k in PARALLELIZE_FUNCTIONS}
-    except ImportError:
-        return False
+    return model_cls in PARALLELIZE_FUNCTIONS or model_cls.__name__ in {k.__name__ for k in PARALLELIZE_FUNCTIONS}
 
 
 def _is_moe(model_cls: type) -> bool:
-    try:
-        from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
+    from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 
-        return issubclass(model_cls, MoEFSDPSyncMixin)
-    except (ImportError, TypeError):
-        return False
+    return issubclass(model_cls, MoEFSDPSyncMixin)
 
 
 def _supports_seq_lens(model: "nn.Module") -> bool:
     """True when ``model.forward()`` accepts a ``seq_lens`` kwarg."""
+    # @akoumparouli: this is a bit of a hack, but it's the best we can do for now
+    # TODO: improve this
     fwd = getattr(model, "forward", None)
     if not callable(fwd):
         return False
@@ -83,11 +74,6 @@ def _uses_te_attention(model: "nn.Module") -> bool:
     return getattr(backend, "attn", None) == "te"
 
 
-# ---------------------------------------------------------------------------
-# ModelSupports -- read-only capability descriptor
-# ---------------------------------------------------------------------------
-
-
 class ModelSupports:
     """Queryable feature-support descriptor attached to a model instance.
 
@@ -102,11 +88,12 @@ class ModelSupports:
         model.supports.pp   # ...
     """
 
-    __slots__ = ("_model", "_model_cls")
+    __slots__ = ("_model", "_model_cls", "_mesh")
 
-    def __init__(self, model: "nn.Module") -> None:
+    def __init__(self, model: "nn.Module", mesh: "MeshContext | None" = None) -> None:
         self._model = model
         self._model_cls = type(model)
+        self._mesh = mesh
 
     def __repr__(self) -> str:
         names = (
@@ -133,6 +120,7 @@ class ModelSupports:
         return getattr(self._model, "_pp_plan", None) is not None
 
     # alias
+
     @property
     def supports_tp_plan(self) -> bool:
         return self.supports_tp
@@ -162,7 +150,8 @@ class ModelSupports:
     @property
     def supports_sequence_packing(self) -> bool:
         """``forward()`` accepts ``seq_lens`` for packed-sequence training."""
-        return _supports_seq_lens(self._model)
+        sp_attn_backend = getattr(self._model, "_supports_sdpa", False) is True or _uses_te_attention(self._model)
+        return _supports_seq_lens(self._model) and sp_attn_backend
 
     @property
     def supports_gradient_checkpointing(self) -> bool:
@@ -171,6 +160,32 @@ class ModelSupports:
             return False
         return getattr(self._model, "supports_gradient_checkpointing", False) is True
 
+    # mesh-aware helpers
+
+    @property
+    def cp_size(self) -> int:
+        return getattr(self._mesh, "cp_size", 1)
+
+    @property
+    def tp_size(self) -> int:
+        return getattr(self._mesh, "tp_size", 1)
+
+    @property
+    def pp_size(self) -> int:
+        return getattr(self._mesh, "pp_size", 1)
+
+    @property
+    def ep_size(self) -> int:
+        return getattr(self._mesh, "ep_size", 1)
+
+    @property
+    def supports_cp_with_sequence_packing(self) -> bool:
+        """CP + packed sequences requires TE attention backend."""
+        if self.cp_size <= 1:
+            return self.supports_sequence_packing
+        return self.supports_sequence_packing and _uses_te_attention(self._model)
+
+    # @akoumparouli: quantisation support + peft
     # @property
     # def supports_fp8(self) -> bool:
     #     """FP8 training is available (torchao works with any model)."""
@@ -192,9 +207,6 @@ class ModelSupports:
     #     return True
 
 
-# ---------------------------------------------------------------------------
-# ModelCapabilitiesMixin
-# ---------------------------------------------------------------------------
 class ModelCapabilitiesMixin:
     """Mixin injected at model-creation time to expose capabilities.
 
@@ -207,14 +219,15 @@ class ModelCapabilitiesMixin:
     @property
     def supports(self) -> ModelSupports:
         if not hasattr(self, "_supports"):
-            self._supports = ModelSupports(self)
+            self._supports = ModelSupports(self, getattr(self, "_mesh", None))
         return self._supports
 
-    def validate_for_mesh(self, mesh: "MeshContext | None" = None) -> None:
+    def validate_for_mesh(self) -> None:
         """Validate *mesh* parallelism sizes against this model's capabilities.
 
         Raises :class:`ValueError` with one bullet per violation.
         """
+        mesh = getattr(self, "_mesh", None)
         tp_size = getattr(mesh, "tp_size", 1)
         pp_size = getattr(mesh, "pp_size", 1)
         ep_size = getattr(mesh, "ep_size", 1)
@@ -259,6 +272,10 @@ class ModelCapabilitiesMixin:
                     f"distributed:\n"
                     f"  cp_size: 1"
                 )
+        if cp_size > 1 and not sup.supports_cp_with_sequence_packing:
+            logger.warning(
+                f"Context parallelism (cp_size={cp_size}) + sequence packing is not supported with {arch} model."
+            )
 
         if ep_size > 1 and not sup.supports_ep:
             errors.append(
@@ -274,9 +291,6 @@ class ModelCapabilitiesMixin:
             raise ValueError(f"Unsupported configuration for {arch}:\n" + "\n".join(f"  - {e}" for e in errors))
 
 
-# ---------------------------------------------------------------------------
-# Public helper -- inject the mixin into an already-instantiated model
-# ---------------------------------------------------------------------------
 def attach_capabilities_and_validate(model: "nn.Module", mesh: "MeshContext") -> "nn.Module":
     """Inject :class:`ModelCapabilitiesMixin` into *model* (in-place).
 
@@ -290,5 +304,6 @@ def attach_capabilities_and_validate(model: "nn.Module", mesh: "MeshContext") ->
         (ModelCapabilitiesMixin, model.__class__),
         {},
     )
-    model.validate_for_mesh(mesh)
+    model._mesh = mesh  # type: ignore[attr-defined]
+    model.validate_for_mesh()
     return model
