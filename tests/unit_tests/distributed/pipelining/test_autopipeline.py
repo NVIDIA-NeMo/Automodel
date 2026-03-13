@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import types
-
 from unittest.mock import Mock
+
 import pytest
 import torch
 import torch.nn as nn
@@ -76,6 +75,7 @@ class FakePPMesh:
 
 class FakeDeviceMesh:
     """Mock DeviceMesh that behaves like the real DeviceMesh but without distributed setup."""
+
     def __init__(self, device_type="cpu", mesh=None, mesh_dim_names=None, pp_size=2, local_rank=0):
         self.device_type = device_type
         self.mesh = mesh or [[0, 1]]
@@ -98,6 +98,7 @@ class FakeDeviceMesh:
 
 class FakeWorldMesh(dict):
     """Mock for DeviceMesh that behaves like a dict."""
+
     pass
 
 
@@ -179,7 +180,9 @@ class TestAutoPipelineValidation:
         world_mesh = FakeDeviceMesh()
 
         # Test missing schedule validation
-        with pytest.raises(ValueError, match="Either pipeline_parallel_schedule or pipeline_parallel_schedule_csv must be provided"):
+        with pytest.raises(
+            ValueError, match="Either pipeline_parallel_schedule or pipeline_parallel_schedule_csv must be provided"
+        ):
             AutoPipeline(
                 world_mesh=world_mesh,
                 pp_axis_name="pp",
@@ -236,6 +239,7 @@ class TestAutoPipelineValidation:
 # -----------------------------
 # Core build/materialize/step tests
 # -----------------------------
+
 
 class TestAutoPipelineBuildAndStep:
     """Test AutoPipeline build, materialize, and step functionality."""
@@ -423,6 +427,7 @@ class TestAutoPipelineErrorHandling:
         with pytest.raises(RuntimeError, match="Autopipeline not built"):
             _ = ap.parts
 
+
 class TestAutoPipelineProperties:
     """Test AutoPipeline properties and state management."""
 
@@ -595,6 +600,7 @@ class TestAutoPipelineDebugUtilities:
 
         # Test log_debug_summary
         import logging
+
         with caplog.at_level(logging.INFO):
             ap.log_debug_summary()
 
@@ -606,7 +612,7 @@ class TestAutoPipelineDebugUtilities:
         # Create a simple module with known parameter count
         module = nn.Sequential(
             nn.Linear(10, 5, bias=True),  # 10*5 + 5 = 55 params
-            nn.Linear(5, 1, bias=False)   # 5*1 = 5 params
+            nn.Linear(5, 1, bias=False),  # 5*1 = 5 params
         )
 
         # Total params: 60
@@ -714,8 +720,8 @@ class TestAutoPipelineDebugUtilities:
 
         # Create stages with is_first and is_last attributes to trigger line 268 coverage
         for i, stage in enumerate(ap._info.stages):
-            stage.is_first = (i == 0)
-            stage.is_last = (i == len(ap._info.stages) - 1)
+            stage.is_first = i == 0
+            stage.is_last = i == len(ap._info.stages) - 1
 
         # Test pretty_print_stages with module limit to trigger line 275-276
         pretty_print = ap.pretty_print_stages(max_modules_per_stage=1)
