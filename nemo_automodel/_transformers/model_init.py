@@ -196,13 +196,16 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
 
 
 def get_is_hf_model(config, force_hf):
-    """
-    Resolve trust_remote_code default and determine if model is HF-based.
-    """
-    # Finally make sure flash_attention is available
+    """Determine whether the model should use the HF (not custom) implementation."""
     architectures = getattr(config, "architectures", None) or []
-    is_hf_model = (not architectures or architectures[0] not in ModelRegistry.model_arch_name_to_cls) or force_hf
-    return is_hf_model
+    if not architectures or force_hf:
+        return True
+    arch_name = architectures[0]
+    if arch_name not in ModelRegistry.model_arch_name_to_cls:
+        return True
+    if not _is_config_compatible_with_custom_model(arch_name, config):
+        return True
+    return False
 
 
 def _download_model_weights(hf_config, pretrained_model_name_or_path):
