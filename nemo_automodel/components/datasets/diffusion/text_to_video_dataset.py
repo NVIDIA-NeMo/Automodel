@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pickle
 from pathlib import Path
 from typing import Dict, List
 
@@ -65,7 +64,7 @@ class TextToVideoDataset(BaseMultiresolutionDataset):
         cache_file = Path(item["cache_file"])
 
         with open(cache_file, "rb") as f:
-            data = pickle.load(f)
+            data = torch.load(f, weights_only=True)
 
         video_latents = data["video_latents"].to(self.device)
         text_embeddings = data["text_embeddings"].to(self.device)

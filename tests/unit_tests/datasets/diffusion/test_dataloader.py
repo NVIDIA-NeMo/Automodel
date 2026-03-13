@@ -858,6 +858,7 @@ class TestBuildMultiresolutionDataloaderCoreGPU:
         dataloaders = []
         for rank in range(min(gpu_count, 2)):  # Use up to 2 GPUs for test
             dl, _ = _build_multiresolution_dataloader_core(
+                collate_fn=collate_fn_production,
                 dataset=large_dataset,
                 batch_size=8,
                 dp_rank=rank,

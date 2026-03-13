@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 from typing import Any, Callable
 
 import torch
@@ -48,13 +47,17 @@ def initialize_attn_module_and_func(
         attn_func = attn_module.__call__
         return attn_module, attn_func
     elif attn_impl == "sdpa":
-        attn_func = functools.partial(
-            F.scaled_dot_product_attention,
+        defaults = dict(
             scale=softmax_scale,
             is_causal=attn_mask_type == "causal",
             enable_gqa=num_gqa_groups is not None,
             **kwargs,
         )
+
+        def attn_func(*args, **call_kwargs):
+            merged = {**defaults, **call_kwargs}
+            return F.scaled_dot_product_attention(*args, **merged)
+
         return None, attn_func
     elif attn_impl == "flex":
         attn_module = FlexAttention()

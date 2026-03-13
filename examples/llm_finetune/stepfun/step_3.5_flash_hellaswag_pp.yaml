@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Recipe validated using 64 H100 GPUs (8 nodes x 8)
+
 seed: 1234
 
 step_scheduler:
@@ -55,7 +57,7 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
-    rms_norm: te
+    rms_norm: torch_fp32
     rope_fusion: true
     enable_deepep: true
     fake_balanced_gate: false

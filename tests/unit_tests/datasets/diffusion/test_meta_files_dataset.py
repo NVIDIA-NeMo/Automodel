@@ -14,8 +14,6 @@
 
 """Unit tests for meta_files_dataset.py: MetaFilesDataset, collate_fn, build_node_parallel_sampler, build_dataloader."""
 
-import os
-import pickle
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -29,7 +27,6 @@ from nemo_automodel.components.datasets.diffusion.meta_files_dataset import (
     build_node_parallel_sampler,
     collate_fn,
 )
-
 
 # =============================================================================
 # Fixtures
@@ -62,8 +59,7 @@ def meta_dir():
     with tempfile.TemporaryDirectory() as tmpdir:
         for i in range(5):
             path = Path(tmpdir) / f"sample_{i:04d}.meta"
-            with open(path, "wb") as f:
-                pickle.dump(_make_meta_sample(i), f)
+            torch.save(_make_meta_sample(i), path)
         yield tmpdir
 
 
@@ -73,8 +69,7 @@ def meta_dir_with_optional_fields():
     with tempfile.TemporaryDirectory() as tmpdir:
         for i in range(5):
             path = Path(tmpdir) / f"sample_{i:04d}.meta"
-            with open(path, "wb") as f:
-                pickle.dump(_make_meta_sample(i, include_optional=True), f)
+            torch.save(_make_meta_sample(i, include_optional=True), path)
         yield tmpdir
 
 
@@ -220,13 +215,17 @@ class TestBuildNodeParallelSampler:
 
     def test_returns_none_when_not_initialized(self, meta_dir):
         ds = MetaFilesDataset(meta_dir)
-        with patch("nemo_automodel.components.datasets.diffusion.meta_files_dataset.dist.is_initialized", return_value=False):
+        with patch(
+            "nemo_automodel.components.datasets.diffusion.meta_files_dataset.dist.is_initialized", return_value=False
+        ):
             sampler = build_node_parallel_sampler(ds, dp_rank=0, dp_world_size=1)
         assert sampler is None
 
     def test_returns_sampler_when_initialized(self, meta_dir):
         ds = MetaFilesDataset(meta_dir)
-        with patch("nemo_automodel.components.datasets.diffusion.meta_files_dataset.dist.is_initialized", return_value=True):
+        with patch(
+            "nemo_automodel.components.datasets.diffusion.meta_files_dataset.dist.is_initialized", return_value=True
+        ):
             sampler = build_node_parallel_sampler(ds, dp_rank=0, dp_world_size=2)
         assert sampler is not None
         from torch.utils.data import DistributedSampler
@@ -243,7 +242,9 @@ class TestBuildDataloader:
     """Tests for build_dataloader."""
 
     def test_basic_build(self, meta_dir):
-        with patch("nemo_automodel.components.datasets.diffusion.meta_files_dataset.dist.is_initialized", return_value=False):
+        with patch(
+            "nemo_automodel.components.datasets.diffusion.meta_files_dataset.dist.is_initialized", return_value=False
+        ):
             dl, sampler = build_dataloader(
                 meta_folder=meta_dir,
                 batch_size=2,
@@ -255,7 +256,9 @@ class TestBuildDataloader:
         assert sampler is None
 
     def test_iteration(self, meta_dir):
-        with patch("nemo_automodel.components.datasets.diffusion.meta_files_dataset.dist.is_initialized", return_value=False):
+        with patch(
+            "nemo_automodel.components.datasets.diffusion.meta_files_dataset.dist.is_initialized", return_value=False
+        ):
             dl, _ = build_dataloader(
                 meta_folder=meta_dir,
                 batch_size=2,

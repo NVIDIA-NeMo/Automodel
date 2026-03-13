@@ -35,7 +35,6 @@ Usage:
 import argparse
 import json
 import logging
-import pickle
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -518,10 +517,8 @@ def main():
                 data_type=args.data_type,
             )
 
-            # Save .meta file using pickle (compatible with wan21.py dataloader)
             output_path = output_dir / f"{Path(file_name).stem}.meta"
-            with open(output_path, "wb") as f:
-                pickle.dump(result, f)
+            torch.save(result, output_path)
 
             successful += 1
 

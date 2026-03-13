@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import os
-import pickle
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -67,8 +66,7 @@ class MetaFilesDataset(Dataset):
             filtered = []
             for path in self.meta_files:
                 try:
-                    with open(path, "rb") as f:
-                        data = pickle.load(f)
+                    data = torch.load(path, weights_only=True)
                 except Exception as exc:  # pragma: no cover - best effort logging
                     logger.warning("Failed to load %s during filtering: %s", path, exc)
                     continue
@@ -84,8 +82,7 @@ class MetaFilesDataset(Dataset):
         stats: List[Tuple[torch.Size, torch.Size, str]] = []
         for path in sample_paths:
             try:
-                with open(path, "rb") as f:
-                    data = pickle.load(f)
+                data = torch.load(path, weights_only=True)
                 stats.append(
                     (
                         data["text_embeddings"].shape,
@@ -107,8 +104,7 @@ class MetaFilesDataset(Dataset):
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:  # type: ignore[override]
         path = self.meta_files[index]
-        with open(path, "rb") as f:
-            data = pickle.load(f)
+        data = torch.load(path, weights_only=True)
 
         text_embeddings: torch.Tensor = data["text_embeddings"].to(self.device)
         video_latents: torch.Tensor = data["video_latents"].to(self.device)

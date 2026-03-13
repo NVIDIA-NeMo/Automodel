@@ -207,7 +207,7 @@ class Gate(nn.Module):
         topk (int): Number of top experts activated for each input.
         n_groups (int): Number of groups for routing.
         topk_groups (int): Number of groups to route inputs to.
-        score_func (str): Scoring function ('softmax' or 'sigmoid').
+        score_func (str): Scoring function ('softmax', 'sigmoid', or 'softmax_with_bias').
         route_scale (float): Scaling factor for routing weights.
         weight (torch.nn.Parameter): Learnable weights for the gate.
         bias (Optional[torch.nn.Parameter]): Optional bias term for the gate.
@@ -317,6 +317,29 @@ class Gate(nn.Module):
                 values, indices = torch.topk(scores, k=self.topk, dim=-1)
                 weights = values.softmax(dim=1, dtype=self.gate_precision or torch.float32)
                 original_scores = scores
+        elif self.score_func == "softmax_with_bias":
+            # softmax first, then add bias for expert selection,
+            # group routing on biased scores, final weights from unbiased softmax scores.
+            scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
+            original_scores = scores
+
+            # Add correction bias for expert SELECTION only
+            if self.e_score_correction_bias is not None:
+                scores_for_choice = scores + self.e_score_correction_bias
+            else:
+                scores_for_choice = scores
+
+            if self.n_groups > 1:
+                scores_for_choice = scores_for_choice.view(x.size(0), self.n_groups, -1)
+                group_scores = scores_for_choice.topk(2, dim=-1)[0].sum(dim=-1)
+
+                group_idx = group_scores.topk(self.topk_groups, dim=-1)[1]
+                mask = torch.zeros_like(scores_for_choice[..., 0]).scatter_(1, group_idx, True)
+                scores_for_choice = (scores_for_choice * mask.unsqueeze(-1)).flatten(1)
+
+            indices = torch.topk(scores_for_choice, self.topk, dim=-1)[1]
+            # Final weights gathered from UNBIASED softmax scores
+            weights = original_scores.gather(1, indices)
         else:
             scores = scores.sigmoid()
             original_scores = scores
@@ -581,6 +604,18 @@ class MoE(nn.Module):
             self.shared_experts = None
             self.shared_expert_gate = None
 
+        # When enabled, input is projected to latent space before MoE and back after
+        if config.moe_latent_size is not None:
+            self.fc1_latent_proj = initialize_linear_module(
+                backend.linear, config.dim, config.moe_latent_size, bias=config.expert_bias, dtype=config.dtype
+            )
+            self.fc2_latent_proj = initialize_linear_module(
+                backend.linear, config.moe_latent_size, config.dim, bias=config.expert_bias, dtype=config.dtype
+            )
+        else:
+            self.fc1_latent_proj = None
+            self.fc2_latent_proj = None
+
         # Set during model parallelization (see parallelizer.apply_cp)
         self.cp_mesh: Optional[DeviceMesh] = None
 
@@ -612,10 +647,19 @@ class MoE(nn.Module):
         else:
             token_mask = torch.ones(x.size(0), dtype=torch.bool, device=x.device)
 
+        # Apply latent projection before MoE if enabled
+        if self.fc1_latent_proj is not None:
+            x_latent = self.fc1_latent_proj(x)
+        else:
+            x_latent = x
+
         weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
 
         if self.shared_experts is None:
-            y = self.experts(x, token_mask, weights, indices)
+            y = self.experts(x_latent, token_mask, weights, indices)
+            # Apply latent projection after MoE if enabled
+            if self.fc2_latent_proj is not None:
+                y = self.fc2_latent_proj(y)
             return y.view(shape)
 
         # Execute shared experts in a separate stream to overlap compute with the
@@ -630,7 +674,11 @@ class MoE(nn.Module):
             if self.shared_expert_gate is not None:
                 z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
 
-        y = self.experts(x, token_mask, weights, indices)
+        y = self.experts(x_latent, token_mask, weights, indices)
+
+        # Apply latent projection after MoE if enabled
+        if self.fc2_latent_proj is not None:
+            y = self.fc2_latent_proj(y)
 
         # Wait for the shared experts stream to complete all operations before
         # adding together the outputs of grouped experts and shared experts.
@@ -666,3 +714,12 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
             to_local(module.up_proj.weight).normal_(mean=0.0, std=init_std)
             if module.gate_proj is not None:
                 to_local(module.gate_proj.weight).normal_(mean=0.0, std=init_std)
+        elif isinstance(module, MoE):
+            if module.fc1_latent_proj is not None:
+                to_local(module.fc1_latent_proj.weight).normal_(mean=0.0, std=init_std)
+                if module.fc1_latent_proj.bias is not None:
+                    to_local(module.fc1_latent_proj.bias).zero_()
+            if module.fc2_latent_proj is not None:
+                to_local(module.fc2_latent_proj.weight).normal_(mean=0.0, std=init_std)
+                if module.fc2_latent_proj.bias is not None:
+                    to_local(module.fc2_latent_proj.bias).zero_()
