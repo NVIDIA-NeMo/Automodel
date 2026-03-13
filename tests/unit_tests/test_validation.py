@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for nemo_automodel._transformers.validation."""
+"""Unit tests for nemo_automodel._transformers.capabilities."""
 
 from __future__ import annotations
 
@@ -22,9 +22,10 @@ from unittest.mock import patch
 import pytest
 import torch.nn as nn
 
-from nemo_automodel._transformers.validation import (
-    ModelCapabilitiesMixin,
+from nemo_automodel._transformers.capabilities import (
+    _build_class_dict,
     attach_capabilities_and_validate,
+    validate_for_mesh,
 )
 
 _PARALLELIZE_PATH = "nemo_automodel.components.distributed.optimized_tp_plans.PARALLELIZE_FUNCTIONS"
@@ -82,13 +83,13 @@ def _mesh(tp=1, pp=1, cp=1, ep=1):
 
 
 def _attach(model):
-    """Inject mixin without validation (for testing supports properties)."""
-    if isinstance(model, ModelCapabilitiesMixin):
+    """Inject capabilities without validation (for testing supports properties)."""
+    if "supports" in type(model).__dict__:
         return model
     model.__class__ = type(
         model.__class__.__name__,
-        (ModelCapabilitiesMixin, model.__class__),
-        {},
+        (model.__class__,),
+        _build_class_dict(),
     )
     return model
 
@@ -124,13 +125,6 @@ def _make_moe_te_cls():
 
 
 class TestAttachCapabilities:
-    def test_injects_mixin(self):
-        model = _Bare()
-        _attach(model)
-        assert isinstance(model, ModelCapabilitiesMixin)
-        assert hasattr(model, "supports")
-        assert hasattr(model, "validate_for_mesh")
-
     def test_idempotent(self):
         model = _Bare()
         _attach(model)
@@ -354,45 +348,39 @@ class TestValidateForMesh:
     def test_tp_fails(self):
         model = _Bare()
         _attach(model)
-        model._mesh = _mesh(tp=2)
         with patch(_PARALLELIZE_PATH, {}):
             with pytest.raises(ValueError, match="Tensor parallelism.*no TP plan"):
-                model.validate_for_mesh()
+                validate_for_mesh(model, _mesh(tp=2))
 
     def test_tp_passes_with_plan(self):
         model = _WithTP()
         _attach(model)
-        model._mesh = _mesh(tp=2)
         with patch(_PARALLELIZE_PATH, {}):
-            model.validate_for_mesh()
+            validate_for_mesh(model, _mesh(tp=2))
 
     def test_pp_fails(self):
         model = _Bare()
         _attach(model)
-        model._mesh = _mesh(pp=2)
         with pytest.raises(ValueError, match="Pipeline parallelism.*_pp_plan"):
-            model.validate_for_mesh()
+            validate_for_mesh(model, _mesh(pp=2))
 
     def test_pp_passes_with_plan(self):
         model = _WithPP()
         _attach(model)
-        model._mesh = _mesh(pp=2)
-        model.validate_for_mesh()
+        validate_for_mesh(model, _mesh(pp=2))
 
     def test_cp_fails_hf_no_sdpa(self):
         model = _Bare()
         _attach(model)
-        model._mesh = _mesh(cp=2)
         with pytest.raises(ValueError, match="Context parallelism.*_supports_sdpa"):
-            model.validate_for_mesh()
+            validate_for_mesh(model, _mesh(cp=2))
 
     def test_cp_fails_hybrid(self):
         model = _WithSDPA()
         model.config = SimpleNamespace(hybrid_override_pattern="MMAMM")
         _attach(model)
-        model._mesh = _mesh(cp=2)
         with pytest.raises(ValueError, match="Context parallelism.*hybrid.*Mamba"):
-            model.validate_for_mesh()
+            validate_for_mesh(model, _mesh(cp=2))
 
     def test_cp_fails_custom_flex(self):
         class _Flex(nn.Module):
@@ -405,44 +393,38 @@ class TestValidateForMesh:
 
         model = _Flex()
         _attach(model)
-        model._mesh = _mesh(cp=2)
         with pytest.raises(ValueError, match="Context parallelism.*TE attention backend"):
-            model.validate_for_mesh()
+            validate_for_mesh(model, _mesh(cp=2))
 
     def test_cp_passes_custom_te(self):
         cls = _make_moe_te_cls()
         model = cls()
         _attach(model)
-        model._mesh = _mesh(cp=4)
-        model.validate_for_mesh()
+        validate_for_mesh(model, _mesh(cp=4))
 
     def test_cp_passes_hf_sdpa(self):
         model = _WithSDPA()
         _attach(model)
-        model._mesh = _mesh(cp=2)
-        model.validate_for_mesh()
+        validate_for_mesh(model, _mesh(cp=2))
 
     def test_ep_fails_for_dense(self):
         model = _Bare()
         _attach(model)
-        model._mesh = _mesh(ep=2)
         with pytest.raises(ValueError, match="Expert parallelism.*MoE model"):
-            model.validate_for_mesh()
+            validate_for_mesh(model, _mesh(ep=2))
 
     def test_ep_passes_for_moe(self):
         cls = _make_moe_cls()
         model = cls()
         _attach(model)
-        model._mesh = _mesh(ep=4)
-        model.validate_for_mesh()
+        validate_for_mesh(model, _mesh(ep=4))
 
     def test_multiple_errors(self):
         model = _Bare()
         _attach(model)
-        model._mesh = _mesh(tp=2, pp=4, ep=2, cp=2)
         with patch(_PARALLELIZE_PATH, {}):
             with pytest.raises(ValueError) as exc_info:
-                model.validate_for_mesh()
+                validate_for_mesh(model, _mesh(tp=2, pp=4, ep=2, cp=2))
             msg = str(exc_info.value)
             assert "no TP plan" in msg
             assert "_pp_plan" in msg
@@ -452,14 +434,12 @@ class TestValidateForMesh:
     def test_no_mesh_is_noop(self):
         model = _Bare()
         _attach(model)
-        model._mesh = None
-        model.validate_for_mesh()
+        validate_for_mesh(model, None)
 
     def test_size_1_is_noop(self):
         model = _Bare()
         _attach(model)
-        model._mesh = _mesh()
-        model.validate_for_mesh()
+        validate_for_mesh(model, _mesh())
 
 
 # ---------------------------------------------------------------------------

@@ -878,7 +878,8 @@ class TestBuildModelRetryDepth:
             patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
             patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
             patch(
-                "nemo_automodel._transformers.validation.attach_capabilities_and_validate", return_value=sentinel_model
+                "nemo_automodel._transformers.capabilities.attach_capabilities_and_validate",
+                return_value=sentinel_model,
             ),
             patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
             patch("torch.cuda.current_device", return_value=0),

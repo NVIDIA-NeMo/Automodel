@@ -15,8 +15,9 @@
 """Model capabilities introspection and input validation.
 
 Provides :class:`ModelSupports` (a read-only descriptor of what a model can
-do) and :class:`ModelCapabilitiesMixin` which attaches ``model.supports`` and
-a ``validate_for_mesh`` helper to any ``nn.Module``.
+do) and :func:`attach_capabilities_and_validate` which attaches
+``model.supports``, ``model.supports_*``, and ``model.validate_for_mesh``
+to any ``nn.Module``.
 
 Capabilities are derived from code introspection -- class attributes, mixin
 inheritance, forward-signature inspection -- so they stay in sync as models
@@ -189,11 +190,12 @@ class ModelSupports:
         """Gradient checkpointing is supported."""
         if self.supports_ep:
             return False
-        # Walk MRO directly to avoid triggering ModelCapabilitiesMixin.__getattr__,
-        # which would recurse back here for models that lack the attribute.
         for cls in type(self._model).__mro__:
             if "supports_gradient_checkpointing" in cls.__dict__:
-                return cls.__dict__["supports_gradient_checkpointing"] is True
+                val = cls.__dict__["supports_gradient_checkpointing"]
+                if isinstance(val, (property, classmethod, staticmethod)):
+                    continue
+                return val is True
         return False
 
     # mesh-aware helpers
@@ -243,123 +245,130 @@ class ModelSupports:
     #     return True
 
 
-class ModelCapabilitiesMixin:
-    """Mixin injected at model-creation time to expose capabilities.
+def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
+    """Validate *mesh* parallelism sizes against this model's capabilities.
 
-    Provides:
-    * ``model.supports`` -- a :class:`ModelSupports` descriptor.
-    * ``model.validate_for_mesh(mesh)`` -- raises ``ValueError`` with
-      actionable messages when the mesh configuration is incompatible.
+    Works both as a bound method (``model.validate_for_mesh()``) and as a
+    standalone call (``validate_for_mesh(model)``).
+
+    Raises :class:`ValueError` with one bullet per violation.
     """
+    tp_size = getattr(mesh, "tp_size", 1)
+    pp_size = getattr(mesh, "pp_size", 1)
+    ep_size = getattr(mesh, "ep_size", 1)
+    cp_size = getattr(mesh, "cp_size", 1)
 
-    @property
-    def supports(self) -> ModelSupports:
-        try:
-            return self._supports
-        except AttributeError:
-            self._supports = ModelSupports(self, getattr(self, "_mesh", None))
-            return self._supports
+    arch = type(model).__name__
+    errors: list[str] = []
 
-    def __getattr__(self, name: str):
-        if name.startswith("supports_"):
-            return getattr(self.supports, name)
-        raise AttributeError(name)
+    if tp_size > 1 and not model.supports_tp:
+        errors.append(
+            f"Tensor parallelism (tp_size={tp_size}) requested but {arch} "
+            f"has no TP plan (not in PARALLELIZE_FUNCTIONS and no `_tp_plan` attribute).\n"
+            f"Please re-run with --distributed.tp_size=1 or\n"
+            f"modify distributed YAML config section:\n"
+            f"distributed:\n"
+            f"  tp_size: 1"
+        )
 
-    def validate_for_mesh(self) -> None:
-        """Validate *mesh* parallelism sizes against this model's capabilities.
+    if pp_size > 1 and not model.supports_pp:
+        errors.append(
+            f"Pipeline parallelism (pp_size={pp_size}) requires a _pp_plan "
+            f"attribute on {arch}, but none was found.\n"
+            f"Please re-run with --distributed.pp_size=1 or\n"
+            f"modify distributed YAML config section:\n"
+            f"distributed:\n"
+            f"  pp_size: 1"
+        )
 
-        Raises :class:`ValueError` with one bullet per violation.
-        """
-        mesh = getattr(self, "_mesh", None)
-        tp_size = getattr(mesh, "tp_size", 1)
-        pp_size = getattr(mesh, "pp_size", 1)
-        ep_size = getattr(mesh, "ep_size", 1)
-        cp_size = getattr(mesh, "cp_size", 1)
-
-        arch = type(self).__name__
-        sup = self.supports
-        errors: list[str] = []
-
-        if tp_size > 1 and not sup.supports_tp:
+    if cp_size > 1 and not model.supports_cp:
+        if _is_hybrid(model):
             errors.append(
-                f"Tensor parallelism (tp_size={tp_size}) requested but {arch} "
-                f"has no TP plan (not in PARALLELIZE_FUNCTIONS and no `_tp_plan` attribute).\n"
-                f"Please re-run with --distributed.tp_size=1 or\n"
+                f"Context parallelism (cp_size={cp_size}) is not supported for "
+                f"hybrid model {arch} (contains Mamba/SSM layers).\n"
+                f"Please re-run with --distributed.cp_size=1 or\n"
                 f"modify distributed YAML config section:\n"
                 f"distributed:\n"
-                f"  tp_size: 1"
+                f"  cp_size: 1"
             )
-
-        if pp_size > 1 and not sup.supports_pp:
+        elif _has_backend(model):
             errors.append(
-                f"Pipeline parallelism (pp_size={pp_size}) requires a _pp_plan "
-                f"attribute on {arch}, but none was found.\n"
-                f"Please re-run with --distributed.pp_size=1 or\n"
+                f"Context parallelism (cp_size={cp_size}) for {arch} requires "
+                f"the TE attention backend (backend.attn='te').\n"
+                f"Please re-run with --distributed.cp_size=1 or switch to TE attention:\n"
+                f"model:\n"
+                f"  backend:\n"
+                f"    attn: te"
+            )
+        else:
+            errors.append(
+                f"Context parallelism (cp_size={cp_size}) not supported with {arch} "
+                f"(model does not declare _supports_sdpa).\n"
+                f"Please re-run with --distributed.cp_size=1 or\n"
                 f"modify distributed YAML config section:\n"
                 f"distributed:\n"
-                f"  pp_size: 1"
+                f"  cp_size: 1"
             )
+    if cp_size > 1 and not model.supports_cp_with_sequence_packing:
+        logger.warning(
+            f"Context parallelism (cp_size={cp_size}) + sequence packing is not supported with {arch} model."
+        )
 
-        if cp_size > 1 and not sup.supports_cp:
-            if _is_hybrid(self):
-                errors.append(
-                    f"Context parallelism (cp_size={cp_size}) is not supported for "
-                    f"hybrid model {arch} (contains Mamba/SSM layers).\n"
-                    f"Please re-run with --distributed.cp_size=1 or\n"
-                    f"modify distributed YAML config section:\n"
-                    f"distributed:\n"
-                    f"  cp_size: 1"
-                )
-            elif _has_backend(self):
-                errors.append(
-                    f"Context parallelism (cp_size={cp_size}) for {arch} requires "
-                    f"the TE attention backend (backend.attn='te').\n"
-                    f"Please re-run with --distributed.cp_size=1 or switch to TE attention:\n"
-                    f"model:\n"
-                    f"  backend:\n"
-                    f"    attn: te"
-                )
-            else:
-                errors.append(
-                    f"Context parallelism (cp_size={cp_size}) not supported with {arch} "
-                    f"(model does not declare _supports_sdpa).\n"
-                    f"Please re-run with --distributed.cp_size=1 or\n"
-                    f"modify distributed YAML config section:\n"
-                    f"distributed:\n"
-                    f"  cp_size: 1"
-                )
-        if cp_size > 1 and not sup.supports_cp_with_sequence_packing:
-            logger.warning(
-                f"Context parallelism (cp_size={cp_size}) + sequence packing is not supported with {arch} model."
-            )
+    if ep_size > 1 and not model.supports_ep:
+        errors.append(
+            f"Expert parallelism (ep_size={ep_size}) requires a MoE model, "
+            f"but {arch} does not inherit from MoEFSDPSyncMixin.\n"
+            f"Please re-run with --distributed.ep_size=1 or\n"
+            f"modify distributed YAML config section:\n"
+            f"distributed:\n"
+            f"  ep_size: 1"
+        )
 
-        if ep_size > 1 and not sup.supports_ep:
-            errors.append(
-                f"Expert parallelism (ep_size={ep_size}) requires a MoE model, "
-                f"but {arch} does not inherit from MoEFSDPSyncMixin.\n"
-                f"Please re-run with --distributed.ep_size=1 or\n"
-                f"modify distributed YAML config section:\n"
-                f"distributed:\n"
-                f"  ep_size: 1"
-            )
+    if errors:
+        raise ValueError(f"Unsupported configuration for {arch}:\n" + "\n".join(f"  - {e}" for e in errors))
 
-        if errors:
-            raise ValueError(f"Unsupported configuration for {arch}:\n" + "\n".join(f"  - {e}" for e in errors))
+
+def _supports_forwarding_property(name: str) -> property:
+    """Property that forwards ``model.<name>`` to ``model.supports.<name>``."""
+
+    def fget(self: "nn.Module") -> bool:
+        return getattr(self.supports, name)
+
+    fget.__name__ = name
+    return property(fget)
+
+
+def _lazy_supports_property(self: "nn.Module") -> ModelSupports:
+    try:
+        return self._supports  # type: ignore[attr-defined]
+    except AttributeError:
+        self._supports = ModelSupports(self, getattr(self, "_mesh", None))  # type: ignore[attr-defined]
+        return self._supports  # type: ignore[attr-defined]
+
+
+def _build_class_dict() -> dict[str, property | type]:
+    cls_dict: dict[str, property | type] = {
+        "supports": property(_lazy_supports_property),
+    }
+    for attr in dir(ModelSupports):
+        if attr.startswith("supports_"):
+            cls_dict[attr] = _supports_forwarding_property(attr)
+    return cls_dict
 
 
 def attach_capabilities_and_validate(model: "nn.Module", mesh: "MeshContext") -> "nn.Module":
-    """Inject :class:`ModelCapabilitiesMixin` into *model* (in-place).
+    """Attach ``model.supports`` and ``model.supports_*`` and call validate_for_mesh.
 
-    After this call ``model.supports`` and ``model.validate_for_mesh`` are
-    available.  Safe to call more than once -- subsequent calls are no-ops.
+    Injects a thin dynamic subclass so that property descriptors (supports_*)
+        resolve via ``__getattribute__`` with no ``__getattr__`` overhead,
+        which avoids triggering ModelCapabilitiesMixin.__getattr__ for models
+        that lack the attribute.
+    Safe to call more than once -- subsequent calls are no-ops.
     """
-    if isinstance(model, ModelCapabilitiesMixin):
-        return model
     model.__class__ = type(
         model.__class__.__name__,
-        (ModelCapabilitiesMixin, model.__class__),
-        {},
+        (model.__class__,),
+        _build_class_dict(),
     )
-    model._mesh = mesh  # type: ignore[attr-defined]
-    model.validate_for_mesh()
+    validate_for_mesh(model, mesh)
     return model

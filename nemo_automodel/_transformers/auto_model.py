@@ -361,7 +361,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         if is_hf_model:
             _verify_sdpa_support(model, mesh.cp_size)
 
-        from nemo_automodel._transformers.validation import attach_capabilities_and_validate
+        from nemo_automodel._transformers.capabilities import attach_capabilities_and_validate
 
         attach_capabilities_and_validate(model, mesh)
 
