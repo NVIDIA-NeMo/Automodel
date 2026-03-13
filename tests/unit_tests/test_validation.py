@@ -326,69 +326,80 @@ class TestValidateForMesh:
     def test_tp_fails(self):
         model = _Bare()
         _attach(model)
+        model._mesh = _mesh(tp=2)
         with patch(_PARALLELIZE_PATH, {}):
             with pytest.raises(ValueError, match="Tensor parallelism.*no TP plan"):
-                model.validate_for_mesh(_mesh(tp=2))
+                model.validate_for_mesh()
 
     def test_tp_passes_with_plan(self):
         model = _WithTP()
         _attach(model)
+        model._mesh = _mesh(tp=2)
         with patch(_PARALLELIZE_PATH, {}):
-            model.validate_for_mesh(_mesh(tp=2))
+            model.validate_for_mesh()
 
     def test_pp_fails(self):
         model = _Bare()
         _attach(model)
+        model._mesh = _mesh(pp=2)
         with pytest.raises(ValueError, match="Pipeline parallelism.*_pp_plan"):
-            model.validate_for_mesh(_mesh(pp=2))
+            model.validate_for_mesh()
 
     def test_pp_passes_with_plan(self):
         model = _WithPP()
         _attach(model)
-        model.validate_for_mesh(_mesh(pp=2))
+        model._mesh = _mesh(pp=2)
+        model.validate_for_mesh()
 
     def test_cp_fails_non_moe(self):
         model = _Bare()
         _attach(model)
+        model._mesh = _mesh(cp=2)
         with pytest.raises(ValueError, match="Context parallelism.*not supported"):
-            model.validate_for_mesh(_mesh(cp=2))
+            model.validate_for_mesh()
 
     def test_cp_fails_moe_without_te(self):
         cls = _make_moe_cls()
         model = cls()
         _attach(model)
+        model._mesh = _mesh(cp=2)
         with pytest.raises(ValueError, match="Context parallelism.*TE attention backend"):
-            model.validate_for_mesh(_mesh(cp=2))
+            model.validate_for_mesh()
 
     def test_cp_passes_moe_with_te(self):
         cls = _make_moe_te_cls()
         model = cls()
         _attach(model)
-        model.validate_for_mesh(_mesh(cp=4))
+        model._mesh = _mesh(cp=4)
+        model.validate_for_mesh()
 
     def test_cp_passes_with_sdpa(self):
         model = _WithSDPA()
         _attach(model)
-        model.validate_for_mesh(_mesh(cp=2))
+        model._mesh = _mesh(cp=2)
+        model.validate_for_mesh()
 
     def test_ep_fails_for_dense(self):
         model = _Bare()
         _attach(model)
+        model._mesh = _mesh(ep=2)
         with pytest.raises(ValueError, match="Expert parallelism.*MoE model"):
-            model.validate_for_mesh(_mesh(ep=2))
+            model.validate_for_mesh()
 
     def test_ep_passes_for_moe(self):
         cls = _make_moe_cls()
         model = cls()
         _attach(model)
-        model.validate_for_mesh(_mesh(ep=4))
+        model._mesh = _mesh(ep=4)
+        model.validate_for_mesh()
 
     def test_multiple_errors(self):
         model = _Bare()
         _attach(model)
+        model._mesh = _mesh(tp=2, pp=4, ep=2, cp=2)
         with patch(_PARALLELIZE_PATH, {}):
             with pytest.raises(ValueError) as exc_info:
-                model.validate_for_mesh(_mesh(tp=2, pp=4, ep=2, cp=2))
+                model.validate_for_mesh()
             msg = str(exc_info.value)
             assert "no TP plan" in msg
             assert "_pp_plan" in msg
@@ -398,12 +409,14 @@ class TestValidateForMesh:
     def test_no_mesh_is_noop(self):
         model = _Bare()
         _attach(model)
-        model.validate_for_mesh(None)
+        model._mesh = None
+        model.validate_for_mesh()
 
     def test_size_1_is_noop(self):
         model = _Bare()
         _attach(model)
-        model.validate_for_mesh(_mesh())
+        model._mesh = _mesh()
+        model.validate_for_mesh()
 
 
 # ---------------------------------------------------------------------------
