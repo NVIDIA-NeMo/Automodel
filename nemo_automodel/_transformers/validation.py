@@ -158,7 +158,12 @@ class ModelSupports:
         """Gradient checkpointing is supported."""
         if self.supports_ep:
             return False
-        return getattr(self._model, "supports_gradient_checkpointing", False) is True
+        # Walk MRO directly to avoid triggering ModelCapabilitiesMixin.__getattr__,
+        # which would recurse back here for models that lack the attribute.
+        for cls in type(self._model).__mro__:
+            if "supports_gradient_checkpointing" in cls.__dict__:
+                return cls.__dict__["supports_gradient_checkpointing"] is True
+        return False
 
     # mesh-aware helpers
 
@@ -218,15 +223,16 @@ class ModelCapabilitiesMixin:
 
     @property
     def supports(self) -> ModelSupports:
-        if not hasattr(self, "_supports"):
+        try:
+            return self._supports
+        except AttributeError:
             self._supports = ModelSupports(self, getattr(self, "_mesh", None))
-        return self._supports
+            return self._supports
 
     def __getattr__(self, name: str):
-        # @akoumparouli: avoid "model.supports.supports_cp_with_sequence_packing" -> "model.supports_cp_with_sequence_packing"
         if name.startswith("supports_"):
             return getattr(self.supports, name)
-        return getattr(self, name)
+        raise AttributeError(name)
 
     def validate_for_mesh(self) -> None:
         """Validate *mesh* parallelism sizes against this model's capabilities.
