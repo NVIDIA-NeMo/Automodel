@@ -42,7 +42,7 @@ TRANSFORMERS_OFFLINE=1 python \
 
 # Now, rerun command with max_steps=4 (previous used 3)
 TRANSFORMERS_OFFLINE=1 python \
--m coverage run --append \
+-m coverage run \
 -m pytest $PYTEST_S_FLAG tests/functional_tests/training/test_qlora_tiny.py \
     --config tests/functional_tests/hf_peft/qlora_tiny_squad.yaml \
     --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l \
