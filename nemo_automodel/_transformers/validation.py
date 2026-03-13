@@ -68,10 +68,32 @@ def _supports_seq_lens(model: "nn.Module") -> bool:
         return False
 
 
+def _has_backend(model: "nn.Module") -> bool:
+    """True for custom models that carry a ``BackendConfig``."""
+    backend = getattr(model, "backend", None)
+    return backend is not None and hasattr(backend, "attn")
+
+
 def _uses_te_attention(model: "nn.Module") -> bool:
     """True when the model was constructed with the TE attention backend."""
     backend = getattr(model, "backend", None)
     return getattr(backend, "attn", None) == "te"
+
+
+def _is_hybrid(model: "nn.Module") -> bool:
+    """True when the model mixes attention with non-attention layers (e.g. Mamba/SSM).
+
+    Detected via config attributes used by NemotronH (``layers_block_type``)
+    and HF hybrid models (``hybrid_override_pattern``, ``is_hybrid_model``).
+    """
+    config = getattr(model, "config", None)
+    if config is None:
+        return False
+    for attr in ("layers_block_type", "hybrid_override_pattern"):
+        pattern = getattr(config, attr, None)
+        if pattern and any(str(c).upper() == "M" for c in pattern):
+            return True
+    return getattr(config, "is_hybrid_model", False) is True
 
 
 class ModelSupports:
@@ -133,11 +155,20 @@ class ModelSupports:
     def supports_cp(self) -> bool:
         """Model supports context parallelism.
 
-        * Non-MoE models: requires ``_supports_sdpa``.
-        * MoE models: requires TE attention backend (runtime check).
+        +------------------+----------------+---------+
+        | Model kind       | Attention      | CP?     |
+        +------------------+----------------+---------+
+        | Custom           | TE             | Yes     |
+        | Custom           | FlexAttention  | No      |
+        | HF (pure attn)   | SDPA           | Yes     |
+        | HF (pure attn)   | no SDPA        | No      |
+        | HF hybrid (Mamba)| any            | No      |
+        +------------------+----------------+---------+
         """
-        if self.supports_ep:
+        if _has_backend(self._model):
             return _uses_te_attention(self._model)
+        if _is_hybrid(self._model):
+            return False
         return getattr(self._model, "_supports_sdpa", False) is True
 
     @property
@@ -270,15 +301,28 @@ class ModelCapabilitiesMixin:
             )
 
         if cp_size > 1 and not sup.supports_cp:
-            if _is_moe(type(self)):
+            if _is_hybrid(self):
+                errors.append(
+                    f"Context parallelism (cp_size={cp_size}) is not supported for "
+                    f"hybrid model {arch} (contains Mamba/SSM layers).\n"
+                    f"Please re-run with --distributed.cp_size=1 or\n"
+                    f"modify distributed YAML config section:\n"
+                    f"distributed:\n"
+                    f"  cp_size: 1"
+                )
+            elif _has_backend(self):
                 errors.append(
                     f"Context parallelism (cp_size={cp_size}) for {arch} requires "
                     f"the TE attention backend (backend.attn='te').\n"
-                    f"Please re-run with --distributed.cp_size=1 or switch to TE attention."
+                    f"Please re-run with --distributed.cp_size=1 or switch to TE attention:\n"
+                    f"model:\n"
+                    f"  backend:\n"
+                    f"    attn: te"
                 )
             else:
                 errors.append(
-                    f"Context parallelism (cp_size={cp_size}) not supported with {arch} model.\n"
+                    f"Context parallelism (cp_size={cp_size}) not supported with {arch} "
+                    f"(model does not declare _supports_sdpa).\n"
                     f"Please re-run with --distributed.cp_size=1 or\n"
                     f"modify distributed YAML config section:\n"
                     f"distributed:\n"

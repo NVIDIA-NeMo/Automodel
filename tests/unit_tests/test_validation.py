@@ -188,23 +188,51 @@ class TestModelSupportsPP:
 
 
 class TestModelSupportsCP:
-    def test_cp_true_with_sdpa(self):
+    def test_hf_true_with_sdpa(self):
         model = _WithSDPA()
         _attach(model)
         assert model.supports.supports_cp is True
 
-    def test_cp_false_without_sdpa(self):
+    def test_hf_false_without_sdpa(self):
         model = _Bare()
         _attach(model)
         assert model.supports.supports_cp is False
 
-    def test_cp_true_for_moe_with_te(self):
+    def test_hf_false_for_hybrid(self):
+        """HF hybrid model (Mamba layers) cannot use CP even with SDPA."""
+        model = _WithSDPA()
+        model.config = SimpleNamespace(hybrid_override_pattern="MMAMM")
+        _attach(model)
+        assert model.supports.supports_cp is False
+
+    def test_hf_false_for_hybrid_layers_block_type(self):
+        model = _WithSDPA()
+        model.config = SimpleNamespace(layers_block_type=["attention", "M", "attention"])
+        _attach(model)
+        assert model.supports.supports_cp is False
+
+    def test_custom_true_with_te(self):
         cls = _make_moe_te_cls()
         model = cls()
         _attach(model)
         assert model.supports.supports_cp is True
 
-    def test_cp_false_for_moe_without_te(self):
+    def test_custom_false_with_flex(self):
+        """Custom model using FlexAttention does not support CP."""
+
+        class _Flex(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.backend = SimpleNamespace(attn="flex")
+
+            def forward(self, x):
+                return x
+
+        model = _Flex()
+        _attach(model)
+        assert model.supports.supports_cp is False
+
+    def test_custom_moe_false_without_te(self):
         cls = _make_moe_cls()
         model = cls()
         _attach(model)
@@ -351,29 +379,44 @@ class TestValidateForMesh:
         model._mesh = _mesh(pp=2)
         model.validate_for_mesh()
 
-    def test_cp_fails_non_moe(self):
+    def test_cp_fails_hf_no_sdpa(self):
         model = _Bare()
         _attach(model)
         model._mesh = _mesh(cp=2)
-        with pytest.raises(ValueError, match="Context parallelism.*not supported"):
+        with pytest.raises(ValueError, match="Context parallelism.*_supports_sdpa"):
             model.validate_for_mesh()
 
-    def test_cp_fails_moe_without_te(self):
-        cls = _make_moe_cls()
-        model = cls()
+    def test_cp_fails_hybrid(self):
+        model = _WithSDPA()
+        model.config = SimpleNamespace(hybrid_override_pattern="MMAMM")
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        with pytest.raises(ValueError, match="Context parallelism.*hybrid.*Mamba"):
+            model.validate_for_mesh()
+
+    def test_cp_fails_custom_flex(self):
+        class _Flex(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.backend = SimpleNamespace(attn="flex")
+
+            def forward(self, x):
+                return x
+
+        model = _Flex()
         _attach(model)
         model._mesh = _mesh(cp=2)
         with pytest.raises(ValueError, match="Context parallelism.*TE attention backend"):
             model.validate_for_mesh()
 
-    def test_cp_passes_moe_with_te(self):
+    def test_cp_passes_custom_te(self):
         cls = _make_moe_te_cls()
         model = cls()
         _attach(model)
         model._mesh = _mesh(cp=4)
         model.validate_for_mesh()
 
-    def test_cp_passes_with_sdpa(self):
+    def test_cp_passes_hf_sdpa(self):
         model = _WithSDPA()
         _attach(model)
         model._mesh = _mesh(cp=2)
