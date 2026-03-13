@@ -15,7 +15,6 @@ model:
   pipeline_spec:
     transformer_cls: "WanTransformer3DModel"
     subfolder: "transformer"
-    enable_gradient_checkpointing: false
     load_full_pipeline: false
 
 step_scheduler:
@@ -27,10 +26,14 @@ step_scheduler:
 
 data:
   dataloader:
-    _target_: nemo_automodel.components.datasets.diffusion.build_dataloader
-    meta_folder: PATH_TO_YOUR_DATA
-    num_workers: 2
-    device: cpu
+    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
+    cache_dir: PATH_TO_YOUR_DATA
+    model_type: wan
+    base_resolution: [512, 512]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+    num_workers: 0
 
 optim:
   learning_rate: 5e-5

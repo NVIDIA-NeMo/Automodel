@@ -30,7 +30,7 @@ import torch
 from diffusers import FluxPipeline
 
 # Import the provided dataloader builder
-from nemo_automodel.components.datasets.diffusion import build_flux_multiresolution_dataloader
+from nemo_automodel.components.datasets.diffusion import build_text_to_image_multiresolution_dataloader
 
 
 def parse_args():
@@ -187,7 +187,7 @@ def main():
     print("=" * 80)
     print(f"Initializing Multiresolution Dataloader: {args.data_path}")
 
-    dataloader, _ = build_flux_multiresolution_dataloader(
+    dataloader, _ = build_text_to_image_multiresolution_dataloader(
         cache_dir=args.data_path, batch_size=1, num_workers=args.num_workers, dynamic_batch_size=True, shuffle=False
     )
     print(f"[INFO] Dataloader ready. Batches: {len(dataloader)}")

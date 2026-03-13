@@ -486,30 +486,10 @@ def test_from_pretrained_load_for_training_makes_params_trainable():
         patch(f"{MODULE_PATH}.torch.cuda.is_available", return_value=False),
     ):
         pipe, managers = NeMoAutoDiffusionPipeline.from_pretrained(
-            "dummy", load_for_training=True, enable_gradient_checkpointing=False,
+            "dummy", load_for_training=True,
         )
 
     assert all(p.requires_grad for p in mod.parameters())
-
-
-def test_from_pretrained_gradient_checkpointing_enabled():
-    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
-
-    transformer = DummyModule()
-    transformer.enable_gradient_checkpointing = Mock()
-
-    dummy_pipe = DummyPipeline({"transformer": transformer})
-    mock_diffusion_pipeline = MagicMock()
-    mock_diffusion_pipeline.from_pretrained.return_value = dummy_pipe
-
-    with (
-        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
-        patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
-        patch(f"{MODULE_PATH}.torch.cuda.is_available", return_value=False),
-    ):
-        pipe, _ = NeMoAutoDiffusionPipeline.from_pretrained("dummy", enable_gradient_checkpointing=True)
-
-    transformer.enable_gradient_checkpointing.assert_called_once()
 
 
 def test_from_pretrained_raises_when_diffusers_unavailable():

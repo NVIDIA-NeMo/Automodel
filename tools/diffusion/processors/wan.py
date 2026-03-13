@@ -111,6 +111,8 @@ class WanProcessor(BaseVideoProcessor):
         from transformers import AutoTokenizer, UMT5EncoderModel
 
         dtype = torch.float16 if "cuda" in device else torch.float32
+        # UMT5 requires bfloat16 (float16 causes overflow/zeros in attention and layer norm)
+        text_encoder_dtype = torch.bfloat16 if "cuda" in device else torch.float32
 
         logger.info("[Wan] Loading models from %s...", model_name)
 
@@ -119,8 +121,19 @@ class WanProcessor(BaseVideoProcessor):
         text_encoder = UMT5EncoderModel.from_pretrained(
             model_name,
             subfolder="text_encoder",
-            torch_dtype=dtype,
+            torch_dtype=text_encoder_dtype,
         )
+        # Workaround for transformers>=5.0.0 weight tying regression:
+        # The Wan2.1 checkpoint stores the token embedding as "shared.weight", which
+        # transformers<5 automatically tied to "encoder.embed_tokens.weight". In v5+,
+        # this tying no longer happens during from_pretrained(), leaving embed_tokens
+        # zero-initialized and producing all-zero text embeddings.
+        if (
+            hasattr(text_encoder, "shared")
+            and hasattr(text_encoder.encoder, "embed_tokens")
+            and text_encoder.encoder.embed_tokens.weight.data_ptr() != text_encoder.shared.weight.data_ptr()
+        ):
+            text_encoder.encoder.embed_tokens.weight = text_encoder.shared.weight
         text_encoder.to(device)
         text_encoder.eval()
 

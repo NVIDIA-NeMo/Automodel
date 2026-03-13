@@ -17,14 +17,29 @@
 import importlib
 
 _LAZY_ATTRS = {
-    "MetaFilesDataset": (".meta_files_dataset", "MetaFilesDataset"),
+    # Dataset classes
+    "BaseMultiresolutionDataset": (".base_dataset", "BaseMultiresolutionDataset"),
     "TextToImageDataset": (".text_to_image_dataset", "TextToImageDataset"),
+    "TextToVideoDataset": (".text_to_video_dataset", "TextToVideoDataset"),
+    "MetaFilesDataset": (".meta_files_dataset", "MetaFilesDataset"),
+    # Utilities
     "MultiTierBucketCalculator": (".multi_tier_bucketing", "MultiTierBucketCalculator"),
     "SequentialBucketSampler": (".sampler", "SequentialBucketSampler"),
-    "collate_fn_flux": (".collate_fns", "collate_fn_flux"),
-    "build_flux_multiresolution_dataloader": (".collate_fns", "build_flux_multiresolution_dataloader"),
-    "build_mock_dataloader": (".mock_dataloader", "build_mock_dataloader"),
+    "VIDEO_OPTIONAL_FIELDS": (".text_to_video_dataset", "VIDEO_OPTIONAL_FIELDS"),
+    # Collate functions
+    "collate_fn_text_to_image": (".collate_fns", "collate_fn_text_to_image"),
+    "collate_fn_video": (".collate_fns", "collate_fn_video"),
+    "collate_fn_production": (".collate_fns", "collate_fn_production"),
+    # Dataloader builders
+    "build_text_to_image_multiresolution_dataloader": (
+        ".collate_fns",
+        "build_text_to_image_multiresolution_dataloader",
+    ),
+    "build_video_multiresolution_dataloader": (".collate_fns", "build_video_multiresolution_dataloader"),
+    # Legacy (non-multiresolution)
     "build_dataloader": (".meta_files_dataset", "build_dataloader"),
+    # Mock/test
+    "build_mock_dataloader": (".mock_dataloader", "build_mock_dataloader"),
 }
 
 __all__ = sorted(_LAZY_ATTRS.keys())
