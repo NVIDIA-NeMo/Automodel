@@ -64,11 +64,15 @@ class _WithSDPA(nn.Module):
 
 
 class _WithSeqLens(nn.Module):
+    _supports_sdpa = True
+
     def forward(self, input_ids, seq_lens=None):
         return input_ids
 
 
 class _WithKwargs(nn.Module):
+    _supports_sdpa = True
+
     def forward(self, input_ids, **kwargs):
         return input_ids
 
@@ -259,6 +263,47 @@ class TestModelSupportsGradientCheckpointing:
         model = _Bare()
         _attach(model)
         assert model.supports.supports_gradient_checkpointing is False
+
+
+class TestModelSupportsCPWithSequencePacking:
+    def test_cp1_seq_packing_supported(self):
+        """When cp_size=1, just checks seq_lens support."""
+        model = _WithSeqLens()
+        _attach(model)
+        model._mesh = _mesh(cp=1)
+        assert model.supports.supports_cp_with_sequence_packing is True
+
+    def test_cp1_seq_packing_unsupported(self):
+        model = _Bare()
+        _attach(model)
+        model._mesh = _mesh(cp=1)
+        assert model.supports.supports_cp_with_sequence_packing is False
+
+    def test_cp_gt1_with_te_and_seq_lens(self):
+        """CP>1 + packing requires TE attention."""
+        cls = _make_moe_te_cls()
+
+        class _MoETESeqLens(cls):
+            def forward(self, input_ids, seq_lens=None):
+                return input_ids
+
+        model = _MoETESeqLens()
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        assert model.supports.supports_cp_with_sequence_packing is True
+
+    def test_cp_gt1_without_te_fails(self):
+        """CP>1 + packing but no TE → not supported."""
+        model = _WithSeqLens()
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        assert model.supports.supports_cp_with_sequence_packing is False
+
+    def test_cp_gt1_no_seq_lens(self):
+        model = _Bare()
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        assert model.supports.supports_cp_with_sequence_packing is False
 
 
 class TestModelSupportsRepr:
