@@ -126,6 +126,7 @@ class ModelSupports:
             "ep",
             "sequence_packing",
             "gradient_checkpointing",
+            "generate",
         )
         flags = ", ".join("{}={}".format(name, getattr(self, "supports_" + name)) for name in names)
         return "ModelSupports({})".format(flags)
@@ -184,6 +185,11 @@ class ModelSupports:
         """``forward()`` accepts ``seq_lens`` for packed-sequence training."""
         sp_attn_backend = getattr(self._model, "_supports_sdpa", False) is True or _uses_te_attention(self._model)
         return _supports_seq_lens(self._model) and sp_attn_backend
+
+    @property
+    def supports_generate(self) -> bool:
+        """Model has a ``generate()`` method for autoregressive inference."""
+        return callable(getattr(self._model, "generate", None))
 
     @property
     def supports_gradient_checkpointing(self) -> bool:
