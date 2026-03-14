@@ -1022,6 +1022,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Extract TE FP8 config from model backend (set after model construction)
         self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
 
+        _packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
+        if self.dist_setup.cp_size > 1 and _packed_seq_size > 0:
+            _m = self.model_parts[0]
+            if hasattr(_m, "supports") and not _m.supports_cp_with_sequence_packing:
+                raise ValueError(
+                    f"Context parallelism (cp_size={self.dist_setup.cp_size}) with packed sequences "
+                    f"is not supported for {type(_m).__name__}.\n"
+                    f"Either disable sequence packing:\n"
+                    f"  packed_sequence:\n"
+                    f"    packed_sequence_size: 0\n"
+                    f"or switch to the TE attention backend -- MoE models only:\n"
+                    f"  model:\n"
+                    f"    backend:\n"
+                    f"      attn: te"
+                )
+
         self.dataloader, self.tokenizer = build_dataloader(
             self.cfg.dataset,
             self.cfg.dataloader,

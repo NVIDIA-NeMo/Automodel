@@ -31,8 +31,8 @@ from nemo_automodel._transformers.auto_model import (
 )
 from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
 from nemo_automodel._transformers.model_init import (
-    _filter_meta_device_from_init_context,
     _filter_kwargs_for_init,
+    _filter_meta_device_from_init_context,
     _get_hf_meta_device_disabled,
     _get_mixin_wrapped_class,
     _patched_get_init_context,
@@ -877,6 +877,10 @@ class TestBuildModelRetryDepth:
             patch("nemo_automodel._transformers.auto_model._init_model") as mock_init,
             patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
             patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
+            patch(
+                "nemo_automodel._transformers.capabilities.attach_capabilities_and_validate",
+                return_value=sentinel_model,
+            ),
             patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
             patch("torch.cuda.current_device", return_value=0),
         ):
