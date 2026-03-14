@@ -64,6 +64,15 @@ _UNIT_TO_SCALE = {
     "P": 1e15,
 }
 
+_UNWRAP_ATTRS = ("module", "_orig_mod", "_fsdp_wrapped_module", "model")
+_CONFIG_ALIAS_ATTRS = (
+    ("n_embd", "hidden_size"),
+    ("n_layer", "num_hidden_layers"),
+    ("n_head", "num_attention_heads"),
+    ("n_positions", "max_position_embeddings"),
+    ("n_inner", "intermediate_size"),
+)
+
 
 def get_device_flops(unit: str = "T", device_name: Optional[str] = None) -> float:
     """Get theoretical device FLOPS in a requested unit.
@@ -141,12 +150,13 @@ class AutoMFU:
             AutoMFU instance
         """
         config = config_or_path_or_model
-        if hasattr(config, "config"):
-            config = config.config
-        elif isinstance(config, (str, PathLike)):
+        if isinstance(config, (str, PathLike)):
             from transformers import AutoConfig
 
             config = AutoConfig.from_pretrained(str(config), **kwargs)
+        else:
+            config = cls._unwrap_config(config)
+            cls._ensure_common_config_aliases(config)
         return cls(config, device=device)
 
     @classmethod
@@ -186,15 +196,9 @@ class AutoMFU:
         Returns:
             MFU as a percentage, or None if model not supported
         """
-        if self.flops_formula is None:
+        flops = self.get_flops(input_ids_or_tensor)
+        if flops is None:
             return None
-
-        if hasattr(input_ids_or_tensor, "shape"):
-            batch_size, seq_len = input_ids_or_tensor.shape[:2]
-        else:
-            batch_size, seq_len = input_ids_or_tensor
-
-        flops = self.flops_formula(self.config, gbs=batch_size, seq_len=seq_len)
         tflops = flops / 1e12
         return calculate_mfu(tflops, world_size, time_delta, reference_mfu=self.reference_mfu)
 
@@ -219,4 +223,55 @@ class AutoMFU:
         else:
             batch_size, seq_len = input_ids_or_tensor
 
-        return self.flops_formula(self.config, gbs=batch_size, seq_len=seq_len)
+        try:
+            # Explicitly gate transformer fallback on required attributes.
+            if self.flops_formula.__name__ == "transformer_flops":
+                required = (
+                    "hidden_size",
+                    "num_hidden_layers",
+                    "num_attention_heads",
+                    "intermediate_size",
+                    "vocab_size",
+                )
+                if not all(hasattr(self.config, attr) for attr in required):
+                    return None
+            return self.flops_formula(self.config, gbs=batch_size, seq_len=seq_len)
+        except Exception as e:
+            logger.debug("Unable to compute FLOPs for config %s: %s", type(self.config).__name__, e)
+            return None
+
+    @staticmethod
+    def _unwrap_config(config_or_model: object):
+        cur = config_or_model
+        visited = set()
+        while cur is not None and id(cur) not in visited:
+            visited.add(id(cur))
+
+            if hasattr(cur, "config"):
+                next_obj = getattr(cur, "config")
+                if next_obj is not None and next_obj is not cur:
+                    cur = next_obj
+                    continue
+
+            moved = False
+            for attr in _UNWRAP_ATTRS:
+                if hasattr(cur, attr):
+                    next_obj = getattr(cur, attr)
+                    if next_obj is not None and next_obj is not cur:
+                        cur = next_obj
+                        moved = True
+                        break
+            if not moved:
+                break
+        return cur
+
+    @staticmethod
+    def _ensure_common_config_aliases(config: object) -> None:
+        for src, dst in _CONFIG_ALIAS_ATTRS:
+            if not hasattr(config, dst) and hasattr(config, src):
+                try:
+                    setattr(config, dst, getattr(config, src))
+                except Exception:
+                    # Some config objects may block dynamic attrs; fallback
+                    # behavior will return None if attrs remain unavailable.
+                    pass
