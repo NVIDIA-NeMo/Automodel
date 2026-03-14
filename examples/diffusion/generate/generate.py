@@ -46,6 +46,7 @@ import torch.distributed as dist
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.shared.t5_patches import patch_t5_layer_norm
 
 logger = logging.getLogger(__name__)
 
@@ -98,10 +99,10 @@ def load_pipeline(cfg, dist_info):
     dtype_str = getattr(cfg.inference, "dtype", "bfloat16")
     torch_dtype = _resolve_dtype(dtype_str)
 
-    # FLUX uses a T5 text encoder whose apex FusedRMSNorm doesn't support bf16.
-    # Patch it before loading so the T5 model is created with the native norm.
-    if torch_dtype == torch.bfloat16 and "flux" in model_id.lower():
-        _patch_t5_layer_norm()
+    # Apex's FusedRMSNorm doesn't support bf16. Patch T5LayerNorm before loading
+    # any pipeline that may use a T5 text encoder (FLUX, HunyuanVideo, etc.).
+    if torch_dtype == torch.bfloat16:
+        patch_t5_layer_norm()
 
     if dist_info is not None and hasattr(cfg.distributed, "parallel_scheme"):
         # Distributed path: use NeMoAutoDiffusionPipeline with parallelization
@@ -117,46 +118,15 @@ def load_pipeline(cfg, dist_info):
     else:
         # Single-GPU path: standard diffusers auto-detection
         pipe = DiffusionPipeline.from_pretrained(model_id, torch_dtype=torch_dtype)
-        pipe.to("cuda")
+        # Skip .to("cuda") when CPU offload is configured — enable_model_cpu_offload()
+        # expects the pipeline on CPU so it can set up per-module device hooks.
+        vae_cfg = getattr(cfg, "vae", None)
+        if not (vae_cfg is not None and getattr(vae_cfg, "enable_cpu_offload", False)):
+            pipe.to("cuda")
         logger.info("Loaded pipeline: %s", type(pipe).__name__)
 
     _fix_text_encoder_weight_tying(pipe)
     return pipe
-
-
-def _patch_t5_layer_norm():
-    """Replace apex's FusedRMSNorm with the native T5LayerNorm in the T5 module.
-
-    Apex's FusedRMSNorm doesn't support bfloat16, but the native T5LayerNorm
-    handles it correctly by upcasting to fp32 internally for numerical stability.
-    This must be called before loading any T5 models.
-    """
-    try:
-        from apex.normalization import FusedRMSNorm
-        from transformers.models.t5 import modeling_t5
-
-        if modeling_t5.T5LayerNorm is not FusedRMSNorm:
-            return
-
-        class _NativeT5LayerNorm(torch.nn.Module):
-            """RMS norm (no bias, no mean subtraction) that works with bf16."""
-
-            def __init__(self, hidden_size, eps=1e-6):
-                super().__init__()
-                self.weight = torch.nn.Parameter(torch.ones(hidden_size))
-                self.variance_epsilon = eps
-
-            def forward(self, hidden_states):
-                variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
-                hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-                if self.weight.dtype in [torch.float16, torch.bfloat16]:
-                    hidden_states = hidden_states.to(self.weight.dtype)
-                return self.weight * hidden_states
-
-        modeling_t5.T5LayerNorm = _NativeT5LayerNorm
-        logger.info("Replaced apex FusedRMSNorm with native T5LayerNorm for bf16 compatibility")
-    except ImportError:
-        pass
 
 
 def _fix_text_encoder_weight_tying(pipe):
@@ -228,6 +198,9 @@ def load_checkpoint_into_pipeline(pipe, cfg):
     if not checkpoint:
         return
 
+    dtype_str = getattr(cfg.inference, "dtype", "bfloat16")
+    torch_dtype = _resolve_dtype(dtype_str)
+
     checkpoint_dir = Path(checkpoint)
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
@@ -250,14 +223,14 @@ def load_checkpoint_into_pipeline(pipe, cfg):
         logger.info("Loaded consolidated checkpoint")
     elif sharded_dir.is_dir() and any(name.endswith(".distcp") for name in os.listdir(sharded_dir)):
         logger.info("Loading sharded FSDP checkpoint from %s", sharded_dir)
-        pipe.transformer = _load_sharded_fsdp_checkpoint(pipe.transformer, str(sharded_dir))
-        pipe.transformer.to("cuda", dtype=torch.bfloat16)
+        pipe.transformer = _load_sharded_fsdp_checkpoint(pipe.transformer, str(sharded_dir), torch_dtype)
+        pipe.transformer.to("cuda", dtype=torch_dtype)
         logger.info("Loaded sharded FSDP checkpoint")
     else:
         logger.warning("No recognized checkpoint format found in %s, using base model weights", checkpoint_dir)
 
 
-def _load_sharded_fsdp_checkpoint(transformer, sharded_dir):
+def _load_sharded_fsdp_checkpoint(transformer, sharded_dir, torch_dtype=torch.bfloat16):
     """Load sharded FSDP/DCP checkpoint into a transformer module.
 
     Creates a temporary gloo process group for single-GPU loading if
@@ -266,6 +239,7 @@ def _load_sharded_fsdp_checkpoint(transformer, sharded_dir):
     Args:
         transformer: The transformer nn.Module to load weights into.
         sharded_dir: Path to the directory containing .distcp shard files.
+        torch_dtype: The dtype to cast the transformer to before loading.
 
     Returns:
         The unwrapped transformer module with loaded checkpoint weights.
@@ -284,7 +258,7 @@ def _load_sharded_fsdp_checkpoint(transformer, sharded_dir):
         init_dist = True
 
     try:
-        transformer.to(dtype=torch.bfloat16)
+        transformer.to(dtype=torch_dtype)
         fsdp_transformer = FSDP(transformer, use_orig_params=True)
 
         FSDP.set_state_dict_type(
@@ -460,6 +434,7 @@ def main():
     # 7. Cleanup
     if dist_info is not None:
         dist.barrier()
+        dist.destroy_process_group()
         logger.info("Distributed inference complete")
 
 

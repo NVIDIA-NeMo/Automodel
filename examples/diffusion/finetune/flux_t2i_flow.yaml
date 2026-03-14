@@ -23,7 +23,6 @@ fsdp:
 flow_matching:
   adapter_type: "flux"
   adapter_kwargs:
-    #Critical: use 3.5 guidance scale for finetuning
     guidance_scale: 1
     use_guidance_embeds: false
   timestep_sampling: "logit_normal"
