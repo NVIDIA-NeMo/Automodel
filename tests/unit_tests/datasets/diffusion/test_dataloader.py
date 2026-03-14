@@ -184,7 +184,7 @@ class TestSequentialBucketSamplerCPU:
         """Test basic sampler initialization."""
         sampler = SequentialBucketSampler(
             simple_dataset,
-            batch_size=4,
+            base_batch_size=4,
             num_replicas=1,
             rank=0,
         )
@@ -198,7 +198,7 @@ class TestSequentialBucketSamplerCPU:
         """Test sampler __len__ returns correct batch count."""
         sampler = SequentialBucketSampler(
             simple_dataset,
-            batch_size=4,
+            base_batch_size=4,
             num_replicas=1,
             rank=0,
         )
@@ -211,7 +211,7 @@ class TestSequentialBucketSamplerCPU:
         """Test sampler iteration yields batches of indices."""
         sampler = SequentialBucketSampler(
             simple_dataset,
-            batch_size=4,
+            base_batch_size=4,
             num_replicas=1,
             rank=0,
         )
@@ -228,7 +228,7 @@ class TestSequentialBucketSamplerCPU:
         batch_size = 4
         sampler = SequentialBucketSampler(
             simple_dataset,
-            batch_size=batch_size,
+            base_batch_size=batch_size,
             num_replicas=1,
             rank=0,
             drop_last=True,
@@ -243,7 +243,7 @@ class TestSequentialBucketSamplerCPU:
         """Test sampler with drop_last=False includes all samples."""
         sampler = SequentialBucketSampler(
             simple_dataset,
-            batch_size=4,
+            base_batch_size=4,
             num_replicas=1,
             rank=0,
             drop_last=False,
@@ -259,7 +259,7 @@ class TestSequentialBucketSamplerCPU:
         """Test set_epoch changes sampler state."""
         sampler = SequentialBucketSampler(
             simple_dataset,
-            batch_size=4,
+            base_batch_size=4,
             num_replicas=1,
             rank=0,
         )
@@ -272,7 +272,7 @@ class TestSequentialBucketSamplerCPU:
         """Test same seed produces same batch order."""
         sampler1 = SequentialBucketSampler(
             simple_dataset,
-            batch_size=4,
+            base_batch_size=4,
             num_replicas=1,
             rank=0,
             seed=42,
@@ -280,7 +280,7 @@ class TestSequentialBucketSamplerCPU:
 
         sampler2 = SequentialBucketSampler(
             simple_dataset,
-            batch_size=4,
+            base_batch_size=4,
             num_replicas=1,
             rank=0,
             seed=42,
@@ -295,7 +295,7 @@ class TestSequentialBucketSamplerCPU:
         """Test different seeds produce different batch orders."""
         sampler1 = SequentialBucketSampler(
             simple_dataset,
-            batch_size=4,
+            base_batch_size=4,
             num_replicas=1,
             rank=0,
             seed=42,
@@ -304,7 +304,7 @@ class TestSequentialBucketSamplerCPU:
 
         sampler2 = SequentialBucketSampler(
             simple_dataset,
-            batch_size=4,
+            base_batch_size=4,
             num_replicas=1,
             rank=0,
             seed=123,
@@ -323,7 +323,7 @@ class TestSequentialBucketSamplerCPU:
         """Test sampler without shuffling."""
         sampler = SequentialBucketSampler(
             simple_dataset,
-            batch_size=4,
+            base_batch_size=4,
             num_replicas=1,
             rank=0,
             shuffle_buckets=False,
@@ -337,7 +337,7 @@ class TestSequentialBucketSamplerCPU:
         """Test that bucket and element order differs across epochs."""
         sampler = SequentialBucketSampler(
             large_dataset,
-            batch_size=8,
+            base_batch_size=8,
             num_replicas=1,
             rank=0,
             seed=42,
@@ -382,7 +382,7 @@ class TestSequentialBucketSamplerCPU:
         batch_size = 4
         sampler = SequentialBucketSampler(
             multi_resolution_dataset,
-            batch_size=batch_size,
+            base_batch_size=batch_size,
             dynamic_batch_size=False,
             num_replicas=1,
             rank=0,
@@ -398,7 +398,7 @@ class TestSequentialBucketSamplerCPU:
         """Test sampler with dynamic_batch_size=True varies batch size."""
         sampler = SequentialBucketSampler(
             multi_resolution_dataset,
-            batch_size=8,
+            base_batch_size=8,
             base_resolution=(512, 512),
             dynamic_batch_size=True,
             num_replicas=1,
@@ -419,7 +419,7 @@ class TestSequentialBucketSamplerCPU:
         """Test get_batch_info returns bucket information."""
         sampler = SequentialBucketSampler(
             simple_dataset,
-            batch_size=4,
+            base_batch_size=4,
             num_replicas=1,
             rank=0,
         )
@@ -444,7 +444,7 @@ class TestSequentialBucketSamplerDistributedCPU:
         for rank in range(world_size):
             sampler = SequentialBucketSampler(
                 large_dataset,
-                batch_size=8,
+                base_batch_size=8,
                 num_replicas=world_size,
                 rank=rank,
             )
@@ -459,7 +459,7 @@ class TestSequentialBucketSamplerDistributedCPU:
 
         sampler0 = SequentialBucketSampler(
             large_dataset,
-            batch_size=8,
+            base_batch_size=8,
             num_replicas=world_size,
             rank=0,
             seed=42,
@@ -467,7 +467,7 @@ class TestSequentialBucketSamplerDistributedCPU:
 
         sampler1 = SequentialBucketSampler(
             large_dataset,
-            batch_size=8,
+            base_batch_size=8,
             num_replicas=world_size,
             rank=1,
             seed=42,
@@ -488,7 +488,7 @@ class TestSequentialBucketSamplerDistributedCPU:
         """Test single rank (world_size=1) processes all data."""
         sampler = SequentialBucketSampler(
             simple_dataset,
-            batch_size=4,
+            base_batch_size=4,
             num_replicas=1,
             rank=0,
         )
@@ -695,7 +695,7 @@ class TestSequentialBucketSamplerGPU:
 
         sampler = SequentialBucketSampler(
             simple_dataset,
-            batch_size=4,
+            base_batch_size=4,
             num_replicas=1,
             rank=0,
         )
@@ -980,7 +980,7 @@ class TestDataloaderIntegration:
         # Create samplers for two ranks
         sampler0 = SequentialBucketSampler(
             large_dataset,
-            batch_size=8,
+            base_batch_size=8,
             num_replicas=world_size,
             rank=0,
             seed=seed,
@@ -988,7 +988,7 @@ class TestDataloaderIntegration:
 
         sampler1 = SequentialBucketSampler(
             large_dataset,
-            batch_size=8,
+            base_batch_size=8,
             num_replicas=world_size,
             rank=1,
             seed=seed,
