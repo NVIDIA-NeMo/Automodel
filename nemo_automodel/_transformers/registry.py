@@ -234,6 +234,10 @@ class _ModelRegistry:
     def get_model_cls_from_model_arch(self, model_arch: str) -> Type[nn.Module]:
         return self.model_arch_name_to_cls[model_arch]
 
+    def has_custom_model(self, arch_name: str) -> bool:
+        """Return ``True`` if *arch_name* has a custom (non-HF) implementation."""
+        return arch_name in self.model_arch_name_to_cls
+
     def register(self, arch_name: str, model_cls: Type[nn.Module], exist_ok: bool = False) -> None:
         """Register a custom model class for a given architecture name."""
         self.model_arch_name_to_cls.register(arch_name, model_cls, exist_ok=exist_ok)

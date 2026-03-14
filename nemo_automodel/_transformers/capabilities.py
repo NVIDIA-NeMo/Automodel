@@ -129,7 +129,17 @@ class ModelSupports:
             "generate",
         )
         flags = ", ".join("{}={}".format(name, getattr(self, "supports_" + name)) for name in names)
+        flags += ", is_custom_model={}".format(self.is_custom_model)
         return "ModelSupports({})".format(flags)
+
+    # model kind
+
+    @property
+    def is_custom_model(self) -> bool:
+        """True when the model class has a custom (non-HF) implementation in the registry."""
+        from nemo_automodel._transformers.registry import ModelRegistry
+
+        return ModelRegistry.has_custom_model(self._model_cls.__name__)
 
     # parallelism
 
@@ -357,7 +367,7 @@ def _build_class_dict() -> dict[str, property | type]:
         "supports": property(_lazy_supports_property),
     }
     for attr in dir(ModelSupports):
-        if attr.startswith("supports_"):
+        if attr.startswith("supports_") or attr == "is_custom_model":
             cls_dict[attr] = _supports_forwarding_property(attr)
     return cls_dict
 
