@@ -12,13 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Configuration for fine-tuning Gemma 4 2B with MedPix dataset for image description
-# export WANDB_API_KEY=xxxxx if you want to use wandb
-# python examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_2b.yaml
-# Multi GPU command:
-# torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_2b.yaml
-# On my local WS, run the following command:
-# NCCL_P2P_DISABLE=1 torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_2b.yaml
+# Configuration for fine-tuning Gemma 4 5B with MedPix dataset for image description
+# torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_5b.yaml
 
 step_scheduler:
   global_batch_size: 8
@@ -38,7 +33,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /workspace/eevee-4-e2b-it_vv4
+  pretrained_model_name_or_path: /workspace/eevee-4-e4b-it_vv4
   torch_dtype: torch.bfloat16
   use_liger_kernel: false
   use_sdpa_patching: false
@@ -48,13 +43,12 @@ model:
 
 # Without this we get an ImportError: cannot import name 'Gemma4ImageProcessorKwargs' from 'transformers.models.gemma4.image_processing_gemma4' (/opt/venv/lib/python3.12/site-packages/transformers/models/gemma4/image_processing_gemma4.py). 
 # This is a workaround to use the default image processor.
-# can add own collate function. Hf reference on how to preprocess the input for infere
 processor:
   use_fast: false
 
 checkpoint:
   enabled: true
-  checkpoint_dir: vlm_checkpoints/gemma4_2b_it/
+  checkpoint_dir: vlm_checkpoints/gemma4_5b/
   model_save_format: torch_save
   save_consolidated: false
 
@@ -63,7 +57,6 @@ distributed:
   dp_size: none
   tp_size: 1
   cp_size: 1
-
   sequence_parallel: false
 
 loss_fn:
@@ -103,5 +96,5 @@ freeze_config:
 
 wandb:
   project: eevee-4
-  name: eevee4-e2b-it_vv4
-  dir: vlm_checkpoints/gemma4_2b_it/
+  name: eevee4-e4b-it_vv4
+  dir: vlm_checkpoints/gemma4_4b/

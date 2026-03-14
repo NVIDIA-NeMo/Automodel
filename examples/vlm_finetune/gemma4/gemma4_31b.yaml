@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Configuration for fine-tuning Gemma 4 5B with MedPix dataset for image description
-# torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_5b.yaml
+# Configuration for fine-tuning Gemma 4 31B (dense) with MedPix dataset for image description
+# Requires 8 GPUs (FSDP2 with activation checkpointing)
+# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_31b.yaml
 
 step_scheduler:
   global_batch_size: 8
@@ -24,7 +25,7 @@ step_scheduler:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 10
+  timeout_minutes: 60
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
@@ -33,22 +34,22 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /workspace/eevee-4-e4b-it_vv2
+  pretrained_model_name_or_path: /workspace/eevee-4-31b-it_vv1
   torch_dtype: torch.bfloat16
   use_liger_kernel: false
   use_sdpa_patching: false
   attn_implementation: eager
+  # use_cache: true is incompatible with activation checkpointing and will cause an error. Also cache is required only for 
+  # models with kv_shared layers. Gemma4 31B has num_kv_shared_layers=0 unlike gemma4 2B and 4B and using DynamicCache has no effect.
   text_config:
-    use_cache: true
+    use_cache: false
 
-# Without this we get an ImportError: cannot import name 'Gemma4ImageProcessorKwargs' from 'transformers.models.gemma4.image_processing_gemma4' (/opt/venv/lib/python3.12/site-packages/transformers/models/gemma4/image_processing_gemma4.py). 
-# This is a workaround to use the default image processor.
 processor:
   use_fast: false
 
 checkpoint:
   enabled: true
-  checkpoint_dir: vlm_checkpoints/gemma4_5b/
+  checkpoint_dir: vlm_checkpoints/gemma4_31b_it/
   model_save_format: torch_save
   save_consolidated: false
 
@@ -57,7 +58,10 @@ distributed:
   dp_size: none
   tp_size: 1
   cp_size: 1
+
   sequence_parallel: false
+  # Activation checkpointing is required for Gemma4 31B to fit in memory, fsdp alone leads to OOM.
+  activation_checkpointing: true
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -84,7 +88,7 @@ validation_dataloader:
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 1e-5
+  lr: 5e-6
   weight_decay: 0.01
   betas: [0.9, 0.95]
 
@@ -94,7 +98,8 @@ freeze_config:
   freeze_audio_tower: true
   freeze_language_model: false
 
+# Uncomment and set WANDB_API_KEY env var to enable W&B logging
 wandb:
   project: eevee-4
-  name: eevee4-e4b-it_vv2
-  dir: vlm_checkpoints/gemma4_4b/
+  name: eevee4-31b-it_vv1
+  dir: vlm_checkpoints/gemma4_31b_it/
