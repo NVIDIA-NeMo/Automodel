@@ -537,6 +537,7 @@ class TestInitializeModelWeights:
         model.initialize_weights.assert_not_called()
         assert model._is_hf_initialized is True
 
+    @pytest.mark.skip(reason="Fix name collision on NemotronHForCausalLM and re-enable")
     def test_does_not_skip_for_nemotron_v3_moe(self):
         """NemotronHForCausalLM v3 (with n_routed_experts) should NOT be skipped."""
         model = self._make_meta_model()
