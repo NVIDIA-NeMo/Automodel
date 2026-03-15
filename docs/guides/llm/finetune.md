@@ -2,7 +2,7 @@
 
 ## Introduction
 
-Fine-tuning teaches a pretrained language model to follow instructions, answer questions, or perform tasks specific to your data. You start with a general-purpose model, train it on your own examples, and end up with a model you can deploy. This guide walks you through that process end-to-end with NeMo AutoModel — from installation through training, evaluation, and deployment — using [Meta LLaMA 3.2 1B](https://huggingface.co/meta-llama/Llama-3.2-1B) and the [SQuAD v1.1](https://huggingface.co/datasets/rajpurkar/squad) dataset as a running example.
+Pretrained language models are general-purpose: they know a lot about language but nothing about your particular domain, terminology, or task. Fine-tuning bridges that gap — you finetune the model on your own examples so it produces answers that are accurate and relevant for your use case, without the cost of training a model from scratch. The result is a model optimized for your data that you can evaluate, publish, and deploy. This guide walks you through that process end-to-end with NeMo AutoModel — from installation through training, evaluation, and deployment — using [Meta LLaMA 3.2 1B](https://huggingface.co/meta-llama/Llama-3.2-1B) and the [SQuAD v1.1](https://huggingface.co/datasets/rajpurkar/squad) dataset as a running example.
 
 NeMo AutoModel supports two fine-tuning modes:
 
@@ -24,7 +24,7 @@ NeMo AutoModel supports two fine-tuning modes:
 | Step | Section | SFT | PEFT |
 |------|---------|-----|------|
 | **1. Install** | [Install NeMo AutoModel](#install-nemo-automodel) | Same | Same |
-| **2. Configure** | [Define Your Training Recipe](#define-your-training-recipe) | YAML without `peft:` section | YAML with `peft:` section |
+| **2. Configure** | [Configure Your Training Recipe](#configure-your-training-recipe) | YAML without `peft:` section | YAML with `peft:` section |
 | **3. Train** | [Finetune the Model](#finetune-the-model) | Same command for both modes | Same command for both modes |
 | **4. Inference** | [Run Inference](#run-inference) | Load consolidated checkpoint directly | Load base model + adapter |
 | **5. Evaluate** | [Evaluate the Fine-Tuned Model](#evaluate-the-fine-tuned-model) | Validation loss during training; lm-eval-harness post-training | Same |
@@ -40,8 +40,8 @@ pip3 install nemo-automodel
 Alternatively, if you run into dependency or driver issues, use the pre-built Docker container:
 
 ```bash
-docker pull nvcr.io/nvidia/nemo-automodel:25.11.00
-docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:25.11.00
+docker pull nvcr.io/nvidia/nemo-automodel:26.02.00
+docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:26.02.00
 ```
 
 :::{important}
@@ -50,17 +50,51 @@ docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:25.11
 
 For the full set of installation methods, see the [installation guide](../installation.md).
 
-## Define Your Training Recipe
+## Configure Your Training Recipe
 
-Both SFT and PEFT are driven by a **recipe** — a self-contained module that wires together model loading, dataset preparation, training, checkpointing, and logging (see the `TrainFinetuneRecipeForNextTokenPrediction` [source](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py)). Recipes are configured entirely through YAML; the only difference between SFT and PEFT is whether a `peft:` section is present (see [Switching Between SFT and PEFT](#switching-between-sft-and-peft)). For a quick standalone example, see the [finetune.py recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/finetune.py).
 
-### Model and Dataset
+Training is configured through a YAML file with three (required) sections — **model**, **dataset**, **PEFT** (optional), and **training schedule** — that fully describe a fine-tuning run. The sections below walk through each one. For the complete copy-pasteable file, see [Full Recipe YAML](#full-recipe-yaml). Both SFT and PEFT are driven by a **recipe** — a self-contained python module that wires together model loading, dataset preparation, training, checkpointing, and logging (see the `TrainFinetuneRecipeForNextTokenPrediction` [source](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py)).
 
-This guide uses **Meta LLaMA 3.2 1B** (`meta-llama/Llama-3.2-1B`) and the **SQuAD v1.1** dataset (`rajpurkar/squad`) as a running example. Both are placeholders — replace the model with any supported [Hugging Face model ID](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm.md), and swap the dataset by changing the `dataset` / `validation_dataset` sections in the YAML (see [Integrate Your Own Text Dataset](dataset.md) and [Dataset Overview](../dataset-overview.md)).
+
+
+### Model
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+```
+
+This guide uses **Meta LLaMA 3.2 1B** as a running example. Replace `pretrained_model_name_or_path` with any supported [Hugging Face model ID](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm.md).
 
 :::{details} About LLaMA 3.2 1B
 LLaMA is a family of decoder-only transformer models developed by Meta. The 1B variant is a compact model suitable for research and edge deployment, featuring RoPE positional embeddings, grouped-query attention (GQA), and SwiGLU activations.
 :::
+
+:::{details} Accessing gated models
+Some Hugging Face models are **gated**. If the model page shows a "Request access" button:
+
+1. Log in with your Hugging Face account and accept the license.
+2. Ensure the token you pass (via `huggingface-cli login` or `HF_TOKEN`) belongs to the approved account.
+
+Pulling a gated model without an authorized token triggers a 403 error.
+:::
+
+### Dataset
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: validation
+```
+
+This guide uses **SQuAD v1.1** as a running example. Swap the dataset by changing `_target_` and the dataset arguments — see [Integrate Your Own Text Dataset](dataset.md) and [Dataset Overview](../dataset-overview.md).
 
 :::{details} About SQuAD v1.1
 The Stanford Question Answering Dataset (SQuAD) is a reading comprehension dataset where each example consists of a Wikipedia passage, a question, and a span answer. SQuAD v1.1 guarantees all questions are answerable from the context, making it suitable for straightforward fine-tuning.
@@ -75,35 +109,43 @@ Example:
 ```
 :::
 
-### Access Gated Models
-
-Some Hugging Face models are **gated**. If the model page shows a "Request access" button:
-
-1. Log in with your Hugging Face account and accept the license.
-2. Ensure the token you pass (via `huggingface-cli login` or `HF_TOKEN`) belongs to the approved account.
-
-:::{note}
-Pulling a gated model without an authorized token triggers a 403 error.
-:::
-
-Save the following as `finetune_config.yaml`. This config launches a PEFT (LoRA) fine-tuning run. To run SFT instead, remove the `peft:` section — see [Switching Between SFT and PEFT](#switching-between-sft-and-peft).
-
-Each `_target_` field specifies the Python class or function that NeMo AutoModel instantiates for that config section.
+### PEFT (Optional)
 
 ```yaml
-# ── Model ──
-model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
-
-# ── PEFT (remove this section entirely for SFT) ──
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules: "*.proj"  # glob pattern matching linear layer FQNs
   dim: 8                    # low-rank dimension of the adapters
   alpha: 32                 # scaling factor for learned weights
+```
 
-# ── Dataset ──
+Including a `peft:` section enables LoRA fine-tuning. Remove it entirely to run SFT instead — see [Switching Between SFT and PEFT](#switching-between-sft-and-peft).
+
+### Training Schedule
+
+```yaml
+step_scheduler:
+  num_epochs: 1     # Will train over the dataset once.
+```
+
+All other settings (distributed strategy, optimizer, checkpointing, logging) use sensible defaults. See the [Full Configuration Reference](#full-configuration-reference) to customize them.
+
+### Full Recipe YAML
+
+:::{details} finetune_config.yaml (click to expand)
+Save as `finetune_config.yaml`. This config runs PEFT (LoRA). To run SFT instead, remove the `peft:` section.
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: "*.proj"
+  dim: 8
+  alpha: 32
+
 dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
@@ -114,12 +156,10 @@ validation_dataset:
   dataset_name: rajpurkar/squad
   split: validation
 
-# ── Training schedule ──
 step_scheduler:
   num_epochs: 1
 ```
-
-All other settings (distributed strategy, optimizer, checkpointing, logging) use sensible defaults. See the [Full Configuration Reference](#full-configuration-reference) to customize them.
+:::
 
 ## Finetune the Model
 
