@@ -221,6 +221,22 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
             snapshot_download(pretrained_model_name_or_path)
 
 
+def _setup_bnb_loading_kwargs(kwargs: dict) -> None:
+    """Configure kwargs for HF from_pretrained to work with BitsAndBytes quantization.
+
+    Sets ``device_map`` so HF loads+quantizes per-shard on the current GPU, and
+    disables the async weight loader introduced in transformers v5 which can
+    materialize many full-precision tensors concurrently before the quantizer
+    runs, causing OOM on memory-constrained systems.
+    """
+    kwargs.setdefault("device_map", {"": torch.cuda.current_device()})
+    prev = os.environ.get("HF_DEACTIVATE_ASYNC_LOAD")
+    if prev is None:
+        os.environ["HF_DEACTIVATE_ASYNC_LOAD"] = "1"
+        logger.info("Set HF_DEACTIVATE_ASYNC_LOAD=1 for BnB-compatible synchronous weight loading.")
+    logger.info("BnB loading: device_map=%s", kwargs["device_map"])
+
+
 def _init_model(
     cls,
     pretrained_model_name_or_path_or_config,
@@ -246,7 +262,7 @@ def _init_model(
     if force_hf:
         if quantization_config is not None:
             kwargs["quantization_config"] = quantization_config
-            kwargs.setdefault("device_map", {"": torch.cuda.current_device()})
+            _setup_bnb_loading_kwargs(kwargs)
         if is_pretrained_init:
             with skip_random_init():
                 model = cls._from_pretrained_parent_class(
@@ -308,7 +324,7 @@ def _init_model(
     model = None
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
-        kwargs.setdefault("device_map", {"": torch.cuda.current_device()})
+        _setup_bnb_loading_kwargs(kwargs)
     if is_pretrained_init:
         with skip_random_init():
             model = cls._from_pretrained_parent_class(
