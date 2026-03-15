@@ -53,7 +53,7 @@ For the full set of installation methods, see the [installation guide](../instal
 ## Configure Your Training Recipe
 
 
-Training is configured through a YAML file with three (required) sections — **model**, **dataset**, **PEFT** (optional), and **training schedule** — that fully describe a fine-tuning run. The sections below walk through each one. For the complete copy-pasteable file, see [Full Recipe YAML](#full-recipe-yaml). Both SFT and PEFT are driven by a **recipe** — a self-contained python module that wires together model loading, dataset preparation, training, checkpointing, and logging (see the `TrainFinetuneRecipeForNextTokenPrediction` [source](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py)).
+Training is configured through a [YAML](https://en.wikipedia.org/wiki/YAML) file with three (required) sections — **model**, **dataset**, **PEFT** (optional), and **training schedule** — that fully describe a fine-tuning run. The sections below walk through each one. For the complete copy-pasteable file, see [Full Recipe YAML](#full-recipe-yaml). Both SFT and PEFT are driven by a **recipe** — a self-contained python module that wires together model loading, dataset preparation, training, checkpointing, and logging (see the `TrainFinetuneRecipeForNextTokenPrediction` [source](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py)).
 
 
 
