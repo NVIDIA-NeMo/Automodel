@@ -35,6 +35,7 @@ import pytest
 import nemo_automodel.components.distributed.parallelizer as parallelizer
 from nemo_automodel.components.distributed.optimized_tp_plans import (
     LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
+    _get_class_qualname,
     get_decilm_nemotron_tp_plan,
     get_llama_nemotron_super_tp_plan,
 )
@@ -128,7 +129,7 @@ def test_optimised_plan_success(monkeypatch):
     plan = {"opt": "plan"}
 
     # Register dummy entry
-    parallelizer.PARALLELIZE_FUNCTIONS[_DummyModel] = lambda m, sp: plan
+    parallelizer.PARALLELIZE_FUNCTIONS[_get_class_qualname(_DummyModel)] = lambda m, sp: plan
     _set_global_model_cls(monkeypatch, _DummyModel)
 
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False)
@@ -142,7 +143,7 @@ def test_optimised_plan_fallback_to_hf(monkeypatch):
     def _broken_fn(model, seq):  # noqa: D401
         raise RuntimeError("fail")
 
-    parallelizer.PARALLELIZE_FUNCTIONS[_DummyModel] = _broken_fn
+    parallelizer.PARALLELIZE_FUNCTIONS[_get_class_qualname(_DummyModel)] = _broken_fn
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda m: sentinel, raising=True)
     _set_global_model_cls(monkeypatch, _DummyModel)
 
@@ -181,7 +182,7 @@ def test_optimised_plan_and_hf_both_fail_raises_sp_false(monkeypatch):
     def _broken_fn(model, seq):
         raise RuntimeError("fail")
 
-    parallelizer.PARALLELIZE_FUNCTIONS[_DummyModel] = _broken_fn
+    parallelizer.PARALLELIZE_FUNCTIONS[_get_class_qualname(_DummyModel)] = _broken_fn
 
     def _raise_hf(_model):
         raise RuntimeError("hf fail")
@@ -199,7 +200,7 @@ def test_optimised_plan_and_hf_both_fail_assert_sp_true(monkeypatch):
     def _broken_fn(model, seq):
         raise RuntimeError("fail")
 
-    parallelizer.PARALLELIZE_FUNCTIONS[_DummyModel] = _broken_fn
+    parallelizer.PARALLELIZE_FUNCTIONS[_get_class_qualname(_DummyModel)] = _broken_fn
 
     def _raise_hf2(_model):
         raise RuntimeError("hf fail")
@@ -214,7 +215,7 @@ def test_optimised_plan_and_hf_both_fail_assert_sp_true(monkeypatch):
 def test_not_registered_and_hf_fail_base_plan(monkeypatch):
     """No optimised plan and HF raises → base plan (with/without SP)."""
     # Ensure dummy not in mapping
-    parallelizer.PARALLELIZE_FUNCTIONS.pop(_DummyModel, None)
+    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_DummyModel), None)
 
     def _raise_hf3(_model):
         raise RuntimeError("hf fail")
