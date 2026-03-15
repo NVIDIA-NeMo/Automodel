@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -22,6 +22,7 @@ import torch.nn as nn
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.mistral4.model import (
+    _HF_MISTRAL3_AVAILABLE,
     Mistral4Block,
     Mistral4ForCausalLM,
     Mistral4MLA,
@@ -29,7 +30,6 @@ from nemo_automodel.components.models.mistral4.model import (
     ModelClass,
     _build_moe_config,
     _get_llama_4_attn_scale,
-    _HF_MISTRAL3_AVAILABLE,
 )
 from nemo_automodel.components.moe.config import MoEConfig
 
@@ -435,6 +435,7 @@ def multimodal_config():
     """Build a small Mistral3Config wrapping a Mistral4Config-like text config."""
     from transformers import AutoConfig
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
     from nemo_automodel.components.models.mistral4.configuration import Mistral4Config
 
     # Ensure Mistral4Config is registered before Mistral3Config tries to resolve it
@@ -532,8 +533,9 @@ class TestMistral4TextModelBackend:
         assert tm.get_input_embeddings() is new_embed
 
     def test_forward_returns_base_model_output(self, text_config, backend, device):
-        from nemo_automodel.components.models.mistral4.model import Mistral4TextModelBackend
         from transformers.modeling_outputs import BaseModelOutputWithPast
+
+        from nemo_automodel.components.models.mistral4.model import Mistral4TextModelBackend
 
         tm = Mistral4TextModelBackend(text_config, backend).to(device).to(torch.bfloat16)
         input_ids = torch.randint(0, 256, (1, 8), device=device)
@@ -562,6 +564,8 @@ class TestMistral3Model:
     def test_init(self, text_config, backend):
         from nemo_automodel.components.models.mistral4.model import (
             Mistral3Model as OurMistral3Model,
+        )
+        from nemo_automodel.components.models.mistral4.model import (
             Mistral4TextModelBackend,
         )
 
@@ -577,6 +581,8 @@ class TestMistral3Model:
     def test_properties_delegate_to_language_model(self, text_config, backend):
         from nemo_automodel.components.models.mistral4.model import (
             Mistral3Model as OurMistral3Model,
+        )
+        from nemo_automodel.components.models.mistral4.model import (
             Mistral4TextModelBackend,
         )
 
@@ -590,6 +596,8 @@ class TestMistral3Model:
     def test_forward_text_only(self, text_config, backend, device):
         from nemo_automodel.components.models.mistral4.model import (
             Mistral3Model as OurMistral3Model,
+        )
+        from nemo_automodel.components.models.mistral4.model import (
             Mistral4TextModelBackend,
         )
 
@@ -602,6 +610,8 @@ class TestMistral3Model:
     def test_forward_raises_on_both_inputs(self, text_config, backend, device):
         from nemo_automodel.components.models.mistral4.model import (
             Mistral3Model as OurMistral3Model,
+        )
+        from nemo_automodel.components.models.mistral4.model import (
             Mistral4TextModelBackend,
         )
 
@@ -616,6 +626,8 @@ class TestMistral3Model:
         """When embed_tokens is None and input_ids is float, treat as embeds."""
         from nemo_automodel.components.models.mistral4.model import (
             Mistral3Model as OurMistral3Model,
+        )
+        from nemo_automodel.components.models.mistral4.model import (
             Mistral4TextModelBackend,
         )
 
@@ -787,6 +799,8 @@ class TestMistral3ModelVision:
         """Test _get_image_features with a mocked vision tower."""
         from nemo_automodel.components.models.mistral4.model import (
             Mistral3Model as OurMistral3Model,
+        )
+        from nemo_automodel.components.models.mistral4.model import (
             Mistral4TextModelBackend,
         )
 
@@ -807,7 +821,9 @@ class TestMistral3ModelVision:
 
         # Mock projector: output after patch merging has n_vision_tokens
         projector = Mock()
-        projector.return_value = torch.randn(1, n_vision_tokens, text_config.hidden_size, device=device, dtype=torch.bfloat16)
+        projector.return_value = torch.randn(
+            1, n_vision_tokens, text_config.hidden_size, device=device, dtype=torch.bfloat16
+        )
 
         config = Mock(spec=[])
         config.spatial_merge_size = 2
@@ -826,6 +842,8 @@ class TestMistral3ModelVision:
         """Forward with pixel_values merges vision features into text embeddings."""
         from nemo_automodel.components.models.mistral4.model import (
             Mistral3Model as OurMistral3Model,
+        )
+        from nemo_automodel.components.models.mistral4.model import (
             Mistral4TextModelBackend,
         )
 
@@ -848,7 +866,9 @@ class TestMistral3ModelVision:
 
         # Mock projector: output has n_vision_tokens after patch merging
         projector = Mock()
-        projector.return_value = torch.randn(n_vision_tokens, text_config.hidden_size, device=device, dtype=torch.bfloat16)
+        projector.return_value = torch.randn(
+            n_vision_tokens, text_config.hidden_size, device=device, dtype=torch.bfloat16
+        )
 
         config = Mock(spec=[])
         config.spatial_merge_size = 2
@@ -872,6 +892,8 @@ class TestMistral3ModelVision:
         """PP stage with no embed_tokens and integer input_ids raises ValueError."""
         from nemo_automodel.components.models.mistral4.model import (
             Mistral3Model as OurMistral3Model,
+        )
+        from nemo_automodel.components.models.mistral4.model import (
             Mistral4TextModelBackend,
         )
 

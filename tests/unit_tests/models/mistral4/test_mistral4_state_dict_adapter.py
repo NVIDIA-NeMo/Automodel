@@ -28,7 +28,6 @@ from nemo_automodel.components.models.mistral4.state_dict_adapter import (
 )
 from nemo_automodel.components.moe.config import MoEConfig
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -73,7 +72,9 @@ def mm_adapter(moe_config, backend):
     config.text_config = Mock()
     config.text_config.hidden_size = 64
     config.text_config.torch_dtype = "bfloat16"
-    return Mistral4MultimodalStateDictAdapter(config=config, moe_config=moe_config, backend=backend, dtype=torch.bfloat16)
+    return Mistral4MultimodalStateDictAdapter(
+        config=config, moe_config=moe_config, backend=backend, dtype=torch.bfloat16
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +292,9 @@ class TestMistral4StateDictAdapter:
             "language_model.model.layers.0.input_layernorm.weight": torch.randn(64),
             "language_model.model.layers.0.mlp.experts.gate_up_proj": torch.randn(4, 64, 64).to(torch.float8_e4m3fn),
             "language_model.model.layers.0.mlp.experts.gate_up_proj_scale_inv": torch.tensor([0.1, 0.2, 0.3, 0.4]),
-            "language_model.model.layers.0.mlp.experts.gate_up_proj_activation_scale": torch.tensor([1.0, 1.0, 1.0, 1.0]),
+            "language_model.model.layers.0.mlp.experts.gate_up_proj_activation_scale": torch.tensor(
+                [1.0, 1.0, 1.0, 1.0]
+            ),
             "language_model.model.layers.0.mlp.experts.down_proj": torch.randn(4, 64, 32).to(torch.float8_e4m3fn),
             "language_model.model.layers.0.mlp.experts.down_proj_scale_inv": torch.tensor([0.1, 0.2, 0.3, 0.4]),
             "language_model.model.layers.0.mlp.experts.down_proj_activation_scale": torch.tensor([1.0, 1.0, 1.0, 1.0]),
@@ -319,9 +322,7 @@ class TestMistral4StateDictAdapter:
     def test_to_hf_expert_conversion(self, text_adapter):
         """to_hf reverses expert key names and adds prefix."""
         tensor = torch.randn(4, 64, 64)
-        result = text_adapter.convert_single_tensor_to_hf(
-            "model.layers.0.mlp.experts.gate_and_up_projs", tensor
-        )
+        result = text_adapter.convert_single_tensor_to_hf("model.layers.0.mlp.experts.gate_and_up_projs", tensor)
         assert len(result) == 1
         key, val = result[0]
         assert key == "language_model.model.layers.0.mlp.experts.gate_up_proj"
@@ -330,9 +331,7 @@ class TestMistral4StateDictAdapter:
     def test_to_hf_regular_key(self, text_adapter):
         """Regular keys just get prefix added."""
         tensor = torch.randn(64)
-        result = text_adapter.convert_single_tensor_to_hf(
-            "model.layers.0.input_layernorm.weight", tensor
-        )
+        result = text_adapter.convert_single_tensor_to_hf("model.layers.0.input_layernorm.weight", tensor)
         assert len(result) == 1
         assert result[0][0] == "language_model.model.layers.0.input_layernorm.weight"
 
@@ -600,9 +599,7 @@ class TestMistral4StateDictAdapterToHf:
     def test_to_hf_down_projs_conversion(self, text_adapter):
         """to_hf converts down_projs back to down_proj with transpose."""
         tensor = torch.randn(4, 32, 64)
-        result = text_adapter.convert_single_tensor_to_hf(
-            "model.layers.0.mlp.experts.down_projs", tensor
-        )
+        result = text_adapter.convert_single_tensor_to_hf("model.layers.0.mlp.experts.down_projs", tensor)
         assert len(result) == 1
         key, val = result[0]
         assert key == "language_model.model.layers.0.mlp.experts.down_proj"

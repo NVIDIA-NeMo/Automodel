@@ -23,7 +23,7 @@ from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAda
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import dequantize_from_fp8
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local, is_dtensor
+from nemo_automodel.components.moe.state_dict_utils import is_dtensor
 
 logger = logging.getLogger(__name__)
 
@@ -102,13 +102,14 @@ def _dequantize_state_dict(state_dict: dict[str, Any], dtype: torch.dtype) -> di
                 # Determine which slice of experts this rank has
                 if weight_is_dtensor:
                     from torch.distributed._tensor import Shard
+
                     for placement in weight.placements:
                         if isinstance(placement, Shard) and placement.dim == 0:
                             rank_in_ep = weight.device_mesh.get_local_rank()
                             n_total = scale_local.shape[0]
                             chunk_size = n_total // weight.device_mesh.size()
                             start = rank_in_ep * chunk_size
-                            scale_local = scale_local[start:start + n_local]
+                            scale_local = scale_local[start : start + n_local]
                             break
                     else:
                         scale_local = scale_local[:n_local]
@@ -124,6 +125,7 @@ def _dequantize_state_dict(state_dict: dict[str, Any], dtype: torch.dtype) -> di
 
         if weight_is_dtensor:
             from torch.distributed._tensor import DTensor
+
             keys_to_update[key] = DTensor.from_local(dequantized, weight.device_mesh, weight.placements)
         else:
             keys_to_update[key] = dequantized
@@ -221,7 +223,7 @@ class Mistral4StateDictAdapter(StateDictAdapter):
         new_sd = {}
         for key, value in state_dict.items():
             if key.startswith(_HF_PREFIX):
-                new_sd[key[len(_HF_PREFIX):]] = value
+                new_sd[key[len(_HF_PREFIX) :]] = value
             else:
                 new_sd[key] = value
         return new_sd
@@ -332,12 +334,12 @@ class Mistral4MultimodalStateDictAdapter(StateDictAdapter):
         for key, value in state_dict.items():
             if key.startswith("language_model.lm_head."):
                 # language_model.lm_head.weight -> model.language_model.lm_head.weight
-                suffix = key[len("language_model."):]
+                suffix = key[len("language_model.") :]
                 new_key = "model.language_model." + suffix
                 new_sd[new_key] = value
             elif key.startswith("language_model.model."):
                 # language_model.model.layers.0.X -> model.language_model.model.layers.0.X
-                suffix = key[len("language_model.model."):]
+                suffix = key[len("language_model.model.") :]
                 new_key = "model.language_model.model." + suffix
                 new_sd[new_key] = value
             elif key.startswith("vision_tower."):
@@ -355,18 +357,18 @@ class Mistral4MultimodalStateDictAdapter(StateDictAdapter):
     def _remap_keys_to_hf(self, key: str) -> str:
         """Remap a single native key back to checkpoint format."""
         if key.startswith("model.language_model.lm_head."):
-            suffix = key[len("model.language_model."):]
+            suffix = key[len("model.language_model.") :]
             return "language_model." + suffix
         elif key.startswith("model.language_model.model."):
-            suffix = key[len("model.language_model.model."):]
+            suffix = key[len("model.language_model.model.") :]
             return "language_model.model." + suffix
         elif key.startswith("model.language_model."):
-            suffix = key[len("model.language_model."):]
+            suffix = key[len("model.language_model.") :]
             return "language_model." + suffix
         elif key.startswith("model.vision_tower."):
-            return key[len("model."):]
+            return key[len("model.") :]
         elif key.startswith("model.multi_modal_projector."):
-            return key[len("model."):]
+            return key[len("model.") :]
         return key
 
     def from_hf(
