@@ -2,193 +2,169 @@
 
 ## Introduction
 
-As large language models (LLMs) become more powerful, adapting them to
-specific tasks through fine-tuning has become essential for achieving
-high accuracy and relevance. There are two ways to do so: 
-- **Supervised Fine-Tuning (SFT)** applies full-parameter update to the pretrained model. It is useful for tasks that require high precision, although it requires more computational resources.
-- **PEFT**, specifically [Low-Rank Adapters (LoRA)](https://arxiv.org/abs/2106.09685), updates only a small subset of parameters while keeping the base model weights frozen. It is lightweight and reduces the number of trainable parameters, often to less than 1%, while achieving decent accuracy. 
+NeMo AutoModel supports two fine-tuning modes:
 
-NeMo AutoModel simplifies the fine-tuning process by offering seamless
-integration with Hugging Face Transformers. It allows you to fine-tune
-models without converting checkpoints, ensuring full compatibility with
-the Hugging Face ecosystem.
+- **Supervised Fine-Tuning (SFT)** updates all model parameters. Use SFT when you need maximum accuracy and have sufficient compute.
+- **Parameter-Efficient Fine-Tuning (PEFT)** via [LoRA](https://arxiv.org/abs/2106.09685) freezes the base model and trains small low-rank adapters. PEFT reduces trainable parameters to less than 1% of the original model, lowering memory and storage costs.
 
-This guide walks you through the end-to-end process of fine-tuning
-models from the Hugging Face Hub using NeMo AutoModel. You'll learn how
-to prepare datasets, train models, generate text with fine-tuned
-checkpoints, share your models on the Hugging Face Model Hub, and deploy
-them efficiently with vLLM.
+Both modes use the same recipe and config. The only difference is whether a `peft:` section is present in the YAML (see [Switching Between SFT and PEFT](#switching-between-sft-and-peft) below).
 
-In addition to this user guide, you can also explore our Quickstart,
-which features a [standalone python3 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/finetune.py),
-offering hands-on demonstrations for quickly getting started with NeMo AutoModel. 
+NeMo AutoModel integrates directly with Hugging Face Transformers — no checkpoint conversion is required. This guide walks through the end-to-end workflow: config, training, inference, publishing, and deployment with vLLM.
 
-## Run SFT and PEFT with NeMo AutoModel
+For a quick standalone example, see the [finetune.py recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/finetune.py).
+
+### Workflow Overview
+
+```text
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│ 1. Configure │───▶│  2. Train    │───▶│ 3. Evaluate  │───▶│ 4. Inference │───▶│ 5. Publish   │───▶│  6. Deploy   │
+│              │    │              │    │              │    │              │    │  (optional)  │    │  (optional)  │
+│ Write YAML   │    │ automodel CLI│    │ Val loss +   │    │ HF generate  │    │ HF Hub       │    │ vLLM serving │
+│ Choose SFT   │    │ or torchrun  │    │ lm-eval-     │    │ API          │    │ upload       │    │              │
+│ or PEFT      │    │              │    │ harness      │    │              │    │              │    │              │
+└──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
+```
+
+| Step | Section | SFT | PEFT |
+|------|---------|-----|------|
+| **1. Configure** | [Recipe Config](#recipe-config) | YAML without `peft:` section | YAML with `peft:` section |
+| **2. Train** | [Run the Fine-Tune Recipe](#run-the-fine-tune-recipe) | Same command for both modes | Same command for both modes |
+| **3. Evaluate** | [Evaluate the Fine-Tuned Model](#evaluate-the-fine-tuned-model) | Validation loss during training; lm-eval-harness post-training | Same |
+| **4. Inference** | [Run Inference](#run-inference) | Load consolidated checkpoint directly | Load base model + adapter |
+| **5. Publish** | [Publish to HF Hub](#publish-to-the-hugging-face-hub) | Upload `model/consolidated/` | Upload `model/` (adapter only) |
+| **6. Deploy** | [Deploy with vLLM](#deploy-with-vllm) | `vllm.LLM(model=...)` | `vLLMHFExporter` with `--lora-model` |
+
+## Prerequisites
 
 :::{important}
-Before proceeding with this guide, please ensure that you have NeMo AutoModel installed on your
-machine. This can be achieved by running:
+Install NeMo AutoModel before proceeding:
 ```bash
 pip3 install nemo-automodel
 ```
-For a complete guide and additional options please consult the AutoModel [installation guide](../installation.md).
+Alternatively, if you run into dependency or driver issues, use the pre-built Docker container:
+```bash
+docker pull nvcr.io/nvidia/nemo-automodel:25.11.00
+docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:25.11.00
+```
+For the full set of installation methods, see the [installation guide](../installation.md).
 :::
 
-### Model and Dataset Context
-In this guide, we will fine-tune Meta's `LLaMA 3.2 1B` model on the popular [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/) (Stanford Question Answering Dataset).
+### Model and Dataset
 
-#### About LLaMA 3.2 1B
-**LLaMA** is a family of decoder-only transformer models developed by Meta. The **LLaMA 3.2 1B** variant is a compact, lightweight model ideal for research and edge deployment. Despite its size, it maintains architectural features consistent with its larger siblings:
-
-- **Decoder-only architecture**: Follows a GPT-style, autoregressive design—optimized for generation tasks.
-
-- **Rotary positional embeddings (RoPE)**: Efficient and extendable positional encoding technique.
-
-- **Grouped-query attention (GQA)**: Enhances scalability by decoupling key/value heads from query heads.
-
-- **SwiGLU activation**: A variant of the GLU activation, offering improved convergence and expressiveness.
-
-- **Multi-layer residual connections**: Enhances training stability and depth scaling.
+This guide uses **Meta LLaMA 3.2 1B** (`meta-llama/Llama-3.2-1B`) and the **SQuAD v1.1** dataset (`rajpurkar/squad`).
 
 :::{tip}
-In this guide, `meta-llama/Llama-3.2-1B` is used only as a placeholder
-model ID. You can replace it with any valid Hugging Face model ID, such
-as `Qwen/Qwen2.5-1.5B`, or any other checkpoint you have access to on
-the Hugging Face Hub that is supported as per [model coverage](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm.md) list.
+`meta-llama/Llama-3.2-1B` is a placeholder. Replace it with any supported Hugging Face model ID — see the [model coverage](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm.md) list.
 :::
 
-#### Access Gated Models
-
-Some Hugging Face model repositories are **gated**. Request permission before you download their files. If the model page shows a "Request access" or "Agree and access" button:
-
-1.  Log in with your Hugging Face account.
-2.  Click the button and accept the license terms.
-3.  Wait for approval (usually instant; occasionally manual).
-4.  Ensure the token you pass to your script (via `huggingface-cli login` or the `HF_TOKEN` environment variable) belongs to the account that was approved.
-
-:::{note}
-Trying to pull a gated model without an authorized token will trigger a 403 "permission denied" error.
+:::{tip}
+SQuAD v1.1 is a placeholder. To use your own data, change the `dataset` / `validation_dataset` sections in the YAML. See [Integrate Your Own Text Dataset](dataset.md) and [Dataset Overview](../dataset-overview.md).
 :::
 
-#### About SQuAD
-The Stanford Question Answering Dataset (SQuAD) is a **reading comprehension dataset**, consisting of questions posed by crowdworkers on a set of Wikipedia articles, where the answer to every question is a segment of text, or span, from the corresponding reading passage, or the question might be unanswerable.
+:::{details} About LLaMA 3.2 1B
+LLaMA is a family of decoder-only transformer models developed by Meta. The 1B variant is a compact model suitable for research and edge deployment, featuring RoPE positional embeddings, grouped-query attention (GQA), and SwiGLU activations.
+:::
 
-There are two major versions:
+:::{details} About SQuAD v1.1
+The Stanford Question Answering Dataset (SQuAD) is a reading comprehension dataset where each example consists of a Wikipedia passage, a question, and a span answer. SQuAD v1.1 guarantees all questions are answerable from the context, making it suitable for straightforward fine-tuning.
 
-- **SQuAD v1.1**: All answers are guaranteed to be present in the context.
-
-- **SQuAD v2.0**: Introduces unanswerable questions, adding complexity and realism.
-
-In this tutorial, we'll focus on **SQuAD v1.1**, which is more suitable for straightforward supervised fine-tuning without requiring additional handling of null answers.
-
-Here's a glimpse of what the data looks like:
+Example:
 ```json
 {
-
-    "id": "5733be284776f41900661182",
-    "title": "University_of_Notre_Dame",
-    "context": "Architecturally, the school has a Catholic character. Atop the Main Building's gold dome is a golden statue of the Virgin Mary. Immediately in front of the Main Building and facing it, is a copper statue of Christ with arms upraised with the legend Venite Ad Me Omnes. Next to the Main Building is the Basilica of the Sacred Heart. Immediately behind the basilica is the Grotto, a Marian place of prayer and reflection. It is a replica of the grotto at Lourdes, France where the Virgin Mary reputedly appeared to Saint Bernadette Soubirous in 1858. At the end of the main drive (and in a direct line that connects through 3 statues and the Gold Dome), is a simple, modern stone statue of Mary.",
+    "context": "Architecturally, the school has a Catholic character. ...",
     "question": "To whom did the Virgin Mary allegedly appear in 1858 in Lourdes France?",
-    "answers": {
-        "text": [
-            "Saint Bernadette Soubirous"
-        ],
-        "answer_start": [
-            515
-        ]
-    }
+    "answers": { "text": ["Saint Bernadette Soubirous"], "answer_start": [515] }
 }
 ```
-This structure is ideal for training models in context-based question answering, where the model learns to answer questions based on the input context.
-
-:::{tip}
-In this guide, we use the `SQuAD v1.1` dataset, but you can use your own data.
-
-To do so, edit the YAML `dataset` / `validation_dataset` sections (for example `dataset._target_`, `dataset_name`/`path_or_dataset`, and `split`). See [Integrate Your Own Text Dataset](dataset.md) and [Dataset Overview](../dataset-overview.md).
 :::
 
-## Use a Recipe to Fine-Tune the Model
+### Access Gated Models
 
-This example demonstrates how to fine-tune a large language model using NVIDIA's NeMo AutoModel library.
-Specifically, we use the LLM [train-finetune recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py), and in particular, the `TrainFinetuneRecipeForNextTokenPrediction` class to orchestrate the fine-tuning process end-to-end: model loading, dataset preparation, optimizer setup, distributed training, checkpointing, and logging.
+Some Hugging Face models are **gated**. If the model page shows a "Request access" button:
 
-### What is a Recipe?
-
-A recipe in NeMo AutoModel is a **self-contained orchestration module** that wires together all
-components needed to perform a specific task (e.g., fine-tuning for next-token prediction or instruction tuning).
-Think of it as the equivalent of a Trainer class, but highly modular, stateful, and reproducible.
-
-The `TrainFinetuneRecipeForNextTokenPrediction` class is one such recipe. It inherits from `BaseRecipe` and implements:
-
-- `setup()`: builds all training components from the config
-
-- `run_train_validation_loop()`: executes training + validation steps
-
-- Misc: Checkpoint handling, logging, and RNG setup.
+1. Log in with your Hugging Face account and accept the license.
+2. Ensure the token you pass (via `huggingface-cli login` or `HF_TOKEN`) belongs to the approved account.
 
 :::{note}
-The recipe ensures stateless, config-driven orchestration where core components like the model, dataset, and optimizer are configured dynamically using Hydra-style `instantiate()` calls, avoiding hardcoded dependencies.
+Pulling a gated model without an authorized token triggers a 403 error.
 :::
 
-### Recipe Config
+## Recipe Config
+
+NeMo AutoModel uses **recipes** — self-contained orchestration modules that wire together model loading, dataset preparation, training, checkpointing, and logging. The `TrainFinetuneRecipeForNextTokenPrediction` class ([source](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py)) drives the fine-tuning workflow.
+
+Recipes are configured entirely through YAML. The complete config is shown below, followed by a field reference.
+
+### Switching Between SFT and PEFT
+
+The `peft:` section controls which mode runs:
+
+| Mode | What to do in the YAML |
+|------|----------------------|
+| **PEFT (LoRA)** | Include the `peft:` section as shown below. |
+| **SFT (full-parameter)** | Remove the `peft:` section entirely. |
+
+All other config sections remain the same for both modes.
+
+### Full Config
+
 ```yaml
-# The model section is responsible for configuring the model we want to finetune.
-# Since we want to use the Llama 3 1B model, we pass `meta-llama/Llama-3.2-1B` to the
-# `pretrained_model_name_or_path` option.
+# ── Model ──
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
-  is_meta_device: false
+  is_meta_device: false  # set true for models that exceed single-GPU memory (see note below)
 
-# The PEFT configuration
+# ── PEFT (remove this section entirely for SFT) ──
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  target_modules: "*.proj" # will match all linear layers with ".proj" in their FQN
-  dim: 8  # the low-rank dimension of the adapters.
-  alpha: 32  # scales the learned weights
-  use_triton: True  # enabled optimized LoRA kernel written in triton-lang
+  target_modules: "*.proj"  # glob pattern matching linear layer FQNs
+  dim: 8                    # low-rank dimension of the adapters
+  alpha: 32                 # scaling factor for learned weights
+  use_triton: True          # use optimized Triton-based LoRA kernel (requires triton)
 
-
-# As mentioned earlier, we are using the SQuAD dataset. NeMo AutoModel provides the make_squad_dataset
-# function which formats and prepares the dataset (e.g., formatting). We are using the "train" split.
+# ── Dataset ──
 dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: train
 
-# Similarly, for validation we use the "validation" split, and limit the number of samples to 64.
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: validation
   limit_dataset_samples: 64
 
+# ── Training schedule ──
 step_scheduler:
-  grad_acc_steps: 4
-  ckpt_every_steps: 10 # will save a checkpoint every 10 steps
-  val_every_steps: 10  # will run every x number of gradient steps
+  grad_acc_steps: 4         # micro-batches accumulated before each optimizer step
+  ckpt_every_steps: 10      # save checkpoint every N gradient steps
+  val_every_steps: 10       # run validation every N gradient steps
   num_epochs: 1
 
+# ── Distributed ──
 dist_env:
   backend: nccl
   timeout_minutes: 1
 
+distributed:
+  strategy: fsdp2
+  dp_size: null   # auto-detected from world size, tp_size, and cp_size
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+# ── RNG ──
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
   seed: 1111
   ranked: true
 
-# For distributed processing, we will use FSDP2.
-distributed:
-  strategy: fsdp2
-  dp_size: null
-  tp_size: 1
-  cp_size: 1
-  sequence_parallel: false
-
+# ── Loss ──
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
+# ── Dataloaders ──
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
@@ -200,14 +176,14 @@ validation_dataloader:
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
   batch_size: 8
 
+# ── Checkpointing ──
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors
-  save_consolidated: True # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: True  # single HF-compatible bundle (requires safetensors format)
 
-# We will use the standard Adam optimizer, but you can specify any optimizer you want, by changing
-# the import path using the _target_ option.
+# ── Optimizer ──
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
@@ -215,7 +191,7 @@ optimizer:
   lr: 1.0e-5
   weight_decay: 0
 
-# If you want to log your experiment on wandb, uncomment and configure the following section
+# ── Logging (optional) ──
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
@@ -223,105 +199,66 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 ```
 
-:::{tip}
-To avoid using unnecessary storage space and enable faster sharing, the
-adapter checkpoint only contains the adapter weights. As a result, when
-running inference, the adapter and base model weights need to match
-those used for training.
-:::
+### Config Field Reference
 
-## QLoRA: Quantized Low-Rank Adaptation
+| Section | Required? | What to change |
+|---------|-----------|----------------|
+| `model` | Yes | Set `pretrained_model_name_or_path` to your Hugging Face model ID. Set `is_meta_device: true` for models that exceed single-GPU memory. |
+| `peft` | PEFT only | Remove entirely for SFT. Adjust `dim` and `alpha` to tune adapter capacity. `use_triton: True` enables an optimized LoRA kernel (requires the `triton` package). |
+| `dataset` | Yes | Change `_target_`, `dataset_name`, and `split` for your data. |
+| `step_scheduler` | Yes | `grad_acc_steps` sets how many micro-batches accumulate per gradient step. `ckpt_every_steps` and `val_every_steps` are counted in gradient steps. |
+| `distributed` | Yes | `dp_size: null` means auto-detect from world size. Adjust `tp_size` for tensor parallelism across GPUs. |
+| `checkpoint` | Recommended | Set `checkpoint_dir` to a persistent path, especially in Docker. |
+| `optimizer` | Optional | Defaults are reasonable. Any `torch.optim` class can be substituted via `_target_`. |
+| `wandb` | Optional | Uncomment and configure to enable Weights & Biases logging. |
 
-### Introduction to QLoRA
+### Loading Large Models
 
-[QLoRA (Quantized LoRA)](https://arxiv.org/abs/2305.14314) is a PEFT technique that combines the benefits of LoRA with 4-bit quantization.
-
-The key innovation of QLoRA is the use of **4-bit NormalFloat (NF4)** quantization, which is specifically designed for normally distributed weights commonly found in neural networks. This quantization technique, combined with double quantization and paged optimizers, dramatically reduces memory usage without significantly impacting model quality.
-
-### Key Benefits of QLoRA
-
-- **Memory Efficiency**: Reduces memory usage by up to 75% compared to full-precision fine-tuning
-- **Hardware Accessibility**: Enables fine-tuning of large models on consumer-grade GPUs
-- **Performance Preservation**: Maintains model quality comparable to full-precision LoRA
-
-### QLoRA Configuration
-
-To use QLoRA with NeMo AutoModel, you need to configure both the quantization settings and the PEFT parameters. Here's an example:
+When a model's parameters exceed single-GPU memory (e.g., a 70B model requires ~140 GB in BF16), set `is_meta_device: true` in the model config:
 
 ```yaml
-# QLoRA configuration for Llama-3.1-8B on SQuAD dataset
-# Uses 4-bit quantization with LoRA adapters
-
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
-
-# PEFT configuration
-peft:
-  _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: true  # Apply LoRA to all linear layers
-  dim: 16                 # LoRA rank - can be adjusted based on model size
-  alpha: 32               # LoRA alpha scaling factor
-  dropout: 0.1            # LoRA dropout rate
-
-# Quantization configuration 
-quantization:
-  load_in_4bit: True                        # Enable 4-bit quantization
-  load_in_8bit: False                       # Disable 8-bit (use 4-bit instead)
-  bnb_4bit_compute_dtype: bfloat16          # Computation dtype (bfloat16 or float16)
-  bnb_4bit_use_double_quant: True           # Enable double quantization
-  bnb_4bit_quant_type: nf4                  # Quantization type (nf4 or fp4)
-  bnb_4bit_quant_storage: bfloat16          # Storage dtype for quantized weights
+  pretrained_model_name_or_path: meta-llama/Llama-3.1-70B
+  is_meta_device: true
 ```
 
-## Loading Large Models
-The common model loading pipeline when doing distributed training is that each GPU will load the full model onto it and then hold the shard it needs. However, this is an issue when we want to train models that are larger than the memory of a single GPU. For example, a 70B parameter model takes up 140GB for the model parameters assuming BF16 data type (2 bytes per parameter). Most popular GPUs have a limit of 80GB, which means we cannot directly load the full model onto the GPU.
-
-In these scenarios, you can pass `is_meta_device: true` in the model config. The model will then be instantiated using [PyTorch's Meta device](https://docs.pytorch.org/docs/stable/meta.html) which loads no data, but stores all other parameter metadata necessary for sharding the model. Once the model is sharded, the model weights will be populated by only loading the weights required by the respective model shard.
+The model is instantiated on [PyTorch's meta device](https://docs.pytorch.org/docs/stable/meta.html) with no data loaded, preserving parameter metadata for sharding. After the distributed strategy shards the model, each GPU loads only the weights for its own shard.
 
 ## Run the Fine-Tune Recipe
-Assuming the above `yaml` is saved in a file named `sft_guide.yaml` (or `peft_guide.yaml` if you want to do PEFT), you can run the fine-tuning workflow either using the AutoModel CLI or by directly invoking the recipe Python script.
+
+Save the config above as `finetune_config.yaml`. You can run the recipe via the AutoModel CLI or directly with torchrun.
 
 :::{note}
-**Fine-tuning in Docker.** When you run inside the NeMo AutoModel container, checkpoints are lost when the container exits unless you save them on the host. Use a bind-mount for your checkpoint directory (see [Install with NeMo Docker Container](../installation.md#install-with-nemo-docker-container)) and set `checkpoint.checkpoint_dir` to that path. Full details: [Saving Checkpoints When Using Docker](../checkpointing.md#saving-checkpoints-when-using-docker).
+**Fine-tuning in Docker.** Checkpoints are lost when the container exits unless you bind-mount the checkpoint directory to the host. See [Install with NeMo Docker Container](../installation.md#install-with-nemo-docker-container) and [Saving Checkpoints When Using Docker](../checkpointing.md#saving-checkpoints-when-using-docker).
 :::
 
 ### AutoModel CLI
 
-When NeMo AutoModel is installed on your system, it includes the `automodel` CLI program that you
-can use to run jobs, locally or on distributed environments.
+```bash
+automodel finetune llm -c finetune_config.yaml
+```
 
-You can use PEFT recipes via the NeMo Run CLI (See the [NeMo Run 
-documentation](https://github.com/NVIDIA/NeMo-Run) for more details). LoRA are registered as factory classes, so you can specify `peft=<lora/none>`
-directly in the terminal. This provides a quick and easy way to launch
-training jobs when you do not need to override any configuration from
-the default recipes. 
+where `finetune` is the command and `llm` is the model domain.
+
+### torchrun
 
 ```bash
-automodel finetune llm -c sft_guide.yaml
+torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config finetune_config.yaml
 ```
 
-where `finetune` is the CLI command and `llm` is the model domain.
-
-### Invoke the Recipe Script Directly
-
-Alternatively, you can run the recipe [script](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py) directly using [torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html), as shown below.
-
-``` bash
-torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config sft_guide.yaml
-```
+See the recipe [source](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py) and [torchrun docs](https://docs.pytorch.org/docs/stable/elastic/run.html) for details.
 
 ### Sample Output
-Running the recipe using either the `automodel` app or by directly invoking the recipe script should produce
-the following log:
+
 ```text
-$ automodel finetune llm -c sft_guide.yaml
+$ automodel finetune llm -c finetune_config.yaml
 INFO:root:Domain:  llm
 INFO:root:Command: finetune
-INFO:root:Config:  /mnt/4tb/auto/Automodel/sft_guide.yaml
+INFO:root:Config:  /mnt/4tb/auto/Automodel/finetune_config.yaml
 INFO:root:Running job using source from: /mnt/4tb/auto/Automodel
 INFO:root:Launching job locally on 2 devices
-cfg-path: /mnt/4tb/auto/Automodel/sft_guide.yaml
+cfg-path: /mnt/4tb/auto/Automodel/finetune_config.yaml
 INFO:root:step 4 | epoch 0 | loss 1.5514 | grad_norm 102.0000 | mem: 11.66 GiB | tps 6924.50
 INFO:root:step 8 | epoch 0 | loss 0.7913 | grad_norm 46.2500 | mem: 14.58 GiB | tps 9328.79
 Saving checkpoint to checkpoints/epoch_0_step_10
@@ -331,10 +268,14 @@ INFO:root:step 20 | epoch 0 | loss 0.2557 | grad_norm 13.4375 | mem: 12.35 GiB |
 Saving checkpoint to checkpoints/epoch_0_step_20
 INFO:root:[val] step 20 | epoch 0 | loss 0.2469
 ```
-For each training batch, the fine-tuning recipe logs the current loss, along with current peak memory usage and tokens per second (TPS).
 
-In addition, the model checkpoint is saved under the `checkpoints/` directory. 
-For SFT, it will have the following contents:
+Each log line reports the current loss, gradient norm, peak GPU memory, and tokens per second (TPS).
+
+### Checkpoint Contents
+
+Checkpoints are saved under the `checkpoint_dir` path. The contents differ between SFT and PEFT:
+
+**SFT checkpoint:**
 ```bash
 $ tree checkpoints/epoch_0_step_10/
 checkpoints/epoch_0_step_10/
@@ -359,7 +300,8 @@ checkpoints/epoch_0_step_10/
 
 4 directories, 11 files
 ```
-For PEFT, it will have the following contents:
+
+**PEFT checkpoint:**
 ```bash
 $ tree checkpoints/epoch_0_step_10/
 checkpoints/epoch_0_step_10/
@@ -378,55 +320,97 @@ checkpoints/epoch_0_step_10/
 2 directories, 8 files
 ```
 
-## Run Inference with the NeMo AutoModel Fine-Tuned Checkpoint
+:::{tip}
+The PEFT checkpoint contains **only the adapter weights**, not the full model. This keeps checkpoints small and fast to share. At inference time, you must load both the original base model and the adapter (see below).
+:::
 
-Inference on the fine-tuned checkpoint or PEFT adapters is supported through the Hugging Face generate API. To use it, replace the path of the full model with the path to a SFT or PEFT checkpoint, which should include all necessary configuration settings such as model type, adapter type, and base model checkpoint path.
+## Evaluate the Fine-Tuned Model
 
-The following is an example script using Hugging Face's Transformers library:
+### During Training: Validation Loss
+
+The recipe automatically computes validation loss at the interval set by `val_every_steps`. Look for `[val]` lines in the training log:
+
+```text
+INFO:root:[val] step 20 | epoch 0 | loss 0.2469
+```
+
+A decreasing validation loss across checkpoints indicates the model is learning. If validation loss plateaus or increases while training loss continues to drop, the model may be overfitting — consider stopping earlier or reducing the learning rate.
+
+### After Training: lm-eval-harness via vLLM
+
+For task-specific benchmarks (e.g., MMLU, GSM8k, HellaSwag accuracy), use [lm-eval-harness](https://github.com/EleutherAI/lm-evaluation-harness) with the fine-tuned checkpoint served through vLLM:
+
+```bash
+pip install lm-eval
+
+# SFT checkpoint
+lm_eval --model vllm \
+  --model_args pretrained=checkpoints/epoch_0_step_20/model/consolidated/ \
+  --tasks hellaswag \
+  --batch_size auto
+
+# PEFT adapter (merge into base model first, or use vLLM LoRA serving)
+lm_eval --model vllm \
+  --model_args pretrained=meta-llama/Llama-3.2-1B \
+  --tasks hellaswag \
+  --batch_size auto
+```
+
+:::{tip}
+Run lm-eval-harness on the base model *before* fine-tuning to establish a baseline, then compare against the fine-tuned checkpoint.
+:::
+
+## Run Inference
+
+Inference uses the Hugging Face `generate` API. The loading procedure differs between SFT and PEFT.
+
+### SFT Inference
+
+The SFT checkpoint at `model/consolidated/` is a complete Hugging Face model and can be loaded directly:
 
 ```python
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import PeftModel # for PEFT
 
-# For SFT, load finetuned checkpoint
-finetuned_ckpt_path = "checkpoints/epoch_0_step_10/model/consolidated"
-tokenizer = AutoTokenizer.from_pretrained(finetuned_ckpt_path)
-model = AutoModelForCausalLM.from_pretrained(finetuned_ckpt_path)
+ckpt_path = "checkpoints/epoch_0_step_10/model/consolidated"
+tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
+model = AutoModelForCausalLM.from_pretrained(ckpt_path)
 
-# For PEFT, Load base model, tokenizer and PEFT adapter
-base_model_name = "meta-llama/Llama-3.2-1B"
-tokenizer = AutoTokenizer.from_pretrained(base_model_name)
-model = AutoModelForCausalLM.from_pretrained(base_model_name)
-adapter_path = "checkpoints/epoch_0_step_10/model/"
-model = PeftModel.from_pretrained(model, adapter_path)
-
-# Move model to GPU if available
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model.to(device)
 
-# Generate text
-input_text = "Your input prompt here"
-inputs = tokenizer(input_text, return_tensors="pt").to(device)
+inputs = tokenizer("Your input prompt here", return_tensors="pt").to(device)
 output = model.generate(**inputs, max_length=100)
-
-# Decode and print the output
 print(tokenizer.decode(output[0], skip_special_tokens=True))
 ```
 
-## Publish the SFT Checkpoint or PEFT Adapters to the Hugging Face Hub
+### PEFT Inference
 
-After fine-tuning a Hugging Face model using NeMo AutoModel, the
-resulting checkpoints or PEFT adapters are stored in a Hugging Face-native format, making
-it easy to share and deploy. To make these checkpoints and adapters publicly
-accessible, we can upload them to the Hugging Face Model Hub, allowing
-seamless integration with the Hugging Face ecosystem.
+PEFT adapters must be loaded on top of the base model:
 
-Using the Hugging Face Hub API, we can push the fine-tuned checkpoint or PEFT adapter to
-a repository, ensuring that others can easily load and use it with
-Transformers' [AutoModelForCausalLM](https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoModelForCausalLM) for fine-tuned checkpoint, and
-[peft.AutoPeftModel](https://huggingface.co/docs/peft/package_reference/auto_class#peft.AutoPeftModel) for PEFT adapters.
-The following steps outline how to publish the fine-tuned checkpoint or PEFT adapter:
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+
+base_model_name = "meta-llama/Llama-3.2-1B"
+tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+model = AutoModelForCausalLM.from_pretrained(base_model_name)
+
+adapter_path = "checkpoints/epoch_0_step_10/model/"
+model = PeftModel.from_pretrained(model, adapter_path)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device)
+
+inputs = tokenizer("Your input prompt here", return_tensors="pt").to(device)
+output = model.generate(**inputs, max_length=100)
+print(tokenizer.decode(output[0], skip_special_tokens=True))
+```
+
+## Publish to the Hugging Face Hub
+
+Fine-tuned checkpoints and PEFT adapters are stored in Hugging Face-native format and can be uploaded directly to the Hub.
 
 1. Install the Hugging Face Hub library (if not already installed):
 
@@ -434,60 +418,65 @@ The following steps outline how to publish the fine-tuned checkpoint or PEFT ada
 pip3 install huggingface_hub
 ```
 
-2. Log in to Hugging Face using your authentication token:
+2. Log in to Hugging Face:
 
 ```bash
 huggingface-cli login
 ```
 
-3. Upload the fine-tuned checkpoint using the
-    [huggingface_hub](https://github.com/huggingface/huggingface_hub) Python API:
+3. Upload:
 
+**SFT checkpoint:**
 ```python
 from huggingface_hub import HfApi
 
 api = HfApi()
 api.upload_folder(
     folder_path="checkpoints/epoch_0_step_10/model/consolidated",
-    repo_id="your-username/llama3.2_1b-finetuned-name" or "your-username/peft-adapter-name",
-    repo_type="model"
+    repo_id="your-username/llama3.2_1b-finetuned-squad",
+    repo_type="model",
 )
 ```
 
-Once uploaded, the fine-tuned checkpoint can be loaded directly using:
+**PEFT adapter:**
+```python
+from huggingface_hub import HfApi
 
+api = HfApi()
+api.upload_folder(
+    folder_path="checkpoints/epoch_0_step_10/model",
+    repo_id="your-username/llama3.2_1b-lora-squad",
+    repo_type="model",
+)
+```
+
+Once uploaded, load the checkpoint or adapter directly from the Hub:
+
+**SFT:**
 ```python
 from transformers import AutoModelForCausalLM
 
-model = AutoModelForCausalLM.from_pretrained("your-username/llama3.2_1b-finetuned-name")
+model = AutoModelForCausalLM.from_pretrained("your-username/llama3.2_1b-finetuned-squad")
 ```
-Similarly, the PEFT adapter can be loaded directly using: 
+
+**PEFT:**
 ```python
-from peft import PeftModel, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM
+from peft import PeftModel
 
-model = AutoModelForCausalLM.from_pretrained("base-model")
-peft_model = PeftModel.from_pretrained(model, "your-username/peft-adapter-name")
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
+model = PeftModel.from_pretrained(model, "your-username/llama3.2_1b-lora-squad")
 ```
 
-By publishing the fine-tuned checkpoint or PEFT adapter to the Hugging Face Hub, we
-enable easy sharing, reproducibility, and integration with downstream
-applications.
+## Deploy with vLLM
 
-## Export to vLLM
-
-[vLLM](https://github.com/vllm-project/vllm) is an efficient inference
-engine designed to optimize the deployment of large language models
-(LLMs) for production use. By utilizing advanced techniques like
-parallel processing and optimized memory management, vLLM accelerates
-inference while maintaining model accuracy.
-
-The following script demonstrates how to use a fine-tuned checkpoint
-in vLLM, allowing seamless deployment and efficient inference:
+[vLLM](https://github.com/vllm-project/vllm) is an efficient inference engine for production deployment of LLMs.
 
 :::{note}
-Make sure vLLM is installed (`pip install vllm`, or use the environment that includes it).
+Make sure vLLM is installed (`pip install vllm`, or use an environment that includes it).
 :::
 
+### SFT Checkpoint with vLLM
 
 ```python
 from vllm import LLM, SamplingParams
@@ -501,12 +490,12 @@ print(f"Generated text: {outputs[0].outputs[0].text}")
 >>> Generated text:  It is the capital of Ontario. Toronto is a global hub for cultural tourism. The City of Toronto
 ```
 
-Similarly, the following script demonstrates how to export a PEFT adapter for vLLM,
-allowing seamless deployment and efficient inference.
+### PEFT Adapter with vLLM
+
+PEFT adapters are served through the `vLLMHFExporter` from NeMo:
 
 :::{note}
-Make sure vLLM is installed (pip install vllm, or use the environment
-that includes it) before proceeding with vLLMHFExporter.
+`vLLMHFExporter` is provided by the `nemo` package. Ensure both `nemo` and `vllm` are installed.
 :::
 
 ```python
@@ -517,7 +506,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', required=True, type=str, help="Local path of the base model")
-    parser.add_argument('--lora-model', required=True, type=str, help="Local path of the lora model")
+    parser.add_argument('--lora-model', required=True, type=str, help="Local path of the LoRA adapter")
     args = parser.parse_args()
 
     lora_model_name = "lora_model"
@@ -527,4 +516,31 @@ if __name__ == '__main__':
     exporter.add_lora_models(lora_model_name=lora_model_name, lora_model=args.lora_model)
 
     print("vLLM Output: ", exporter.forward(input_texts=["How are you doing?"], lora_model_name=lora_model_name))
+```
+
+## Advanced: QLoRA (Quantized Low-Rank Adaptation)
+
+If GPU memory is a constraint, [QLoRA](https://arxiv.org/abs/2305.14314) combines LoRA with 4-bit NormalFloat (NF4) quantization to reduce memory usage by up to 75% compared to full-precision fine-tuning, while maintaining comparable quality to standard LoRA.
+
+To enable QLoRA, add a `quantization:` section alongside the `peft:` section in your config:
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: true   # apply LoRA to all linear layers
+  dim: 16                  # LoRA rank
+  alpha: 32                # scaling factor
+  dropout: 0.1             # LoRA dropout rate
+
+quantization:
+  load_in_4bit: True                   # enable 4-bit quantization
+  load_in_8bit: False                  # use 4-bit, not 8-bit
+  bnb_4bit_compute_dtype: bfloat16     # compute dtype
+  bnb_4bit_use_double_quant: True      # double quantization for extra savings
+  bnb_4bit_quant_type: nf4             # NormalFloat quantization type
+  bnb_4bit_quant_storage: bfloat16     # storage dtype for quantized weights
 ```
