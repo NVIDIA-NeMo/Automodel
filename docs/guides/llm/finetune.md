@@ -2,37 +2,14 @@
 
 ## Introduction
 
-Fine-tuning teaches a pretrained language model to follow instructions, answer questions, or perform tasks specific to your data. You start with a general-purpose model, train it on your own examples, and end up with a model you can deploy. This guide walks you through that process end-to-end with NeMo AutoModel — from installation through training, evaluation, and deployment.
+Fine-tuning teaches a pretrained language model to follow instructions, answer questions, or perform tasks specific to your data. You start with a general-purpose model, train it on your own examples, and end up with a model you can deploy. This guide walks you through that process end-to-end with NeMo AutoModel — from installation through training, evaluation, and deployment — using [Meta LLaMA 3.2 1B](https://huggingface.co/meta-llama/Llama-3.2-1B) and the [SQuAD v1.1](https://huggingface.co/datasets/rajpurkar/squad) dataset as a running example.
 
 NeMo AutoModel supports two fine-tuning modes:
 
 - **Supervised Fine-Tuning (SFT)** updates all model parameters. Use SFT when you need maximum accuracy and have sufficient compute.
 - **Parameter-Efficient Fine-Tuning (PEFT)** via [LoRA](https://arxiv.org/abs/2106.09685) freezes the base model and trains small low-rank adapters. PEFT reduces trainable parameters to less than 1% of the original model, lowering memory and storage costs.
 
-Both modes are driven by a **recipe** — a self-contained module that wires together model loading, dataset preparation, training, checkpointing, and logging (see the `TrainFinetuneRecipeForNextTokenPrediction` [source](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py)). Recipes are configured entirely through YAML; the only difference between SFT and PEFT is whether a `peft:` section is present (see [Switching Between SFT and PEFT](#switching-between-sft-and-peft)). NeMo AutoModel integrates directly with Hugging Face Transformers, so no checkpoint conversion is required.
-
-For a quick standalone example, see the [finetune.py recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/finetune.py).
-
-### Model and Dataset
-
-This guide uses **Meta LLaMA 3.2 1B** (`meta-llama/Llama-3.2-1B`) and the **SQuAD v1.1** dataset (`rajpurkar/squad`) as a running example. Both are placeholders — replace the model with any supported [Hugging Face model ID](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm.md), and swap the dataset by changing the `dataset` / `validation_dataset` sections in the YAML (see [Integrate Your Own Text Dataset](dataset.md) and [Dataset Overview](../dataset-overview.md)).
-
-:::{details} About LLaMA 3.2 1B
-LLaMA is a family of decoder-only transformer models developed by Meta. The 1B variant is a compact model suitable for research and edge deployment, featuring RoPE positional embeddings, grouped-query attention (GQA), and SwiGLU activations.
-:::
-
-:::{details} About SQuAD v1.1
-The Stanford Question Answering Dataset (SQuAD) is a reading comprehension dataset where each example consists of a Wikipedia passage, a question, and a span answer. SQuAD v1.1 guarantees all questions are answerable from the context, making it suitable for straightforward fine-tuning.
-
-Example:
-```json
-{
-    "context": "Architecturally, the school has a Catholic character. ...",
-    "question": "To whom did the Virgin Mary allegedly appear in 1858 in Lourdes France?",
-    "answers": { "text": ["Saint Bernadette Soubirous"], "answer_start": [515] }
-}
-```
-:::
+NeMo AutoModel integrates directly with Hugging Face Transformers, so no checkpoint conversion is required.
 
 ### Workflow Overview
 
@@ -55,6 +32,27 @@ Example:
 | **5. Evaluate** | [Evaluate the Fine-Tuned Model](#evaluate-the-fine-tuned-model) | Validation loss during training; lm-eval-harness post-training | Same |
 | **6. Publish** | [Publish to HF Hub](#publish-to-the-hugging-face-hub) | Upload `model/consolidated/` | Upload `model/` (adapter only) |
 | **7. Deploy** | [Deploy with vLLM](#deploy-with-vllm) | `vllm.LLM(model=...)` | `vLLMHFExporter` with `--lora-model` |
+
+### Model and Dataset
+
+This guide uses **Meta LLaMA 3.2 1B** (`meta-llama/Llama-3.2-1B`) and the **SQuAD v1.1** dataset (`rajpurkar/squad`) as a running example. Both are placeholders — replace the model with any supported [Hugging Face model ID](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm.md), and swap the dataset by changing the `dataset` / `validation_dataset` sections in the YAML (see [Integrate Your Own Text Dataset](dataset.md) and [Dataset Overview](../dataset-overview.md)).
+
+:::{details} About LLaMA 3.2 1B
+LLaMA is a family of decoder-only transformer models developed by Meta. The 1B variant is a compact model suitable for research and edge deployment, featuring RoPE positional embeddings, grouped-query attention (GQA), and SwiGLU activations.
+:::
+
+:::{details} About SQuAD v1.1
+The Stanford Question Answering Dataset (SQuAD) is a reading comprehension dataset where each example consists of a Wikipedia passage, a question, and a span answer. SQuAD v1.1 guarantees all questions are answerable from the context, making it suitable for straightforward fine-tuning.
+
+Example:
+```json
+{
+    "context": "Architecturally, the school has a Catholic character. ...",
+    "question": "To whom did the Virgin Mary allegedly appear in 1858 in Lourdes France?",
+    "answers": { "text": ["Saint Bernadette Soubirous"], "answer_start": [515] }
+}
+```
+:::
 
 ## Install NeMo AutoModel
 
@@ -87,6 +85,8 @@ Pulling a gated model without an authorized token triggers a 403 error.
 :::
 
 ## Write the Config
+
+Both SFT and PEFT are driven by a **recipe** — a self-contained module that wires together model loading, dataset preparation, training, checkpointing, and logging (see the `TrainFinetuneRecipeForNextTokenPrediction` [source](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py)). Recipes are configured entirely through YAML; the only difference between SFT and PEFT is whether a `peft:` section is present (see [Switching Between SFT and PEFT](#switching-between-sft-and-peft)). For a quick standalone example, see the [finetune.py recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/finetune.py).
 
 Save the following as `finetune_config.yaml`. This config launches a PEFT (LoRA) fine-tuning run. To run SFT instead, remove the `peft:` section — see [Switching Between SFT and PEFT](#switching-between-sft-and-peft).
 
