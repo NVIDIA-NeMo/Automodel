@@ -461,18 +461,41 @@ def _parallelize_phi3(
 # Named TP plan for use with tp_shard_plan="llama_nemotron_super_tp_plan" in parallelizer
 LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME = "llama_nemotron_super_tp_plan"
 
-# Create the model-specific parallel plan mapping
-PARALLELIZE_FUNCTIONS: Dict[type, Callable[..., Dict[str, ParallelStyle]]] = {
-    Qwen2ForCausalLM: _parallelize_qwen,
-    Qwen3ForCausalLM: _parallelize_qwen,
-    Qwen3ForSequenceClassification: _parallelize_qwen_classification,
-    LlamaForCausalLM: _parallelize_llama,
-    Ministral3ForCausalLM: _parallelize_ministral3,
+
+def _get_class_qualname(cls: type) -> str:
+    """Return the fully qualified name of a class as ``module.qualname``.
+
+    Used as a stable dict key for PARALLELIZE_FUNCTIONS instead of the class
+    object itself.
+
+    When NeMo-RL uses automodel, ``force_hf=True`` is auto-set for models
+    (e.g. ``LlamaForCausalLM``) whose adapter does not implement
+    ``convert_single_tensor_to_hf``. This causes ``_get_mixin_wrapped_class``
+    in ``model_init.py`` to create a new class via ``type(...)`` that wraps
+    the original with ``HFCheckpointingMixin``. The wrapper copies
+    ``__module__`` and ``__qualname__`` from the original but is a **different
+    Python object**, so ``type(model) in PARALLELIZE_FUNCTIONS`` (identity
+    check) returns ``False`` and the default plan is used instead of the
+    optimized one.
+
+    String comparison on ``module.qualname`` survives this wrapping and
+    correctly identifies the model class.
+    """
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+# Keyed by qualified class name — see _get_class_qualname for why.
+PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
+    _get_class_qualname(Qwen2ForCausalLM): _parallelize_qwen,
+    _get_class_qualname(Qwen3ForCausalLM): _parallelize_qwen,
+    _get_class_qualname(Qwen3ForSequenceClassification): _parallelize_qwen_classification,
+    _get_class_qualname(LlamaForCausalLM): _parallelize_llama,
+    _get_class_qualname(Ministral3ForCausalLM): _parallelize_ministral3,
     # gemma-3-1b-it uses Gemma3ForCausalLM since it is a text-only model
-    Gemma3ForCausalLM: _parallelize_gemma3,
+    _get_class_qualname(Gemma3ForCausalLM): _parallelize_gemma3,
     # The larger gemma models use Gemma3ForConditionalGeneration, which are for text-image input
-    Gemma3ForConditionalGeneration: _parallelize_gemma3,
-    Phi3ForCausalLM: _parallelize_phi3,
-    CustomLlamaForCausalLM: _parallelize_llama,
-    CustomQwen2ForCausalLM: _parallelize_qwen,
+    _get_class_qualname(Gemma3ForConditionalGeneration): _parallelize_gemma3,
+    _get_class_qualname(Phi3ForCausalLM): _parallelize_phi3,
+    _get_class_qualname(CustomLlamaForCausalLM): _parallelize_llama,
+    _get_class_qualname(CustomQwen2ForCausalLM): _parallelize_qwen,
 }
