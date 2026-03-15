@@ -246,6 +246,7 @@ def _init_model(
     if force_hf:
         if quantization_config is not None:
             kwargs["quantization_config"] = quantization_config
+            kwargs.setdefault("device_map", {"": torch.cuda.current_device()})
         if is_pretrained_init:
             with skip_random_init():
                 model = cls._from_pretrained_parent_class(
@@ -307,6 +308,7 @@ def _init_model(
     model = None
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
+        kwargs.setdefault("device_map", {"": torch.cuda.current_device()})
     if is_pretrained_init:
         with skip_random_init():
             model = cls._from_pretrained_parent_class(
