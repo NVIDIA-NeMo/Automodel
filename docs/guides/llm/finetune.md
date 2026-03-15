@@ -85,7 +85,7 @@ Pulling a gated model without an authorized token triggers a 403 error.
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
+  dataset_name: rajpurkar/squad  # HF-Hub id used to pull the dataset
   split: train
 
 validation_dataset:
