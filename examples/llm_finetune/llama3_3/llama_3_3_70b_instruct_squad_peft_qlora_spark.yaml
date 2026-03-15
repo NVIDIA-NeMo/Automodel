@@ -20,10 +20,10 @@
 
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 4
+  local_batch_size: 1
   ckpt_every_steps: 100
   val_every_steps: 600
-  max_steps: 500
+  max_steps: 500   # adjust this as necessary
 
 dist_env:
   backend: nccl
@@ -36,7 +36,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
+  pretrained_model_name_or_path: meta-llama/Meta-Llama-3-70B
   torch_dtype: bfloat16
 
 peft:
@@ -63,7 +63,7 @@ quantization:
   bnb_4bit_quant_storage: bfloat16
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  _target_: nemo_automodel.components.loss.te_parallel_ce.TEParallelCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
@@ -71,7 +71,7 @@ dataset:
   split: train
 
 packed_sequence:
-  packed_sequence_size: 0
+  packed_sequence_size: 1024
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
