@@ -9,7 +9,7 @@ NeMo AutoModel supports two fine-tuning modes:
 
 Both modes use the same recipe and config. The only difference is whether a `peft:` section is present in the YAML (see [Switching Between SFT and PEFT](#switching-between-sft-and-peft) below).
 
-NeMo AutoModel integrates directly with Hugging Face Transformers — no checkpoint conversion is required. This guide walks through the end-to-end workflow: config, training, inference, publishing, and deployment with vLLM.
+NeMo AutoModel integrates directly with Hugging Face Transformers — no checkpoint conversion is required. This guide walks through the end-to-end workflow: config, training, inference, evaluation, publishing, and deployment with vLLM.
 
 For a quick standalone example, see the [finetune.py recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/finetune.py).
 
@@ -17,11 +17,11 @@ For a quick standalone example, see the [finetune.py recipe](https://github.com/
 
 ```text
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│ 1. Configure │───▶│  2. Train    │───▶│ 3. Evaluate  │───▶│ 4. Inference │───▶│ 5. Publish   │───▶│  6. Deploy   │
+│ 1. Configure │───▶│  2. Train    │───▶│ 3. Inference │───▶│ 4. Evaluate  │───▶│ 5. Publish   │───▶│  6. Deploy   │
 │              │    │              │    │              │    │              │    │  (optional)  │    │  (optional)  │
-│ Write YAML   │    │ automodel CLI│    │ Val loss +   │    │ HF generate  │    │ HF Hub       │    │ vLLM serving │
-│ Choose SFT   │    │ or torchrun  │    │ lm-eval-     │    │ API          │    │ upload       │    │              │
-│ or PEFT      │    │              │    │ harness      │    │              │    │              │    │              │
+│ Write YAML   │    │ automodel CLI│    │ HF generate  │    │ Val loss +   │    │ HF Hub       │    │ vLLM serving │
+│ Choose SFT   │    │ or torchrun  │    │ API          │    │ lm-eval-     │    │ upload       │    │              │
+│ or PEFT      │    │              │    │              │    │ harness      │    │              │    │              │
 └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
 ```
 
@@ -29,8 +29,8 @@ For a quick standalone example, see the [finetune.py recipe](https://github.com/
 |------|---------|-----|------|
 | **1. Configure** | [Recipe Config](#recipe-config) | YAML without `peft:` section | YAML with `peft:` section |
 | **2. Train** | [Run the Fine-Tune Recipe](#run-the-fine-tune-recipe) | Same command for both modes | Same command for both modes |
-| **3. Evaluate** | [Evaluate the Fine-Tuned Model](#evaluate-the-fine-tuned-model) | Validation loss during training; lm-eval-harness post-training | Same |
-| **4. Inference** | [Run Inference](#run-inference) | Load consolidated checkpoint directly | Load base model + adapter |
+| **3. Inference** | [Run Inference](#run-inference) | Load consolidated checkpoint directly | Load base model + adapter |
+| **4. Evaluate** | [Evaluate the Fine-Tuned Model](#evaluate-the-fine-tuned-model) | Validation loss during training; lm-eval-harness post-training | Same |
 | **5. Publish** | [Publish to HF Hub](#publish-to-the-hugging-face-hub) | Upload `model/consolidated/` | Upload `model/` (adapter only) |
 | **6. Deploy** | [Deploy with vLLM](#deploy-with-vllm) | `vllm.LLM(model=...)` | `vLLMHFExporter` with `--lora-model` |
 
@@ -93,7 +93,7 @@ Pulling a gated model without an authorized token triggers a 403 error.
 
 NeMo AutoModel uses **recipes** — self-contained orchestration modules that wire together model loading, dataset preparation, training, checkpointing, and logging. The `TrainFinetuneRecipeForNextTokenPrediction` class ([source](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py)) drives the fine-tuning workflow.
 
-Recipes are configured entirely through YAML. The complete config is shown below, followed by a field reference.
+Recipes are configured entirely through YAML. A minimal quick-start config is shown first, followed by the full config reference.
 
 ### Switching Between SFT and PEFT
 
@@ -106,8 +106,43 @@ The `peft:` section controls which mode runs:
 
 All other config sections remain the same for both modes.
 
-### Full Config
+### Quick-Start Config
 
+The minimal config below is enough to launch a PEFT fine-tuning run. Remove the `peft:` section for SFT.
+
+```yaml
+# ── Model ──
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+
+# ── PEFT (remove this section entirely for SFT) ──
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: "*.proj"  # glob pattern matching linear layer FQNs
+  dim: 8                    # low-rank dimension of the adapters
+  alpha: 32                 # scaling factor for learned weights
+
+# ── Dataset ──
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: validation
+
+# ── Training schedule ──
+step_scheduler:
+  num_epochs: 1
+```
+
+All other settings (distributed strategy, optimizer, checkpointing, logging) use sensible defaults. See the full config below to customize them.
+
+:::{details} Full Config
+:open:
 ```yaml
 # ── Model ──
 model:
@@ -198,13 +233,14 @@ optimizer:
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
 ```
+:::
 
 ### Config Field Reference
 
 | Section | Required? | What to change |
 |---------|-----------|----------------|
 | `model` | Yes | Set `pretrained_model_name_or_path` to your Hugging Face model ID. Set `is_meta_device: true` for models that exceed single-GPU memory. |
-| `peft` | PEFT only | Remove entirely for SFT. Adjust `dim` and `alpha` to tune adapter capacity. `use_triton: True` enables an optimized LoRA kernel (requires the `triton` package). |
+| `peft` | PEFT only | Remove entirely for SFT. Adjust `dim` and `alpha` to tune adapter capacity. `use_triton: True` enables an optimized LoRA kernel (requires the `triton` package). For reduced memory usage, see [QLoRA](#qlora-quantized-low-rank-adaptation) below. |
 | `dataset` | Yes | Change `_target_`, `dataset_name`, and `split` for your data. |
 | `step_scheduler` | Yes | `grad_acc_steps` sets how many micro-batches accumulate per gradient step. `ckpt_every_steps` and `val_every_steps` are counted in gradient steps. |
 | `distributed` | Yes | `dp_size: null` means auto-detect from world size. Adjust `tp_size` for tensor parallelism across GPUs. |
@@ -224,6 +260,33 @@ model:
 ```
 
 The model is instantiated on [PyTorch's meta device](https://docs.pytorch.org/docs/stable/meta.html) with no data loaded, preserving parameter metadata for sharding. After the distributed strategy shards the model, each GPU loads only the weights for its own shard.
+
+### QLoRA (Quantized Low-Rank Adaptation)
+
+If GPU memory is a constraint, [QLoRA](https://arxiv.org/abs/2305.14314) combines LoRA with 4-bit NormalFloat (NF4) quantization to reduce memory usage by up to 75% compared to full-precision fine-tuning, while maintaining comparable quality to standard LoRA.
+
+To enable QLoRA, add a `quantization:` section alongside the `peft:` section in your config:
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: true   # apply LoRA to all linear layers
+  dim: 16                  # LoRA rank
+  alpha: 32                # scaling factor
+  dropout: 0.1             # LoRA dropout rate
+
+quantization:
+  load_in_4bit: True                   # enable 4-bit quantization
+  load_in_8bit: False                  # use 4-bit, not 8-bit
+  bnb_4bit_compute_dtype: bfloat16     # compute dtype
+  bnb_4bit_use_double_quant: True      # double quantization for extra savings
+  bnb_4bit_quant_type: nf4             # NormalFloat quantization type
+  bnb_4bit_quant_storage: bfloat16     # storage dtype for quantized weights
+```
 
 ## Run the Fine-Tune Recipe
 
@@ -271,8 +334,7 @@ INFO:root:[val] step 20 | epoch 0 | loss 0.2469
 
 Each log line reports the current loss, gradient norm, peak GPU memory, and tokens per second (TPS).
 
-### Checkpoint Contents
-
+:::{details} Checkpoint Contents
 Checkpoints are saved under the `checkpoint_dir` path. The contents differ between SFT and PEFT:
 
 **SFT checkpoint:**
@@ -320,44 +382,7 @@ checkpoints/epoch_0_step_10/
 2 directories, 8 files
 ```
 
-:::{tip}
-The PEFT checkpoint contains **only the adapter weights**, not the full model. This keeps checkpoints small and fast to share. At inference time, you must load both the original base model and the adapter (see below).
-:::
-
-## Evaluate the Fine-Tuned Model
-
-### During Training: Validation Loss
-
-The recipe automatically computes validation loss at the interval set by `val_every_steps`. Look for `[val]` lines in the training log:
-
-```text
-INFO:root:[val] step 20 | epoch 0 | loss 0.2469
-```
-
-A decreasing validation loss across checkpoints indicates the model is learning. If validation loss plateaus or increases while training loss continues to drop, the model may be overfitting — consider stopping earlier or reducing the learning rate.
-
-### After Training: lm-eval-harness via vLLM
-
-For task-specific benchmarks (e.g., MMLU, GSM8k, HellaSwag accuracy), use [lm-eval-harness](https://github.com/EleutherAI/lm-evaluation-harness) with the fine-tuned checkpoint served through vLLM:
-
-```bash
-pip install lm-eval
-
-# SFT checkpoint
-lm_eval --model vllm \
-  --model_args pretrained=checkpoints/epoch_0_step_20/model/consolidated/ \
-  --tasks hellaswag \
-  --batch_size auto
-
-# PEFT adapter (merge into base model first, or use vLLM LoRA serving)
-lm_eval --model vllm \
-  --model_args pretrained=meta-llama/Llama-3.2-1B \
-  --tasks hellaswag \
-  --batch_size auto
-```
-
-:::{tip}
-Run lm-eval-harness on the base model *before* fine-tuning to establish a baseline, then compare against the fine-tuned checkpoint.
+The PEFT checkpoint contains **only the adapter weights**, not the full model. This keeps checkpoints small and fast to share. At inference time, you must load both the original base model and the adapter (see [PEFT Inference](#peft-inference)).
 :::
 
 ## Run Inference
@@ -407,6 +432,46 @@ inputs = tokenizer("Your input prompt here", return_tensors="pt").to(device)
 output = model.generate(**inputs, max_length=100)
 print(tokenizer.decode(output[0], skip_special_tokens=True))
 ```
+
+## Evaluate the Fine-Tuned Model
+
+### During Training: Validation Loss
+
+The recipe automatically computes validation loss at the interval set by `val_every_steps`. Look for `[val]` lines in the training log:
+
+```text
+INFO:root:[val] step 20 | epoch 0 | loss 0.2469
+```
+
+A decreasing validation loss across checkpoints indicates the model is learning. If validation loss plateaus or increases while training loss continues to drop, the model may be overfitting — consider stopping earlier or reducing the learning rate.
+
+### After Training: lm-eval-harness
+
+For task-specific benchmarks (e.g., MMLU, GSM8k, HellaSwag accuracy), use [lm-eval-harness](https://github.com/EleutherAI/lm-evaluation-harness) with the fine-tuned checkpoint:
+
+```bash
+pip install lm-eval
+
+# SFT checkpoint (using vLLM backend for faster evaluation)
+lm_eval --model vllm \
+  --model_args pretrained=checkpoints/epoch_0_step_20/model/consolidated/ \
+  --tasks hellaswag \
+  --batch_size auto
+
+# PEFT adapter (using Hugging Face backend with built-in PEFT support)
+lm_eval --model hf \
+  --model_args pretrained=meta-llama/Llama-3.2-1B,peft=checkpoints/epoch_0_step_20/model/ \
+  --tasks hellaswag \
+  --batch_size auto
+```
+
+:::{tip}
+The SFT example uses the `vllm` backend for faster evaluation (requires `pip install vllm`; see [Deploy with vLLM](#deploy-with-vllm) for setup details). The PEFT example uses the `hf` backend with lm-eval's built-in PEFT support to load the adapter on top of the base model.
+:::
+
+:::{tip}
+Run lm-eval-harness on the base model *before* fine-tuning to establish a baseline, then compare against the fine-tuned checkpoint.
+:::
 
 ## Publish to the Hugging Face Hub
 
@@ -516,31 +581,4 @@ if __name__ == '__main__':
     exporter.add_lora_models(lora_model_name=lora_model_name, lora_model=args.lora_model)
 
     print("vLLM Output: ", exporter.forward(input_texts=["How are you doing?"], lora_model_name=lora_model_name))
-```
-
-## Advanced: QLoRA (Quantized Low-Rank Adaptation)
-
-If GPU memory is a constraint, [QLoRA](https://arxiv.org/abs/2305.14314) combines LoRA with 4-bit NormalFloat (NF4) quantization to reduce memory usage by up to 75% compared to full-precision fine-tuning, while maintaining comparable quality to standard LoRA.
-
-To enable QLoRA, add a `quantization:` section alongside the `peft:` section in your config:
-
-```yaml
-model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
-
-peft:
-  _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: true   # apply LoRA to all linear layers
-  dim: 16                  # LoRA rank
-  alpha: 32                # scaling factor
-  dropout: 0.1             # LoRA dropout rate
-
-quantization:
-  load_in_4bit: True                   # enable 4-bit quantization
-  load_in_8bit: False                  # use 4-bit, not 8-bit
-  bnb_4bit_compute_dtype: bfloat16     # compute dtype
-  bnb_4bit_use_double_quant: True      # double quantization for extra savings
-  bnb_4bit_quant_type: nf4             # NormalFloat quantization type
-  bnb_4bit_quant_storage: bfloat16     # storage dtype for quantized weights
 ```
