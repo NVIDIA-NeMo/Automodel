@@ -23,6 +23,7 @@ from nemo_automodel.components.models.mistral4.state_dict_adapter import (
     Mistral4StateDictAdapter,
     _convert_aggregated_experts,
     _dequantize_state_dict,
+    _inject_missing_gate_bias,
     _should_quantize_key,
 )
 from nemo_automodel.components.moe.config import MoEConfig
@@ -209,6 +210,65 @@ class TestConvertAggregatedExperts:
 
 
 # ---------------------------------------------------------------------------
+# _inject_missing_gate_bias
+# ---------------------------------------------------------------------------
+
+
+class TestInjectMissingGateBias:
+    def test_injects_when_missing(self):
+        """Injects zero bias when gate.weight exists but bias does not."""
+        sd = {
+            "model.layers.0.mlp.gate.weight": torch.randn(4, 64),
+            "model.layers.1.mlp.gate.weight": torch.randn(4, 64),
+        }
+        result = _inject_missing_gate_bias(sd, n_routed_experts=4)
+        assert "model.layers.0.mlp.gate.e_score_correction_bias" in result
+        assert "model.layers.1.mlp.gate.e_score_correction_bias" in result
+        assert result["model.layers.0.mlp.gate.e_score_correction_bias"].shape == (4,)
+        torch.testing.assert_close(
+            result["model.layers.0.mlp.gate.e_score_correction_bias"],
+            torch.zeros(4, dtype=torch.float32),
+        )
+
+    def test_no_op_when_bias_exists(self):
+        """Does not overwrite existing bias."""
+        existing_bias = torch.ones(4)
+        sd = {
+            "model.layers.0.mlp.gate.weight": torch.randn(4, 64),
+            "model.layers.0.mlp.gate.e_score_correction_bias": existing_bias,
+        }
+        result = _inject_missing_gate_bias(sd, n_routed_experts=4)
+        assert result["model.layers.0.mlp.gate.e_score_correction_bias"] is existing_bias
+
+    def test_no_op_when_no_gate(self):
+        """Does nothing when there are no gate.weight keys."""
+        sd = {"model.layers.0.input_layernorm.weight": torch.randn(64)}
+        result = _inject_missing_gate_bias(sd, n_routed_experts=4)
+        assert "e_score_correction_bias" not in str(result.keys())
+
+
+# ---------------------------------------------------------------------------
+# _dequantize_state_dict — 3D scale squeeze
+# ---------------------------------------------------------------------------
+
+
+class TestDequantize3DScale:
+    def test_per_expert_scale_3d(self):
+        """scale_inv [n_experts, 1, 1] is squeezed and dequantized correctly."""
+        n_experts = 4
+        weight = torch.randn(n_experts, 8, 8).to(torch.float8_e4m3fn)
+        scale_inv = torch.tensor([0.1, 0.2, 0.3, 0.4]).view(4, 1, 1)  # 3D
+        sd = {
+            "mlp.experts.gate_up_proj": weight,
+            "mlp.experts.gate_up_proj_scale_inv": scale_inv,
+        }
+        result = _dequantize_state_dict(sd, torch.float32)
+        assert "mlp.experts.gate_up_proj" in result
+        assert "mlp.experts.gate_up_proj_scale_inv" not in result
+        assert result["mlp.experts.gate_up_proj"].dtype == torch.float32
+
+
+# ---------------------------------------------------------------------------
 # Mistral4StateDictAdapter (text-only)
 # ---------------------------------------------------------------------------
 
@@ -245,6 +305,16 @@ class TestMistral4StateDictAdapter:
         # Scale keys removed
         assert not any("_scale_inv" in k for k in result)
         assert not any("_activation_scale" in k for k in result)
+
+    def test_from_hf_injects_gate_bias(self, text_adapter):
+        """from_hf injects e_score_correction_bias when missing from checkpoint."""
+        sd = {
+            "language_model.model.layers.0.input_layernorm.weight": torch.randn(64),
+            "language_model.model.layers.0.mlp.gate.weight": torch.randn(4, 64),
+        }
+        result = text_adapter.from_hf(sd)
+        assert "model.layers.0.mlp.gate.e_score_correction_bias" in result
+        assert result["model.layers.0.mlp.gate.e_score_correction_bias"].shape == (4,)
 
     def test_to_hf_expert_conversion(self, text_adapter):
         """to_hf reverses expert key names and adds prefix."""
@@ -305,7 +375,7 @@ class TestMistral4StateDictAdapter:
         assert result[0][1].dtype != torch.float8_e4m3fn
 
     def test_to_hf_quantization_expert_3d(self, text_adapter):
-        """quantization=True for expert keys creates [n_experts] scale."""
+        """quantization=True for expert keys creates [n_experts,1,1] scale_inv and [n_experts] act_scale."""
         tensor = torch.randn(4, 64, 64)
         result = text_adapter.convert_single_tensor_to_hf(
             "model.layers.0.mlp.experts.gate_and_up_projs",
@@ -314,8 +384,21 @@ class TestMistral4StateDictAdapter:
         )
         keys = {k: v for k, v in result}
         scale_key = "language_model.model.layers.0.mlp.experts.gate_up_proj_scale_inv"
+        act_key = "language_model.model.layers.0.mlp.experts.gate_up_proj_activation_scale"
         assert scale_key in keys
-        assert keys[scale_key].shape == (4,)
+        assert keys[scale_key].shape == (4, 1, 1)
+        assert act_key in keys
+        assert keys[act_key].shape == (4,)
+
+    def test_to_hf_quantization_drops_gate_bias(self, text_adapter):
+        """quantization=True drops e_score_correction_bias keys."""
+        tensor = torch.zeros(4)
+        result = text_adapter.convert_single_tensor_to_hf(
+            "model.layers.0.mlp.gate.e_score_correction_bias",
+            tensor,
+            quantization=True,
+        )
+        assert result == []
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +457,17 @@ class TestMistral4MultimodalStateDictAdapter:
         assert "model.language_model.lm_head.weight" in result
         assert "model.vision_tower.patch_conv.weight" in result
 
+    def test_from_hf_injects_gate_bias(self, mm_adapter):
+        """from_hf injects e_score_correction_bias when missing from checkpoint."""
+        sd = {
+            "language_model.model.layers.0.input_layernorm.weight": torch.randn(64),
+            "language_model.model.layers.0.mlp.gate.weight": torch.randn(4, 64),
+        }
+        result = mm_adapter.from_hf(sd)
+        bias_key = "model.language_model.model.layers.0.mlp.gate.e_score_correction_bias"
+        assert bias_key in result
+        assert result[bias_key].shape == (4,)
+
     def test_to_hf_quantization_skips_vision(self, mm_adapter):
         """quantization=True skips vision tower and projector."""
         sd = {
@@ -425,14 +519,25 @@ class TestMistral4MultimodalStateDictAdapter:
         assert hf_sd["language_model.model.layers.0.self_attn.q_a_proj.weight"].dtype == torch.float8_e4m3fn
 
     def test_to_hf_quantization_expert_3d(self, mm_adapter):
-        """quantization=True for expert keys creates [n_experts] scale."""
+        """quantization=True for expert keys creates [n_experts,1,1] scale_inv and [n_experts] act_scale."""
         sd = {
             "model.language_model.model.layers.0.mlp.experts.gate_and_up_projs": torch.randn(4, 64, 64),
         }
         hf_sd = mm_adapter.to_hf(sd, quantization=True)
         scale_key = "language_model.model.layers.0.mlp.experts.gate_up_proj_scale_inv"
+        act_key = "language_model.model.layers.0.mlp.experts.gate_up_proj_activation_scale"
         assert scale_key in hf_sd
-        assert hf_sd[scale_key].shape == (4,)
+        assert hf_sd[scale_key].shape == (4, 1, 1)
+        assert act_key in hf_sd
+        assert hf_sd[act_key].shape == (4,)
+
+    def test_to_hf_quantization_drops_gate_bias(self, mm_adapter):
+        """quantization=True drops e_score_correction_bias keys."""
+        sd = {
+            "model.language_model.model.layers.0.mlp.gate.e_score_correction_bias": torch.zeros(4),
+        }
+        hf_sd = mm_adapter.to_hf(sd, quantization=True)
+        assert len(hf_sd) == 0
 
     def test_to_hf_quantization_non_weight_suffix(self, mm_adapter):
         """quantization with non-.weight key uses key + _activation_scale."""
