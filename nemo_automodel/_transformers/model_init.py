@@ -274,23 +274,33 @@ def _init_model(
     architectures = get_architectures(hf_config)
     # 2. If we have a custom model implementation available, we prioritize that over HF
     if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
-        # if we are able to init the custom model, we will now download the model weights on local rank 0
-        # Skip download for from_config (no pretrained path) or local paths
-        if pretrained_model_name_or_path:
-            _download_model_weights(hf_config, pretrained_model_name_or_path)
-        logger.info(f"Using custom model implementation for {architectures[0]}")
-        kwargs.pop("trust_remote_code", None)
-        model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
-        # Treat config-related kwargs as config overrides (HF behavior) and
-        # avoid forwarding them into model __init__.
-        init_param_names = _get_init_param_names(model_cls)
-        _consume_config_overrides(hf_config, kwargs, init_param_names=init_param_names)
-        kwargs = _filter_kwargs_for_init(model_cls, kwargs)
-        # Override config's torch_dtype with user-requested dtype so model __init__ uses correct dtype
-        if torch_dtype != "auto":
-            hf_config.torch_dtype = torch_dtype
-        with local_torch_dtype(torch_dtype, model_cls.__name__):
-            return True, model_cls(hf_config, *model_args, **kwargs)
+        if quantization_config is not None:
+            # BnB quantization is tightly integrated with HF's from_pretrained weight
+            # loading pipeline.  Custom model constructors only create the architecture
+            # (no weight loading, no quantization), so we must fall through to the HF
+            # path which handles load + quantize atomically.
+            logger.info(
+                "BnB quantization requested; using HuggingFace model loader for %s "
+                "(custom implementations do not support BnB quantization natively).",
+                architectures[0],
+            )
+        else:
+            # Download model weights on local rank 0; skip for from_config or local paths
+            if pretrained_model_name_or_path:
+                _download_model_weights(hf_config, pretrained_model_name_or_path)
+            logger.info(f"Using custom model implementation for {architectures[0]}")
+            kwargs.pop("trust_remote_code", None)
+            model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
+            # Treat config-related kwargs as config overrides (HF behavior) and
+            # avoid forwarding them into model __init__.
+            init_param_names = _get_init_param_names(model_cls)
+            _consume_config_overrides(hf_config, kwargs, init_param_names=init_param_names)
+            kwargs = _filter_kwargs_for_init(model_cls, kwargs)
+            # Override config's torch_dtype with user-requested dtype so model __init__ uses correct dtype
+            if torch_dtype != "auto":
+                hf_config.torch_dtype = torch_dtype
+            with local_torch_dtype(torch_dtype, model_cls.__name__):
+                return True, model_cls(hf_config, *model_args, **kwargs)
 
     # 3. fallback to HF model class wrapped with mixin
 
