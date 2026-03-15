@@ -15,7 +15,7 @@ NeMo AutoModel supports two fine-tuning modes:
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
 │ 1. Install   │───▶│ 2. Configure │───▶│  3. Train    │───▶│ 4. Inference │───▶│ 5. Evaluate  │───▶│ 6. Publish   │───▶│  7. Deploy   │
 │              │    │              │    │              │    │              │    │              │    │  (optional)  │    │  (optional)  │
-│ pip install  │    │ Write YAML   │    │ automodel CLI│    │ HF generate  │    │ Val loss +   │    │ HF Hub       │    │ vLLM serving │
+│ pip install  │    │ YAML recipe  │    │ automodel CLI│    │ HF generate  │    │ Val loss +   │    │ HF Hub       │    │ vLLM serving │
 │ or Docker    │    │ Choose SFT   │    │ or torchrun  │    │ API          │    │ lm-eval-     │    │ upload       │    │              │
 │              │    │ or PEFT      │    │              │    │              │    │ harness      │    │              │    │              │
 └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
@@ -24,12 +24,35 @@ NeMo AutoModel supports two fine-tuning modes:
 | Step | Section | SFT | PEFT |
 |------|---------|-----|------|
 | **1. Install** | [Install NeMo AutoModel](#install-nemo-automodel) | Same | Same |
-| **2. Configure** | [Write the Config](#write-the-config) | YAML without `peft:` section | YAML with `peft:` section |
-| **3. Train** | [Run Training](#run-training) | Same command for both modes | Same command for both modes |
+| **2. Configure** | [Define Your Training Recipe](#define-your-training-recipe) | YAML without `peft:` section | YAML with `peft:` section |
+| **3. Train** | [Finetune the Model](#finetune-the-model) | Same command for both modes | Same command for both modes |
 | **4. Inference** | [Run Inference](#run-inference) | Load consolidated checkpoint directly | Load base model + adapter |
 | **5. Evaluate** | [Evaluate the Fine-Tuned Model](#evaluate-the-fine-tuned-model) | Validation loss during training; lm-eval-harness post-training | Same |
 | **6. Publish** | [Publish to HF Hub](#publish-to-the-hugging-face-hub) | Upload `model/consolidated/` | Upload `model/` (adapter only) |
 | **7. Deploy** | [Deploy with vLLM](#deploy-with-vllm) | `vllm.LLM(model=...)` | `vLLMHFExporter` with `--lora-model` |
+
+## Install NeMo AutoModel
+
+```bash
+pip3 install nemo-automodel
+```
+
+Alternatively, if you run into dependency or driver issues, use the pre-built Docker container:
+
+```bash
+docker pull nvcr.io/nvidia/nemo-automodel:25.11.00
+docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:25.11.00
+```
+
+:::{important}
+**Docker users:** Checkpoints are lost when the container exits unless you bind-mount the checkpoint directory to the host. See [Install with NeMo Docker Container](../installation.md#install-with-nemo-docker-container) and [Saving Checkpoints When Using Docker](../checkpointing.md#saving-checkpoints-when-using-docker).
+:::
+
+For the full set of installation methods, see the [installation guide](../installation.md).
+
+## Define Your Training Recipe
+
+Both SFT and PEFT are driven by a **recipe** — a self-contained module that wires together model loading, dataset preparation, training, checkpointing, and logging (see the `TrainFinetuneRecipeForNextTokenPrediction` [source](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py)). Recipes are configured entirely through YAML; the only difference between SFT and PEFT is whether a `peft:` section is present (see [Switching Between SFT and PEFT](#switching-between-sft-and-peft)). For a quick standalone example, see the [finetune.py recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/finetune.py).
 
 ### Model and Dataset
 
@@ -52,25 +75,6 @@ Example:
 ```
 :::
 
-## Install NeMo AutoModel
-
-```bash
-pip3 install nemo-automodel
-```
-
-Alternatively, if you run into dependency or driver issues, use the pre-built Docker container:
-
-```bash
-docker pull nvcr.io/nvidia/nemo-automodel:25.11.00
-docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:25.11.00
-```
-
-:::{important}
-**Docker users:** Checkpoints are lost when the container exits unless you bind-mount the checkpoint directory to the host. See [Install with NeMo Docker Container](../installation.md#install-with-nemo-docker-container) and [Saving Checkpoints When Using Docker](../checkpointing.md#saving-checkpoints-when-using-docker).
-:::
-
-For the full set of installation methods, see the [installation guide](../installation.md).
-
 ### Access Gated Models
 
 Some Hugging Face models are **gated**. If the model page shows a "Request access" button:
@@ -81,10 +85,6 @@ Some Hugging Face models are **gated**. If the model page shows a "Request acces
 :::{note}
 Pulling a gated model without an authorized token triggers a 403 error.
 :::
-
-## Write the Config
-
-Both SFT and PEFT are driven by a **recipe** — a self-contained module that wires together model loading, dataset preparation, training, checkpointing, and logging (see the `TrainFinetuneRecipeForNextTokenPrediction` [source](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py)). Recipes are configured entirely through YAML; the only difference between SFT and PEFT is whether a `peft:` section is present (see [Switching Between SFT and PEFT](#switching-between-sft-and-peft)). For a quick standalone example, see the [finetune.py recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/finetune.py).
 
 Save the following as `finetune_config.yaml`. This config launches a PEFT (LoRA) fine-tuning run. To run SFT instead, remove the `peft:` section — see [Switching Between SFT and PEFT](#switching-between-sft-and-peft).
 
@@ -121,7 +121,7 @@ step_scheduler:
 
 All other settings (distributed strategy, optimizer, checkpointing, logging) use sensible defaults. See the [Full Configuration Reference](#full-configuration-reference) to customize them.
 
-## Run Training
+## Finetune the Model
 
 You can run the recipe via the AutoModel CLI or directly with torchrun.
 
@@ -433,7 +433,7 @@ if __name__ == '__main__':
 
 ## Full Configuration Reference
 
-This section documents all available config fields for the fine-tuning recipe. For the quick-start config, see [Write the Config](#write-the-config).
+This section documents all available config fields for the fine-tuning recipe. For the quick-start config, see [Define Your Training Recipe](#define-your-training-recipe).
 
 ### Switching Between SFT and PEFT
 
