@@ -124,7 +124,11 @@ def _load_openai_messages(
                     sl = slice(start, end)
 
             load_path = str(p.parent) if is_parquet_file else str(p)
-            dataset = load_dataset(load_path, split=base_split or "train")
+            dataset = load_dataset(
+                load_path,
+                split=base_split or "train",
+                verification_mode=VerificationMode.NO_CHECKS,
+            )
 
             if shuffle_seed is not None:
                 dataset = dataset.shuffle(seed=shuffle_seed)

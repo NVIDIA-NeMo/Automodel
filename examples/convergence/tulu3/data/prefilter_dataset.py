@@ -82,7 +82,7 @@ def parse_args():
         "--strategies",
         nargs="+",
         default=["text_only"],
-        choices=["baseline", "two_pass", "text_only"],
+        choices=["baseline", "text_only"],
         help="Strategies to benchmark",
     )
 
@@ -146,77 +146,6 @@ def filter_baseline(dataset, tokenizer, seq_length, num_proc=None):
     )
 
 
-def filter_two_pass(dataset, tokenizer, seq_length, num_proc=None):
-    """Two-pass: cheap char-length pre-filter to drop obviously-too-long, then exact tokenization.
-
-    Pass 1 — compute raw character length of the messages field (no Jinja
-    rendering, just ``str(row["messages"])``).  Samples whose char length
-    exceeds a conservative upper bound are dropped without tokenization.
-    The minimum chars-per-token for any BPE tokenizer is ~1 (single-byte
-    fallback tokens), so ``char_threshold = seq_length * 1`` would be safe
-    but useless.  We use the *rendered* text length via the cheap
-    ``apply_chat_template(tokenize=False)`` call instead.
-
-    Pass 2 — remaining samples are filtered with exact tokenization via
-    ``apply_chat_template(tokenize=False)`` + ``tokenizer.encode()``,
-    identical to the ``text_only`` strategy.
-
-    The speedup comes from skipping the Jinja render + encode for samples
-    that are obviously too long (char length >> seq_length).
-    """
-    # Conservative upper bound: if the raw rendered text has more than
-    # seq_length * CHAR_DROP_RATIO chars, it cannot possibly fit.
-    # The *minimum* chars/token is ~1 (byte fallback), so any ratio >= 1
-    # is safe for dropping.  We use 1.0 — if the rendered text has more
-    # characters than seq_length, it has at least seq_length tokens.
-    # NOTE: this is safe because len(chars) >= len(tokens) always holds
-    # for any tokenizer (each token encodes >= 1 character/byte).
-    CHAR_DROP_RATIO = 1.0
-
-    np = _auto_num_proc(len(dataset), num_proc)
-
-    # Pass 1: cheap char-length filter on rendered text
-    def _obviously_too_long(row) -> bool:
-        try:
-            text = tokenizer.apply_chat_template(row["messages"], tokenize=False)
-            return len(text) <= int(seq_length * CHAR_DROP_RATIO)
-        except Exception:
-            return False
-
-    # This pass is cheap — apply_chat_template(tokenize=False) is Jinja-only
-    candidates = dataset.filter(
-        _obviously_too_long,
-        num_proc=np,
-        desc="two_pass: char pre-filter",
-    )
-    dropped_early = len(dataset) - len(candidates)
-
-    # Pass 2: exact tokenization on remaining candidates
-    def _fits_exact(row) -> bool:
-        try:
-            text = tokenizer.apply_chat_template(row["messages"], tokenize=False)
-            return len(tokenizer.encode(text, add_special_tokens=False)) <= seq_length
-        except Exception:
-            return False
-
-    result = candidates.filter(
-        _fits_exact,
-        num_proc=np,
-        desc="two_pass: exact tokenization",
-    )
-
-    logger.info(
-        "two_pass: dropped %d early by char length, then tokenized %d → kept %d "
-        "(skipped exact tokenization for %.1f%% of samples)",
-        dropped_early,
-        len(candidates),
-        len(result),
-        100 * dropped_early / max(len(dataset), 1),
-    )
-
-    return result
-
-
 def filter_text_only(dataset, tokenizer, seq_length, num_proc=None):
     """Render text (no tokenize), then use tokenizer.encode() on the rendered string.
 
@@ -239,7 +168,6 @@ def filter_text_only(dataset, tokenizer, seq_length, num_proc=None):
 
 STRATEGIES = {
     "baseline": filter_baseline,
-    "two_pass": filter_two_pass,
     "text_only": filter_text_only,
 }
 

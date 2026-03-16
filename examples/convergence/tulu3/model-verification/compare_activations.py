@@ -220,7 +220,7 @@ def compare_and_report(
         logit_max_diff = (hf_logits - nemo_logits).abs().max().item()
         top1_agree = hf_logits.argmax().item() == nemo_logits.argmax().item()
 
-        prompt_pass = mean_sim >= threshold and logit_cos >= threshold
+        prompt_pass = worst_sim >= threshold and logit_cos >= threshold
         if not prompt_pass:
             all_pass = False
 
