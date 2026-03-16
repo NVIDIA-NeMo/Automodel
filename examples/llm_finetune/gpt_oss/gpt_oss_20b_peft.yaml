@@ -30,7 +30,18 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: openai/gpt-oss-120b
+  pretrained_model_name_or_path: openai/gpt-oss-20b
+  # Customize this backend for fine grained control
+  # backend:
+  #   _target_: nemo_automodel.components.models.common.BackendConfig
+  #   attn: te
+  #   linear: te
+  #   rms_norm: te
+  #   experts: te
+  #   dispatcher: deepep
+  #   fake_balanced_gate: false
+  #   enable_hf_state_dict_adapter: true
+  #   enable_fsdp_optimizations: true
 
 checkpoint:
   enabled: true
@@ -43,7 +54,7 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 32
+  ep_size: 8
 
   sequence_parallel: false
 
@@ -55,6 +66,15 @@ distributed:
     patch_inner_model: false
     patch_causal_lm_model: false
 
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: '*_proj'
+  dim: 8
+  alpha: 32
+  use_triton: True
+  # dtype needs a fix to resolve to type instead of string
+  # lora_dtype: torch.bfloat16
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
