@@ -499,15 +499,23 @@ class Checkpointer:
         #   init.zeros_(module.weight[module.padding_idx]) on the embedding layer, which
         #   triggers DTensor redistribute and fails with sharded (TP) embeddings.
         # - NemotronHForCausalLM: the HF remote code's _init_weights uses dt_bias.copy_()
-        #   which fails with DTensors. Note: v3 (MoE) has n_routed_experts and uses our custom
-        #   implementation which handles this correctly.
+        #   which fails with DTensors. This applies to:
+        #   - v2 (non-MoE, no n_routed_experts): always uses HF remote code.
+        #   - v3 (MoE, has n_routed_experts) with force_hf=True: also uses HF remote code
+        #     (detected via model.backbone attribute). When force_hf=False, v3 uses our custom
+        #     implementation (model.model with ModuleDict layers) which handles this correctly.
         try:
             model_class = model.config.architectures[0]
         except Exception:
             model_class = ""
         is_nemotron_v2 = model_class == "NemotronHForCausalLM" and not getattr(model.config, "n_routed_experts", None)
+        is_nemotron_v3_hf = (
+            model_class == "NemotronHForCausalLM"
+            and getattr(model.config, "n_routed_experts", None)  # is Nemotron V3
+            and hasattr(model, "backbone")                       # is HF remote code
+        )
         skip_initialize_weights = (
-            model_class in ["Gemma3ForConditionalGeneration", "Gemma3ForCausalLM"] or is_nemotron_v2
+            model_class in ["Gemma3ForConditionalGeneration", "Gemma3ForCausalLM"] or is_nemotron_v2 or is_nemotron_v3_hf
         )
         if not skip_initialize_weights:
             for _, module in model.named_modules():
