@@ -38,6 +38,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     import_class_from_path,
     megatron_fsdp_strategy_parallelize,
 )
+from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
 
 
 class MockModel(nn.Module):
@@ -904,45 +905,85 @@ class TestUnshardFsdp2Model:
 
 
 class TestGetParallelPlanClassNameFallback:
-    """Test that _get_parallel_plan matches by class name when identity check fails."""
+    """Test that _get_parallel_plan matches by qualified class name (module.qualname)."""
 
     def test_identity_match(self):
-        """Exact class object in PARALLELIZE_FUNCTIONS is found."""
+        """Exact class qualname in PARALLELIZE_FUNCTIONS is found."""
         sentinel_plan = {"layer": ColwiseParallel()}
         model = MockModel()
 
         with patch(
             "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
-            {type(model): lambda m, sp: sentinel_plan},
+            {_get_class_qualname(type(model)): lambda m, sp: sentinel_plan},
         ):
             plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
         assert plan is sentinel_plan
 
     def test_class_name_fallback(self):
-        """A different class object with the same __name__ still matches."""
+        """A different class object with the same module.qualname still matches.
+
+        With the old class-object-keyed dict, identity was required. With the new
+        string-keyed dict, two distinct class objects that share ``__module__`` and
+        ``__qualname__`` resolve to the same key and both match — which is exactly
+        the NeMo-RL wrapping scenario this fix targets.
+        """
         sentinel_plan = {"layer": ColwiseParallel()}
 
-        # Create a *different* class with the same name as MockModel
+        # Create a *different* class object with the same name (and therefore the same
+        # module.qualname since both are defined in this test module).
         DuplicateMockModel = type("MockModel", (nn.Module,), {"forward": lambda self, x: x})
+        assert DuplicateMockModel is not MockModel
+        assert _get_class_qualname(DuplicateMockModel) == _get_class_qualname(MockModel)
 
         model = MockModel()
         model.__class__ = DuplicateMockModel  # model's type is the duplicate
 
         with patch(
             "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
-            {MockModel: lambda m, sp: sentinel_plan},  # keyed by the original
+            {_get_class_qualname(MockModel): lambda m, sp: sentinel_plan},
+        ):
+            plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
+        # Matches because module.qualname is the same, even though the class object differs
+        assert plan is sentinel_plan
+
+    def test_nemo_rl_wrapped_class_match(self):
+        """A different class object with the same module and qualname still matches.
+
+        This simulates the NeMo-RL scenario: _get_mixin_wrapped_class() creates a new
+        class via type(...) that preserves __module__ and __qualname__ from the original.
+        Both the original and the wrapper resolve to the same _get_class_qualname() key.
+        """
+        sentinel_plan = {"layer": ColwiseParallel()}
+        original_cls = type(MockModel())
+
+        # Simulate _get_mixin_wrapped_class: create a *new* class object that copies
+        # __module__ and __qualname__ from the original (same qualname, different object)
+        WrappedCls = type(original_cls.__name__, (nn.Module,), {
+            "forward": lambda self, x: x,
+            "__module__": original_cls.__module__,
+            "__qualname__": original_cls.__qualname__,
+        })
+        assert WrappedCls is not original_cls
+        assert _get_class_qualname(WrappedCls) == _get_class_qualname(original_cls)
+
+        model = MockModel()
+        model.__class__ = WrappedCls  # model's type is the wrapper
+
+        with patch(
+            "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
+            {_get_class_qualname(original_cls): lambda m, sp: sentinel_plan},
         ):
             plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
         assert plan is sentinel_plan
 
     def test_no_match_falls_through_to_default(self):
-        """Completely unknown class name falls through to the default plan."""
+        """Completely unknown class qualname falls through to the default plan."""
         model = MockModel()
         model.__class__ = type("UnknownModel", (nn.Module,), {"forward": lambda self, x: x})
 
         with patch(
             "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
-            {MockModel: lambda m, sp: {"x": ColwiseParallel()}},
+            {_get_class_qualname(MockModel): lambda m, sp: {"x": ColwiseParallel()}},
         ):
             plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
         # Should get the default Llama3-style plan (has q_proj, k_proj, etc.)
