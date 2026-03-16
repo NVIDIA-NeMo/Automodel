@@ -150,8 +150,13 @@ class ModelSupports:
 
     @property
     def supports_pp(self) -> bool:
-        """Model declares a ``_pp_plan`` for pipeline parallelism."""
-        return getattr(self._model, "_pp_plan", None) is not None
+        """Model supports pipeline parallelism.
+
+        True when the model either declares a ``_pp_plan`` or inherits from
+        ``MoEFSDPSyncMixin`` (MoE models handle PP via
+        ``patched_backward_maybe_with_nosync``).
+        """
+        return getattr(self._model, "_pp_plan", None) is not None or _is_moe(self._model_cls)
 
     # alias
 
@@ -239,27 +244,6 @@ class ModelSupports:
             return self.supports_sequence_packing
         return self.supports_sequence_packing and _uses_te_attention(self._model)
 
-    # @akoumparouli: quantisation support + peft
-    # @property
-    # def supports_fp8(self) -> bool:
-    #     """FP8 training is available (torchao works with any model)."""
-    #     return True
-
-    # @property
-    # def supports_nvfp4(self) -> bool:
-    #     """NVFP4 quantisation path (not yet implemented)."""
-    #     return False
-
-    # @property
-    # def supports_qlora(self) -> bool:
-    #     """Quantised LoRA via BitsAndBytes."""
-    #     return True
-
-    # @property
-    # def supports_peft(self) -> bool:
-    #     """Parameter-efficient fine-tuning (LoRA) support."""
-    #     return True
-
 
 def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
     """Validate *mesh* parallelism sizes against this model's capabilities.
@@ -269,6 +253,9 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
 
     Raises :class:`ValueError` with one bullet per violation.
     """
+    if mesh is None:
+        return
+
     tp_size = getattr(mesh, "tp_size", 1)
     pp_size = getattr(mesh, "pp_size", 1)
     ep_size = getattr(mesh, "ep_size", 1)
@@ -325,10 +312,6 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
                 f"distributed:\n"
                 f"  cp_size: 1"
             )
-    if cp_size > 1 and not model.supports_cp_with_sequence_packing:
-        logger.warning(
-            f"Context parallelism (cp_size={cp_size}) + sequence packing is not supported with {arch} model."
-        )
 
     if ep_size > 1 and not model.supports_ep:
         errors.append(
