@@ -89,6 +89,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.mistral3.model", "Ministral3ForCausalLM"),
         ),
         (
+            "Mistral4ForCausalLM",
+            ("nemo_automodel.components.models.mistral4.model", "Mistral4ForCausalLM"),
+        ),
+        (
+            "Mistral3ForConditionalGeneration",
+            ("nemo_automodel.components.models.mistral4.model", "Mistral3ForConditionalGeneration"),
+        ),
+        (
             "NemotronHForCausalLM",
             ("nemo_automodel.components.models.nemotron_v3.model", "NemotronHForCausalLM"),
         ),
@@ -136,6 +144,7 @@ MODEL_ARCH_MAPPING = OrderedDict(
 # AutoConfig.from_pretrained can resolve them without trust_remote_code.
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
+    "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
 }
 
 
