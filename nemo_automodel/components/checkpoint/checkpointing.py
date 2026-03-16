@@ -494,21 +494,27 @@ class Checkpointer:
         # But because we initialize on meta device, these are erroneously set to True.
         # We need to set them to False and call initialize_weights to re-initialize the weights.
 
-        # Some models cannot call initialize_weights when sharded with DTensors:
-        # - Gemma3ForConditionalGeneration / Gemma3ForCausalLM: _init_weights() calls
-        #   init.zeros_(module.weight[module.padding_idx]) on the embedding layer, which
-        #   triggers DTensor redistribute and fails with sharded (TP) embeddings.
-        # - NemotronHForCausalLM: the HF remote code's _init_weights uses dt_bias.copy_()
-        #   which fails with DTensors. Note: v3 (MoE) has n_routed_experts and uses our custom
-        #   implementation which handles this correctly.
+        # Skip initialize_weights for models whose _init_weights does tensor ops
+        # (copy_, indexing, etc.) that fail on DTensor-sharded parameters.
+        # Safe to skip because weights are loaded from checkpoint immediately after.
+        #
+        # - Gemma3: _init_weights() calls init.zeros_(module.weight[module.padding_idx])
+        #   on the embedding layer, which triggers DTensor redistribute and fails with
+        #   sharded (TP) embeddings.
+        # - NemotronH: the HF remote code's _init_weights uses dt_bias.copy_(inv_dt)
+        #   which fails with mixed Tensor/DTensor. NemotronH v3 (MoE, has n_routed_experts)
+        #   normally uses our custom Automodel implementation which handles this correctly,
+        #   but when force_hf=true is set it falls back to the HF code path and hits the
+        #   same issue, so we skip for all NemotronH variants unconditionally.
         try:
             model_class = model.config.architectures[0]
         except Exception:
             model_class = ""
-        is_nemotron_v2 = model_class == "NemotronHForCausalLM" and not getattr(model.config, "n_routed_experts", None)
-        skip_initialize_weights = (
-            model_class in ["Gemma3ForConditionalGeneration", "Gemma3ForCausalLM"] or is_nemotron_v2
-        )
+        skip_initialize_weights = model_class in [
+            "Gemma3ForConditionalGeneration",
+            "Gemma3ForCausalLM",
+            "NemotronHForCausalLM",
+        ]
         if not skip_initialize_weights:
             for _, module in model.named_modules():
                 if hasattr(module, "_is_hf_initialized"):
