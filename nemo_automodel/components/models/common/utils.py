@@ -240,7 +240,7 @@ class Float32RMSNorm(nn.Module):
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)
 
-    @torch.compile(fullgraph=True)
+    @torch.compile(fullgraph=True, dynamic=True)
     def forward(self, x):
         input_dtype = x.dtype
         x = x.float()
