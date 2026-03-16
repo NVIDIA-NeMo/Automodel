@@ -14,7 +14,7 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/nemotron/llama3_3_nemotron_super_49B_squad_peft.yaml
+# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/llama3_3_nemotron_super_49B_squad_tp2_peft.yaml
 
 
 step_scheduler:
@@ -48,7 +48,7 @@ compile:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  target_modules: '*_proj'
   dim: 8
   alpha: 32
   use_triton: True
@@ -56,7 +56,7 @@ peft:
 distributed:
   strategy: fsdp2
   dp_size: none
-  tp_size: 1
+  tp_size: 2
   cp_size: 1
 
   sequence_parallel: false
