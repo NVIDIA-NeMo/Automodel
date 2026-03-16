@@ -323,5 +323,10 @@ def test_null_decorator_as_factory():
     assert _identity(11) == 11
 
 
+@pytest.mark.skipif(
+    not si.safe_import("bitsandbytes")[0],
+    reason="bitsandbytes not installed",
+)
 def test_bitsandbytes_importable():
     """bitsandbytes must be importable in the current environment."""
+    import bitsandbytes  # noqa: F401

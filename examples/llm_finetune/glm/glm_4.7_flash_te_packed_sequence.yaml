@@ -45,7 +45,7 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
-    rms_norm: te
+    rms_norm: torch_fp32
     experts: gmm
     dispatcher: deepep
     fake_balanced_gate: false

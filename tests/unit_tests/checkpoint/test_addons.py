@@ -20,6 +20,7 @@ from torch import nn
 from nemo_automodel.components.checkpoint.addons import (
     _extract_target_modules,
     _maybe_save_custom_model_code,
+    _maybe_strip_quantization_config,
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 
@@ -232,3 +233,41 @@ class TestExtractTargetModules:
         assert all("lm_q" not in m for m in result)
 
 
+class TestMaybeStripQuantizationConfig:
+    """Tests for _maybe_strip_quantization_config."""
+
+    @staticmethod
+    def _make_config_with_quant():
+        cfg = type("Config", (), {})()
+        cfg.quantization_config = {"quant_method": "mxfp4"}
+        return cfg
+
+    def test_strips_quantization_config_when_all_params_bf16(self):
+        """quantization_config is removed when all params are standard floating-point."""
+        model = nn.Linear(4, 4, dtype=torch.bfloat16)
+        model.config = self._make_config_with_quant()
+
+        _maybe_strip_quantization_config(model)
+        assert not hasattr(model.config, "quantization_config")
+
+    def test_keeps_quantization_config_when_uint8_params_exist(self):
+        """quantization_config is preserved when quantized (uint8) parameters exist."""
+        model = nn.Module()
+        model.register_parameter("weight", nn.Parameter(torch.ones(4, 4, dtype=torch.uint8), requires_grad=False))
+        model.config = self._make_config_with_quant()
+
+        _maybe_strip_quantization_config(model)
+        assert hasattr(model.config, "quantization_config")
+
+    def test_noop_when_no_quantization_config(self):
+        """No error when config has no quantization_config attribute."""
+        model = nn.Linear(4, 4)
+        model.config = type("Config", (), {})()
+
+        _maybe_strip_quantization_config(model)
+        assert not hasattr(model.config, "quantization_config")
+
+    def test_noop_when_no_config(self):
+        """No error when model has no config attribute."""
+        model = nn.Linear(4, 4)
+        _maybe_strip_quantization_config(model)

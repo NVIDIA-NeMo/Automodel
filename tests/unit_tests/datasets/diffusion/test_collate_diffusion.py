@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for collate_fns.py: collate_fn_flux, build_flux_multiresolution_dataloader."""
+"""Unit tests for collate_fns.py: collate_fn_text_to_image and build_text_to_image_multiresolution_dataloader."""
 
 import json
 import tempfile
@@ -23,10 +23,9 @@ import pytest
 import torch
 
 from nemo_automodel.components.datasets.diffusion.collate_fns import (
-    build_flux_multiresolution_dataloader,
-    collate_fn_flux,
+    build_text_to_image_multiresolution_dataloader,
+    collate_fn_text_to_image,
 )
-
 
 # =============================================================================
 # Helpers
@@ -58,12 +57,12 @@ def _make_production_batch(
 
 
 # =============================================================================
-# TestCollateFnFlux
+# TestCollateFnTextToImage
 # =============================================================================
 
 
-class TestCollateFnFlux:
-    """Tests for collate_fn_flux."""
+class TestCollateFnTextToImage:
+    """Tests for collate_fn_text_to_image."""
 
     def test_pre_encoded_embeddings(self):
         prod_batch = _make_production_batch(has_prompt_embeds=True)
@@ -71,7 +70,7 @@ class TestCollateFnFlux:
             "nemo_automodel.components.datasets.diffusion.collate_fns.collate_fn_production",
             return_value=prod_batch,
         ):
-            result = collate_fn_flux([{}, {}])  # Dummy batch items
+            result = collate_fn_text_to_image([{}, {}])  # Dummy batch items
 
         assert "image_latents" in result
         assert "text_embeddings" in result
@@ -85,7 +84,7 @@ class TestCollateFnFlux:
             "nemo_automodel.components.datasets.diffusion.collate_fns.collate_fn_production",
             return_value=prod_batch,
         ):
-            result = collate_fn_flux([{}, {}])
+            result = collate_fn_text_to_image([{}, {}])
 
         assert "clip_hidden" in result
 
@@ -95,7 +94,7 @@ class TestCollateFnFlux:
             "nemo_automodel.components.datasets.diffusion.collate_fns.collate_fn_production",
             return_value=prod_batch,
         ):
-            result = collate_fn_flux([{}, {}])
+            result = collate_fn_text_to_image([{}, {}])
 
         assert "clip_hidden" not in result
 
@@ -108,7 +107,7 @@ class TestCollateFnFlux:
             return_value=prod_batch,
         ):
             with pytest.raises(NotImplementedError, match="On-the-fly text encoding"):
-                collate_fn_flux([{}, {}])
+                collate_fn_text_to_image([{}, {}])
 
     def test_metadata_fields(self):
         prod_batch = _make_production_batch(has_prompt_embeds=True)
@@ -116,7 +115,7 @@ class TestCollateFnFlux:
             "nemo_automodel.components.datasets.diffusion.collate_fns.collate_fn_production",
             return_value=prod_batch,
         ):
-            result = collate_fn_flux([{}, {}])
+            result = collate_fn_text_to_image([{}, {}])
 
         meta = result["metadata"]
         assert "prompts" in meta
@@ -129,7 +128,7 @@ class TestCollateFnFlux:
 
 
 # =============================================================================
-# TestBuildFluxMultiresolutionDataloader
+# TestBuildTextToImageMultiresolutionDataloader
 # =============================================================================
 
 
@@ -177,8 +176,8 @@ class MockCacheBuilder:
         return metadata
 
 
-class TestBuildFluxMultiresolutionDataloader:
-    """Tests for build_flux_multiresolution_dataloader."""
+class TestBuildTextToImageMultiresolutionDataloader:
+    """Tests for build_text_to_image_multiresolution_dataloader."""
 
     def test_returns_dataloader_and_sampler(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -186,7 +185,7 @@ class TestBuildFluxMultiresolutionDataloader:
             builder = MockCacheBuilder(cache_dir, num_samples=10)
             builder.build_cache()
 
-            dl, sampler = build_flux_multiresolution_dataloader(
+            dl, sampler = build_text_to_image_multiresolution_dataloader(
                 cache_dir=str(cache_dir),
                 batch_size=2,
                 dp_rank=0,
@@ -205,7 +204,7 @@ class TestBuildFluxMultiresolutionDataloader:
             builder = MockCacheBuilder(cache_dir, num_samples=10)
             builder.build_cache()
 
-            dl, _ = build_flux_multiresolution_dataloader(
+            dl, _ = build_text_to_image_multiresolution_dataloader(
                 cache_dir=str(cache_dir),
                 batch_size=2,
                 dp_rank=0,

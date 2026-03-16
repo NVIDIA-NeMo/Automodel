@@ -20,22 +20,22 @@ import os
 import shutil
 from pathlib import Path
 
+import datasets
+import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.distributed.tensor
 import torch.nn as nn
+import yaml
 from peft import PeftModel
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM
-import yaml
-import pytest
 
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction, calculate_loss
 
-import datasets
 datasets.disable_caching()
 
 def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
@@ -384,6 +384,13 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
         restored_model = restored_model.model_parts[0]
         source_model_loss = get_validation_loss(trainer.model_parts[0], val_batch, trainer.loss_fn, trainer.dist_env.device)
         restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
+        for (source_name, source_p), (restore_name, restore_p) in zip(trainer.model_parts[0].named_parameters(), restored_model.named_parameters()):
+            assert source_name == restore_name, "Parameter name mismatch"
+            if isinstance(source_p, torch.distributed.tensor.DTensor):
+                source_p = source_p.to_local()
+            if isinstance(restore_p, torch.distributed.tensor.DTensor):
+                restore_p = restore_p.to_local()
+            assert torch.allclose(source_p, restore_p), "Parameter value mismatch for " + source_name
         assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
 
         # compare the recipe configs

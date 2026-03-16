@@ -30,11 +30,11 @@ import pytest
 
 from nemo_automodel.components.datasets.llm.formatting_utils import (
     _add_pad_token,
-    _pad_to_seq_length,
     _package_tokenized_example,
+    _pad_to_seq_length,
     _warned_add_pad_token,
-    format_prompt_completion,
     format_chat_template,
+    format_prompt_completion,
 )
 
 
@@ -91,17 +91,17 @@ class _StubTokenizerChat(_StubTokenizerPlain):  # noqa: D401
         # Separate prompt messages (system, user) from assistant messages
         prompt_messages = [m for m in messages if m["role"] != "assistant"]
         assistant_messages = [m for m in messages if m["role"] == "assistant"]
-        
+
         # Build ids: [SOT] + prompt tokens + [SOT] + assistant tokens + [EOS]
         ids: List[int] = [self._start_of_turn_token_id]
-        
+
         # Add all prompt tokens (system + user)
         prompt_token_count = 0
         for msg in prompt_messages:
             tokens = msg["content"].split()
             ids.extend(self._id_for_token(tok) for tok in tokens)
             prompt_token_count += len(tokens)
-        
+
         # Add second SOT and assistant tokens
         ids.append(self._start_of_turn_token_id)
         assistant_token_count = 0
@@ -109,15 +109,15 @@ class _StubTokenizerChat(_StubTokenizerPlain):  # noqa: D401
             tokens = msg["content"].split()
             ids.extend(self._id_for_token(tok) for tok in tokens)
             assistant_token_count += len(tokens)
-        
+
         ids.append(self.eos_token_id)
-        
+
         # Handle return_dict parameter
         if kwargs.get("return_dict", False):
             result = {"input_ids": ids}
             # Handle return_assistant_tokens_mask parameter
             if kwargs.get("return_assistant_tokens_mask", False):
-                # Create mask: first SOT and prompt tokens are 0 (masked), 
+                # Create mask: first SOT and prompt tokens are 0 (masked),
                 # second SOT and assistant tokens are 1 (not masked)
                 mask = [0] * (1 + prompt_token_count)  # first SOT + prompt tokens
                 mask += [1] * (1 + assistant_token_count + 1)  # second SOT + assistant tokens + EOS
@@ -263,7 +263,7 @@ class _StubTokenizerChatNoGen:
                 assistant_started = True
             if assistant_started:
                 ids.extend(self._id_for_token(tok) for tok in str(msg["content"]).split())
-        # Intentionally DO NOT append EOS here; function under test will handle it.
+        ids.append(self.eos_token_id)
         if kwargs.get("return_dict", False):
             return {"input_ids": ids}
         return ids
@@ -303,10 +303,9 @@ def test_apply_chat_template_manual_mask_without_generation_kwd():
     # Sanity: there must be supervised tokens (assistant section)
     assert expected_ignored < len(out["labels"])
     # Number of supervised tokens (exclude -100) should equal number of assistant tokens.
-    # Note: labels include the final EOS as supervised; subtract 1 to compare to assistant count.
     assistant_tokens = sum(len(str(m["content"]).split()) for m in messages if m["role"] == "assistant")
     num_supervised = sum(1 for v in out["labels"] if v != -100)
-    assert num_supervised - 1 == assistant_tokens
+    assert num_supervised == assistant_tokens
 
 
 def test_apply_chat_template_manual_mask_raises_when_last_not_assistant():
@@ -510,6 +509,105 @@ class TestPackageTokenizedExamplePadEos:
         assert 2 not in pad_region, "EOS token id must not appear as label padding"
 
 
+class TestPackageTokenizedExamplePrePaddedInput:
+    """Tests for _package_tokenized_example when input_ids arrive already padded.
+
+    This happens when a tokenizer's apply_chat_template is called with
+    padding="max_length" — the returned input_ids already contain trailing
+    pad tokens.  _package_tokenized_example must detect these and set
+    attention_mask=0 at those positions.
+    """
+
+    def test_attention_mask_zeros_for_pre_padded_distinct_pad(self):
+        """Pre-padded input with pad_token_id != eos_token_id."""
+        tok = _StubTokForPackage(pad_token_id=0)
+        eos = tok.eos_token_id  # 2
+        # Simulate tokenizer output already padded to length 8:
+        # [BOS=1, A=10, B=11, EOS=2, PAD=0, PAD=0, PAD=0, PAD=0]
+        input_ids = [1, 10, 11, eos, 0, 0, 0, 0]
+        assistant_masks = [0, 0, 1, 1, 0, 0, 0, 0]
+        out = _package_tokenized_example(
+            tokenizer=tok,
+            input_ids=input_ids,
+            assistant_masks=assistant_masks,
+            eos_token_id=eos,
+            pad_token_id=0,
+            seq_length=None,
+            padding="do_not_pad",
+        )
+        # Content length is computed on the original input (4 real tokens),
+        # then reduced by 1 for the next-token shift → 3 ones.
+        assert out["attention_mask"] == [1, 1, 1, 0, 0, 0, 0], (
+            f"Expected zeros at pre-padded positions, got {out['attention_mask']}"
+        )
+
+    def test_attention_mask_zeros_for_pre_padded_pad_equals_eos(self):
+        """Pre-padded input where pad_token_id == eos_token_id.
+
+        The real trailing EOS should keep attention_mask=1, but subsequent
+        pad tokens (same id) should get attention_mask=0.
+        """
+        tok = _StubTokForPackage(pad_token_id=2)
+        eos = tok.eos_token_id  # 2
+        # [BOS=1, A=10, B=11, EOS=2, PAD=2, PAD=2, PAD=2]
+        input_ids = [1, 10, 11, eos, 2, 2, 2]
+        assistant_masks = [0, 0, 1, 1, 0, 0, 0]
+        out = _package_tokenized_example(
+            tokenizer=tok,
+            input_ids=input_ids,
+            assistant_masks=assistant_masks,
+            eos_token_id=eos,
+            pad_token_id=2,
+            seq_length=None,
+            padding="do_not_pad",
+        )
+        # Content length is computed on the original input (4 real tokens
+        # including one trailing EOS), then reduced by 1 for the shift → 3 ones.
+        assert out["attention_mask"] == [1, 1, 1, 0, 0, 0], (
+            f"Expected one trailing EOS kept + zeros for pad, got {out['attention_mask']}"
+        )
+
+    def test_attention_mask_no_padding_present(self):
+        """No pre-padding — attention_mask should be all ones (existing behavior)."""
+        tok = _StubTokForPackage(pad_token_id=0)
+        eos = tok.eos_token_id  # 2
+        input_ids = [1, 10, 11, eos]
+        assistant_masks = [0, 0, 1, 1]
+        out = _package_tokenized_example(
+            tokenizer=tok,
+            input_ids=input_ids,
+            assistant_masks=assistant_masks,
+            eos_token_id=eos,
+            pad_token_id=0,
+            seq_length=None,
+            padding="do_not_pad",
+        )
+        # After [:-1]: input_ids = [1, 10, 11], no pad tokens
+        assert out["attention_mask"] == [1, 1, 1]
+
+    def test_pre_padded_then_further_padded_by_seq_length(self):
+        """Input already partially padded, then _pad_to_seq_length extends further."""
+        tok = _StubTokForPackage(pad_token_id=0)
+        eos = tok.eos_token_id  # 2
+        # Pre-padded to 6, but seq_length=10
+        input_ids = [1, 10, 11, eos, 0, 0]
+        assistant_masks = [0, 0, 1, 1, 0, 0]
+        out = _package_tokenized_example(
+            tokenizer=tok,
+            input_ids=input_ids,
+            assistant_masks=assistant_masks,
+            eos_token_id=eos,
+            pad_token_id=0,
+            seq_length=10,
+            padding="max_length",
+        )
+        # Content length computed on original (4 real), minus 1 for shift → 3 ones.
+        # _pad_to_seq_length extends to 10.
+        assert len(out["attention_mask"]) == 10
+        assert out["attention_mask"][:3] == [1, 1, 1]
+        assert all(v == 0 for v in out["attention_mask"][3:])
+
+
 class _StubTokPadEosPlain(_StubTokenizerPlain):
     """Plain tokenizer (no chat template) where pad_token_id == eos_token_id."""
 
@@ -598,6 +696,78 @@ class TestFormatPromptCompletionPadEos:
         assert len(supervised) > 0, "Must have supervised (answer) tokens"
 
 
+class _StubTokenizerChatTruncating(_StubTokenizerChat):
+    """Chat tokenizer that respects max_length truncation like HF tokenizers."""
+
+    def apply_chat_template(self, messages, **kwargs):
+        result = super().apply_chat_template(messages, **kwargs)
+        max_length = kwargs.get("max_length")
+        if max_length is not None:
+            if kwargs.get("return_dict", False):
+                ids = result["input_ids"][:max_length]
+                result["input_ids"] = ids
+                if "assistant_masks" in result:
+                    result["assistant_masks"] = result["assistant_masks"][:max_length]
+            else:
+                result = result[:max_length]
+        return result
+
+
+class TestFormatChatTemplateNoEosAfterTruncation:
+    """EOS must NOT be appended when the sequence was truncated to seq_length.
+
+    When apply_chat_template returns seq_length tokens (i.e. the sequence was
+    truncated), appending EOS makes the total seq_length+1 which after
+    BOS-removal in _package_tokenized_example produces exactly seq_length
+    labels with no room for -100 padding.  The last label becomes the
+    spurious EOS instead of -100.
+    """
+
+    def _messages(self):
+        # Long enough content to exceed any small seq_length
+        return [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "a b c d e f g h i j k l m n o p q r s t"},
+            {"role": "assistant", "content": "x y z w v u"},
+        ]
+
+    def test_no_eos_appended_when_truncated_generation_kwd(self):
+        tok = _StubTokenizerChatTruncating()
+        seq_length = 10  # Force truncation
+        out = format_chat_template(
+            tok,
+            [m.copy() for m in self._messages()],
+            eos_token_id=tok.eos_token_id,
+            pad_token_id=tok.eos_token_id,
+            seq_length=seq_length,
+            padding="max_length",
+            truncation=True,
+        )
+        # All labels must be exactly seq_length
+        assert len(out["labels"]) == seq_length
+        # The last label must be -100 (padding), NOT eos_token_id
+        assert out["labels"][-1] == -100, (
+            f"Last label should be -100 (padding) after truncation, got {out['labels'][-1]}"
+        )
+
+    def test_eos_still_appended_when_not_truncated(self):
+        tok = _StubTokenizerChatTruncating()
+        seq_length = 100  # Large enough — no truncation
+        out = format_chat_template(
+            tok,
+            [m.copy() for m in self._messages()],
+            eos_token_id=tok.eos_token_id,
+            pad_token_id=tok.eos_token_id,
+            seq_length=seq_length,
+            padding="max_length",
+            truncation=True,
+        )
+        assert len(out["labels"]) == seq_length
+        # EOS should be in the supervised region (not truncated, so EOS was appended)
+        supervised = [v for v in out["labels"] if v != -100]
+        assert tok.eos_token_id in supervised
+
+
 class TestFormatChatTemplatePadEos:
     """Tests for format_chat_template when pad_token_id == eos_token_id."""
 
@@ -673,3 +843,88 @@ class TestFormatChatTemplatePadEos:
             assert n == 30
             assert len(out["labels"]) == n
             assert len(out["attention_mask"]) == n
+
+
+class TestContentLengthBranches:
+    """Tests covering all branches of the content_length logic in _package_tokenized_example."""
+
+    def _run(self, pad_token_id, input_ids, assistant_masks=None, eos_token_id=2,
+             seq_length=None, padding="do_not_pad"):
+        tok = _StubTokForPackage(pad_token_id)
+        tok.eos_token_id = eos_token_id
+        if assistant_masks is None:
+            assistant_masks = [1] * len(input_ids)
+        return _package_tokenized_example(
+            tokenizer=tok,
+            input_ids=input_ids,
+            assistant_masks=assistant_masks,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            seq_length=seq_length,
+            padding=padding,
+        )
+
+    def test_content_length_pad_token_id_none(self):
+        """When pad_token_id is None, all tokens are attended."""
+        out = self._run(pad_token_id=None, input_ids=[1, 10, 11, 2], eos_token_id=2)
+        assert out["attention_mask"] == [1, 1, 1]
+
+    def test_content_length_single_token_input(self):
+        """Single-token input produces empty output after shift."""
+        out = self._run(pad_token_id=0, input_ids=[10], eos_token_id=2)
+        assert out["attention_mask"] == []
+
+    def test_content_length_pad_eq_eos_no_trailing(self):
+        """pad==eos but no trailing eos/pad tokens — all content attended."""
+        out = self._run(pad_token_id=2, input_ids=[1, 10, 11, 99], eos_token_id=2)
+        assert out["attention_mask"] == [1, 1, 1]
+
+    def test_content_length_pad_eq_eos_all_same(self):
+        """All tokens are eos/pad — end=0, content_length=min(1,4)=1, after shift=0."""
+        out = self._run(pad_token_id=2, input_ids=[2, 2, 2, 2], eos_token_id=2)
+        assert out["attention_mask"] == [0, 0, 0]
+
+    def test_content_length_pad_ne_eos_all_pad(self):
+        """All tokens are pad (distinct from eos) — none attended."""
+        out = self._run(pad_token_id=0, input_ids=[0, 0, 0, 0], eos_token_id=2)
+        assert out["attention_mask"] == [0, 0, 0]
+
+    def test_content_length_identical_for_padded_and_nonpadded(self):
+        """Padded and non-padded inputs produce the same content_length."""
+        padded_out = self._run(pad_token_id=2, input_ids=[1, 10, 11, 2, 2, 2], eos_token_id=2)
+        nonpadded_out = self._run(pad_token_id=2, input_ids=[1, 10, 11, 2], eos_token_id=2)
+        padded_content = sum(padded_out["attention_mask"])
+        nonpadded_content = sum(nonpadded_out["attention_mask"])
+        assert padded_content == nonpadded_content
+
+    def test_labels_at_nonattended_positions_prompt_completion(self):
+        """Labels at attention_mask=0 positions are -100 when using max_length padding."""
+        tok = _StubTokForPackage(pad_token_id=0)
+        tok.eos_token_id = 2
+        input_ids = [1, 10, 11, 2]
+        assistant_masks = [0, 0, 1, 1]
+        out = _package_tokenized_example(
+            tokenizer=tok,
+            input_ids=input_ids,
+            assistant_masks=assistant_masks,
+            eos_token_id=2,
+            pad_token_id=0,
+            seq_length=8,
+            padding="max_length",
+        )
+        for i in range(len(out["labels"])):
+            if out["attention_mask"][i] == 0:
+                assert out["labels"][i] == -100, (
+                    f"Position {i}: attention_mask=0 but labels={out['labels'][i]}"
+                )
+
+    def test_labels_preserved_when_no_padding(self):
+        """Without padding, all labels are attended and none masked by padding."""
+        out = self._run(
+            pad_token_id=0,
+            input_ids=[1, 10, 11, 2],
+            assistant_masks=[1, 1, 1, 1],
+            eos_token_id=2,
+        )
+        assert all(v == 1 for v in out["attention_mask"])
+        assert -100 not in out["labels"]

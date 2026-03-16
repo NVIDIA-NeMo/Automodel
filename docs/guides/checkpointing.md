@@ -228,13 +228,14 @@ automodel config.yaml --nproc-per-node=2 --step_scheduler.ckpt_every_steps 20 --
 
 ## Saving Checkpoints When Using Docker
 
-When training inside a Docker container (see [Installation Guide](installation.md)), any files written to the container's filesystem are lost when the container exits (especially with `--rm`). To keep your checkpoints, **bind-mount a host directory** to the checkpoint path before starting the container:
+When training inside a Docker container (see [Installation Guide](installation.md)), any files written to the container's filesystem are lost when the container exits (especially with `--rm`). To keep your checkpoints, you must **bind-mount a host directory** to the checkpoint path before starting the container:
 
 ```bash
 docker run --gpus all -it --rm \
   --shm-size=8g \
   -v "$(pwd)"/checkpoints:/opt/Automodel/checkpoints \
   nvcr.io/nvidia/nemo-automodel:25.11.00
+```
 
 You can also set a custom checkpoint directory via the YAML config or CLI override:
 ```yaml

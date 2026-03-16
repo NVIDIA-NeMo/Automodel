@@ -14,7 +14,6 @@
 
 """Unit tests for MoE load balance metrics."""
 
-import math
 
 import pytest
 import torch
@@ -261,6 +260,76 @@ class TestComputeDetailedMetrics:
         # Layer 1: ideal=200, ratios=[1.0, 1.0] -> mean=1.0
         assert "moe/layer_1/utilization_mean" in metrics
         assert metrics["moe/layer_1/utilization_mean"] == pytest.approx(1.0, abs=1e-4)
+
+
+class TestDiversityMetrics:
+    def test_uniform_load(self):
+        """Uniform load: no dead experts, diversity=1.0."""
+        layer_loads = _make_layer_loads([[100.0, 100.0, 100.0, 100.0]])
+        metrics = compute_brief_metrics(layer_loads)
+
+        assert metrics["moe/dead_expert_frac_mean"] == pytest.approx(0.0, abs=1e-6)
+        assert metrics["moe/expert_diversity_mean"] == pytest.approx(1.0, abs=1e-4)
+        assert metrics["moe/expert_diversity_min"] == pytest.approx(1.0, abs=1e-4)
+
+    def test_single_expert_receives_all(self):
+        """All tokens to one expert: dead_frac=0.75, diversity=0.25."""
+        layer_loads = _make_layer_loads([[400.0, 0.0, 0.0, 0.0]])
+        metrics = compute_brief_metrics(layer_loads)
+
+        assert metrics["moe/dead_expert_frac_mean"] == pytest.approx(0.75, abs=1e-4)
+        # exp(0) / 4 = 1/4 = 0.25
+        assert metrics["moe/expert_diversity_mean"] == pytest.approx(0.25, abs=1e-4)
+
+    def test_two_of_four_experts_used(self):
+        """Two equally loaded experts out of 4: diversity=0.5."""
+        layer_loads = _make_layer_loads([[200.0, 200.0, 0.0, 0.0]])
+        metrics = compute_brief_metrics(layer_loads)
+
+        assert metrics["moe/dead_expert_frac_mean"] == pytest.approx(0.5, abs=1e-4)
+        # exp(log(2)) / 4 = 2/4 = 0.5
+        assert metrics["moe/expert_diversity_mean"] == pytest.approx(0.5, abs=1e-4)
+
+    def test_all_zero_load(self):
+        """All experts receive 0 tokens: dead_frac=1.0, diversity=0."""
+        layer_loads = _make_layer_loads([[0.0, 0.0, 0.0, 0.0]])
+        metrics = compute_brief_metrics(layer_loads)
+
+        assert metrics["moe/dead_expert_frac_mean"] == pytest.approx(1.0, abs=1e-4)
+        assert metrics["moe/expert_diversity_mean"] == pytest.approx(0.0, abs=1e-4)
+
+    def test_diversity_min_across_layers(self):
+        """Min should reflect the worst layer."""
+        # Layer 0: uniform (diversity=1.0), Layer 1: single expert (diversity=0.5)
+        layer_loads = _make_layer_loads([[100.0, 100.0], [200.0, 0.0]])
+        metrics = compute_brief_metrics(layer_loads)
+
+        assert metrics["moe/expert_diversity_min"] == pytest.approx(0.5, abs=1e-4)
+        assert metrics["moe/expert_diversity_mean"] == pytest.approx(0.75, abs=1e-4)
+
+    def test_detailed_includes_per_layer(self):
+        """Detailed mode should include per-layer diversity keys."""
+        layer_loads = _make_layer_loads([[100.0, 200.0], [150.0, 150.0]])
+        metrics = compute_detailed_metrics(layer_loads)
+
+        assert "moe/layer_0/dead_expert_frac" in metrics
+        assert "moe/layer_0/expert_diversity" in metrics
+        assert "moe/layer_1/dead_expert_frac" in metrics
+        assert "moe/layer_1/expert_diversity" in metrics
+
+    def test_brief_no_per_layer(self):
+        """Brief mode should NOT include per-layer diversity keys."""
+        layer_loads = _make_layer_loads([[100.0, 200.0], [150.0, 150.0]])
+        metrics = compute_brief_metrics(layer_loads)
+
+        assert "moe/layer_0/dead_expert_frac" not in metrics
+        assert "moe/layer_0/expert_diversity" not in metrics
+
+    def test_empty_input(self):
+        """Empty input should produce empty metrics."""
+        metrics = compute_brief_metrics({})
+        assert "moe/dead_expert_frac_mean" not in metrics
+        assert "moe/expert_diversity_mean" not in metrics
 
 
 class TestEnableLoadBalanceTracking:

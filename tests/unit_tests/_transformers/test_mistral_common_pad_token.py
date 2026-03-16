@@ -27,7 +27,6 @@ The fix makes:
   - Both properties settable so _add_pad_token() can override them.
 """
 
-import pytest
 from unittest.mock import MagicMock, patch
 
 from nemo_automodel._transformers.tokenization.tokenization_mistral_common import (
@@ -35,7 +34,6 @@ from nemo_automodel._transformers.tokenization.tokenization_mistral_common impor
     MistralTokenizerType,
 )
 from nemo_automodel.components.datasets.llm.formatting_utils import _add_pad_token
-
 
 # ---------------------------------------------------------------------------
 # Helpers: lightweight stub that mimics MistralCommonBackend without needing
@@ -82,6 +80,9 @@ def _make_stub_tokenizer(pad_id=-1, eos_id=2, bos_id=1, unk_id=0, vocab_size=320
     backend._pad_token_override = None
     backend._all_special_tokens_ids = {bos_id, eos_id}
     backend._tokenizer_type = MistralTokenizerType.spm
+    # PreTrainedTokenizerBase.__setattr__/__getattr__ expect these dicts
+    backend._special_tokens_map = {}
+    backend._extra_special_tokens = []
 
     return backend
 

@@ -36,6 +36,7 @@ from nemo_automodel._transformers import NeMoAutoModelForImageTextToText, NeMoAu
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
@@ -271,6 +272,12 @@ def build_dataloader(
                     # Some models do not provide an AutoProcessor
                     processor = None
                     logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
+
+            chat_template_raw = cfg_ds.__dict__.pop("chat_template", None)
+            # Update chat_template if chat_template is given
+            if chat_template_raw is not None and processor is not None:
+                processor.chat_template = _resolve_chat_template(chat_template_raw)
+                processor.tokenizer.chat_template = processor.chat_template
 
             ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
 
@@ -740,8 +747,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 pixel_values = batch.pop("pixel_values", None)
                 image_grid_hws = batch.pop("image_grid_hws", None)
                 image_grid_thw = batch.pop("image_grid_thw", None)
+                image_sizes = batch.pop("image_sizes", None)
 
                 image_grid = image_grid_hws if image_grid_hws is not None else image_grid_thw
+                if image_grid is None and image_sizes is not None:
+                    image_grid = image_sizes
 
                 if self.pp.info.has_first_stage and pixel_values is not None and image_grid is not None:
                     stage0_model = self.model_parts[0]
@@ -749,14 +759,20 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     batch_size = input_ids.shape[0]
                     n_images = image_grid.shape[0]
 
-                    patch_counts = image_grid.prod(dim=1)
-                    cumsum = torch.cumsum(patch_counts, dim=0)
-
                     pixel_values_chunks = []
                     image_grid_chunks = []
 
-                    if n_images == batch_size:
-                        # 1 image per sample
+                    if pixel_values.dim() == 4 and pixel_values.shape[0] == batch_size:
+                        # pixel_values is [N_images, C, H, W] with one full image per
+                        # batch sample. Simply split along dim 0 to distribute across microbatches.
+                        pixel_values_chunks = list(pixel_values.chunk(n_microbatches, dim=0))
+                        image_grid_chunks = list(image_grid.chunk(n_microbatches, dim=0))
+                    elif n_images == batch_size:
+                        # Qwen/Kimi-style: pixel_values is 2D/3D flat patches [total_patches, hidden_dim].
+                        # Use cumsum-based slicing to split variable-length patch sequences.
+                        patch_counts = image_grid.prod(dim=1)
+                        cumsum = torch.cumsum(patch_counts, dim=0)
+
                         images_per_mb = batch_size // n_microbatches
                         for mb_idx in range(n_microbatches):
                             img_start = mb_idx * images_per_mb

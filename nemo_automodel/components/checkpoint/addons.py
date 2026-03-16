@@ -68,11 +68,23 @@ class ConsolidatedHFAddon:
             _maybe_save_custom_model_code(original_model_path, hf_metadata_dir)
             # save the config.json file
             if hasattr(model_part, "config"):
-                with open(os.path.join(hf_metadata_dir, "config.json"), "w") as f:
+                v4_compatible = kwargs.get("v4_compatible", False)
+                config_name = "config.json"
+                if v4_compatible and _config_exists(original_model_path, config_name):
+                    _save_original_config_json(original_model_path, hf_metadata_dir, config_name)
+                    config_name = "config.v5.json"
+
+                _maybe_strip_quantization_config(model_part)
+                with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
                     f.write(model_part.config.to_json_string())
+
             # save the generation_config.json file
             if getattr(model_part, "generation_config", None) is not None:
-                with open(os.path.join(hf_metadata_dir, "generation_config.json"), "w") as f:
+                config_name = "generation_config.json"
+                if v4_compatible and _config_exists(original_model_path, config_name):
+                    _save_original_config_json(original_model_path, hf_metadata_dir, config_name)
+                    config_name = "generation_config.v5.json"
+                with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
                     f.write(model_part.generation_config.to_json_string())
 
             # save the tokenizer
@@ -327,6 +339,53 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
             final_target_modules = remapped
 
     return sorted(list(final_target_modules))
+
+
+def _maybe_strip_quantization_config(model_part: nn.Module) -> None:
+    """Remove ``quantization_config`` from the HF config when no parameters are quantized.
+
+    Models loaded from quantized checkpoints (e.g. mxfp4 GPT-OSS) carry a
+    ``quantization_config`` on their ``config`` object.  After dequantization
+    all parameters are standard floating-point, but the stale config entry would
+    still be written to the saved ``config.json``.  This strips it so the output
+    checkpoint is a clean bf16 checkpoint, consistent with e.g.
+    ``unsloth/gpt-oss-20b-BF16``.
+    """
+    config = getattr(model_part, "config", None)
+    if config is None or not hasattr(config, "quantization_config"):
+        return
+
+    _QUANTIZED_DTYPES = frozenset({torch.uint8, torch.int8})
+    if any(p.dtype in _QUANTIZED_DTYPES for p in model_part.parameters()):
+        return
+
+    delattr(config, "quantization_config")
+
+
+def _config_exists(original_model_path: str, config_name: str) -> bool:
+    if original_model_path is None or not os.path.isdir(original_model_path):
+        return False
+    src = os.path.join(original_model_path, config_name)
+    return os.path.isfile(src)
+
+
+def _save_original_config_json(original_model_path: str, hf_metadata_dir: str, config_name: str) -> None:
+    """Copy the original pretrained ``config.json`` with ``quantization_config`` stripped.
+
+    This is used in v4-compatible mode so that downstream consumers (e.g. vLLM)
+    that expect a transformers-v4-style config receive the file verbatim from the
+    original checkpoint, minus any quantization metadata (since saved weights are
+    always bf16).
+    """
+    src = os.path.join(original_model_path, config_name)
+    if not os.path.isfile(src):
+        return
+    with open(src) as f:
+        cfg = json.load(f)
+    cfg.pop("quantization_config", None)
+    dst = os.path.join(hf_metadata_dir, config_name)
+    with open(dst, "w") as f:
+        json.dump(cfg, f, indent=2)
 
 
 def _maybe_save_custom_model_code(original_model_path: str | None, hf_metadata_dir: str) -> None:

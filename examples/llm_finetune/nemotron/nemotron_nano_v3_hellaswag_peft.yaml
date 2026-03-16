@@ -40,10 +40,9 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
-  trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    rms_norm: torch
+    rms_norm: torch_fp32
     linear: torch
 
 # torch.compile configuration

@@ -17,7 +17,7 @@
 This module contains both CPU and GPU tests for:
 - SequentialBucketSampler
 - collate_fn_production
-- build_multiresolution_dataloader
+- _build_multiresolution_dataloader_core
 
 GPU tests are skipped when CUDA is not available.
 """
@@ -30,15 +30,16 @@ from typing import Dict, List
 import pytest
 import torch
 
+from nemo_automodel.components.datasets.diffusion.collate_fns import (
+    _build_multiresolution_dataloader_core,
+    collate_fn_production,
+)
 from nemo_automodel.components.datasets.diffusion.sampler import (
     SequentialBucketSampler,
-    build_multiresolution_dataloader,
-    collate_fn_production,
 )
 from nemo_automodel.components.datasets.diffusion.text_to_image_dataset import (
     TextToImageDataset,
 )
-
 
 # ============================================================================
 # Fixtures and Helpers
@@ -570,18 +571,19 @@ class TestCollateFnProductionCPU:
 
 
 # ============================================================================
-# CPU Tests - build_multiresolution_dataloader
+# CPU Tests - _build_multiresolution_dataloader_core
 # ============================================================================
 
 
-class TestBuildMultiresolutionDataloaderCPU:
-    """CPU tests for build_multiresolution_dataloader."""
+class TestBuildMultiresolutionDataloaderCoreCPU:
+    """CPU tests for _build_multiresolution_dataloader_core."""
 
     def test_build_dataloader_returns_tuple(self, simple_dataset):
         """Test function returns dataloader and sampler."""
-        dataloader, sampler = build_multiresolution_dataloader(
+        dataloader, sampler = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             num_workers=0,
@@ -593,9 +595,10 @@ class TestBuildMultiresolutionDataloaderCPU:
 
     def test_dataloader_iteration(self, simple_dataset):
         """Test dataloader can be iterated."""
-        dataloader, sampler = build_multiresolution_dataloader(
+        dataloader, sampler = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             num_workers=0,
@@ -613,9 +616,10 @@ class TestBuildMultiresolutionDataloaderCPU:
 
     def test_dataloader_batch_content(self, simple_dataset):
         """Test dataloader batches have correct content."""
-        dataloader, _ = build_multiresolution_dataloader(
+        dataloader, _ = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             num_workers=0,
@@ -628,9 +632,10 @@ class TestBuildMultiresolutionDataloaderCPU:
 
     def test_dataloader_with_shuffle(self, simple_dataset):
         """Test dataloader with shuffle enabled."""
-        dataloader, _ = build_multiresolution_dataloader(
+        dataloader, _ = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             shuffle=True,
@@ -643,9 +648,10 @@ class TestBuildMultiresolutionDataloaderCPU:
 
     def test_dataloader_without_shuffle(self, simple_dataset):
         """Test dataloader with shuffle disabled."""
-        dataloader, _ = build_multiresolution_dataloader(
+        dataloader, _ = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             shuffle=False,
@@ -658,9 +664,10 @@ class TestBuildMultiresolutionDataloaderCPU:
 
     def test_dataloader_with_dynamic_batch(self, multi_resolution_dataset):
         """Test dataloader with dynamic batch sizing."""
-        dataloader, _ = build_multiresolution_dataloader(
+        dataloader, _ = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=multi_resolution_dataset,
-            base_batch_size=8,
+            batch_size=8,
             base_resolution=(512, 512),
             dp_rank=0,
             dp_world_size=1,
@@ -747,20 +754,21 @@ class TestCollateFnProductionGPU:
 
 
 # ============================================================================
-# GPU Tests - build_multiresolution_dataloader
+# GPU Tests - _build_multiresolution_dataloader_core
 # ============================================================================
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
-class TestBuildMultiresolutionDataloaderGPU:
-    """GPU tests for build_multiresolution_dataloader."""
+class TestBuildMultiresolutionDataloaderCoreGPU:
+    """GPU tests for _build_multiresolution_dataloader_core."""
 
     def test_dataloader_with_pin_memory(self, simple_dataset):
         """Test dataloader with pin_memory for faster GPU transfer."""
 
-        dataloader, _ = build_multiresolution_dataloader(
+        dataloader, _ = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             pin_memory=True,
@@ -775,9 +783,10 @@ class TestBuildMultiresolutionDataloaderGPU:
 
     def test_dataloader_batch_to_gpu(self, simple_dataset):
         """Test full batch transfer to GPU."""
-        dataloader, _ = build_multiresolution_dataloader(
+        dataloader, _ = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             num_workers=0,
@@ -814,9 +823,10 @@ class TestBuildMultiresolutionDataloaderGPU:
         torch.cuda.empty_cache()
         initial_memory = torch.cuda.memory_allocated()
 
-        dataloader, _ = build_multiresolution_dataloader(
+        dataloader, _ = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             num_workers=0,
@@ -846,9 +856,10 @@ class TestBuildMultiresolutionDataloaderGPU:
         # Create dataloaders for each GPU (simulated)
         dataloaders = []
         for rank in range(min(gpu_count, 2)):  # Use up to 2 GPUs for test
-            dl, _ = build_multiresolution_dataloader(
+            dl, _ = _build_multiresolution_dataloader_core(
+                collate_fn=collate_fn_production,
                 dataset=large_dataset,
-                base_batch_size=8,
+                batch_size=8,
                 dp_rank=rank,
                 dp_world_size=min(gpu_count, 2),
                 num_workers=0,
@@ -867,9 +878,10 @@ class TestBuildMultiresolutionDataloaderGPU:
 
     def test_gpu_operations_on_batch(self, simple_dataset):
         """Test performing GPU operations on loaded batch."""
-        dataloader, _ = build_multiresolution_dataloader(
+        dataloader, _ = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             num_workers=0,
@@ -902,9 +914,10 @@ class TestDataloaderIntegration:
 
     def test_full_epoch_iteration_cpu(self, simple_dataset):
         """Test iterating through a full epoch on CPU."""
-        dataloader, sampler = build_multiresolution_dataloader(
+        dataloader, sampler = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             num_workers=0,
@@ -919,9 +932,10 @@ class TestDataloaderIntegration:
 
     def test_multiple_epochs_cpu(self, simple_dataset):
         """Test iterating through multiple epochs."""
-        dataloader, sampler = build_multiresolution_dataloader(
+        dataloader, sampler = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             num_workers=0,
@@ -937,9 +951,10 @@ class TestDataloaderIntegration:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
     def test_full_epoch_iteration_gpu(self, simple_dataset):
         """Test iterating through a full epoch with GPU transfer."""
-        dataloader, sampler = build_multiresolution_dataloader(
+        dataloader, sampler = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
             dataset=simple_dataset,
-            base_batch_size=4,
+            batch_size=4,
             dp_rank=0,
             dp_world_size=1,
             pin_memory=True,
