@@ -14,7 +14,7 @@
 
 
 step_scheduler:
-  global_batch_size: 64
+  global_batch_size: 32
   local_batch_size: 4
   ckpt_every_steps: 50
   val_every_steps: 50  # will run every x number of gradient steps
@@ -31,9 +31,9 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: microsoft/phi-2
+  pretrained_model_name_or_path: microsoft/phi-4
   torch_dtype: bf16
-  attn_implementation: eager
+  trust_remote_code: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
@@ -45,13 +45,13 @@ peft:
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
-  model_save_format: safetensors # torch_save or safetensors
+  model_save_format: safetensors
   save_consolidated: true
 
 distributed:
   strategy: fsdp2
   dp_size: none
-  tp_size: 1
+  tp_size: 2
   cp_size: 1
 
   sequence_parallel: false
@@ -72,7 +72,7 @@ packed_sequence:
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: false
+  shuffle: true
 
 
 validation_dataset:
@@ -83,7 +83,7 @@ validation_dataset:
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  
+
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
