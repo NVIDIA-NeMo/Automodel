@@ -18,8 +18,7 @@
 #   automodel examples/benchmark/configs/nemotron_nano_v3_te_deepep.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
-recipe:
-  _target_: nemo_automodel.recipes.llm.benchmark.BenchmarkingRecipeForNextTokenPrediction
+recipe: BenchmarkingRecipeForNextTokenPrediction
 
 seed: 1234
 

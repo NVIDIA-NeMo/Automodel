@@ -19,8 +19,7 @@
 #   automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_megatron_fsdp.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
-recipe:
-  _target_: nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM
+recipe: FinetuneRecipeForVLM
 
 step_scheduler:
   global_batch_size: 8
