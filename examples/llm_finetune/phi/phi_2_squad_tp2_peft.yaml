@@ -51,7 +51,7 @@ checkpoint:
 distributed:
   strategy: fsdp2
   dp_size: none
-  tp_size: 1
+  tp_size: 2
   cp_size: 1
 
   sequence_parallel: false
