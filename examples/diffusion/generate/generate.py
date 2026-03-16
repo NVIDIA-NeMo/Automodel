@@ -259,7 +259,7 @@ def _load_sharded_fsdp_checkpoint(transformer, sharded_dir, torch_dtype=torch.bf
         init_dist = True
 
     try:
-        transformer.to(dtype=torch_dtype)
+        transformer.to(device="cuda", dtype=torch_dtype)
         fsdp_transformer = FSDP(transformer, use_orig_params=True)
 
         FSDP.set_state_dict_type(

@@ -43,10 +43,9 @@ def patch_t5_layer_norm() -> None:
         return
 
     try:
-        from apex.normalization import FusedRMSNorm
         from transformers.models.t5 import modeling_t5
 
-        if modeling_t5.T5LayerNorm is not FusedRMSNorm:
+        if not (getattr(modeling_t5.T5LayerNorm, "__module__", "") or "").startswith("apex"):
             _T5_PATCH_APPLIED = True
             return
 

@@ -82,7 +82,7 @@ class TestPatchT5LayerNormIdempotent:
     def test_replaces_fused_rms_norm(self):
         """When T5LayerNorm IS FusedRMSNorm, it gets replaced."""
         mock_modeling_t5 = MagicMock()
-        fused_cls = type("FusedRMSNorm", (), {})
+        fused_cls = type("FusedRMSNorm", (), {"__module__": "apex.normalization"})
 
         mock_modeling_t5.T5LayerNorm = fused_cls
 
@@ -116,7 +116,7 @@ class TestNativeT5LayerNorm:
         t5_patches_module._T5_PATCH_APPLIED = False
 
         mock_modeling_t5 = MagicMock()
-        fused_cls = type("FusedRMSNorm", (), {})
+        fused_cls = type("FusedRMSNorm", (), {"__module__": "apex.normalization"})
         mock_modeling_t5.T5LayerNorm = fused_cls
 
         mock_apex_norm = MagicMock()
