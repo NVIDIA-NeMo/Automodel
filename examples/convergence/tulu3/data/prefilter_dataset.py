@@ -40,7 +40,6 @@ Usage:
     #   dataset:
     #     _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
     #     path_or_dataset_id: /path/to/cache/tulu-3-sft-mixture_train_seq1024_filtered
-    #     filter_long: false   # already filtered
 """
 
 import argparse
@@ -518,7 +517,6 @@ def main():
         logger.info("  To use in training config:")
         logger.info("    dataset:")
         logger.info("      path_or_dataset_id: %s", cache_path)
-        logger.info("      filter_long: false")
         logger.info("=" * 70)
 
 

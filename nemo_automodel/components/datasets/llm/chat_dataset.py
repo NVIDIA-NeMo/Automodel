@@ -124,8 +124,12 @@ def _load_openai_messages(
                     sl = slice(start, end)
 
             load_path = str(p.parent) if is_parquet_file else str(p)
+            # Cached Parquet datasets (from prefilter_dataset.py) are saved as a single
+            # split. Default to "train" when split is unspecified or was stripped to
+            # extract a slice (e.g. "train[:128]" → base_split="train", sl=slice(None,128)).
             dataset = load_dataset(
                 load_path,
+                name=name,
                 split=base_split or "train",
                 verification_mode=VerificationMode.NO_CHECKS,
             )

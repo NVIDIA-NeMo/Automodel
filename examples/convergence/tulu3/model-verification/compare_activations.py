@@ -192,6 +192,11 @@ def compare_and_report(
 
         # Compare per-layer hidden states
         common_layers = sorted(set(hf_layers.keys()) & set(nemo_layers.keys()))
+        if not common_layers:
+            print(
+                f"    WARNING: no common layers found between HF ({sorted(hf_layers.keys())[:3]}...) "
+                f"and NeMo ({sorted(nemo_layers.keys())[:3]}...). Layer comparison skipped."
+            )
         layer_sims = []
         layer_diffs = []
         worst_layer = None
