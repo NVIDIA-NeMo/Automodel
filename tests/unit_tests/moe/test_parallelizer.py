@@ -1816,3 +1816,167 @@ def test_parallelize_model_mp_policy_defaults_to_none(monkeypatch):
     apply_fsdp_mock.assert_called_once()
     _, kwargs = apply_fsdp_mock.call_args
     assert kwargs.get("mp_policy") is None
+
+
+def test_apply_ac_derives_hidden_size_and_num_experts_from_text_config(monkeypatch):
+    """Test that apply_ac resolves hidden_size/num_experts from model.config.text_config (VLM models)."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    captured_hidden_size = None
+    captured_num_experts = None
+
+    def fake_create_selective_checkpoint_contexts(policy_cb):
+        nonlocal captured_hidden_size, captured_num_experts
+        torch_stub = sys.modules["torch"]
+        for hs in [256, 512, 2048]:
+            for ne in [8, 16, 128]:
+                rhs = type("Mat", (), {"shape": (hs, ne)})()
+                result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs)
+                if result == P.CheckpointPolicy.MUST_SAVE:
+                    captured_hidden_size = hs
+                    captured_num_experts = ne
+                    break
+            if captured_hidden_size is not None:
+                break
+        return "CTX"
+
+    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+        if context_fn is not None:
+            context_fn()
+        return block
+
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
+
+    # VLM pattern: attrs nested under text_config, NOT at top level
+    class TextConfig:
+        hidden_size = 2048
+        num_experts = 128
+
+    class VLMConfig:
+        text_config = TextConfig()
+
+    class VLMModel:
+        def __init__(self):
+            self.config = VLMConfig()
+            self.layers = LayerContainer([DummyBlock()])
+
+    model = VLMModel()
+    P.apply_ac(model, ignore_router=True)
+
+    assert captured_hidden_size == 2048
+    assert captured_num_experts == 128
+
+
+# ============================================================================
+# Tests for apply_cp – skip non-TE attention modules instead of asserting
+# ============================================================================
+
+
+class _FakeAttnModule:
+    """Non-TE attention module (e.g. SDPA)."""
+
+    pass
+
+
+class _FakeSelfAttn:
+    def __init__(self, attn_module):
+        self.attn_module = attn_module
+
+
+class _FakeBlockWithAttn:
+    def __init__(self, attn_module, moe=None):
+        self.self_attn = _FakeSelfAttn(attn_module)
+        self.mlp = moe if moe is not None else object()
+
+
+def test_apply_cp_skips_non_te_attention(monkeypatch):
+    """apply_cp should skip blocks whose attn_module is not DotProductAttention."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    # Stub DotProductAttention in the TE import inside apply_cp
+    te_attn_stub = types.ModuleType("transformer_engine.pytorch.attention")
+
+    class DotProductAttention:
+        pass
+
+    te_attn_stub.DotProductAttention = DotProductAttention
+    monkeypatch.setitem(sys.modules, "transformer_engine", types.ModuleType("transformer_engine"))
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", types.ModuleType("transformer_engine.pytorch"))
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.attention", te_attn_stub)
+
+    non_te_attn = _FakeAttnModule()  # not a DotProductAttention
+    block = _FakeBlockWithAttn(non_te_attn)
+    model = DummyModel([block])
+
+    cp_mesh = MagicMock()
+    cp_mesh.get_group.return_value = MagicMock()
+
+    # Stub get_process_group_ranks to avoid real distributed calls
+    dist_stub = sys.modules["torch.distributed"]
+    dist_stub.get_process_group_ranks = MagicMock(return_value=[0, 1])
+
+    # Should not raise — just skip the non-TE block
+    P.apply_cp(model, cp_mesh)
+
+
+def _setup_te_and_dist_stubs(monkeypatch, DotProductAttention):
+    """Register TE and torch.distributed stubs needed by apply_cp."""
+    te_attn_stub = types.ModuleType("transformer_engine.pytorch.attention")
+    te_attn_stub.DotProductAttention = DotProductAttention
+    monkeypatch.setitem(sys.modules, "transformer_engine", types.ModuleType("transformer_engine"))
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", types.ModuleType("transformer_engine.pytorch"))
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.attention", te_attn_stub)
+
+    # apply_cp uses torch.distributed.get_process_group_ranks via attribute access
+    torch_mod = sys.modules["torch"]
+    dist_stub = sys.modules["torch.distributed"]
+    dist_stub.get_process_group_ranks = MagicMock(return_value=[0, 1])
+    torch_mod.distributed = dist_stub
+
+
+def test_apply_cp_configures_te_attention(monkeypatch):
+    """apply_cp should call set_context_parallel_group on TE DotProductAttention modules."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class DotProductAttention:
+        def __init__(self):
+            self.set_context_parallel_group = MagicMock()
+
+    _setup_te_and_dist_stubs(monkeypatch, DotProductAttention)
+
+    te_attn = DotProductAttention()
+    block = _FakeBlockWithAttn(te_attn)
+    model = DummyModel([block])
+
+    cp_mesh = MagicMock()
+    cp_mesh.get_group.return_value = MagicMock()
+
+    P.apply_cp(model, cp_mesh)
+
+    te_attn.set_context_parallel_group.assert_called_once()
+
+
+def test_apply_cp_mixed_te_and_non_te(monkeypatch):
+    """apply_cp should configure TE blocks and skip non-TE blocks in the same model."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class DotProductAttention:
+        def __init__(self):
+            self.set_context_parallel_group = MagicMock()
+
+    _setup_te_and_dist_stubs(monkeypatch, DotProductAttention)
+
+    te_attn = DotProductAttention()
+    non_te_attn = _FakeAttnModule()
+    block_te = _FakeBlockWithAttn(te_attn)
+    block_non_te = _FakeBlockWithAttn(non_te_attn)
+    model = DummyModel([block_te, block_non_te])
+
+    cp_mesh = MagicMock()
+    cp_mesh.get_group.return_value = MagicMock()
+
+    P.apply_cp(model, cp_mesh)
+
+    # TE block configured, non-TE block skipped (no error)
+    te_attn.set_context_parallel_group.assert_called_once()

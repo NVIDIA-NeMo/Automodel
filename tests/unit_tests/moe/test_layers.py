@@ -19,6 +19,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
@@ -30,8 +32,7 @@ from nemo_automodel.components.moe.layers import (
     Gate,
     MoE,
 )
-from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_CUDA = torch.cuda.is_available()
@@ -584,6 +585,75 @@ class TestGate:
         weights_detached = weights.detach()
         assert (weights_detached >= 0).all() and (weights_detached <= 1).all()
 
+    def test_gate_forward_softmax_with_bias_mode(self, moe_config, device):
+        """Test Gate forward pass in softmax_with_bias mode (no groups)."""
+        moe_config.score_func = "softmax_with_bias"
+        moe_config.force_e_score_correction_bias = True
+        gate = Gate(moe_config)
+        gate = gate.to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+            if gate.bias is not None:
+                gate.bias.zero_()
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        assert weights.shape == (num_tokens, moe_config.n_activated_experts)
+        assert indices.shape == (num_tokens, moe_config.n_activated_experts)
+        # Weights should be gathered from unbiased softmax scores, so all >= 0
+        weights_detached = weights.detach()
+        assert (weights_detached >= 0).all()
+
+    def test_gate_forward_softmax_with_bias_groups(self, moe_config, device):
+        """Test Gate forward pass in softmax_with_bias mode with group routing."""
+        moe_config.score_func = "softmax_with_bias"
+        moe_config.n_routed_experts = 16
+        moe_config.n_expert_groups = 4
+        moe_config.n_limited_groups = 2
+        moe_config.n_activated_experts = 4
+        moe_config.force_e_score_correction_bias = True
+        gate = Gate(moe_config)
+        gate = gate.to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        assert weights.shape == (num_tokens, moe_config.n_activated_experts)
+        assert indices.shape == (num_tokens, moe_config.n_activated_experts)
+        # All selected expert indices should be valid
+        assert (indices >= 0).all() and (indices < moe_config.n_routed_experts).all()
+
+    def test_gate_forward_softmax_with_bias_no_correction_bias(self, moe_config, device):
+        """Test softmax_with_bias without e_score_correction_bias falls back to unbiased selection."""
+        moe_config.score_func = "softmax_with_bias"
+        moe_config.gate_bias_update_factor = 0
+        moe_config.force_e_score_correction_bias = False
+        gate = Gate(moe_config)
+        gate = gate.to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        assert weights.shape == (num_tokens, moe_config.n_activated_experts)
+        assert indices.shape == (num_tokens, moe_config.n_activated_experts)
+
     def test_gate_forward_with_aux_loss(self, moe_config, device):
         """Test Gate forward pass with auxiliary loss computation."""
         moe_config.aux_loss_coeff = 0.01
@@ -1079,3 +1149,141 @@ class TestMoE:
 
             # Should return the reshaped output since aux_loss handling is done in gate
             assert result.shape == x.shape
+
+
+class TestMoEAuxLossAutoScaler:
+    """Tests for MoEAuxLossAutoScaler gradient flow and scaling."""
+
+    def setup_method(self):
+        MoEAuxLossAutoScaler.main_loss_backward_scale = None
+
+    def teardown_method(self):
+        MoEAuxLossAutoScaler.main_loss_backward_scale = None
+
+    def test_apply_returns_output_unchanged(self):
+        output = torch.randn(4, 8, requires_grad=True)
+        aux_loss = torch.tensor(0.5, requires_grad=True)
+        result = MoEAuxLossAutoScaler.apply(output, aux_loss)
+        assert torch.equal(result.data, output.data)
+
+    def test_apply_return_has_grad_fn(self):
+        output = torch.randn(4, 8, requires_grad=True)
+        aux_loss = torch.tensor(0.5, requires_grad=True)
+        result = MoEAuxLossAutoScaler.apply(output, aux_loss)
+        assert result.grad_fn is not None
+
+    def test_backward_scales_aux_loss_grad(self):
+        output = torch.randn(4, 8, requires_grad=True)
+        aux_loss = torch.tensor(0.5, requires_grad=True)
+        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(10.0)
+
+        result = MoEAuxLossAutoScaler.apply(output, aux_loss)
+        result.sum().backward()
+
+        assert aux_loss.grad is not None
+        assert aux_loss.grad.item() == pytest.approx(10.0)
+
+    def test_backward_default_scale_is_one(self):
+        output = torch.randn(4, 8, requires_grad=True)
+        aux_loss = torch.tensor(0.5, requires_grad=True)
+
+        result = MoEAuxLossAutoScaler.apply(output, aux_loss)
+        result.sum().backward()
+
+        assert aux_loss.grad.item() == pytest.approx(1.0)
+
+    def test_backward_passes_grad_output_through(self):
+        output = torch.randn(4, 8, requires_grad=True)
+        aux_loss = torch.tensor(0.5, requires_grad=True)
+        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(5.0)
+
+        result = MoEAuxLossAutoScaler.apply(output, aux_loss)
+        loss = (result * 2).sum()
+        loss.backward()
+
+        assert output.grad is not None
+        assert torch.allclose(output.grad, torch.full_like(output, 2.0))
+
+
+class TestGateAuxLossGradientFlow:
+    """Tests that Gate.forward() correctly wires aux loss into the autograd graph."""
+
+    def setup_method(self):
+        MoEAuxLossAutoScaler.main_loss_backward_scale = None
+
+    def teardown_method(self):
+        MoEAuxLossAutoScaler.main_loss_backward_scale = None
+
+    def test_gate_weights_carry_aux_loss_grad_fn(self, moe_config, device):
+        moe_config.aux_loss_coeff = 0.01
+        moe_config.gate_bias_update_factor = 0.0
+        gate = Gate(moe_config).to(device)
+        gate.train()
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        assert weights.grad_fn is not None, (
+            "weights must have a grad_fn from MoEAuxLossAutoScaler.apply()"
+        )
+
+    def test_aux_loss_receives_gradient_through_weights(self, moe_config, device):
+        moe_config.aux_loss_coeff = 0.01
+        moe_config.gate_bias_update_factor = 0.0
+        gate = Gate(moe_config).to(device)
+        gate.train()
+        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(1.0)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        # Backward through the weights (simulating main loss path)
+        weights.sum().backward()
+
+        # Gate router weight should have gradients from aux loss
+        assert gate.weight.grad is not None
+
+    def test_aux_loss_coeff_scales_aux_loss_input(self, moe_config, device):
+        moe_config.aux_loss_coeff = 0.05
+        moe_config.gate_bias_update_factor = 0.0
+        gate = Gate(moe_config).to(device)
+        with torch.no_grad():
+            gate.init_weights(device, init_std=0.02)
+        gate.train()
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        captured = {}
+        original_apply = MoEAuxLossAutoScaler.apply
+
+        def spy_apply(output, aux_loss):
+            captured["scaled_aux_loss"] = aux_loss.detach().clone()
+            return original_apply(output, aux_loss)
+
+        with patch.object(MoEAuxLossAutoScaler, "apply", side_effect=spy_apply):
+            weights, indices, raw_aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        expected = moe_config.aux_loss_coeff * raw_aux_loss.detach()
+        assert captured["scaled_aux_loss"].item() == pytest.approx(expected.item(), rel=1e-2)
+
+    def test_no_aux_loss_when_coeff_zero(self, moe_config, device):
+        moe_config.aux_loss_coeff = 0.0
+        moe_config.gate_bias_update_factor = 0.0
+        gate = Gate(moe_config).to(device)
+        gate.train()
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        assert aux_loss is None

@@ -94,6 +94,7 @@ from nemo_automodel._transformers.model_init import (
     get_hf_config,
     get_is_hf_model,
     no_hf_meta_device,
+    resolve_sdpa_method,
 )
 
 if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
@@ -103,6 +104,21 @@ if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
 
 
 logger = logging.getLogger(__name__)
+
+_MAX_BUILD_RETRIES = 5
+
+
+def _maybe_dequantize_fp8_for_peft(hf_native_quant_cfg, peft_config, pretrained_path):
+    """Set ``dequantize=True`` on FP8 quantization configs when PEFT is requested.
+
+    Returns True if the config was mutated, False otherwise.
+    """
+    if peft_config is not None and isinstance(pretrained_path, str):
+        if isinstance(hf_native_quant_cfg, dict) and hf_native_quant_cfg.get("quant_method") == "fp8":
+            hf_native_quant_cfg["dequantize"] = True
+            logger.info("FP8 model with PEFT: setting dequantize=True for compatibility")
+            return True
+    return False
 
 
 class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
@@ -132,8 +148,20 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         name = cls.__name__
         if name.startswith("NeMo"):
             cls.__name__ = name[4:]
-        model = super().from_pretrained(*args, **kwargs)
-        cls.__name__ = name
+        try:
+            model = super().from_pretrained(*args, **kwargs)
+        except OSError:
+            if kwargs.get("use_safetensors") is not False:
+                logger.warning(
+                    "Checkpoint resolution failed; retrying with use_safetensors=False "
+                    "(the model may only provide .bin checkpoints)."
+                )
+                kwargs["use_safetensors"] = False
+                model = super().from_pretrained(*args, **kwargs)
+            else:
+                raise
+        finally:
+            cls.__name__ = name
         return model
 
     @classmethod
@@ -168,6 +196,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         fp8_config,
         compile_config,
         load_base_model,
+        _retry_depth=0,
         **kwargs,
     ):
         """Shared model building logic for ``from_pretrained`` and ``from_config``.
@@ -188,6 +217,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         def _retry(**override):
             """Re-enter ``_build_model`` with overridden parameters."""
+            if _retry_depth >= _MAX_BUILD_RETRIES:
+                raise
             retry_kwargs = {
                 **kwargs,
                 "has_packed_sequence": has_packed_sequence,
@@ -215,6 +246,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 fp8_config=fp8_config,
                 compile_config=compile_config,
                 load_base_model=load_base_model,
+                _retry_depth=_retry_depth + 1,
                 **retry_kwargs,
             )
 
@@ -228,15 +260,30 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             )
         device = torch.cuda.current_device()
 
+        # When PEFT is requested, force dequantization of FP8-quantized models.
+        # FP8 linear modules (e.g. transformers FP8Linear) have scalar parameters
+        # incompatible with FSDP2, and their custom forward doesn't compose with
+        # LoRA patching. Setting dequantize=True tells transformers to convert
+        # FP8 weights to bf16 during loading.
+        _hf_config = (
+            get_hf_config(pretrained_model_name_or_path_or_config, attn_implementation, **kwargs)
+            if isinstance(pretrained_model_name_or_path_or_config, str)
+            else pretrained_model_name_or_path_or_config
+        )
+        _hf_native_quant_cfg = getattr(_hf_config, "quantization_config", None)
+        if _maybe_dequantize_fp8_for_peft(_hf_native_quant_cfg, peft_config, pretrained_model_name_or_path_or_config):
+            kwargs["config"] = _hf_config
+
         # Use meta device initialization when:
         # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)
         # - AND either multi-GPU (world_size > 1) or single-GPU custom model (not HF)
-        # - AND not using quantization (we let HF handle BitsAndBytes; don't init meta device)
+        # - AND not using quantization (we let HF handle BitsAndBytes/FP8; don't init meta device)
+        #   For non-HF models, native quant config is ignored.
         is_meta_device = all(
             [
                 not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)),
                 get_world_size_safe() > 1 or not is_hf_model,
-                quantization_config is None,
+                quantization_config is None and (_hf_native_quant_cfg is None or not is_hf_model),
             ]
         )
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
@@ -343,7 +390,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         *model_args,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: Optional[List[SDPBackend]] = None,
+        sdpa_method: Optional[List[Union[SDPBackend, str]]] = None,
         torch_dtype="auto",
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
@@ -380,8 +427,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 the model with Liger kernels for faster inference/training.
             use_sdpa_patching (bool, default=True): If `True`, patch the
                 model with SDPA-based attention optimizations.
-            sdpa_method (list[SDPBackend] | None, optional): Explicit list of
+            sdpa_method (list[SDPBackend | str] | None, optional): Explicit list of
                 SDPA back-ends to consider when `use_sdpa_patching=True`.
+                Accepts both SDPBackend enum values and string names (e.g.
+                ``["flash_attention", "efficient_attention"]``). When ``None``,
+                auto-selects based on CP and activation checkpointing.
             torch_dtype (str | torch.dtype | Literal["auto"], default="auto"):
                 Data type passed to the underlying `from_pretrained` call.
             attn_implementation (str, optional):
@@ -452,6 +502,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 raise
         is_hf_model = get_is_hf_model(hf_config, force_hf)
 
+        sdpa_method = resolve_sdpa_method(sdpa_method, device_mesh, activation_checkpointing)
+
         return cls._build_model(
             pretrained_model_name_or_path,
             *model_args,
@@ -483,7 +535,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         *model_args,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: Optional[List[SDPBackend]] = None,
+        sdpa_method: Optional[List[Union[SDPBackend, str]]] = None,
         torch_dtype: Union[str, torch.dtype] = "auto",
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
@@ -553,6 +605,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     raise
         _consume_config_overrides(config, kwargs)
         is_hf_model = get_is_hf_model(config, force_hf)
+
+        sdpa_method = resolve_sdpa_method(sdpa_method, device_mesh, activation_checkpointing)
 
         return cls._build_model(
             config,
@@ -734,7 +788,7 @@ class NeMoAutoModelBiencoder:
         share_encoder: bool = True,
         pooling: str = "avg",
         l2_normalize: bool = True,
-        attn_implementation: str = "flash_attention_2",
+        attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
         sdpa_method: Optional[List[SDPBackend]] = None,
@@ -762,7 +816,8 @@ class NeMoAutoModelBiencoder:
             l2_normalize: Whether to L2 normalize embeddings.
             attn_implementation: Attention implementation to use (e.g.,
                 ``"flash_attention_2"``, ``"sdpa"``, ``"eager"``).
-                Defaults to ``"flash_attention_2"``.
+                Defaults to ``DEFAULT_ATTN_IMPLEMENTATION``
+                (``"flash_attention_2"`` when flash-attn is installed, otherwise ``"sdpa"``).
             use_liger_kernel: Whether to apply Liger kernel optimizations.
             use_sdpa_patching: Whether to apply SDPA patching.
             sdpa_method: SDPA backend methods to use.

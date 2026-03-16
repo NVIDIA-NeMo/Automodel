@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from nemo_automodel.components.checkpoint.checkpointing import (
@@ -266,7 +266,6 @@ class TestIsCustomModel:
 
     def test_module_from_custom_namespace_is_custom(self):
         """A class whose __module__ starts with nemo_automodel.components.models. is custom."""
-        model = torch.nn.Module()
         # Simulate a custom model by patching __module__ on the class's MRO
         FakeCustom = type("FakeCustom", (torch.nn.Module,), {})
         FakeCustom.__module__ = "nemo_automodel.components.models.deepseek_v3.model"
@@ -357,7 +356,7 @@ class TestLoadModelCustomModelGuard:
 
     def _make_checkpointer(self):
         """Create a minimally configured Checkpointer for testing."""
-        from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig, Checkpointer
+        from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
         config = CheckpointingConfig(
             enabled=True,
@@ -392,6 +391,26 @@ class TestLoadModelCustomModelGuard:
         # DCP path should NOT be used
         mock_dcp_load.assert_not_called()
 
+    @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=False)
+    @patch("nemo_automodel.components.checkpoint.checkpointing._is_bin_checkpoint", return_value=True)
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
+    def test_bin_checkpoint_uses_fast_path(self, mock_load_full, mock_load_hf, mock_is_bin, mock_is_st):
+        """Non-custom (HF) models with .bin checkpoints use the fast loading path."""
+        checkpointer = self._make_checkpointer()
+        model = torch.nn.Linear(4, 4)
+
+        mock_load_hf.return_value = {"weight": torch.randn(4, 4), "bias": torch.randn(4)}
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch.object(checkpointer, "_do_load") as mock_dcp_load,
+        ):
+            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
+
+        mock_load_full.assert_called_once()
+        mock_dcp_load.assert_not_called()
+
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
@@ -417,9 +436,7 @@ class TestLoadModelCustomModelGuard:
 
         with (
             patch("os.path.exists", return_value=True),
-            patch(
-                "nemo_automodel.components.checkpoint.checkpointing.ModelState"
-            ) as MockModelState,
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as MockModelState,
             patch(
                 "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
                 side_effect=lambda m, sd, **kw: sd,
@@ -529,6 +546,23 @@ class TestInitializeModelWeights:
         Checkpointer.initialize_model_weights(model, torch.device("cpu"))
 
         model.initialize_weights.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "architecture",
+        ["Gemma3ForCausalLM", "Gemma3ForConditionalGeneration"],
+        ids=["causal_lm", "conditional_generation"],
+    )
+    def test_skips_for_gemma3(self, architecture):
+        """Gemma3 models should skip init — _init_weights zeros embedding padding_idx which fails with DTensors."""
+        model = self._make_meta_model()
+        model.config = SimpleNamespace(architectures=[architecture])
+        model._is_hf_initialized = True
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_not_called()
+        assert model._is_hf_initialized is True
 
     def test_handles_missing_config_gracefully(self):
         """Model without config.architectures should not raise."""

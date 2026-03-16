@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import glob
 import logging
 import os
@@ -75,6 +76,19 @@ def _is_safetensors_checkpoint(path: str) -> bool:
     return len(glob.glob(os.path.join(path, "*.safetensors"))) > 0
 
 
+def _is_bin_checkpoint(path: str) -> bool:
+    """Return True if path looks like a PyTorch .bin checkpoint."""
+    if os.path.isfile(path):
+        return path.endswith(".bin")
+    if not os.path.isdir(path):
+        return False
+    if os.path.isfile(os.path.join(path, "pytorch_model.bin.index.json")):
+        return True
+    if os.path.isfile(os.path.join(path, "pytorch_model.bin")):
+        return True
+    return len(glob.glob(os.path.join(path, "*.bin"))) > 0
+
+
 if _is_geq_torch_2_9():
     from torch.distributed.checkpoint.staging import DefaultStager
     from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType, AsyncSaveResponse
@@ -122,6 +136,8 @@ class CheckpointingConfig:
     # This should be used for remote storage systems that don't support direct-append or non-sequential writes.
     staging_dir: str | None = None  # Optional directory for staging files during consolidation.
     # If provided, temp files will be created here instead of system temp. Useful when system temp has limited space.
+    v4_compatible: bool = False  # If True, save the original pretrained config.json (with quantization_config removed)
+    # instead of the in-memory v5 config.  Useful when downstream consumers (e.g. vLLM) expect a v4-format config.
 
     def __post_init__(self):
         """
@@ -132,6 +148,15 @@ class CheckpointingConfig:
             f"Unsupported model save format: {self.model_save_format}. Supported formats: {formats}"
         )
         self.model_save_format = SerializationFormat[self.model_save_format.upper()]
+        if self.save_consolidated or False:
+            if not self.v4_compatible:
+                logging.warning(
+                    "save_consolidated=True but v4_compatible=False; "
+                    "checkpoint assets may be not compatible with transformers v4; "
+                    "[experimental] set --checkpoint.v4_compatible=True to enable"
+                )
+            else:
+                logging.warning("[experimental] v4_compatible=True enables transformers v4 compatibility")
 
         # Async is only enabled for torch >= 2.9.0 currently because of large API changes in async DCP from 2.8.0 to 2.9.0
         if self.is_async and not _is_geq_torch_2_9():
@@ -254,6 +279,7 @@ class Checkpointer:
                 peft_config=peft_config,
                 fqn_to_file_index_mapping=fqn_to_file_index_mapping,
                 original_model_path=self._get_original_model_path(model_state),
+                v4_compatible=self.config.v4_compatible,
             )
 
         storage_writer = self._get_storage_writer(
@@ -363,14 +389,15 @@ class Checkpointer:
         # local DTensor shard.  This avoids NCCL collectives entirely, side-stepping
         # the broadcast_from_rank0 hang where rank 0's synchronous CPU→GPU copies
         # fall behind other ranks' async allocations.
+        is_safetensors = _is_safetensors_checkpoint(model_path)
         if (
             is_init_step
             and len(model_state.model) == 1
-            and _is_safetensors_checkpoint(model_path)
-            and not _is_custom_model(model_state.model[0])
+            and (_is_bin_checkpoint(model_path) or (is_safetensors and not _is_custom_model(model_state.model[0])))
         ):
             t0 = time.monotonic()
-            state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
+            weights_only = not _is_remote_code_model(model_state.model[0])
+            state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path, weights_only=weights_only)
             t_disk = time.monotonic()
             if state_dict_from_disk is not None:
                 state_dict_from_disk = _maybe_adapt_state_dict_from_hf(
@@ -403,6 +430,8 @@ class Checkpointer:
                 f"({gb / total_s:.2f} GB/s overall | "
                 f"disk read {disk_s:.2f}s, distribute {dist_s:.2f}s)"
             )
+            del state_dict_from_disk
+            gc.collect()
             return
 
         # Standard loading path (DCP copies into model's existing tensors; dtypes follow the model)
@@ -425,6 +454,9 @@ class Checkpointer:
 
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
         model_state.load_state_dict(state_dict, strict=not (len(model_state.model) > 1 or has_state_dict_adapter))
+
+        del state_dict
+        gc.collect()
 
     @staticmethod
     def initialize_model_weights(
@@ -463,17 +495,30 @@ class Checkpointer:
         # We need to set them to False and call initialize_weights to re-initialize the weights.
 
         # Some models cannot call initialize_weights when sharded with DTensors:
-        # - Gemma3ForConditionalGeneration: requires setting a row to zeros in the embedding matrix,
-        #   which is not supported for DTensors in the pinned torch version.
+        # - Gemma3ForConditionalGeneration / Gemma3ForCausalLM: _init_weights() calls
+        #   init.zeros_(module.weight[module.padding_idx]) on the embedding layer, which
+        #   triggers DTensor redistribute and fails with sharded (TP) embeddings.
         # - NemotronHForCausalLM: the HF remote code's _init_weights uses dt_bias.copy_()
-        #   which fails with DTensors. Note: v3 (MoE) has n_routed_experts and uses our custom
-        #   implementation which handles this correctly.
+        #   which fails with DTensors. This applies to:
+        #   - v2 (non-MoE, no n_routed_experts): always uses HF remote code.
+        #   - v3 (MoE, has n_routed_experts) with force_hf=True: also uses HF remote code
+        #     (detected via model.backbone attribute). When force_hf=False, v3 uses our custom
+        #     implementation (model.model with ModuleDict layers) which handles this correctly.
         try:
             model_class = model.config.architectures[0]
         except Exception:
             model_class = ""
         is_nemotron_v2 = model_class == "NemotronHForCausalLM" and not getattr(model.config, "n_routed_experts", None)
-        skip_initialize_weights = is_nemotron_v2
+        is_nemotron_v3_hf = (
+            model_class == "NemotronHForCausalLM"
+            and getattr(model.config, "n_routed_experts", None)  # is Nemotron V3
+            and hasattr(model, "backbone")  # is HF remote code
+        )
+        skip_initialize_weights = (
+            model_class in ["Gemma3ForConditionalGeneration", "Gemma3ForCausalLM"]
+            or is_nemotron_v2
+            or is_nemotron_v3_hf
+        )
         if not skip_initialize_weights:
             for _, module in model.named_modules():
                 if hasattr(module, "_is_hf_initialized"):
@@ -1231,7 +1276,7 @@ def _convert_checkpoint_with_transformers(
         # Now apply all the conversions
         for first_param_name, mapping in param_name_to_mapping.items():
             try:
-                realized_value, _ = mapping.convert(first_param_name, model=model, config=model.config)
+                realized_value = mapping.convert(first_param_name, model=model, config=model.config)
                 for target_name, param in realized_value.items():
                     param = param[0] if isinstance(param, list) else param
                     converted_state_dict[target_name] = param
@@ -1292,23 +1337,54 @@ def _model_has_dtensors(module: nn.Module) -> bool:
 
 
 def _is_custom_model(module: nn.Module) -> bool:
-    """True if the model has a custom implementation in nemo_automodel/components/models/."""
-    return any((c.__module__ or "").startswith("nemo_automodel.components.models.") for c in type(module).__mro__)
+    """True if the model has a custom implementation in nemo_automodel/components/models/.
 
-
-def _load_hf_checkpoint_preserving_dtype(model_path: str) -> Optional[dict[str, torch.Tensor]]:
+    The generic HFCheckpointingMixin (in .common.hf_checkpointing_mixin) is
+    injected into every model by _get_mixin_wrapped_class and does NOT count
+    as a "custom model".  Only actual model implementations (e.g. llama,
+    deepseek_v3) that live under nemo_automodel.components.models qualify.
     """
-    Load a HuggingFace checkpoint (safetensors) into a new state dict so tensor dtypes
+    _MIXIN_MODULE = "nemo_automodel.components.models.common."
+    return any(
+        (c.__module__ or "").startswith("nemo_automodel.components.models.")
+        and not (c.__module__ or "").startswith(_MIXIN_MODULE)
+        for c in type(module).__mro__
+    )
+
+
+def _is_remote_code_model(module: nn.Module) -> bool:
+    """True if the model was loaded with trust_remote_code (HF dynamic modules)."""
+    return any("transformers_modules" in (c.__module__ or "") for c in type(module).__mro__)
+
+
+def _load_hf_checkpoint_preserving_dtype(
+    model_path: str, weights_only: bool = True
+) -> Optional[dict[str, torch.Tensor]]:
+    """
+    Load a HuggingFace checkpoint into a new state dict so tensor dtypes
     match the checkpoint (e.g. bf16). Used when loading the base model so FSDP sees
     uniform dtype instead of the model's init dtypes (e.g. float32).
-    Returns None if the path is not a valid safetensors checkpoint.
+    Prefers safetensors but falls back to .bin files.
+    Returns None if no loadable checkpoint is found.
+
+    Args:
+        model_path: Path to checkpoint file or directory.
+        weights_only: Forwarded to ``torch.load`` when loading ``.bin`` files.
     """
-    try:
-        from safetensors import safe_open
-    except ImportError:
-        return None
-    if not _is_safetensors_checkpoint(model_path):
-        return None
+
+    if _is_bin_checkpoint(model_path):
+        return _load_hf_bin_checkpoint(model_path, weights_only=weights_only)
+    elif _is_safetensors_checkpoint(model_path):
+        return _load_hf_safetensors_checkpoint(model_path)
+    return None
+
+
+def _load_hf_safetensors_checkpoint(model_path: str) -> Optional[dict[str, torch.Tensor]]:
+    """
+    Load a safetensors checkpoint into a state dict.
+    """
+    from safetensors import safe_open
+
     out: dict[str, torch.Tensor] = {}
     if os.path.isfile(model_path):
         return dict(load_file(model_path))
@@ -1332,6 +1408,62 @@ def _load_hf_checkpoint_preserving_dtype(model_path: str) -> Optional[dict[str, 
             with safe_open(sf_path, framework="pt", device="cpu") as f:
                 for key in f.keys():
                     out[key] = f.get_tensor(key)
+    return out if out else None
+
+
+def _load_hf_bin_checkpoint(model_path: str, weights_only: bool = True) -> Optional[dict[str, torch.Tensor]]:
+    """
+    Load a HuggingFace .bin checkpoint into a state dict.
+
+    Handles single-file (pytorch_model.bin), sharded (pytorch_model.bin.index.json),
+    and glob fallback (*.bin) layouts.
+    Returns None if no .bin files are found.
+
+    Args:
+        model_path: Path to checkpoint file or directory.
+        weights_only: Passed to ``torch.load``.  Default ``True`` for safety;
+            set to ``False`` for remote-code models whose checkpoints may
+            contain custom pickled objects.
+    """
+    if not _is_bin_checkpoint(model_path):
+        return None
+
+    load_kwargs = dict(map_location="cpu", weights_only=weights_only)
+
+    if os.path.isfile(model_path):
+        return torch.load(model_path, **load_kwargs)
+
+    # Sharded: read the index and load each shard
+    index_file = os.path.join(model_path, "pytorch_model.bin.index.json")
+    if os.path.isfile(index_file):
+        import json
+
+        with open(index_file) as f:
+            index = json.load(f)
+        weight_map: dict[str, str] = index.get("weight_map", {})
+        out: dict[str, torch.Tensor] = {}
+        loaded_files: set[str] = set()
+        for key, filename in weight_map.items():
+            if filename in loaded_files:
+                continue
+            bin_path = os.path.join(model_path, filename)
+            if not os.path.isfile(bin_path):
+                continue
+            shard = torch.load(bin_path, **load_kwargs)
+            out.update(shard)
+            loaded_files.add(filename)
+        return out if out else None
+
+    # Single file
+    single = os.path.join(model_path, "pytorch_model.bin")
+    if os.path.isfile(single):
+        return torch.load(single, **load_kwargs)
+
+    # Glob fallback
+    out = {}
+    for bin_path in sorted(glob.glob(os.path.join(model_path, "*.bin"))):
+        shard = torch.load(bin_path, **load_kwargs)
+        out.update(shard)
     return out if out else None
 
 

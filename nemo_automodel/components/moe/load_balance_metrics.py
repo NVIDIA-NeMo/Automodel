@@ -23,15 +23,23 @@ Expert utilization is a ratio of ``current_load / ideal_load`` where
 expert receives exactly its fair share; >1 = overloaded, <1 = underloaded,
 0 = dead expert.
 
+Expert diversity measures how many experts are meaningfully used:
+- ``dead_expert_frac``: fraction of experts receiving zero tokens.
+- ``expert_diversity``: ``exp(H) / N`` where ``H`` is Shannon entropy of the
+  routing distribution (1.0 = all experts equally used, 0 = collapsed).
+
 Modes:
 - **brief**: Aggregated scalars (mean/median/min/max of cv and expert
-  utilization) plus top-K/bottom-K individual expert utilization ratios.
+  utilization, diversity metrics) plus top-K/bottom-K individual expert
+  utilization ratios.
 - **detailed**: Everything in brief, plus per-layer breakdowns
-  (``moe/layer_{i}/cv``, ``moe/layer_{i}/utilization_mean``, etc.).
+  (``moe/layer_{i}/cv``, ``moe/layer_{i}/utilization_mean``,
+  ``moe/layer_{i}/expert_diversity``, etc.).
 """
 
 from __future__ import annotations
 
+import math
 import statistics
 
 import torch
@@ -174,7 +182,7 @@ def _compute_expert_utilization(
     Returns:
         Dict like ``{"moe_expert_utilization/layer_0_expert_5": 1.23, ...}``.
     """
-    if not per_layer_utilizations:
+    if not per_layer_utilizations or top_k <= 0:
         return {}
 
     # Build flat list of (utilization, layer_idx, expert_idx)
@@ -233,6 +241,79 @@ def _compute_utilization_aggregates(
     return metrics
 
 
+def _compute_diversity_per_layer(
+    per_layer_utilizations: list[torch.Tensor],
+) -> list[dict[str, float]]:
+    """Compute per-layer expert diversity metrics from utilization ratios.
+
+    For each layer, computes:
+    - ``dead_expert_frac``: fraction of experts with zero load.
+    - ``expert_diversity``: ``exp(H) / N`` where ``H`` is Shannon entropy of
+      the token routing distribution.  1.0 = perfectly uniform, 1/N = all
+      tokens routed to a single expert, 0 = all-zero load.
+
+    Args:
+        per_layer_utilizations: List of ``Tensor[n_experts]`` with utilization
+            ratios (1.0 = ideal load).
+
+    Returns:
+        List of dicts (one per layer) with the metrics above.
+    """
+    results: list[dict[str, float]] = []
+    for util in per_layer_utilizations:
+        n_experts = util.shape[0]
+        total = util.sum()
+
+        if total == 0:
+            results.append({"dead_expert_frac": 1.0, "expert_diversity": 0.0})
+            continue
+
+        dead_expert_frac = (util == 0).float().mean().item()
+
+        # Probability distribution: p_i = util_i / sum(util)
+        p = util / total
+        p_nonzero = p[p > 0]
+        H = -(p_nonzero * p_nonzero.log()).sum().item()
+        effective_frac = math.exp(H) / n_experts if n_experts > 0 else 0.0
+
+        results.append({"dead_expert_frac": dead_expert_frac, "expert_diversity": effective_frac})
+    return results
+
+
+def _aggregate_diversity_metrics(
+    per_layer_diversity: list[dict[str, float]],
+    per_layer: bool = False,
+) -> dict[str, float]:
+    """Aggregate per-layer diversity metrics into model-level summaries.
+
+    Args:
+        per_layer_diversity: Output of :func:`_compute_diversity_per_layer`.
+        per_layer: If ``True``, also emit per-layer keys (for detailed mode).
+
+    Returns:
+        Dict with ``moe/dead_expert_frac_mean``, ``moe/expert_diversity_mean``,
+        ``moe/expert_diversity_min``, and optionally per-layer keys.
+    """
+    if not per_layer_diversity:
+        return {}
+
+    metrics: dict[str, float] = {}
+
+    dead_fracs = [m["dead_expert_frac"] for m in per_layer_diversity]
+    diversities = [m["expert_diversity"] for m in per_layer_diversity]
+
+    metrics["moe/dead_expert_frac_mean"] = sum(dead_fracs) / len(dead_fracs)
+    metrics["moe/expert_diversity_mean"] = sum(diversities) / len(diversities)
+    metrics["moe/expert_diversity_min"] = min(diversities)
+
+    if per_layer:
+        for i, m in enumerate(per_layer_diversity):
+            metrics[f"moe/layer_{i}/dead_expert_frac"] = m["dead_expert_frac"]
+            metrics[f"moe/layer_{i}/expert_diversity"] = m["expert_diversity"]
+
+    return metrics
+
+
 def compute_brief_metrics(
     layer_loads: dict[str, dict],
     top_k: int = 5,
@@ -269,6 +350,7 @@ def compute_brief_metrics(
 
     metrics.update(_compute_expert_utilization(per_layer_utils, top_k=top_k))
     metrics.update(_compute_utilization_aggregates(per_layer_utils, per_layer=False))
+    metrics.update(_aggregate_diversity_metrics(_compute_diversity_per_layer(per_layer_utils), per_layer=False))
     return metrics
 
 
@@ -310,4 +392,5 @@ def compute_detailed_metrics(
 
     metrics.update(_compute_expert_utilization(per_layer_utils, top_k=top_k))
     metrics.update(_compute_utilization_aggregates(per_layer_utils, per_layer=True))
+    metrics.update(_aggregate_diversity_metrics(_compute_diversity_per_layer(per_layer_utils), per_layer=True))
     return metrics

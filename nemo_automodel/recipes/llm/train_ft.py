@@ -57,12 +57,14 @@ from nemo_automodel.components.distributed.megatron_fsdp import fully_shard_opti
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
+from nemo_automodel.components.loggers.comet_utils import build_comet
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.mlflow_utils import build_mlflow
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
@@ -87,6 +89,8 @@ from nemo_automodel.components.utils.model_utils import (
 )
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.shared.te_patches import apply_te_patches
+from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -150,6 +154,7 @@ def build_model(
     cfg_moe=None,
     activation_checkpointing=False,
     unfreeze_modules: list[str] | None = None,
+    sdpa_method: list[str] | None = None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model.
 
@@ -169,6 +174,9 @@ def build_model(
         cfg_moe: MoEParallelizerConfig instance, or ConfigNode to be converted.
         activation_checkpointing: Whether to enable activation checkpointing.
         unfreeze_modules: List of module names/substrings to unfreeze.
+        sdpa_method: Explicit list of SDPA backend name strings (e.g.
+            ``["flash_attention", "efficient_attention"]``), or ``None`` to
+            auto-select based on CP / activation checkpointing.
     """
     with ScopedRNG(seed=seed, ranked=True):
         kwargs = {
@@ -178,6 +186,7 @@ def build_model(
             "moe_mesh": moe_mesh,
             "distributed_config": distributed_config,
             "pipeline_config": pipeline_config,
+            "sdpa_method": sdpa_method,
         }
 
         if cfg_qat is not None and cfg_qat.get("enabled", False):
@@ -228,6 +237,10 @@ def build_model(
         else:
             # For non-NemoAutoModel entry points (e.g., build_gpt2_model),
             # instantiate the model first, then apply infrastructure separately.
+            # Note: sdpa_method is not supported here — SDPA patching only runs
+            # inside NeMoAutoModel._build_model.
+            if sdpa_method is not None:
+                logger.warning("sdpa_method is ignored for non-NeMoAutoModel targets.")
             # We must convert config objects into runtime objects (model_wrapper,
             # autopipeline, parallelize_fn, etc.) via instantiate_infrastructure,
             # exactly as from_pretrained/from_config do internally.
@@ -283,6 +296,13 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
         distributed_config: The distributed configuration.
         device_mesh: The device mesh.
     """
+    # Resolve dtype strings (e.g. "torch.bfloat16") to torch.dtype objects for
+    # optimizers like TE FusedAdam that accept dtype kwargs.
+    for attr in ("master_weight_dtype", "exp_avg_dtype", "exp_avg_sq_dtype"):
+        val = getattr(cfg_opt, attr, None)
+        if isinstance(val, str):
+            setattr(cfg_opt, attr, dtype_from_str(val))
+
     if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
         # TP does not support foreach
         cfg_opt.foreach = False
@@ -467,29 +487,41 @@ def build_dataloader(
                 logging.warning("IterableDataset does not support sharding; Data may be duplicated across ranks.")
 
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
+        packing_strategy = getattr(cfg_ps, "packing_strategy", "thd")
 
-        # check if packed sequence is supported
+        # check if packed sequence is supported (only for thd strategy)
         supports_seq_lens = _supports_seq_lens(model)
-        if packed_sequence_size > 0 and not supports_seq_lens:
+        if packed_sequence_size > 0 and packing_strategy == "thd" and not supports_seq_lens:
             logging.warning("Packed sequence is not supported without seq_lens; disabling packed sequence")
             packed_sequence_size = 0
 
         # Apply packing if configured
-        # Apply packing if configured
         if packed_sequence_size > 0:
-            logger.info(f"Packing dataset with size: {packed_sequence_size}")
+            logger.info(f"Packing dataset with size: {packed_sequence_size}, strategy: {packing_strategy}")
             if hasattr(ds, "shuffle"):
                 ds = ds.shuffle(seed)
-            # Determine whether to include seq_lens/seq_lens_padded in packed samples.
-            # Priority: explicit config > model.forward signature detection > default False
-            ds = pack_dataset(
-                ds,
-                split=cfg_ds.split,  # Assumes split is defined in dataset config
-                packed_sequence_size=packed_sequence_size,
-                max_packs=getattr(cfg_ps, "max_packs", None),
-                padding_idx=getattr(tokenizer, "pad_token_id", 0),
-                cp_size=cp_size,
-            )
+
+            if packing_strategy == "neat":
+                from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
+
+                ds = neat_pack_dataset(
+                    ds,
+                    split=cfg_ds.split,
+                    pack_size=packed_sequence_size,
+                    max_packs=getattr(cfg_ps, "max_packs", None),
+                    padding_idx=getattr(tokenizer, "pad_token_id", 0),
+                    drop_long_samples=getattr(cfg_ps, "drop_long_samples", False),
+                )
+            else:
+                # "thd" — existing packing logic
+                ds = pack_dataset(
+                    ds,
+                    split=cfg_ds.split,
+                    packed_sequence_size=packed_sequence_size,
+                    max_packs=getattr(cfg_ps, "max_packs", None),
+                    padding_idx=getattr(tokenizer, "pad_token_id", 0),
+                    cp_size=cp_size,
+                )
 
         if isinstance(ds, MegatronPretraining):
             ds = ds.get_dataset(split=cfg_ds.splits_to_build)
@@ -837,6 +869,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         setup_logging()
 
         apply_cache_compatibility_patches()
+        apply_te_patches()
         # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
         # Enable NVTX patching only when explicitly requested in config
@@ -859,6 +892,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.mlflow_logger = build_mlflow(self.cfg)
             self.mlflow_logger.log_params(self.cfg.to_dict())
             logging.info("MLflow experiment tracking enabled")
+
+        self.comet_logger = None
+        if self.dist_env.is_main and hasattr(self.cfg, "comet"):
+            self.comet_logger = build_comet(self.cfg)
+            self.comet_logger.log_params(self.cfg.to_dict())
+            logging.info("Comet experiment tracking enabled")
 
         # Log experiment details on main rank
         self._log_experiment_details()
@@ -936,6 +975,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
+        # Disable fused RoPE when context parallelism is enabled (cp > 1)
+        if self.dist_setup.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", False):
+            logging.info("Disabling rope_fusion because cp_size=%d > 1", self.dist_setup.cp_size)
+            self.cfg.model.backend.rope_fusion = False
+
         model = build_model(
             self.cfg.model,
             self.peft_config,
@@ -951,6 +995,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_qat=self.cfg.get("qat", None),
             cfg_moe=self.dist_setup.moe_config,
             activation_checkpointing=self.dist_setup.activation_checkpointing,
+            sdpa_method=self.cfg.get("sdpa_method", None),
         )
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 
@@ -1090,7 +1135,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         moe_metrics_cfg = self.cfg.get("moe_metrics", None)
         mode = moe_metrics_cfg.get("mode", "brief") if moe_metrics_cfg else "brief"
-        top_k = moe_metrics_cfg.get("top_k_experts", 5) if moe_metrics_cfg else 5
+        top_k = moe_metrics_cfg.get("top_k_experts", 0) if moe_metrics_cfg else 0
         if mode == "detailed":
             detailed_every = moe_metrics_cfg.get("detailed_every_steps", None) if moe_metrics_cfg else None
             if detailed_every is None or step % detailed_every == 0:
@@ -1305,6 +1350,27 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+
+        # MoE aux loss gradients are injected via MoEAuxLossAutoScaler, which
+        # multiplies them by main_loss_backward_scale during backward.  This
+        # counteracts the unwanted scaling that FSDP and PP post-hoc rescaling
+        # apply to *all* gradients (including aux loss):
+        #
+        #   Non-PP: FSDP allreduce divides grads by dp_group_size.
+        #           Scale = dp_group_size  →  net = 1.
+        #
+        #   PP:     FSDP divides by dp_group_size, then
+        #           scale_grads_and_clip_grad_norm divides by
+        #           (num_label_tokens / dp_group_size).  The dp_group_size
+        #           factors cancel, leaving net 1/num_label_tokens.
+        #           Scale = num_label_tokens  →  net = 1.
+        if self.pp_enabled:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(float(num_label_tokens))
+        else:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+                float(self._get_dp_group_size(include_cp=True))
+            )
+
         loss_buffer = []
 
         # number of tokens in the batch, excluding any tail padding.
@@ -1511,6 +1577,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.mlflow_logger is not None:
             self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
+        if self.comet_logger is not None:
+            self.comet_logger.log_metrics(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
+
         # JSONL validation log
         if not metric_logger is None:
             metric_logger.log(log_data)
@@ -1545,16 +1614,23 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        # Log to remote services (WandB, MLflow) according to step_scheduler frequency
+        # Log to remote services (WandB, MLflow, Comet) according to step_scheduler frequency
         if self.step_scheduler.is_remote_logging_step:
             if wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
             if self.mlflow_logger is not None:
                 self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
+            if self.comet_logger is not None:
+                self.comet_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         # Log MoE load balance metrics (already collected/reduced on all ranks)
-        if self.step_scheduler.is_remote_logging_step and wandb.run is not None:
-            self._log_moe_metrics(self.step_scheduler.step, wandb.log)
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
+                self._log_moe_metrics(self.step_scheduler.step, wandb.log)
+            if self.comet_logger is not None:
+                self._log_moe_metrics(
+                    self.step_scheduler.step, lambda m, step: self.comet_logger.log_metrics(m, step=step)
+                )
 
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
