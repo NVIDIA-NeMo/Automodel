@@ -90,7 +90,13 @@ class HunyuanVideoProcessor(BaseVideoProcessor):
         """
         from diffusers import HunyuanVideo15ImageToVideoPipeline
 
+        from nemo_automodel.shared.t5_patches import patch_t5_layer_norm
+
         dtype = torch.float16 if "cuda" in device else torch.float32
+
+        # Apex's FusedRMSNorm doesn't support fp16/bf16 on CUDA.  Patch before
+        # loading so that the ByT5 text encoder uses a native implementation.
+        patch_t5_layer_norm()
 
         logger.info("[HunyuanVideo] Loading pipeline from %s...", model_name)
 
@@ -119,6 +125,22 @@ class HunyuanVideoProcessor(BaseVideoProcessor):
         if hasattr(vae, "enable_slicing"):
             vae.enable_slicing()
             logger.info("  VAE slicing enabled")
+
+        # Move text encoder and image encoder to device once up front.
+        # Previously these were moved per-video (to device → encode → to CPU)
+        # which corrupted internal rotary-embedding caches in the Qwen text
+        # encoder, causing device-mismatch errors on subsequent videos.
+        logger.info("  Moving text encoder to %s...", device)
+        pipeline.text_encoder.to(device)
+        pipeline.text_encoder.eval()
+
+        logger.info("  Moving text encoder 2 (ByT5) to %s...", device)
+        pipeline.text_encoder_2.to(device)
+        pipeline.text_encoder_2.eval()
+
+        logger.info("  Moving image encoder to %s...", device)
+        pipeline.image_encoder.to(device)
+        pipeline.image_encoder.eval()
 
         logger.info("[HunyuanVideo] Models loaded successfully!")
 
@@ -306,10 +328,6 @@ class HunyuanVideoProcessor(BaseVideoProcessor):
         pipeline = models["pipeline"]
         dtype = models.get("dtype", torch.float16)
 
-        # Move text encoder to device
-        pipeline.text_encoder.to(device)
-        pipeline.text_encoder.eval()
-
         with torch.no_grad():
             (
                 prompt_embeds,
@@ -323,9 +341,6 @@ class HunyuanVideoProcessor(BaseVideoProcessor):
                 batch_size=1,
                 num_videos_per_prompt=1,
             )
-
-        # Move back to CPU to free VRAM
-        pipeline.text_encoder.to("cpu")
 
         return {
             "text_embeddings": prompt_embeds.detach().cpu(),
@@ -354,9 +369,6 @@ class HunyuanVideoProcessor(BaseVideoProcessor):
         pipeline = models["pipeline"]
         dtype = models.get("dtype", torch.float16)
 
-        # Move image encoder to device
-        pipeline.image_encoder.to(device)
-
         # Convert numpy to PIL Image if needed
         if isinstance(first_frame, np.ndarray):
             first_frame_pil = Image.fromarray(first_frame)
@@ -370,9 +382,6 @@ class HunyuanVideoProcessor(BaseVideoProcessor):
                 device=device,
                 dtype=dtype,
             )
-
-        # Move back to CPU
-        pipeline.image_encoder.to("cpu")
 
         return image_embeds.detach().cpu()
 
