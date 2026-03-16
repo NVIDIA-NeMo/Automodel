@@ -101,7 +101,7 @@ def load_hf_dataset(dataset_id, split, name=None, shuffle_seed=None):
 
     from nemo_automodel.components.datasets.llm.chat_dataset import _load_openai_messages
 
-    data = _load_openai_messages(dataset_id, split=split, name=name)
+    data = _load_openai_messages(dataset_id, split=split, name=name, shuffle_seed=shuffle_seed)
     # _load_openai_messages returns an HF Dataset for repo IDs, or a plain
     # list of dicts for local files.  Wrap lists so .filter()/.map() work.
     if isinstance(data, list):
