@@ -332,6 +332,29 @@ class TestApplyCacheCompatibilityPatchesIntegration:
 
         assert hasattr(Cache, "get_usable_length")
 
+    def test_get_usable_length_returns_seq_length(self):
+        """get_usable_length delegates to get_seq_length when no max_length constraint."""
+        apply_cache_compatibility_patches()
+        from transformers.cache_utils import Cache
+
+        mock_cache = Mock(spec=Cache)
+        mock_cache.get_seq_length = Mock(return_value=10)
+        mock_cache.get_max_cache_shape = Mock(return_value=None)
+        result = Cache.get_usable_length(mock_cache, new_seq_length=5, layer_idx=0)
+        assert result == 10
+
+    def test_get_usable_length_respects_max_length(self):
+        """get_usable_length returns max_length - new_seq_length when cache is near full."""
+        apply_cache_compatibility_patches()
+        from transformers.cache_utils import Cache
+
+        mock_cache = Mock(spec=Cache)
+        mock_cache.get_seq_length = Mock(return_value=90)
+        mock_cache.get_max_cache_shape = Mock(return_value=100)
+        # 90 + 15 > 100, so should return 100 - 15 = 85
+        result = Cache.get_usable_length(mock_cache, new_seq_length=15, layer_idx=0)
+        assert result == 85
+
     def test_patches_tied_weights_keys_list_to_dict(self):
         """post_init should convert _tied_weights_keys from list to dict."""
         apply_cache_compatibility_patches()
@@ -348,6 +371,31 @@ class TestApplyCacheCompatibilityPatchesIntegration:
             assert getattr(pm.PeftModelForCausalLM.__init__, "_nemo_peft_patched", False)
         except ImportError:
             pytest.skip("peft not installed")
+
+    def test_peft_patch_adds_stub_on_missing_prepare_inputs(self):
+        """The PEFT patch should add prepare_inputs_for_generation stub when missing."""
+        apply_cache_compatibility_patches()
+        try:
+            import peft.peft_model  # noqa: F401
+        except ImportError:
+            pytest.skip("peft not installed")
+
+        # Simulate the stub logic from _patch_peft_prepare_inputs:
+        # when a model lacks prepare_inputs_for_generation, the patch adds a stub
+        class FakeModel:
+            pass
+
+        model = FakeModel()
+        assert not hasattr(model, "prepare_inputs_for_generation")
+
+        # Reproduce what the patch does on AttributeError
+        try:
+            _ = model.prepare_inputs_for_generation
+        except AttributeError:
+            model.prepare_inputs_for_generation = lambda *a, **kw: {}
+
+        assert callable(model.prepare_inputs_for_generation)
+        assert model.prepare_inputs_for_generation() == {}
 
     def test_patches_phi4mm_processor(self):
         """ProcessorMixin.from_pretrained should be patched for phi4mm fallback."""

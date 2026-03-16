@@ -19,7 +19,6 @@ import pytest
 import torch
 from PIL import Image as PILImage
 
-
 CONVERSATION = [
     {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
     {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
@@ -363,7 +362,72 @@ def test_phi4_mm_collate_fn_handles_audio_and_trimming(collate_mod, monkeypatch)
     assert torch.equal(batch["extra"], torch.arange(len(examples), dtype=torch.long))
     # Labels are shifted by [:, 1:] — not overwritten with full labels
     assert torch.equal(batch["labels"], labels_stub[:, 1:])
+
+
+def test_phi4_mm_collate_fn_input_mode_from_processor(collate_mod, monkeypatch):
+    """When the processor already sets input_mode, the collate fn should not override it."""
+
+    class Phi4ProcessorWithInputMode:
+        def __init__(self):
+            self.tokenizer = _DummyPhi4Tokenizer(pad_token_id=0)
+
+        def __call__(self, *, text, audios, return_tensors, padding, truncation, max_length):
+            bs = len(text)
+            ids = torch.arange(1, bs * 3 + 1, dtype=torch.long).reshape(bs, 3)
+            return {"input_ids": ids, "attention_mask": torch.ones_like(ids), "input_mode": torch.tensor([2])}
+
+    examples = [{"conversation": CONVERSATION, "audio": {"array": [0.1], "sampling_rate": 16000}}]
+    monkeypatch.setattr(
+        collate_mod, "build_labels", lambda *a, **kw: torch.tensor([[1, 2, 3]], dtype=torch.long), raising=True
+    )
+    batch = collate_mod.phi4_mm_collate_fn(examples, Phi4ProcessorWithInputMode())
+    assert torch.equal(batch["input_mode"], torch.tensor([2]))
+
+
+def test_phi4_mm_collate_fn_input_mode_fallback(collate_mod, monkeypatch):
+    """When processor doesn't set input_mode, collate fn computes it from batch keys."""
+
+    class Phi4ProcessorWithAudioEmbeds:
+        def __init__(self):
+            self.tokenizer = _DummyPhi4Tokenizer(pad_token_id=0)
+
+        def __call__(self, *, text, audios, return_tensors, padding, truncation, max_length):
+            bs = len(text)
+            ids = torch.arange(1, bs * 3 + 1, dtype=torch.long).reshape(bs, 3)
+            return {
+                "input_ids": ids,
+                "attention_mask": torch.ones_like(ids),
+                "input_audio_embeds": torch.randn(bs, 4, 80),
+            }
+
+    examples = [{"conversation": CONVERSATION, "audio": {"array": [0.1], "sampling_rate": 16000}}]
+    monkeypatch.setattr(
+        collate_mod, "build_labels", lambda *a, **kw: torch.tensor([[1, 2, 3]], dtype=torch.long), raising=True
+    )
+    batch = collate_mod.phi4_mm_collate_fn(examples, Phi4ProcessorWithAudioEmbeds())
+    assert batch["input_mode"] == 2  # SPEECH
+
+
+def test_phi4_mm_collate_fn_raw_audio_passthrough(collate_mod, monkeypatch):
+    """Audio that is neither a dict nor a tuple/list should pass through as-is."""
+    import numpy as np
+
+    processor = DummyPhi4Processor()
+    raw_array = np.array([0.5, -0.5])
+    examples = [
+        {"conversation": CONVERSATION, "audio": raw_array},
+    ]
+    monkeypatch.setattr(
+        collate_mod, "build_labels", lambda *a, **kw: torch.tensor([[1, 2, 3]], dtype=torch.long), raising=True
+    )
+    collate_mod.phi4_mm_collate_fn(examples, processor)
+    # The raw array should be wrapped as a single-element tuple by the collate fn
+    forward_call = processor.forward_calls[0]
+    assert forward_call["audios"][0] is raw_array
+
+
 @pytest.fixture()
+
 def collate_mod():
     import nemo_automodel.components.datasets.vlm.collate_fns as _m
 
