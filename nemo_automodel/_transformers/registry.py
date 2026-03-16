@@ -243,6 +243,25 @@ class _ModelRegistry:
     def get_model_cls_from_model_arch(self, model_arch: str) -> Type[nn.Module]:
         return self.model_arch_name_to_cls[model_arch]
 
+    def resolve_custom_model_cls(self, architecture: str, config) -> Union[Type[nn.Module], None]:
+        """Return the custom model class if it exists and supports *config*, else ``None``.
+
+        Custom model classes may define a ``supports_config(config)`` classmethod
+        to opt out for specific HF configs (e.g. a Mistral3 VLM with a dense
+        Ministral3 text backbone instead of the expected Mistral4 MoE+MLA).
+        """
+        if architecture not in self.model_arch_name_to_cls:
+            return None
+        model_cls = self.model_arch_name_to_cls[architecture]
+        if hasattr(model_cls, "supports_config") and not model_cls.supports_config(config):
+            logger.info(
+                "Custom model %s does not support config %s, falling back to HF",
+                model_cls.__name__,
+                type(config).__name__,
+            )
+            return None
+        return model_cls
+
     def register(self, arch_name: str, model_cls: Type[nn.Module], exist_ok: bool = False) -> None:
         """Register a custom model class for a given architecture name."""
         self.model_arch_name_to_cls.register(arch_name, model_cls, exist_ok=exist_ok)

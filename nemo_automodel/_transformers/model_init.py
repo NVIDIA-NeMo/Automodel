@@ -201,8 +201,9 @@ def get_is_hf_model(config, force_hf):
     """
     # Finally make sure flash_attention is available
     architectures = getattr(config, "architectures", None) or []
-    is_hf_model = (not architectures or architectures[0] not in ModelRegistry.model_arch_name_to_cls) or force_hf
-    return is_hf_model
+    if force_hf or not architectures:
+        return True
+    return ModelRegistry.resolve_custom_model_cls(architectures[0], config) is None
 
 
 def _download_model_weights(hf_config, pretrained_model_name_or_path):
@@ -273,14 +274,14 @@ def _init_model(
 
     architectures = get_architectures(hf_config)
     # 2. If we have a custom model implementation available, we prioritize that over HF
-    if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
+    model_cls = ModelRegistry.resolve_custom_model_cls(architectures[0], hf_config) if architectures else None
+    if model_cls is not None:
         # if we are able to init the custom model, we will now download the model weights on local rank 0
         # Skip download for from_config (no pretrained path) or local paths
         if pretrained_model_name_or_path:
             _download_model_weights(hf_config, pretrained_model_name_or_path)
         logger.info(f"Using custom model implementation for {architectures[0]}")
         kwargs.pop("trust_remote_code", None)
-        model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
         # Treat config-related kwargs as config overrides (HF behavior) and
         # avoid forwarding them into model __init__.
         init_param_names = _get_init_param_names(model_cls)
