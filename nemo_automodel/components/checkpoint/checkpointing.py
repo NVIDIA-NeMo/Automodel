@@ -512,10 +512,12 @@ class Checkpointer:
         is_nemotron_v3_hf = (
             model_class == "NemotronHForCausalLM"
             and getattr(model.config, "n_routed_experts", None)  # is Nemotron V3
-            and hasattr(model, "backbone")                       # is HF remote code
+            and hasattr(model, "backbone")  # is HF remote code
         )
         skip_initialize_weights = (
-            model_class in ["Gemma3ForConditionalGeneration", "Gemma3ForCausalLM"] or is_nemotron_v2 or is_nemotron_v3_hf
+            model_class in ["Gemma3ForConditionalGeneration", "Gemma3ForCausalLM"]
+            or is_nemotron_v2
+            or is_nemotron_v3_hf
         )
         if not skip_initialize_weights:
             for _, module in model.named_modules():
