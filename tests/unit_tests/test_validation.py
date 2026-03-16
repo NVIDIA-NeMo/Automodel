@@ -180,6 +180,19 @@ class TestModelSupportsPP:
         _attach(model)
         assert model.supports.supports_pp is False
 
+    def test_pp_true_for_moe(self):
+        """MoE models support PP via MoEFSDPSyncMixin even without _pp_plan."""
+        cls = _make_moe_cls()
+        model = cls()
+        _attach(model)
+        assert model.supports.supports_pp is True
+
+    def test_pp_true_for_moe_with_te(self):
+        cls = _make_moe_te_cls()
+        model = cls()
+        _attach(model)
+        assert model.supports.supports_pp is True
+
 
 class TestModelSupportsCP:
     def test_hf_true_with_sdpa(self):
@@ -366,6 +379,13 @@ class TestValidateForMesh:
 
     def test_pp_passes_with_plan(self):
         model = _WithPP()
+        _attach(model)
+        validate_for_mesh(model, _mesh(pp=2))
+
+    def test_pp_passes_for_moe(self):
+        """MoE models support PP via MoEFSDPSyncMixin."""
+        cls = _make_moe_cls()
+        model = cls()
         _attach(model)
         validate_for_mesh(model, _mesh(pp=2))
 
