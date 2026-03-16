@@ -101,17 +101,21 @@ class DummyQwen3OmniProcessor:
         return {"input_ids": input_ids}
 
 
-class DummyPhi4Processor:
-    def __init__(self):
-        self.tokenizer = DummyTokenizer(pad_token_id=0)
-        self.chat_calls = []
-        self.forward_calls = []
-        self.produced_input_ids = None
+class _DummyPhi4Tokenizer(DummyTokenizer):
+    """Tokenizer with apply_chat_template for Phi4 tests."""
 
     def apply_chat_template(self, conversation, *, tokenize, **kwargs):
         assert tokenize is False
-        self.chat_calls.append({"conversation": conversation, "kwargs": kwargs})
+        self._chat_calls = getattr(self, "_chat_calls", [])
+        self._chat_calls.append({"conversation": conversation, "kwargs": kwargs})
         return "chat::" + conversation[0]["content"][0]["text"]
+
+
+class DummyPhi4Processor:
+    def __init__(self):
+        self.tokenizer = _DummyPhi4Tokenizer(pad_token_id=0)
+        self.forward_calls = []
+        self.produced_input_ids = None
 
     def __call__(
         self,
@@ -331,8 +335,9 @@ def test_phi4_mm_collate_fn_handles_audio_and_trimming(collate_mod, monkeypatch)
 
     batch = collate_mod.phi4_mm_collate_fn(examples, processor)
 
-    assert len(processor.chat_calls) == len(examples)
-    for call, example in zip(processor.chat_calls, examples, strict=True):
+    # Chat template is called on the tokenizer, not the processor
+    assert len(processor.tokenizer._chat_calls) == len(examples)
+    for call, example in zip(processor.tokenizer._chat_calls, examples, strict=True):
         assert call["conversation"] is example["conversation"]
 
     assert len(processor.forward_calls) == 1
@@ -343,9 +348,10 @@ def test_phi4_mm_collate_fn_handles_audio_and_trimming(collate_mod, monkeypatch)
     assert forward_call["max_length"] == 1024
     assert forward_call["text"] == ["chat::Hi", "chat::Hola"]
 
+    # Audio inputs are converted to (array, sampling_rate) tuples
     expected_audio0 = (examples[0]["audio"]["array"], examples[0]["audio"]["sampling_rate"])
     assert forward_call["audios"][0] == expected_audio0
-    assert forward_call["audios"][1] == examples[1]["audio"]
+    assert forward_call["audios"][1] == tuple(examples[1]["audio"])
 
     assert torch.equal(captured["input_ids"], processor.produced_input_ids)
     assert captured["conversations"] == [example["conversation"] for example in examples]
@@ -355,7 +361,8 @@ def test_phi4_mm_collate_fn_handles_audio_and_trimming(collate_mod, monkeypatch)
     assert torch.equal(batch["input_ids"], trimmed_input)
     assert torch.equal(batch["attention_mask"], torch.ones_like(trimmed_input))
     assert torch.equal(batch["extra"], torch.arange(len(examples), dtype=torch.long))
-    assert torch.equal(batch["labels"], labels_stub)
+    # Labels are shifted by [:, 1:] — not overwritten with full labels
+    assert torch.equal(batch["labels"], labels_stub[:, 1:])
 @pytest.fixture()
 def collate_mod():
     import nemo_automodel.components.datasets.vlm.collate_fns as _m

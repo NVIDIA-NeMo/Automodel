@@ -563,6 +563,12 @@ class Checkpointer:
         self.config.original_model_root_dir = root_dir
         if hasattr(model, "tie_weights") and is_tied_lm_head:
             model.tie_weights()
+            # find embed_tokens manually and tie to lm_head.
+            if hasattr(model, "lm_head") and model.lm_head.weight.data.sum() == 0:
+                for _name, _mod in model.named_modules():
+                    if _name.endswith("embed_tokens") and hasattr(_mod, "weight") and _mod.weight.data.sum() != 0:
+                        model.lm_head.weight = _mod.weight
+                        break
 
     def maybe_wait_for_staging(self) -> None:
         """
