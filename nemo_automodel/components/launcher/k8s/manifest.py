@@ -91,22 +91,20 @@ def _pod_template(
     recipe_target: str,
     extra_args: List[str],
 ) -> Dict[str, Any]:
-    template: Dict[str, Any] = {
-        "spec": {
-            "containers": [
-                _container_spec(cfg, config_mount_path, recipe_target, extra_args),
-            ],
-            "volumes": _volumes(cfg, configmap_name),
-            "restartPolicy": "Never",
-        },
+    spec: Dict[str, Any] = {
+        "containers": [
+            _container_spec(cfg, config_mount_path, recipe_target, extra_args),
+        ],
+        "volumes": _volumes(cfg, configmap_name),
+        "restartPolicy": "Never",
     }
     if cfg.service_account:
-        template["spec"]["serviceAccountName"] = cfg.service_account
+        spec["serviceAccountName"] = cfg.service_account
     if cfg.node_selector:
-        template["spec"]["nodeSelector"] = cfg.node_selector
+        spec["nodeSelector"] = cfg.node_selector
     if cfg.tolerations:
-        template["spec"]["tolerations"] = cfg.tolerations
-    return template
+        spec["tolerations"] = cfg.tolerations
+    return {"spec": spec}
 
 
 def render_pytorchjob(
