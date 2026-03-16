@@ -26,6 +26,7 @@ evolve without manual feature tables.
 
 from __future__ import annotations
 
+import functools
 import inspect
 import logging
 from typing import TYPE_CHECKING
@@ -256,6 +257,12 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
     if mesh is None:
         return
 
+    # If capabilities haven't been attached yet, use a temporary ModelSupports.
+    if not hasattr(model, "supports"):
+        supports = ModelSupports(model, mesh)
+    else:
+        supports = model.supports
+
     tp_size = getattr(mesh, "tp_size", 1)
     pp_size = getattr(mesh, "pp_size", 1)
     ep_size = getattr(mesh, "ep_size", 1)
@@ -264,7 +271,7 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
     arch = type(model).__name__
     errors: list[str] = []
 
-    if tp_size > 1 and not model.supports_tp:
+    if tp_size > 1 and not supports.supports_tp:
         errors.append(
             f"Tensor parallelism (tp_size={tp_size}) requested but {arch} "
             f"has no TP plan (not in PARALLELIZE_FUNCTIONS and no `_tp_plan` attribute).\n"
@@ -274,7 +281,7 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
             f"  tp_size: 1"
         )
 
-    if pp_size > 1 and not model.supports_pp:
+    if pp_size > 1 and not supports.supports_pp:
         errors.append(
             f"Pipeline parallelism (pp_size={pp_size}) requires a _pp_plan "
             f"attribute on {arch}, but none was found.\n"
@@ -284,7 +291,7 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
             f"  pp_size: 1"
         )
 
-    if cp_size > 1 and not model.supports_cp:
+    if cp_size > 1 and not supports.supports_cp:
         if _is_hybrid(model):
             errors.append(
                 f"Context parallelism (cp_size={cp_size}) is not supported for "
@@ -313,7 +320,7 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
                 f"  cp_size: 1"
             )
 
-    if ep_size > 1 and not model.supports_ep:
+    if ep_size > 1 and not supports.supports_ep:
         errors.append(
             f"Expert parallelism (ep_size={ep_size}) requires a MoE model, "
             f"but {arch} does not inherit from MoEFSDPSyncMixin.\n"
@@ -345,6 +352,7 @@ def _lazy_supports_property(self: "nn.Module") -> ModelSupports:
         return self._supports  # type: ignore[attr-defined]
 
 
+@functools.lru_cache(maxsize=1)
 def _build_class_dict() -> dict[str, property | type]:
     cls_dict: dict[str, property | type] = {
         "supports": property(_lazy_supports_property),
@@ -364,10 +372,11 @@ def attach_capabilities_and_validate(model: "nn.Module", mesh: "MeshContext") ->
         that lack the attribute.
     Safe to call more than once -- subsequent calls are no-ops.
     """
-    model.__class__ = type(
-        model.__class__.__name__,
-        (model.__class__,),
-        _build_class_dict(),
-    )
+    if "supports" not in type(model).__dict__:
+        model.__class__ = type(
+            model.__class__.__name__,
+            (model.__class__,),
+            _build_class_dict(),
+        )
     validate_for_mesh(model, mesh)
     return model
