@@ -839,36 +839,43 @@ class TestMistral3ModelVision:
         assert features[0].shape[0] == n_vision_tokens
 
     def test_forward_with_vision(self, text_config, backend, device):
-        """Forward with pixel_values merges vision features into text embeddings."""
-        from nemo_automodel.components.models.mistral4.model import (
-            Mistral3Model as OurMistral3Model,
-        )
-        from nemo_automodel.components.models.mistral4.model import (
-            Mistral4TextModelBackend,
-        )
+        """Forward with pixel_values merges vision features into text embeddings.
 
-        language_model = Mistral4TextModelBackend(text_config, backend).to(device).to(torch.bfloat16)
+        Uses a mock language_model to avoid MoE grouped_mm issues in small test configs.
+        The key behavior tested: vision features are extracted, merged into embeddings via
+        masked_scatter at image_token positions, and passed to the language model.
+        """
+        from transformers.modeling_outputs import BaseModelOutputWithPast
 
-        # downsample_ratio = patch_size * spatial_merge_size = 4 * 2 = 8
-        # image_size = 16x16 -> (16/8)*(16/8) = 4 vision tokens
+        from nemo_automodel.components.models.mistral4.model import Mistral3Model as OurMistral3Model
+
+        hidden_size = text_config.hidden_size
         n_vision_tokens = 4
+        seq_len = 8
 
         # Mock vision tower
         vision_tower = Mock()
         vision_tower.patch_size = 4
-        hidden_size = 32
-        # _get_image_features squeezes dim 0, so hidden_states should be [1, n_patches, hidden_size]
-        n_patches = 16  # before projector downsampling
-        fake_features = torch.randn(1, n_patches, hidden_size, device=device, dtype=torch.bfloat16)
+        vis_hidden = 32
+        n_patches = 16
+        fake_features = torch.randn(1, n_patches, vis_hidden, device=device, dtype=torch.bfloat16)
         vision_output = Mock()
         vision_output.hidden_states = [fake_features]
         vision_tower.return_value = vision_output
 
-        # Mock projector: output has n_vision_tokens after patch merging
+        # Mock projector
         projector = Mock()
-        projector.return_value = torch.randn(
-            n_vision_tokens, text_config.hidden_size, device=device, dtype=torch.bfloat16
+        projector.return_value = torch.randn(n_vision_tokens, hidden_size, device=device, dtype=torch.bfloat16)
+
+        # Mock language_model: captures inputs_embeds to verify vision merge happened
+        language_model = Mock()
+        language_model.get_input_embeddings.return_value = nn.Embedding(256, hidden_size).to(
+            device=device, dtype=torch.bfloat16
         )
+        fake_output = BaseModelOutputWithPast(
+            last_hidden_state=torch.randn(1, seq_len, hidden_size, device=device, dtype=torch.bfloat16)
+        )
+        language_model.return_value = fake_output
 
         config = Mock(spec=[])
         config.spatial_merge_size = 2
@@ -877,28 +884,27 @@ class TestMistral3ModelVision:
 
         model = OurMistral3Model(config, vision_tower, projector, language_model)
 
-        # Build input: 4 image tokens at positions 0-3, rest are normal text tokens
-        seq_len = 8
         input_ids = torch.randint(0, 256, (1, seq_len), device=device)
-        input_ids[0, :n_vision_tokens] = 10  # image token index
+        input_ids[0, :n_vision_tokens] = 10  # image token positions
 
         pixel_values = torch.randn(1, 3, 16, 16, device=device, dtype=torch.bfloat16)
         image_sizes = torch.tensor([[16, 16]], device=device)
 
         out = model(input_ids=input_ids, pixel_values=pixel_values, image_sizes=image_sizes)
-        assert out.last_hidden_state.shape == (1, seq_len, text_config.hidden_size)
+        assert out.last_hidden_state.shape == (1, seq_len, hidden_size)
+
+        # Verify language_model was called with inputs_embeds (not input_ids)
+        call_kwargs = language_model.call_args
+        assert call_kwargs.kwargs["inputs_embeds"] is not None
+        assert call_kwargs.kwargs["input_ids"] is None
 
     def test_forward_raises_on_pp_stage_without_embeds(self, text_config, backend, device):
         """PP stage with no embed_tokens and integer input_ids raises ValueError."""
-        from nemo_automodel.components.models.mistral4.model import (
-            Mistral3Model as OurMistral3Model,
-        )
-        from nemo_automodel.components.models.mistral4.model import (
-            Mistral4TextModelBackend,
-        )
+        from nemo_automodel.components.models.mistral4.model import Mistral3Model as OurMistral3Model
 
-        language_model = Mistral4TextModelBackend(text_config, backend).to(device).to(torch.bfloat16)
-        language_model.model.embed_tokens = None
+        # Mock language_model with no embed_tokens
+        language_model = Mock()
+        language_model.get_input_embeddings.return_value = None
         model = OurMistral3Model(Mock(spec=[]), None, None, language_model)
 
         # Integer input_ids (not float) should raise
