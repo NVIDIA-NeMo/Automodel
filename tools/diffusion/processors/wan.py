@@ -339,7 +339,9 @@ class WanProcessor(BaseVideoProcessor):
             "text_embeddings": text_encodings["text_embeddings"],
             # First frame for image-to-video conditioning (stored as tensor
             # for weights_only=True compatibility in torch.load)
-            "first_frame": torch.from_numpy(metadata["first_frame"]) if metadata.get("first_frame") is not None else None,
+            "first_frame": torch.from_numpy(metadata["first_frame"])
+            if metadata.get("first_frame") is not None
+            else None,
             # Resolution and bucketing info
             "original_resolution": metadata.get("original_resolution"),
             "bucket_resolution": metadata.get("bucket_resolution"),
