@@ -13,14 +13,6 @@
 # limitations under the License.
 
 
-# To run this recipe:
-#   automodel examples/llm_finetune/phi/phi_4_squad_peft.yaml --nproc-per-node 8
-# Adjust --nproc-per-node to the number of GPUs available on your machine.
-
-recipe:
-  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
-
-
 step_scheduler:
   global_batch_size: 32
   local_batch_size: 4
@@ -45,7 +37,7 @@ model:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  target_modules: '*_proj'
+  match_all_linear: True
   dim: 8
   alpha: 32
   use_triton: True
@@ -59,7 +51,7 @@ checkpoint:
 distributed:
   strategy: fsdp2
   dp_size: none
-  tp_size: 1
+  tp_size: 2
   cp_size: 1
 
   sequence_parallel: false
@@ -91,7 +83,7 @@ validation_dataset:
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  
+
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
