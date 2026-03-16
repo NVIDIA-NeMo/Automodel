@@ -1013,7 +1013,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             total_tokens = 0
             total_num_label_tokens = 0
             for batch in val_dataloader:
-                batch = {k: (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+                batch = {
+                    k: (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
+                    for k, v in batch.items()
+                }
                 labels = batch.pop("labels")
                 num_label_tokens = (labels != -100).sum().item()
 

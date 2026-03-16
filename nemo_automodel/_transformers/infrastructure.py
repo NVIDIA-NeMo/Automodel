@@ -442,9 +442,7 @@ def apply_model_infrastructure(
             # Non-meta models already have weights from from_pretrained.
             # Still call load_base_model with load_base_model=False to
             # handle weight tying
-            checkpointer.load_base_model(
-                model, device, cache_dir, pretrained_model_name_or_path, load_base_model=False
-            )
+            checkpointer.load_base_model(model, device, cache_dir, pretrained_model_name_or_path, load_base_model=False)
         checkpoint_already_loaded = True
 
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
