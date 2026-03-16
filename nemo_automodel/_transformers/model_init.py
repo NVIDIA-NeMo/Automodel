@@ -18,7 +18,9 @@ Functions for resolving which model class to use (custom vs HF), downloading
 weights, applying config overrides, and instantiating the model.
 """
 
+import gc
 import inspect
+import json
 import logging
 import os
 import threading
@@ -237,6 +239,176 @@ def _setup_bnb_loading_kwargs(kwargs: dict) -> None:
     logger.info("BnB loading: device_map=%s", kwargs["device_map"])
 
 
+def _resolve_model_dir(pretrained_model_name_or_path: str) -> str:
+    """Resolve a HF repo id or local path to a local directory with model files."""
+    if os.path.isdir(pretrained_model_name_or_path):
+        return pretrained_model_name_or_path
+    return snapshot_download(pretrained_model_name_or_path, local_files_only=True)
+
+
+def _has_safetensors(model_dir: str) -> bool:
+    """Check whether a model directory contains safetensors checkpoint files."""
+    if os.path.exists(os.path.join(model_dir, "model.safetensors.index.json")):
+        return True
+    if os.path.exists(os.path.join(model_dir, "model.safetensors")):
+        return True
+    return False
+
+
+def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
+    """Load safetensor shards one-at-a-time, quantizing BnB Params4bit on the fly.
+
+    Peak memory ≈ (accumulated quantized weights) + (one bf16 weight tensor)
+    instead of (full bf16 model) with standard HF loading.
+    """
+    import bitsandbytes as bnb
+    from safetensors import safe_open
+
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            index = json.load(f)
+        shard_files = list(dict.fromkeys(index["weight_map"].values()))
+    else:
+        shard_files = ["model.safetensors"]
+
+    # Build name → (module, attr_name, param_or_buffer) index
+    param_map: dict[str, tuple] = {}
+    for name, param in model.named_parameters():
+        parts = name.rsplit(".", 1)
+        mod = model.get_submodule(parts[0]) if len(parts) == 2 else model
+        param_map[name] = (mod, parts[-1], param)
+    for name, buf in model.named_buffers():
+        if name not in param_map:
+            parts = name.rsplit(".", 1)
+            mod = model.get_submodule(parts[0]) if len(parts) == 2 else model
+            param_map[name] = (mod, parts[-1], buf)
+
+    loaded = 0
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+
+    for shard_idx, shard_file in enumerate(shard_files):
+        shard_path = os.path.join(model_dir, shard_file)
+        logger.info(
+            "Streaming BnB shard %d/%d: %s",
+            shard_idx + 1,
+            len(shard_files),
+            shard_file,
+        )
+
+        with safe_open(shard_path, framework="pt") as f:
+            for key in f.keys():
+                tensor = f.get_tensor(key)
+
+                if key not in param_map:
+                    logger.debug("Skipping key not in model: %s", key)
+                    del tensor
+                    continue
+
+                mod, attr, old_param = param_map[key]
+
+                if isinstance(old_param, bnb.nn.Params4bit):
+                    if torch_dtype is not None:
+                        tensor = tensor.to(dtype=torch_dtype)
+                    new_param = bnb.nn.Params4bit(
+                        data=tensor,
+                        requires_grad=False,
+                        compress_statistics=old_param.compress_statistics,
+                        quant_type=old_param.quant_type,
+                        quant_storage=old_param.quant_storage,
+                        module=mod if isinstance(mod, bnb.nn.Linear4bit) else None,
+                        bnb_quantized=False,
+                    )
+                    del tensor
+                    new_param._quantize(device)
+                    mod._parameters[attr] = new_param
+                else:
+                    target_dtype = torch_dtype if torch_dtype is not None else tensor.dtype
+                    materialized = tensor.to(device=device, dtype=target_dtype)
+                    del tensor
+                    if isinstance(old_param, torch.nn.Parameter):
+                        mod._parameters[attr] = torch.nn.Parameter(materialized, requires_grad=old_param.requires_grad)
+                    else:
+                        mod._buffers[attr] = materialized
+
+                loaded += 1
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    logger.info("Streaming BnB load complete: %d tensors loaded", loaded)
+
+
+def _init_model_bnb_streaming(
+    cls, pretrained_model_name_or_path, hf_config, attn_implementation, torch_dtype, quantization_config, **kwargs
+):
+    """Create model on meta device, replace Linear→Linear4bit, stream-load+quantize.
+
+    This avoids materializing the full bf16 model in memory, which is critical
+    for unified-memory systems (e.g. DGX Spark) where CPU and GPU share the
+    same physical memory pool.
+
+    Returns ``(is_custom_model=False, model)`` so the caller treats it like an
+    HF-loaded model with weights already present.
+    """
+    from transformers.initialization import no_init_weights
+    from transformers.integrations.bitsandbytes import replace_with_bnb_linear
+
+    from nemo_automodel.components.utils.model_utils import init_empty_weights
+
+    if isinstance(torch_dtype, str) and torch_dtype != "auto":
+        torch_dtype = dtype_from_str(torch_dtype)
+    if torch_dtype == "auto":
+        torch_dtype = getattr(hf_config, "torch_dtype", torch.bfloat16)
+        if isinstance(torch_dtype, str):
+            torch_dtype = dtype_from_str(torch_dtype)
+
+    device = torch.cuda.current_device()
+
+    # 1. Download weights if needed
+    _download_model_weights(hf_config, pretrained_model_name_or_path)
+
+    # 2. Resolve to local directory & verify safetensors
+    model_dir = _resolve_model_dir(pretrained_model_name_or_path)
+    if not _has_safetensors(model_dir):
+        raise FileNotFoundError(f"Streaming BnB loading requires safetensors checkpoint, but none found in {model_dir}")
+
+    # 3. Create model skeleton on meta device (zero memory)
+    logger.info("Creating model skeleton on meta device for streaming BnB quantization")
+    with no_init_weights(), init_empty_weights():
+        model = cls._from_config_parent_class(
+            hf_config,
+            torch_dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+        )
+
+    # 4. Replace nn.Linear → bnb.nn.Linear4bit (still on meta, no memory)
+    modules_to_not_convert = getattr(quantization_config, "llm_int8_skip_modules", None)
+    if modules_to_not_convert is None:
+        modules_to_not_convert = getattr(model, "_keep_in_fp32_modules", None)
+    model = replace_with_bnb_linear(
+        model,
+        modules_to_not_convert=modules_to_not_convert,
+        quantization_config=quantization_config,
+    )
+
+    # 5. Stream-load weights, quantizing each tensor on the fly
+    _stream_load_bnb_weights(model, model_dir, device, torch_dtype)
+
+    # 6. Store quantization_config on the model (HF convention)
+    model.config.quantization_config = quantization_config
+    model.is_quantized = True
+
+    # 7. Wrap with HFCheckpointingMixin
+    try:
+        hf_model_cls = cls._model_mapping[type(hf_config)]
+    except KeyError:
+        hf_model_cls = type(model)
+    model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
+
+    return False, model
+
+
 def _init_model(
     cls,
     pretrained_model_name_or_path_or_config,
@@ -257,6 +429,28 @@ def _init_model(
     pretrained_model_name_or_path = (
         pretrained_model_name_or_path_or_config if is_pretrained_init else getattr(hf_config, "name_or_path")
     )
+
+    # Streaming BnB loading: when quantization is requested and we're loading from a
+    # pretrained checkpoint, use streaming quantization to avoid materializing the full
+    # bf16 model in memory. This is critical for unified-memory systems (DGX Spark)
+    # and large models (70B+). Can be disabled with AUTOMODEL_BNB_STREAMING=0.
+    _bnb_streaming = os.environ.get("AUTOMODEL_BNB_STREAMING", "1") != "0"
+    if quantization_config is not None and is_pretrained_init and _bnb_streaming:
+        try:
+            logger.info("Using streaming BnB quantization for memory-efficient loading")
+            return _init_model_bnb_streaming(
+                cls,
+                pretrained_model_name_or_path,
+                hf_config,
+                attn_implementation,
+                torch_dtype,
+                quantization_config,
+                **kwargs,
+            )
+        except FileNotFoundError:
+            logger.warning(
+                "Streaming BnB loading unavailable (no safetensors checkpoint); falling back to standard HF loading."
+            )
 
     # 1. if force_hf is True, use HF model class wrapped with mixin
     if force_hf:
