@@ -72,8 +72,10 @@ class HunyuanVideoProcessor(BaseVideoProcessor):
 
     @property
     def quantization(self) -> int:
-        # HunyuanVideo VAE requires 8-pixel aligned dimensions
-        return 8
+        # HunyuanVideo VAE requires 16-pixel aligned dimensions to ensure
+        # latent spatial dims (pixel_dim / 8) are even, which is needed
+        # for VAE tiling to work correctly.
+        return 16
 
     def load_models(self, model_name: str, device: str) -> Dict[str, Any]:
         """
