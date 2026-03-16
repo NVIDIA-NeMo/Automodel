@@ -20,12 +20,14 @@ CPU=false
 TEST_DIR="tests/"
 TEST_NAME=""
 ADDITIONAL_ARGS=""
+TEST_PATHS=""
 
 for i in "$@"; do
     case $i in
         --UNIT_TEST=?*) UNIT_TEST="${i#*=}";;
         --CPU=?*) CPU="${i#*=}";;
         --TEST_NAME=?*) TEST_NAME="${i#*=}";;
+        --TEST_PATHS=?*) TEST_PATHS="${i#*=}";;
         *) ;;
     esac
     shift
@@ -41,6 +43,20 @@ if [[ "$UNIT_TEST" == "true" ]]; then
     export TEST_DIR="tests/unit_tests"
 else
     export TEST_DIR="tests/functional_tests/$TEST_NAME"
+fi
+
+if [[ -n "${TEST_PATHS}" ]]; then
+    # Run changed tests first, if provided. Coverage is in parallel mode so it can be combined later.
+    coverage run \
+        --data-file=/workspace/.coverage \
+        --source=/workspace/ \
+        --parallel-mode \
+        -m pytest \
+        ${TEST_PATHS} \
+        -o log_cli=true \
+        -o log_cli_level=INFO \
+        -vs -m "not pleasefixme" --tb=short -rA \
+        $ADDITIONAL_ARGS
 fi
 
 coverage run \
