@@ -249,10 +249,14 @@ def apply_parameter_freezing(model, freeze_config):
     if freeze_language_model:
         _freeze_module_by_attribute_and_patterns(model, "language_model", ["language", "text", "llm"])
 
-    # Phi4MM: cast internal fp32 LoRA adapters to bf16
+    # Phi4MM: cast internal fp32 LoRA adapters to bf16 for FSDP2 compatibility,
+    # and disable KV cache (remote code uses legacy DynamicCache.key_cache
+    # attribute removed in transformers v5.x).
     model_type = getattr(getattr(model, "config", None), "model_type", "")
     if model_type == "phi4mm":
         cast_mixed_dtype_params_to_bf16(model)
+        if hasattr(model, "config"):
+            model.config.use_cache = False
 
 
 def cast_mixed_dtype_params_to_bf16(model):

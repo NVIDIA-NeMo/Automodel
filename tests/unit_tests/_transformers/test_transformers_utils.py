@@ -318,6 +318,46 @@ class TestApplyCacheCompatibilityPatchesIntegration:
 
         assert hasattr(DynamicCache, "get_usable_length") or hasattr(DynamicCache, "get_seq_length")
 
+    def test_patches_sliding_window_cache(self):
+        """SlidingWindowCache should exist after patching (aliased to StaticCache if removed)."""
+        apply_cache_compatibility_patches()
+        import transformers.cache_utils as cu
+
+        assert hasattr(cu, "SlidingWindowCache")
+
+    def test_patches_cache_get_usable_length(self):
+        """Cache.get_usable_length should exist after patching."""
+        apply_cache_compatibility_patches()
+        from transformers.cache_utils import Cache
+
+        assert hasattr(Cache, "get_usable_length")
+
+    def test_patches_tied_weights_keys_list_to_dict(self):
+        """post_init should convert _tied_weights_keys from list to dict."""
+        apply_cache_compatibility_patches()
+        from transformers.modeling_utils import PreTrainedModel
+
+        assert getattr(PreTrainedModel.post_init, "_nemo_tied_keys_patched", False)
+
+    def test_patches_peft_prepare_inputs(self):
+        """PeftModelForCausalLM.__init__ should be patched for missing prepare_inputs_for_generation."""
+        apply_cache_compatibility_patches()
+        try:
+            import peft.peft_model as pm
+
+            assert getattr(pm.PeftModelForCausalLM.__init__, "_nemo_peft_patched", False)
+        except ImportError:
+            pytest.skip("peft not installed")
+
+    def test_patches_phi4mm_processor(self):
+        """ProcessorMixin.from_pretrained should be patched for phi4mm fallback."""
+        apply_cache_compatibility_patches()
+        import transformers.processing_utils as pu
+
+        # The patch replaces from_pretrained with a wrapper named _patched
+        fn = pu.ProcessorMixin.from_pretrained
+        assert fn.__func__.__qualname__ == "_patch_phi4mm_processor.<locals>._patched"
+
 
 class TestApplyQwen3OmniConfigPatch:
     """Test cases for apply_qwen3_omni_config_patch function."""
