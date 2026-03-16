@@ -28,9 +28,16 @@ Usage
     # Via console entry-points (if installed):
     automodel <config.yaml> [--nproc-per-node N] [--key.subkey=override ...]
 
-The YAML config must contain a ``recipe._target_`` key that specifies which
-recipe class to instantiate.  Launcher selection is automatic based on the
-presence of ``slurm:``, ``k8s:``, or ``nemo_run:`` sections in the YAML.
+The YAML config must specify which recipe class to instantiate.  All three
+forms are accepted::
+
+    recipe: TrainFinetuneRecipeForNextTokenPrediction        # bare class name
+    recipe: nemo_automodel.recipes.llm.train_ft.TrainFin...  # fully-qualified
+    recipe:
+      _target_: nemo_automodel.recipes.llm.train_ft.Trai...  # Hydra-style
+
+Launcher selection is automatic based on the presence of ``slurm:``, ``k8s:``,
+or ``nemo_run:`` sections in the YAML.
 
 When launched via ``torchrun``, the CLI detects the existing distributed
 environment and runs the recipe in-process on each worker instead of
@@ -39,13 +46,58 @@ re-spawning torchrun.
 
 import argparse
 import logging
+import re
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 import yaml
 
 logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
+
+_RECIPES_DIR = Path(__file__).resolve().parent.parent / "nemo_automodel" / "recipes"
+
+
+@lru_cache(maxsize=1)
+def _discover_recipe_classes() -> dict[str, str]:
+    """Scan ``nemo_automodel/recipes/`` for concrete recipe classes.
+
+    Returns a mapping from bare class name to fully-qualified dotted path,
+    e.g. ``{"TrainFinetuneRecipeForNextTokenPrediction":
+    "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction"}``.
+    """
+    registry: dict[str, str] = {}
+    pkg_root = _RECIPES_DIR.parent.parent
+    for py_file in _RECIPES_DIR.rglob("*.py"):
+        if py_file.name.startswith("_"):
+            continue
+        module_dotted = str(py_file.relative_to(pkg_root).with_suffix("")).replace("/", ".")
+        source = py_file.read_text()
+        for m in re.finditer(r"^class\s+(\w*Recipe\w*)\s*[\(:]", source, re.MULTILINE):
+            cls_name = m.group(1)
+            if cls_name == "BaseRecipe":
+                continue
+            registry[cls_name] = f"{module_dotted}.{cls_name}"
+    return registry
+
+
+def resolve_recipe_name(raw: str) -> str:
+    """Resolve a recipe name to its fully-qualified dotted path.
+
+    Accepts:
+      - Bare class name: ``"TrainFinetuneRecipeForNextTokenPrediction"``
+      - Full FQN: ``"nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction"``
+
+    Raises ``ValueError`` when a bare name cannot be found.
+    """
+    if "." in raw:
+        return raw
+    registry = _discover_recipe_classes()
+    if raw in registry:
+        return registry[raw]
+    available = "\n".join(f"  - {name}" for name in sorted(registry))
+    raise ValueError(f"Unknown recipe class '{raw}'. Available short names:\n{available}")
 
 
 def load_yaml(file_path):
@@ -75,7 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
         "config",
         metavar="<config.yaml>",
         type=Path,
-        help="Path to YAML configuration file (must contain a recipe._target_ key)",
+        help="Path to YAML configuration file (must specify a recipe target)",
     )
     parser.add_argument(
         "--nproc-per-node",
@@ -103,11 +155,18 @@ def main():
     logger.info("Config: %s", config_path)
     config = load_yaml(config_path)
 
-    recipe_section = config.get("recipe", {})
-    if not isinstance(recipe_section, dict) or "_target_" not in recipe_section:
+    recipe_section = config.get("recipe")
+    if isinstance(recipe_section, str) and recipe_section.strip():
+        raw_target = recipe_section.strip()
+    elif isinstance(recipe_section, dict) and "_target_" in recipe_section:
+        raw_target = recipe_section["_target_"]
+    else:
         logger.error(
-            "YAML config must contain a 'recipe:' section with a '_target_' key.\n"
-            "Example:\n"
+            "YAML config must specify a recipe target.\n"
+            "Examples:\n"
+            "  recipe: TrainFinetuneRecipeForNextTokenPrediction\n"
+            "  recipe: nemo_automodel.recipes.llm.train_ft."
+            "TrainFinetuneRecipeForNextTokenPrediction\n"
             "  recipe:\n"
             "    _target_: nemo_automodel.recipes.llm.train_ft."
             "TrainFinetuneRecipeForNextTokenPrediction\n\n"
@@ -115,7 +174,11 @@ def main():
         )
         sys.exit(1)
 
-    recipe_target = recipe_section["_target_"]
+    try:
+        recipe_target = resolve_recipe_name(raw_target)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
     logger.info("Recipe: %s", recipe_target)
 
     if slurm_config := config.pop("slurm", None):
