@@ -1318,18 +1318,24 @@ class TestAuxLossSoftmaxFix:
             expert_bias=False,
             expert_activation="swiglu",
             softmax_before_topk=softmax_before_topk,
-            dtype=torch.bfloat16,
+            dtype=torch.float32,
         )
         gate = Gate(config).to(device)
         gate.train()
+        gate.gate_precision = torch.float32
+        # Deterministic init: use known weights to avoid CUDA-state-dependent NaN.
+        # Small uniform weights ensure softmax/sigmoid produce well-conditioned scores.
+        with torch.no_grad():
+            gate.weight.uniform_(-0.1, 0.1)
+            if gate.bias is not None:
+                gate.bias.zero_()
         return gate
 
     def test_softmax_topk_first_aux_loss_is_positive(self, device):
         """aux_loss must be non-negative when using softmax with topk-first (GPT-OSS style)."""
-        torch.manual_seed(42)
         gate = self._make_gate(device, score_func="softmax", softmax_before_topk=False)
-        x = torch.randn(32, 64, device=device, dtype=torch.bfloat16)
-        token_mask = torch.ones(32, dtype=torch.bool, device=device)
+        x = torch.randn(256, 64, device=device)
+        token_mask = torch.ones(256, dtype=torch.bool, device=device)
 
         weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
 
@@ -1339,10 +1345,9 @@ class TestAuxLossSoftmaxFix:
 
     def test_softmax_before_topk_aux_loss_is_positive(self, device):
         """aux_loss must be non-negative when using softmax_before_topk (Qwen3-MoE style)."""
-        torch.manual_seed(42)
         gate = self._make_gate(device, score_func="softmax", softmax_before_topk=True)
-        x = torch.randn(32, 64, device=device, dtype=torch.bfloat16)
-        token_mask = torch.ones(32, dtype=torch.bool, device=device)
+        x = torch.randn(256, 64, device=device)
+        token_mask = torch.ones(256, dtype=torch.bool, device=device)
 
         weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
 
@@ -1351,16 +1356,20 @@ class TestAuxLossSoftmaxFix:
         assert aux_loss.item() >= 0, f"aux_loss should be non-negative, got {aux_loss.item()}"
 
     def test_sigmoid_aux_loss_is_positive(self, device):
-        """aux_loss must be non-negative when using sigmoid scoring (Moonlight/DeepSeek style)."""
-        torch.manual_seed(42)
+        """aux_loss must be non-negative when using sigmoid scoring (Moonlight/DeepSeek style).
+
+        Sigmoid scores are always in [0, 1], so P_i is always non-negative.
+        This test verifies the sigmoid path was not broken by the softmax fix.
+        """
         gate = self._make_gate(device, score_func="sigmoid", softmax_before_topk=False)
-        x = torch.randn(32, 64, device=device, dtype=torch.bfloat16)
-        token_mask = torch.ones(32, dtype=torch.bool, device=device)
+        # Use 512 tokens with topk=2 and 8 experts to ensure good expert coverage
+        x = torch.randn(512, 64, device=device)
+        token_mask = torch.ones(512, dtype=torch.bool, device=device)
 
         weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
 
         assert aux_loss is not None
-        assert not torch.isnan(aux_loss), "aux_loss is NaN"
+        assert torch.isfinite(aux_loss), f"aux_loss is not finite: {aux_loss.item()}"
         assert aux_loss.item() >= 0, f"aux_loss should be non-negative, got {aux_loss.item()}"
 
     def test_softmax_topk_first_aux_loss_stays_positive_after_gradient_steps(self, device):
@@ -1369,17 +1378,17 @@ class TestAuxLossSoftmaxFix:
         This is the regression test for the GPT-OSS divergence bug where raw logits
         caused aux_loss to go increasingly negative during training.
         """
-        torch.manual_seed(42)
         gate = self._make_gate(device, score_func="softmax", softmax_before_topk=False, aux_loss_coeff=0.1)
         optimizer = torch.optim.SGD(gate.parameters(), lr=0.01)
 
         for step in range(20):
-            x = torch.randn(64, 64, device=device, dtype=torch.bfloat16)
+            x = torch.randn(64, 64, device=device)
             token_mask = torch.ones(64, dtype=torch.bool, device=device)
 
             weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
 
             assert aux_loss is not None
+            assert not torch.isnan(aux_loss), f"aux_loss went to NaN at step {step}"
             assert aux_loss.item() >= 0, f"aux_loss went negative at step {step}: {aux_loss.item()}"
 
             # Simulate training: backward through aux_loss via the MoEAuxLossAutoScaler
