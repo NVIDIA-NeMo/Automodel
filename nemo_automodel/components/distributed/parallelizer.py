@@ -1015,7 +1015,6 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
     }
     LLM_MODEL_CLS_TO_LAYERS = {
         "NemotronHForCausalLM": ["backbone.layers"],
-        "Gemma4ForConditionalGeneration": ["model.language_model.layers"],
         GPT2LMHeadModel: ["transformer.h"],
     }
 

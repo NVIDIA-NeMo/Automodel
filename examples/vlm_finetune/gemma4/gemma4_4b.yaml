@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Configuration for fine-tuning Gemma 4 5B with MedPix dataset for image description
-# torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_5b.yaml
+# torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_4b.yaml
 
 step_scheduler:
   global_batch_size: 8
@@ -33,7 +33,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /workspace/eevee-4-e4b-it_vv4
+  pretrained_model_name_or_path: /workspace/eevee-4-e4b-it_vv5
   torch_dtype: torch.bfloat16
   use_liger_kernel: false
   use_sdpa_patching: false
@@ -94,7 +94,7 @@ freeze_config:
   freeze_audio_tower: true
   freeze_language_model: false
 
-wandb:
-  project: eevee-4
-  name: eevee4-e4b-it_vv4
-  dir: vlm_checkpoints/gemma4_4b/
+# wandb:
+#   project: eevee-4
+#   name: eevee4-e4b-it_vv4
+#   dir: vlm_checkpoints/gemma4_4b/
