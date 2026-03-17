@@ -17,9 +17,9 @@
 This recipe fine-tunes a *student* model using the logits of a frozen *teacher* model. It
 extends ``FinetuneRecipeForNextTokenPrediction`` adding:
 
-1. teacher_model – an additional HF/NeMo model loaded in ``eval`` mode
-2. kd_loss_fn     – KL-divergence between temperature-scaled distributions
-3. kd_ratio       – linear mix between CE loss and KD loss
+1. teacher_model  an additional HF/NeMo model loaded in ``eval`` mode
+2. kd_loss_fn     KL-divergence between temperature-scaled distributions
+3. kd_ratio       linear mix between CE loss and KD loss
 
 The training loop is copied from the parent class but the loss becomes:
     loss = (1-kd_ratio) * ce_loss + kd_ratio * kd_loss
@@ -273,8 +273,6 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 )
             self.teacher_model = _build_teacher_model_with_pp(
                 cfg_teacher=self.cfg.get("teacher_model", None),
-            self.teacher_model = _build_teacher_model_with_pp(
-                cfg_teacher=self.cfg.get("teacher_model", None),
                 seed=self.cfg.get("seed", 42),
                 has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
                 device_mesh=self.device_mesh,
@@ -290,6 +288,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     "With multiple microbatches, only the last teacher microbatch's "
                     "logits are captured, producing incorrect KD targets for earlier microbatches."
                 )
+        else:
+            self.teacher_model = _build_teacher_model(
+                cfg_teacher=self.cfg.get("teacher_model", None),
                 seed=self.cfg.get("seed", 42),
                 has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
                 device_mesh=self.device_mesh,
