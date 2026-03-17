@@ -22,7 +22,7 @@ warnings.warn(
     "See BREAKING_CHANGES.md for details.",
     DeprecationWarning,
     stacklevel=2,
-)
+    stacklevel=1,
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
