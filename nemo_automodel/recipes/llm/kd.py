@@ -273,6 +273,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 )
             self.teacher_model = _build_teacher_model_with_pp(
                 cfg_teacher=self.cfg.get("teacher_model", None),
+            self.teacher_model = _build_teacher_model_with_pp(
+                cfg_teacher=self.cfg.get("teacher_model", None),
                 seed=self.cfg.get("seed", 42),
                 has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
                 device_mesh=self.device_mesh,
@@ -282,9 +284,12 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 dist_setup=self.dist_setup,
             )
             self.teacher_pp = self.teacher_model
-        else:
-            self.teacher_model = _build_teacher_model(
-                cfg_teacher=self.cfg.get("teacher_model", None),
+            if self.pipeline_config.pp_microbatch_size != self.pipeline_config.pp_batch_size:
+                raise ValueError(
+                    "PP with KD requires pp_microbatch_size == pp_batch_size. "
+                    "With multiple microbatches, only the last teacher microbatch's "
+                    "logits are captured, producing incorrect KD targets for earlier microbatches."
+                )
                 seed=self.cfg.get("seed", 42),
                 has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
                 device_mesh=self.device_mesh,
