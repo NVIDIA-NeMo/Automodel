@@ -162,7 +162,7 @@ During preprocessing, the `--resolution_preset` argument controls the pixel budg
 
 During training, the dataloader uses these key configuration parameters:
 
-- `base_resolution`: The target resolution used for bucketing (e.g., `[512, 512]`)
+- `base_resolution`: The target resolution used for bucketing (for example, `[512, 512]`)
 - The `SequentialBucketSampler` groups samples by resolution bucket
 - `dynamic_batch_size`: When `true`, adjusts batch size per resolution bucket to maintain constant memory usage
 
