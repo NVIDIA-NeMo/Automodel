@@ -26,10 +26,10 @@ sys.modules["torch.distributed.run"] = mock.MagicMock()
 
 import cli.app as module
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def tmp_yaml_file():
@@ -46,12 +46,16 @@ def tmp_yaml_file():
 def recipe_yaml(tmp_path):
     """YAML with a recipe._target_ (no launcher section)."""
     cfg = tmp_path / "recipe.yaml"
-    cfg.write_text(yaml.dump({
-        "recipe": {
-            "_target_": "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction",
-        },
-        "step_scheduler": {"num_epochs": 1},
-    }))
+    cfg.write_text(
+        yaml.dump(
+            {
+                "recipe": {
+                    "_target_": "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction",
+                },
+                "step_scheduler": {"num_epochs": 1},
+            }
+        )
+    )
     return cfg
 
 
@@ -59,18 +63,22 @@ def recipe_yaml(tmp_path):
 def slurm_yaml(tmp_path):
     """YAML with recipe + slurm section."""
     cfg = tmp_path / "slurm.yaml"
-    cfg.write_text(yaml.dump({
-        "recipe": {
-            "_target_": "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction",
-        },
-        "step_scheduler": {"num_epochs": 1},
-        "slurm": {
-            "job_name": "test_job",
-            "nodes": 1,
-            "ntasks_per_node": 8,
-            "job_dir": str(tmp_path / "slurm_jobs"),
-        },
-    }))
+    cfg.write_text(
+        yaml.dump(
+            {
+                "recipe": {
+                    "_target_": "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction",
+                },
+                "step_scheduler": {"num_epochs": 1},
+                "slurm": {
+                    "job_name": "test_job",
+                    "nodes": 1,
+                    "ntasks_per_node": 8,
+                    "job_dir": str(tmp_path / "slurm_jobs"),
+                },
+            }
+        )
+    )
     return cfg
 
 
@@ -78,17 +86,21 @@ def slurm_yaml(tmp_path):
 def k8s_yaml(tmp_path):
     """YAML with recipe + k8s section."""
     cfg = tmp_path / "k8s.yaml"
-    cfg.write_text(yaml.dump({
-        "recipe": {
-            "_target_": "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction",
-        },
-        "step_scheduler": {"num_epochs": 1},
-        "k8s": {
-            "num_nodes": 2,
-            "gpus_per_node": 8,
-            "image": "nvcr.io/nvidia/nemo-automodel:latest",
-        },
-    }))
+    cfg.write_text(
+        yaml.dump(
+            {
+                "recipe": {
+                    "_target_": "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction",
+                },
+                "step_scheduler": {"num_epochs": 1},
+                "k8s": {
+                    "num_nodes": 2,
+                    "gpus_per_node": 8,
+                    "image": "nvcr.io/nvidia/nemo-automodel:latest",
+                },
+            }
+        )
+    )
     return cfg
 
 
@@ -96,22 +108,34 @@ def k8s_yaml(tmp_path):
 def nemo_run_yaml(tmp_path):
     """YAML with recipe + nemo_run section."""
     cfg = tmp_path / "nemo_run.yaml"
-    cfg.write_text(yaml.dump({
-        "recipe": {
-            "_target_": "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction",
-        },
-        "step_scheduler": {"num_epochs": 1},
-        "nemo_run": {
-            "executor": "local",
-            "num_gpus_per_node": 1,
-        },
-    }))
+    cfg.write_text(
+        yaml.dump(
+            {
+                "recipe": {
+                    "_target_": "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction",
+                },
+                "step_scheduler": {"num_epochs": 1},
+                "nemo_run": {
+                    "executor": "local",
+                    "num_gpus_per_node": 1,
+                },
+            }
+        )
+    )
     return cfg
+
+
+@pytest.fixture
+def clear_recipe_discovery_cache():
+    module._discover_recipe_classes.cache_clear()
+    yield
+    module._discover_recipe_classes.cache_clear()
 
 
 # ---------------------------------------------------------------------------
 # load_yaml tests
 # ---------------------------------------------------------------------------
+
 
 def test_load_yaml_valid(tmp_yaml_file):
     data = module.load_yaml(tmp_yaml_file)
@@ -132,8 +156,74 @@ def test_load_yaml_bad_format(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# recipe resolution tests
+# ---------------------------------------------------------------------------
+
+
+def test_discover_recipe_classes_scans_recipe_modules(monkeypatch, tmp_path, clear_recipe_discovery_cache):
+    recipes_dir = tmp_path / "nemo_automodel" / "recipes"
+    recipe_file = recipes_dir / "llm" / "train_ft.py"
+    recipe_file.parent.mkdir(parents=True)
+    recipe_file.write_text(
+        "class BaseRecipe:\n"
+        "    pass\n\n"
+        "class HelperClass:\n"
+        "    pass\n\n"
+        "class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):\n"
+        "    pass\n\n"
+        "class EvalRecipe:\n"
+        "    pass\n"
+    )
+    private_file = recipes_dir / "_private.py"
+    private_file.write_text("class HiddenRecipe:\n    pass\n")
+
+    monkeypatch.setattr(module, "_RECIPES_DIR", recipes_dir)
+
+    assert module._discover_recipe_classes() == {
+        "EvalRecipe": "nemo_automodel.recipes.llm.train_ft.EvalRecipe",
+        "TrainFinetuneRecipeForNextTokenPrediction": (
+            "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction"
+        ),
+    }
+
+
+def test_resolve_recipe_name_resolves_bare_class_name(monkeypatch):
+    expected = "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction"
+    monkeypatch.setattr(
+        module,
+        "_discover_recipe_classes",
+        lambda: {"TrainFinetuneRecipeForNextTokenPrediction": expected},
+    )
+
+    assert module.resolve_recipe_name("TrainFinetuneRecipeForNextTokenPrediction") == expected
+
+
+def test_resolve_recipe_name_returns_fqn_unchanged(monkeypatch):
+    raw = "nemo_automodel.recipes.llm.train_ft.Foo"
+    discover = mock.MagicMock()
+    monkeypatch.setattr(module, "_discover_recipe_classes", discover)
+
+    assert module.resolve_recipe_name(raw) == raw
+    discover.assert_not_called()
+
+
+def test_resolve_recipe_name_raises_for_unknown_bare_name(monkeypatch):
+    monkeypatch.setattr(
+        module,
+        "_discover_recipe_classes",
+        lambda: {"KnownRecipe": "nemo_automodel.recipes.llm.train_ft.KnownRecipe"},
+    )
+
+    with pytest.raises(ValueError, match="Unknown recipe class 'MissingRecipe'") as exc_info:
+        module.resolve_recipe_name("MissingRecipe")
+
+    assert "  - KnownRecipe" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
 # build_parser tests
 # ---------------------------------------------------------------------------
+
 
 def test_build_parser_requires_config():
     parser = module.build_parser()
@@ -161,6 +251,7 @@ def test_build_parser_nproc_per_node(tmp_path):
 # ---------------------------------------------------------------------------
 # main() dispatch tests
 # ---------------------------------------------------------------------------
+
 
 def test_main_missing_recipe(monkeypatch, tmp_yaml_file):
     """YAML without recipe._target_ should exit with error."""
@@ -277,6 +368,7 @@ def test_main_passes_extra_args(monkeypatch, recipe_yaml):
 # ---------------------------------------------------------------------------
 # Repo structure test (unchanged)
 # ---------------------------------------------------------------------------
+
 
 def test_repo_structure():
     repo_root = Path(__file__).parents[3]
