@@ -16,7 +16,7 @@ import shutil
 
 from tests.utils.test_utils import run_test_script
 
-TEST_FOLDER = "llm_seq_cls"
+TEST_FOLDER = "llm_pretrain_and_kd/llm_seq_cls/"
 SEQ_CLS_MOCK_FILENAME = "L2_Seq_Cls_Mock.sh"
 
 
