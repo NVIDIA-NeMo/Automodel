@@ -354,6 +354,8 @@ class GroupedExperts(nn.Module):
                 indices,
                 gate_and_up_projs,
                 down_projs,
+                gate_up_proj_bias,
+                down_proj_bias,
                 n_local_experts,
                 experts_start_idx,
             )
@@ -455,6 +457,8 @@ class GroupedExperts(nn.Module):
         indices,
         gate_and_up_projs,
         down_projs,
+        gate_up_proj_bias,
+        down_proj_bias,
         n_local_experts,
         experts_start_idx,
     ):
@@ -477,15 +481,6 @@ class GroupedExperts(nn.Module):
                 # torch._grouped_mm does not support bias yet (raises
                 # "RuntimeError: Bias not supported yet" as of PyTorch 2.10).
                 # Apply bias manually after each grouped GEMM via _apply_bias.
-                gate_up_proj_bias = (
-                    self.gate_up_proj_bias.to_local()
-                    if isinstance(self.gate_up_proj_bias, DTensor)
-                    else self.gate_up_proj_bias
-                )
-                down_proj_bias = (
-                    self.down_proj_bias.to_local() if isinstance(self.down_proj_bias, DTensor) else self.down_proj_bias
-                )
-
                 output1 = torch._grouped_mm(permuted_x, gate_and_up_projs, offs=offs)
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
                 output1 = self.expert_activation_grouped(output1, permuted_probs)
