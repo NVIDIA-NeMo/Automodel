@@ -100,7 +100,7 @@ class Qwen3VLMoeStateDictAdapter(StateDictAdapter):
         state_dict: dict[str, Any] = {}
         for key, value in hf_state_dict.items():
             match = re.match(
-                r"(?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp\.experts\.(gate_up_proj|down_proj)$",
+                r"(?:model\.)?language_model\.layers\.(\d+)\.mlp\.experts\.(gate_up_proj|down_proj)$",
                 key,
             )
             if match:
