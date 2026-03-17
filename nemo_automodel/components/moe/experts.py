@@ -296,6 +296,12 @@ class GroupedExperts(nn.Module):
             self.gate_and_up_projs.to_local() if isinstance(self.gate_and_up_projs, DTensor) else self.gate_and_up_projs
         )
         down_projs = self.down_projs.to_local() if isinstance(self.down_projs, DTensor) else self.down_projs
+        gate_up_proj_bias = (
+            self.gate_up_proj_bias.to_local() if isinstance(self.gate_up_proj_bias, DTensor) else self.gate_up_proj_bias
+        ) if self.expert_bias else None
+        down_proj_bias = (
+            self.down_proj_bias.to_local() if isinstance(self.down_proj_bias, DTensor) else self.down_proj_bias
+        ) if self.expert_bias else None
 
         # EP variable-length all-gather
         if ep_size > 1:
@@ -351,6 +357,8 @@ class GroupedExperts(nn.Module):
                 token_mask,
                 gate_and_up_projs,
                 down_projs,
+                gate_up_proj_bias,
+                down_proj_bias,
                 n_local_experts,
                 experts_start_idx,
                 experts_end_idx,
@@ -376,6 +384,8 @@ class GroupedExperts(nn.Module):
         token_mask,
         gate_and_up_projs,
         down_projs,
+        gate_up_proj_bias,
+        down_proj_bias,
         n_local_experts,
         experts_start_idx,
         experts_end_idx,
@@ -394,18 +404,18 @@ class GroupedExperts(nn.Module):
 
             local_idx = i - experts_start_idx
             down_proj = down_projs[local_idx]
-            down_proj_bias = self.down_proj_bias[local_idx] if self.expert_bias else None
+            expert_down_proj_bias = down_proj_bias[local_idx] if down_proj_bias is not None else None
 
             idx_b = idx[:, None].expand(-1, x.size(1))
             x_idx = x.gather(dim=0, index=idx_b)
 
             gate_and_up_proj = gate_and_up_projs[local_idx]
-            gate_up_proj_bias = self.gate_up_proj_bias[local_idx] if self.expert_bias else None
+            expert_gate_up_proj_bias = gate_up_proj_bias[local_idx] if gate_up_proj_bias is not None else None
 
             # Up projection (separate from activation, matching DeepEP pattern)
             gate_and_up_out = x_idx @ gate_and_up_proj
-            if gate_up_proj_bias is not None:
-                gate_and_up_out = gate_and_up_out + gate_up_proj_bias
+            if expert_gate_up_proj_bias is not None:
+                gate_and_up_out = gate_and_up_out + expert_gate_up_proj_bias
 
             # Weighted activation (routing weight applied BETWEEN up and down projections)
             # Uses WeightedSwiGLUFunction with float32 backward precision
@@ -414,8 +424,8 @@ class GroupedExperts(nn.Module):
 
             # Down projection
             expert_out = activated @ down_proj
-            if down_proj_bias is not None:
-                expert_out = expert_out + down_proj_bias * w
+            if expert_down_proj_bias is not None:
+                expert_out = expert_out + expert_down_proj_bias * w
 
             y.scatter_add_(dim=0, index=idx_b, src=expert_out.float())
 
