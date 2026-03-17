@@ -25,10 +25,12 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
     SequenceParallel,
 )
+from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
 # Import the function under test
 from nemo_automodel.components.distributed.parallelizer import (
+    _attention_is_head_sharded,
     _get_parallel_plan,
     _update_attention_head_counts_for_tp,
     apply_fsdp2_sharding_recursively,
@@ -36,6 +38,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     import_class_from_path,
     megatron_fsdp_strategy_parallelize,
 )
+from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
 
 
 class MockModel(nn.Module):
@@ -902,45 +905,85 @@ class TestUnshardFsdp2Model:
 
 
 class TestGetParallelPlanClassNameFallback:
-    """Test that _get_parallel_plan matches by class name when identity check fails."""
+    """Test that _get_parallel_plan matches by qualified class name (module.qualname)."""
 
     def test_identity_match(self):
-        """Exact class object in PARALLELIZE_FUNCTIONS is found."""
+        """Exact class qualname in PARALLELIZE_FUNCTIONS is found."""
         sentinel_plan = {"layer": ColwiseParallel()}
         model = MockModel()
 
         with patch(
             "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
-            {type(model): lambda m, sp: sentinel_plan},
+            {_get_class_qualname(type(model)): lambda m, sp: sentinel_plan},
         ):
             plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
         assert plan is sentinel_plan
 
     def test_class_name_fallback(self):
-        """A different class object with the same __name__ still matches."""
+        """A different class object with the same module.qualname still matches.
+
+        With the old class-object-keyed dict, identity was required. With the new
+        string-keyed dict, two distinct class objects that share ``__module__`` and
+        ``__qualname__`` resolve to the same key and both match — which is exactly
+        the NeMo-RL wrapping scenario this fix targets.
+        """
         sentinel_plan = {"layer": ColwiseParallel()}
 
-        # Create a *different* class with the same name as MockModel
+        # Create a *different* class object with the same name (and therefore the same
+        # module.qualname since both are defined in this test module).
         DuplicateMockModel = type("MockModel", (nn.Module,), {"forward": lambda self, x: x})
+        assert DuplicateMockModel is not MockModel
+        assert _get_class_qualname(DuplicateMockModel) == _get_class_qualname(MockModel)
 
         model = MockModel()
         model.__class__ = DuplicateMockModel  # model's type is the duplicate
 
         with patch(
             "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
-            {MockModel: lambda m, sp: sentinel_plan},  # keyed by the original
+            {_get_class_qualname(MockModel): lambda m, sp: sentinel_plan},
+        ):
+            plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
+        # Matches because module.qualname is the same, even though the class object differs
+        assert plan is sentinel_plan
+
+    def test_nemo_rl_wrapped_class_match(self):
+        """A different class object with the same module and qualname still matches.
+
+        This simulates the NeMo-RL scenario: _get_mixin_wrapped_class() creates a new
+        class via type(...) that preserves __module__ and __qualname__ from the original.
+        Both the original and the wrapper resolve to the same _get_class_qualname() key.
+        """
+        sentinel_plan = {"layer": ColwiseParallel()}
+        original_cls = type(MockModel())
+
+        # Simulate _get_mixin_wrapped_class: create a *new* class object that copies
+        # __module__ and __qualname__ from the original (same qualname, different object)
+        WrappedCls = type(original_cls.__name__, (nn.Module,), {
+            "forward": lambda self, x: x,
+            "__module__": original_cls.__module__,
+            "__qualname__": original_cls.__qualname__,
+        })
+        assert WrappedCls is not original_cls
+        assert _get_class_qualname(WrappedCls) == _get_class_qualname(original_cls)
+
+        model = MockModel()
+        model.__class__ = WrappedCls  # model's type is the wrapper
+
+        with patch(
+            "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
+            {_get_class_qualname(original_cls): lambda m, sp: sentinel_plan},
         ):
             plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
         assert plan is sentinel_plan
 
     def test_no_match_falls_through_to_default(self):
-        """Completely unknown class name falls through to the default plan."""
+        """Completely unknown class qualname falls through to the default plan."""
         model = MockModel()
         model.__class__ = type("UnknownModel", (nn.Module,), {"forward": lambda self, x: x})
 
         with patch(
             "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
-            {MockModel: lambda m, sp: {"x": ColwiseParallel()}},
+            {_get_class_qualname(MockModel): lambda m, sp: {"x": ColwiseParallel()}},
         ):
             plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
         # Should get the default Llama3-style plan (has q_proj, k_proj, etc.)
@@ -1073,3 +1116,55 @@ class TestUpdateAttentionHeadCountsForTP:
         model = nn.Module()
         model.config = SimpleNamespace(num_attention_heads=8, hidden_size=64)
         _update_attention_head_counts_for_tp(model, tp_size=2)
+
+
+class TestAttentionIsHeadSharded:
+    """Tests for _attention_is_head_sharded."""
+
+    def test_colwise_default_is_sharded(self):
+        """ColwiseParallel() with default output (Shard) → heads are sharded."""
+        plan = {
+            "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+        }
+        assert _attention_is_head_sharded(plan) is True
+
+    def test_colwise_explicit_shard_is_sharded(self):
+        plan = {
+            "model.layers.*.self_attn.q_proj": ColwiseParallel(output_layouts=Shard(-1)),
+        }
+        assert _attention_is_head_sharded(plan) is True
+
+    def test_rowwise_replicate_is_not_sharded(self):
+        """Phi-3 style: RowwiseParallel with Replicate output → not sharded."""
+        plan = {
+            "model.layers.*.self_attn.qkv_proj": RowwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=Replicate(),
+            ),
+            "model.layers.*.self_attn.o_proj": ColwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=Replicate(),
+            ),
+        }
+        assert _attention_is_head_sharded(plan) is False
+
+    def test_colwise_replicate_output_is_not_sharded(self):
+        """ColwiseParallel with explicit Replicate output → not sharded."""
+        plan = {
+            "model.layers.*.self_attn.q_proj": ColwiseParallel(output_layouts=Replicate()),
+        }
+        assert _attention_is_head_sharded(plan) is False
+
+    def test_no_attn_keys_is_not_sharded(self):
+        """Plan with only MLP entries → not sharded."""
+        plan = {
+            "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),
+            "model.layers.*.mlp.down_proj": RowwiseParallel(),
+        }
+        assert _attention_is_head_sharded(plan) is False
+
+    def test_empty_plan_is_not_sharded(self):
+        assert _attention_is_head_sharded({}) is False

@@ -16,7 +16,7 @@
 set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
 # Run knowledge distillation finetune flow on small, offline fixtures.
-TRANSFORMERS_OFFLINE=1 coverage run --data-file=/workspace/.coverage --source=/workspace --parallel-mode \
+TRANSFORMERS_OFFLINE=1 coverage run \
 examples/llm_kd/kd.py \
   --config examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml \
   --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \

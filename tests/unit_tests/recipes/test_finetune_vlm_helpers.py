@@ -518,6 +518,71 @@ def test_autoprocessor_with_processor_kwargs(caplog):
 
 
 # -----------------------------------------------------------------------------
+# chat_template override tests for build_dataloader
+# -----------------------------------------------------------------------------
+
+
+def test_build_dataloader_chat_template_applied():
+    """chat_template in dataset config is applied to processor and not leaked to dataset target."""
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    ds_calls = []
+
+    def ds_factory(path_or_dataset, split=None):
+        ds_calls.append({"path_or_dataset": path_or_dataset, "split": split})
+        return []
+
+    class DummyProcessor:
+        def __init__(self):
+            self.chat_template = "{{ default }}"
+            self.tokenizer = SimpleNamespace(chat_template="{{ default }}")
+
+    processor = DummyProcessor()
+    cfg_ds = ConfigNode(
+        {"_target_": ds_factory, "path_or_dataset": "ds/path", "split": "train", "chat_template": "{{ custom }}"}
+    )
+    cfg_dl = MagicMock()
+    cfg_dl.get.return_value = None
+    cfg_dl.instantiate.return_value = MagicMock()
+
+    with patch("transformers.AutoProcessor.from_pretrained", return_value=processor), \
+         patch("torch.utils.data.distributed.DistributedSampler"), \
+         patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"default": MagicMock()}):
+        _, built_processor = build_dataloader(cfg_ds, cfg_dl, "model", None, None, 42, 1)
+
+    assert built_processor.chat_template == "{{ custom }}"
+    assert built_processor.tokenizer.chat_template == "{{ custom }}"
+    assert ds_calls == [{"path_or_dataset": "ds/path", "split": "train"}]
+
+
+def test_build_dataloader_no_chat_template():
+    """Without chat_template, processor template stays unchanged."""
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    def ds_factory(path_or_dataset, split=None):
+        return []
+
+    class DummyProcessor:
+        def __init__(self):
+            self.chat_template = "{{ original }}"
+            self.tokenizer = SimpleNamespace(chat_template="{{ original }}")
+
+    processor = DummyProcessor()
+    cfg_ds = ConfigNode({"_target_": ds_factory, "path_or_dataset": "ds/path", "split": "train"})
+    cfg_dl = MagicMock()
+    cfg_dl.get.return_value = None
+    cfg_dl.instantiate.return_value = MagicMock()
+
+    with patch("transformers.AutoProcessor.from_pretrained", return_value=processor), \
+         patch("torch.utils.data.distributed.DistributedSampler"), \
+         patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"default": MagicMock()}):
+        _, built_processor = build_dataloader(cfg_ds, cfg_dl, "model", None, None, 42, 1)
+
+    assert built_processor.chat_template == "{{ original }}"
+    assert built_processor.tokenizer.chat_template == "{{ original }}"
+
+
+# -----------------------------------------------------------------------------
 # State dict adapter tests for _maybe_adapt_state_dict_to_hf in VLM
 # -----------------------------------------------------------------------------
 

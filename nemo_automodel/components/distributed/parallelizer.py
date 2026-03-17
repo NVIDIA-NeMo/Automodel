@@ -82,6 +82,7 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
     PARALLELIZE_FUNCTIONS,
     VocabParallelEmbedding,
+    _get_class_qualname,
     get_decilm_nemotron_tp_plan,
     get_llama_nemotron_super_tp_plan,
 )
@@ -101,6 +102,7 @@ except:
 import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_utils
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 class ParallelizationStrategy(ABC):
@@ -175,7 +177,8 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                         category=UserWarning,
                     )
                     parallelize_module(model, tp_mesh, model_parallel_plan)
-                _update_attention_head_counts_for_tp(model, tp_mesh.size())
+                if _attention_is_head_sharded(model_parallel_plan):
+                    _update_attention_head_counts_for_tp(model, tp_mesh.size())
 
         # Apply activation checkpointing to linear layers if requested
         if activation_checkpointing:
@@ -749,6 +752,33 @@ def translate_to_torch_parallel_style(style: str):
         raise ValueError(f"Unknown parallel style: {style}")
 
 
+def _attention_is_head_sharded(model_parallel_plan: dict) -> bool:
+    """Return True when the TP plan column-wise shards any QKV attention projection.
+
+    When Q/K/V projections use ``ColwiseParallel`` with sharded output (the
+    default), each TP rank holds ``num_heads / tp_size`` heads and the model
+    config / layer attributes must be updated accordingly.
+
+    Plans that keep attention replicated (e.g. Phi-3 with ``RowwiseParallel``
+    on fused QKV and ``Replicate`` output) should *not* trigger a head-count
+    update.
+    """
+    attn_proj_suffixes = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.qkv_proj")
+    for key, style in model_parallel_plan.items():
+        if not any(key.endswith(s) for s in attn_proj_suffixes):
+            continue
+        if isinstance(style, ColwiseParallel):
+            out = getattr(style, "output_layouts", None)
+            if out is None:
+                return True
+            if isinstance(out, (list, tuple)):
+                if any(isinstance(p, Shard) for p in out):
+                    return True
+            elif isinstance(out, Shard):
+                return True
+    return False
+
+
 def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None:
     """
     After TP sharding, the Q/K/V outputs are split across ranks (each rank has
@@ -1089,15 +1119,12 @@ def _get_parallel_plan(
                 f"Error: {e}"
             )
 
-    elif model_cls in PARALLELIZE_FUNCTIONS or model_cls.__name__ in {k.__name__ for k in PARALLELIZE_FUNCTIONS}:
-        func = PARALLELIZE_FUNCTIONS.get(model_cls) or next(
-            f for k, f in PARALLELIZE_FUNCTIONS.items() if k.__name__ == model_cls.__name__
-        )
+    elif (func := PARALLELIZE_FUNCTIONS.get(_get_class_qualname(model_cls))) is not None:
         try:
             model_parallel_plan = func(model, sequence_parallel)
-            logger.info("Using optimized parallel plan.")
+            logger.info(f"Using optimized parallel plan for {model_cls.__name__}.")
         except Exception as e:
-            logger.info(f"Optimized parallel plan is not available: {e}. Falling back to the HF tp plan.")
+            logger.info(f"Optimized parallel plan not available: {e}. Falling back to the HF tp plan.")
             model_parallel_plan = get_hf_tp_shard_plan(model)
 
     else:
