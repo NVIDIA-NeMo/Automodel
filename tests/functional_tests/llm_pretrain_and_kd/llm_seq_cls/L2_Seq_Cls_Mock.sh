@@ -17,4 +17,4 @@ set -xeuo pipefail
 
 TRANSFORMERS_OFFLINE=1 coverage run \
 examples/llm_seq_cls/seq_cls.py \
-  --config tests/functional_tests/llm_seq_cls/seq_cls_bert_mock.yaml
+  --config tests/functional_tests/llm_seq_cls/llm_seq_cls/seq_cls_bert_mock.yaml
