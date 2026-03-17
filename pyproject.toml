@@ -95,7 +95,9 @@ diffusion = [
     "ftfy",
     "imageio",
     "imageio-ffmpeg",
+    "kernels",
     "opencv-python-headless",
+    "torchvision",
 ]
 # nvidia-cudnn-cu12 pin: This is required for GPTOSS TE support + faster cudnn attention (only on Linux where CUDA is available)
 # "nvidia-cudnn-cu12>=9.18.0.0; sys_platform == 'linux'",
@@ -210,6 +212,11 @@ torch = [
   { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
+torchvision = [
+  { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
+  { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
+  { index = "pypi", marker = "sys_platform == 'darwin'" },
+]
 
 [[tool.uv.index]]
 name = "pypi"
@@ -260,9 +267,12 @@ requires-dist = ["torch", "packaging", "ninja", "setuptools"]
 pythonpath = ["."]
 
 [tool.coverage.paths]
-source = [".", "/workspace", "/home/runner/work/Automodel/Automodel"]
+source = [".", "/opt/Automodel", "/home/runner/work/Automodel/Automodel"]
 
 [tool.coverage.run]
+data_file = "/opt/Automodel/.coverage"
+source = ["/opt/Automodel/"]
+parallel = true
 concurrency = ["thread", "multiprocessing"]
 omit = [
     "nemo_automodel/components/checkpoint/_backports/*.py",
