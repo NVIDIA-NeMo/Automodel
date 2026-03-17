@@ -688,6 +688,42 @@ class TestModelMappingKeyErrorFallback:
         assert is_custom is False
         mock_wrap.assert_called_once_with(FakeModel)
 
+    def test_fallback_path_skips_incompatible_shared_arch_custom_model(self):
+        """Shared architecture names should stay on HF when the config does not match our custom model."""
+
+        class FakeConfig:
+            name_or_path = "test-model"
+            architectures = ["NemotronHForCausalLM"]
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
+        fake_config = FakeConfig()
+        fake_model = FakeModel()
+
+        cls = self._make_cls({FakeConfig: FakeModel})
+        cls._from_config_parent_class = MagicMock(return_value=fake_model)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.ModelRegistry.has_custom_model", return_value=True),
+            patch("nemo_automodel._transformers.model_init.ModelRegistry.resolve_custom_model_cls") as mock_resolve,
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
+        ):
+            mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
+            is_custom, model = _init_model(
+                cls,
+                fake_config,
+                attn_implementation="eager",
+                torch_dtype="auto",
+                quantization_config=None,
+                force_hf=False,
+            )
+
+        assert is_custom is False
+        mock_resolve.assert_not_called()
+        mock_wrap.assert_called_once_with(FakeModel)
+
     def test_fallback_path_unknown_config_falls_back_to_type_model(self):
         """Fallback path: KeyError in _model_mapping falls back to type(model)."""
 
