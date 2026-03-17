@@ -101,6 +101,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.nemotron_v3.model", "NemotronHForCausalLM"),
         ),
         (
+            "NemotronFlashForCausalLM",
+            ("nemo_automodel.components.models.nemotron_flash.model", "NemotronFlashForCausalLM"),
+        ),
+        (
             "NemotronParseForConditionalGeneration",
             ("nemo_automodel.components.models.nemotron_parse.model", "NemotronParseForConditionalGeneration"),
         ),
@@ -145,6 +149,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
+    "nemotron_flash": (
+        "nemo_automodel.components.models.nemotron_flash.configuration",
+        "NemotronFlashConfig",
+    ),
 }
 
 
