@@ -609,6 +609,12 @@ if _HF_MISTRAL3_AVAILABLE:
         """
 
         @classmethod
+        def supports_config(cls, config) -> bool:
+            """Only handle configs whose text backbone is Mistral4 (MoE + MLA)."""
+            text_config = getattr(config, "text_config", None)
+            return text_config is not None and getattr(text_config, "model_type", None) == "mistral4"
+
+        @classmethod
         def from_config(
             cls,
             config,

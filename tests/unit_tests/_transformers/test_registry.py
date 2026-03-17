@@ -172,6 +172,76 @@ def test_default_registry_has_static_entries():
         assert arch_name in inst.model_arch_name_to_cls.keys()
 
 
+def test_resolve_custom_model_cls_found():
+    """resolve_custom_model_cls returns the class when it exists and has no supports_config."""
+    from nemo_automodel._transformers import registry as reg
+
+    inst = _new_registry_instance(reg)
+
+    class PlainModel:
+        pass
+
+    inst.register("PlainModel", PlainModel)
+    assert inst.resolve_custom_model_cls("PlainModel", object()) is PlainModel
+
+
+def test_resolve_custom_model_cls_not_found():
+    """resolve_custom_model_cls returns None for unregistered architectures."""
+    from nemo_automodel._transformers import registry as reg
+
+    inst = _new_registry_instance(reg)
+    assert inst.resolve_custom_model_cls("NonExistent", object()) is None
+
+
+def test_resolve_custom_model_cls_supports_config_true():
+    """resolve_custom_model_cls returns the class when supports_config returns True."""
+    from nemo_automodel._transformers import registry as reg
+
+    inst = _new_registry_instance(reg)
+
+    class SupportedModel:
+        @classmethod
+        def supports_config(cls, config):
+            return True
+
+    inst.register("SupportedModel", SupportedModel)
+    assert inst.resolve_custom_model_cls("SupportedModel", object()) is SupportedModel
+
+
+def test_resolve_custom_model_cls_supports_config_false():
+    """resolve_custom_model_cls returns None when supports_config returns False."""
+    from nemo_automodel._transformers import registry as reg
+
+    inst = _new_registry_instance(reg)
+
+    class UnsupportedModel:
+        @classmethod
+        def supports_config(cls, config):
+            return False
+
+    inst.register("UnsupportedModel", UnsupportedModel)
+    assert inst.resolve_custom_model_cls("UnsupportedModel", object()) is None
+
+
+def test_resolve_custom_model_cls_passes_config_to_supports():
+    """resolve_custom_model_cls passes the config to supports_config for inspection."""
+    from nemo_automodel._transformers import registry as reg
+
+    inst = _new_registry_instance(reg)
+
+    class ConfigAwareModel:
+        @classmethod
+        def supports_config(cls, config):
+            return getattr(config, "ok", False)
+
+    inst.register("ConfigAwareModel", ConfigAwareModel)
+
+    good = types.SimpleNamespace(ok=True)
+    bad = types.SimpleNamespace(ok=False)
+    assert inst.resolve_custom_model_cls("ConfigAwareModel", good) is ConfigAwareModel
+    assert inst.resolve_custom_model_cls("ConfigAwareModel", bad) is None
+
+
 def test_all_model_folders_registered_in_auto_map():
     """Every model folder with a model.py must have at least one entry in MODEL_ARCH_MAPPING.
 
