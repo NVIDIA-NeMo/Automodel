@@ -316,7 +316,9 @@ class Gate(nn.Module):
             else:
                 values, indices = torch.topk(scores, k=self.topk, dim=-1)
                 weights = values.softmax(dim=1, dtype=self.gate_precision or torch.float32)
-                original_scores = scores
+                # Use full softmax for aux_loss so P_i represents proper probabilities.
+                # Raw logits can be negative, causing aux_loss to diverge negative.
+                original_scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
         elif self.score_func == "softmax_with_bias":
             # softmax first, then add bias for expert selection,
             # group routing on biased scores, final weights from unbiased softmax scores.

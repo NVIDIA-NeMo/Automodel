@@ -204,13 +204,17 @@ def test_dropout_pre_post_effects(dummy_input):
 
 def test_apply_lora_respects_wildcard(model):
     """Validates that wildcard matching correctly applies LoRA to all matching modules."""
+    assert isinstance(model.linear1, nn.Linear)
+    assert isinstance(model.linear2, nn.Linear)
     apply_lora_to_linear_modules(model, PeftConfig(target_modules=[".*"], dim=4, alpha=8))
-    assert isinstance(model.linear1, LinearLoRA)
+    assert isinstance(model.linear1, LinearLoRA), type(model.linear1)
     assert isinstance(model.linear2, LinearLoRA)
 
 
 def test_no_patch_on_non_matching_module(model):
     """Confirms that no modules are patched if target pattern doesn't match any names."""
+    assert isinstance(model.linear1, nn.Linear)
+    assert isinstance(model.linear2, nn.Linear)
     apply_lora_to_linear_modules(model, PeftConfig(target_modules=["nonexistent_module"], dim=4, alpha=8))
     assert not isinstance(model.linear1, LinearLoRA)
     assert not isinstance(model.linear2, LinearLoRA)

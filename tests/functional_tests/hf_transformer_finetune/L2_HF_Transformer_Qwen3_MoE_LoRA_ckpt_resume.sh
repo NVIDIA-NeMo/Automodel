@@ -23,7 +23,7 @@ echo "Checkpoint directory: $CKPT_DIR"
 
 # 1. Train and save checkpoint
 echo "Starting training..."
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
     examples/llm_finetune/finetune.py \
     --config examples/llm_finetune/qwen/qwen3_moe_2layer_proxy_lora.yaml \
     --step_scheduler.max_steps 5 \
@@ -33,7 +33,7 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
 
 # 2. Resume from checkpoint
 echo "Resuming training..."
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
     examples/llm_finetune/finetune.py \
     --config examples/llm_finetune/qwen/qwen3_moe_2layer_proxy_lora.yaml \
     --step_scheduler.max_steps 10 \
