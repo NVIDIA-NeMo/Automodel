@@ -24,10 +24,18 @@ HAS_TE, transformer_engine = safe_import_te()
 import logging
 
 logger = logging.getLogger(__name__)
+from functools import lru_cache
 
 
 def _is_linear_module(module):
     return isinstance(module, nn.Linear) or (HAS_TE and isinstance(module, transformer_engine.pytorch.Linear))
+
+
+@lru_cache(maxsize=1000)
+def _compile_wildcard_pattern(pattern):
+    pattern = re.sub(r"(?<!\.)\*", r".*", pattern)  # replace [^\.]* with `.*` ie insert "." before "*"
+    pattern = re.sub(r"\.\*", "(.*)", pattern)  # replace .* -> (.*)
+    return re.compile("^" + pattern + "$")
 
 
 def wildcard_match(pattern, key):
@@ -43,9 +51,7 @@ def wildcard_match(pattern, key):
     """
     if key is None:
         return False
-    pattern = re.sub(r"(?<!\.)\*", r".*", pattern)  # replace [^\.]* with .*
-    pattern = re.sub(r"\.\*", "(.*)", pattern)  # replace .* -> (.*)
-    regex_pattern = re.compile("^" + pattern + "$")
+    regex_pattern = _compile_wildcard_pattern(pattern)
     match = regex_pattern.match(key)
     return match is not None
 
