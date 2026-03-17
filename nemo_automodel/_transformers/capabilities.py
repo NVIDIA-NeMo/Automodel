@@ -46,7 +46,7 @@ def _has_optimized_tp_plan(model_cls: type) -> bool:
     )
 
     def get_name(x):
-        if x is str:
+        if isinstance(x, str):
             return x
         return x.__name__
 
