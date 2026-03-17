@@ -931,3 +931,49 @@ class TestRegistry:
         mapping = dict(MODEL_ARCH_MAPPING)
         assert mapping["Mistral4ForCausalLM"][0] == "nemo_automodel.components.models.mistral4.model"
         assert mapping["Mistral3ForConditionalGeneration"][0] == "nemo_automodel.components.models.mistral4.model"
+
+
+# ---------------------------------------------------------------------------
+# supports_config gate
+# ---------------------------------------------------------------------------
+
+
+@_skip_no_hf_mistral3
+class TestSupportsConfig:
+    def test_supports_mistral4_text_config(self, multimodal_config):
+        """supports_config returns True for Mistral3Config wrapping a Mistral4 text backbone."""
+        from nemo_automodel.components.models.mistral4.model import (
+            Mistral3ForConditionalGeneration as OurMistral3ForCG,
+        )
+
+        assert OurMistral3ForCG.supports_config(multimodal_config) is True
+
+    def test_rejects_non_mistral4_text_config(self):
+        """supports_config returns False when text_config.model_type is not 'mistral4'."""
+        from nemo_automodel.components.models.mistral4.model import (
+            Mistral3ForConditionalGeneration as OurMistral3ForCG,
+        )
+
+        config = Mock(spec=[])
+        config.text_config = Mock(spec=[])
+        config.text_config.model_type = "ministral3"
+        assert OurMistral3ForCG.supports_config(config) is False
+
+    def test_rejects_config_without_text_config(self):
+        """supports_config returns False when config has no text_config attribute."""
+        from nemo_automodel.components.models.mistral4.model import (
+            Mistral3ForConditionalGeneration as OurMistral3ForCG,
+        )
+
+        config = Mock(spec=[])
+        assert OurMistral3ForCG.supports_config(config) is False
+
+    def test_rejects_text_config_without_model_type(self):
+        """supports_config returns False when text_config has no model_type."""
+        from nemo_automodel.components.models.mistral4.model import (
+            Mistral3ForConditionalGeneration as OurMistral3ForCG,
+        )
+
+        config = Mock(spec=[])
+        config.text_config = Mock(spec=[])
+        assert OurMistral3ForCG.supports_config(config) is False
