@@ -297,11 +297,19 @@ class GroupedExperts(nn.Module):
         )
         down_projs = self.down_projs.to_local() if isinstance(self.down_projs, DTensor) else self.down_projs
         gate_up_proj_bias = (
-            self.gate_up_proj_bias.to_local() if isinstance(self.gate_up_proj_bias, DTensor) else self.gate_up_proj_bias
-        ) if self.expert_bias else None
+            (
+                self.gate_up_proj_bias.to_local()
+                if isinstance(self.gate_up_proj_bias, DTensor)
+                else self.gate_up_proj_bias
+            )
+            if self.expert_bias
+            else None
+        )
         down_proj_bias = (
-            self.down_proj_bias.to_local() if isinstance(self.down_proj_bias, DTensor) else self.down_proj_bias
-        ) if self.expert_bias else None
+            (self.down_proj_bias.to_local() if isinstance(self.down_proj_bias, DTensor) else self.down_proj_bias)
+            if self.expert_bias
+            else None
+        )
 
         # EP variable-length all-gather
         if ep_size > 1:
