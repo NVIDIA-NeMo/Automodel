@@ -143,7 +143,6 @@ def _permute_tokens_for_grouped_mm(
     return sorted_token_ids, sorted_weights, tokens_per_expert, offs
 
 
-@torch.compile
 def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     """Apply per-expert bias to grouped GEMM output.
 
