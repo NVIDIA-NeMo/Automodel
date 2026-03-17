@@ -109,7 +109,7 @@ def load_yaml(file_path):
         logging.error("File '%s' was not found.", file_path)
         raise e
     except yaml.YAMLError as e:
-        logging.error("parsing YAML file %s failed.", e)
+        logging.error("parsing YAML file '%s' failed: %s", file_path, e)
         raise e
 
 
