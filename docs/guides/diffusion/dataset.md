@@ -121,7 +121,7 @@ python -m tools.diffusion.preprocessing_multiprocess video \
 | `--video_dir` | Input video directory |
 | `--mode` | `video` (full video) or `frames` (extract evenly-spaced frames) |
 | `--num_frames` | Number of frames to extract in `frames` mode |
-| `--target_frames` | Target frame count (e.g., 121 for HunyuanVideo 4n+1 constraint) |
+| `--target_frames` | Target frame count (for example, 121 for HunyuanVideo 4n+1 constraint) |
 | `--resolution_preset` | Resolution preset for bucketing |
 | `--height` / `--width` | Explicit target size (disables bucketing) |
 | `--resize_mode` | Interpolation: `bilinear`, `bicubic`, `nearest`, `area`, `lanczos` |

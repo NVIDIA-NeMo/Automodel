@@ -4,7 +4,7 @@
 
 ## Introduction
 
-NeMo AutoModel supports training and fine-tuning diffusion models using flow matching. Flow matching is a generative modeling framework that learns to transform noise into data by regressing a velocity field along straight interpolation paths. NeMo AutoModel integrates with [Hugging Face Diffusers](https://huggingface.co/docs/diffusers) to provide distributed training for state-of-the-art text-to-image and text-to-video models.
+NeMo AutoModel supports training and fine-tuning diffusion models using flow matching. Flow matching is a generative modeling framework that learns to transform noise into data by regressing a velocity field along straight interpolation paths. NeMo AutoModel integrates with [Hugging Face Diffusers](https://huggingface.co/docs/diffusers) to provide distributed training for text-to-image and text-to-video models.
 
 The `TrainDiffusionRecipe` orchestrates the full training pipeline: model loading, dataset preparation, optimizer setup, distributed training with FSDP2, flow matching loss computation, checkpointing, and logging.
 
