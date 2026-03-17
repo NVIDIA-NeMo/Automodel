@@ -52,6 +52,8 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "GlmMoeDsaForCausalLM",
             ("nemo_automodel.components.models.glm_moe_dsa.model", "GlmMoeDsaForCausalLM"),
+            "Gemma4ForConditionalGeneration",
+            ("nemo_automodel.components.models.gemma4_moe.model", "Gemma4ForConditionalGeneration"),
         ),
         (
             "GptOssForCausalLM",
