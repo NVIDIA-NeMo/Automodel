@@ -72,7 +72,7 @@ def _discover_recipe_classes() -> dict[str, str]:
     for py_file in _RECIPES_DIR.rglob("*.py"):
         if py_file.name.startswith("_"):
             continue
-        module_dotted = str(py_file.relative_to(pkg_root).with_suffix("")).replace("/", ".")
+        module_dotted = ".".join(py_file.relative_to(pkg_root).with_suffix("").parts)
         source = py_file.read_text()
         for m in re.finditer(r"^class\s+(\w*Recipe\w*)\s*[\(:]", source, re.MULTILINE):
             cls_name = m.group(1)
