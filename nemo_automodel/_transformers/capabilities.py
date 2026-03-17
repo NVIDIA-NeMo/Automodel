@@ -45,7 +45,12 @@ def _has_optimized_tp_plan(model_cls: type) -> bool:
         PARALLELIZE_FUNCTIONS,
     )
 
-    return model_cls in PARALLELIZE_FUNCTIONS or model_cls.__name__ in {k.__name__ for k in PARALLELIZE_FUNCTIONS}
+    def get_name(x):
+        if x is str:
+            return x
+        return x.__name__
+
+    return model_cls in PARALLELIZE_FUNCTIONS or model_cls.__name__ in set(map(get_name, PARALLELIZE_FUNCTIONS))
 
 
 def _is_moe(model_cls: type) -> bool:
