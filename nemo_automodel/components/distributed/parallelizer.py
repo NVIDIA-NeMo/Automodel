@@ -195,15 +195,21 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     layers[i].mlp = checkpoint_wrapper(layer.mlp)
                 if hasattr(layer, "self_attn"):
                     layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
-
                 if hasattr(layer, "input_layernorm"):
                     layers[i].input_layernorm = checkpoint_wrapper(
                         layers[i].input_layernorm  # type: ignore
                     )
-
                 if hasattr(layer, "post_attention_layernorm"):
                     layers[i].post_attention_layernorm = checkpoint_wrapper(
                         layers[i].post_attention_layernorm  # type: ignore
+                    )
+                if hasattr(layer, "mamba"):
+                    layers[i].mamba = checkpoint_wrapper(layers[i].mamba)  # type: ignore
+                if hasattr(layer, "gla"):
+                    layers[i].gla = checkpoint_wrapper(layers[i].gla)  # type: ignore
+                if hasattr(layer, "pre_ffn_layernorm"):
+                    layers[i].pre_ffn_layernorm = checkpoint_wrapper(
+                        layers[i].pre_ffn_layernorm  # type: ignore
                     )
 
         # Set up mixed precision policy
@@ -214,8 +220,20 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 output_dtype=torch.float32,
             )
 
-        # Find transformer layers and apply parallelisms
-        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
+        # Prefer dtype-aware sharding for extracted transformer layers so mixed
+        # fp32/bf16 subtrees can be wrapped without model-specific strategies.
+        if layers:
+            for layer_id, layer in enumerate(layers):
+                _pre_shard_combined_projections(layer, dp_mesh, mp_policy, offload_policy)
+                parallelizer_utils.fully_shard_by_dtype(
+                    layer,
+                    mesh=dp_mesh,
+                    mp_policy=mp_policy,
+                    offload_policy=offload_policy,
+                    reshard_after_forward=layer_id < len(layers) - 1,
+                )
+        else:
+            apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
 
         # Apply FSDP to the root model
         # Do not reshard after forward for root model because its parameters
