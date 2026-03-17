@@ -80,6 +80,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         save_sharded: bool = False,
         consolidated_output_path: Optional[str] = None,
         num_threads_consolidation: Optional[int] = None,
+        staging_dir: Optional[str] = None,
     ) -> None:
         """
         Initialize the huggingface writer pointing to path.
@@ -98,6 +99,8 @@ class _HuggingFaceStorageWriter(FsspecWriter):
                         Default is False which assumes full tensors are being saved.
             consolidated_output_path: If provided, the output path where the consolidated files will be written in the finish step. This needs to be a local fs path right now.
             num_threads_consolidation: Number of threads to use for parallel processing of saving data to output files. If not provided, the default value is the number of output files.
+            staging_dir: Optional directory for staging files during consolidation. If provided,
+                        temp files will be created here instead of system temp.
         """
         if token is not None:
             super().__init__(
@@ -113,6 +116,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         self._fqn_to_index_mapping: Optional[dict[str, int]] = fqn_to_index_mapping
         self._save_sharded = save_sharded
         self._consolidated_output_path = consolidated_output_path
+        self._staging_dir = staging_dir
 
         if num_threads_consolidation:
             self._num_threads_consolidation = num_threads_consolidation
@@ -170,11 +174,14 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         if self._save_sharded and not self._consolidated_output_path:
             return
         if self._save_sharded:
+            # Use staging for single-rank consolidation path
             return consolidate_safetensors_files(
                 input_dir=self.path,
                 output_dir=self._consolidated_output_path,
                 num_threads=self._num_threads_consolidation,
                 fqn_to_index_mapping=self._fqn_to_index_mapping,
+                use_staging=True,
+                staging_dir=self._staging_dir,
             )
 
         metadata_to_write = {}
@@ -255,7 +262,7 @@ class _HuggingFaceStorageReader(FsspecReader):
                     item_md = self.storage_data[req.storage_index]
 
                     stream.seek(item_md.offset)
-                    tensor_bytes = stream.read(item_md.length)
+                    tensor_bytes = bytearray(stream.read(item_md.length))
 
                     tensor = torch.frombuffer(
                         tensor_bytes,

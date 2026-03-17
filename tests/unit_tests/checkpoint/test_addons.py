@@ -14,7 +14,15 @@
 
 import os
 
-from nemo_automodel.components.checkpoint.addons import _maybe_save_custom_model_code
+import torch
+from torch import nn
+
+from nemo_automodel.components.checkpoint.addons import (
+    _extract_target_modules,
+    _maybe_save_custom_model_code,
+    _maybe_strip_quantization_config,
+)
+from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 
 
 def _write(path: str, content: str) -> None:
@@ -42,9 +50,9 @@ def test_maybe_save_custom_model_code_copies_py_files_and_structure(tmp_path):
     # Act
     _maybe_save_custom_model_code(str(src_root), str(dst_root))
 
-    # Assert: .py files copied with preserved structure; non-.py ignored
+    # Assert: .py files copied with preserved structure; non-.py and __init__.py ignored
     assert (dst_root / "main.py").exists()
-    assert (dst_root / "pkg" / "__init__.py").exists()
+    assert not (dst_root / "pkg" / "__init__.py").exists()
     assert (dst_root / "pkg" / "subpkg" / "module.py").exists()
     assert not (dst_root / "pkg" / "readme.txt").exists()
 
@@ -68,3 +76,198 @@ def test_maybe_save_custom_model_code_noop_for_none_or_non_dir(tmp_path):
     assert list(dst_root.rglob("*.py")) == []
 
 
+def test_model_state_disables_tied_embeddings_for_non_tied_models():
+    """
+    Ensure ModelState explicitly disables tied embeddings for models listed in
+    the non_tied_lm_head_models filter (e.g., Qwen3 Omni Moe Thinker).
+    """
+
+    class _DummyConfig:
+        tie_word_embeddings = True
+
+    class _DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = _DummyConfig()
+            self.lm_head = torch.nn.Linear(2, 2, bias=False)
+
+    _DummyModel.__name__ = "Qwen3OmniMoeThinkerForConditionalGeneration"
+
+    model = _DummyModel()
+    state = ModelState([model])
+
+    assert state.is_tied_lm_head is False
+    assert not hasattr(state, "lm_head_param_name")
+
+    state_dict = state.state_dict()
+    assert "lm_head.weight" in state_dict
+
+
+# _extract_target_modules tests
+def _make_model_with_named_modules(module_names):
+    """Build a dummy model whose ``named_modules`` yields the given names.
+
+    We simulate LoRA sub-modules by adding ``nn.Identity`` leaves under
+    the requested paths.  ``_extract_target_modules`` looks for any
+    module whose name contains "lora", so we add leaves like
+    ``<target>.lora_A``.
+    """
+    root = nn.Module()
+    for name in module_names:
+        parts = name.split(".")
+        parent = root
+        for part in parts[:-1]:
+            if not hasattr(parent, part):
+                setattr(parent, part, nn.Module())
+            parent = getattr(parent, part)
+        setattr(parent, parts[-1], nn.Identity())
+    return root
+
+
+class TestExtractTargetModules:
+    """Tests for _extract_target_modules with combined-projection expansion."""
+
+    def test_simple_non_combined_modules(self):
+        """Non-combined module names pass through unchanged."""
+        model = _make_model_with_named_modules(
+            [
+                "model.layers.0.self_attn.o_proj.lora_A",
+                "model.layers.0.self_attn.o_proj.lora_B",
+                "model.layers.0.mlp.down_proj.lora_A",
+            ]
+        )
+        result = _extract_target_modules(model)
+        assert "model.layers.0.self_attn.o_proj" in result
+        assert "model.layers.0.mlp.down_proj" in result
+
+    def test_qkv_proj_expanded(self):
+        """qkv_proj is expanded to q_proj, k_proj, v_proj."""
+        model = _make_model_with_named_modules(
+            [
+                "model.layers.0.self_attn.qkv_proj.lora_A",
+                "model.layers.0.self_attn.qkv_proj.lora_B",
+            ]
+        )
+        result = _extract_target_modules(model)
+        assert "model.layers.0.self_attn.q_proj" in result
+        assert "model.layers.0.self_attn.k_proj" in result
+        assert "model.layers.0.self_attn.v_proj" in result
+        # Combined name should NOT appear
+        assert all("qkv_proj" not in m for m in result)
+
+    def test_gate_up_proj_expanded(self):
+        """gate_up_proj is expanded to gate_proj, up_proj."""
+        model = _make_model_with_named_modules(
+            [
+                "model.layers.0.mlp.gate_up_proj.lora_A",
+                "model.layers.0.mlp.gate_up_proj.lora_B",
+            ]
+        )
+        result = _extract_target_modules(model)
+        assert "model.layers.0.mlp.gate_proj" in result
+        assert "model.layers.0.mlp.up_proj" in result
+        assert all("gate_up_proj" not in m for m in result)
+
+    def test_mixed_combined_and_regular(self):
+        """Mixed combined and regular module names."""
+        model = _make_model_with_named_modules(
+            [
+                "model.layers.0.self_attn.qkv_proj.lora_A",
+                "model.layers.0.self_attn.o_proj.lora_A",
+                "model.layers.0.mlp.gate_up_proj.lora_A",
+                "model.layers.0.mlp.down_proj.lora_A",
+            ]
+        )
+        result = _extract_target_modules(model)
+        expected = {
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.0.self_attn.k_proj",
+            "model.layers.0.self_attn.v_proj",
+            "model.layers.0.self_attn.o_proj",
+            "model.layers.0.mlp.gate_proj",
+            "model.layers.0.mlp.up_proj",
+            "model.layers.0.mlp.down_proj",
+        }
+        assert set(result) == expected
+
+    def test_torch_compile_prefix_stripped(self):
+        """_orig_mod. prefix from torch.compile is stripped before expansion."""
+        model = _make_model_with_named_modules(
+            [
+                "_orig_mod.model.layers.0.self_attn.qkv_proj.lora_A",
+            ]
+        )
+        result = _extract_target_modules(model)
+        assert "model.layers.0.self_attn.q_proj" in result
+        assert "model.layers.0.self_attn.k_proj" in result
+        assert "model.layers.0.self_attn.v_proj" in result
+        assert all("_orig_mod" not in m for m in result)
+
+    def test_result_is_sorted(self):
+        """Return value is sorted."""
+        model = _make_model_with_named_modules(
+            [
+                "model.layers.0.mlp.gate_up_proj.lora_A",
+                "model.layers.0.self_attn.qkv_proj.lora_A",
+            ]
+        )
+        result = _extract_target_modules(model)
+        assert result == sorted(result)
+
+    def test_biencoder_target_modules_remapped(self):
+        """Biencoder lm_q.* target modules have lm_q. prefix stripped."""
+        from nemo_automodel.components.models.common.bidirectional import BiencoderStateDictAdapter
+
+        model = _make_model_with_named_modules(
+            [
+                "lm_q.layers.0.self_attn.q_proj.lora_A",
+                "lm_q.layers.0.self_attn.k_proj.lora_A",
+                "lm_q.layers.0.mlp.down_proj.lora_A",
+            ]
+        )
+        model.state_dict_adapter = BiencoderStateDictAdapter()
+        result = _extract_target_modules(model)
+        assert "layers.0.self_attn.q_proj" in result
+        assert "layers.0.self_attn.k_proj" in result
+        assert "layers.0.mlp.down_proj" in result
+        assert all("lm_q" not in m for m in result)
+
+
+class TestMaybeStripQuantizationConfig:
+    """Tests for _maybe_strip_quantization_config."""
+
+    @staticmethod
+    def _make_config_with_quant():
+        cfg = type("Config", (), {})()
+        cfg.quantization_config = {"quant_method": "mxfp4"}
+        return cfg
+
+    def test_strips_quantization_config_when_all_params_bf16(self):
+        """quantization_config is removed when all params are standard floating-point."""
+        model = nn.Linear(4, 4, dtype=torch.bfloat16)
+        model.config = self._make_config_with_quant()
+
+        _maybe_strip_quantization_config(model)
+        assert not hasattr(model.config, "quantization_config")
+
+    def test_keeps_quantization_config_when_uint8_params_exist(self):
+        """quantization_config is preserved when quantized (uint8) parameters exist."""
+        model = nn.Module()
+        model.register_parameter("weight", nn.Parameter(torch.ones(4, 4, dtype=torch.uint8), requires_grad=False))
+        model.config = self._make_config_with_quant()
+
+        _maybe_strip_quantization_config(model)
+        assert hasattr(model.config, "quantization_config")
+
+    def test_noop_when_no_quantization_config(self):
+        """No error when config has no quantization_config attribute."""
+        model = nn.Linear(4, 4)
+        model.config = type("Config", (), {})()
+
+        _maybe_strip_quantization_config(model)
+        assert not hasattr(model.config, "quantization_config")
+
+    def test_noop_when_no_config(self):
+        """No error when model has no config attribute."""
+        model = nn.Linear(4, 4)
+        _maybe_strip_quantization_config(model)

@@ -20,6 +20,9 @@ from contextlib import contextmanager
 from nemo_automodel.shared.import_utils import safe_import
 
 HAVE_TORCHAO, torch_ao = safe_import("torchao")
+HAVE_BNB, bnb = safe_import("bitsandbytes")
+
+import math
 
 import torch
 import torch.nn as nn
@@ -45,14 +48,45 @@ def _supports_logits_to_keep(model: nn.Module) -> bool:
 
 def _supports_seq_lens(model: nn.Module) -> bool:
     """
-    Check if the model supports seq_lens.
+    Check if the model's forward() accepts seq_lens.
+
+    Returns True if:
+    - forward() has an explicit `seq_lens` parameter, OR
+    - forward() has **kwargs (so it won't crash if seq_lens is passed)
+
+    Returns False otherwise (passing seq_lens would cause "unexpected kwarg" error).
     """
-    if callable(getattr(model, "forward", None)):
-        return "seq_lens" in set(inspect.signature(model.forward).parameters.keys())
-    else:
+    if not callable(getattr(model, "forward", None)):
+        return False
+    try:
+        sig = inspect.signature(model.forward)
+        params = sig.parameters
+        # Check for explicit seq_lens parameter
+        if "seq_lens" in params:
+            return True
+        # Check for **kwargs (VAR_KEYWORD)
+        for param in params.values():
+            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                return True
+        return False
+    except (ValueError, TypeError):
         return False
 
 
+def _get_logical_numel(param) -> int:
+    """Return the logical number of elements for a parameter,
+    accounting for quantized (packed) storage.
+
+    For bitsandbytes 4-bit params (Params4bit), the physical tensor
+    packs multiple values per byte. We recover the logical count from
+    the original shape stored in param.quant_state.
+    """
+    if HAVE_BNB and isinstance(param, bnb.nn.Params4bit) and getattr(param, "quant_state", None) is not None:
+        return math.prod(param.quant_state.shape)
+    return param.numel()
+
+
+@torch.no_grad()
 def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
     """
     Get the number of trainable parameters and the L2 norm of the model.
@@ -70,15 +104,34 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
     local_sq_norm = 0.0
 
     for p in model.parameters():
-        n = p.numel()
+        n = _get_logical_numel(p)
         total_params += n
         if p.requires_grad:
             trainable_params += n
         try:
-            local_sq_norm += float(p.detach().float().norm(2).item() ** 2)
+            local_sq_norm += p.detach().norm(2) ** 2
         except Exception:
             pass
+    if isinstance(local_sq_norm, torch.Tensor):
+        local_sq_norm = local_sq_norm.item()
     return total_params, trainable_params, local_sq_norm
+
+
+@contextmanager
+def skip_random_init():
+    """
+    Context manager to skip random weight initialization when loading pretrained models.
+    """
+    try:
+        mod = __import__("transformers.initialization", fromlist=["_init_weights"])
+    except ImportError:
+        mod = __import__("transformers.modeling_utils", fromlist=["_init_weights"])
+    prev = getattr(mod, "_init_weights", True)
+    mod._init_weights = False
+    try:
+        yield
+    finally:
+        mod._init_weights = prev
 
 
 def resolve_trust_remote_code(pretrained_model_name_or_path):
@@ -97,6 +150,27 @@ def resolve_trust_remote_code(pretrained_model_name_or_path):
     return not os.path.isdir(pretrained_model_name_or_path) and pretrained_model_name_or_path.startswith("nvidia/")
 
 
+def count_model_parameters(model: nn.Module) -> tuple[int, int]:
+    """Count total and trainable parameters. Safe to call on meta-device models.
+
+    Args:
+        model: Model to analyze
+
+    Returns:
+        trainable_params: int
+        total_params: int
+    """
+    total_params = 0
+    trainable_params = 0
+    for p in model.parameters():
+        n = _get_logical_numel(p)
+        total_params += n
+        if p.requires_grad:
+            trainable_params += n
+    return trainable_params, total_params
+
+
+@torch.no_grad()
 def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
     """Print the number of trainable parameters in the model.
 
@@ -155,20 +229,13 @@ def apply_parameter_freezing(model, freeze_config):
         freeze_config: Configuration dict specifying what to freeze.
 
     freeze_config can contain:
-        - freeze_embeddings: bool (default True)
-        - freeze_vision_tower: bool (default False)
+        - freeze_vision_tower: bool (default True)
+        - freeze_audio_tower: bool (default False)
         - freeze_language_model: bool (default False)
     """
-    freeze_embeddings = freeze_config.get("freeze_embeddings", True)
     freeze_vision_tower = freeze_config.get("freeze_vision_tower", True)
     freeze_audio_tower = freeze_config.get("freeze_audio_tower", False)
     freeze_language_model = freeze_config.get("freeze_language_model", False)
-
-    # Freeze embeddings
-    if freeze_embeddings:
-        for m in model.modules():
-            if isinstance(m, nn.Embedding):
-                m.weight.requires_grad = False
 
     # Freeze vision tower
     if freeze_vision_tower:
@@ -301,10 +368,20 @@ def init_empty_weights():
                 for k in module._parameters[name].__dict__:
                     if k in fp8_parameter_mapping:
                         kwargs[fp8_parameter_mapping[k]] = getattr(module._parameters[name], k)
+                is_hf_initialized = kwargs.pop("_is_hf_initialized", None)
             else:
-                kwargs = module._parameters[name].__dict__
-                kwargs["requires_grad"] = param.requires_grad
+                # Standard nn.Parameter only accepts requires_grad, not arbitrary __dict__ attributes
+                # (e.g., TransformerEngine sets tensor_model_parallel on weights)
+                if param_cls is nn.Parameter:
+                    kwargs = {"requires_grad": param.requires_grad}
+                    is_hf_initialized = None
+                else:
+                    kwargs = module._parameters[name].__dict__.copy()
+                    kwargs["requires_grad"] = param.requires_grad
+                    is_hf_initialized = kwargs.pop("_is_hf_initialized", None)
             module._parameters[name] = param_cls(module._parameters[name].to(device), **kwargs)
+            if is_hf_initialized is not None:
+                setattr(module._parameters[name], "_is_hf_initialized", is_hf_initialized)
 
     try:
         nn.Module.register_parameter = register_empty_parameter

@@ -227,6 +227,39 @@ def test_fully_shard_by_dtype_no_params(monkeypatch):
     assert sub_calls == []
 
 
+def test_combined_projection_adapter_gate_up_bias_paths_tensor_only():
+    """
+    Cover the gate_up_proj.bias concat path (from_hf) and split path (to_hf) using regular tensors.
+    This exercises the renamed helper calls in those code paths.
+    """
+    import types
+    import nemo_automodel.components.models.common.combined_projection.state_dict_adapter as mod
+
+    cfg = types.SimpleNamespace(
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        hidden_size=4,
+        head_dim=2,
+        tie_word_embeddings=False,
+    )
+    adapter = mod.CombinedProjectionStateDictAdapter(cfg)
+
+    hf_sd = {
+        "model.layers.0.mlp.gate_proj.weight": mod.torch.randn((3, 4)),
+        "model.layers.0.mlp.up_proj.weight": mod.torch.randn((3, 4)),
+        "model.layers.0.mlp.gate_proj.bias": mod.torch.randn(3, dtype=mod.torch.float32),
+        "model.layers.0.mlp.up_proj.bias": mod.torch.randn(3, dtype=mod.torch.float32),
+    }
+    custom_sd = adapter.from_hf(hf_sd)
+    assert "model.layers.0.mlp.gate_up_proj.bias" in custom_sd
+    assert tuple(custom_sd["model.layers.0.mlp.gate_up_proj.bias"].shape) == (6,)
+
+    hf_sd2 = adapter.to_hf(custom_sd)
+    assert mod.torch.equal(hf_sd2["model.layers.0.mlp.gate_proj.bias"], hf_sd["model.layers.0.mlp.gate_proj.bias"])
+    assert mod.torch.equal(hf_sd2["model.layers.0.mlp.up_proj.bias"], hf_sd["model.layers.0.mlp.up_proj.bias"])
+
+
 def test_fully_shard_by_dtype_single_dtype(monkeypatch):
     fully_calls: list[nn.Module] = []
     sub_calls: list[nn.Module] = []

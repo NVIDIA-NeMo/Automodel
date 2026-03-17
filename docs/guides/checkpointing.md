@@ -1,12 +1,12 @@
-# Checkpointing in NeMo AutoModel
+# Checkpointing in NeMo Automodel
 
 ## Introduction
 
 During machine-learning experiments, the model-training routine regularly saves checkpoints. A checkpoint is a complete snapshot of a run that includes model weights, optimizer states, and other metadata required to resume training exactly where it left off. Writing these snapshots at regular intervals lets you recover quickly from crashes or pauses without losing progress.
 
-NeMo AutoModel checkpoints capture the complete state of a distributed training run across multiple GPUs or nodes. This reduces memory overhead, improves GPU utilization, and allows training to be resumed with a different parallelism strategy.
+NeMo Automodel checkpoints capture the complete state of a distributed training run across multiple GPUs or nodes. This reduces memory overhead, improves GPU utilization, and allows training to be resumed with a different parallelism strategy.
 
-NeMo AutoModel writes checkpoints in two formats: [Hugging Face Safetensors](https://github.com/huggingface/safetensors) and [PyTorch Distributed Checkpointing (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html). It also supports two layouts:
+NeMo Automodel writes checkpoints in two formats: [Hugging Face Safetensors](https://github.com/huggingface/safetensors) and [PyTorch Distributed Checkpointing (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html). It also supports two layouts:
 
 - **Consolidated Checkpoints**: The complete model state is saved as a Hugging Face-compatible bundle, typically in a single file or a compact set of files with an index. Because tensors are not split across GPUs (unsharded), tools like Hugging Face, vLLM, and SGLang can load these checkpoints directly.
 
@@ -22,7 +22,7 @@ PEFT | LLM / VLM            | 🚧          | 🚧                   | ✅      
 
 
 Changing between output formats can be done seamlessly through the recipe's `yaml` configuration file:
-```
+```yaml
 checkpoint:
     ...
     model_save_format: safetensors # Format for saving (torch_save or safetensors)
@@ -31,11 +31,21 @@ checkpoint:
 ```
 > **Note:** For optimal compatibility with the Hugging Face ecosystem, including downstream tools such as vLLM and SGLang, we recommend using the checkpoint configuration provided above.
 
-> **Note:** The optimizer states are _always_ saved in DCP (`.distcp` extension) format.
+::: {note}
+The optimizer states are _always_ saved in DCP (`.distcp` extension) format.
+:::
 
+## Checkpoint Symbolic Links
+
+NeMo Automodel automatically creates symbolic links in the checkpoint directory to provide convenient access to important checkpoints:
+
+- **LATEST**: Points to the most recently saved checkpoint. This is useful for resuming training from the last saved state.
+- **LOWEST_VAL**: Points to the checkpoint with the lowest validation score/loss. This provides easy access to the best-performing checkpoint based on validation metrics, making it ideal for model evaluation or deployment.
+
+These symbolic links eliminate the need to manually track checkpoint names or search through directories to find the best model. When validation is enabled in your training run, both links are automatically maintained and updated as training progresses.
 
 ## Safetensors
-To ensure seamless integration with the Hugging Face ecosystem, NeMo Automodel saves checkpoints in the [Safetensors](https://github.com/huggingface/safetensors) format. Safetensors is a memory-safe, zero-copy alternative to Python's pickle (Pytorch .bin), natively supported by Hugging Face Transformers, offering both safety and performance advantages over Python pickle-based approaches.
+To ensure seamless integration with the Hugging Face ecosystem, NeMo Automodel saves checkpoints in the [Safetensors](https://github.com/huggingface/safetensors) format. Safetensors is a memory-safe, zero-copy alternative to Python's pickle (PyTorch .bin), natively supported by Hugging Face Transformers, offering both safety and performance advantages over Python pickle-based approaches.
 
 ### Key Benefits:
 - **Native Hugging Face Compatibility**: Checkpoints can be loaded directly into Hugging Face-compatible tools, including vLLM, SGLang, and others.
@@ -52,7 +62,7 @@ uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py --step_sche
 ```
 
 If you're running on a single GPU, you can run:
-```
+```bash
 uv run examples/llm_finetune/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors --checkpoint.save_consolidated True
 ```
 
@@ -66,23 +76,24 @@ After running for a few seconds, the standard output should be:
 The `checkpoints/` should have the following contents:
 ```
 checkpoints/
-└── epoch_0_step_20/
-    ├── model/
-    │   ├── consolidated/
-    │   │   ├── config.json
-    │   │   ├── model-00001-of-00001.safetensors
-    │   │   ├── model.safetensors.index.json
-    │   │   ├── special_tokens_map.json
-    │   │   ├── tokenizer_config.json
-    │   │   ├── tokenizer.json
-    │   │   └── generation_config.json
-    │   ├── shard-00001-model-00001-of-00002.safetensors
-    │   └── shard-00002-model-00001-of-00002.safetensors
-    └── optim/
-        ├── __0_0.distcp
-        ├── __1_0.distcp
-        └── .metadata
-    ...
+├── LATEST -> epoch_0_step_20
+├── LOWEST_VAL -> epoch_0_step_20
+└── epoch_0_step_20
+   ├── model
+   │   ├── consolidated
+   │   │   ├── config.json
+   │   │   ├── generation_config.json
+   │   │   ├── model-00001-of-00001.safetensors
+   │   │   ├── model.safetensors.index.json
+   │   │   ├── special_tokens_map.json
+   │   │   ├── tokenizer.json
+   │   │   └── tokenizer_config.json
+   │   ├── shard-00001-model-00001-of-00001.safetensors
+   │   └── shard-00002-model-00001-of-00001.safetensors
+   └── optim
+       ├── __0_0.distcp
+       └── __1_0.distcp
+...
 ```
 
 The `epoch_0_step_20/` directory stores the full training state from step `20` of the first epoch, including both the model and optimizer states.
@@ -121,7 +132,7 @@ Because the PEFT state is so lightweight, sharded checkpointing adds unnecessary
 ### Example: PEFT Fine-Tuning on Two GPUs
 
 To fine-tune a model using PEFT and save a Hugging Face–ready checkpoint:
-```
+```bash
 uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py --config examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors
 ```
 
@@ -129,22 +140,33 @@ After training, you'll get a compact, consolidated Safetensors checkpoint that c
 
 ```
 checkpoints/
-└── epoch_0_step_20/
-    ├── model/
-    │   ├── adapter_config.json
-    │   ├── adapter_model.safetensors
-    │   ├── automodel_peft_config.json
-    │   ├── special_tokens_map.json
-    │   ├── tokenizer_config.json
-    │   └── tokenizer.json
-    └── optim/
-        ├── __0_0.distcp
-        ├── __1_0.distcp
-        └── .metadata
-    ...
+├── LATEST -> epoch_0_step_20
+├── LOWEST_VAL -> epoch_0_step_20
+├── epoch_0_step_20
+│   ├── config.yaml
+│   ├── dataloader
+│   │   ├── dataloader_dp_rank_0.pt
+│   │   └── dataloader_dp_rank_1.pt
+│   ├── losses.json
+│   ├── model
+│   │   ├── adapter_config.json
+│   │   ├── adapter_model.safetensors
+│   │   ├── automodel_peft_config.json
+│   │   ├── special_tokens_map.json
+│   │   ├── tokenizer.json
+│   │   └── tokenizer_config.json
+│   ├── optim
+│   │   ├── __0_0.distcp
+│   │   └── __1_0.distcp
+│   ├── rng
+│   │   ├── rng_dp_rank_0.pt
+│   │   └── rng_dp_rank_1.pt
+│   └── step_scheduler.pt
+├── training.jsonl
+└── validation.jsonl
 ```
 
-The example below showcases the direct compatibility of NeMo AutoModel with Hugging Face and PEFT:
+The example below showcases the direct compatibility of NeMo Automodel with Hugging Face and PEFT:
 ```python
 from peft import AutoPeftModelForCausalLM
 from transformers import AutoTokenizer
@@ -164,7 +186,7 @@ print(tokenizer.batch_decode(outputs.detach().cpu().numpy(), skip_special_tokens
 ```
 
 ## PyTorch DCP
-NeMo AutoModel also offers native PyTorch DCP checkpointing support (`.distcp` extension). Similar to Safetensors, it also provides the same features of load-time resharding and parallel saving.
+NeMo Automodel also offers native PyTorch DCP checkpointing support (`.distcp` extension). Similar to Safetensors, it also provides the same features of load-time resharding and parallel saving.
 
 As a simple example, we can run the following command to launch the training recipe on two GPUs.
 ```bash
@@ -178,19 +200,24 @@ After 20 steps, the following checkpoint will be saved:
 
 ```
 checkpoints/
-└── epoch_0_step_20/
-    ├── model/
-    │   ├── __0_0.distcp
-    │   ├── __1_0.distcp
-    │   └── .metadata
-    └── optim/
-        ├── __0_0.distcp
-        ├── __1_0.distcp
-        └── .metadata
-        ...
+├── LATEST -> epoch_0_step_20
+├── LOWEST_VAL -> epoch_0_step_20
+└── epoch_0_step_20
+   ├── config.yaml
+   ├── dataloader
+   │   ├── dataloader_dp_rank_0.pt
+   │   └── dataloader_dp_rank_1.pt
+   ├── losses.json
+   ├── model
+   │   ├── __0_0.distcp
+   │   └── __1_0.distcp
+   └── optim
+       ├── __0_0.distcp
+       └── __1_0.distcp
+...
 ```
 
-If you rerun the script, NeMo AutoModel automatically detects and restores the most recent checkpoint.
+If you rerun the script, NeMo Automodel automatically detects and restores the most recent checkpoint.
 ```bash
 uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format torch_save
 
@@ -199,12 +226,39 @@ uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py --step_sche
 ...
 ```
 
+## Saving Checkpoints When Using Docker
+
+When training inside a Docker container (see [Installation Guide](installation.md)), any files written to the container's filesystem are lost when the container exits (especially with `--rm`). To keep your checkpoints, you must **bind-mount a host directory** to the checkpoint path before starting the container:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v "$(pwd)"/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:25.11.00
+```
+
+You can also set a custom checkpoint directory via the YAML config or CLI override:
+```yaml
+checkpoint:
+  checkpoint_dir: /mnt/shared/my_checkpoints
+```
+```bash
+# Or via CLI override:
+automodel finetune llm -c config.yaml --checkpoint.checkpoint_dir /mnt/shared/my_checkpoints
+```
+
+When using a custom path, make sure the corresponding host directory is mounted into the container with `-v`.
+
+::: {tip}
+Mount additional host directories for datasets and the Hugging Face model cache to avoid re-downloading large models across container restarts. See the [Installation Guide](installation.md) for a complete `docker run` example with all recommended mounts.
+:::
+
 ## Asynchronous Checkpointing
 
-NeMo AutoModel can write checkpoints asynchronously to reduce training stalls caused by I/O. When enabled, checkpoint writes are scheduled in the background using PyTorch Distributed Checkpointing’s async API while training continues.
+NeMo Automodel can write checkpoints asynchronously to reduce training stalls caused by I/O. When enabled, checkpoint writes are scheduled in the background using PyTorch Distributed Checkpointing's async API while training continues.
 
 - **Enable** (YAML):
-  ```
+  ```yaml
   checkpoint:
     is_async: true
   ```
@@ -213,29 +267,38 @@ NeMo AutoModel can write checkpoints asynchronously to reduce training stalls ca
 - **Behavior**: At most one checkpoint uploads at a time; the next save waits for the previous upload to finish. The `LATEST` symlink is updated after the async save completes (may be deferred until the next save call). During PEFT, adapter model files are written synchronously on rank 0; optimizer states can still use async.
 
 ## Advanced Usage: Save Additional States
-You can also save additional states in NeMo AutoModel. By default, we also automatically checkpoint the `dataloader`, `rng`, and `step_scheduler` states which are necessary to resume training accurately. In full, a Safetensors consolidated checkpoint will look like this:
+You can also save additional states in NeMo Automodel. By default, we also automatically checkpoint the `dataloader`, `rng`, and `step_scheduler` states which are necessary to resume training accurately. In full, a Safetensors consolidated checkpoint will look like this:
 
 ```
 checkpoints/
-└── epoch_0_step_20/
-    ├── model/
-    │   ├── consolidated/
-    │   │   ├── config.json
-    │   │   ├── model-00001-of-00001.safetensors
-    │   │   ├── model.safetensors.index.json
-    │   │   ├── special_tokens_map.json
-    │   │   ├── tokenizer_config.json
-    │   │   └── tokenizer.json
-    │   ├── shard-00001-model-00001-of-00002.safetensors
-    │   └── shard-00002-model-00001-of-00002.safetensors
-    ├── optim/
-    │   ├── __0_0.distcp
-    │   ├── __1_0.distcp
-    │   └── .metadata
-    ├── config.yaml
-    ├── dataloader.pt
-    ├── rng.pt
-    └── step_scheduler.pt
+├── LATEST -> epoch_0_step_20
+├── LOWEST_VAL -> epoch_0_step_20
+├── epoch_0_step_20
+│   ├── config.yaml
+│   ├── dataloader
+│   │   ├── dataloader_dp_rank_0.pt
+│   │   └── dataloader_dp_rank_1.pt
+│   ├── losses.json
+│   ├── model
+│   │   ├── consolidated
+│   │   │   ├── config.json
+│   │   │   ├── generation_config.json
+│   │   │   ├── model-00001-of-00001.safetensors
+│   │   │   ├── model.safetensors.index.json
+│   │   │   ├── special_tokens_map.json
+│   │   │   ├── tokenizer.json
+│   │   │   └── tokenizer_config.json
+│   │   ├── shard-00001-model-00001-of-00001.safetensors
+│   │   └── shard-00002-model-00001-of-00001.safetensors
+│   ├── optim
+│   │   ├── __0_0.distcp
+│   │   └── __1_0.distcp
+│   ├── rng
+│   │   ├── rng_dp_rank_0.pt
+│   │   └── rng_dp_rank_1.pt
+│   └── step_scheduler.pt
+├── training.jsonl
+└── validation.jsonl
 ```
 
 If you want to define a new state to be checkpointed in the recipe, the easiest way is to create a new attribute in the recipe class (defined using `self.` inside the recipe). Just make sure that the new attribute uses both the `load_state_dict` and `state_dict` methods.
@@ -251,13 +314,13 @@ class NewState:
         self.another_value = ...
         ...
     
-    def state_dict() -> dict[str, Any]:
+    def state_dict(self) -> dict[str, Any]:
         return {
             "<some state you're tracking>": self.state_value,
             "<another state you're tracking>": self.another_value,
         }
     
-    def load_state_dict(state_dict: dict[str, Any]) -> None:
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self.state_value = state_dict["<some state you're tracking>"]
         self.another_value = state_dict["<another state you're tracking>"]
 ```

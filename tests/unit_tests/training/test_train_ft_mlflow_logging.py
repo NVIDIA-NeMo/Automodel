@@ -63,17 +63,30 @@ def test_log_train_metrics_calls_mlflow(monkeypatch):
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg=None)
     # Minimal attributes required by the method
     recipe.dist_env = types.SimpleNamespace(is_main=True)
-    recipe.step_scheduler = types.SimpleNamespace(step=7)
+    recipe.step_scheduler = types.SimpleNamespace(step=7, is_remote_logging_step=True)
     recipe.metric_logger_train = types.SimpleNamespace(log=lambda x: None)
     mlflow_mock = Mock()
     recipe.mlflow_logger = types.SimpleNamespace(log_metrics=mlflow_mock)
+    recipe.comet_logger = None
 
     # Avoid cuda calls on environments without GPUs
     import torch.cuda
 
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None, raising=False)
 
-    log_data = MetricsSample(step=7, epoch=1, metrics={"loss": 1.23, "grad_norm": 0.5, "lr": 1e-3, "mem": 0.1, "tps": 10.0, "tps_per_gpu": 5.0, "num_label_tokens": 42})
+    log_data = MetricsSample(
+        step=7,
+        epoch=1,
+        metrics={
+            "loss": 1.23,
+            "grad_norm": 0.5,
+            "lr": 1e-3,
+            "mem": 0.1,
+            "tps": 10.0,
+            "tps_per_gpu": 5.0,
+            "num_label_tokens": 42,
+        },
+    )
     recipe.log_train_metrics(log_data)
 
     mlflow_mock.assert_called_once()
@@ -90,9 +103,12 @@ def test_log_val_metrics_calls_mlflow(monkeypatch):
     recipe.dist_env = types.SimpleNamespace(is_main=True)
     mlflow_mock = Mock()
     recipe.mlflow_logger = types.SimpleNamespace(log_metrics=mlflow_mock)
+    recipe.comet_logger = None
     # No JSONL logger passed (None) to keep test minimal
 
-    log_data = MetricsSample(step=3, epoch=0, metrics={"val_loss": 0.99, "lr": 5e-4, "num_label_tokens": 100, "mem": 0.2})
+    log_data = MetricsSample(
+        step=3, epoch=0, metrics={"val_loss": 0.99, "lr": 5e-4, "num_label_tokens": 100, "mem": 0.2}
+    )
     recipe.log_val_metrics("default", log_data, metric_logger=None)
 
     mlflow_mock.assert_called_once()

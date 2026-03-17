@@ -11,97 +11,86 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-from dataclasses import dataclass
+import warnings
 from functools import partial
-from typing import Literal, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Partial, Replicate
 
-from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module
-from nemo_automodel.shared.utils import dtype_from_str
-
-try:
-    from torch.distributed.device_mesh import DeviceMesh
-    from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
-except ImportError:
-    print("torch.distributed.tensor is not available. DeepSeek model will not work.")
-
-try:
-    from grouped_gemm import ops
-except ImportError:
-    print("grouped_gemm is not available. Please run:pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4")
-
+from nemo_automodel.components.distributed.init_utils import get_world_size_safe
+from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.experts import (
+    GroupedExperts,
+    GroupedExpertsDeepEP,
+    GroupedExpertsTE,
+    is_gated_activation,
+)
+from nemo_automodel.components.moe.experts import (
+    _init_weights as _init_expert_weights,
+)
 from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
-    weighted_bias_swiglu_impl,
 )
-from nemo_automodel.components.moe.megatron.token_dispatcher import MoEConfig as MegatronMoEConfig
-from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher
 
 _shared_experts_stream: Optional[torch.cuda.Stream] = None
-
-
-@dataclass(kw_only=True)
-class MoEConfig:
-    n_routed_experts: int
-    n_shared_experts: int
-    n_activated_experts: int
-    n_expert_groups: int
-    n_limited_groups: int
-    train_gate: bool
-    gate_bias_update_factor: float
-    aux_loss_coeff: float
-    score_func: str
-    route_scale: float
-    dim: int
-    inter_dim: int
-    moe_inter_dim: int
-    norm_topk_prob: bool
-    router_bias: bool = False
-    expert_bias: bool = False
-    expert_activation: Literal["swiglu", "quick_geglu"] = "swiglu"
-    activation_alpha: float = 1.702
-    activation_limit: float = 7.0
-    softmax_before_topk: bool = False
-    dtype: str | torch.dtype = torch.bfloat16
-    shared_expert_gate: bool = False
-    shared_expert_inter_dim: int | None = None
-
-    def __post_init__(self):
-        if isinstance(self.dtype, str):
-            self.dtype = dtype_from_str(self.dtype, default=torch.bfloat16)
 
 
 class MLP(nn.Module):
     """
     Multi-Layer Perceptron (MLP) used as a feed-forward layer.
 
+    Supports both gated activations (SwiGLU) and simple activations (ReLU²).
+
     Attributes:
-        gate_proj (nn.Module): Linear layer for input-to-hidden transformation.
+        gate_proj (nn.Module): Linear layer for gate in gated activations (or up_proj for simple).
         down_proj (nn.Module): Linear layer for hidden-to-output transformation.
-        up_proj (nn.Module): Additional linear layer for feature transformation.
+        up_proj (nn.Module): Additional linear layer for gated activations (None for simple).
     """
 
-    def __init__(self, dim: int, inter_dim: int, backend: str, dtype: torch.dtype = torch.bfloat16):
+    def __init__(
+        self,
+        dim: int,
+        inter_dim: int,
+        backend: str,
+        dtype: torch.dtype = torch.bfloat16,
+        activation: str = "swiglu",
+        bias: bool = False,
+    ):
         """
         Initializes the MLP layer.
 
         Args:
             dim (int): Input and output dimensionality.
             inter_dim (int): Hidden layer dimensionality.
+            backend (str): Backend for linear layers.
+            dtype (torch.dtype): Data type for weights.
+            activation (str): Activation function - "swiglu" (default) or "relu2".
+            bias (bool): Whether to use bias in linear layers.
         """
         super().__init__()
-        self.gate_proj = initialize_linear_module(
-            linear_impl=backend, in_features=dim, out_features=inter_dim, bias=False, dtype=dtype
-        )
-        self.down_proj = initialize_linear_module(
-            linear_impl=backend, in_features=inter_dim, out_features=dim, bias=False, dtype=dtype
-        )
+        if activation not in ("swiglu", "relu2"):
+            raise ValueError(f"Unsupported activation: {activation}. Choose 'swiglu' or 'relu2'.")
+
+        self.activation = activation
+        self.is_gated = is_gated_activation(activation)
+
         self.up_proj = initialize_linear_module(
-            linear_impl=backend, in_features=dim, out_features=inter_dim, bias=False, dtype=dtype
+            linear_impl=backend, in_features=dim, out_features=inter_dim, bias=bias, dtype=dtype
+        )
+        if self.is_gated:
+            self.gate_proj = initialize_linear_module(
+                linear_impl=backend, in_features=dim, out_features=inter_dim, bias=bias, dtype=dtype
+            )
+        else:
+            self.gate_proj = None
+
+        self.down_proj = initialize_linear_module(
+            linear_impl=backend, in_features=inter_dim, out_features=dim, bias=bias, dtype=dtype
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -114,403 +103,14 @@ class MLP(nn.Module):
         Returns:
             torch.Tensor: Output tensor after MLP computation.
         """
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        if self.is_gated:
+            return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        else:
+            return self.down_proj(F.relu(self.up_proj(x)).pow(2))
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)
         self.apply(init_weights_fn)
-
-
-@torch.compile
-def swiglu(x, *, gate_and_up_proj, down_proj, gate_up_proj_bias=None, down_proj_bias=None):
-    gate_and_up_out = x @ gate_and_up_proj
-    if gate_up_proj_bias is not None:
-        gate_and_up_out = gate_and_up_out + gate_up_proj_bias
-    gate_out, up_out = torch.chunk(gate_and_up_out, 2, -1)
-    inter = F.silu(gate_out) * up_out
-
-    inter = inter @ down_proj
-    if down_proj_bias is not None:
-        inter = inter + down_proj_bias
-    return inter
-
-
-@torch.compile
-def quick_geglu(
-    x,
-    *,
-    gate_and_up_proj,
-    down_proj,
-    gate_up_proj_bias=None,
-    down_proj_bias=None,
-    alpha: float = 1.702,
-    limit: float | None = 7.0,
-):
-    gate_and_up_out = x @ gate_and_up_proj
-    if gate_up_proj_bias is not None:
-        gate_and_up_out = gate_and_up_out + gate_up_proj_bias
-    gate_out, up_out = gate_and_up_out[:, ::2], gate_and_up_out[:, 1::2]
-    # Clamp the input values
-    gate_out = gate_out.clamp(min=None, max=limit)
-    up_out = up_out.clamp(min=-limit, max=limit)
-    out_glu = gate_out * torch.sigmoid(alpha * gate_out)
-    # Note we add an extra bias of 1 to the linear layer
-    inter = out_glu * (up_out + 1)
-    inter = inter @ down_proj
-    if down_proj_bias is not None:
-        inter = inter + down_proj_bias
-    return inter
-
-
-def get_expert_activation(config: MoEConfig):
-    if config.expert_activation == "swiglu":
-        return swiglu
-    elif config.expert_activation == "quick_geglu":
-        return partial(quick_geglu, alpha=config.activation_alpha, limit=config.activation_limit)
-    else:
-        raise ValueError(f"Invalid expert activation: {config.expert_activation}")
-
-
-class GroupedExperts(nn.Module):
-    """
-    Sparse MoE implementation using all-gather/reduce-scatter primitives.
-
-    Once the experts for a particular token have been identified, this module
-    is invoked to compute and average the output of the activated experts.
-
-    Attributes:
-        n_routed_experts (int): Total number of experts in the model.
-        gate_projs (nn.Parameter): Linear layer for input-to-gate transformation.
-        up_projs (nn.Parameter): Linear layer for input-to-hidden transformation.
-        down_projs (nn.Parameter): Linear layer for hidden-to-output transformation.
-    """
-
-    def __init__(self, config: MoEConfig):
-        """
-        Initializes the GroupedExperts module.
-
-        Args:
-            args (MoEArgs): Model arguments containing the number of routed experts,
-                model and intermediate dimension parameters.
-        """
-        super().__init__()
-        self.n_routed_experts = config.n_routed_experts
-        self.expert_bias = config.expert_bias
-        self.gate_and_up_projs = nn.Parameter(
-            torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim * 2, dtype=config.dtype)
-        )
-        self.down_projs = nn.Parameter(
-            torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim, dtype=config.dtype)
-        )
-
-        if self.expert_bias:
-            self.gate_up_proj_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, config.moe_inter_dim * 2, dtype=config.dtype)
-            )
-            self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim, dtype=config.dtype))
-        else:
-            self.gate_up_proj_bias = None
-            self.down_proj_bias = None
-
-        self.expert_activation = get_expert_activation(config)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        token_mask: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Forward pass for the grouped experts.
-
-        Args:
-            x (torch.Tensor): Input tensor. Shape is [num_tokens, model_dim].
-            token_mask (torch.Tensor): Boolean mask indicating valid tokens.
-                Shape is [num_tokens].
-            weights (torch.Tensor): Routing weights for the selected experts.
-                Shape is [num_tokens, num_activated_experts].
-            indices (torch.Tensor): Indices of the selected experts.
-                Shape is [num_tokens, num_activated_experts].
-
-        Returns:
-            torch.Tensor: Output tensor after expert computation.
-                Shape is [num_tokens, model_dim]
-        """
-        assert not isinstance(x, DTensor)
-
-        if isinstance(self.gate_and_up_projs, DTensor):
-            ep_mesh = self.gate_and_up_projs.device_mesh
-            assert ep_mesh is not None
-            assert ep_mesh.ndim == 1, "We only support 1D mesh for MoE"
-            ep_size = ep_mesh.size()
-            ep_rank = ep_mesh.get_local_rank()
-        else:
-            ep_mesh = None
-            ep_size = 1
-            ep_rank = 0
-
-        assert self.n_routed_experts % ep_size == 0, (
-            f"Number of experts must be divisible by ep_size (ep_size={ep_size})"
-        )
-
-        # Replicate the tensor to all experts. This is sub-optimal but is
-        # used by this implementation for correctness.
-        if ep_size > 1:
-            x = DTensor.from_local(x, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
-            weights = DTensor.from_local(weights.float(), device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
-            indices = DTensor.from_local(indices, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
-            token_mask = DTensor.from_local(token_mask, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
-
-        n_local_experts = self.n_routed_experts // ep_size
-        experts_start_idx = ep_rank * n_local_experts
-        experts_end_idx = experts_start_idx + n_local_experts
-
-        def get_local_proj(proj, expert_id):
-            local_proj = proj.to_local() if isinstance(proj, DTensor) else proj
-            return local_proj[expert_id - experts_start_idx]
-
-        y = torch.zeros_like(x)
-
-        active_local_experts = 0
-        for i in range(experts_start_idx, experts_end_idx):
-            indices_mask = torch.logical_and(indices == i, token_mask.unsqueeze(-1))
-            idx, top = torch.where(indices_mask)
-
-            if idx.numel() == 0:
-                continue
-            active_local_experts += 1
-
-            gate_and_up_proj = get_local_proj(self.gate_and_up_projs, i)
-            down_proj = get_local_proj(self.down_projs, i)
-
-            gate_up_proj_bias = get_local_proj(self.gate_up_proj_bias, i) if self.expert_bias else None
-            down_proj_bias = get_local_proj(self.down_proj_bias, i) if self.expert_bias else None
-
-            idx_b = idx[:, None].expand(-1, x.size(1))
-            x_idx = x.gather(dim=0, index=idx_b)
-
-            expert_out = (
-                self.expert_activation(
-                    x_idx,
-                    gate_and_up_proj=gate_and_up_proj,
-                    down_proj=down_proj,
-                    gate_up_proj_bias=gate_up_proj_bias,
-                    down_proj_bias=down_proj_bias,
-                )
-                * weights[idx, top, None]
-            )
-
-            y.scatter_add_(dim=0, index=idx_b, src=expert_out.to(x.dtype))
-
-        if ep_size > 1:
-            y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
-            y = y.redistribute(placements=[Shard(0)]).to_local()
-
-        return y
-
-    def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
-        self.apply(partial(_init_weights, buffer_device=buffer_device, init_std=init_std))
-
-
-@torch.compile
-def quick_geglu_deepep(
-    x,
-    permuted_probs,
-    alpha: float = 1.702,
-    limit: float = 7.0,
-    linear_offset: float = 1.0,
-):
-    gate_out, up_out = x[..., ::2], x[..., 1::2]
-    # Clamp the input values
-    gate_out = gate_out.clamp(min=None, max=limit)
-    up_out = up_out.clamp(min=-limit, max=limit)
-    out_glu = gate_out * torch.sigmoid(alpha * gate_out)
-    # Note we add an extra bias of 1 to the linear layer
-    inter = out_glu * (up_out + linear_offset)
-    return (inter * permuted_probs).to(x.dtype)
-
-
-def get_expert_activation_for_deepep(config: MoEConfig):
-    if config.expert_activation == "swiglu":
-        return weighted_bias_swiglu_impl
-    elif config.expert_activation == "quick_geglu":
-        return partial(
-            quick_geglu_deepep,
-            limit=config.activation_limit,
-            alpha=config.activation_alpha,
-            linear_offset=1.0,
-        )
-    else:
-        raise ValueError(f"Invalid expert activation: {config.expert_activation}")
-
-
-class GroupedExpertsDeepEP(nn.Module):
-    """
-    Sparse MoE implementation using DeepEP.
-
-    Once the experts for a particular token have been identified, this module
-    is invoked to compute and average the output of the activated experts.
-
-    Attributes:
-        n_routed_experts (int): Total number of experts in the model.
-        gate_and_up_projs part1 / gate_projs (nn.Parameter): Linear layer for input-to-gate transformation.
-        gate_and_up_projs part2 / up_projs (nn.Parameter): Linear layer for input-to-hidden transformation.
-        down_projs (nn.Parameter): Linear layer for hidden-to-output transformation.
-    """
-
-    @staticmethod
-    def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
-        if bias is None:
-            return value
-        shape = value.shape
-        if permuted_probs is not None:
-            output = (
-                torch.cat(
-                    [
-                        t + b * p
-                        for t, b, p in zip(
-                            torch.split(value.view(-1, shape[-1]), tokens_per_expert.tolist()),
-                            bias,
-                            torch.split(permuted_probs, tokens_per_expert.tolist()),
-                        )
-                    ]
-                )
-                .view(shape)
-                .to(value.dtype)
-            )
-        else:
-            output = (
-                torch.cat(
-                    [t + b for t, b in zip(torch.split(value.view(-1, shape[-1]), tokens_per_expert.tolist()), bias)]
-                )
-                .view(shape)
-                .to(value.dtype)
-            )
-
-        return output
-
-    def __init__(self, config: MoEConfig):
-        """
-        Initializes the GroupedExperts module.
-
-        Args:
-            args (MoEArgs): Model arguments containing the number of routed experts,
-                model and intermediate dimension parameters.
-        """
-        super().__init__()
-
-        self.config = config
-        self.expert_bias = config.expert_bias
-        self.gate_and_up_projs = nn.Parameter(
-            torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim * 2)
-        )
-        self.down_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim, config.dim))
-
-        if self.expert_bias:
-            self.gate_up_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim * 2))
-            self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.dim))
-        else:
-            self.gate_up_proj_bias = None
-            self.down_proj_bias = None
-
-        self.expert_activation = get_expert_activation_for_deepep(config)
-
-    def init_token_dispatcher(self, ep_mesh: DeviceMesh):
-        self.ep_size = ep_mesh.size()
-        self.ep_rank = ep_mesh.get_local_rank()
-
-        # TODO: merge with MoEArgs
-        config = MegatronMoEConfig(
-            moe_router_topk=self.config.n_activated_experts,
-            num_moe_experts=self.config.n_routed_experts,
-            moe_permute_fusion=True,
-            moe_enable_deepep=True,
-        )
-
-        self.n_routed_experts = self.config.n_routed_experts
-
-        num_local_experts = self.config.n_routed_experts // self.ep_size
-
-        local_expert_indices_offset = self.ep_rank * num_local_experts
-        local_expert_indices = [local_expert_indices_offset + i for i in range(num_local_experts)]
-
-        self.token_dispatcher = MoEFlexTokenDispatcher(
-            num_local_experts=num_local_experts,
-            local_expert_indices=local_expert_indices,
-            config=config,
-            ep_group=ep_mesh.get_group(),
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        token_mask: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Forward pass for the grouped experts.
-
-        Args:
-            x (torch.Tensor): Input tensor. Shape is [num_tokens, model_dim].
-            token_mask (torch.Tensor): Boolean mask indicating valid tokens.
-                Shape is [num_tokens].
-            weights (torch.Tensor): Routing weights for the selected experts.
-                Shape is [num_tokens, num_activated_experts].
-            indices (torch.Tensor): Indices of the selected experts.
-                Shape is [num_tokens, num_activated_experts].
-
-        Returns:
-            torch.Tensor: Output tensor after expert computation.
-                Shape is [num_tokens, model_dim]
-        """
-        assert not isinstance(x, DTensor)
-
-        assert self.n_routed_experts % self.ep_size == 0, (
-            f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
-        )
-
-        indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
-
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
-            hidden_states=x,
-            num_local_tokens=x.size(0),
-            token_probs=weights,
-            token_indices=indices,
-        )
-        permuted_probs = permuted_probs.unsqueeze(-1)
-
-        if torch.count_nonzero(tokens_per_expert) > 0:
-            output1 = ops.gmm(
-                permuted_local_hidden_states,
-                self.gate_and_up_projs.to_local(),
-                tokens_per_expert,
-                trans_b=False,
-            )
-
-            if self.expert_bias:
-                gate_and_up_bias = self.gate_up_proj_bias.to_local()
-                output1 = self._apply_bias(output1, gate_and_up_bias, tokens_per_expert)
-            else:
-                gate_and_up_bias = None
-
-            output1 = self.expert_activation(output1, permuted_probs)
-            output2 = ops.gmm(output1, self.down_projs.to_local(), tokens_per_expert, trans_b=False)
-
-            if self.expert_bias:
-                down_bias = self.down_proj_bias.to_local()
-                output2 = self._apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
-        else:
-            output1 = torch.matmul(x[0] * 0, self.gate_and_up_projs.to_local()[0])
-            output1_ = self.expert_activation(output1, permuted_probs)
-            output2 = torch.matmul(output1_, self.down_projs.to_local()[0])
-
-        y = self.token_dispatcher.token_unpermutation(output2)
-        return y
-
-    def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
-        self.apply(partial(_init_weights, buffer_device=buffer_device, init_std=init_std))
 
 
 class FakeBalancedGate(nn.Module):
@@ -518,13 +118,18 @@ class FakeBalancedGate(nn.Module):
     Load balanced gate implementation, spreads tokens uniformly across all experts.
     The rationale for this class is to do performance experiments to understand
     how the load imbalance with real data is impacting end-to-end performance.
+
+    When ``noise > 0``, random perturbation is added to mimic realistic routing
+    imbalance.  A noise value of 0.0 gives perfectly balanced assignment, while
+    1.0 gives fully random expert selection and non-uniform weights.
     """
 
-    def __init__(self, config: MoEConfig, skip_first_n_experts: int = 0):
+    def __init__(self, config: MoEConfig, skip_first_n_experts: int = 0, noise: float = 0.0):
         super().__init__()
         self.n_routed_experts = config.n_routed_experts
         self.n_activated_experts = config.n_activated_experts
         self.skip_first_n_experts = skip_first_n_experts
+        self.noise = noise
 
     def forward(
         self,
@@ -548,13 +153,41 @@ class FakeBalancedGate(nn.Module):
         del token_mask
         del cp_mesh
 
+        n_tokens = x.size(0)
         n_exp = self.n_routed_experts
         a_exp = self.n_activated_experts
-        weights = torch.ones(x.size(0), a_exp, device=x.device) / a_exp
         available_experts = n_exp - self.skip_first_n_experts
-        indices = (
-            torch.arange(x.size(0) * a_exp, device=x.device).view(-1, a_exp) % available_experts
-        ) + self.skip_first_n_experts
+
+        if self.noise > 0:
+            # Derive the generator seed from the input content so that:
+            #  - Forward and activation-checkpointing recompute get the same x,
+            #    hence the same seed, hence identical routing (no shape mismatch).
+            #  - Different training steps get different x (different data + updated
+            #    weights), hence different seeds, hence dynamic routing that
+            #    reproduces the varying tokens_per_expert pattern of real Gate.
+            seed = int(x.view(-1)[:4].to(torch.float32).sum().item() * 1e6) & 0x7FFFFFFF
+            gen = torch.Generator(device=x.device).manual_seed(seed)
+
+            # Noisy weights: interpolate between uniform (1/a_exp) and random
+            uniform_weights = torch.ones(n_tokens, a_exp, device=x.device) / a_exp
+            raw_weights = torch.rand(n_tokens, a_exp, device=x.device, generator=gen)
+            raw_weights = raw_weights / raw_weights.sum(dim=-1, keepdim=True)
+            weights = (1 - self.noise) * uniform_weights + self.noise * raw_weights
+
+            # Noisy indices via biased topk selection to mimic real routing where
+            # some experts are systematically "hot".  A per-expert popularity bias
+            # creates correlated selections across tokens; the noise parameter
+            # scales this bias.  topk guarantees unique experts per token (required
+            # by the downstream scatter-back which uses y[token_ids] += ...).
+            expert_bias = torch.randn(available_experts, device=x.device, generator=gen) * self.noise * 0.1
+            scores = torch.rand(n_tokens, available_experts, device=x.device, generator=gen) + expert_bias
+            _, indices = scores.topk(a_exp, dim=-1)
+            indices = indices + self.skip_first_n_experts
+        else:
+            weights = torch.ones(n_tokens, a_exp, device=x.device) / a_exp
+            indices = (
+                torch.arange(n_tokens * a_exp, device=x.device).view(-1, a_exp) % available_experts
+            ) + self.skip_first_n_experts
 
         return weights.type_as(x), indices, None
 
@@ -574,13 +207,17 @@ class Gate(nn.Module):
         topk (int): Number of top experts activated for each input.
         n_groups (int): Number of groups for routing.
         topk_groups (int): Number of groups to route inputs to.
-        score_func (str): Scoring function ('softmax' or 'sigmoid').
+        score_func (str): Scoring function ('softmax', 'sigmoid', or 'softmax_with_bias').
         route_scale (float): Scaling factor for routing weights.
         weight (torch.nn.Parameter): Learnable weights for the gate.
         bias (Optional[torch.nn.Parameter]): Optional bias term for the gate.
     """
 
-    def __init__(self, config: MoEConfig, gate_precision: torch.dtype | None = None):
+    def __init__(
+        self,
+        config: MoEConfig,
+        gate_precision: torch.dtype | None = None,
+    ):
         """
         Initializes the Gate module.
 
@@ -616,8 +253,13 @@ class Gate(nn.Module):
         else:
             self.bias = None
 
-        if self.bias_update_factor > 0:
-            self.register_buffer("e_score_correction_bias", torch.zeros((self.n_experts), dtype=config.dtype))
+        # e_score_correction_bias is only created when bias_update_factor > 0 (for training)
+        # or when force_e_score_correction_bias is True (for loading HF checkpoints that have it).
+        # This flag is useful in cases where we want to load the bias but not update it.
+        # Must be float32 when created - small quantization errors in bf16 can cause
+        # completely different expert routing.
+        if self.bias_update_factor > 0 or config.force_e_score_correction_bias:
+            self.register_buffer("e_score_correction_bias", torch.zeros((self.n_experts), dtype=torch.float32))
         else:
             self.e_score_correction_bias = None
 
@@ -627,6 +269,11 @@ class Gate(nn.Module):
         # routed to each expert on the current rank, accumulated across gradient
         # accumulation steps.
         self._cumulative_expert_load: Optional[torch.Tensor] = None
+
+        # Load balance tracking (enabled externally via enable_load_balance_tracking)
+        self._track_load_balance: bool = False
+        self._last_expert_load: Optional[torch.Tensor] = None
+        self._last_aux_loss: Optional[torch.Tensor] = None
 
     def forward(
         self,
@@ -670,14 +317,36 @@ class Gate(nn.Module):
                 values, indices = torch.topk(scores, k=self.topk, dim=-1)
                 weights = values.softmax(dim=1, dtype=self.gate_precision or torch.float32)
                 original_scores = scores
+        elif self.score_func == "softmax_with_bias":
+            # softmax first, then add bias for expert selection,
+            # group routing on biased scores, final weights from unbiased softmax scores.
+            scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
+            original_scores = scores
+
+            # Add correction bias for expert SELECTION only
+            if self.e_score_correction_bias is not None:
+                scores_for_choice = scores + self.e_score_correction_bias
+            else:
+                scores_for_choice = scores
+
+            if self.n_groups > 1:
+                scores_for_choice = scores_for_choice.view(x.size(0), self.n_groups, -1)
+                group_scores = scores_for_choice.topk(2, dim=-1)[0].sum(dim=-1)
+
+                group_idx = group_scores.topk(self.topk_groups, dim=-1)[1]
+                mask = torch.zeros_like(scores_for_choice[..., 0]).scatter_(1, group_idx, True)
+                scores_for_choice = (scores_for_choice * mask.unsqueeze(-1)).flatten(1)
+
+            indices = torch.topk(scores_for_choice, self.topk, dim=-1)[1]
+            # Final weights gathered from UNBIASED softmax scores
+            weights = original_scores.gather(1, indices)
         else:
             scores = scores.sigmoid()
             original_scores = scores
 
             # Add correction bias to balance tokens across gates.
             if self.e_score_correction_bias is not None:
-                correction_bias = self.e_score_correction_bias
-                scores = scores + correction_bias
+                scores = scores + self.e_score_correction_bias
 
             if self.n_groups > 1:
                 scores = scores.view(x.size(0), self.n_groups, -1)
@@ -705,8 +374,11 @@ class Gate(nn.Module):
             weights = weights.to(dtype=original_dtype)
             original_scores = original_scores.to(dtype=original_dtype)
 
-        if self.bias_update_factor > 0 or self.aux_loss_coeff > 0:
+        if self.bias_update_factor > 0 or self.aux_loss_coeff > 0 or self._track_load_balance:
             expert_load = self._compute_expert_load(indices, token_mask)
+
+        if self._track_load_balance:
+            self._last_expert_load = expert_load.detach()
 
         if self.bias_update_factor > 0 and self.training:
             if self._cumulative_expert_load is None:
@@ -720,7 +392,10 @@ class Gate(nn.Module):
             # Scale the aux_loss by the number of tokens.
             # Training scales all gradients by 1/(number of tokens).
             # To correct this scaling, we need to scale the aux_loss by number of tokens here.
-            MoEAuxLossAutoScaler.apply(weights, aux_loss * weights.shape[0])
+            weights = MoEAuxLossAutoScaler.apply(weights, self.aux_loss_coeff * aux_loss)
+
+        if self._track_load_balance and aux_loss is not None:
+            self._last_aux_loss = aux_loss.detach()
 
         return weights.type_as(x), indices, aux_loss
 
@@ -848,6 +523,8 @@ class Gate(nn.Module):
         # Compute f_i (fraction of tokens dispatched to each expert).
         # If uniform distribution, expert_load will be topk * num_location / n_experts, and f_i will be 1
         # Maximum value f_i entries happens when expert_load = num_location, the value will be n_experts / topk
+        # Protect against division by zero when all tokens are masked (e.g. padding-heavy CP rank).
+        context_length = torch.clamp(context_length, min=1)
         f_i = expert_load * self.n_experts / (self.topk * context_length)  # Normalized fraction, (n_experts)
 
         # Compute P_i (average routing probability per expert)
@@ -888,19 +565,36 @@ class MoE(nn.Module):
         self.n_activated_experts = config.n_activated_experts
 
         if backend.fake_balanced_gate:
-            self.gate = FakeBalancedGate(config)
+            self.gate = FakeBalancedGate(config, noise=backend.fake_gate_noise)
         else:
             self.gate = Gate(config, gate_precision=backend.gate_precision)
-        if backend.enable_deepep:
-            self.experts = GroupedExpertsDeepEP(config)
+        if backend.dispatcher == "deepep" and get_world_size_safe() == 1:
+            warnings.warn(
+                "DeepEP dispatcher is enabled in config, but world size is 1. "
+                "DeepEP requires multiple GPUs. Falling back to standard GroupedExperts.",
+                category=UserWarning,
+                stacklevel=2,
+            )
+            self.experts = GroupedExperts(config, backend=backend)
+        elif backend.dispatcher == "deepep":
+            # DeepEP dispatcher requires TE, GMM, or torch_mm experts (validated in BackendConfig)
+            if backend.experts in ("gmm", "torch_mm"):
+                self.experts = GroupedExpertsDeepEP(config, backend=backend)
+            else:
+                # experts == "te"
+                self.experts = GroupedExpertsTE(config, backend=backend)
         else:
-            self.experts = GroupedExperts(config)
+            # Default to torch experts
+            self.experts = GroupedExperts(config, backend=backend)
 
         if config.n_shared_experts > 0:
             self.shared_experts = MLP(
                 config.dim,
                 config.n_shared_experts * (config.shared_expert_inter_dim or config.moe_inter_dim),
                 backend.linear,
+                dtype=config.dtype,
+                activation=config.shared_expert_activation,
+                bias=config.expert_bias,
             )
             if config.shared_expert_gate:
                 self.shared_expert_gate = initialize_linear_module(backend.linear, config.dim, 1, False)
@@ -909,6 +603,21 @@ class MoE(nn.Module):
         else:
             self.shared_experts = None
             self.shared_expert_gate = None
+
+        # When enabled, input is projected to latent space before MoE and back after
+        if config.moe_latent_size is not None:
+            self.fc1_latent_proj = initialize_linear_module(
+                backend.linear, config.dim, config.moe_latent_size, bias=config.expert_bias, dtype=config.dtype
+            )
+            self.fc2_latent_proj = initialize_linear_module(
+                backend.linear, config.moe_latent_size, config.dim, bias=config.expert_bias, dtype=config.dtype
+            )
+        else:
+            self.fc1_latent_proj = None
+            self.fc2_latent_proj = None
+
+        # Set during model parallelization (see parallelizer.apply_cp)
+        self.cp_mesh: Optional[DeviceMesh] = None
 
     def forward(
         self,
@@ -927,6 +636,9 @@ class MoE(nn.Module):
             torch.Tensor: Output tensor after expert routing and computation.
             Optional[torch.Tensor]: Auxiliary loss for load balancing (if applicable).
         """
+        if cp_mesh is None:
+            cp_mesh = self.cp_mesh
+
         # Reshape the inputs to 2-D since we are just distributing tokens.
         shape = x.size()
         x = x.view(-1, self.dim)
@@ -935,10 +647,19 @@ class MoE(nn.Module):
         else:
             token_mask = torch.ones(x.size(0), dtype=torch.bool, device=x.device)
 
+        # Apply latent projection before MoE if enabled
+        if self.fc1_latent_proj is not None:
+            x_latent = self.fc1_latent_proj(x)
+        else:
+            x_latent = x
+
         weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
 
         if self.shared_experts is None:
-            y = self.experts(x, token_mask, weights, indices)
+            y = self.experts(x_latent, token_mask, weights, indices)
+            # Apply latent projection after MoE if enabled
+            if self.fc2_latent_proj is not None:
+                y = self.fc2_latent_proj(y)
             return y.view(shape)
 
         # Execute shared experts in a separate stream to overlap compute with the
@@ -953,7 +674,11 @@ class MoE(nn.Module):
             if self.shared_expert_gate is not None:
                 z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
 
-        y = self.experts(x, token_mask, weights, indices)
+        y = self.experts(x_latent, token_mask, weights, indices)
+
+        # Apply latent projection after MoE if enabled
+        if self.fc2_latent_proj is not None:
+            y = self.fc2_latent_proj(y)
 
         # Wait for the shared experts stream to complete all operations before
         # adding together the outputs of grouped experts and shared experts.
@@ -981,13 +706,20 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
                 to_local(module.e_score_correction_bias).zero_()
             if module.bias is not None:
                 to_local(module.bias).zero_()
-        elif isinstance(module, (GroupedExperts, GroupedExpertsDeepEP)):
-            to_local(module.gate_and_up_projs).normal_(mean=0.0, std=init_std)
-            to_local(module.down_projs).normal_(mean=0.0, std=init_std)
-            if module.expert_bias:
-                to_local(module.gate_up_proj_bias).zero_()
-                to_local(module.down_proj_bias).zero_()
+        elif isinstance(module, (GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE)):
+            # Delegate expert initialization to experts.py
+            _init_expert_weights(module, buffer_device, init_std)
         elif isinstance(module, MLP):
-            to_local(module.gate_proj.weight).normal_(mean=0.0, std=init_std)
             to_local(module.down_proj.weight).normal_(mean=0.0, std=init_std)
             to_local(module.up_proj.weight).normal_(mean=0.0, std=init_std)
+            if module.gate_proj is not None:
+                to_local(module.gate_proj.weight).normal_(mean=0.0, std=init_std)
+        elif isinstance(module, MoE):
+            if module.fc1_latent_proj is not None:
+                to_local(module.fc1_latent_proj.weight).normal_(mean=0.0, std=init_std)
+                if module.fc1_latent_proj.bias is not None:
+                    to_local(module.fc1_latent_proj.bias).zero_()
+            if module.fc2_latent_proj is not None:
+                to_local(module.fc2_latent_proj.weight).normal_(mean=0.0, std=init_std)
+                if module.fc2_latent_proj.bias is not None:
+                    to_local(module.fc2_latent_proj.bias).zero_()

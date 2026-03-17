@@ -5,8 +5,8 @@ step_scheduler:
   local_batch_size: 32
   ckpt_every_steps: 200
   val_every_steps: 100
-  num_epochs: 2
-  max_steps: 10
+  num_epochs: 3
+  max_steps: None
 
 dist_env:
   backend: nccl
@@ -22,13 +22,15 @@ checkpoint:
   checkpoint_dir: checkpoints/
   model_save_format: safetensors
   save_consolidated: true
+  # Skip classifier head when loading base roberta-large (it doesn't have these layers)
+  skip_task_head_prefixes_for_base_model: ["classifier."]
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   dp_size: none
-  dp_replicate_size: 1
   tp_size: 1
   cp_size: 1
+
   sequence_parallel: false
 
 peft:
@@ -36,6 +38,7 @@ peft:
   target_modules:
   - "*.query"
   - "*.value"
+  # Note: classifier head is fully trained (not LoRA), unfrozen automatically in train_seq_cls.py
   dim: 8
   alpha: 16
   dropout: 0.1
@@ -60,6 +63,6 @@ optimizer:
   _target_: torch.optim.AdamW
   betas: [0.9, 0.999]
   eps: 1e-8
-  lr: 3.0e-4
-  weight_decay: 0
+  lr: 2.0e-5  # Standard learning rate for BERT/RoBERTa fine-tuning
+  weight_decay: 0.01  # Crucial for stable training on small datasets
 

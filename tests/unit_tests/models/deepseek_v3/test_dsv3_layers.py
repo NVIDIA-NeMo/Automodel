@@ -22,7 +22,7 @@ from nemo_automodel.components.models.deepseek_v3.layers import (
     postprocess_output_for_attn,
     MLA,
 )
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig
 
 # Skip Transformer Engine tests by default unless explicitly enabled
 TE_AVAILABLE = False
@@ -140,10 +140,9 @@ class TestPreprocessArgsAndKwargsForAttn:
         assert v_out.shape == (2, 16, 8, 64)
 
         # Check attention kwargs
-        expected_keys = {"is_causal", "attn_mask"}
+        expected_keys = {"is_causal"}
         assert set(attn_kwargs.keys()) == expected_keys
         assert attn_kwargs["is_causal"] == True
-        assert torch.equal(attn_kwargs["attn_mask"], attention_mask)
 
     def test_sdpa_backend_with_integer_attention_mask(self):
         q = torch.randn(2, 8, 16, 64)
@@ -202,6 +201,7 @@ class TestMLAInitialization:
         config.hidden_size = 4096
         config.rope_scaling = None
         config.max_position_embeddings = 4096
+        config.rms_norm_eps = 1e-6
 
         # Apply overrides
         for key, value in overrides.items():
@@ -359,6 +359,7 @@ class TestMLAForward:
         config.hidden_size = 1024
         config.rope_scaling = None
         config.max_position_embeddings = 4096
+        config.rms_norm_eps = 1e-6
 
         for key, value in overrides.items():
             setattr(config, key, value)
@@ -481,6 +482,7 @@ class TestMLAInitWeights:
         config.hidden_size = 1024
         config.rope_scaling = None
         config.max_position_embeddings = 4096
+        config.rms_norm_eps = 1e-6
 
         for key, value in overrides.items():
             setattr(config, key, value)

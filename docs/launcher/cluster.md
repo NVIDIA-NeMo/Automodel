@@ -1,15 +1,15 @@
-# Run on a Cluster (Slurm / Multi-node)
+# Run on a Cluster
 
 In this guide, you will learn how to submit distributed training jobs on Slurm clusters (single- or multi-node). For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.md). For setup details, refer to our [Installation Guide](../guides/installation.md).
 
-NeMo Automodel uses recipes to run end-to-end workflows. If you're new to recipes, see the [Repository Structure](../repository-structure.md) guide.
+NeMo AutoModel uses recipes to run end-to-end workflows. If you're new to recipes, see the [Repository Structure](../repository-structure.md) guide.
 
 
 :::{note}
 Kubernetes support is coming soon.
 :::
 
-## Quick start: Choose your job launch option
+## Quickstart: Choose Your Job Launch Option
 
 Slurm jobs support two modes of execution: `batch` and `interactive`. In `batch` mode, the job is submitted to the cluster queue and
 is executed without any other input from the user (e.g., no keyboard input), whereas the `interactive` mode, as the name implies, enables keyboard input.
@@ -59,14 +59,14 @@ slurm:
   time: 00:30:00
   account: your_account
   partition: gpu
-  container_image: nvcr.io/nvidia/nemo:25.07
+  container_image: nvcr.io/nvidia/nemo-automodel:25.11.00
   gpus_per_node: 8 # Adds an SBATCH line: "#SBATCH --gpus-per-node=8"
   # Optional: Add extra mount points if needed
   extra_mounts:
     - /lustre:/lustre
   # Optional: Specify custom HF_HOME location (will auto-create if not specified)
   hf_home: /path/to/your/HF_HOME
-  # Optional : Specify custom env vars
+  # Optional: Specify custom env vars
   # env_vars:
   #   ENV_VAR: value
   # Optional: Specify custom job directory (defaults to cwd/slurm_jobs)
@@ -78,7 +78,7 @@ Then submit the job:
 automodel finetune llm -c your_config_with_slurm.yaml
 ```
 
-The Automodel CLI is the preferred method for most users. It provides a unified interface for running jobs, from local environments (e.g., [workstation](./local-workstation.md)) to large clusters (e.g., Slurm batch jobs). The CLI will automatically submit the job to Slurm and handle the distributed setup. The above example launches one node with eight workers per node using torchrun (`--nproc_per_node=8`). The Slurm script itself uses `#SBATCH --ntasks-per-node 1`, and when `gpus_per_node` is set, it adds `#SBATCH --gpus-per-node=8` as well.
+The AutoModel CLI is the preferred method for most users. It provides a unified interface for running jobs, from local environments (e.g., [workstation](./local-workstation.md)) to large clusters (e.g., Slurm batch jobs). The CLI will automatically submit the job to Slurm and handle the distributed setup. The above example launches one node with eight workers per node using torchrun (`--nproc-per-node=8`). The Slurm script itself uses `#SBATCH --ntasks-per-node 1`, and when `gpus_per_node` is set, it adds `#SBATCH --gpus-per-node=8` as well.
 
 
 The CLI follows this format:
@@ -93,7 +93,7 @@ Where:
 
 ### Launch a Batch Job on Slurm with Modified Code
 
-If the command is executed from within a Git repository accessible to Slurm workers, the generated SBATCH script will prioritize the repository source over the Automodel installation inside the container image.
+If the command is executed from within a Git repository accessible to Slurm workers, the generated SBATCH script will prioritize the repository source over the AutoModel installation inside the container image.
 
 For example:
 ```bash
@@ -106,7 +106,7 @@ This will launch the job using the source code in the `automodel_test_repo` dire
 
 ## Standalone Slurm Script (Advanced)
 
-If you prefer to submit with your own Slurm script, here is a standalone bash script adapted from the Automodel launcher template. See the upstream template for the authoritative reference: [Automodel Slurm template](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/launcher/slurm/template.py).
+If you prefer to submit with your own Slurm script, here is a standalone bash script adapted from the AutoModel launcher template. See the upstream template for the authoritative reference: [AutoModel Slurm template](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/launcher/slurm/template.py).
 
 ```bash
 #!/bin/bash
@@ -154,7 +154,7 @@ srun \
     bash -c "$CMD"
 ```
 
-Replace bracketed placeholders (e.g., `<account>`, `<container_image>`, `<command>`) with your values. For multi-node training, ensure your `<command>` uses `torchrun` with `--nnodes=$SLURM_NNODES --nproc-per-node=$NUM_GPUS --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT` or rely on the Automodel CLI, which configures this for you.
+Replace bracketed placeholders (e.g., `<account>`, `<container_image>`, `<command>`) with your values. For multi-node training, ensure your `<command>` uses `torchrun` with `--nnodes=$SLURM_NNODES --nproc-per-node=$NUM_GPUS --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT` or rely on the AutoModel CLI, which configures this for you.
 
 ## Run with uv (Development Mode)
 
@@ -174,7 +174,7 @@ uv provides several advantages for development and experimentation:
 
 ## Run with Torchrun
 
-For cluster usage, prefer submitting via the CLI with `slurm` configuration. Direct `torchrun` is recommended for single-node development; see [Run on Your Local Workstation](./local-workstation.md).
+For cluster usage, prefer submitting using the CLI with `slurm` configuration. Direct `torchrun` is recommended for single-node development; see [Run on Your Local Workstation](./local-workstation.md).
 
 ### Standard PyTorch Multi-Node Example
 
@@ -187,17 +187,18 @@ export NODE_RANK=0                  # node0 -> 0, node1 -> 1, ...
 
 torchrun \
   --nnodes=2 \
-  --nproc_per_node=8 \
+  --nproc-per-node=8 \
   --node_rank=${NODE_RANK} \
   --rdzv_backend=c10d \
   --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
   train.py --batch_size 32
 ```
 
-Notes:
+:::{note}
 - Set `NODE_RANK=0` on the master node (where `MASTER_ADDR` resolves), `NODE_RANK=1` on the second node, and so on.
-- Ensure `--nproc_per_node` matches the number of GPUs per node.
-- When launching under Slurm, prefer the CLI `slurm` configuration above or ensure equivalent rendezvous/env settings are provided via the scheduler.
+- Ensure `--nproc-per-node` matches the number of GPUs per node.
+- When launching under Slurm, use the CLI `slurm` configuration described above, or ensure the scheduler provides equivalent rendezvous and environment settings.
+:::
 
 ## Customize Configuration Settings
 
@@ -215,7 +216,7 @@ For example, if you want to fine-tune `Qwen/Qwen3-0.6B` instead of `meta-llama/L
 
 ## When to Use Which Approach
 
-**Use the Automodel CLI when:**
+**Use the AutoModel CLI when:**
 - You want a simple, unified interface
 - You are submitting jobs to production clusters (Slurm)
 

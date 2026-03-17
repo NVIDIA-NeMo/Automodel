@@ -135,3 +135,88 @@ def test_collator_with_prefix_and_pad_multiple():
     assert out["labels"].shape[0] == 2
 
 
+def test_collator_with_dataset_instruction():
+    """Test that use_dataset_instruction prepends query/passage instructions from dataset metadata."""
+    tok = FakeTokenizer()
+    collator = rc.RetrievalBiencoderCollator(
+        tokenizer=tok,
+        q_max_len=64,
+        p_max_len=64,
+        padding=True,
+        use_dataset_instruction=True,
+    )
+
+    # Simulate the instruction from merlin_metadata.json
+    query_instruction = "Instruct: Given a question, retrieve Wikipedia passages that answer the question\nQuery:"
+    passage_instruction = ""
+
+    # Create a batch with query_instruction and passage_instruction fields
+    # as they would come from the dataset transform function
+    batch = [
+        {
+            "question": "What is the capital of France?",
+            "doc_text": ["Paris is the capital", "Lyon is a city"],
+            "doc_image": ["", ""],
+            "query_instruction": query_instruction,
+            "passage_instruction": passage_instruction,
+        },
+        {
+            "question": "Who invented the telephone?",
+            "doc_text": ["Alexander Graham Bell invented", "The telephone was invented"],
+            "doc_image": ["", ""],
+            "query_instruction": query_instruction,
+            "passage_instruction": passage_instruction,
+        },
+    ]
+
+    out = collator(batch)
+
+    # Verify output has expected keys
+    for k in ["q_input_ids", "q_attention_mask", "d_input_ids", "d_attention_mask", "labels"]:
+        assert k in out
+
+    # Verify batch size
+    assert out["q_input_ids"].shape[0] == 2
+    assert out["d_input_ids"].shape[0] == 2 * 2  # 2 examples * 2 docs each
+
+    # The key test: verify that the tokenizer received queries with instructions prepended
+    # Since FakeTokenizer splits on whitespace, we can check the number of tokens
+    # The instruction has many tokens, so the query with instruction should have more tokens
+    # than just the question alone
+
+    # Create a second batch without instructions to compare
+    collator_no_instruction = rc.RetrievalBiencoderCollator(
+        tokenizer=tok,
+        q_max_len=64,
+        p_max_len=64,
+        padding=True,
+        use_dataset_instruction=False,
+    )
+
+    batch_no_instruction = [
+        {
+            "question": "What is the capital of France?",
+            "doc_text": ["Paris is the capital", "Lyon is a city"],
+            "doc_image": ["", ""],
+            "query_instruction": "",
+            "passage_instruction": "",
+        },
+        {
+            "question": "Who invented the telephone?",
+            "doc_text": ["Alexander Graham Bell invented", "The telephone was invented"],
+            "doc_image": ["", ""],
+            "query_instruction": "",
+            "passage_instruction": "",
+        },
+    ]
+
+    out_no_instruction = collator_no_instruction(batch_no_instruction)
+
+    # With instructions, queries should have more tokens (instruction adds many words)
+    # Count non-zero tokens in first query
+    with_instruction_tokens = (out["q_attention_mask"][0] == 1).sum().item()
+    without_instruction_tokens = (out_no_instruction["q_attention_mask"][0] == 1).sum().item()
+
+    # The instruction adds 12 words, so we should see significantly more tokens
+    assert with_instruction_tokens > without_instruction_tokens
+    assert with_instruction_tokens - without_instruction_tokens > 10  # At least 10 more tokens from instruction

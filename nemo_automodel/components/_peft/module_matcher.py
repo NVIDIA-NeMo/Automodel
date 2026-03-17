@@ -18,9 +18,12 @@ from typing import List
 
 import torch.nn as nn
 
-from nemo_automodel.shared.import_utils import safe_import
+from nemo_automodel.shared.import_utils import safe_import_te
 
-HAS_TE, transformer_engine = safe_import("transformer_engine")
+HAS_TE, transformer_engine = safe_import_te()
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def _is_linear_module(module):
@@ -39,8 +42,8 @@ def wildcard_match(pattern, key):
         False
     """
     if key is None:
-        return None
-    regex_pattern = re.compile("^" + pattern.replace("*", "(.*)") + "$")
+        return False
+    regex_pattern = re.compile("^" + re.escape(pattern).replace(r"\*", "(.*)") + "$")
     match = regex_pattern.match(key)
     return match is not None
 
@@ -52,21 +55,22 @@ class ModuleMatcher:
 
     Args:
         target_modules (List[str], optional): A list of module names to apply LoRA to.
-            Defaults to all linear layers ['linear_qkv', 'linear_proj', 'linear_fc1', 'linear_fc2'].
-                - 'linear_qkv': Apply LoRA to the fused linear layer used for query, key, and value projections
-                                in self-attention.
-                - 'linear_proj': Apply LoRA to the linear layer used for projecting the output of self-attention.
-                - 'linear_fc1': Apply LoRA to the first fully-connected layer in MLP.
-                - 'linear_fc2': Apply LoRA to the second fully-connected layer in MLP.
-            Target modules can also contain wildcards. For example, you can specify
+            Defaults to an empty list.
+            If empty and no other parameter is provided it will match to "*_proj".
+            Target modules can also contain wildcards (e.g. "*.layers.0.*.linear_qkv"). For example, you can specify
                 target_modules=['*.layers.0.*.linear_qkv', '*.layers.1.*.linear_qkv'] to add LoRA to only linear_qkv
                 on the first two layers.
         exclude_modules (List[str], optional): A list of module names to exclude from applying LoRA to.
+            Defaults to an empty list.
+            Exclude modules can also contain wildcards (e.g. "*.lm_head"). For example, you can specify
+                exclude_modules=['*.lm_head'] to exclude the lm_head.
         match_all_linear (bool, optional): Whether to match all linear layers.
+            Defaults to False. Prefer using target_modules or exclude_modules to specify the modules to match,
+            to avoid issues with downstream tools (e.g., vLLM, etc).
         is_causal_lm (bool, optional): Whether the model is a causal language model.
     """
 
-    target_modules: List[str] = field(default_factory=lambda: ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"])
+    target_modules: List[str] = field(default_factory=list)
     exclude_modules: List[str] = field(default_factory=list)
     match_all_linear: bool = field(default=False)
     is_causal_lm: bool = field(default=False)
@@ -75,16 +79,42 @@ class ModuleMatcher:
         """
         Input validation.
         """
+        if self.target_modules is None:
+            self.target_modules = []
+        if self.exclude_modules is None:
+            self.exclude_modules = []
         if isinstance(self.target_modules, str):
             self.target_modules = [self.target_modules]
         if isinstance(self.exclude_modules, str):
             self.exclude_modules = [self.exclude_modules]
-        if (
-            self.match_all_linear is False
-            and (not isinstance(self.target_modules, list) or len(self.target_modules) == 0)
-            and (not isinstance(self.exclude_modules, list) or len(self.exclude_modules) == 0)
-        ):
-            raise ValueError("Expected match_all_linear to be true or target_modules/exclude_modules to be non-empty")
+        if self.match_all_linear is False and len(self.target_modules) == 0 and len(self.exclude_modules) == 0:
+            logger.warning(
+                "No modules specified for LoRA. Will use target_modules='*_proj' by default."
+                """
+            Equivalent to the following YAML configuration:
+            peft:
+              target_modules: '*_proj'
+            If this is not what you want, please specify target_modules or exclude_modules.
+            """
+            )
+            self.target_modules = ["*_proj"]
+
+        if self.target_modules and self.exclude_modules:
+            raise ValueError(
+                "target_modules and exclude_modules are mutually exclusive. Please provide only one of them."
+            )
+        if self.match_all_linear and (len(self.target_modules) > 0 or len(self.exclude_modules) > 0):
+            raise ValueError(
+                "Expected target_modules/exclude_modules to be empty when match_all_linear is true. Please provide only one of them."
+            )
+        if self.match_all_linear:
+            logger.warning(
+                "match_all_linear is true. This will match all linear layers in the model (including lm_head). "
+                "Please consider using target_modules or exclude_modules to specify the modules to match, to avoid issues with downstream tools "
+                "For example, to match all linear layers except the lm_head, you can use: "
+                "peft: "
+                "  target_modules: '*_proj' "
+            )
 
     # --------------------------------------------------------------------- #
     # Public API                                                            #
@@ -94,10 +124,6 @@ class ModuleMatcher:
         Return (pattern, full_name) if the module matches; otherwise None.
         """
         full_name = f"{prefix}.{name}" if prefix else name
-
-        if self.is_causal_lm:
-            if "lm_head" in full_name:
-                return False
 
         # 1. matching by layer type takes absolute precedence
         if self.match_all_linear and _is_linear_module(m):
@@ -109,7 +135,7 @@ class ModuleMatcher:
             for pattern in self.target_modules:
                 if name == pattern or wildcard_match(pattern, full_name):
                     return True
-
+            return False
         # 3. Fallback: “all linear layers except those explicitly excluded”
         else:
             return (

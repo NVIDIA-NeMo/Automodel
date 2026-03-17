@@ -20,26 +20,7 @@ from torch.distributed.fsdp import FSDPModule, fully_shard
 from torch.distributed.pipelining._backward import stage_backward, stage_backward_input, stage_backward_weight
 from torch.nn.parallel import DistributedDataParallel
 
-IS_OPTIM_STEP = False
-
-
-def set_is_optim_step(value: bool) -> None:
-    """Set the global IS_OPTIM_STEP flag.
-
-    Args:
-        value: Whether we are in an optimization step.
-    """
-    global IS_OPTIM_STEP
-    IS_OPTIM_STEP = value
-
-
-def get_is_optim_step() -> bool:
-    """Get the global IS_OPTIM_STEP flag.
-
-    Returns:
-        Whether we are in an optimization step.
-    """
-    return IS_OPTIM_STEP
+from nemo_automodel.components.models.common.utils import get_is_optim_step
 
 
 def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:

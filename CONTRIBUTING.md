@@ -1,26 +1,112 @@
 # Contributing To NeMo-Automodel
 
-## Building a NeMo-Automodel container
+## Environment setup for Automodel
 
-* Run the following command to build your container:
+Common workflows used for setting up Automodel environment:
+
+1. [Developing with Automodel container](#1-developing-with-automodel-container)
+2. [Developing with UV sync/pip install]($2-developing-with-uv-syncpip-install)
+3. [Developing with custom docker build](#3-developing-with-custom-docker-build)
+
+### 1. Developing with Automodel container
+
+The latest Automodel container can be found: [here](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel)
+
+The container can be run with the following docker command:
+
+```bash
+docker run --gpus all --network=host -it --rm --shm-size=32g nvcr.io/nvidia/nemo-automodel:25.11.00 /bin/bash
+```
+
+#### Mounting local Automodel directory into the container
+
+To sync local Automodel directory into the container, mount the local directory into `/opt/Automodel` and override the installed Automodel repository.
+Example docker command:
+
+```bash
+docker run --gpus all --network=host -it --rm -v <local-Automodel-path>:/opt/Automodel --shm-size=32g nvcr.io/nvidia/nemo-automodel:25.11.00 /bin/bash
+```
+
+Within the container, cd into `/opt/Automodel/` and update the pyproject.toml and uv.lock file by running the following command:
+
+```bash
+bash docker/common/update_pyproject_pytorch.sh /opt/Automodel
+```
+
+Finally, run uv sync to sync the container with the updated repository:
+
+```bash
+uv sync --locked --extra all --all-groups
+```
+
+> [!WARNING]
+> Ensure `bash docker/common/update_pyproject_pytorch.sh /opt/Automodel` is executed. Without this command, uv sync will attempt to reinstall `torch`. This leads to errors relating to CUDA version mismatch, TE import failures, etc. This work around is required as uv cannot recognize the torch installed in the PyTorch base container.
+
+### 2. Developing with uv sync/pip install
+
+Uv sync and pip install are both supported in Automodel. Uv sync is the recommened path.
+
+From the local Automodel directory run the following command:
+
+```bash
+uv sync --locked --extra all
+```
+
+The following optional dependencies are available, please see `[project.optional-dependencies]` section in [pyproject.toml](./pyproject.toml):
+
+- cuda (all dependencies that require cuda)
+- extra (additional dependencies for model coverage)
+- fa (flash attention)
+- delta-databricks
+- moe
+- vlm
+- all (installs cuda, delta-databricks, extra and vlm)
+
+Example, installing vlm dependencies:
+
+```bash
+uv sync --locked --extra vlm
+```
+
+### 3. Developing with custom docker build
+
+For developers building a custom docker container with Automodel, please refer to Automodel's [Dockerfile](./docker/Dockerfile).
+
+If [Nvidia PyTorch](https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/index.html) container is used as a base image, please review [Developing with Automodel container](#1-developing-with-automodel-container).
+
+Command to build Automodel's Dockerfile:
 
 ```bash
 # Set build arguments
-export AUTOMODEL_INSTALL=dev #[all, dev, deepep, fa, moe, vlm]
-export BASE_IMAGE=cuda #[cuda, pytorch]
-export INSTALL_DEEPEP=False #[True, False]
+export AUTOMODEL_INSTALL=all #(cuda, moe, vlm, ...)
+export BASE_IMAGE=pytorch #(cuda, pytorch)
+
+# Dependency install options [True, False]
+export INSTALL_DEEPEP=True
+export INSTALL_TE=True
 
 docker build -f docker/Dockerfile \
---build-arg AUTOMODEL_INSTALL=$AUTOMODEL_INSTALL \
---build-arg BASE_IMAGE=$BASE_IMAGE \
---build-arg INSTALL_DEEPEP=$INSTALL_DEEPEP \
--t automodel --target=automodel_final .
+    --build-arg AUTOMODEL_INSTALL=$AUTOMODEL_INSTALL \
+    --build-arg BASE_IMAGE=$BASE_IMAGE \
+    --build-arg INSTALL_DEEPEP=$INSTALL_DEEPEP \
+    --build-arg INSTALL_MAMBA=$INSTALL_MAMBA \
+    -t automodel --target=automodel_final .
 ```
 
-* Run the following command to start your container:
+## MoE Dependency
+
+* Requires [cuDNN](https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
 
 ```bash
-docker run --rm -it --entrypoint bash --runtime nvidia --gpus all automodel
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt-get update
+sudo apt-get install cudnn-cuda-12
+pip install transformer-engine[pytorch]==2.8.0
+# Flash-attn version should be selected to satisfy TE requirements
+# https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
+pip install flash-attn==2.7.4.post1
+pip install grouped_gemm
 ```
 
 ## Development Dependencies

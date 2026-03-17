@@ -19,7 +19,6 @@
 import importlib
 import logging
 import traceback
-from contextlib import contextmanager
 
 import torch
 from packaging.version import Version as PkgVersion
@@ -47,7 +46,6 @@ class UnavailableError(Exception):
     """
 
 
-@contextmanager
 def null_decorator(*args, **kwargs):
     """
     No-op decorator.
@@ -374,6 +372,55 @@ def gpu_only_import_from(module, symbol, *, alt=None):
     )
 
 
+def safe_import_te():
+    """
+    Safely import Transformer Engine (TE). Returns (True, module) only if the
+    package and its PyTorch extension load successfully. Handles known failure
+    modes so callers get a consistent (False, placeholder) instead of crashes.
+
+    Known failure modes (handled by returning False and a placeholder):
+
+    1) ImportError when importing transformer_engine (torch is pulled in by TE's
+       pytorch/__init__.py), e.g. CUDA/runtime mismatch:
+       ImportError: .../libc10_cuda.so: undefined symbol: cudaGetDriverEntryPointByVersion, version libcudart.so.12
+
+    2) FileNotFoundError when TE loads its framework extension (e.g. in
+       transformer_engine.common.load_framework_extension("torch")):
+       FileNotFoundError: Could not find shared object file for Transformer Engine torch lib.
+
+    Returns:
+        Tuple[bool, Union[module, UnavailableMeta]]: (True, te_module) if import
+        and TE torch lib load succeeded; (False, placeholder) otherwise.
+    """
+    # 1) ImportError when doing "from transformer_engine import pytorch" -> torch is loaded -> fails with:
+    #    from torch._C import *
+    #    ImportError: /path/to/.venv/.../torch/lib/libc10_cuda.so: undefined symbol: cudaGetDriverEntryPointByVersion, version libcudart.so.12
+    # 2) FileNotFoundError when TE's load_framework_extension("torch") runs (e.g. in transformer_engine.pytorch):
+    #    raise FileNotFoundError(
+    #    FileNotFoundError: Could not find shared object file for Transformer Engine torch lib.
+    msg = "transformer_engine could not be imported (e.g. CUDA symbol mismatch or TE torch lib not found)."
+    try:
+        import transformer_engine as te
+    except ImportError:
+        logger.debug("safe_import_te: import transformer_engine failed (e.g. ImportError from torch)", exc_info=True)
+        return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
+    except FileNotFoundError:
+        logger.debug("safe_import_te: import transformer_engine failed (TE torch lib not found)", exc_info=True)
+        return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
+
+    try:
+        # Trigger loading of TE's PyTorch extension (where the .so is loaded).
+        import transformer_engine.pytorch  # noqa: F401
+    except ImportError:
+        logger.debug("safe_import_te: import transformer_engine.pytorch failed", exc_info=True)
+        return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
+    except FileNotFoundError:
+        logger.debug("safe_import_te: transformer_engine.pytorch failed (TE torch lib not found)", exc_info=True)
+        return False, UnavailableMeta("transformer_engine", (), {"_msg": msg})
+
+    return True, te
+
+
 def get_torch_version():
     """
     Return pytorch version with fallback if unavailable.
@@ -419,3 +466,66 @@ def is_te_min_version(version, check_equality=True):
     if check_equality:
         return get_te_version() >= PkgVersion(version)
     return get_te_version() > PkgVersion(version)
+
+
+def get_transformers_version():
+    """Get transformers version from __version__."""
+    try:
+        import transformers
+
+        if hasattr(transformers, "__version__"):
+            _version = str(transformers.__version__)
+        else:
+            from importlib.metadata import version
+
+            _version = version("transformers")
+    except ImportError:
+        _version = "0.0.0"
+    return PkgVersion(_version)
+
+
+def is_transformers_min_version(version, check_equality=True):
+    """Check if minimum version of `transformers` is installed."""
+    if check_equality:
+        return get_transformers_version() >= PkgVersion(version)
+    return get_transformers_version() > PkgVersion(version)
+
+
+def get_check_model_inputs_decorator():
+    """
+    Get the appropriate check_model_inputs decorator based on transformers version.
+
+    In transformers >= 4.57.3, check_model_inputs became a function that returns a decorator.
+    In older versions, it was directly a decorator.
+    In transformers >= 5.2.0, check_model_inputs was removed and split into
+    ``merge_with_config_defaults`` and ``capture_outputs``.
+
+    Returns:
+        Decorator function to validate model inputs.
+    """
+    try:
+        from transformers.utils.generic import check_model_inputs
+
+        if is_transformers_min_version("4.57.3"):
+            # New API: check_model_inputs() returns a decorator
+            return check_model_inputs()
+        else:
+            # Old API: check_model_inputs is directly a decorator
+            return check_model_inputs
+    except ImportError:
+        pass
+
+    # transformers >= 5.2.0: check_model_inputs was split into two decorators
+    try:
+        from transformers.utils.generic import merge_with_config_defaults
+        from transformers.utils.output_capturing import capture_outputs
+
+        def _combined_decorator(func):
+            return merge_with_config_defaults(capture_outputs(func))
+
+        return _combined_decorator
+    except ImportError:
+        pass
+
+    # No transformers decorator available — return a no-op decorator
+    return null_decorator

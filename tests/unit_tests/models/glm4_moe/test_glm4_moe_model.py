@@ -12,16 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from transformers.models.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.glm4_moe.model import Block, Glm4MoeForCausalLM, Glm4MoeModel
-from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig
-
+from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.layers import MLP, MoE
+from nemo_automodel.components.models.common import BackendConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -67,7 +69,8 @@ def backend_config():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
-        enable_deepep=False,
+        experts="torch",
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -125,10 +128,14 @@ class TestBlock:
 
         batch, seq_len = 2, 4
         x = torch.randn(batch, seq_len, glm_config.hidden_size, device=device)
-        freqs_cis = torch.randn(batch, seq_len, int(glm_config.head_dim * glm_config.partial_rotary_factor), device=device)
+        freqs_cis = torch.randn(
+            batch, seq_len, int(glm_config.head_dim * glm_config.partial_rotary_factor), device=device
+        )
 
-        with patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn, \
-            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp:
+        with (
+            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
+            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+        ):
             out = block(x, freqs_cis=freqs_cis)
 
         assert out.shape == x.shape
@@ -143,8 +150,10 @@ class TestBlock:
         freqs_cis = torch.randn(1, 3, int(glm_config.head_dim * glm_config.partial_rotary_factor), device=device)
         attention_mask = torch.tensor([[1, 1, 0]], dtype=torch.bool, device=device)
 
-        with patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn, \
-            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp:
+        with (
+            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
+            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+        ):
             block(x, freqs_cis=freqs_cis, attention_mask=attention_mask)
 
         mock_attn.assert_called_once()
@@ -163,8 +172,10 @@ class TestBlock:
         attention_mask = torch.tensor([[1, 1, 0]], dtype=torch.bool, device=device)
         padding_mask = torch.tensor([[0, 0, 1]], dtype=torch.bool, device=device)
 
-        with patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn, \
-            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp:
+        with (
+            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
+            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+        ):
             block(x, freqs_cis=freqs_cis, attention_mask=attention_mask, padding_mask=padding_mask)
 
         _, kwargs = mock_mlp.call_args
@@ -193,10 +204,12 @@ class TestBlock:
     def test_init_weights_resets_sublayers(self, glm_config, backend_config):
         block = Block(layer_idx=0, config=glm_config, moe_config=magic_moe_config(glm_config), backend=backend_config)
 
-        with patch.object(block.input_layernorm, "reset_parameters") as mock_in, \
-            patch.object(block.post_attention_layernorm, "reset_parameters") as mock_post, \
-            patch.object(block.self_attn, "init_weights") as mock_attn, \
-            patch.object(block.mlp, "init_weights") as mock_mlp:
+        with (
+            patch.object(block.input_layernorm, "reset_parameters") as mock_in,
+            patch.object(block.post_attention_layernorm, "reset_parameters") as mock_post,
+            patch.object(block.self_attn, "init_weights") as mock_attn,
+            patch.object(block.mlp, "init_weights") as mock_mlp,
+        ):
             block.init_weights(torch.device("cpu"))
 
         mock_in.assert_called_once()
@@ -239,7 +252,10 @@ class TestGlm4MoeModel:
         assert model.moe_config == moe_config
 
     def test_model_uses_partial_rotary_factor(self, glm_config, backend_config):
-        glm_config.partial_rotary_factor = 0.75
+        if hasattr(glm_config, "rope_parameters"):
+            glm_config.rope_parameters["partial_rotary_factor"] = 0.75
+        else:
+            glm_config.partial_rotary_factor = 0.75
         model = Glm4MoeModel(glm_config, backend=backend_config)
 
         assert model.rotary_emb.partial_rotary_factor == 0.75
@@ -252,7 +268,9 @@ class TestGlm4MoeModel:
         freqs_mock = MagicMock(return_value=(1.0, torch.ones(glm_config.head_dim // 2)))
 
         with patch.object(model.rotary_emb, "_compute_concentration_and_inv_freq", freqs_mock):
-            with patch.object(Block, "forward", side_effect=lambda *_, **__: torch.randn(batch, seq_len, glm_config.hidden_size)) as mock_block:
+            with patch.object(
+                Block, "forward", side_effect=lambda *_, **__: torch.randn(batch, seq_len, glm_config.hidden_size)
+            ) as mock_block:
                 out = model(input_ids)
 
         assert out.shape == (batch, seq_len, glm_config.hidden_size)
@@ -263,10 +281,18 @@ class TestGlm4MoeModel:
         batch, seq_len = 2, 4
         input_ids = torch.randint(0, glm_config.vocab_size, (batch, seq_len))
 
-        with patch.object(model.rotary_emb, "_compute_concentration_and_inv_freq", return_value=(1.0, torch.ones(glm_config.head_dim // 2))):
-            with patch.object(Block, "forward", side_effect=lambda *_, **kwargs: torch.randn(batch, seq_len, glm_config.hidden_size)):
+        with patch.object(
+            model.rotary_emb,
+            "_compute_concentration_and_inv_freq",
+            return_value=(1.0, torch.ones(glm_config.head_dim // 2)),
+        ):
+            with patch.object(
+                Block, "forward", side_effect=lambda *_, **kwargs: torch.randn(batch, seq_len, glm_config.hidden_size)
+            ):
                 with patch("nemo_automodel.components.models.glm4_moe.model.position_ids_to_freqs_cis") as mock_freqs:
-                    mock_freqs.return_value = torch.randn(batch, seq_len, int(glm_config.head_dim * glm_config.partial_rotary_factor))
+                    mock_freqs.return_value = torch.randn(
+                        batch, seq_len, int(glm_config.head_dim * glm_config.partial_rotary_factor)
+                    )
                     out = model(input_ids)
 
         # Verify position_ids_to_freqs_cis was called
@@ -283,7 +309,11 @@ class TestGlm4MoeModel:
         input_ids = torch.randint(0, glm_config.vocab_size, (batch, seq_len))
         position_ids = torch.arange(seq_len).unsqueeze(0)
 
-        with patch.object(model.rotary_emb, "_compute_concentration_and_inv_freq", return_value=(1.0, torch.ones(glm_config.head_dim // 2))):
+        with patch.object(
+            model.rotary_emb,
+            "_compute_concentration_and_inv_freq",
+            return_value=(1.0, torch.ones(glm_config.head_dim // 2)),
+        ):
             with patch.object(Block, "forward", return_value=torch.zeros(batch, seq_len, glm_config.hidden_size)):
                 out = model(input_ids, position_ids=position_ids)
 
@@ -294,9 +324,15 @@ class TestGlm4MoeModel:
         batch, seq_len = 1, 3
         input_ids = torch.randint(0, glm_config.vocab_size, (batch, seq_len))
 
-        with patch.object(model.rotary_emb, "_compute_concentration_and_inv_freq", return_value=(1.0, torch.ones(glm_config.head_dim // 2))):
+        with patch.object(
+            model.rotary_emb,
+            "_compute_concentration_and_inv_freq",
+            return_value=(1.0, torch.ones(glm_config.head_dim // 2)),
+        ):
             with patch("nemo_automodel.components.models.glm4_moe.model.position_ids_to_freqs_cis") as mock_freqs:
-                mock_freqs.return_value = torch.randn(batch, seq_len, int(glm_config.head_dim * glm_config.partial_rotary_factor))
+                mock_freqs.return_value = torch.randn(
+                    batch, seq_len, int(glm_config.head_dim * glm_config.partial_rotary_factor)
+                )
                 with patch.object(Block, "forward", return_value=torch.zeros(batch, seq_len, glm_config.hidden_size)):
                     model(input_ids)
 
@@ -307,8 +343,10 @@ class TestGlm4MoeModel:
         model = Glm4MoeModel(glm_config, backend=backend_config)
         original = model.embed_tokens.weight.clone()
 
-        with patch.object(model.norm, "reset_parameters") as mock_norm, \
-            patch.object(Block, "init_weights") as mock_layer_init:
+        with (
+            patch.object(model.norm, "reset_parameters") as mock_norm,
+            patch.object(Block, "init_weights") as mock_layer_init,
+        ):
             model.init_weights(torch.device("cpu"))
 
         mock_norm.assert_called_once()
@@ -319,8 +357,7 @@ class TestGlm4MoeModel:
         model = Glm4MoeModel(glm_config, backend=backend_config)
         device = torch.device("cpu")
 
-        with patch.object(model.norm, "reset_parameters"), \
-            patch.object(Block, "init_weights"):
+        with patch.object(model.norm, "reset_parameters"), patch.object(Block, "init_weights"):
             model.init_weights(buffer_device=device)
 
         assert model.rotary_emb.device == device
@@ -334,7 +371,11 @@ class TestGlm4MoeForCausalLM:
         batch, seq_len = 2, 6
         input_ids = torch.randint(0, glm_config.vocab_size, (batch, seq_len), device=device)
 
-        with patch.object(model.model, "forward", return_value=torch.randn(batch, seq_len, glm_config.hidden_size, device=device).to(torch.bfloat16)):
+        with patch.object(
+            model.model,
+            "forward",
+            return_value=torch.randn(batch, seq_len, glm_config.hidden_size, device=device).to(torch.bfloat16),
+        ):
             logits = model(input_ids)
 
         assert logits.shape == (batch, seq_len, glm_config.vocab_size)
@@ -346,8 +387,14 @@ class TestGlm4MoeForCausalLM:
         batch, seq_len = 1, 5
         input_ids = torch.randint(0, glm_config.vocab_size, (batch, seq_len), device=device)
 
-        with patch("nemo_automodel.components.models.glm4_moe.model.squeeze_input_for_thd") as mock_squeeze, \
-             patch.object(model.model, "forward", return_value=torch.randn(seq_len, glm_config.hidden_size, device=device).to(torch.bfloat16)):
+        with (
+            patch("nemo_automodel.components.models.glm4_moe.model.squeeze_input_for_thd") as mock_squeeze,
+            patch.object(
+                model.model,
+                "forward",
+                return_value=torch.randn(seq_len, glm_config.hidden_size, device=device).to(torch.bfloat16),
+            ),
+        ):
             mock_squeeze.return_value = (input_ids.squeeze(0), None, None, {"qkv_format": "thd"})
             logits = model(input_ids, qkv_format="thd")
 
@@ -369,14 +416,13 @@ class TestGlm4MoeForCausalLM:
     def test_initialize_weights_uses_scaled_std_for_lm_head(self, glm_config, backend_config):
         model = Glm4MoeForCausalLM(glm_config, backend=backend_config)
 
-        with patch.object(model.model, "init_weights"), \
-             patch("torch.nn.init.trunc_normal_") as mock_trunc:
+        with patch.object(model.model, "init_weights"), patch("torch.nn.init.trunc_normal_") as mock_trunc:
             model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
 
         # Check that trunc_normal_ was called with scaled std
         mock_trunc.assert_called()
         call_args = mock_trunc.call_args
-        assert call_args[1]["std"] == glm_config.hidden_size ** -0.5
+        assert call_args[1]["std"] == glm_config.hidden_size**-0.5
 
     def test_initialize_weights_sets_e_score_correction_bias_for_moe_layers(self, glm_config, backend_config):
         """GLM4 MoE initializes e_score_correction_bias for MoE layers"""
@@ -395,7 +441,7 @@ class TestGlm4MoeForCausalLM:
                 assert layer.mlp.gate.e_score_correction_bias.dtype == torch.float32
                 torch.testing.assert_close(
                     layer.mlp.gate.e_score_correction_bias,
-                    torch.zeros(glm_config.n_routed_experts, dtype=torch.float32)
+                    torch.zeros(glm_config.n_routed_experts, dtype=torch.float32),
                 )
 
     def test_initialize_weights_updates_rotary_emb_device_after_dtype_move(self, glm_config, backend_config):
@@ -452,10 +498,14 @@ class TestGlm4MoeModelClassmethods:
             attention_bias=False,
         )
 
-        with patch("transformers.models.glm4_moe.configuration_glm4_moe.Glm4MoeConfig.from_pretrained") as mock_from_pretrained:
+        with patch(
+            "transformers.models.glm4_moe.configuration_glm4_moe.Glm4MoeConfig.from_pretrained"
+        ) as mock_from_pretrained:
             mock_from_pretrained.return_value = cfg
 
-            with patch.object(Glm4MoeForCausalLM, "from_config", wraps=Glm4MoeForCausalLM.from_config) as mock_from_config:
+            with patch.object(
+                Glm4MoeForCausalLM, "from_config", wraps=Glm4MoeForCausalLM.from_config
+            ) as mock_from_config:
                 model = Glm4MoeForCausalLM.from_pretrained("glm4_moe/model")
                 assert isinstance(model, Glm4MoeForCausalLM)
                 mock_from_pretrained.assert_called_once_with("glm4_moe/model")
@@ -491,3 +541,6 @@ def magic_moe_config(config: Glm4MoeConfig) -> MoEConfig:
         expert_activation="swiglu",
         softmax_before_topk=False,
     )
+
+
+# NOTE: HFCheckpointingMixin tests are now in tests/unit_tests/models/common/test_hf_checkpointing_mixin.py

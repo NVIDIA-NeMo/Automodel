@@ -19,12 +19,20 @@ import torch.nn as nn
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
 from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextGatedDeltaNet
 
+from nemo_automodel.components.models.common import (
+    BackendConfig,
+    get_rope_config,
+    initialize_linear_module,
+    initialize_rms_norm_module,
+)
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention, Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.state_dict_adapter import Qwen3NextStateDictAdapter
+from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.moe.layers import MLP, MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -147,12 +155,16 @@ class Qwen3NextModel(nn.Module):
         # Rotary embedding cache compatible with our rope_utils functions
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        base, rope_scaling, partial_rotary_factor = get_rope_config(config)
+
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
-            base=config.rope_theta,
+            base=base,
             dtype=torch.float32,
-            scaling_factor=1.0,
+            initial_context_length=rope_scaling.get("original_max_position_embeddings", 4096),
+            scaling_factor=rope_scaling.get("factor", 1.0),
+            ntk_alpha=rope_scaling.get("beta_slow", 1.0),
+            ntk_beta=rope_scaling.get("beta_fast", 32.0),
             partial_rotary_factor=partial_rotary_factor,
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
         )
@@ -173,7 +185,11 @@ class Qwen3NextModel(nn.Module):
 
         # Compute freqs_cis from RotaryEmbedding inv_freq and current position_ids; then concat [cos, sin]
         freqs_cis = position_ids_to_freqs_cis(
-            self.rotary_emb, position_ids, qkv_format=attn_kwargs.get("qkv_format", "bshd")
+            self.rotary_emb,
+            position_ids,
+            qkv_format=attn_kwargs.get("qkv_format", "bshd"),
+            for_fused_rope=self.backend.rope_fusion,
+            cp_size=attn_kwargs.get("cp_size", 1),
         )
 
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
@@ -208,7 +224,7 @@ class Qwen3NextModel(nn.Module):
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class Qwen3NextForCausalLM(nn.Module, MoEFSDPSyncMixin):
+class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     @classmethod
     def from_config(
         cls,
@@ -245,6 +261,18 @@ class Qwen3NextForCausalLM(nn.Module, MoEFSDPSyncMixin):
             self.state_dict_adapter = Qwen3NextStateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
             )
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
 
     def forward(
         self,
@@ -291,7 +319,7 @@ class Qwen3NextForCausalLM(nn.Module, MoEFSDPSyncMixin):
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
         with buffer_device:
             # Ensure rotary embedding uses correct device after dtype move
             self.model.rotary_emb.device = buffer_device

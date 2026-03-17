@@ -15,8 +15,8 @@
 import torch
 from unittest.mock import Mock, patch
 
-from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.models.common import BackendConfig
 
 from nemo_automodel.components.models.qwen3_next.state_dict_adapter import Qwen3NextStateDictAdapter
 
@@ -465,7 +465,8 @@ class TestConvertSingleTensorToHf:
 
     def create_mock_backend_config(self):
         backend = Mock()
-        backend.enable_deepep = False
+        backend.dispatcher = "torch"
+        backend.experts = "torch"
         return backend
 
     def test_expert_tensor_conversion_with_mapping(self):

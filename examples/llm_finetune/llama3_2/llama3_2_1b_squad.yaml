@@ -46,13 +46,14 @@ compile:
   dynamic: true  # Set to false for better performance with fixed shapes
   backend: null  # Use default backend (inductor)
 
+clip_grad_norm:
+  max_norm: 1.0
+
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   dp_size: none
-  dp_replicate_size: 1 # dp_shard_size = dp_size / dp_replicate_size and dp_shard_size < dp_size. For DDP usecase, use DDPManager
   tp_size: 1
   cp_size: 1
-  sequence_parallel: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -67,7 +68,8 @@ packed_sequence:
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
   shuffle: false
 
 validation_dataset:
@@ -78,7 +80,8 @@ validation_dataset:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
 
 optimizer:
   _target_: torch.optim.Adam

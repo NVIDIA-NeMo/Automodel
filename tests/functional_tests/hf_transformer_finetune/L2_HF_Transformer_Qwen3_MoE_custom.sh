@@ -18,7 +18,7 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
 examples/llm_finetune/finetune.py \
     --config examples/llm_finetune/qwen/qwen3_moe_2layer_proxy_torch_sdpa.yaml \
     --step_scheduler.max_steps 4 \
@@ -38,10 +38,8 @@ examples/llm_finetune/finetune.py \
     --validation_dataset.limit_dataset_samples 8 \
     --model.is_meta_device true \
     --checkpoint.enabled false \
-    --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
     --distributed.tp_size 1 \
     --distributed.cp_size 1 \
-    --distributed.dp_replicate_size 1 \
     --distributed.pp_size 1 \
     --distributed.ep_size 2 \
     --distributed.sequence_parallel false

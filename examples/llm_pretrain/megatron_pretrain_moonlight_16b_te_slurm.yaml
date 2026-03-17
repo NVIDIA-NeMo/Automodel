@@ -35,10 +35,6 @@ rng:
   seed: 1111
   ranked: true
 
-parallelizer:
-  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
-  activation_checkpointing: false
-
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
@@ -50,14 +46,12 @@ checkpoint:
   checkpoint_dir: checkpoints/
   model_save_format: torch_save # torch_save or safetensors
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
-  load_base_model: false
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  dp_replicate_size: 1
   dp_size: 8
   ep_size: 8
 
@@ -69,7 +63,7 @@ dataset:
   paths: /path/to/fineweb_edu/processed_data_*_text_document*  # REPLACE THIS
   index_mapping_dir: /path/to/fineweb_edu/mapping_dir  # REPLACE THIS
   tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
     trust_remote_code: true
   seq_length: 2048
@@ -86,7 +80,7 @@ validation_dataset:
   paths: /path/to/fineweb_edu/processed_data_*_text_document*  # REPLACE THIS
   index_mapping_dir: /path/to/fineweb_edu/mapping_dir  # REPLACE THIS
   tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
     trust_remote_code: true
   seq_length: 2048

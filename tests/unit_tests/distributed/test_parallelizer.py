@@ -13,13 +13,10 @@
 # limitations under the License.
 
 import sys
-import types
-from typing import Dict, Any
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
-
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
@@ -27,20 +24,21 @@ from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
     SequenceParallel,
-    ParallelStyle,
 )
-
+from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
 # Import the function under test
 from nemo_automodel.components.distributed.parallelizer import (
-    fsdp2_strategy_parallelize,
-    megatron_fsdp_strategy_parallelize,
-    import_class_from_path,
-    get_hf_tp_shard_plan,
+    _attention_is_head_sharded,
+    _get_parallel_plan,
+    _update_attention_head_counts_for_tp,
     apply_fsdp2_sharding_recursively,
-    unshard_fsdp2_model,
+    get_hf_tp_shard_plan,
+    import_class_from_path,
+    megatron_fsdp_strategy_parallelize,
 )
+from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
 
 
 class MockModel(nn.Module):
@@ -62,9 +60,7 @@ class MockModel(nn.Module):
         class MockInnerModel(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.layers = nn.ModuleList([
-                    MockModel._create_mock_layer() for _ in range(2)
-                ])
+                self.layers = nn.ModuleList([MockModel._create_mock_layer() for _ in range(2)])
 
         self.model = MockInnerModel()
 
@@ -105,16 +101,14 @@ class MockGemma3Model(nn.Module):
             text_config=SimpleNamespace(
                 num_attention_heads=num_attention_heads,
                 num_key_value_heads=num_key_value_heads,
-            )
+            ),
         )
 
         # Create mock model as a proper nn.Module so it gets picked up by named_children()
         class MockInnerModel(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.layers = nn.ModuleList([
-                    MockGemma3Model._create_mock_layer() for _ in range(2)
-                ])
+                self.layers = nn.ModuleList([MockGemma3Model._create_mock_layer() for _ in range(2)])
 
         self.model = MockInnerModel()
 
@@ -135,6 +129,7 @@ class MockGemma3Model(nn.Module):
 
     def forward(self, x):
         return x
+
 
 def create_gemma3_mock():
     """Factory function to create a mock that passes Gemma3 type checks."""
@@ -185,6 +180,7 @@ def mock_device_mesh_fsdp2():
     }[key]
 
     return mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh, cp_mesh
+
 
 @pytest.fixture
 def mock_device_mesh_megatron_fsdp():
@@ -267,10 +263,22 @@ def mock_distributed_env(monkeypatch):
     # Apply patches
     monkeypatch.setattr("torch.distributed", dist_mock, raising=False)
     # Patch the imported functions directly in the parallelizer module
-    monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.fully_shard", fsdp_mock.fully_shard, raising=False)
-    monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.parallelize_module", tp_parallel_mock.parallelize_module, raising=False)
-    monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper", checkpoint_wrapper_mock.checkpoint_wrapper, raising=False)
-    monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer._mesh_resources", mesh_resources_mock, raising=False)
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer.fully_shard", fsdp_mock.fully_shard, raising=False
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer.parallelize_module",
+        tp_parallel_mock.parallelize_module,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper",
+        checkpoint_wrapper_mock.checkpoint_wrapper,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer._mesh_resources", mesh_resources_mock, raising=False
+    )
 
     return {
         "dist": dist_mock,
@@ -298,6 +306,7 @@ def mock_optimized_tp_plans(monkeypatch):
         mock_plans[type(create_gemma3_mock())] = mock_gemma3_plan
         yield mock_plans
 
+
 class TestMegatronFSDPStrategyParallelize:
     """Test suite for megatron_fsdp_strategy_parallelize function."""
 
@@ -309,16 +318,30 @@ class TestMegatronFSDPStrategyParallelize:
         megatron_fsdp_mock.fully_shard = MagicMock(return_value=(MagicMock(), None))
 
         # Mock HAVE_MEGATRON_FSDP flag
-        monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.HAVE_MEGATRON_FSDP", True, raising=False)
-        monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.megatron_fsdp_fully_shard", megatron_fsdp_mock.fully_shard, raising=False)
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.HAVE_MEGATRON_FSDP", True, raising=False
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.megatron_fsdp_fully_shard",
+            megatron_fsdp_mock.fully_shard,
+            raising=False,
+        )
 
         # Mock parallelize_module
         parallelize_module_mock = MagicMock()
-        monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.parallelize_module", parallelize_module_mock, raising=False)
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.parallelize_module",
+            parallelize_module_mock,
+            raising=False,
+        )
 
         # Mock import_classes_from_paths
         import_classes_mock = MagicMock(return_value=[])
-        monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.import_classes_from_paths", import_classes_mock, raising=False)
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.import_classes_from_paths",
+            import_classes_mock,
+            raising=False,
+        )
 
         return {
             "megatron_fsdp": megatron_fsdp_mock,
@@ -404,7 +427,7 @@ class TestMegatronFSDPStrategyParallelize:
         custom_dp_mesh.size.return_value = 2
         custom_tp_mesh.size.return_value = 1
         custom_cp_mesh.size.return_value = 2  # Enable CP
-        custom_dp_cp_mesh.size.return_value = 4 # Mock flattening
+        custom_dp_cp_mesh.size.return_value = 4  # Mock flattening
         custom_dp_mesh.ndim = 1
         custom_tp_mesh.ndim = 1
         custom_cp_mesh.ndim = 1
@@ -438,7 +461,9 @@ class TestMegatronFSDPStrategyParallelize:
     def test_megatron_fsdp_not_available_error(self, mock_device_mesh_megatron_fsdp, monkeypatch):
         """Test error when Megatron FSDP is not available."""
         # Mock HAVE_MEGATRON_FSDP as False
-        monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer.HAVE_MEGATRON_FSDP", False, raising=False)
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.HAVE_MEGATRON_FSDP", False, raising=False
+        )
 
         mesh, dp_mesh, tp_mesh, cp_mesh = mock_device_mesh_megatron_fsdp
         model = MockModel()
@@ -493,8 +518,8 @@ class TestGetHfTpShardPlan:
 
         finally:
             # Clean up class attribute
-            if hasattr(model_cls, '_tp_plan'):
-                delattr(model_cls, '_tp_plan')
+            if hasattr(model_cls, "_tp_plan"):
+                delattr(model_cls, "_tp_plan")
 
     def test_standard_model_with_instance_tp_plan(self):
         """Test standard model with TP plan defined on model instance."""
@@ -561,8 +586,8 @@ class TestGetHfTpShardPlan:
             assert isinstance(result["layers.0.self_attn.q_proj"], ColwiseParallel)
         finally:
             # Clean up class attribute
-            if hasattr(model_cls, '_tp_plan'):
-                delattr(model_cls, '_tp_plan')
+            if hasattr(model_cls, "_tp_plan"):
+                delattr(model_cls, "_tp_plan")
 
     def test_lm_head_optimization(self):
         """Test special optimization for lm_head with colwise_rep."""
@@ -658,14 +683,13 @@ class TestApplyFsdpShardingRecursively:
     @pytest.fixture
     def mock_module_list(self):
         """Create a mock ModuleList with transformer blocks."""
-        module_list = nn.ModuleList([
-            nn.Linear(10, 10) for _ in range(3)
-        ])
+        module_list = nn.ModuleList([nn.Linear(10, 10) for _ in range(3)])
         return module_list
 
     @pytest.fixture
     def mock_single_module(self):
         """Create a mock module with child modules."""
+
         class TestModule(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -685,6 +709,7 @@ class TestApplyFsdpShardingRecursively:
     def mock_mp_policy(self):
         """Create a mock mixed precision policy."""
         from torch.distributed.fsdp import MixedPrecisionPolicy
+
         mp_policy = MagicMock(spec=MixedPrecisionPolicy)
         return mp_policy
 
@@ -692,21 +717,21 @@ class TestApplyFsdpShardingRecursively:
     def mock_offload_policy(self):
         """Create a mock offload policy."""
         from torch.distributed.fsdp import CPUOffloadPolicy
+
         offload_policy = MagicMock(spec=CPUOffloadPolicy)
         return offload_policy
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    def test_apply_fsdp_sharding_module_list(self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy, mock_offload_policy):
+    def test_apply_fsdp_sharding_module_list(
+        self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy, mock_offload_policy
+    ):
         """Test apply_fsdp2_sharding_recursively with a ModuleList."""
         # Set up mock return values
         mock_fully_shard.side_effect = lambda x, **kwargs: x  # Return the module unchanged
 
         # Call the function
         apply_fsdp2_sharding_recursively(
-            module=mock_module_list,
-            mesh=mock_mesh,
-            mp_policy=mock_mp_policy,
-            offload_policy=mock_offload_policy
+            module=mock_module_list, mesh=mock_mesh, mp_policy=mock_mp_policy, offload_policy=mock_offload_policy
         )
 
         # Verify fully_shard was called for each layer in the ModuleList
@@ -726,17 +751,15 @@ class TestApplyFsdpShardingRecursively:
             assert kwargs["reshard_after_forward"] == expected_reshard
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    def test_apply_fsdp_sharding_module_list_without_offload_policy(self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy):
+    def test_apply_fsdp_sharding_module_list_without_offload_policy(
+        self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy
+    ):
         """Test apply_fsdp2_sharding_recursively with a ModuleList and no offload policy."""
         # Set up mock return values
         mock_fully_shard.side_effect = lambda x, **kwargs: x
 
         # Call the function without offload_policy
-        apply_fsdp2_sharding_recursively(
-            module=mock_module_list,
-            mesh=mock_mesh,
-            mp_policy=mock_mp_policy
-        )
+        apply_fsdp2_sharding_recursively(module=mock_module_list, mesh=mock_mesh, mp_policy=mock_mp_policy)
 
         # Verify fully_shard was called with None offload_policy
         calls = mock_fully_shard.call_args_list
@@ -745,17 +768,16 @@ class TestApplyFsdpShardingRecursively:
             assert kwargs["offload_policy"] is None
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    def test_apply_fsdp_sharding_regular_module(self, mock_fully_shard, mock_single_module, mock_mesh, mock_mp_policy, mock_offload_policy):
+    def test_apply_fsdp_sharding_regular_module(
+        self, mock_fully_shard, mock_single_module, mock_mesh, mock_mp_policy, mock_offload_policy
+    ):
         """Test apply_fsdp2_sharding_recursively with a regular module (not ModuleList)."""
         # Set up mock return values
         mock_fully_shard.side_effect = lambda x, **kwargs: x
 
         # Call the function
         apply_fsdp2_sharding_recursively(
-            module=mock_single_module,
-            mesh=mock_mesh,
-            mp_policy=mock_mp_policy,
-            offload_policy=mock_offload_policy
+            module=mock_single_module, mesh=mock_mesh, mp_policy=mock_mp_policy, offload_policy=mock_offload_policy
         )
 
         # For regular modules, it should recursively call on children
@@ -764,33 +786,31 @@ class TestApplyFsdpShardingRecursively:
         assert mock_fully_shard.call_count == 1  # Just the nested ModuleList's single layer
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    def test_apply_fsdp_sharding_empty_module_list(self, mock_fully_shard, mock_mesh, mock_mp_policy, mock_offload_policy):
+    def test_apply_fsdp_sharding_empty_module_list(
+        self, mock_fully_shard, mock_mesh, mock_mp_policy, mock_offload_policy
+    ):
         """Test apply_fsdp2_sharding_recursively with an empty ModuleList."""
         empty_module_list = nn.ModuleList([])
 
         # Call the function
         apply_fsdp2_sharding_recursively(
-            module=empty_module_list,
-            mesh=mock_mesh,
-            mp_policy=mock_mp_policy,
-            offload_policy=mock_offload_policy
+            module=empty_module_list, mesh=mock_mesh, mp_policy=mock_mp_policy, offload_policy=mock_offload_policy
         )
 
         # Should not call fully_shard for empty ModuleList
         assert mock_fully_shard.call_count == 0
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    def test_apply_fsdp_sharding_single_item_module_list(self, mock_fully_shard, mock_mesh, mock_mp_policy, mock_offload_policy):
+    def test_apply_fsdp_sharding_single_item_module_list(
+        self, mock_fully_shard, mock_mesh, mock_mp_policy, mock_offload_policy
+    ):
         """Test apply_fsdp2_sharding_recursively with a single-item ModuleList."""
         single_module_list = nn.ModuleList([nn.Linear(10, 10)])
         mock_fully_shard.side_effect = lambda x, **kwargs: x
 
         # Call the function
         apply_fsdp2_sharding_recursively(
-            module=single_module_list,
-            mesh=mock_mesh,
-            mp_policy=mock_mp_policy,
-            offload_policy=mock_offload_policy
+            module=single_module_list, mesh=mock_mesh, mp_policy=mock_mp_policy, offload_policy=mock_offload_policy
         )
 
         # Should call fully_shard once
@@ -806,10 +826,7 @@ class TestApplyFsdpShardingRecursively:
 
         # This should complete without error (no children to recurse on)
         apply_fsdp2_sharding_recursively(
-            module=leaf_module,
-            mesh=mock_mesh,
-            mp_policy=mock_mp_policy,
-            offload_policy=mock_offload_policy
+            module=leaf_module, mesh=mock_mesh, mp_policy=mock_mp_policy, offload_policy=mock_offload_policy
         )
 
         # Just verify it doesn't crash - leaf modules have no children to process
@@ -821,7 +838,7 @@ class TestUnshardFsdp2Model:
     def test_unshard_fsdp2_model_basic_functionality(self):
         """Test basic unshard/reshard functionality with FSDP modules."""
         # Import the function to test
-        from nemo_automodel.components.distributed.parallelizer import unshard_fsdp2_model, FSDPModule
+        from nemo_automodel.components.distributed.parallelizer import unshard_fsdp2_model
 
         # Create a simple test double that can pass isinstance checks
         class TestFSDPModule:
@@ -842,7 +859,9 @@ class TestUnshardFsdp2Model:
         mock_model.modules.return_value = [test_fsdp_module, nn.Linear(10, 10)]
 
         # Patch FSDPModule to be our test class
-        with patch.object(sys.modules['nemo_automodel.components.distributed.parallelizer'], 'FSDPModule', TestFSDPModule):
+        with patch.object(
+            sys.modules["nemo_automodel.components.distributed.parallelizer"], "FSDPModule", TestFSDPModule
+        ):
             # Test the context manager
             with unshard_fsdp2_model(mock_model):
                 assert test_fsdp_module.unshard_called is True
@@ -874,10 +893,278 @@ class TestUnshardFsdp2Model:
         mock_model.modules.return_value = [test_fsdp_module]
 
         # Patch FSDPModule to be our test class
-        with patch.object(sys.modules['nemo_automodel.components.distributed.parallelizer'], 'FSDPModule', TestFSDPModule):
+        with patch.object(
+            sys.modules["nemo_automodel.components.distributed.parallelizer"], "FSDPModule", TestFSDPModule
+        ):
             with pytest.raises(ValueError):
                 with unshard_fsdp2_model(mock_model):
                     raise ValueError("Test exception")
 
             # Verify reshard was still called despite the exception
             assert test_fsdp_module.reshard_called is True
+
+
+class TestGetParallelPlanClassNameFallback:
+    """Test that _get_parallel_plan matches by qualified class name (module.qualname)."""
+
+    def test_identity_match(self):
+        """Exact class qualname in PARALLELIZE_FUNCTIONS is found."""
+        sentinel_plan = {"layer": ColwiseParallel()}
+        model = MockModel()
+
+        with patch(
+            "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
+            {_get_class_qualname(type(model)): lambda m, sp: sentinel_plan},
+        ):
+            plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
+        assert plan is sentinel_plan
+
+    def test_class_name_fallback(self):
+        """A different class object with the same module.qualname still matches.
+
+        With the old class-object-keyed dict, identity was required. With the new
+        string-keyed dict, two distinct class objects that share ``__module__`` and
+        ``__qualname__`` resolve to the same key and both match — which is exactly
+        the NeMo-RL wrapping scenario this fix targets.
+        """
+        sentinel_plan = {"layer": ColwiseParallel()}
+
+        # Create a *different* class object with the same name (and therefore the same
+        # module.qualname since both are defined in this test module).
+        DuplicateMockModel = type("MockModel", (nn.Module,), {"forward": lambda self, x: x})
+        assert DuplicateMockModel is not MockModel
+        assert _get_class_qualname(DuplicateMockModel) == _get_class_qualname(MockModel)
+
+        model = MockModel()
+        model.__class__ = DuplicateMockModel  # model's type is the duplicate
+
+        with patch(
+            "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
+            {_get_class_qualname(MockModel): lambda m, sp: sentinel_plan},
+        ):
+            plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
+        # Matches because module.qualname is the same, even though the class object differs
+        assert plan is sentinel_plan
+
+    def test_nemo_rl_wrapped_class_match(self):
+        """A different class object with the same module and qualname still matches.
+
+        This simulates the NeMo-RL scenario: _get_mixin_wrapped_class() creates a new
+        class via type(...) that preserves __module__ and __qualname__ from the original.
+        Both the original and the wrapper resolve to the same _get_class_qualname() key.
+        """
+        sentinel_plan = {"layer": ColwiseParallel()}
+        original_cls = type(MockModel())
+
+        # Simulate _get_mixin_wrapped_class: create a *new* class object that copies
+        # __module__ and __qualname__ from the original (same qualname, different object)
+        WrappedCls = type(original_cls.__name__, (nn.Module,), {
+            "forward": lambda self, x: x,
+            "__module__": original_cls.__module__,
+            "__qualname__": original_cls.__qualname__,
+        })
+        assert WrappedCls is not original_cls
+        assert _get_class_qualname(WrappedCls) == _get_class_qualname(original_cls)
+
+        model = MockModel()
+        model.__class__ = WrappedCls  # model's type is the wrapper
+
+        with patch(
+            "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
+            {_get_class_qualname(original_cls): lambda m, sp: sentinel_plan},
+        ):
+            plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
+        assert plan is sentinel_plan
+
+    def test_no_match_falls_through_to_default(self):
+        """Completely unknown class qualname falls through to the default plan."""
+        model = MockModel()
+        model.__class__ = type("UnknownModel", (nn.Module,), {"forward": lambda self, x: x})
+
+        with patch(
+            "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
+            {_get_class_qualname(MockModel): lambda m, sp: {"x": ColwiseParallel()}},
+        ):
+            plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
+        # Should get the default Llama3-style plan (has q_proj, k_proj, etc.)
+        assert "model.layers.*.self_attn.q_proj" in plan
+
+
+class TestUpdateAttentionHeadCountsForTP:
+    """Tests for _update_attention_head_counts_for_tp."""
+
+    @staticmethod
+    def _make_model(num_heads=64, num_kv_heads=8, hidden_size=8192, architectures=None, model_type=None):
+        model = nn.Module()
+        cfg = SimpleNamespace(
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_kv_heads,
+            hidden_size=hidden_size,
+        )
+        if architectures is not None:
+            cfg.architectures = architectures
+        if model_type is not None:
+            cfg.model_type = model_type
+        model.config = cfg
+
+        inner = nn.Module()
+        layers = nn.ModuleList()
+        for _ in range(2):
+            layer = nn.Module()
+            attn = nn.Module()
+            attn.num_heads = num_heads
+            attn.num_key_value_heads = num_kv_heads
+            layer.self_attn = attn
+            layers.append(layer)
+        inner.layers = layers
+        model.model = inner
+        return model
+
+    def test_noop_for_tp_size_1(self):
+        model = self._make_model()
+        _update_attention_head_counts_for_tp(model, tp_size=1)
+        assert model.config.num_attention_heads == 64
+        assert model.config.num_key_value_heads == 8
+
+    def test_updates_config_and_layer_attrs(self):
+        model = self._make_model(num_heads=64, num_kv_heads=8, hidden_size=8192)
+        _update_attention_head_counts_for_tp(model, tp_size=2)
+        assert model.config.num_attention_heads == 32
+        assert model.config.num_key_value_heads == 4
+        assert model.config.head_dim == 128
+        for layer in model.model.layers:
+            assert layer.self_attn.num_heads == 32
+            assert layer.self_attn.num_key_value_heads == 4
+
+    def test_preserves_existing_head_dim(self):
+        model = self._make_model(num_heads=64, num_kv_heads=8, hidden_size=8192)
+        model.config.head_dim = 128
+        _update_attention_head_counts_for_tp(model, tp_size=2)
+        assert model.config.head_dim == 128
+
+    def test_computes_head_dim_when_missing(self):
+        model = self._make_model(num_heads=32, num_kv_heads=8, hidden_size=4096)
+        _update_attention_head_counts_for_tp(model, tp_size=2)
+        assert model.config.head_dim == 128  # 4096 // 32
+
+    def test_decilm_nemotron_nas_skips_config_update(self):
+        model = self._make_model(
+            num_heads=64,
+            num_kv_heads=8,
+            hidden_size=8192,
+            architectures=["DeciLMForCausalLM"],
+            model_type="nemotron-nas",
+        )
+        _update_attention_head_counts_for_tp(model, tp_size=2)
+        # Config should NOT be updated for DeciLM (per-layer head counts differ)
+        assert model.config.num_attention_heads == 64
+        assert model.config.num_key_value_heads == 8
+        # But per-layer attn modules should still be updated
+        for layer in model.model.layers:
+            assert layer.self_attn.num_heads == 32
+            assert layer.self_attn.num_key_value_heads == 4
+
+    def test_derives_kv_heads_from_num_key_value_groups(self):
+        """When config.num_key_value_heads is None, fall back to num_key_value_groups."""
+        model = self._make_model(num_heads=64, num_kv_heads=8, hidden_size=8192)
+        model.config.num_key_value_heads = None
+        for layer in model.model.layers:
+            layer.self_attn.num_key_value_groups = 8
+        _update_attention_head_counts_for_tp(model, tp_size=2)
+        for layer in model.model.layers:
+            assert layer.self_attn.num_heads == 32
+            assert layer.self_attn.num_key_value_heads == 4  # 32 // 8
+
+    def test_kv_heads_defaults_to_num_heads_without_groups(self):
+        """When config.num_key_value_heads is None and no num_key_value_groups attr."""
+        model = self._make_model(num_heads=64, num_kv_heads=8, hidden_size=8192)
+        model.config.num_key_value_heads = None
+        # num_key_value_groups is never set in _make_model, so already absent
+        _update_attention_head_counts_for_tp(model, tp_size=2)
+        for layer in model.model.layers:
+            assert layer.self_attn.num_key_value_heads == 32  # same as local_num_attention_heads
+
+    def test_language_model_inner_path(self):
+        """Layers under model.language_model are found when model.model has no layers."""
+        model = nn.Module()
+        model.config = SimpleNamespace(
+            num_attention_heads=64,
+            num_key_value_heads=8,
+            hidden_size=8192,
+        )
+        lang = nn.Module()
+        layers = nn.ModuleList()
+        for _ in range(2):
+            layer = nn.Module()
+            attn = nn.Module()
+            attn.num_heads = 64
+            attn.num_key_value_heads = 8
+            layer.self_attn = attn
+            layers.append(layer)
+        lang.layers = layers
+        model.language_model = lang
+        _update_attention_head_counts_for_tp(model, tp_size=2)
+        for layer in lang.layers:
+            assert layer.self_attn.num_heads == 32
+            assert layer.self_attn.num_key_value_heads == 4
+
+    def test_noop_without_config(self):
+        model = nn.Module()
+        _update_attention_head_counts_for_tp(model, tp_size=2)
+
+    def test_noop_without_layers(self):
+        model = nn.Module()
+        model.config = SimpleNamespace(num_attention_heads=8, hidden_size=64)
+        _update_attention_head_counts_for_tp(model, tp_size=2)
+
+
+class TestAttentionIsHeadSharded:
+    """Tests for _attention_is_head_sharded."""
+
+    def test_colwise_default_is_sharded(self):
+        """ColwiseParallel() with default output (Shard) → heads are sharded."""
+        plan = {
+            "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+        }
+        assert _attention_is_head_sharded(plan) is True
+
+    def test_colwise_explicit_shard_is_sharded(self):
+        plan = {
+            "model.layers.*.self_attn.q_proj": ColwiseParallel(output_layouts=Shard(-1)),
+        }
+        assert _attention_is_head_sharded(plan) is True
+
+    def test_rowwise_replicate_is_not_sharded(self):
+        """Phi-3 style: RowwiseParallel with Replicate output → not sharded."""
+        plan = {
+            "model.layers.*.self_attn.qkv_proj": RowwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=Replicate(),
+            ),
+            "model.layers.*.self_attn.o_proj": ColwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=Replicate(),
+            ),
+        }
+        assert _attention_is_head_sharded(plan) is False
+
+    def test_colwise_replicate_output_is_not_sharded(self):
+        """ColwiseParallel with explicit Replicate output → not sharded."""
+        plan = {
+            "model.layers.*.self_attn.q_proj": ColwiseParallel(output_layouts=Replicate()),
+        }
+        assert _attention_is_head_sharded(plan) is False
+
+    def test_no_attn_keys_is_not_sharded(self):
+        """Plan with only MLP entries → not sharded."""
+        plan = {
+            "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),
+            "model.layers.*.mlp.down_proj": RowwiseParallel(),
+        }
+        assert _attention_is_head_sharded(plan) is False
+
+    def test_empty_plan_is_not_sharded(self):
+        assert _attention_is_head_sharded({}) is False

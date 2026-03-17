@@ -121,7 +121,7 @@ def get_model_config_and_attention(model_type, device):
 
         from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention
         from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding
-        from nemo_automodel.components.moe.utils import BackendConfig
+        from nemo_automodel.components.models.common import BackendConfig
 
         config = Qwen3MoeConfig(
             vocab_size=256,
@@ -146,7 +146,8 @@ def get_model_config_and_attention(model_type, device):
             linear="torch",
             attn="te",
             rms_norm="torch",
-            enable_deepep=False,
+            experts="torch",
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -173,7 +174,7 @@ def get_model_config_and_attention(model_type, device):
             precompute_freqs_cis,
             freqs_cis_from_position_ids,
         )
-        from nemo_automodel.components.moe.utils import BackendConfig
+        from nemo_automodel.components.models.common import BackendConfig
 
         config = DeepseekV3Config(
             vocab_size=256,
@@ -195,7 +196,8 @@ def get_model_config_and_attention(model_type, device):
             linear="torch",
             attn="te",
             rms_norm="torch",
-            enable_deepep=False,
+            experts="torch",
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )

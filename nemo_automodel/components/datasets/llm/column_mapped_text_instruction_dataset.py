@@ -163,14 +163,14 @@ class ColumnMappedTextInstructionDataset(Dataset):
         column_mapping: Dict[str, str],
         tokenizer,
         *,
-        split: Optional[str] = None,
+        split: Optional[str] = "train",
         name: Optional[str] = None,
         answer_only_loss_mask: bool = True,
         seq_length: Optional[int] = None,
         padding: Union[str, bool] = "do_not_pad",
         truncation: Union[str, bool] = "do_not_truncate",
-        start_of_turn_token: Optional[str] = None,
         limit_dataset_samples: Optional[int] = None,
+        use_hf_chat_template: bool = False,
     ) -> None:
         """
         Initialize the dataset.
@@ -183,17 +183,14 @@ class ColumnMappedTextInstructionDataset(Dataset):
             name: The name of the dataset configuration/subset to load
             answer_only_loss_mask: Whether to compute the loss mask only on the answer tokens.
             seq_length: The sequence length to use for padding.
-            start_of_turn_token: The token to use to indicate the start of a turn.
             limit_dataset_samples: The number of samples to load from the dataset.
         """
 
-        if _has_chat_template(tokenizer):
+        if use_hf_chat_template and _has_chat_template(tokenizer):
             if not answer_only_loss_mask:
                 logging.warning(
-                    "answer_only_loss_mask=False but tokenizer has chat template. Consider providing `answer_only_loss_mask` and `start_of_turn_token`."
+                    "answer_only_loss_mask=False but tokenizer has chat template. Consider providing `answer_only_loss_mask`."
                 )
-            elif start_of_turn_token is None:
-                raise ValueError("start_of_turn_token must be provided when answer_only_loss_mask=True")
 
         assert tokenizer is not None, "Tokenizer is required"
         self.tokenizer = tokenizer
@@ -234,10 +231,14 @@ class ColumnMappedTextInstructionDataset(Dataset):
         self.column_mapping = column_mapping
 
         self.answer_only_loss_mask = answer_only_loss_mask
-        self.start_of_turn_token = start_of_turn_token
         self.seq_length = seq_length
         self.padding = padding
         self.truncation = truncation
+        self.use_hf_chat_template = use_hf_chat_template
+
+    def __iter__(self) -> Iterator[Dict[str, List[int]]]:
+        for idx in range(len(self)):
+            yield self[idx]
 
     def __len__(self) -> int:  # noqa: D401
         """
@@ -245,9 +246,6 @@ class ColumnMappedTextInstructionDataset(Dataset):
 
         Returns:
             The length of the dataset.
-
-        Raises:
-            RuntimeError: If streaming is enabled.
         """
         return len(self.dataset)
 
@@ -260,17 +258,20 @@ class ColumnMappedTextInstructionDataset(Dataset):
 
         Returns:
             A dictionary with the mapped columns.
-
-        Raises:
-            RuntimeError: If streaming is enabled.
         """
-        row = self.dataset[idx]
-        mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
-        mapped = self._apply_tokenizer(mapped)
-        if not any(label != -100 for label in mapped["labels"]):
-            return self.__getitem__((idx + 1) % len(self.dataset))
-        assert _check_all_values_equal_length(mapped), "All values must be of the same length"
-        return mapped
+        n = len(self.dataset)
+        for _ in range(n):
+            row = self.dataset[idx]
+            mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
+            mapped = self._apply_tokenizer(mapped)
+            if any(label != -100 for label in mapped["labels"]):
+                assert _check_all_values_equal_length(mapped), "All values must be of the same length"
+                return mapped
+            idx = (idx + 1) % n
+        raise ValueError(
+            "All samples in the dataset produced labels that are entirely -100. "
+            "Check that the dataset and tokenizer configuration produce valid training targets."
+        )
 
     def _apply_tokenizer(self, sample: Dict[str, str]) -> Dict[str, List[int]]:
         """
@@ -295,7 +296,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
         pad_token_id = _add_pad_token(self.tokenizer) or eos_token_id
 
-        if _has_chat_template(self.tokenizer):
+        if self.use_hf_chat_template and _has_chat_template(self.tokenizer):
             formatted_text = [
                 {"role": "system", "content": context or ""},
                 {"role": "user", "content": question or ""},
@@ -309,6 +310,7 @@ class ColumnMappedTextInstructionDataset(Dataset):
                 seq_length=self.seq_length,
                 padding=self.padding,
                 truncation=self.truncation,
+                answer_only_loss_mask=self.answer_only_loss_mask,
             )
         else:
             prompt = " ".join(filter(lambda x: x is not None, (context, question, "")))

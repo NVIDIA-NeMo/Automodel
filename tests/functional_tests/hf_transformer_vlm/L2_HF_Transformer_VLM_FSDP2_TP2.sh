@@ -15,7 +15,7 @@
 #!/bin/bash
 set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
 examples/vlm_finetune/finetune.py \
   --config examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml \
   --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_gemma3_2l_large/ \
@@ -27,7 +27,6 @@ examples/vlm_finetune/finetune.py \
   --dataset.limit_dataset_samples 10 \
   --validation_dataset.path_or_dataset $HF_CACHE/mini_cord_v2/ \
   --validation_dataset.limit_dataset_samples 10 \
-  --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
   --distributed.dp_size none \
   --distributed.tp_size 2 \
   --distributed.cp_size 1 \

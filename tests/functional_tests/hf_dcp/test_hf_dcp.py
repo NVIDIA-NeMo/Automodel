@@ -12,7 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import shutil
+
+import pytest
+
 from tests.utils.test_utils import run_test_script
+
+try:
+    import qwen_vl_utils  # noqa: F401
+
+    _has_qwen_vl_utils = True
+except ImportError:
+    _has_qwen_vl_utils = False
+
+skip_if_no_qwen_vl_utils = pytest.mark.skipif(
+    not _has_qwen_vl_utils,
+    reason="qwen_vl_utils is not installed (pip install qwen-vl-utils)",
+)
 
 TEST_FOLDER = "hf_dcp"
 DCP_FSDP2_CHECKPOINT_FILENAME = "L2_DCP_FSDP2_Checkpoint.sh"
@@ -20,7 +36,13 @@ DCP_VLM_FSDP2_CHECKPOINT_FILENAME = "L2_DCP_VLM_FSDP2_Checkpoint.sh"
 HF_DCP_FSDP2_CHECKPOINT_FILENAME = "L2_HF_DCP_FSDP2_Checkpoint.sh"
 HF_DCP_VLM_FSDP2_CHECKPOINT_FILENAME = "L2_HF_DCP_VLM_FSDP2_Checkpoint.sh"
 HF_DCP_PP2_CHECKPOINT_FILENAME = "L2_DCP_PP2_Checkpoint.sh"
-import shutil
+# hf_consolidated_fsdp
+HF_CONSOLIDATED_FSDP2_LLM_FILENAME = "L2_HF_Consolidated_FSDP2_LLM_Checkpoint.sh"
+HF_CONSOLIDATED_FSDP2_VLM_FILENAME = "L2_HF_Consolidated_FSDP2_VLM_Checkpoint.sh"
+HF_CONSOLIDATED_FSDP2_LLM_SCALAR_WEIGHT_FILENAME = "L2_HF_Consolidated_FSDP2_LLM_Checkpoint_Scalar_Param.sh"
+HF_CONSOLIDATED_PP2_LLM_FILENAME = "L2_HF_Consolidated_PP2_LLM_Checkpoint.sh"
+HF_CONSOLIDATED_GPTOSS_MXFP4_FILENAME = "L2_HF_Consolidated_GPTOSS_MXFP4_Checkpoint.sh"
+FLASHOPTIM_DCP_ROUNDTRIP_FILENAME = "L2_FlashOptim_DCP_Roundtrip.sh"
 
 
 class TestHFDCP:
@@ -31,6 +53,7 @@ class TestHFDCP:
             # remove the checkpoint directory
             shutil.rmtree("checkpoints/", ignore_errors=True)
 
+    @skip_if_no_qwen_vl_utils
     def test_dcp_vlm_fsdp2_checkpoint(self):
         try:
             run_test_script(TEST_FOLDER, DCP_VLM_FSDP2_CHECKPOINT_FILENAME)
@@ -45,6 +68,7 @@ class TestHFDCP:
             # remove the checkpoint directory
             shutil.rmtree("checkpoints/", ignore_errors=True)
 
+    @skip_if_no_qwen_vl_utils
     def test_hf_dcp_vlm_fsdp2_checkpoint(self):
         try:
             run_test_script(TEST_FOLDER, HF_DCP_VLM_FSDP2_CHECKPOINT_FILENAME)
@@ -57,4 +81,45 @@ class TestHFDCP:
             run_test_script(TEST_FOLDER, HF_DCP_PP2_CHECKPOINT_FILENAME)
         finally:
             # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_hf_consolidated_fsdp2_llm_checkpoint(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_CONSOLIDATED_FSDP2_LLM_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    @skip_if_no_qwen_vl_utils
+    def test_hf_consolidated_fsdp2_vlm_checkpoint(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_CONSOLIDATED_FSDP2_VLM_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_hf_consolidated_fsdp2_llm_checkpoint_scalar_weight(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_CONSOLIDATED_FSDP2_LLM_SCALAR_WEIGHT_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_hf_consolidated_pp2_llm_checkpoint(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_CONSOLIDATED_PP2_LLM_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_hf_consolidated_gptoss_mxfp4_checkpoint(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_CONSOLIDATED_GPTOSS_MXFP4_FILENAME)
+        finally:
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_flashoptim_dcp_roundtrip(self):
+        try:
+            run_test_script(TEST_FOLDER, FLASHOPTIM_DCP_ROUNDTRIP_FILENAME)
+        finally:
             shutil.rmtree("checkpoints/", ignore_errors=True)

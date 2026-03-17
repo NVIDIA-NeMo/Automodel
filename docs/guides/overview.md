@@ -1,8 +1,8 @@
-## Recipes and E2E Examples
+## Recipes and End-to-End Examples
 
 NeMo Automodel is organized around two key concepts: recipes and components.
 
-Recipes are executable scripts configured via YAML files. Each recipe defines its own training and validation loop, orchestrated through a `step_scheduler`. It specifies the model, dataset, loss function, optimizer and scheduler, checkpointing, and distributed training settings—allowing end-to-end training with a single command.
+Recipes are executable scripts configured with YAML files. Each recipe defines its own training and validation loop, orchestrated through a `step_scheduler`. It specifies the model, dataset, loss function, optimizer, scheduler, checkpointing, and distributed training settings—allowing end-to-end training with a single command.
 
 Components are modular, plug-and-play building blocks referenced using the `_target_` field. These include models, datasets, loss functions, and distribution managers. Recipes assemble these components, making it easy to swap them out to change precision, distribution strategy, dataset, or task—without modifying the training loop itself.
 
@@ -14,7 +14,7 @@ This page maps the ready-to-run recipes found in the `examples/` directory to th
 ## Large Language Models (LLM)
 This section provides practical recipes and configurations for working with large language models across three core workflows: fine-tuning, pretraining, and knowledge distillation.
 
-### Fine-tuning
+### Fine-Tuning
 
 End-to-end fine-tuning recipes for many open models. Each subfolder contains YAML configurations showing task setups (e.g., SQuAD, HellaSwag), precision options (e.g., FP8), and parameter-efficient methods (e.g., LoRA/QLoRA).
 
@@ -30,7 +30,7 @@ Starter configurations and scripts for pretraining with datasets from different 
 - Example models: GPT-2 baseline, NanoGPT, DeepSeek-V3, Moonlight 16B TE (Slurm)
 - How-to guides:
   - [LLM pretraining](llm/pretraining.md)
-  - [Pretraining with Megatron-Core datasets](llm/mcore-pretraining.md)
+  - [Pretraining with NanoGPT](llm/nanogpt-pretraining.md)
 
 ### Knowledge Distillation (KD)
 
@@ -49,11 +49,11 @@ Curated configurations for benchmarking different training stacks and settings (
 
 
 ## Vision Language Models (VLM)
-This section provides practical recipes and configurations for working with vision-language models, covering fine-tuning and generation workflows for multimodal tasks.
+This section provides practical recipes and configurations for working with vision language models, covering fine-tuning and generation workflows for multimodal tasks.
 
-### Fine-tuning
+### Fine-Tuning
 
-Vision-language model fine-tuning recipes.
+Fine-tuning recipes for VLMs.
 
 - Folder: [examples/vlm_finetune](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/vlm_finetune)
 - Representative family: Gemma 3 (various configurations)

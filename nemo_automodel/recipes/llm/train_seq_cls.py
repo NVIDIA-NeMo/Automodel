@@ -16,23 +16,29 @@ from __future__ import annotations
 
 import logging
 import pathlib
+import time
 
 import torch
 import wandb
 
+from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.components.training.utils import clip_grad_norm
+from nemo_automodel.components.utils.flops_utils import calculate_mfu
+from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import (
     build_checkpoint_config,
     build_dataloader,
     build_distributed,
     build_lr_scheduler,
-    build_model_and_optimizer,
+    build_model,
+    build_optimizer,
     build_step_scheduler,
 )
 
@@ -52,13 +58,12 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         apply_cache_compatibility_patches()
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
-        self.model_wrapper = None
-        self.device_mesh = None
-        self.moe_mesh = None
-        if "distributed" in self.cfg:
-            self.model_wrapper = self.cfg.distributed.instantiate(world_size=self.dist_env.world_size)
-            self.device_mesh = getattr(self.model_wrapper, "device_mesh", None)
-            self.moe_mesh = getattr(self.model_wrapper, "moe_mesh", None)
+        self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+        self.distributed_config = self.dist_setup.strategy_config
+        self.device_mesh = self.dist_setup.device_mesh
+        self.moe_mesh = self.dist_setup.moe_mesh
+        self.pp_enabled = self.dist_setup.pp_enabled
+        self.pipeline_config = self.dist_setup.pipeline_config
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -86,6 +91,12 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
+        if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
+            self.max_grad_norm = float(self.cfg.clip_grad_norm.max_norm)
+        else:
+            logging.info("No clip_grad_norm.max_norm specified in config, using default value of 1.0")
+            self.max_grad_norm = 1.0
+
         self.checkpointer = Checkpointer(
             config=checkpoint_config,
             dp_rank=self._get_dp_rank(include_cp=True),
@@ -95,29 +106,22 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         self.peft_config = self.cfg.instantiate_path("peft")
-        model, model_state_dict_keys, self.optimizer, _ = build_model_and_optimizer(
-            device=self.dist_env.device,
+        model = build_model(
             cfg_model=self.cfg.model,
-            cfg_opt=self.cfg.optimizer,
             cfg_peft=self.peft_config,
-            has_packed_sequence=use_hf_fa2,
-            model_wrapper=self.model_wrapper,
             seed=self.cfg.get("seed", 42),
-            tp_size=self.cfg.get("distributed.tp_size", 1),
-            cp_size=self.cfg.get("distributed.cp_size", 1),
-            cfg_fp8=None,
+            has_packed_sequence=use_hf_fa2,
             cfg_compile=self.cfg.get("compile", None),
             cfg_quantization=self.cfg.get("quantization", None),
-            autopipeline=None,
-            loss_fn=self.loss_fn,
-            parallelize_fn=None,
-            load_base_model=self.cfg.get("checkpoint.load_base_model", True),
-            checkpointer=self.checkpointer,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            distributed_config=self.distributed_config,
+            unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )
-
-        self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
+        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 
         self.model_parts = [model]
+        self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
 
         self.dataloader, self.tokenizer = build_dataloader(
             self.cfg.dataset,
@@ -152,12 +156,14 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 pp_enabled=False,
             )
 
+        self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         self.step_scheduler = build_step_scheduler(
             self.cfg.get("step_scheduler", None),
             self.dataloader,
             self._get_dp_group_size(),
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
         )
+        self._setup_garbage_collection(self.step_scheduler)
 
         self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
 
@@ -176,6 +182,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
     def run_train_validation_loop(self):
         for mp in self.model_parts:
             mp.train()
+        self.timestamp = time.perf_counter()
 
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
@@ -183,14 +190,23 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 train_log_data = self._run_train_optim_step(batches)
                 self.log_train_metrics(train_log_data)
 
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(epoch, self.step_scheduler.step)
-
+                val_loss = {}
                 if self.step_scheduler.is_val_step and self.val_dataloader is not None:
                     val_log_data = self._validate_one_epoch(self.val_dataloader)
+                    val_loss["val_loss"] = val_log_data.metrics["val_loss"]
                     self.log_val_metrics(val_log_data)
                     for mp in self.model_parts:
                         mp.train()
+
+                if self.step_scheduler.is_ckpt_step:
+                    self.save_checkpoint(
+                        epoch,
+                        self.step_scheduler.step,
+                        train_log_data.metrics["loss"],
+                        val_loss,
+                        best_metric_key=self.best_metric_key,
+                    )
+                self._maybe_collect_garbage()
 
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
@@ -199,6 +215,16 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
     def _run_train_optim_step(self, batches):
         model = self.model_parts[0]
         losses = []
+        all_preds = []
+        all_labels = []
+
+        # Count input tokens for throughput calculation (excluding padding)
+        num_tokens_in_batch = torch.tensor(
+            sum(batch["attention_mask"].sum().item() for batch in batches),
+            dtype=torch.long,
+        )
+        num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
+
         for batch in batches:
             batch = {
                 k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()
@@ -208,28 +234,88 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             logits = getattr(out, "logits", out)
             loss = self.loss_fn(logits, labels.view(-1))
             losses.append(loss.detach().clone())
+
+            # Collect predictions for accuracy calculation
+            preds = torch.argmax(logits, dim=-1)
+            all_preds.append(preds.detach())
+            all_labels.append(labels.view(-1).detach())
             (loss * self._get_dp_group_size(include_cp=True)).backward()
-            for opt in self.optimizer:
-                opt.step()
-                opt.zero_grad()
-            if self.lr_scheduler is not None:
-                for scheduler in self.lr_scheduler:
-                    scheduler.step(1)
+
+        # Calculate gradient norm (distributed-aware)
+        grad_norm = clip_grad_norm(
+            max_grad_norm=self.max_grad_norm,
+            model_parts=self.model_parts,
+            norm_type=2.0,
+            pp_enabled=self._get_pp_rank() != 0 if hasattr(self, "_get_pp_rank") else False,
+            device_mesh=self.device_mesh,
+        )
+
+        # Calculate accuracy
+        all_preds = torch.cat(all_preds)
+        all_labels = torch.cat(all_labels)
+        correct = (all_preds == all_labels).sum()
+        total = all_labels.numel()
+        accuracy = correct.float() / total
+
+        # Sync accuracy across distributed ranks if needed
+        if self._get_dp_group_size(include_cp=True) > 1:
+            correct = self._dp_allreduce(correct.float(), include_cp=True)
+            total_across_ranks = self._dp_allreduce(
+                torch.tensor(total, device=correct.device, dtype=torch.float), include_cp=True
+            )
+            accuracy = correct / total_across_ranks
+
+        for opt in self.optimizer:
+            opt.step()
+            opt.zero_grad()
+        if self.lr_scheduler is not None:
+            for scheduler in self.lr_scheduler:
+                scheduler.step(1)
+
+        # Calculate throughput (tokens per second)
+        t = time.perf_counter()
+        time_delta = t - self.timestamp
+        self.timestamp = t
+        tps = num_tokens_in_batch / time_delta
+
+        mfu = None
+        mfu_calculator = getattr(self, "mfu_calculator", None)
+        if batches and mfu_calculator is not None:
+            step_flops = 0.0
+            flops_supported = True
+            for batch in batches:
+                input_ids = batch.get("input_ids")
+                if input_ids is None:
+                    flops_supported = False
+                    break
+                batch_flops = mfu_calculator.get_flops(input_ids)
+                if batch_flops is None:
+                    flops_supported = False
+                    break
+                step_flops += float(batch_flops)
+
+            if flops_supported:
+                step_flops = self._dp_allreduce(
+                    torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device), include_cp=True
+                ).item()
+                mfu = calculate_mfu(step_flops / 1e12, self.dist_env.world_size, time_delta)
 
         total_loss = torch.sum(torch.stack(losses))
         total_loss = self._dp_allreduce(total_loss, include_cp=True).detach()
         loss = total_loss / len(batches)
+
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
             metrics={
                 "loss": loss,
+                "accuracy": accuracy.item() if isinstance(accuracy, torch.Tensor) else accuracy,
+                "grad_norm": grad_norm,
                 "lr": self.optimizer[0].param_groups[0]["lr"],
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,
-                "tps": 0.0,
-                "tps_per_gpu": 0.0,
-                "num_tokens_per_step": 0,
-                "num_label_tokens": 0,
+                "tps": tps,
+                "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
+                "mfu": mfu,
             },
         )
 
@@ -238,7 +324,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         model = self.model_parts[0]
         model.eval()
         total_loss = 0.0
+        all_preds = []
+        all_labels = []
         count = 0
+
         for batch in dataloader:
             batch = {
                 k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()
@@ -248,15 +337,40 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             logits = getattr(out, "logits", out)
             loss = self.loss_fn(logits, labels.view(-1))
             total_loss += loss.detach()
+
+            # Collect predictions for accuracy
+            preds = torch.argmax(logits, dim=-1)
+            all_preds.append(preds)
+            all_labels.append(labels.view(-1))
             count += 1
+
         total_loss = total_loss if count == 0 else total_loss / count
+
+        # Calculate accuracy
+        if len(all_preds) > 0:
+            all_preds = torch.cat(all_preds)
+            all_labels = torch.cat(all_labels)
+            correct = (all_preds == all_labels).sum()
+            total = all_labels.numel()
+            accuracy = correct.float() / total
+
+            # Sync across distributed ranks if needed
+            if self._get_dp_group_size(include_cp=True) > 1:
+                correct = self._dp_allreduce(correct.float(), include_cp=True)
+                total_across_ranks = self._dp_allreduce(
+                    torch.tensor(total, device=correct.device, dtype=torch.float), include_cp=True
+                )
+                accuracy = correct / total_across_ranks
+        else:
+            accuracy = 0.0
+
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
             metrics={
                 "val_loss": total_loss,
+                "val_accuracy": accuracy.item() if isinstance(accuracy, torch.Tensor) else accuracy,
                 "lr": self.optimizer[0].param_groups[0]["lr"],
-                "num_label_tokens": 0,
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,
             },
         )
@@ -285,12 +399,12 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         self.metric_logger_valid.log(log_data)
 
         logging.info(
-            "[val] step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
+            "[val] step {} | epoch {} | loss {:.4f} | accuracy {:.4f} | lr {:.2e}".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["val_loss"],
+                log_data.metrics["val_accuracy"],
                 log_data.metrics["lr"],
-                log_data.metrics["num_label_tokens"],
             )
         )
 
@@ -303,33 +417,34 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 epoch: int, the current epoch.
                 metrics: Dict[str, float], containing:
                     "loss": Training loss.
-                    "grad_norm": Grad norm from the training step.
+                    "accuracy": Training accuracy.
+                    "grad_norm": Gradient norm from the training step.
                     "lr": Learning rate.
                     "mem": Memory allocated.
-                    "tps": Tokens per second.
+                    "tps": Tokens per second (throughput).
                     "tps_per_gpu": Tokens per second per GPU.
-                    "num_label_tokens": Number of label tokens.
         """
         if not self.dist_env.is_main:
             return
 
-        if wandb.run is not None:
-            wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+        # Log to remote services (WandB) according to step_scheduler frequency
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
+                wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
 
-        # JSONL training log
+        # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
+            "step {} | epoch {} | loss {:.4f} | accuracy {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu)".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
-                0,
-                # log_data.metrics["grad_norm"],
+                log_data.metrics["accuracy"],
+                log_data.metrics["grad_norm"],
                 log_data.metrics["lr"],
                 log_data.metrics["mem"],
                 log_data.metrics["tps"],
                 log_data.metrics["tps_per_gpu"],
-                log_data.metrics["num_label_tokens"],
             )
         )
         torch.cuda.reset_peak_memory_stats()

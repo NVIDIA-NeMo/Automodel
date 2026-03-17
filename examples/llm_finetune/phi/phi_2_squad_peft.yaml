@@ -37,22 +37,23 @@ model:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  target_modules: '*_proj'
   dim: 8
   alpha: 32
   use_triton: True
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors # torch_save or safetensors
-  save_consolidated: false 
+  save_consolidated: true
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   dp_size: none
   tp_size: 1
   cp_size: 1
+
   sequence_parallel: false
 
 
@@ -82,7 +83,7 @@ validation_dataset:
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  
+
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]

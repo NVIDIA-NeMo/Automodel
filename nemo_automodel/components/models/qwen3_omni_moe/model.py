@@ -16,7 +16,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers.masking_utils import create_causal_mask
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeTextConfig,
     Qwen3OmniMoeThinkerConfig,
@@ -28,11 +27,13 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerTextRotaryEmbedding,
 )
 
+from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_moe.model import Block
 from nemo_automodel.components.models.qwen3_omni_moe.state_dict_adapter import Qwen3OmniMoeStateDictAdapter
+from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -116,20 +117,9 @@ class Qwen3OmniMoeThinkerTextModel(
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
-            text_position_ids = position_ids[0]
             position_ids = position_ids[1:]
-        else:
-            text_position_ids = position_ids[0]
 
         padding_mask = attention_mask.bool().logical_not()
-        attention_mask = create_causal_mask(
-            config=self.config,
-            input_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device),
-            past_key_values=None,
-            position_ids=text_position_ids,
-        )
 
         hidden_states = inputs_embeds
 
@@ -185,7 +175,9 @@ class Qwen3OmniMoeThinkerTextModel(
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class Qwen3OmniMoeThinkerForConditionalGeneration(HFQwen3OmniMoeThinkerForConditionalGeneration, MoEFSDPSyncMixin):
+class Qwen3OmniMoeThinkerForConditionalGeneration(
+    HFCheckpointingMixin, HFQwen3OmniMoeThinkerForConditionalGeneration, MoEFSDPSyncMixin
+):
     """Qwen3OmniMoe Thinker for Conditional Generation with multimodal support."""
 
     @classmethod
@@ -251,6 +243,12 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(HFQwen3OmniMoeThinkerForCondit
 
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
 
     def forward(
         self,
@@ -323,7 +321,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(HFQwen3OmniMoeThinkerForCondit
 
         # Images
         if pixel_values is not None:
-            image_embeds, image_embeds_multiscale = self.get_image_features(pixel_values, image_grid_thw)
+            image_features = self.get_image_features(pixel_values, image_grid_thw)
+            image_embeds = image_features.pooler_output
+            image_embeds_multiscale = image_features.deepstack_features
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
@@ -334,7 +334,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(HFQwen3OmniMoeThinkerForCondit
 
         # Videos
         if pixel_values_videos is not None:
-            video_embeds, video_embeds_multiscale = self.get_video_features(pixel_values_videos, video_grid_thw)
+            video_features = self.get_video_features(pixel_values_videos, video_grid_thw)
+            video_embeds = video_features.pooler_output
+            video_embeds_multiscale = video_features.deepstack_features
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             _, video_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
@@ -438,7 +440,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(HFQwen3OmniMoeThinkerForCondit
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
         with buffer_device:
             # Ensure rotary embedding uses correct device after dtype move
             self.model.rotary_emb.device = buffer_device

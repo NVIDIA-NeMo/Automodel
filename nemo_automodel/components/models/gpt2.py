@@ -164,7 +164,10 @@ class GPT2LMHeadModel(nn.Module):
         # Initialize parameters following GPT-2 scheme
         self._init_weights()
 
-    def forward(self, input_ids: torch.LongTensor) -> torch.Tensor:  # (B, T) → (B, T, V)
+    def initialize_weights(self):
+        self._init_weights()
+
+    def forward(self, input_ids: torch.LongTensor, **kwargs) -> torch.Tensor:  # (B, T) → (B, T, V)
         batch_size, seq_len = input_ids.shape
 
         if seq_len > self.wpe.num_embeddings:

@@ -13,12 +13,15 @@
 # limitations under the License.
 
 import json
+import runpy
+import sys
 from typing import Any, Dict
 
 import pytest
 from datasets import Dataset
 
 import nemo_automodel.components.datasets.llm.retrieval_dataset as rd
+import nemo_automodel.components.datasets.llm.retrieval_dataset_inline as rdi
 
 
 class DummyImage:
@@ -31,8 +34,18 @@ class DummyImage:
 
 
 class DummyCorpus(rd.AbstractDataset):
-    def __init__(self, id_to_doc: Dict[str, Dict[str, Any]]):
+    def __init__(self, id_to_doc: Dict[str, Dict[str, Any]], query_instruction: str = "", passage_instruction: str = ""):
         self._id_to_doc = id_to_doc
+        self._query_instruction = query_instruction
+        self._passage_instruction = passage_instruction
+
+    @property
+    def query_instruction(self):
+        return self._query_instruction
+
+    @property
+    def passage_instruction(self):
+        return self._passage_instruction
 
     def get_document_by_id(self, id):
         return self._id_to_doc[str(id)]
@@ -103,6 +116,38 @@ def test_add_corpus_duplicate_rules(tmp_path, monkeypatch):
         rd.add_corpus({"path": str(path2)}, corpus_dict)
 
 
+def test_load_datasets_resolves_relative_corpus_path(tmp_path, monkeypatch):
+    """Relative corpus paths should be resolved relative to the JSON file's directory."""
+    corpus_dir = tmp_path / "my_corpus"
+    corpus_dir.mkdir()
+    (corpus_dir / "merlin_metadata.json").write_text(json.dumps({"class": "TextQADataset", "corpus_id": "corpusA"}))
+
+    monkeypatch.setattr(
+        rd,
+        "load_dataset",
+        _mock_hf_load_dataset_returning([{"id": "p1", "text": "pos"}, {"id": "n1", "text": "neg"}]),
+    )
+
+    train_data = {
+        "corpus": [{"path": "my_corpus"}],
+        "data": [
+            {
+                "question_id": "q1",
+                "question": "Q?",
+                "corpus_id": "corpusA",
+                "pos_doc": [{"id": "p1"}],
+                "neg_doc": [{"id": "n1"}],
+            }
+        ],
+    }
+    train_file = tmp_path / "train.json"
+    train_file.write_text(json.dumps(train_data))
+
+    dataset, corpus_dict = rd.load_datasets(str(train_file))
+    assert len(dataset) == 1
+    assert corpus_dict["corpusA"].path == str(corpus_dir)
+
+
 def test_load_datasets_normalizes_and_errors(tmp_path, monkeypatch):
     corpus_dir = tmp_path / "corpusA"
     corpus_dir.mkdir()
@@ -157,7 +202,7 @@ def test_load_datasets_normalizes_and_errors(tmp_path, monkeypatch):
         rd.load_datasets(str(f_bad))
 
 
-def test_transform_func_single_batched_and_limits():
+def test_transform_func_single_batched():
     corpus_dict = {
         "corpusA": DummyCorpus(
             {
@@ -189,10 +234,6 @@ def test_transform_func_single_batched_and_limits():
     out_single = rd._transform_func(examples_single, num_neg_docs=1, corpus_dict=corpus_dict)
     assert out_single["question"] == "Q"
     assert out_single["doc_text"] == ["pos", "neg1"]
-
-    # Limit error
-    with pytest.raises(Exception):
-        rd._transform_func(examples_batched, num_neg_docs=3, corpus_dict=corpus_dict)
 
 
 def test_transform_func_image_conversion():
@@ -255,14 +296,14 @@ def test_make_retrieval_dataset_train_and_eval(tmp_path, monkeypatch):
     ds_eval = rd.make_retrieval_dataset(data_dir_list=str(train_file), data_type="eval", eval_negative_size=2)
     ex_e = ds_eval[0]
     assert len(ex_e["doc_text"]) == 3
- 
- 
+
+
 def test_abstract_dataset_methods_cover_pass():
      # Directly call abstract methods as unbound functions to execute 'pass' lines
      assert rd.AbstractDataset.get_document_by_id(None, None) is None
      assert rd.AbstractDataset.get_all_ids(None) is None
- 
- 
+
+
 def test_textqa_get_all_ids(tmp_path, monkeypatch):
      corpus_dir = tmp_path / "corpusB"
      corpus_dir.mkdir()
@@ -279,27 +320,27 @@ def test_textqa_get_all_ids(tmp_path, monkeypatch):
      )
      _, corpus = rd.load_corpus(str(corpus_dir))
      assert corpus.get_all_ids() == ["1", "2"]
- 
- 
+
+
 def test_load_corpus_metadata_missing_file(tmp_path):
      empty_dir = tmp_path / "empty_corpus"
      empty_dir.mkdir()
      with pytest.raises(ValueError) as e:
          rd.load_corpus_metadata(str(empty_dir))
      assert "merlin_metadata.json" in str(e.value)
- 
- 
+
+
 def test_load_corpus_invalid_class():
      with pytest.raises(ValueError) as e:
          rd.load_corpus("/unused", metadata={"class": "UnknownDataset", "corpus_id": "x"})
      assert "DatasetClass is not implemented" in str(e.value)
- 
- 
+
+
 def test_add_corpus_requires_dict(tmp_path):
      with pytest.raises(ValueError):
          rd.add_corpus({"path": str(tmp_path)}, None)
- 
- 
+
+
 def test_load_datasets_type_coercion_and_concatenate_false(tmp_path, monkeypatch):
      corpus_dir = tmp_path / "corpusC"
      corpus_dir.mkdir()
@@ -335,8 +376,8 @@ def test_load_datasets_type_coercion_and_concatenate_false(tmp_path, monkeypatch
      assert row["pos_doc"][0]["id"] == "101"
      assert [d["id"] for d in row["neg_doc"]] == ["202", "x"]
      assert "C" in corpus_dict
- 
- 
+
+
 def test_transform_func_positive_else_and_text_empty_branch():
      # Covers line 198 (positives not list) and 228 (text empty and no image)
      corpus = DummyCorpus({"p": {"text": "", "image": "", "nr_ocr": ""}, "n": {"text": "n", "image": "", "nr_ocr": ""}})
@@ -346,8 +387,8 @@ def test_transform_func_positive_else_and_text_empty_branch():
      out = rd._transform_func(examples_single, num_neg_docs=1, corpus_dict=corpus_dict)
      # Positive text becomes "" (line 228), negative is "n"
      assert out["doc_text"] == ["", "n"]
- 
- 
+
+
 def test_make_retrieval_dataset_shuffle_branch(tmp_path, monkeypatch):
     corpus_dir = tmp_path / "corpusD"
     corpus_dir.mkdir()
@@ -369,8 +410,8 @@ def test_make_retrieval_dataset_shuffle_branch(tmp_path, monkeypatch):
     )
     ex0 = ds[0]
     assert len(ex0["doc_text"]) == 2
- 
- 
+
+
 def test_make_retrieval_dataset_invalid_type(tmp_path, monkeypatch):
     corpus_dir = tmp_path / "corpusE"
     corpus_dir.mkdir()
@@ -385,3 +426,706 @@ def test_make_retrieval_dataset_invalid_type(tmp_path, monkeypatch):
         rd.make_retrieval_dataset(str(train_file), data_type="invalid")
 
 
+def test_use_dataset_instruction_from_metadata(tmp_path, monkeypatch):
+    """Test that use_dataset_instruction correctly loads and applies instructions from metadata."""
+    corpus_dir = tmp_path / "squad_corpus"
+    corpus_dir.mkdir()
+
+    # Create metadata with query and passage instructions as in merlin_metadata.json
+    metadata = {
+        "corpus_id": "squad",
+        "class": "TextQADataset",
+        "query_instruction": "Instruct: Given a question, retrieve Wikipedia passages that answer the question\nQuery:",
+        "passage_instruction": "",
+        "task_type": "Retrieval",
+    }
+    (corpus_dir / "merlin_metadata.json").write_text(json.dumps(metadata))
+
+    # Mock HF dataset
+    monkeypatch.setattr(
+        rd,
+        "load_dataset",
+        _mock_hf_load_dataset_returning(
+            [
+                {"id": "doc1", "text": "Paris is the capital of France"},
+                {"id": "doc2", "text": "London is the capital of England"},
+            ]
+        ),
+    )
+
+    # Use add_corpus to properly create CorpusInfo object
+    corpus_dict = {}
+    rd.add_corpus({"path": str(corpus_dir)}, corpus_dict)
+
+    # Verify metadata properties are accessible through CorpusInfo
+    assert "squad" in corpus_dict
+    corpus_info = corpus_dict["squad"]
+    assert corpus_info.corpus_id == "squad"
+    assert corpus_info.query_instruction == metadata["query_instruction"]
+    assert corpus_info.passage_instruction == metadata["passage_instruction"]
+    assert corpus_info.task_type == metadata["task_type"]
+
+
+def test_transform_func_with_use_dataset_instruction():
+    """Test that _transform_func includes query and passage instructions when use_dataset_instruction=True."""
+
+    query_instruction = "Instruct: Given a question, retrieve Wikipedia passages that answer the question\nQuery:"
+    passage_instruction = ""
+
+    corpus_dict = {
+        "squad": DummyCorpus(
+            {
+                "p1": {"text": "positive doc", "image": "", "nr_ocr": ""},
+                "n1": {"text": "negative doc", "image": "", "nr_ocr": ""},
+            },
+            query_instruction=query_instruction,
+            passage_instruction=passage_instruction,
+        )
+    }
+
+    # Test with use_dataset_instruction=True
+    examples_with_instruction = {
+        "question": ["What is the capital?"],
+        "corpus_id": ["squad"],
+        "pos_doc": [[{"id": "p1"}]],
+        "neg_doc": [[{"id": "n1"}]],
+    }
+
+    out_with_instruction = rd._transform_func(
+        examples_with_instruction,
+        num_neg_docs=1,
+        corpus_dict=corpus_dict,
+        use_dataset_instruction=True,
+    )
+
+    # Verify that query_instruction and passage_instruction fields are populated
+    assert "query_instruction" in out_with_instruction
+    assert "passage_instruction" in out_with_instruction
+    assert out_with_instruction["query_instruction"][0] == query_instruction
+    assert out_with_instruction["passage_instruction"][0] == passage_instruction
+
+    # Test with use_dataset_instruction=False
+    out_without_instruction = rd._transform_func(
+        examples_with_instruction,
+        num_neg_docs=1,
+        corpus_dict=corpus_dict,
+        use_dataset_instruction=False,
+    )
+
+    # Verify that instruction fields are empty strings when disabled
+    assert out_without_instruction["query_instruction"][0] == ""
+    assert out_without_instruction["passage_instruction"][0] == ""
+
+    # Both should have same question and doc_text content
+    assert out_with_instruction["question"] == out_without_instruction["question"]
+    assert out_with_instruction["doc_text"] == out_without_instruction["doc_text"]
+
+
+def test_load_datasets_inline_jsonl(tmp_path):
+    """Inline retrieval format: query + inline pos/neg doc texts (JSONL)."""
+    f = tmp_path / "inline.jsonl"
+    records = [
+        {
+            "query": "Explain transformers",
+            "pos_doc": "Transformers are a type of neural network...",
+            "neg_doc": ["RNNs are...", "CNNs are..."],
+            "extra_field": 123,  # should be ignored
+        },
+        {
+            # Support "question" as alias for "query", plus list/singleton coercions
+            "question": "What is Python?",
+            "pos_doc": ["A programming language."],
+            "neg_doc": "A snake.",
+        },
+    ]
+    f.write_text("\n".join(json.dumps(r) for r in records))
+
+    dataset, corpus_dict = rdi.load_datasets(str(f))
+    assert len(dataset) == 2
+    assert corpus_dict == {}
+
+    row0 = dataset[0]
+    assert row0["question"] == "Explain transformers"
+    assert row0["corpus_id"] == rdi.INLINE_CORPUS_ID
+    assert row0["pos_doc"][0]["id"] == ""
+    assert row0["pos_doc"][0]["text"].startswith("Transformers are")
+    assert [d["text"] for d in row0["neg_doc"]] == ["RNNs are...", "CNNs are..."]
+
+    row1 = dataset[1]
+    assert row1["question"] == "What is Python?"
+    assert [d["text"] for d in row1["pos_doc"]] == ["A programming language."]
+    assert [d["text"] for d in row1["neg_doc"]] == ["A snake."]
+
+
+def test_transform_func_inline_text_docs_no_corpus():
+    """_transform_func should work without a corpus_dict when docs are inline text."""
+    examples = {
+        "question": ["Q"],
+        "corpus_id": [rdi.INLINE_CORPUS_ID],
+        "pos_doc": [[{"id": "", "text": "P", "image": "", "nr_ocr": ""}]],
+        "neg_doc": [
+            [
+                {"id": "", "text": "N1", "image": "", "nr_ocr": ""},
+                {"id": "", "text": "N2", "image": "", "nr_ocr": ""},
+            ]
+        ],
+    }
+
+    out = rdi._transform_func(examples, num_neg_docs=2, corpus_dict={}, use_dataset_instruction=True)
+    assert out["question"] == ["Q"]
+    assert out["doc_text"][0] == ["P", "N1", "N2"]
+    assert len(out["doc_image"][0]) == 3
+    # No corpus metadata -> instructions should be empty even if enabled
+    assert out["query_instruction"][0] == ""
+    assert out["passage_instruction"][0] == ""
+
+
+def test_make_retrieval_dataset_inline_end_to_end(tmp_path):
+    """End-to-end: make_retrieval_dataset should accept inline JSONL input."""
+    f = tmp_path / "inline.jsonl"
+    f.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "query": "Explain transformers",
+                        "pos_doc": "Transformers are a type of neural network...",
+                        "neg_doc": ["RNNs are...", "CNNs are..."],
+                    }
+                )
+            ]
+        )
+    )
+
+    ds = rdi.make_retrieval_dataset(data_dir_list=str(f), data_type="train", train_n_passages=3, do_shuffle=False)
+    ex = ds[0]
+    assert ex["question"] == "Explain transformers"
+    assert ex["doc_text"] == ["Transformers are a type of neural network...", "RNNs are...", "CNNs are..."]
+    assert ex["doc_image"] == ["", "", ""]
+
+
+def test__load_json_or_jsonl_json_and_jsonl_error_paths(tmp_path):
+    # JSON (list)
+    f_json = tmp_path / "data.json"
+    f_json.write_text(json.dumps([{"a": 1}, {"a": 2}]))
+    out = rdi._load_json_or_jsonl(str(f_json))
+    assert isinstance(out, list) and out[0]["a"] == 1
+
+    # JSON (single object)
+    f_json_obj = tmp_path / "obj.json"
+    f_json_obj.write_text(json.dumps({"a": 3}))
+    out_obj = rdi._load_json_or_jsonl(str(f_json_obj))
+    assert isinstance(out_obj, dict) and out_obj["a"] == 3
+
+    # Empty file -> JSONL fallback -> "No records found"
+    f_empty = tmp_path / "empty.jsonl"
+    f_empty.write_text("")
+    with pytest.raises(ValueError, match="No records found in JSONL file"):
+        rdi._load_json_or_jsonl(str(f_empty))
+
+    # Invalid JSONL line -> parse error includes line number
+    f_bad = tmp_path / "bad.jsonl"
+    f_bad.write_text('{"ok": 1}\n{bad json}\n')
+    with pytest.raises(ValueError, match=r"Failed to parse JSONL .*:2"):
+        rdi._load_json_or_jsonl(str(f_bad))
+
+
+def test_inline_normalization_and_resolution_branches():
+    # _normalize_inline_doc: dict missing "text" should raise
+    with pytest.raises(ValueError, match="Inline doc dict must include 'text'"):
+        rdi._normalize_inline_doc({"image": "x"})
+
+    # _resolve_doc_to_example: dict missing "text" should raise
+    with pytest.raises(ValueError, match="Inline doc dict must include 'text'"):
+        rdi._resolve_doc_to_example({"id": "123"})
+
+    # String doc -> treated as inline text
+    ex = rdi._resolve_doc_to_example("hello")
+    assert ex["text"] == "hello"
+
+    # Inline dict doc: id empty -> use inline fields
+    inline = rdi._resolve_doc_to_example(
+        {"id": "", "text": "txt", "image": None, "nr_ocr": 123},
+    )
+    assert inline["text"] == "txt"
+    assert inline["image"] == ""  # None -> ""
+    assert inline["nr_ocr"] == "123"
+
+    # Fallback: non-str doc coerces to string
+    ex3 = rdi._resolve_doc_to_example(123)
+    assert ex3["text"] == "123"
+
+
+def test_load_datasets_inline_dict_container_and_error_cases(tmp_path):
+    # Dict container with "data" key (no corpus)
+    f = tmp_path / "inline.json"
+    f.write_text(
+        json.dumps(
+            {
+                "data": {
+                    "query": "Q",
+                    "pos_doc": "P",
+                    "neg_doc": "N",
+                }
+            }
+        )
+    )
+    ds, corpus_dict = rdi.load_datasets(str(f))
+    assert len(ds) == 1
+    assert corpus_dict == {}
+    row = ds[0]
+    assert row["question"] == "Q"
+    assert [d["text"] for d in row["pos_doc"]] == ["P"]
+    assert [d["text"] for d in row["neg_doc"]] == ["N"]
+
+    # Missing query/question should raise
+    f_missing_query = tmp_path / "missing_query.json"
+    f_missing_query.write_text(json.dumps({"pos_doc": "P", "neg_doc": "N"}))
+    with pytest.raises(ValueError, match="must include 'query' or 'question'"):
+        rdi.load_datasets(str(f_missing_query))
+
+    # pos_doc empty list should raise
+    f_empty_pos = tmp_path / "empty_pos.json"
+    f_empty_pos.write_text(json.dumps({"query": "Q", "pos_doc": [], "neg_doc": ["N"]}))
+    with pytest.raises(ValueError, match="pos_doc cannot be empty"):
+        rdi.load_datasets(str(f_empty_pos))
+
+    # Inline record must be dict
+    f_bad_record = tmp_path / "bad_record.json"
+    f_bad_record.write_text(json.dumps([1, 2, 3]))
+    with pytest.raises(ValueError, match="Inline retrieval record must be a dict"):
+        rdi.load_datasets(str(f_bad_record))
+
+    # Unsupported container type
+    f_bad_container = tmp_path / "bad_container.json"
+    f_bad_container.write_text(json.dumps(123))
+    with pytest.raises(ValueError, match="Unsupported inline retrieval dataset container type"):
+        rdi.load_datasets(str(f_bad_container))
+
+
+def test_load_datasets_corpus_id_format_in_inline_module(tmp_path):
+    """The inline loader should reject corpus-id format (use retrieval_dataset.py instead)."""
+    data = {
+        "corpus": [{"path": str(tmp_path / "corpus")}],
+        "data": [
+            {
+                "question_id": "q1",
+                "question": "Q1",
+                "corpus_id": "corpusA",
+                "pos_doc": [{"id": "p"}],
+                "neg_doc": [{"id": "n1"}],
+            }
+        ],
+    }
+    f = tmp_path / "train.json"
+    f.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match=r"Corpus-id retrieval format.*not supported.*retrieval_dataset_inline"):
+        rdi.load_datasets(str(f))
+
+
+def test_transform_func_inline_error_and_num_neg_docs_zero():
+    # pos_doc empty should raise (batched)
+    with pytest.raises(ValueError, match="pos_doc cannot be empty"):
+        rdi._transform_func(
+            {"question": ["Q"], "corpus_id": [rdi.INLINE_CORPUS_ID], "pos_doc": [[]], "neg_doc": [[{"text": "n"}]]},
+            num_neg_docs=1,
+            corpus_dict={},
+        )
+
+    # neg_doc empty with num_neg_docs>0 should raise
+    with pytest.raises(ValueError, match="neg_doc must contain at least 1 document"):
+        rdi._transform_func(
+            {
+                "question": ["Q"],
+                "corpus_id": [rdi.INLINE_CORPUS_ID],
+                "pos_doc": [[{"text": "p"}]],
+                "neg_doc": [[]],
+            },
+            num_neg_docs=1,
+            corpus_dict={},
+        )
+
+    # num_neg_docs=0 should succeed with only positive
+    out = rdi._transform_func(
+        {
+            "question": ["Q"],
+            "corpus_id": [rdi.INLINE_CORPUS_ID],
+            "pos_doc": [[{"text": "p"}]],
+            "neg_doc": [[]],
+        },
+        num_neg_docs=0,
+        corpus_dict={},
+    )
+    assert out["doc_text"][0] == ["p"]
+
+
+def test_transform_func_inline_with_dataset_instruction_from_corpus():
+    corpus_dict = {
+        "c": DummyCorpus(
+            {"p": {"text": "P", "image": "", "nr_ocr": ""}, "n": {"text": "N", "image": "", "nr_ocr": ""}},
+            query_instruction="QI",
+            passage_instruction="PI",
+        )
+    }
+    examples = {
+        "question": ["Q"],
+        "corpus_id": ["c"],
+        "pos_doc": [[{"id": "", "text": "P", "image": "", "nr_ocr": ""}]],
+        "neg_doc": [[{"id": "", "text": "N", "image": "", "nr_ocr": ""}]],
+    }
+    out = rdi._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, use_dataset_instruction=True)
+    assert out["query_instruction"][0] == "QI"
+    assert out["passage_instruction"][0] == "PI"
+
+
+def test_retrieval_dataset_cli_smoke(tmp_path, monkeypatch, capsys):
+    corpus_dir = tmp_path / "corpusA"
+    corpus_dir.mkdir()
+    (corpus_dir / "merlin_metadata.json").write_text(json.dumps({"class": "TextQADataset", "corpus_id": "corpusA"}))
+
+    train_file = _make_train_file(tmp_path, corpus_dir, data_len=1, corpus_id="corpusA")
+
+    # Patch datasets.load_dataset before running module as __main__ so the import binds the stub.
+    monkeypatch.setattr(
+        "datasets.load_dataset",
+        _mock_hf_load_dataset_returning([{"id": "p", "text": "P"}, {"id": "n1", "text": "N1"}]),
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prog",
+            "--data_dir_list",
+            str(train_file),
+            "--data_type",
+            "train",
+            "--train_n_passages",
+            "2",
+            "--max_train_samples",
+            "1",
+        ],
+    )
+    runpy.run_module("nemo_automodel.components.datasets.llm.retrieval_dataset", run_name="__main__")
+    assert "Dataset loading completed successfully" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# HF dataset loading tests
+# ---------------------------------------------------------------------------
+
+
+def test_parse_hf_uri():
+    repo, subset = rd._parse_hf_uri("hf://nvidia/embed-nemotron-dataset-v1/FEVER")
+    assert repo == "nvidia/embed-nemotron-dataset-v1"
+    assert subset == "FEVER"
+
+    repo2, subset2 = rd._parse_hf_uri("hf://nvidia/embed-nemotron-dataset-v1")
+    assert repo2 == "nvidia/embed-nemotron-dataset-v1"
+    assert subset2 is None
+
+    # Trailing slash is tolerated
+    repo3, subset3 = rd._parse_hf_uri("hf://nvidia/embed-nemotron-dataset-v1/")
+    assert repo3 == "nvidia/embed-nemotron-dataset-v1"
+    assert subset3 is None
+
+    # Not an HF URI
+    with pytest.raises(ValueError, match="Not an HF URI"):
+        rd._parse_hf_uri("s3://bucket/key")
+
+    # Too few parts
+    with pytest.raises(ValueError, match="at least org/repo"):
+        rd._parse_hf_uri("hf://nvidia")
+
+
+def test_hf_corpus_dataset():
+    hf_ds = Dataset.from_list([{"id": "d2", "text": "Doc 2"}, {"id": "d1", "text": "Doc 1"}])
+    corpus = rd.HFCorpusDataset(hf_ds, path="hf://org/repo/sub")
+
+    assert corpus.path == "hf://org/repo/sub"
+    assert corpus.get_all_ids() == ["d1", "d2"]
+
+    doc = corpus.get_document_by_id("d1")
+    assert doc["text"] == "Doc 1"
+    assert doc["image"] == ""
+    assert doc["nr_ocr"] == ""
+
+    doc2 = corpus.get_document_by_id("d2")
+    assert doc2["text"] == "Doc 2"
+
+
+def test_load_hf_subset(tmp_path, monkeypatch):
+    """Mock hf_hub_download and load_dataset to verify _load_hf_subset output."""
+    # Create metadata file (ids_only=false)
+    meta_path = tmp_path / "dataset_metadata.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "corpus_id": "test_corpus",
+                "class": "TextQADataset",
+                "ids_only": False,
+                "query_instruction": "find relevant passages",
+                "passage_instruction": "",
+            }
+        )
+    )
+
+    def fake_hf_hub_download(repo_id, filename, repo_type, **kw):
+        if filename.endswith("dataset_metadata.json"):
+            return str(meta_path)
+        raise FileNotFoundError(filename)
+
+    monkeypatch.setattr(rd, "hf_hub_download", fake_hf_hub_download)
+
+    # Corpus dataset has id + text columns
+    corpus_ds = Dataset.from_list([{"id": "p1", "text": "Positive"}, {"id": "n1", "text": "Negative"}])
+    # Query dataset
+    query_ds = Dataset.from_list(
+        [
+            {
+                "question_id": "q1",
+                "question": "What?",
+                "pos_doc": [{"id": "p1"}],
+                "neg_doc": [{"id": "n1"}],
+            }
+        ]
+    )
+
+    def fake_load_dataset(repo_id, config=None, split=None, **kw):
+        if config is not None and config.endswith("_corpus"):
+            return corpus_ds
+        return query_ds
+
+    monkeypatch.setattr(rd, "load_dataset", fake_load_dataset)
+
+    data_list, corpus_info = rd._load_hf_subset("org/repo", "SubsetA")
+
+    assert len(data_list) == 1
+    assert data_list[0]["question"] == "What?"
+    assert data_list[0]["corpus_id"] == "test_corpus"
+    assert data_list[0]["pos_doc"] == [{"id": "p1"}]
+    assert data_list[0]["neg_doc"] == [{"id": "n1"}]
+
+    assert corpus_info.corpus_id == "test_corpus"
+    assert corpus_info.path == "hf://org/repo/SubsetA"
+    assert corpus_info.query_instruction == "find relevant passages"
+    assert corpus_info.get_document_by_id("p1")["text"] == "Positive"
+
+
+def test_make_retrieval_dataset_hf_uri(tmp_path, monkeypatch):
+    """End-to-end: make_retrieval_dataset with an hf:// URI in data_dir_list."""
+    meta_path = tmp_path / "dataset_metadata.json"
+    meta_path.write_text(
+        json.dumps({"corpus_id": "e2e_corpus", "class": "TextQADataset", "ids_only": False})
+    )
+
+    def fake_hf_hub_download(repo_id, filename, repo_type, **kw):
+        return str(meta_path)
+
+    monkeypatch.setattr(rd, "hf_hub_download", fake_hf_hub_download)
+
+    corpus_ds = Dataset.from_list(
+        [{"id": "p", "text": "P"}, {"id": "n1", "text": "N1"}, {"id": "n2", "text": "N2"}]
+    )
+    query_ds = Dataset.from_list(
+        [
+            {
+                "question_id": "q1",
+                "question": "What?",
+                "pos_doc": [{"id": "p"}],
+                "neg_doc": [{"id": "n1"}, {"id": "n2"}],
+            }
+        ]
+    )
+
+    def fake_load_dataset(repo_id, config=None, split=None, **kw):
+        if config is not None and config.endswith("_corpus"):
+            return corpus_ds
+        return query_ds
+
+    monkeypatch.setattr(rd, "load_dataset", fake_load_dataset)
+
+    ds = rd.make_retrieval_dataset(
+        data_dir_list=["hf://org/repo/SubA"],
+        data_type="train",
+        train_n_passages=3,
+    )
+    assert len(ds) == 1
+    ex = ds[0]
+    assert ex["question"] == "What?"
+    assert len(ex["doc_text"]) == 3  # 1 pos + 2 neg
+    assert ex["doc_text"][0] == "P"
+
+
+def test_transform_func_empty_neg_doc_with_negatives_requested():
+    """Empty neg_doc + num_neg_docs > 0 must raise, not ZeroDivisionError."""
+    corpus_dict = {
+        "c": DummyCorpus({"p": {"text": "pos", "image": "", "nr_ocr": ""}}),
+    }
+    examples = {
+        "question": ["Q"],
+        "corpus_id": ["c"],
+        "pos_doc": [[{"id": "p"}]],
+        "neg_doc": [[]],
+    }
+    with pytest.raises(ValueError, match="neg_doc is empty"):
+        rd._transform_func(examples, num_neg_docs=2, corpus_dict=corpus_dict)
+
+    # num_neg_docs=0 with empty neg_doc should still work fine
+    out = rd._transform_func(examples, num_neg_docs=0, corpus_dict=corpus_dict)
+    assert out["doc_text"][0] == ["pos"]
+
+
+def test_load_hf_subset_rejects_ids_only(tmp_path, monkeypatch):
+    """ids_only subsets should fail fast with a clear message."""
+    meta_path = tmp_path / "dataset_metadata.json"
+    meta_path.write_text(
+        json.dumps({"corpus_id": "c", "class": "TextQADataset", "ids_only": True})
+    )
+    monkeypatch.setattr(rd, "hf_hub_download", lambda **kw: str(meta_path))
+
+    with pytest.raises(ValueError, match="ids_only=true.*not supported for direct HF loading"):
+        rd._load_hf_subset("org/repo", "SciFact")
+
+
+def test_load_hf_subset_synthesizes_question_id(tmp_path, monkeypatch):
+    """Records without question_id get deterministic IDs: {subset}:{row_idx}."""
+    meta_path = tmp_path / "dataset_metadata.json"
+    meta_path.write_text(
+        json.dumps({"corpus_id": "c", "class": "TextQADataset", "ids_only": False})
+    )
+    monkeypatch.setattr(rd, "hf_hub_download", lambda **kw: str(meta_path))
+
+    corpus_ds = Dataset.from_list([{"id": "p", "text": "P"}])
+    query_ds = Dataset.from_list(
+        [{"question": "Q?", "pos_doc": [{"id": "p"}], "neg_doc": [{"id": "p"}]}]
+    )
+
+    def fake_load_dataset(repo_id, config=None, split=None, **kw):
+        return corpus_ds if config is not None and config.endswith("_corpus") else query_ds
+
+    monkeypatch.setattr(rd, "load_dataset", fake_load_dataset)
+
+    data_list, _ = rd._load_hf_subset("org/repo", "MySub")
+    assert data_list[0]["question_id"] == "MySub:0"
+
+
+def test_load_hf_subset_allows_empty_neg_doc(tmp_path, monkeypatch):
+    """Empty neg_doc is allowed at load time (validated later at transform)."""
+    meta_path = tmp_path / "dataset_metadata.json"
+    meta_path.write_text(
+        json.dumps({"corpus_id": "c", "class": "TextQADataset", "ids_only": False})
+    )
+    monkeypatch.setattr(rd, "hf_hub_download", lambda **kw: str(meta_path))
+
+    corpus_ds = Dataset.from_list([{"id": "p", "text": "P"}])
+    query_ds = Dataset.from_list(
+        [{"question": "Q?", "pos_doc": [{"id": "p"}], "neg_doc": []}]
+    )
+
+    def fake_load_dataset(repo_id, config=None, split=None, **kw):
+        return corpus_ds if config is not None and config.endswith("_corpus") else query_ds
+
+    monkeypatch.setattr(rd, "load_dataset", fake_load_dataset)
+
+    data_list, _ = rd._load_hf_subset("org/repo", "Sub")
+    assert data_list[0]["neg_doc"] == []
+
+
+def test_make_retrieval_dataset_backwards_compat(tmp_path, monkeypatch):
+    """data_dir_list still works as before."""
+    corpus_dir = tmp_path / "corpusBC"
+    corpus_dir.mkdir()
+    (corpus_dir / "merlin_metadata.json").write_text(
+        json.dumps({"class": "TextQADataset", "corpus_id": "BC"})
+    )
+
+    monkeypatch.setattr(
+        rd,
+        "load_dataset",
+        _mock_hf_load_dataset_returning(
+            [{"id": "p", "text": "P"}, {"id": "n1", "text": "N1"}]
+        ),
+    )
+
+    train_file = _make_train_file(tmp_path, corpus_dir, data_len=1, corpus_id="BC")
+    ds = rd.make_retrieval_dataset(
+        data_dir_list=str(train_file), data_type="train", train_n_passages=2
+    )
+    assert len(ds) == 1
+    ex = ds[0]
+    assert ex["question"] == "Q0"
+
+
+def test_make_retrieval_dataset_requires_data_dir_list():
+    """Calling without data_dir_list raises ValueError."""
+    with pytest.raises(ValueError, match="data_dir_list is required"):
+        rd.make_retrieval_dataset()
+
+
+def test_make_retrieval_dataset_corpus_id_collision_hf_local(tmp_path, monkeypatch):
+    """HF and local sources with same corpus_id but different paths must raise."""
+    # Setup HF side
+    meta_path = tmp_path / "dataset_metadata.json"
+    meta_path.write_text(
+        json.dumps({"corpus_id": "shared_id", "class": "TextQADataset", "ids_only": False})
+    )
+
+    def fake_hf_hub_download(repo_id, filename, repo_type, **kw):
+        return str(meta_path)
+
+    monkeypatch.setattr(rd, "hf_hub_download", fake_hf_hub_download)
+
+    corpus_ds = Dataset.from_list([{"id": "p", "text": "P"}, {"id": "n", "text": "N"}])
+    query_ds = Dataset.from_list(
+        [{"question_id": "q1", "question": "Q?", "pos_doc": [{"id": "p"}], "neg_doc": [{"id": "n"}]}]
+    )
+
+    # Setup local side with same corpus_id but different path
+    local_corpus_dir = tmp_path / "local_corpus"
+    local_corpus_dir.mkdir()
+    (local_corpus_dir / "merlin_metadata.json").write_text(
+        json.dumps({"class": "TextQADataset", "corpus_id": "shared_id"})
+    )
+    local_train = {
+        "corpus": [{"path": str(local_corpus_dir)}],
+        "data": [
+            {"question_id": "q2", "question": "Q2?", "corpus_id": "shared_id",
+             "pos_doc": [{"id": "p"}], "neg_doc": [{"id": "n"}]},
+        ],
+    }
+    local_file = tmp_path / "local.json"
+    local_file.write_text(json.dumps(local_train))
+
+    def fake_load_dataset(repo_id_or_path, config=None, split=None, **kw):
+        if isinstance(repo_id_or_path, str) and repo_id_or_path == str(local_corpus_dir):
+            return {"train": corpus_ds}
+        if config is not None and config.endswith("_corpus"):
+            return corpus_ds
+        return query_ds
+
+    monkeypatch.setattr(rd, "load_dataset", fake_load_dataset)
+
+    with pytest.raises(ValueError, match="Duplicate corpus_id.*shared_id.*different paths"):
+        rd.make_retrieval_dataset(
+            data_dir_list=["hf://org/repo/Sub", str(local_file)],
+            data_type="train",
+            train_n_passages=2,
+        )
+
+
+def test_retrieval_dataset_inline_smoke(tmp_path):
+    f = tmp_path / "inline.jsonl"
+    f.write_text(json.dumps({"query": "Q", "pos_doc": "P", "neg_doc": ["N"]}))
+
+    ds = rdi.make_retrieval_dataset(
+        data_dir_list=str(f),
+        data_type="train",
+        train_n_passages=2,
+        do_shuffle=False,
+        max_train_samples=1,
+    )
+    ex = ds[0]
+    assert ex["question"] == "Q"
+    assert ex["doc_text"] == ["P", "N"]
+    assert ex["doc_image"] == ["", ""]

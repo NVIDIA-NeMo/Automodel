@@ -32,7 +32,12 @@ from torch.distributed.pipelining.schedules import (
     get_schedule_class,
 )
 
-from nemo_automodel.components.distributed.pipelining.hf_utils import patch_hf_model_for_pp
+from nemo_automodel.components.distributed.pipelining.hf_utils import (
+    MULTIMODAL_SUFFIXES,
+    TEXT_MODULE_ATTRS,
+    get_text_module,
+    patch_hf_model_for_pp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +49,6 @@ class ParallelizeFnProtocol(Protocol):
         world_mesh: DeviceMesh,
         moe_mesh: DeviceMesh,
         *,
-        pp_enabled: bool,
         dp_axis_names: tuple[str, ...],
         cp_axis_name: str | None = None,
         tp_axis_name: str | None = None,
@@ -81,7 +85,10 @@ def generate_hf_model_fqn_per_model_part(
     include_embeddings: bool = True,
     include_lm_head: bool = True,
     include_rotary_emb: bool = True,
+    include_multimodal_encoders: bool = True,
+    extra_module_fqns: Optional[list[str]] = None,
     fqn_prefix: str = "model.",
+    lm_head_fqn: str = "lm_head",
 ) -> list[list[str]]:
     """
     Generates module names for each pipeline stage for HuggingFace models.
@@ -91,6 +98,8 @@ def generate_hf_model_fqn_per_model_part(
         num_layers: Total number of transformer layers in the model
         include_embeddings: Whether to include embedding layer in first stage
         include_lm_head: Whether to include lm_head in last stage (for CausalLM models)
+        include_multimodal_encoders: Whether to include common vision/audio encoder modules in stage 0
+        extra_module_fqns: Optional list of extra module FQNs to include in stage 0
 
     Returns:
         List of lists containing module names for each stage
@@ -125,9 +134,14 @@ def generate_hf_model_fqn_per_model_part(
         if stage_idx < extra_layers:
             stage_layer_count += 1
 
-        # First stage: add embeddings if requested
-        if stage_idx == 0 and include_embeddings:
-            stage_modules.append(f"{fqn_prefix}embed_tokens")
+        # First stage: add embeddings and multimodal encoders if requested
+        if stage_idx == 0:
+            if include_embeddings:
+                stage_modules.append(f"{fqn_prefix}embed_tokens")
+            if include_multimodal_encoders:
+                stage_modules.extend([f"{fqn_prefix}{suffix}" for suffix in MULTIMODAL_SUFFIXES])
+            if extra_module_fqns:
+                stage_modules.extend(extra_module_fqns)
 
         # Add transformer layers for this stage
         for _ in range(stage_layer_count):
@@ -138,7 +152,7 @@ def generate_hf_model_fqn_per_model_part(
         if stage_idx == num_stages - 1:
             stage_modules.append(f"{fqn_prefix}norm")
             if include_lm_head:
-                stage_modules.append("lm_head")
+                stage_modules.append(lm_head_fqn)
 
         if include_rotary_emb:
             # Always include rotary_emb in all stages (it's needed for position embeddings)
@@ -216,6 +230,62 @@ def calculate_virtual_stages(
     return num_virtual_stages, stages_per_rank
 
 
+def _precompute_stage_shapes(
+    stages: list[PipelineStage],
+    model_config,
+    microbatch_size: int,
+    seq_len: int,
+) -> None:
+    """Precompute input/output meta tensors for each pipeline stage to bypass serial shape inference.
+
+    By default, PipelineStage performs shape inference at runtime via a serial P2P chain:
+    stage 0 → send → stage 1 → send → ... → stage N-1.  This is O(N) in the number of
+    pipeline stages and becomes a bottleneck for large world sizes.
+
+    This function sets ``inputs_meta`` and ``_outputs_meta`` on each stage *before* the
+    first ``step()`` call, so that ``_shape_inference`` is never invoked and the serial
+    chain is completely eliminated.
+
+    Args:
+        stages: The local pipeline stages (already parallelized).
+        model_config: The HuggingFace model config (``model.config``).
+        microbatch_size: Microbatch size used by the pipeline schedule.
+        seq_len: Sequence length of the input data.
+    """
+    hidden_size = model_config.hidden_size
+    vocab_size = model_config.vocab_size
+
+    for stage in stages:
+        # Infer the computation dtype from the stage's parameters
+        try:
+            model_dtype = next(stage.submod.parameters()).dtype
+        except StopIteration:
+            model_dtype = torch.bfloat16
+
+        # --- inputs_meta ---
+        if stage.is_first:
+            # First stage receives input_ids: [mb, seq_len] int64
+            stage.inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
+        else:
+            # Non-first stages receive hidden_states: [mb, seq_len, hidden_size]
+            stage.inputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
+
+        # --- outputs_meta ---
+        has_lm_head = hasattr(stage.submod, "lm_head") and stage.submod.lm_head is not None
+        if has_lm_head:
+            # Last stage with lm_head produces logits: [mb, seq_len, vocab_size]
+            outputs_meta = (torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=model_dtype),)
+        else:
+            # Intermediate stages produce hidden_states: [mb, seq_len, hidden_size]
+            outputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
+        stage._configure_outputs_meta(outputs_meta)
+
+    logger.info(
+        f"Precomputed pipeline stage shapes (seq_len={seq_len}, microbatch_size={microbatch_size}) — "
+        f"serial shape inference bypassed"
+    )
+
+
 def split_model_into_stages(
     model: torch.nn.Module,
     pp_mesh: DeviceMesh,
@@ -247,15 +317,26 @@ def split_model_into_stages(
     pp_size = pp_mesh.size()
     # Detect model structure
     has_model_attr = hasattr(model, "model")
-    has_rotary_emb = hasattr(model.model, "rotary_emb") if has_model_attr else hasattr(model, "rotary_emb")
-    has_lm_head = hasattr(model, "lm_head")
+    text_model = get_text_module(model.model if has_model_attr else model)
+    text_model_attr_name = ""
+    for attr_name in TEXT_MODULE_ATTRS:
+        if hasattr(model, attr_name) or hasattr(model.model, attr_name):
+            text_model_attr_name = attr_name
+            break
+    has_rotary_emb = hasattr(text_model, "rotary_emb")
 
-    if has_model_attr:
+    # Check for lm_head in multiple locations:
+    has_lm_head = hasattr(text_model, "lm_head") or hasattr(model, "lm_head")
+    lm_head_on_top_level = hasattr(model, "lm_head") and not hasattr(text_model, "lm_head")
+
+    text_model_has_model_attr = hasattr(text_model, "model")
+
+    if text_model_has_model_attr:
         # Models like LlamaForCausalLM have model.layers
-        num_layers = len(model.model.layers)
+        num_layers = len(text_model.model.layers)
     else:
         # Direct model access
-        num_layers = len(model.layers)
+        num_layers = len(text_model.layers)
 
     schedule_class = get_schedule_class(pp_schedule)
     is_single_stage_schedule = issubclass(schedule_class, PipelineScheduleSingle)
@@ -269,6 +350,30 @@ def split_model_into_stages(
         round_to_pp_multiple=round_to_pp_multiple,
     )
 
+    # Determine module prefix for text layers and where multimodal encoders live
+    base_prefix = "model." if has_model_attr else ""
+    layers_prefix = base_prefix
+    include_multimodal_encoders = True
+    extra_module_fqns = None
+
+    text_model_attr_prefix = text_model_attr_name + "." if text_model_attr_name else ""
+    layers_prefix = (
+        f"{base_prefix}{text_model_attr_prefix}model."
+        if text_model_has_model_attr
+        else f"{base_prefix}{text_model_attr_prefix}"
+    )
+
+    # If layers live under a nested language_model, keep multimodal encoders at the base prefix
+    if layers_prefix != base_prefix:
+        include_multimodal_encoders = False
+        extra_module_fqns = [f"{base_prefix}{suffix}" for suffix in MULTIMODAL_SUFFIXES]
+        if lm_head_on_top_level:
+            lm_head_fqn = "lm_head"
+        else:
+            lm_head_fqn = f"{base_prefix}{text_model_attr_name}.lm_head"
+    else:
+        lm_head_fqn = "lm_head"
+
     # Auto-generate module split if not provided
     if module_names_per_stage is None:
         module_names_per_stage = generate_hf_model_fqn_per_model_part(
@@ -277,7 +382,10 @@ def split_model_into_stages(
             include_embeddings=True,
             include_lm_head=has_lm_head,
             include_rotary_emb=has_rotary_emb,
-            fqn_prefix="model." if has_model_attr else "",
+            include_multimodal_encoders=include_multimodal_encoders,
+            extra_module_fqns=extra_module_fqns,
+            fqn_prefix=layers_prefix,
+            lm_head_fqn=lm_head_fqn,
         )
 
     def _build_stage_from_modules(
@@ -299,6 +407,9 @@ def split_model_into_stages(
         def _process_module(parent_module, parent_name=""):
             for name, module in list(parent_module.named_children()):
                 full_name = f"{parent_name}.{name}" if parent_name else name
+
+                if full_name in modules_to_keep:
+                    continue
 
                 # Special handling for layers (ModuleList)
                 if isinstance(module, (nn.ModuleDict, nn.ModuleList)):
@@ -326,14 +437,18 @@ def split_model_into_stages(
                         elif isinstance(module, nn.ModuleList):
                             setattr(parent_module, name, nn.ModuleDict())
 
+                # If this module is explicitly in modules_to_keep, keep it and all its children
+                # (don't recurse to avoid removing PEFT adapters like lora_A, lora_B)
+                elif full_name in modules_to_keep:
+                    # Keep this module and all its children intact
+                    pass
+
                 # Handle other modules
-                elif full_name not in modules_to_keep and not any(
-                    kept_name.startswith(full_name + ".") for kept_name in modules_to_keep
-                ):
+                elif not any(kept_name.startswith(full_name + ".") for kept_name in modules_to_keep):
                     # This module and its children are not needed
                     setattr(parent_module, name, None)
                 else:
-                    # Recursively process children
+                    # This module has descendants that need to be kept, recurse into it
                     _process_module(module, full_name)
 
         # Process the model
@@ -471,6 +586,7 @@ def pipeline_model(
     scale_grads: bool = False,
     round_to_pp_multiple: str | None = None,
     patch_stage_backward_maybe_with_nosync: bool = False,
+    seq_len: int | None = None,
 ) -> tuple[_PipelineSchedule, list[torch.nn.Module], bool, bool, list[PipelineStage]]:
     """HF-specific pipeline model splitting."""
     pp_size = world_mesh[pp_axis_name].size()
@@ -497,7 +613,6 @@ def pipeline_model(
                 m,
                 world_mesh=world_mesh,
                 moe_mesh=moe_mesh,
-                pp_enabled=True,
                 dp_axis_names=dp_axis_names,
                 cp_axis_name=cp_axis_name,
                 tp_axis_name=tp_axis_name,
@@ -506,6 +621,11 @@ def pipeline_model(
             )
             model_parts[i] = m
             stages[i].submod = m
+
+    # Precompute stage shapes to bypass serial P2P shape inference.
+    # This must happen *after* parallelization so that dtypes are final.
+    if seq_len is not None:
+        _precompute_stage_shapes(stages, model.config, microbatch_size, seq_len)
 
     # Build pipeline schedule
     pp_schedule = build_pipeline_schedule(

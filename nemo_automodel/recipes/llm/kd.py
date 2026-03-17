@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Knowledge Distillation recipe for next-token prediction with NeMo-AutoModel.
+"""Knowledge Distillation recipe for next-token prediction with NeMo AutoModel.
 
 This recipe fine-tunes a *student* model using the logits of a frozen *teacher* model. It
 extends ``FinetuneRecipeForNextTokenPrediction`` adding:
@@ -29,8 +29,8 @@ The file exposes ``KnowledgeDistillationRecipeForNextTokenPrediction`` and a
 recipes:
 
     python -m torch.distributed.run --nproc-per-node=8 \
-        nemo_automodel/recipes/llm/knowledge_distillation.py \
-        -c examples/llm/llama_3_2_1b_kd.yaml
+        nemo_automodel/recipes/llm/kd.py \
+        -c examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml
 """
 
 from __future__ import annotations
@@ -43,8 +43,8 @@ from typing import Any, Dict, Optional
 import torch
 import wandb
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-from transformers import AutoTokenizer
 
+from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.utils import get_sync_ctx
@@ -67,31 +67,53 @@ def _build_kd_loss_fn(cfg_kd):
     return cfg_kd.instantiate()
 
 
-def _build_teacher_model(cfg_teacher, seed, has_packed_sequence, device, model_wrapper, device_mesh):
+def _build_teacher_model(
+    cfg_teacher,
+    seed,
+    has_packed_sequence,
+    device_mesh=None,
+    moe_mesh=None,
+    distributed_config=None,
+    device=None,
+):
+    """Build and initialize the teacher model for knowledge distillation.
+
+    Uses the same infrastructure as student model (NeMoAutoModelForCausalLM) but without
+    PEFT, FP8, or QAT since the teacher should be frozen in full precision.
+
+    Args:
+        cfg_teacher: Configuration for teacher model instantiation.
+        seed: Random seed for reproducibility.
+        has_packed_sequence: Whether using packed sequences.
+        device_mesh: Device mesh for distributed training.
+        moe_mesh: MOE mesh for expert parallelism.
+        distributed_config: Strategy-specific distributed config.
+        device: Device to place the teacher model on.
+
+    Returns:
+        The frozen teacher model ready for inference.
+
+    Note:
+        The `offload_teacher_model` config option is not supported with this approach.
+        Device placement is handled internally by NeMoAutoModelForCausalLM infrastructure.
+    """
+
     assert cfg_teacher is not None, "`teacher_model` section missing from YAML config"
     logger.info("Instantiating teacher model")
 
-    # Build teacher model using the same approach as student model
+    # Build teacher model using the same infrastructure as student
+    # but without PEFT/FP8/QAT (teacher should be frozen in full precision)
     with ScopedRNG(seed=seed, ranked=True):
-        kwargs: Dict[str, Any] = {}
-        if has_packed_sequence > 0:
-            kwargs["attn_implementation"] = "flash_attention_2"
+        kwargs: Dict[str, Any] = {
+            "has_packed_sequence": has_packed_sequence,
+            "device_mesh": device_mesh,
+            "moe_mesh": moe_mesh,
+            "distributed_config": distributed_config,
+        }
 
         teacher_model = cfg_teacher.instantiate(**kwargs)
 
-        # For teacher model, we'll apply FSDP2 sharding if the same model_wrapper is available
-        # but we need to be careful about device placement and parallelization
-        if model_wrapper is not None and hasattr(model_wrapper, "parallelize"):
-            logger.info("Applying FSDP2 sharding to teacher model")
-            # Create a new model wrapper instance for the teacher to avoid conflicts
-            # with the student model's parallelization
-            try:
-                teacher_model = model_wrapper.parallelize(teacher_model)
-            except Exception as e:
-                logger.warning(f"Failed to parallelize teacher model with FSDP2: {e}")
-                logger.info("Falling back to simple device placement for teacher model")
-                teacher_model = teacher_model.to(device)
-        # ensure on device
+        # Ensure the teacher model is on the correct device
         teacher_model = teacher_model.to(device)
 
         # Set teacher to eval mode and freeze parameters
@@ -105,10 +127,10 @@ def _build_teacher_model(cfg_teacher, seed, has_packed_sequence, device, model_w
 def _verify_tokenizer_compatibility(student_cfg, teacher_cfg, trust_remote_code=True):
     if student_cfg is None or teacher_cfg is None:
         raise ValueError("Student and teacher model configs are required")
-    student_tokenizer = AutoTokenizer.from_pretrained(
+    student_tokenizer = NeMoAutoTokenizer.from_pretrained(
         student_cfg.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
     )
-    teacher_tokenizer = AutoTokenizer.from_pretrained(
+    teacher_tokenizer = NeMoAutoTokenizer.from_pretrained(
         teacher_cfg.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
     )
     if student_tokenizer.vocab_size != teacher_tokenizer.vocab_size:
@@ -135,15 +157,16 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             raise ValueError("Pipeline parallelism support will be added in the future for knowledge distillation")
 
         self._offload_teacher_model = self.cfg.get("offload_teacher_model", False)
-        # teacher specific
         teacher_device = self.dist_env.device if not self._offload_teacher_model else "cpu"
+
         self.teacher_model = _build_teacher_model(
-            self.cfg.get("teacher_model", None),
-            self.cfg.get("seed", 42),
-            self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
-            teacher_device,
-            self.model_wrapper,
-            self.device_mesh,
+            cfg_teacher=self.cfg.get("teacher_model", None),
+            seed=self.cfg.get("seed", 42),
+            has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            distributed_config=self.distributed_config,
+            device=teacher_device,
         )
         logger.info("Teacher Model: " + str(self.teacher_model))
         # KD
@@ -173,7 +196,15 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
 
         model = self.model_parts[0]
-        sync_ctx = get_sync_ctx(model, idx == num_batches - 1) if is_train else nullcontext()
+        sync_ctx = (
+            get_sync_ctx(
+                model,
+                idx == num_batches - 1,
+                defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
+            )
+            if is_train
+            else nullcontext()
+        )
         with train_ctx(), sync_ctx:
             # No grad for teacher forward
             with (
@@ -413,9 +444,11 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         """
         if not self.dist_env.is_main:
             return
-        # log_data
-        if wandb.run is not None:
-            wandb.log(log_data.to_dict(), step=log_data.step)
+
+        # Log to remote services (WandB) according to step_scheduler frequency
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
+                wandb.log(log_data.to_dict(), step=log_data.step)
 
         logging.info(
             "step {} | epoch {} | "

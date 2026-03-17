@@ -272,3 +272,127 @@ def test_check_all_values_equal_length_true():
 def test_check_all_values_equal_length_false():
     sample = {"a": [1, 2, 3, 4], "b": [5, 6], "c": []}
     assert _check_all_values_equal_length(sample) is False
+
+
+class TestColumnMappedIter:
+    """Tests for ColumnMappedTextInstructionDataset.__iter__."""
+
+    def _make_dataset(self, tmp_path):
+        samples = [
+            {"query": "Why is the sky blue?", "response": "Rayleigh scattering."},
+            {"query": "What is 2+2?", "response": "4."},
+            {"query": "Capital of France?", "response": "Paris."},
+        ]
+        jsonl_path = tmp_path / "iter_test.jsonl"
+        with jsonl_path.open("w", encoding="utf-8") as fp:
+            for row in samples:
+                fp.write(json.dumps(row) + "\n")
+
+        return ColumnMappedTextInstructionDataset(
+            path_or_dataset_id=str(jsonl_path),
+            column_mapping={"question": "query", "answer": "response"},
+            tokenizer=_DummyTokenizer(),
+            answer_only_loss_mask=False,
+        )
+
+    def test_iter_yields_all_items(self, tmp_path):
+        ds = self._make_dataset(tmp_path)
+        items = list(ds)
+        assert len(items) == len(ds)
+
+    def test_iter_matches_getitem(self, tmp_path):
+        ds = self._make_dataset(tmp_path)
+        for i, item in enumerate(ds):
+            direct = ds[i]
+            assert item["input_ids"] == direct["input_ids"]
+            assert item["labels"] == direct["labels"]
+
+    def test_iter_yields_dicts_with_expected_keys(self, tmp_path):
+        ds = self._make_dataset(tmp_path)
+        for item in ds:
+            assert "input_ids" in item
+            assert "labels" in item
+            assert "attention_mask" in item
+
+
+class TestColumnMappedGetitemBoundedLoop:
+    """Tests for the bounded-loop skip logic in __getitem__."""
+
+    def _make_dataset(self, tmp_path, samples):
+        jsonl_path = tmp_path / "getitem_test.jsonl"
+        with jsonl_path.open("w", encoding="utf-8") as fp:
+            for row in samples:
+                fp.write(json.dumps(row) + "\n")
+
+        return ColumnMappedTextInstructionDataset(
+            path_or_dataset_id=str(jsonl_path),
+            column_mapping={"question": "query", "answer": "response"},
+            tokenizer=_DummyTokenizer(),
+            answer_only_loss_mask=False,
+        )
+
+    def test_skips_all_minus_100_sample(self, tmp_path, monkeypatch):
+        """When one sample produces all -100 labels, __getitem__ skips to the next."""
+        samples = [
+            {"query": "Bad question", "response": "Bad answer"},
+            {"query": "Good question", "response": "Good answer"},
+        ]
+        ds = self._make_dataset(tmp_path, samples)
+        good_result = ds[1]
+
+        call_count = 0
+        original_apply = ds._apply_tokenizer
+
+        def _patched_apply(sample):
+            nonlocal call_count
+            call_count += 1
+            if sample.get("question") == "Bad question":
+                result = original_apply(sample)
+                result["labels"] = [-100] * len(result["labels"])
+                return result
+            return original_apply(sample)
+
+        monkeypatch.setattr(ds, "_apply_tokenizer", _patched_apply)
+        result = ds[0]
+        assert call_count == 2
+        assert result["input_ids"] == good_result["input_ids"]
+
+    def test_raises_when_all_samples_produce_minus_100(self, tmp_path, monkeypatch):
+        """When every sample produces all -100 labels, __getitem__ raises ValueError."""
+        samples = [
+            {"query": "Q1", "response": "A1"},
+            {"query": "Q2", "response": "A2"},
+        ]
+        ds = self._make_dataset(tmp_path, samples)
+        original_apply = ds._apply_tokenizer
+
+        def _all_masked(sample):
+            result = original_apply(sample)
+            result["labels"] = [-100] * len(result["labels"])
+            return result
+
+        monkeypatch.setattr(ds, "_apply_tokenizer", _all_masked)
+        with pytest.raises(ValueError, match="entirely -100"):
+            ds[0]
+
+    def test_wraps_around_to_beginning(self, tmp_path, monkeypatch):
+        """When the last sample is bad, the loop wraps around to idx 0."""
+        samples = [
+            {"query": "Good question", "response": "Good answer"},
+            {"query": "Bad question", "response": "Bad answer"},
+        ]
+        ds = self._make_dataset(tmp_path, samples)
+        good_result = ds[0]
+
+        original_apply = ds._apply_tokenizer
+
+        def _patched_apply(sample):
+            if sample.get("question") == "Bad question":
+                result = original_apply(sample)
+                result["labels"] = [-100] * len(result["labels"])
+                return result
+            return original_apply(sample)
+
+        monkeypatch.setattr(ds, "_apply_tokenizer", _patched_apply)
+        result = ds[1]
+        assert result["input_ids"] == good_result["input_ids"]

@@ -22,6 +22,7 @@ import torch
 from torch import nn
 
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
+from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -67,11 +68,23 @@ class ConsolidatedHFAddon:
             _maybe_save_custom_model_code(original_model_path, hf_metadata_dir)
             # save the config.json file
             if hasattr(model_part, "config"):
-                with open(os.path.join(hf_metadata_dir, "config.json"), "w") as f:
+                v4_compatible = kwargs.get("v4_compatible", False)
+                config_name = "config.json"
+                if v4_compatible and _config_exists(original_model_path, config_name):
+                    _save_original_config_json(original_model_path, hf_metadata_dir, config_name)
+                    config_name = "config.v5.json"
+
+                _maybe_strip_quantization_config(model_part)
+                with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
                     f.write(model_part.config.to_json_string())
+
             # save the generation_config.json file
             if getattr(model_part, "generation_config", None) is not None:
-                with open(os.path.join(hf_metadata_dir, "generation_config.json"), "w") as f:
+                config_name = "generation_config.json"
+                if v4_compatible and _config_exists(original_model_path, config_name):
+                    _save_original_config_json(original_model_path, hf_metadata_dir, config_name)
+                    config_name = "generation_config.v5.json"
+                with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
                     f.write(model_part.generation_config.to_json_string())
 
             # save the tokenizer
@@ -182,7 +195,11 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState) -> d
     model_part = model_state.model[0]
     target_modules = _extract_target_modules(model_part)
     try:
-        model_task = model_part.config.architectures[0].split("For")[-1]
+        arch_name = model_part.config.architectures[0]
+        # "LlamaForCausalLM".split("For") → ["Llama", "CausalLM"]
+        # "LlamaBidirectionalModel".split("For") → ["LlamaBidirectionalModel"]
+        parts = arch_name.split("For")
+        model_task = parts[-1] if len(parts) > 1 else "FeatureExtraction"
     except (AttributeError, IndexError, TypeError):
         model_task = "N/A"
 
@@ -201,6 +218,7 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState) -> d
         "peft_type": "LORA",
         "r": peft_config.dim,
         "lora_alpha": peft_config.alpha,
+        "use_dora": peft_config.use_dora,
         "target_modules": target_modules,
         "bias": "none",
         "base_model_name_or_path": name_or_path,
@@ -226,6 +244,15 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
     """
     Extract the target modules from the model used by LoRA/PEFT layers.
 
+    Combined-projection module names (e.g. ``qkv_proj``, ``gate_up_proj``) are
+    expanded to the individual Hugging Face projection names so that the saved
+    ``adapter_config.json`` is compatible with vLLM, TensorRT-LLM and the
+    Hugging Face PEFT library.
+
+    For MoE expert LoRA (GroupedExpertsLoRA / GroupedExpertsDeepEPLoRA), the
+    grouped 3-D adapter parameters are expanded to per-expert HF projection
+    names (e.g. ``model.layers.0.mlp.experts.0.gate_proj``).
+
     Note:
         When torch.compile is used, module names get prefixed with `_orig_mod.`.
         This function strips those prefixes to get the original module names.
@@ -236,6 +263,14 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
     Returns:
         A sorted list of unique module name prefixes that contain LoRA layers.
     """
+    # Mapping from combined projection names to their HF-compatible split names.
+    _COMBINED_TO_SPLIT = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
+    _MOE_LORA_SUFFIXES = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
+
     final_target_modules = set()
     for name, _ in model.named_modules():
         if "lora" in name.lower():
@@ -243,8 +278,114 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
             target_name = name.rsplit(".", 1)[0]
             if target_name.startswith("_orig_mod."):
                 target_name = target_name[len("_orig_mod.") :]
-            final_target_modules.add(target_name)
+
+            # Expand combined projection names to individual HF projection names
+            last_component = target_name.rsplit(".", 1)[-1]
+            if last_component in _COMBINED_TO_SPLIT:
+                parent = target_name.rsplit(".", 1)[0] if "." in target_name else ""
+                for split_name in _COMBINED_TO_SPLIT[last_component]:
+                    expanded = f"{parent}.{split_name}" if parent else split_name
+                    final_target_modules.add(expanded)
+            else:
+                final_target_modules.add(target_name)
+
+    # Detect MoE expert LoRA: adapter weights stored as nn.Parameter (not
+    # nn.Module) so they don't appear in named_modules(). Scan parameters
+    # and expand to per-expert HF projection names.
+    # Only applies to models that use split-expert state dict conversion
+    # (MoESplitExpertsStateDictMixin); models with natively merged experts
+    # (e.g. Qwen 3.5) don't need per-expert expansion.
+    if hasattr(model, "state_dict_adapter") and isinstance(model.state_dict_adapter, MoESplitExpertsStateDictMixin):
+        seen_expert_groups: set[tuple[str, str]] = set()
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            for lora_suffix in _MOE_LORA_SUFFIXES:
+                if name.endswith(f".{lora_suffix}"):
+                    expert_path = name[: -len(f".{lora_suffix}")]
+                    if expert_path.startswith("_orig_mod."):
+                        expert_path = expert_path[len("_orig_mod.") :]
+
+                    group = "gate_and_up" if "gate_and_up" in lora_suffix else "down"
+                    if (expert_path, group) in seen_expert_groups:
+                        break
+                    seen_expert_groups.add((expert_path, group))
+
+                    n_experts = param.shape[0]
+                    for expert_id in range(n_experts):
+                        if group == "gate_and_up":
+                            final_target_modules.add(f"{expert_path}.{expert_id}.gate_proj")
+                            final_target_modules.add(f"{expert_path}.{expert_id}.up_proj")
+                        else:
+                            final_target_modules.add(f"{expert_path}.{expert_id}.down_proj")
+                    break
+
+    # When the model is a biencoder, LoRA target modules are discovered under
+    # the "lm_q." prefix (the biencoder query-encoder wrapper).  The standalone
+    # HF base model (LlamaBidirectionalModel) uses bare names without any
+    # wrapper prefix (e.g. "layers.0.self_attn.q_proj").  Strip "lm_q." so
+    # the saved adapter_config.json is compatible with merge_lora / HF PEFT.
+    adapter = getattr(model, "state_dict_adapter", None)
+    if adapter is not None:
+        from nemo_automodel.components.models.common.bidirectional import BiencoderStateDictAdapter
+
+        if isinstance(adapter, BiencoderStateDictAdapter):
+            remapped = set()
+            for name in final_target_modules:
+                if name.startswith("lm_q."):
+                    remapped.add(name[len("lm_q.") :])
+                else:
+                    remapped.add(name)
+            final_target_modules = remapped
+
     return sorted(list(final_target_modules))
+
+
+def _maybe_strip_quantization_config(model_part: nn.Module) -> None:
+    """Remove ``quantization_config`` from the HF config when no parameters are quantized.
+
+    Models loaded from quantized checkpoints (e.g. mxfp4 GPT-OSS) carry a
+    ``quantization_config`` on their ``config`` object.  After dequantization
+    all parameters are standard floating-point, but the stale config entry would
+    still be written to the saved ``config.json``.  This strips it so the output
+    checkpoint is a clean bf16 checkpoint, consistent with e.g.
+    ``unsloth/gpt-oss-20b-BF16``.
+    """
+    config = getattr(model_part, "config", None)
+    if config is None or not hasattr(config, "quantization_config"):
+        return
+
+    _QUANTIZED_DTYPES = frozenset({torch.uint8, torch.int8})
+    if any(p.dtype in _QUANTIZED_DTYPES for p in model_part.parameters()):
+        return
+
+    delattr(config, "quantization_config")
+
+
+def _config_exists(original_model_path: str, config_name: str) -> bool:
+    if original_model_path is None or not os.path.isdir(original_model_path):
+        return False
+    src = os.path.join(original_model_path, config_name)
+    return os.path.isfile(src)
+
+
+def _save_original_config_json(original_model_path: str, hf_metadata_dir: str, config_name: str) -> None:
+    """Copy the original pretrained ``config.json`` with ``quantization_config`` stripped.
+
+    This is used in v4-compatible mode so that downstream consumers (e.g. vLLM)
+    that expect a transformers-v4-style config receive the file verbatim from the
+    original checkpoint, minus any quantization metadata (since saved weights are
+    always bf16).
+    """
+    src = os.path.join(original_model_path, config_name)
+    if not os.path.isfile(src):
+        return
+    with open(src) as f:
+        cfg = json.load(f)
+    cfg.pop("quantization_config", None)
+    dst = os.path.join(hf_metadata_dir, config_name)
+    with open(dst, "w") as f:
+        json.dump(cfg, f, indent=2)
 
 
 def _maybe_save_custom_model_code(original_model_path: str | None, hf_metadata_dir: str) -> None:
@@ -253,12 +394,16 @@ def _maybe_save_custom_model_code(original_model_path: str | None, hf_metadata_d
     """
     if original_model_path is None:
         return
-    if not os.path.isdir(original_model_path):
+    if os.path.isfile(original_model_path):
+        pattern = original_model_path
+    elif os.path.isdir(original_model_path):
+        pattern = os.path.join(original_model_path, "**", "*.py")
+    else:
         return
-    pattern = os.path.join(original_model_path, "**", "*.py")
     for src_path in glob.glob(pattern, recursive=True):
-        # Skip any .hidden paths
         rel_path = os.path.relpath(src_path, original_model_path)
+        if os.path.basename(src_path) == "__init__.py":
+            continue
         dst_path = os.path.join(hf_metadata_dir, rel_path)
         os.makedirs(os.path.dirname(dst_path), exist_ok=True)
         shutil.copy2(src_path, dst_path)
