@@ -25,7 +25,7 @@ if [ "${PYTEST_PROPAGATE_S:-}" = "1" ]; then
 fi
 
 python -m torch.distributed.run \
---master-port=29503 --nproc_per_node=1 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace  \
+--master-port=29503 --nproc_per_node=1 --nnodes=1 -m coverage run  \
 -m pytest $PYTEST_S_FLAG tests/functional_tests/checkpoint/test_peft.py::test_hf_peft_dora_checkpoint -vs \
     --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \

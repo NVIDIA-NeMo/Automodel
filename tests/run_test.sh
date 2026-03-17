@@ -44,9 +44,6 @@ else
 fi
 
 coverage run \
-    --data-file=/workspace/.coverage \
-    --source=/workspace/ \
-    --parallel-mode \
     -m pytest \
     --durations 32 \
     --durations-min=0 \
