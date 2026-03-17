@@ -209,7 +209,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             # No grad for teacher forward
             with (
                 ScopedModuleOffloading(self.teacher_model, enabled=self._offload_teacher_model),
-                torch.inference_mode(),
+                torch.no_grad(),
             ):
                 teacher_logits = self.teacher_model(**batch)
                 teacher_logits = getattr(teacher_logits, "logits", teacher_logits).detach().clone()
