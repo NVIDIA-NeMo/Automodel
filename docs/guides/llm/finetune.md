@@ -7,7 +7,7 @@ Pretrained language models are general-purpose: they know a lot about language b
 NeMo AutoModel supports two fine-tuning modes:
 
 - **Supervised Fine-Tuning (SFT)** updates all model parameters. Use SFT when you need maximum accuracy and have sufficient compute.
-- **Parameter-Efficient Fine-Tuning (PEFT)** via [LoRA](https://arxiv.org/abs/2106.09685) freezes the base model and trains small low-rank adapters. PEFT reduces trainable parameters to less than 1% of the original model, lowering memory and storage costs.
+- **Parameter-Efficient Fine-Tuning (PEFT)** using [LoRA](https://arxiv.org/abs/2106.09685) freezes the base model and trains small low-rank adapters. PEFT reduces trainable parameters to less than 1% of the original model, lowering memory and storage costs.
 
 ### Workflow Overview
 
@@ -25,7 +25,7 @@ NeMo AutoModel supports two fine-tuning modes:
 |------|---------|-----|------|
 | **1. Install** | [Install NeMo AutoModel](#install-nemo-automodel) | Same | Same |
 | **2. Configure** | [Configure Your Training Recipe](#configure-your-training-recipe) | YAML without `peft:` section | YAML with `peft:` section |
-| **3. Train** | [Finetune the Model](#finetune-the-model) | Same command for both modes | Same command for both modes |
+| **3. Train** | [Fine-Tune the Model](#finetune-the-model) | Same command for both modes | Same command for both modes |
 | **4. Inference** | [Run Inference](#run-inference) | Load consolidated checkpoint directly | Load base model + adapter |
 | **5. Evaluate** | [Evaluate the Fine-Tuned Model](#evaluate-the-fine-tuned-model) | Validation loss during training; lm-eval-harness post-training | Same |
 | **6. Publish** | [Publish to HF Hub](#publish-to-the-hugging-face-hub) | Upload `model/consolidated/` | Upload `model/` (adapter only) |
@@ -53,7 +53,7 @@ For the full set of installation methods, see the [installation guide](../instal
 ## Configure Your Training Recipe
 
 
-Training is configured through a [YAML](https://en.wikipedia.org/wiki/YAML) file with three (required) sections — **model**, **dataset**, **PEFT** (optional), and **training schedule** — that fully describe a fine-tuning run. The sections below walk through each one. For the complete copy-pasteable file, see [Full Recipe YAML](#full-recipe-yaml). Both SFT and PEFT are driven by a **recipe** — a self-contained python module that wires together model loading, dataset preparation, training, checkpointing, and logging (see the `TrainFinetuneRecipeForNextTokenPrediction` [source](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py)).
+Training is configured through a [YAML](https://en.wikipedia.org/wiki/YAML) file with three required sections — **model**, **dataset**, and **step_scheduler** — plus an optional **peft** section that fully describes a fine-tuning run. The sections below walk through each one. For the complete copy-pastable file, see [Full Recipe YAML](#full-recipe-yaml). Both SFT and PEFT are driven by a **recipe** — a self-contained Python module that wires together model loading, dataset preparation, training, checkpointing, and logging (see the `TrainFinetuneRecipeForNextTokenPrediction` [source](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py)).
 
 
 
@@ -75,7 +75,7 @@ LLaMA is a family of decoder-only transformer models developed by Meta. The 1B v
 Some Hugging Face models are **gated**. If the model page shows a "Request access" button:
 
 1. Log in with your Hugging Face account and accept the license.
-2. Ensure the token you pass (via `huggingface-cli login` or `HF_TOKEN`) belongs to the approved account.
+2. Ensure the token you use (from `huggingface-cli login` or `HF_TOKEN`) belongs to the approved account.
 
 Pulling a gated model without an authorized token triggers a 403 error.
 :::
@@ -85,7 +85,7 @@ Pulling a gated model without an authorized token triggers a 403 error.
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad  # HF-Hub id used to pull the dataset
+  dataset_name: rajpurkar/squad  # HF-Hub ID used to pull the dataset
   split: train
 
 validation_dataset:
@@ -161,9 +161,9 @@ step_scheduler:
 ```
 :::
 
-## Finetune the Model
+## Fine-Tune the Model
 
-You can run the recipe via the AutoModel CLI or directly with torchrun.
+You can run the recipe using the AutoModel CLI or directly with `torchrun`.
 
 ### AutoModel CLI
 
@@ -173,7 +173,7 @@ automodel finetune llm -c finetune_config.yaml
 
 where `finetune` is the command and `llm` is the model domain.
 
-### torchrun
+### Run with `torchrun`
 
 ```bash
 torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config finetune_config.yaml
@@ -473,7 +473,7 @@ if __name__ == '__main__':
 
 ## Full Configuration Reference
 
-This section documents all available config fields for the fine-tuning recipe. For the quick-start config, see [Define Your Training Recipe](#define-your-training-recipe).
+This section documents all available config fields for the fine-tuning recipe. For the quick-start config, see [Configure Your Training Recipe](#configure-your-training-recipe).
 
 ### Switching Between SFT and PEFT
 
@@ -486,7 +486,7 @@ The `peft:` section controls which mode runs:
 
 All other config sections remain the same for both modes.
 
-### Full Config
+### Full Configuration
 
 :::{details} Full Config
 :open:
