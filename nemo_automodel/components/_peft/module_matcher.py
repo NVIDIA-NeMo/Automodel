@@ -43,7 +43,9 @@ def wildcard_match(pattern, key):
     """
     if key is None:
         return False
-    regex_pattern = re.compile("^" + re.escape(pattern).replace(r"\*", "(.*)") + "$")
+    pattern = re.sub(r"(?<!\.)\*", r".*", pattern)  # replace [^\.]* with .*
+    pattern = re.sub(r"\.\*", "(.*)", pattern)  # replace .* -> (.*)
+    regex_pattern = re.compile("^" + pattern + "$")
     match = regex_pattern.match(key)
     return match is not None
 
