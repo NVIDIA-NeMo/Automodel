@@ -268,9 +268,12 @@ requires-dist = ["torch", "packaging", "ninja", "setuptools"]
 pythonpath = ["."]
 
 [tool.coverage.paths]
-source = [".", "/workspace", "/home/runner/work/Automodel/Automodel"]
+source = [".", "/opt/Automodel", "/home/runner/work/Automodel/Automodel"]
 
 [tool.coverage.run]
+data_file = "/opt/Automodel/.coverage"
+source = ["/opt/Automodel/"]
+parallel = true
 concurrency = ["thread", "multiprocessing"]
 omit = [
     "nemo_automodel/components/checkpoint/_backports/*.py",

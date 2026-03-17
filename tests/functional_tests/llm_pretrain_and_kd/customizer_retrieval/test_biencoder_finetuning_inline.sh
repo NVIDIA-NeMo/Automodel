@@ -15,10 +15,8 @@
 
 set -exo pipefail
 
-COVERAGE_ARGS="--data-file=/workspace/.coverage --source=/workspace/ --parallel-mode"
-
 # Run the biencoder recipe (uses nemo_automodel/recipes/biencoder/train_biencoder.py via module entrypoint).
-python3 -m coverage run ${COVERAGE_ARGS} \
+python3 -m coverage run \
     -m nemo_automodel.recipes.biencoder.train_biencoder \
     --config \
     tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/recipe.yaml \
@@ -27,7 +25,7 @@ python3 -m coverage run ${COVERAGE_ARGS} \
     --dataloader.dataset.data_dir_list $TEST_DATA_DIR/embedding_testdata/training.jsonl \
 
 # Compare baseline vs finetuned biencoder checkpoint (pos-neg separation should not degrade).
-python3 -m coverage run --append ${COVERAGE_ARGS} \
+python3 -m coverage run \
     tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/compare_biencoder_models.py \
     $TEST_DATA_DIR/llama-nemotron-embed-1b-v2 \
     /workspace/output/biencoder_inline/checkpoints/epoch_0_step_31/ \
@@ -42,7 +40,7 @@ CHECKPOINT_DIR=/workspace/output/biencoder_ckpt_restore/checkpoints \
 PEFT_CHECKPOINT_DIR=/workspace/output/biencoder_ckpt_restore_peft/checkpoints \
 RECIPE_YAML=tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/recipe_ckpt_restore.yaml \
 PEFT_RECIPE_YAML=tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/recipe_peft.yaml \
-python3 -m coverage run --append ${COVERAGE_ARGS} \
+python3 -m coverage run \
     -m pytest -xvs \
     tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/test_biencoder_checkpoint_restoration.py
 
@@ -50,6 +48,6 @@ python3 -m coverage run --append ${COVERAGE_ARGS} \
 # Verifies that merge_lora.py correctly handles embedding / biencoder models
 # (FEATURE_EXTRACTION task_type → AutoModel instead of AutoModelForCausalLM).
 BASE_MODEL_PATH=$TEST_DATA_DIR/llama-nemotron-embed-1b-v2 \
-python3 -m coverage run --append ${COVERAGE_ARGS} \
+python3 -m coverage run \
     -m pytest -xvs \
     tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/test_peft_merge_lora.py
