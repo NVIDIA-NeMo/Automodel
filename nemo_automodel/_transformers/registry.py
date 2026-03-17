@@ -243,6 +243,10 @@ class _ModelRegistry:
     def get_model_cls_from_model_arch(self, model_arch: str) -> Type[nn.Module]:
         return self.model_arch_name_to_cls[model_arch]
 
+    def has_custom_model(self, arch_name: str) -> bool:
+        """Return ``True`` if *arch_name* has a custom (non-HF) implementation."""
+        return arch_name in self.model_arch_name_to_cls
+
     def resolve_custom_model_cls(self, architecture: str, config) -> Union[Type[nn.Module], None]:
         """Return the custom model class if it exists and supports *config*, else ``None``.
 
