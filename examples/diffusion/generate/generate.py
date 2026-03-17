@@ -46,7 +46,7 @@ import torch.distributed as dist
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.shared.t5_patches import patch_t5_layer_norm
+from nemo_automodel.shared.transformers_patches import patch_t5_layer_norm
 
 logger = logging.getLogger(__name__)
 

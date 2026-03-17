@@ -27,7 +27,7 @@ from typing import Any, Dict
 import torch
 from torch import autocast
 
-from nemo_automodel.shared.t5_patches import patch_t5_layer_norm
+from nemo_automodel.shared.transformers_patches import patch_t5_layer_norm
 
 from .base import BaseModelProcessor
 from .registry import ProcessorRegistry

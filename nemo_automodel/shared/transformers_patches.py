@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-T5 compatibility patches.
+Transformers compatibility patches.
 
 Runtime monkey-patch for apex's FusedRMSNorm which does not support bfloat16.
 Call `patch_t5_layer_norm()` before loading any T5 models when running in bf16.
@@ -26,8 +26,6 @@ import torch
 
 _logger = logging.getLogger(__name__)
 
-_T5_PATCH_APPLIED = False
-
 
 def patch_t5_layer_norm() -> None:
     """Replace apex's FusedRMSNorm with a native T5LayerNorm in the T5 module.
@@ -38,15 +36,10 @@ def patch_t5_layer_norm() -> None:
 
     This function is idempotent and safe to call multiple times.
     """
-    global _T5_PATCH_APPLIED
-    if _T5_PATCH_APPLIED:
-        return
-
     try:
         from transformers.models.t5 import modeling_t5
 
         if not (getattr(modeling_t5.T5LayerNorm, "__module__", "") or "").startswith("apex"):
-            _T5_PATCH_APPLIED = True
             return
 
         class _NativeT5LayerNorm(torch.nn.Module):
@@ -68,5 +61,3 @@ def patch_t5_layer_norm() -> None:
         _logger.info("Replaced apex FusedRMSNorm with native T5LayerNorm for bf16 compatibility")
     except ImportError:
         pass
-
-    _T5_PATCH_APPLIED = True

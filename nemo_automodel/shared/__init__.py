@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.shared.t5_patches import patch_t5_layer_norm
+from nemo_automodel.shared.transformers_patches import patch_t5_layer_norm
 from nemo_automodel.shared.utils import dtype_from_str
 
 __all__ = ["dtype_from_str", "patch_t5_layer_norm"]

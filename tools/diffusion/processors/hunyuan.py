@@ -90,7 +90,7 @@ class HunyuanVideoProcessor(BaseVideoProcessor):
         """
         from diffusers import HunyuanVideo15ImageToVideoPipeline
 
-        from nemo_automodel.shared.t5_patches import patch_t5_layer_norm
+        from nemo_automodel.shared.transformers_patches import patch_t5_layer_norm
 
         dtype = torch.float16 if "cuda" in device else torch.float32
 

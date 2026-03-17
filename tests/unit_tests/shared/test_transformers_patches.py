@@ -17,80 +17,26 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-import nemo_automodel.shared.t5_patches as t5_patches_module
-from nemo_automodel.shared.t5_patches import patch_t5_layer_norm
+from nemo_automodel.shared.transformers_patches import patch_t5_layer_norm
 
 
 class TestPatchT5LayerNormIdempotent:
-    """Test that patch_t5_layer_norm is idempotent and sets the global flag."""
+    """Test that patch_t5_layer_norm is idempotent."""
 
-    def setup_method(self):
-        t5_patches_module._T5_PATCH_APPLIED = False
-
-    def teardown_method(self):
-        t5_patches_module._T5_PATCH_APPLIED = False
-
-    def test_sets_flag_after_call(self):
-        assert not t5_patches_module._T5_PATCH_APPLIED
-        patch_t5_layer_norm()
-        assert t5_patches_module._T5_PATCH_APPLIED
-
-    def test_idempotent_second_call_is_noop(self):
-        """Calling twice should only execute the body once."""
-        t5_patches_module._T5_PATCH_APPLIED = True
-        # If it tried to import apex again we'd notice, but the early return
-        # means it never reaches the import.
-        patch_t5_layer_norm()
-        assert t5_patches_module._T5_PATCH_APPLIED
-
-    def test_handles_missing_apex(self):
-        """When apex is not installed, ImportError is caught and flag is still set."""
-        with patch.dict("sys.modules", {"apex": None, "apex.normalization": None}):
-            patch_t5_layer_norm()
-        assert t5_patches_module._T5_PATCH_APPLIED
-
-    def test_skips_when_not_fused_rms_norm(self):
-        """When T5LayerNorm is already NOT FusedRMSNorm, no replacement happens."""
-        mock_modeling_t5 = MagicMock()
-        original_norm = type("OriginalT5LayerNorm", (), {})
-        mock_modeling_t5.T5LayerNorm = original_norm
-
-        mock_fused = type("FusedRMSNorm", (), {})
-
-        mock_apex_norm = MagicMock()
-        mock_apex_norm.FusedRMSNorm = mock_fused
-
-        # Link parent so `from transformers.models.t5 import modeling_t5` works
-        mock_t5_parent = MagicMock()
-        mock_t5_parent.modeling_t5 = mock_modeling_t5
-
-        with patch.dict(
-            "sys.modules",
-            {
-                "apex": MagicMock(),
-                "apex.normalization": mock_apex_norm,
-                "transformers.models.t5": mock_t5_parent,
-                "transformers.models.t5.modeling_t5": mock_modeling_t5,
-            },
-        ):
-            patch_t5_layer_norm()
-
-        # T5LayerNorm should be untouched since it wasn't FusedRMSNorm
-        assert mock_modeling_t5.T5LayerNorm is original_norm
-        assert t5_patches_module._T5_PATCH_APPLIED
-
-    def test_replaces_fused_rms_norm(self):
-        """When T5LayerNorm IS FusedRMSNorm, it gets replaced."""
-        mock_modeling_t5 = MagicMock()
+    def _make_apex_mock(self):
+        """Return mocks with FusedRMSNorm installed as T5LayerNorm."""
         fused_cls = type("FusedRMSNorm", (), {"__module__": "apex.normalization"})
-
+        mock_modeling_t5 = MagicMock()
         mock_modeling_t5.T5LayerNorm = fused_cls
-
         mock_apex_norm = MagicMock()
         mock_apex_norm.FusedRMSNorm = fused_cls
-
         mock_t5_parent = MagicMock()
         mock_t5_parent.modeling_t5 = mock_modeling_t5
+        return mock_modeling_t5, mock_apex_norm, mock_t5_parent, fused_cls
+
+    def test_replaces_fused_rms_norm(self):
+        """When T5LayerNorm IS FusedRMSNorm, it gets replaced with the native impl."""
+        mock_modeling_t5, mock_apex_norm, mock_t5_parent, fused_cls = self._make_apex_mock()
 
         with patch.dict(
             "sys.modules",
@@ -103,9 +49,49 @@ class TestPatchT5LayerNormIdempotent:
         ):
             patch_t5_layer_norm()
 
-        # Should have been replaced with something else
         assert mock_modeling_t5.T5LayerNorm is not fused_cls
-        assert t5_patches_module._T5_PATCH_APPLIED
+        assert mock_modeling_t5.T5LayerNorm.__name__ == "_NativeT5LayerNorm"
+
+    def test_idempotent_when_already_patched(self):
+        """Calling twice leaves T5LayerNorm as the already-replaced native class."""
+        mock_modeling_t5, mock_apex_norm, mock_t5_parent, fused_cls = self._make_apex_mock()
+
+        modules = {
+            "apex": MagicMock(),
+            "apex.normalization": mock_apex_norm,
+            "transformers.models.t5": mock_t5_parent,
+            "transformers.models.t5.modeling_t5": mock_modeling_t5,
+        }
+        with patch.dict("sys.modules", modules):
+            patch_t5_layer_norm()
+            first_replacement = mock_modeling_t5.T5LayerNorm
+            patch_t5_layer_norm()
+
+        assert mock_modeling_t5.T5LayerNorm is first_replacement
+
+    def test_skips_when_not_apex(self):
+        """When T5LayerNorm is already NOT from apex, no replacement happens."""
+        original_norm = type("OriginalT5LayerNorm", (), {"__module__": "transformers"})
+        mock_modeling_t5 = MagicMock()
+        mock_modeling_t5.T5LayerNorm = original_norm
+        mock_t5_parent = MagicMock()
+        mock_t5_parent.modeling_t5 = mock_modeling_t5
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "transformers.models.t5": mock_t5_parent,
+                "transformers.models.t5.modeling_t5": mock_modeling_t5,
+            },
+        ):
+            patch_t5_layer_norm()
+
+        assert mock_modeling_t5.T5LayerNorm is original_norm
+
+    def test_handles_missing_transformers(self):
+        """When transformers is not installed, ImportError is caught silently."""
+        with patch.dict("sys.modules", {"transformers": None, "transformers.models.t5": None}):
+            patch_t5_layer_norm()  # must not raise
 
 
 class TestNativeT5LayerNorm:
@@ -113,10 +99,8 @@ class TestNativeT5LayerNorm:
 
     def _get_native_norm_class(self):
         """Extract the _NativeT5LayerNorm class by running the patch against a mock."""
-        t5_patches_module._T5_PATCH_APPLIED = False
-
-        mock_modeling_t5 = MagicMock()
         fused_cls = type("FusedRMSNorm", (), {"__module__": "apex.normalization"})
+        mock_modeling_t5 = MagicMock()
         mock_modeling_t5.T5LayerNorm = fused_cls
 
         mock_apex_norm = MagicMock()
@@ -136,7 +120,6 @@ class TestNativeT5LayerNorm:
         ):
             patch_t5_layer_norm()
 
-        t5_patches_module._T5_PATCH_APPLIED = False
         return mock_modeling_t5.T5LayerNorm
 
     def test_forward_fp32(self):
