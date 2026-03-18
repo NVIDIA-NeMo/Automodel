@@ -351,7 +351,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 logits,
                 teacher_logits,
                 target,
-                num_batch_labels=None,
+                num_batch_labels=1,
             )
             recipe_ref._ce_loss_buffer.append(ce_loss.detach().clone())
             recipe_ref._kd_loss_buffer.append(kd_loss.detach().clone())
