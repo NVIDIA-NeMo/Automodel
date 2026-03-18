@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """Benchmark and cache filtered datasets for ChatDataset.
 
-Compares three filtering strategies and saves the filtered dataset to disk
+Compares filtering strategies and saves the filtered dataset to disk
 so it can be loaded directly during training (skipping the expensive
 per-sample tokenization filter).
 
 Strategies benchmarked:
   1. baseline     — current _filter_long_samples: tokenize every sample via
                     apply_chat_template(tokenize=True)
-  2. two_pass     — char-length pre-filter to skip Jinja render on obviously-too-long
-                    samples, then exact tokenization on the rest
-  3. text_only    — apply_chat_template(tokenize=False) + tokenizer.encode()
+  2. text_only    — apply_chat_template(tokenize=False) + tokenizer.encode()
                     (skips return_dict/assistant_mask overhead)
 
 Usage:
