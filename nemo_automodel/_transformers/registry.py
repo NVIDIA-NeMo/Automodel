@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 MODEL_ARCH_MAPPING = OrderedDict(
     [
         (
+            "BaichuanForCausalLM",
+            ("nemo_automodel.components.models.baichuan.model", "BaichuanForCausalLM"),
+        ),
+        (
             "DeepseekV3ForCausalLM",
             ("nemo_automodel.components.models.deepseek_v3.model", "DeepseekV3ForCausalLM"),
         ),
@@ -44,6 +48,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "Glm4MoeLiteForCausalLM",
             ("nemo_automodel.components.models.glm4_moe_lite.model", "Glm4MoeLiteForCausalLM"),
+        ),
+        (
+            "GlmMoeDsaForCausalLM",
+            ("nemo_automodel.components.models.glm_moe_dsa.model", "GlmMoeDsaForCausalLM"),
         ),
         (
             "GptOssForCausalLM",
@@ -79,6 +87,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "Ministral3ForCausalLM",
             ("nemo_automodel.components.models.mistral3.model", "Ministral3ForCausalLM"),
+        ),
+        (
+            "Mistral4ForCausalLM",
+            ("nemo_automodel.components.models.mistral4.model", "Mistral4ForCausalLM"),
+        ),
+        (
+            "Mistral3ForConditionalGeneration",
+            ("nemo_automodel.components.models.mistral4.model", "Mistral3ForConditionalGeneration"),
         ),
         (
             "NemotronHForCausalLM",
@@ -121,6 +137,32 @@ MODEL_ARCH_MAPPING = OrderedDict(
         ),
     ]
 )
+
+
+# Custom model_type → config class for models that have auto_map in their
+# checkpoint config.json.  Registered eagerly with AutoConfig so that
+# AutoConfig.from_pretrained can resolve them without trust_remote_code.
+_CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
+    "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
+    "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
+}
+
+
+def _register_custom_configs() -> None:
+    from transformers import AutoConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    for model_type, (module_path, cls_name) in _CUSTOM_CONFIG_REGISTRATIONS.items():
+        if model_type not in CONFIG_MAPPING:
+            try:
+                mod = importlib.import_module(module_path)
+                cfg_cls = getattr(mod, cls_name)
+                AutoConfig.register(model_type, cfg_cls)
+            except Exception:
+                logger.debug("Failed to register config for model_type=%s", model_type, exc_info=True)
+
+
+_register_custom_configs()
 
 
 class _LazyArchMapping:
@@ -200,6 +242,29 @@ class _ModelRegistry:
 
     def get_model_cls_from_model_arch(self, model_arch: str) -> Type[nn.Module]:
         return self.model_arch_name_to_cls[model_arch]
+
+    def has_custom_model(self, arch_name: str) -> bool:
+        """Return ``True`` if *arch_name* has a custom (non-HF) implementation."""
+        return arch_name in self.model_arch_name_to_cls
+
+    def resolve_custom_model_cls(self, architecture: str, config) -> Union[Type[nn.Module], None]:
+        """Return the custom model class if it exists and supports *config*, else ``None``.
+
+        Custom model classes may define a ``supports_config(config)`` classmethod
+        to opt out for specific HF configs (e.g. a Mistral3 VLM with a dense
+        Ministral3 text backbone instead of the expected Mistral4 MoE+MLA).
+        """
+        if architecture not in self.model_arch_name_to_cls:
+            return None
+        model_cls = self.model_arch_name_to_cls[architecture]
+        if hasattr(model_cls, "supports_config") and not model_cls.supports_config(config):
+            logger.info(
+                "Custom model %s does not support config %s, falling back to HF",
+                model_cls.__name__,
+                type(config).__name__,
+            )
+            return None
+        return model_cls
 
     def register(self, arch_name: str, model_cls: Type[nn.Module], exist_ok: bool = False) -> None:
         """Register a custom model class for a given architecture name."""

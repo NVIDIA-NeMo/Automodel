@@ -2,6 +2,7 @@
 codecov.yml @nvidia-nemo/automation
 docker/ @nvidia-nemo/automation
 pyproject.toml @nvidia-nemo/automation
+uv.lock @nvidia-nemo/automation
 
 docs @akoumpa @jgerh @adil-a @HuiyingLi @hemildesai
 nemo_automodel @akoumpa @HuiyingLi @adil-a @hemildesai @ZhiyuLi-Nvidia

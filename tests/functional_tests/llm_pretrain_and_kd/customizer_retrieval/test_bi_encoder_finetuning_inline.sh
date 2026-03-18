@@ -42,7 +42,7 @@ CHECKPOINT_DIR=/workspace/output/bi_encoder_ckpt_restore/checkpoints \
 PEFT_CHECKPOINT_DIR=/workspace/output/bi_encoder_ckpt_restore_peft/checkpoints \
 RECIPE_YAML=tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/recipe_ckpt_restore.yaml \
 PEFT_RECIPE_YAML=tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/recipe_peft.yaml \
-python3 -m coverage run --append ${COVERAGE_ARGS} \
+python3 -m coverage run \
     -m pytest -xvs \
     tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/test_bi_encoder_checkpoint_restoration.py
 
@@ -50,6 +50,6 @@ python3 -m coverage run --append ${COVERAGE_ARGS} \
 # Verifies that merge_lora.py correctly handles embedding / bi-encoder models
 # (FEATURE_EXTRACTION task_type → AutoModel instead of AutoModelForCausalLM).
 BASE_MODEL_PATH=$TEST_DATA_DIR/llama-nemotron-embed-1b-v2 \
-python3 -m coverage run --append ${COVERAGE_ARGS} \
+python3 -m coverage run \
     -m pytest -xvs \
     tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/test_peft_merge_lora.py

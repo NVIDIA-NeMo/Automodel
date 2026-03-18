@@ -42,7 +42,6 @@ import hashlib
 import json
 import logging
 import os
-import pickle
 import traceback
 from multiprocessing import Pool
 from pathlib import Path
@@ -531,8 +530,7 @@ def _save_cache_file(
 
     if output_format == "meta":
         cache_file = cache_subdir / f"{cache_hash}.meta"
-        with open(cache_file, "wb") as f:
-            pickle.dump(cache_data, f)
+        torch.save(cache_data, cache_file)
     else:  # pt format
         cache_file = cache_subdir / f"{cache_hash}.pt"
         torch.save(cache_data, cache_file)

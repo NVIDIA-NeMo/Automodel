@@ -466,6 +466,18 @@ Each example follows the conversation schema expected by `apply_chat_template`, 
 }
 ```
 
+### Custom Chat Template
+By default, VLM fine-tuning uses the chat template built into the model's `AutoProcessor`. To override it, add `chat_template` under `dataset:` in your YAML config:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  split: train
+  chat_template: "{% for msg in messages %}{{ msg.role }}: {{ msg.content }}\n{% endfor %}"
+```
+
+`chat_template` accepts a Jinja template string, a path to a `.jinja` file, or a path to a JSON file containing a `chat_template` key. The override is applied to both the processor and its tokenizer before dataset instantiation.
+
 ### Collate Functions
 - `nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn`
 - `nemo_automodel.components.datasets.vlm.collate_fns.qwen2_5_collate_fn` (Qwen2.5 VL)

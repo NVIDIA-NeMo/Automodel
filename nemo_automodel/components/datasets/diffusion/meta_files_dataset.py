@@ -16,13 +16,14 @@ from __future__ import annotations
 
 import logging
 import os
-import pickle
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
+
+from .text_to_video_dataset import collate_optional_video_fields, load_optional_video_fields
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +66,7 @@ class MetaFilesDataset(Dataset):
             filtered = []
             for path in self.meta_files:
                 try:
-                    with open(path, "rb") as f:
-                        data = pickle.load(f)
+                    data = torch.load(path, weights_only=True)
                 except Exception as exc:  # pragma: no cover - best effort logging
                     logger.warning("Failed to load %s during filtering: %s", path, exc)
                     continue
@@ -82,8 +82,7 @@ class MetaFilesDataset(Dataset):
         stats: List[Tuple[torch.Size, torch.Size, str]] = []
         for path in sample_paths:
             try:
-                with open(path, "rb") as f:
-                    data = pickle.load(f)
+                data = torch.load(path, weights_only=True)
                 stats.append(
                     (
                         data["text_embeddings"].shape,
@@ -105,25 +104,10 @@ class MetaFilesDataset(Dataset):
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:  # type: ignore[override]
         path = self.meta_files[index]
-        with open(path, "rb") as f:
-            data = pickle.load(f)
+        data = torch.load(path, weights_only=True)
 
         text_embeddings: torch.Tensor = data["text_embeddings"].to(self.device)
         video_latents: torch.Tensor = data["video_latents"].to(self.device)
-
-        # Load text_mask if available (backwards compatible)
-        text_mask = data.get("text_mask")
-        text_embeddings_2 = data.get("text_embeddings_2")
-        text_mask_2 = data.get("text_mask_2")
-        image_embeds = data.get("image_embeds")
-        if text_mask is not None:
-            text_mask = text_mask.to(self.device)
-        if text_embeddings_2 is not None:
-            text_embeddings_2 = text_embeddings_2.to(self.device)
-        if text_mask_2 is not None:
-            text_mask_2 = text_mask_2.to(self.device)
-        if image_embeds is not None:
-            image_embeds = image_embeds.to(self.device)
 
         if self.transform_text is not None:
             text_embeddings = self.transform_text(text_embeddings)
@@ -146,15 +130,8 @@ class MetaFilesDataset(Dataset):
             "file_info": file_info,
         }
 
-        # Add text_mask if available (backwards compatible)
-        if text_mask is not None:
-            result["text_mask"] = text_mask
-        if text_embeddings_2 is not None:
-            result["text_embeddings_2"] = text_embeddings_2
-        if text_mask_2 is not None:
-            result["text_mask_2"] = text_mask_2
-        if image_embeds is not None:
-            result["image_embeds"] = image_embeds
+        # Optional model-specific fields (backwards compatible)
+        result.update(load_optional_video_fields(data, self.device))
 
         return result
 
@@ -174,19 +151,8 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         "file_info": [item["file_info"] for item in batch],
     }
 
-    # Collate text_mask if available (backwards compatible)
-    if len(batch) > 0 and "text_mask" in batch[0]:
-        text_mask = torch.cat([item["text_mask"] for item in batch], dim=0)
-        result["text_mask"] = text_mask
-    if len(batch) > 0 and "text_embeddings_2" in batch[0]:
-        text_embeddings_2 = torch.cat([item["text_embeddings_2"] for item in batch], dim=0)
-        result["text_embeddings_2"] = text_embeddings_2
-    if len(batch) > 0 and "text_mask_2" in batch[0]:
-        text_mask_2 = torch.cat([item["text_mask_2"] for item in batch], dim=0)
-        result["text_mask_2"] = text_mask_2
-    if len(batch) > 0 and "image_embeds" in batch[0]:
-        image_embeds = torch.cat([item["image_embeds"] for item in batch], dim=0)
-        result["image_embeds"] = image_embeds
+    # Optional model-specific fields (backwards compatible)
+    collate_optional_video_fields(batch, result)
 
     return result
 
