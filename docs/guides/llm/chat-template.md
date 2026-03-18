@@ -1,6 +1,6 @@
 # Configure Chat Templates for LLM Fine-Tuning
 
-When fine-tuning an instruct model on a custom dataset, the training data must be formatted with the same special tokens the model expects at inference time. A **chat template** is a template string (stored in `tokenizer.chat_template`) that defines this formatting — it controls how system prompts, user messages, and assistant responses are wrapped with model-specific control tokens such as `<|im_start|>` / `<|im_end|>` (Qwen) or `<|start_header_id|>` / `<|end_header_id|>` (Llama-3). Chat templates are most commonly written in [Jinja](https://jinja.palletsprojects.com/), a widely used templating language, though other formats exist.
+When [fine-tuning](finetune.md) an instruct model on a custom dataset, the training data must be formatted with the same special tokens the model expects at inference time. A **chat template** is a template string (stored in `tokenizer.chat_template`) that defines this formatting — it controls how system prompts, user messages, and assistant responses are wrapped with model-specific control tokens such as `<|im_start|>` / `<|im_end|>` (Qwen) or `<|start_header_id|>` / `<|end_header_id|>` (Llama-3). Chat templates are most commonly written in [Jinja](https://jinja.palletsprojects.com/), a widely used templating language, though other formats exist.
 
 This guide shows how to enable chat template formatting in NeMo AutoModel for LLM fine-tuning. It covers two dataset classes and one override mechanism.
 
@@ -18,8 +18,8 @@ Your data format determines which dataset class to use:
 
 | Your data format | Dataset class | Chat template behavior | YAML key to set |
 |------------------|--------------|----------------------|-----------------|
-| Flat columns (e.g. `instruction`, `input`, `output`) | `ColumnMappedTextInstructionDataset` | Off by default; opt in | `use_hf_chat_template: true` |
-| OpenAI messages list (`{"messages": [...]}`) | `ChatDataset` | Always on (required) | None needed |
+| Flat columns (e.g. `instruction`, `input`, `output`) | [`ColumnMappedTextInstructionDataset`](../../../nemo_automodel/components/datasets/llm/column_mapped_text_instruction_dataset.py) | Off by default; opt in | `use_hf_chat_template: true` |
+| OpenAI messages list (`{"messages": [...]}`) | [`ChatDataset`](../../../nemo_automodel/components/datasets/llm/chat_dataset.py) | Always on (required) | None needed |
 
 If you need to override the tokenizer's built-in template or provide one where none exists, see [Custom or Missing Template](#custom-or-missing-template). If your data format does not fit either class, see [Integrate Your Own Text Dataset](dataset.md) for writing a custom dataset class.
 
@@ -204,10 +204,32 @@ print(tokenizer.apply_chat_template(messages, tokenize=False))
 ## Troubleshooting
 
 ### "Tokenizer lacks a usable chat template"
-The tokenizer does not have a `chat_template` attribute. Solutions:
-1. Use an instruct variant of the model (e.g., `Qwen/Qwen3-4B` ships with a template; many base models do not).
-2. Provide a custom template via the `chat_template` parameter on `ChatDataset`.
-3. Set `use_hf_chat_template: false` on `ColumnMappedTextInstructionDataset` to fall back to plain concatenation.
+The tokenizer does not have a `chat_template` attribute. This is common with base model tokenizers. There are three ways to resolve it:
+
+**Option 1 — Switch to the instruct variant of the model.** Instruct models (names containing `Instruct`, `Chat`, or `-it`) ship with a built-in template. For example, `Qwen/Qwen3-4B` has one but the corresponding base model may not.
+
+**Option 2 — Supply a custom template via `ChatDataset`.** Point the `chat_template` parameter to a `.jinja` file or pass a literal Jinja string:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: /path/to/train.jsonl
+  chat_template: /path/to/my_template.jinja
+```
+
+You can find ready-made templates in the model's Hugging Face repository (look for `tokenizer_config.json` → `chat_template` key) or write your own following the example in [Custom or Missing Template](#custom-or-missing-template).
+
+**Option 3 — Disable chat template formatting.** If you do not need special tokens (e.g., you are fine-tuning for plain completion), set `use_hf_chat_template: false` on `ColumnMappedTextInstructionDataset` to fall back to plain concatenation:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+  path_or_dataset_id: /path/to/train.jsonl
+  column_mapping:
+    question: instruction
+    answer: output
+  use_hf_chat_template: false  # plain concatenation, no special tokens
+```
 
 ### Loss not decreasing
 - Ensure `answer_only_loss_mask: true` so loss is computed only on the assistant tokens.
@@ -235,4 +257,4 @@ tokenized = tokenizer.apply_chat_template(messages, tokenize=True, return_dict=T
 
 `ChatDataset` follows the same path but reads the `messages` list directly from the data row. Some chat templates include a `{%- generation -%}` block — a Jinja directive that marks where the assistant's response begins. When this block is present, `apply_chat_template` can accept a `return_assistant_tokens_mask` flag to return a per-token boolean mask that identifies assistant tokens directly. When the block is absent, the mask is derived by tokenizing the prompt portion separately and computing the length difference.
 
-The underlying formatting functions live in `nemo_automodel/components/datasets/llm/formatting_utils.py`.
+The underlying formatting functions live in [`nemo_automodel/components/datasets/llm/formatting_utils.py`](../../../nemo_automodel/components/datasets/llm/formatting_utils.py).
