@@ -33,6 +33,7 @@ from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import (
+    _get_model_name,
     build_checkpoint_config,
     build_dataloader,
     build_distributed,
@@ -85,7 +86,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         checkpoint_config = build_checkpoint_config(
             self.cfg.get("checkpoint", None),
             self.cfg.get("model.cache_dir", None),
-            self.cfg.model.pretrained_model_name_or_path,
+            _get_model_name(self.cfg.model),
             True if self.cfg.get("peft", None) else False,
         )
 
@@ -136,7 +137,6 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
             pp_enabled=False,
-            supports_seq_lens=False,
         )
 
         self.val_dataloader = None
