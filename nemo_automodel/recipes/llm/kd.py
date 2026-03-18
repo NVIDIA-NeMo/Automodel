@@ -705,6 +705,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         )
         ce_tensor = self._dp_allreduce(ce_tensor, include_cp=True)
         kd_tensor = self._dp_allreduce(kd_tensor, include_cp=True)
+        # The PP wrapper buffers raw CE/KD sums; normalize them here so the logged
+        # metrics match the non-PP path and stay comparable across PP settings.
+        ce_tensor = ce_tensor / num_label_tokens
+        kd_tensor = kd_tensor / num_label_tokens
         ce_tensor = ce_tensor.to(self.dist_env.device)
         kd_tensor = kd_tensor.to(self.dist_env.device)
         if self.dist_env.rank == src_rank and not self.dist_env.is_main:
