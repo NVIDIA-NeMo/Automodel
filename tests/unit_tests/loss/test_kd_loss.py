@@ -15,6 +15,7 @@
 Unit tests for :pyclass:`nemo_automodel.components.loss.kd_loss.KDLoss` and its
 tensor-parallel helpers.
 """
+
 from typing import Optional
 
 import pytest
@@ -120,7 +121,8 @@ def test_kd_loss_num_labels():
 
 # Standalone re-implementation of the capture closure and the pp_kd_loss_fn
 # wrapper used in KnowledgeDistillationRecipeForNextTokenPrediction, so these
-# tests have no dependency on the recipe's distributed infrastructure.
+# tests have no dependency on the recipe's distributed infrastructure. Keep
+# the PP wrapper in sync with kd.py's normalization contract.
 
 
 def _make_capture_fn(capture_list):
@@ -156,17 +158,15 @@ def _make_pp_kd_loss_fn(recipe):
 
     def pp_kd_loss_fn(logits, target, **kwargs):
         teacher_logits = getattr(recipe, "_current_teacher_logits", None)
-        num_label_tokens = getattr(recipe, "_current_num_label_tokens", None)
         if teacher_logits is None:
             raise RuntimeError(
-                "KD loss wrapper: _current_teacher_logits not set. "
-                "Teacher pipeline eval must run before student step."
+                "KD loss wrapper: _current_teacher_logits not set. Teacher pipeline eval must run before student step."
             )
         if recipe.kd_ratio >= 1.0:
             ce_loss = logits.new_tensor(0.0, dtype=logits.dtype)
         else:
-            ce_loss = recipe._ce_fn(logits=logits, labels=target, num_label_tokens=num_label_tokens)
-        kd_loss = recipe.kd_loss_fn(logits, teacher_logits, target, num_batch_labels=num_label_tokens)
+            ce_loss = recipe._ce_fn(logits=logits, labels=target, num_label_tokens=None)
+        kd_loss = recipe.kd_loss_fn(logits, teacher_logits, target, num_batch_labels=None)
         recipe._ce_loss_buffer.append(ce_loss.detach().clone())
         recipe._kd_loss_buffer.append(kd_loss.detach().clone())
         return (1.0 - recipe.kd_ratio) * ce_loss + recipe.kd_ratio * kd_loss
@@ -247,11 +247,36 @@ def test_pp_kd_loss_fn_correct_combination():
 
     combined = loss_fn(student_logits, labels)
 
-    expected_ce = _simple_ce(logits=student_logits, labels=labels, num_label_tokens=num_label_tokens)
-    expected_kd = kd_fn(student_logits, teacher_logits, labels, num_batch_labels=num_label_tokens)
+    expected_ce = _simple_ce(logits=student_logits, labels=labels, num_label_tokens=None)
+    expected_kd = kd_fn(student_logits, teacher_logits, labels, num_batch_labels=None)
     expected = (1.0 - kd_ratio) * expected_ce + kd_ratio * expected_kd
 
     assert torch.allclose(combined, expected, atol=1e-6), f"Expected {expected.item()}, got {combined.item()}"
+
+
+def test_pp_kd_loss_fn_does_not_pass_step_label_count_to_inner_losses():
+    """PP wrapper must leave normalization to the outer train-step reduction."""
+    torch.manual_seed(11)
+    recorded_kwargs = {"ce": [], "kd": []}
+
+    def ce_fn(*, logits, labels, num_label_tokens=None):
+        recorded_kwargs["ce"].append(num_label_tokens)
+        return logits.new_tensor(1.5)
+
+    def kd_fn(student_logits, teacher_logits, labels, num_batch_labels=None):
+        recorded_kwargs["kd"].append(num_batch_labels)
+        return student_logits.new_tensor(2.5)
+
+    recipe = _SimpleRecipe(kd_ratio=0.25, ce_fn=ce_fn, kd_loss_fn=kd_fn)
+    recipe._current_teacher_logits = torch.randn(4, 6)
+    recipe._current_num_label_tokens = 99
+    loss_fn = _make_pp_kd_loss_fn(recipe)
+
+    combined = loss_fn(torch.randn(4, 6), torch.tensor([0, 1, -100, 2]))
+
+    assert recorded_kwargs["ce"] == [None]
+    assert recorded_kwargs["kd"] == [None]
+    assert torch.allclose(combined, torch.tensor(1.75))
 
 
 def test_pp_kd_loss_fn_kd_ratio_one_zeros_ce():
@@ -270,7 +295,7 @@ def test_pp_kd_loss_fn_kd_ratio_one_zeros_ce():
     loss_fn = _make_pp_kd_loss_fn(recipe)
 
     combined = loss_fn(student_logits, labels)
-    expected_kd = kd_fn(student_logits, teacher_logits, labels, num_batch_labels=num_label_tokens)
+    expected_kd = kd_fn(student_logits, teacher_logits, labels, num_batch_labels=None)
 
     assert torch.allclose(combined, expected_kd, atol=1e-6)
     # CE buffer must be zero (CE was skipped).
@@ -293,7 +318,7 @@ def test_pp_kd_loss_fn_kd_ratio_zero_zeros_kd_contribution():
     loss_fn = _make_pp_kd_loss_fn(recipe)
 
     combined = loss_fn(student_logits, labels)
-    expected_ce = _simple_ce(logits=student_logits, labels=labels, num_label_tokens=num_label_tokens)
+    expected_ce = _simple_ce(logits=student_logits, labels=labels, num_label_tokens=None)
 
     assert torch.allclose(combined, expected_ce, atol=1e-6)
 

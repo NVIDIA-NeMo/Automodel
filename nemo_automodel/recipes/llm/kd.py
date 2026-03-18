@@ -329,12 +329,15 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
         def pp_kd_loss_fn(logits, target, **kwargs):
             teacher_logits = getattr(recipe_ref, "_current_teacher_logits", None)
-            num_label_tokens = getattr(recipe_ref, "_current_num_label_tokens", None)
             if teacher_logits is None:
                 raise RuntimeError(
                     "KD loss wrapper: _current_teacher_logits not set. "
                     "Teacher pipeline eval must run before student step."
                 )
+            # num_label_tokens is None because
+            # _run_train_optim_step_pp applies scale_grads_and_clip_grad_norm
+            # (which divides grads by num_label_tokens/dp_group_size) and
+            # reporting_loss / num_label_tokens (dividing the reported loss).
             if recipe_ref.kd_ratio >= 1.0:
                 ce_loss = logits.new_tensor(0.0, dtype=logits.dtype)
             else:
@@ -342,13 +345,13 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     recipe_ref.loss_fn,
                     logits=logits,
                     labels=target,
-                    num_label_tokens=num_label_tokens,
+                    num_label_tokens=None,
                 )
             kd_loss = recipe_ref.kd_loss_fn(
                 logits,
                 teacher_logits,
                 target,
-                num_batch_labels=num_label_tokens,
+                num_batch_labels=None,
             )
             recipe_ref._ce_loss_buffer.append(ce_loss.detach().clone())
             recipe_ref._kd_loss_buffer.append(kd_loss.detach().clone())
