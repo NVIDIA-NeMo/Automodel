@@ -14,8 +14,6 @@ The tokenizer splits text into pieces and converts each piece into an integer **
   "Hello, world!"  -->  Tokenizer  -->  [15496, 11, 995, 0]  -->  Embedding Layer (LLM)  -->  Rest of LLM
 ```
 
-The reverse operation — converting token IDs back to text — is called **decoding**.
-
 ---
 
 ## What Is a Token?
