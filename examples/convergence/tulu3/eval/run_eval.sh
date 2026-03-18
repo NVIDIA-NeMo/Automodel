@@ -65,18 +65,20 @@ fi
 # ── Patch config.json for vLLM rope_theta compatibility ─────────────────────
 CONFIG="$MODEL_PATH/config.json"
 if [ -f "$CONFIG" ]; then
-  python3 -c "
-import json
-with open('$CONFIG') as f:
+  python3 - "$CONFIG" <<'PYEOF'
+import json, sys
+config_path = sys.argv[1]
+with open(config_path) as f:
     cfg = json.load(f)
 if 'rope_parameters' in cfg and 'rope_theta' in cfg['rope_parameters']:
     cfg['rope_theta'] = cfg['rope_parameters']['rope_theta']
-    with open('$CONFIG', 'w') as f:
+    with open(config_path, 'w') as f:
         json.dump(cfg, f, indent=2)
-    print(f'Patched rope_theta={cfg[\"rope_theta\"]} in $CONFIG')
+    print(f'Patched rope_theta={cfg["rope_theta"]} in {config_path}')
 else:
     print('No rope_parameters.rope_theta found, skipping patch')
-"; else
+PYEOF
+else
   echo "WARNING: $CONFIG not found, skipping rope_theta patch"
 fi
 
