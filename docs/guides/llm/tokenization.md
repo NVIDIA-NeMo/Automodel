@@ -8,15 +8,10 @@ This guide explains what tokenization is, how different tokenizers work, what sp
 
 ## From Text to Numbers
 
-A model's vocabulary is a fixed table that maps every known piece of text to an integer ID. The tokenizer looks up each piece in this table to produce the sequence of IDs the model actually receives.
+The tokenizer splits text into pieces and converts each piece into an integer **token ID**. These token IDs are then fed into the model's **embedding layer**, which looks up a learned vector for each ID — producing the numeric input the model actually operates on.
 
 ```
-         Tokenizer
-  Text ──────────────> Token IDs ──────────────> Model
-
-  "Hello, world!"      [15496, 11, 995, 0]       ┌─────────┐
-                                                   │   LLM   │
-                                                   └─────────┘
+  "Hello, world!"  -->  Tokenizer  -->  [15496, 11, 995, 0]  -->  Embedding Layer (LLM)  -->  Rest of LLM
 ```
 
 The reverse operation — converting token IDs back to text — is called **decoding**.
@@ -35,13 +30,13 @@ A token is a unit of text that the model treats as a single element. Depending o
 Most modern tokenizers split text into **subwords** — pieces that are shorter than full words but longer than individual characters. This lets the model handle rare or unseen words by composing them from familiar parts.
 
 ```
-  Input:    "unhappiness"
+  Input:    "happiness"
 
-  Word-level token:     [ unhappiness ]           ← 1 token (must be in vocabulary)
+  Word-level token:     [ happiness ]              ← 1 token (must be in vocabulary)
 
-  Subword tokens:       [ un | happi | ness ]     ← 3 tokens (composed from common parts)
+  Subword tokens:       [ happi | ness ]           ← 2 tokens (composed from common parts)
 
-  Character tokens:     [ u | n | h | a | p | ... ]  ← 11 tokens (always works, but slow)
+  Character tokens:     [ h | a | p | p | i | ... ]  ← 9 tokens (always works, but slow)
 ```
 
 Subword tokenization hits the sweet spot: common words stay as single tokens (efficient), while rare words are split into recognizable pieces (flexible).
