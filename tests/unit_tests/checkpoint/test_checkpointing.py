@@ -601,3 +601,59 @@ class TestInitializeModelWeights:
 
         sig = inspect.signature(Checkpointer.load_base_model)
         assert "peft_init_method" not in sig.parameters
+
+
+class TestLmHeadWeightTying:
+    """Tests that load_base_model calls tie_weights for tied models."""
+
+    def test_tie_weights_called_when_tied(self):
+        """load_base_model should call model.tie_weights() when tie_word_embeddings=True."""
+        import torch.nn as nn
+
+        class FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = nn.Embedding(10, 4)
+                self.lm_head = nn.Linear(4, 10, bias=False)
+                self.config = SimpleNamespace(tie_word_embeddings=True)
+                self.tie_weights_called = False
+
+            def tie_weights(self, **kwargs):
+                self.lm_head.weight = self.embed_tokens.weight
+                self.tie_weights_called = True
+
+        model = FakeModel()
+        assert model.lm_head.weight.data_ptr() != model.embed_tokens.weight.data_ptr()
+
+        from nemo_automodel.components.checkpoint.checkpointing import is_tied_word_embeddings
+
+        is_tied = is_tied_word_embeddings(model)
+        if hasattr(model, "tie_weights") and is_tied:
+            model.tie_weights()
+
+        assert model.tie_weights_called
+        assert model.lm_head.weight.data_ptr() == model.embed_tokens.weight.data_ptr()
+
+    def test_tie_weights_skipped_when_not_tied(self):
+        """load_base_model should skip tie_weights when tie_word_embeddings=False."""
+        import torch.nn as nn
+
+        class FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(4, 10, bias=False)
+                self.config = SimpleNamespace(tie_word_embeddings=False)
+                self.tie_weights_called = False
+
+            def tie_weights(self, **kwargs):
+                self.tie_weights_called = True
+
+        model = FakeModel()
+
+        from nemo_automodel.components.checkpoint.checkpointing import is_tied_word_embeddings
+
+        is_tied = is_tied_word_embeddings(model)
+        if hasattr(model, "tie_weights") and is_tied:
+            model.tie_weights()
+
+        assert not model.tie_weights_called

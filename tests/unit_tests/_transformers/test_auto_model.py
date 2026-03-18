@@ -928,6 +928,28 @@ class TestBuildModelRetryDepth:
             assert result is sentinel_model
             assert mock_init.call_count == 2
 
+    def test_meta_tensor_runtime_error_retries_without_meta_device(self):
+        """RuntimeError with 'meta tensors' triggers retry without meta device."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        sentinel_model = MagicMock()
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
+            patch("nemo_automodel._transformers.auto_model._init_model") as mock_init,
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=2),
+            patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=mock_config),
+            patch("nemo_automodel._transformers.auto_model._maybe_dequantize_fp8_for_peft", return_value=False),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            mock_init.side_effect = [
+                RuntimeError("Tensor.item() cannot be called on meta tensors"),
+                (False, sentinel_model),
+            ]
+            result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+            assert result is sentinel_model
+            assert mock_init.call_count == 2
+
 
 class TestNeMoAutoModelForMultimodalLM:
     """Tests for the NeMoAutoModelForMultimodalLM class and its exports."""

@@ -428,15 +428,21 @@ def apply_model_infrastructure(
 
     checkpoint_already_loaded = False
     if load_before_shard:
-        lora_a_init = getattr(peft_config, "lora_A_init", None)
-        checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
-        checkpointer.load_base_model(
-            model,
-            device,
-            cache_dir,
-            pretrained_model_name_or_path,
-            load_base_model=load_base_model,
-        )
+        if is_meta_device:
+            lora_a_init = getattr(peft_config, "lora_A_init", None)
+            checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
+            checkpointer.load_base_model(
+                model,
+                device,
+                cache_dir,
+                pretrained_model_name_or_path,
+                load_base_model=load_base_model,
+            )
+        else:
+            # Non-meta models already have weights from from_pretrained.
+            # Still call load_base_model with load_base_model=False to
+            # handle weight tying
+            checkpointer.load_base_model(model, device, cache_dir, pretrained_model_name_or_path, load_base_model=False)
         checkpoint_already_loaded = True
 
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
