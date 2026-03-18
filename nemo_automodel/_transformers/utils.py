@@ -213,7 +213,7 @@ def _patch_phi4mm_processor():
     def _patched(cls, pretrained_model_name_or_path, *args, **kwargs):
         try:
             return _orig(cls, pretrained_model_name_or_path, *args, **kwargs)
-        except (AttributeError, Exception) as e:
+        except AttributeError as e:
             if "image_token" not in str(e) and "audio_token" not in str(e):
                 raise
             import json
