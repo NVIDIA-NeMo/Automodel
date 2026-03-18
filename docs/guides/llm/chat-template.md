@@ -26,7 +26,7 @@ If you need to override the tokenizer's built-in template or provide one where n
 :::{note}
 **Before you start:**
 - The examples below use `Qwen/Qwen3-4B`, which ships with a built-in chat template. Any instruct model with a `chat_template` in its tokenizer config works the same way.
-- The tokenizer is injected into the dataset by the recipe at runtime. You do not specify it in the YAML `dataset` block.
+- The tokenizer is injected into the dataset by the recipe at runtime. You do not need to specify it in the YAML `dataset` block.
 - **`answer_only_loss_mask`**: When `true`, prompt tokens are masked with `-100` so the training loss is computed only on the assistant response. This is the recommended setting for instruction tuning.
 :::
 
