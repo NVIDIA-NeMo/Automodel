@@ -356,11 +356,39 @@ class TestApplyCacheCompatibilityPatchesIntegration:
         assert result == 85
 
     def test_patches_tied_weights_keys_list_to_dict(self):
-        """post_init should convert _tied_weights_keys from list to dict."""
+        """post_init should convert _tied_weights_keys from list to correct {target: source} dict."""
         apply_cache_compatibility_patches()
         from transformers.modeling_utils import PreTrainedModel
 
         assert getattr(PreTrainedModel.post_init, "_nemo_tied_keys_patched", False)
+
+    def test_tied_weights_keys_patch_resolves_correct_source(self):
+        """The post_init patch should map tied keys to model.embed_tokens.weight, not self-map."""
+        apply_cache_compatibility_patches()
+        import torch.nn as nn
+        from transformers import PretrainedConfig
+        from transformers.modeling_utils import PreTrainedModel
+
+        class FakeCfg(PretrainedConfig):
+            model_type = "fake_tied_test"
+
+        class FakeRemoteModel(PreTrainedModel):
+            config_class = FakeCfg
+            _tied_weights_keys = ["lm_head.weight"]
+
+            def __init__(self, config):
+                super().__init__(config)
+                self.model = nn.Module()
+                self.model.embed_tokens = nn.Embedding(10, 4)
+                self.lm_head = nn.Linear(4, 10, bias=False)
+                self.post_init()
+
+        config = FakeCfg(tie_word_embeddings=True)
+        model = FakeRemoteModel(config)
+        tied = model._tied_weights_keys
+        assert isinstance(tied, dict)
+        assert "lm_head.weight" in tied
+        assert tied["lm_head.weight"] == "model.embed_tokens.weight"
 
     def test_patches_peft_prepare_inputs(self):
         """PeftModelForCausalLM.__init__ should be patched for missing prepare_inputs_for_generation."""

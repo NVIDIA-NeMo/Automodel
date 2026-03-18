@@ -603,51 +603,11 @@ class TestInitializeModelWeights:
         assert "peft_init_method" not in sig.parameters
 
 
-class TestLmHeadWeightTyingFallback:
-    """Tests for lm_head weight tying fallback when PeftModel hides embed_tokens."""
+class TestLmHeadWeightTying:
+    """Tests that load_base_model calls tie_weights for tied models."""
 
-    def test_tie_weights_fallback_copies_embed_to_lm_head(self):
-        """When tie_weights fails and lm_head is zeros, find embed_tokens and tie."""
-        import torch.nn as nn
-
-        class FakeModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.embed_tokens = nn.Embedding(100, 16)
-                self.lm_head = nn.Linear(16, 100, bias=False)
-                # Simulate broken tying: lm_head is zeros
-                self.lm_head.weight = nn.Parameter(torch.zeros(100, 16))
-                self.config = SimpleNamespace(
-                    model_type="test",
-                    tie_word_embeddings=True,
-                    _name_or_path="test",
-                )
-
-            def tie_weights(self):
-                # Simulate tie_weights failing (PeftModel hides embed_tokens)
-                pass
-
-        model = FakeModel()
-        assert model.lm_head.weight.data.sum() == 0
-
-        # Simulate what load_base_model does after tie_weights
-        from nemo_automodel.components.checkpoint.checkpointing import is_tied_word_embeddings
-
-        is_tied = is_tied_word_embeddings(model)
-        if hasattr(model, "tie_weights") and is_tied:
-            model.tie_weights()
-            if hasattr(model, "lm_head") and model.lm_head.weight.data.sum() == 0:
-                for _name, _mod in model.named_modules():
-                    if _name.endswith("embed_tokens") and hasattr(_mod, "weight") and _mod.weight.data.sum() != 0:
-                        model.lm_head.weight = _mod.weight
-                        break
-
-        # lm_head should now point to embed_tokens weight
-        assert model.lm_head.weight.data_ptr() == model.embed_tokens.weight.data_ptr()
-        assert model.lm_head.weight.data.sum() != 0
-
-    def test_tie_weights_noop_when_lm_head_nonzero(self):
-        """Fallback should not run when lm_head already has weights."""
+    def test_tie_weights_called_when_tied(self):
+        """load_base_model should call model.tie_weights() when tie_word_embeddings=True."""
         import torch.nn as nn
 
         class FakeModel(nn.Module):
@@ -655,14 +615,45 @@ class TestLmHeadWeightTyingFallback:
                 super().__init__()
                 self.embed_tokens = nn.Embedding(10, 4)
                 self.lm_head = nn.Linear(4, 10, bias=False)
-                # lm_head already has nonzero weights (tying worked normally)
                 self.config = SimpleNamespace(tie_word_embeddings=True)
+                self.tie_weights_called = False
 
-            def tie_weights(self):
+            def tie_weights(self, **kwargs):
                 self.lm_head.weight = self.embed_tokens.weight
+                self.tie_weights_called = True
 
         model = FakeModel()
-        model.tie_weights()
+        assert model.lm_head.weight.data_ptr() != model.embed_tokens.weight.data_ptr()
 
-        # Fallback guard: lm_head.sum() != 0, so no manual search needed
-        assert model.lm_head.weight.data.sum() != 0
+        from nemo_automodel.components.checkpoint.checkpointing import is_tied_word_embeddings
+
+        is_tied = is_tied_word_embeddings(model)
+        if hasattr(model, "tie_weights") and is_tied:
+            model.tie_weights()
+
+        assert model.tie_weights_called
+        assert model.lm_head.weight.data_ptr() == model.embed_tokens.weight.data_ptr()
+
+    def test_tie_weights_skipped_when_not_tied(self):
+        """load_base_model should skip tie_weights when tie_word_embeddings=False."""
+        import torch.nn as nn
+
+        class FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(4, 10, bias=False)
+                self.config = SimpleNamespace(tie_word_embeddings=False)
+                self.tie_weights_called = False
+
+            def tie_weights(self, **kwargs):
+                self.tie_weights_called = True
+
+        model = FakeModel()
+
+        from nemo_automodel.components.checkpoint.checkpointing import is_tied_word_embeddings
+
+        is_tied = is_tied_word_embeddings(model)
+        if hasattr(model, "tie_weights") and is_tied:
+            model.tie_weights()
+
+        assert not model.tie_weights_called
