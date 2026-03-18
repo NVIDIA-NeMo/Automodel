@@ -2,6 +2,26 @@
 
 When [fine-tuning](finetune.md) an instruct model on a custom dataset, the training data must be formatted with the same special tokens the model expects at inference time. A **chat template** is a template string (stored in `tokenizer.chat_template`) that defines this formatting — it controls how system prompts, user messages, and assistant responses are wrapped with model-specific control tokens such as `<|im_start|>` / `<|im_end|>` (Qwen) or `<|start_header_id|>` / `<|end_header_id|>` (Llama-3). Chat templates are most commonly written in [Jinja](https://jinja.palletsprojects.com/), a widely used templating language, though other formats exist.
 
+For example, a minimal ChatML-style chat template looks like this:
+
+```jinja
+{% for message in messages %}
+<|im_start|>{{ message['role'] }}
+{{ message['content'] }}<|im_end|>
+{% endfor %}
+```
+
+Given a user message `"What is 2+2?"` and an assistant reply `"4"`, this template produces:
+
+```
+<|im_start|>user
+What is 2+2?<|im_end|>
+<|im_start|>assistant
+4<|im_end|>
+```
+
+Every model family defines its own template with its own control tokens — your model's template will likely differ from this example. For background on tokenization, special tokens, and how they relate to chat templates, see the [Tokenization guide](tokenization.md).
+
 This guide shows how to enable chat template formatting in NeMo AutoModel for LLM fine-tuning. It covers two dataset classes and one override mechanism.
 
 :::{note}
@@ -149,16 +169,7 @@ There are two distinct cases where you need the `chat_template` parameter on `Ch
 1. **Override**: The tokenizer has a built-in template, but you want a different format (e.g., to match your deployment API).
 2. **Provision**: The tokenizer has no template at all (common with base model tokenizers), and you need to supply one.
 
-Here is a simplified ChatML-style template for reference:
-
-```jinja
-{% for message in messages %}
-<|im_start|>{{ message['role'] }}
-{{ message['content'] }}<|im_end|>
-{% endfor %}
-```
-
-Every model family defines its own template with its own control tokens — the template your model ships with will likely differ from this example. Always inspect the tokenizer's built-in template (see [Verifying the Template Before Training](#verifying-the-template-before-training)) before writing a custom one.
+See the [reference example in the introduction](#configure-chat-templates-for-llm-fine-tuning) for what a chat template looks like. Always inspect the tokenizer's built-in template (see [Verifying the Template Before Training](#verifying-the-template-before-training)) before writing a custom one.
 
 In both cases, the `chat_template` parameter accepts the following input forms:
 
