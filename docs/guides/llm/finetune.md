@@ -67,11 +67,11 @@ model:
 
 This guide uses **Meta LLaMA 3.2 1B** as a running example. Replace `pretrained_model_name_or_path` with any supported [Hugging Face model ID](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/model-coverage/llm.md).
 
-:::{details} About LLaMA 3.2 1B
+:::{dropdown} About LLaMA 3.2 1B
 LLaMA is a family of decoder-only transformer models developed by Meta. The 1B variant is a compact model suitable for research and edge deployment, featuring RoPE positional embeddings, grouped-query attention (GQA), and SwiGLU activations.
 :::
 
-:::{details} Accessing gated models
+:::{dropdown} Accessing gated models
 Some Hugging Face models are **gated**. If the model page shows a "Request access" button:
 
 1. Log in with your Hugging Face account and accept the license.
@@ -96,7 +96,7 @@ validation_dataset:
 
 This guide uses **SQuAD v1.1** as a running example. Swap the dataset by changing `_target_` and the dataset arguments — see [Integrate Your Own Text Dataset](dataset.md) and [Dataset Overview](../dataset-overview.md).
 
-:::{details} About SQuAD v1.1
+:::{dropdown} About SQuAD v1.1
 The Stanford Question Answering Dataset (SQuAD) is a reading comprehension dataset where each example consists of a Wikipedia passage, a question, and a span answer. SQuAD v1.1 guarantees all questions are answerable from the context, making it suitable for straightforward fine-tuning.
 
 Example:
@@ -132,7 +132,7 @@ All other settings (distributed strategy, optimizer, checkpointing, logging) use
 
 ### Full Recipe YAML
 
-:::{details} finetune_config.yaml (click to expand)
+:::{dropdown} finetune_config.yaml (click to expand)
 Save as `finetune_config.yaml`. This config runs PEFT (LoRA). To run SFT instead, remove the `peft:` section.
 
 ```yaml
@@ -207,7 +207,7 @@ Each log line reports the current loss, gradient norm, peak GPU memory, and toke
 
 Checkpoints are saved in native Hugging Face format, so no conversion is required — they work directly with Transformers, PEFT, vLLM, lm-eval-harness, and other tools in the Hugging Face ecosystem. SFT and PEFT produce different checkpoint layouts. **SFT checkpoints** contain the full model weights at `model/consolidated/` and can be loaded directly. **PEFT checkpoints** contain only the adapter weights (~MBs instead of GBs) — at inference time you must load the original base model and apply the adapter on top. This distinction affects every downstream step (inference, publishing, deployment).
 
-:::{details} Checkpoint directory structure
+:::{dropdown} Checkpoint directory structure
 **SFT checkpoint:**
 ```bash
 $ tree checkpoints/epoch_0_step_10/
@@ -488,7 +488,7 @@ All other config sections remain the same for both modes.
 
 ### Full Configuration
 
-:::{details} Full Config
+:::{dropdown} Full Config
 :open:
 ```yaml
 # ── Model ──
