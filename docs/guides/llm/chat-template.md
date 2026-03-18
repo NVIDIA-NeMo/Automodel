@@ -1,6 +1,6 @@
 # Configure Chat Templates for LLM Fine-Tuning
 
-When fine-tuning an instruct model on a custom dataset, the training data must be formatted with the same special tokens the model expects at inference time. A **chat template** is the Jinja string (stored in `tokenizer.chat_template`) that defines this formatting — it controls how system prompts, user messages, and assistant responses are wrapped with model-specific control tokens such as `<|im_start|>` / `<|im_end|>` (Qwen) or `<|start_header_id|>` / `<|end_header_id|>` (Llama-3).
+When fine-tuning an instruct model on a custom dataset, the training data must be formatted with the same special tokens the model expects at inference time. A **chat template** is a template string (stored in `tokenizer.chat_template`) that defines this formatting — it controls how system prompts, user messages, and assistant responses are wrapped with model-specific control tokens such as `<|im_start|>` / `<|im_end|>` (Qwen) or `<|start_header_id|>` / `<|end_header_id|>` (Llama-3). Chat templates are most commonly written in [Jinja](https://jinja.palletsprojects.com/), a widely used templating language, though other formats exist.
 
 This guide shows how to enable chat template formatting in NeMo AutoModel for LLM fine-tuning. It covers two dataset classes and one override mechanism.
 
