@@ -185,7 +185,9 @@ def apply_cache_compatibility_patches():
         def _patched_post_init(self):
             tied = getattr(self, "_tied_weights_keys", None)
             if isinstance(tied, list):
-                self._tied_weights_keys = {k: "model.embed_tokens.weight" for k in tied}
+                model_type = getattr(getattr(self, "config", None), "model_type", None)
+                if model_type == "phi4mm":
+                    self._tied_weights_keys = {k: "model.embed_tokens.weight" for k in tied}
             return _orig_post_init(self)
 
         mu.PreTrainedModel.post_init = _patched_post_init
