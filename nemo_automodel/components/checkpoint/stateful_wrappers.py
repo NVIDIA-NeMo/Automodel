@@ -254,20 +254,11 @@ class ModelState:
         if self.is_init_step:
             return self._get_base_model_state_dict()
 
-        # For PEFT models with quantized parameters or expert parallelism, bypass
-        # PyTorch DCP's get_model_state_dict() which fails when: (1) traversing
-        # quantized parameter types like Params4bit (QLoRA with BitsAndBytes); or
-        # (2) expert weights are sharded across EP ranks (MoE+EP), causing DCP to
-        # raise KeyError on expert-parallel FQNs. Instead, directly collect
-        # trainable PEFT adapter weights.
-        if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
+        # For PEFT models bypass DCP; instead collect trainable PEFT adapter weights.
+        if self.is_peft:
             model_state_dict = {k: v for sd in map(_get_peft_state_dict, self.model) for k, v in sd.items()}
         else:
-            options = None
-            if self.is_peft:
-                options = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=True)
-
-            func = partial(get_model_state_dict, options=options)
+            func = partial(get_model_state_dict, options=None)
             model_state_dict = {k: v for sd in map(func, self.model) for k, v in sd.items()}
 
         if self.is_tied_lm_head:
