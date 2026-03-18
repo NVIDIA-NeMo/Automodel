@@ -20,6 +20,7 @@ personas:
 - DevOps Professionals
 difficulty: beginner
 content_type: index
+---
 
 (automodel-home)=
 
