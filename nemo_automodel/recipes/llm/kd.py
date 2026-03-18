@@ -17,9 +17,9 @@
 This recipe fine-tunes a *student* model using the logits of a frozen *teacher* model. It
 extends ``FinetuneRecipeForNextTokenPrediction`` adding:
 
-1. teacher_model  an additional HF/NeMo model loaded in ``eval`` mode
-2. kd_loss_fn     KL-divergence between temperature-scaled distributions
-3. kd_ratio       linear mix between CE loss and KD loss
+1. teacher_model — an additional HF/NeMo model loaded in ``eval`` mode
+2. kd_loss_fn    — KL-divergence between temperature-scaled distributions
+3. kd_ratio      — linear mix between CE loss and KD loss
 
 The training loop is copied from the parent class but the loss becomes:
     loss = (1-kd_ratio) * ce_loss + kd_ratio * kd_loss
