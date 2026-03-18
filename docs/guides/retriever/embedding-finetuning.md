@@ -31,7 +31,7 @@ torchrun --nproc-per-node=8 examples/biencoder/finetune.py \
     --config examples/biencoder/llama3_2_1b_biencoder.yaml
 ```
 
-Or using the AutoModel CLI:
+Or use the AutoModel CLI:
 
 ```bash
 automodel finetune biencoder -c examples/biencoder/llama3_2_1b_biencoder.yaml
@@ -184,7 +184,7 @@ distributed:
   sequence_parallel: false
 ```
 
-FSDP2 for data parallelism. Tensor parallelism available for larger backbones.
+FSDP2 handles data parallelism. Tensor parallelism is available for larger backbones.
 
 :::{note}
 Pipeline parallelism is not supported for biencoder training.
@@ -200,7 +200,7 @@ checkpoint:
   save_consolidated: true
 ```
 
-Saves Hugging Face `safetensors` format, directly loadable for inference or further fine-tuning.
+Checkpoints are saved in Hugging Face `safetensors` format and are directly loadable for inference or further fine-tuning.
 
 ### LoRA/PEFT (Optional)
 
@@ -306,7 +306,7 @@ INFO:root:step 30 | epoch 0 | val_loss 1.1230 | val_acc1 0.7820 | val_mrr 0.8450
 
 ## Using the Fine-Tuned Model
 
-Consolidated checkpoints are in Hugging Face format and loadable directly:
+Consolidated checkpoints are in Hugging Face format and are directly loadable:
 
 ```python
 from sentence_transformers import SentenceTransformer
