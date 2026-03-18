@@ -688,6 +688,42 @@ class TestModelMappingKeyErrorFallback:
         assert is_custom is False
         mock_wrap.assert_called_once_with(FakeModel)
 
+    def test_fallback_path_skips_incompatible_shared_arch_custom_model(self):
+        """Shared architecture names should stay on HF when the config does not match our custom model."""
+
+        class FakeConfig:
+            name_or_path = "test-model"
+            architectures = ["NemotronHForCausalLM"]
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
+        fake_config = FakeConfig()
+        fake_model = FakeModel()
+
+        cls = self._make_cls({FakeConfig: FakeModel})
+        cls._from_config_parent_class = MagicMock(return_value=fake_model)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.ModelRegistry.has_custom_model", return_value=True),
+            patch("nemo_automodel._transformers.model_init.ModelRegistry.resolve_custom_model_cls") as mock_resolve,
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
+        ):
+            mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
+            is_custom, model = _init_model(
+                cls,
+                fake_config,
+                attn_implementation="eager",
+                torch_dtype="auto",
+                quantization_config=None,
+                force_hf=False,
+            )
+
+        assert is_custom is False
+        mock_resolve.assert_not_called()
+        mock_wrap.assert_called_once_with(FakeModel)
+
     def test_fallback_path_unknown_config_falls_back_to_type_model(self):
         """Fallback path: KeyError in _model_mapping falls back to type(model)."""
 
@@ -877,11 +913,37 @@ class TestBuildModelRetryDepth:
             patch("nemo_automodel._transformers.auto_model._init_model") as mock_init,
             patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
             patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
+            patch(
+                "nemo_automodel._transformers.capabilities.attach_capabilities_and_validate",
+                return_value=sentinel_model,
+            ),
             patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
             patch("torch.cuda.current_device", return_value=0),
         ):
             mock_init.side_effect = [
                 ValueError("model does not support sdpa"),
+                (False, sentinel_model),
+            ]
+            result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+            assert result is sentinel_model
+            assert mock_init.call_count == 2
+
+    def test_meta_tensor_runtime_error_retries_without_meta_device(self):
+        """RuntimeError with 'meta tensors' triggers retry without meta device."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        sentinel_model = MagicMock()
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
+            patch("nemo_automodel._transformers.auto_model._init_model") as mock_init,
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=2),
+            patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=mock_config),
+            patch("nemo_automodel._transformers.auto_model._maybe_dequantize_fp8_for_peft", return_value=False),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            mock_init.side_effect = [
+                RuntimeError("Tensor.item() cannot be called on meta tensors"),
                 (False, sentinel_model),
             ]
             result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)

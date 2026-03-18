@@ -22,7 +22,7 @@
 recipe: FinetuneRecipeForVLM
 
 step_scheduler:
-  global_batch_size: 8
+  global_batch_size: 64
   local_batch_size: 8
   ckpt_every_steps: 100
   val_every_steps: 10000  # will run every x number of gradient steps
@@ -54,11 +54,11 @@ checkpoint:
   model_save_format: torch_save
   save_consolidated: false
 
-# distributed:
-#   _target_: nemo_automodel.components.distributed.megatron_fsdp.MegatronFSDPManager
-#   dp_size: none
-#   tp_size: 1
-#   cp_size: 1
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -94,6 +94,7 @@ optimizer:
 freeze_config:
   freeze_embeddings: false
   freeze_vision_tower: true
+  freeze_audio_tower: true
   freeze_language_model: false
   
 # Uncomment and configure for W&B logging
