@@ -16,11 +16,11 @@
 """Calculate truncation percentage for a given dataset and sequence length.
 
 Usage:
-    python scripts/check_truncation.py --dataset allenai/tulu-3-sft-mixture --seq_length 1024
-    python scripts/check_truncation.py --dataset allenai/tulu-3-sft-mixture --seq_length 1024 2048 4096
-    python scripts/check_truncation.py --dataset allenai/tulu-3-sft-mixture --seq_length 2048 --model Qwen/Qwen3-30B-A3B
-    python scripts/check_truncation.py --dataset allenai/tulu-3-sft-mixture --seq_length 2048 --chat_template path/to/template.json
-    python scripts/check_truncation.py --dataset allenai/tulu-3-sft-mixture --seq_length 2048 --num_samples 5000
+    python examples/convergence/tulu3/data/check_truncation.py --dataset allenai/tulu-3-sft-mixture --seq_length 1024
+    python examples/convergence/tulu3/data/check_truncation.py --dataset allenai/tulu-3-sft-mixture --seq_length 1024 2048 4096
+    python examples/convergence/tulu3/data/check_truncation.py --dataset allenai/tulu-3-sft-mixture --seq_length 2048 --model Qwen/Qwen3-30B-A3B
+    python examples/convergence/tulu3/data/check_truncation.py --dataset allenai/tulu-3-sft-mixture --seq_length 2048 --chat_template path/to/template.json
+    python examples/convergence/tulu3/data/check_truncation.py --dataset allenai/tulu-3-sft-mixture --seq_length 2048 --num_samples 5000
 """
 
 import argparse

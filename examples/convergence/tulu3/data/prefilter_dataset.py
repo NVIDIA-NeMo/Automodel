@@ -27,7 +27,7 @@ Strategies benchmarked:
 
 Usage:
     # Benchmark all strategies on 5000 samples, then cache the full filtered dataset
-    python scripts/prefilter_dataset.py \
+    python examples/convergence/tulu3/data/prefilter_dataset.py \
         --dataset allenai/tulu-3-sft-mixture \
         --model Qwen/Qwen3-30B-A3B \
         --seq_length 1024 \
@@ -35,14 +35,14 @@ Usage:
         --benchmark --num_benchmark_samples 5000
 
     # Just cache (no benchmark), save to custom dir
-    python scripts/prefilter_dataset.py \
+    python examples/convergence/tulu3/data/prefilter_dataset.py \
         --dataset allenai/tulu-3-sft-mixture \
         --model Qwen/Qwen3-30B-A3B \
         --seq_length 1024 \
         --cache_dir /path/to/cache
 
     # Use a custom chat template (file path or inline Jinja string)
-    python scripts/prefilter_dataset.py \
+    python examples/convergence/tulu3/data/prefilter_dataset.py \
         --dataset allenai/tulu-3-sft-mixture \
         --model Qwen/Qwen3-30B-A3B \
         --seq_length 1024 \
