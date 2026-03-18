@@ -394,13 +394,8 @@ class OptimizerState:
         Returns:
             dict: Dictionary containing the optimizer and scheduler state dicts with CPU offloading enabled.
         """
-        # For PEFT models with quantized parameters or expert parallelism, bypass
-        # PyTorch DCP's get_optimizer_state_dict() which fails because DCP cannot
-        # build a consistent parameter-ID-to-FQN mapping when the model contains
-        # quantized frozen params (Params4bit/Int8Params) alongside trainable LoRA
-        # params, or when expert weights are sharded across EP ranks (MoE+EP) and
-        # the optimizer only tracks trainable params. Use native state_dict instead.
-        if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
+        # For PEFT models, bypass DCP, use native state_dict instead.
+        if self.is_peft:
             optimizer_state_dict = self.optimizer[0].state_dict()
         else:
             # this line automatically manages FSDP FQN's, as well as sets the default state dict type
@@ -427,7 +422,7 @@ class OptimizerState:
             state_dict (dict): State dictionary containing optimizer and scheduler states to load.
         """
         # For PEFT + quantized or expert-parallel models, use native load to match the native save path.
-        if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
+        if self.is_peft:
             self.optimizer[0].load_state_dict(state_dict["optim"])
         else:
             # sets our state dicts on the optimizer, now that we've loaded
