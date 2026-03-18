@@ -25,7 +25,7 @@ NeMo AutoModel supports two fine-tuning modes:
 |------|---------|-----|------|
 | **1. Install** | [Install NeMo AutoModel](#install-nemo-automodel) | Same | Same |
 | **2. Configure** | [Configure Your Training Recipe](#configure-your-training-recipe) | YAML without `peft:` section | YAML with `peft:` section |
-| **3. Train** | [Fine-Tune the Model](#finetune-the-model) | Same command for both modes | Same command for both modes |
+| **3. Train** | [Fine-Tune the Model](#fine-tune-the-model) | Same command for both modes | Same command for both modes |
 | **4. Inference** | [Run Inference](#run-inference) | Load consolidated checkpoint directly | Load base model + adapter |
 | **5. Evaluate** | [Evaluate the Fine-Tuned Model](#evaluate-the-fine-tuned-model) | Validation loss during training; lm-eval-harness post-training | Same |
 | **6. Publish** | [Publish to HF Hub](#publish-to-the-hugging-face-hub) | Upload `model/consolidated/` | Upload `model/` (adapter only) |
