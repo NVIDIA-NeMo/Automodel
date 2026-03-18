@@ -302,11 +302,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     *model_args,
                     **kwargs,
                 )
-        except NotImplementedError as e:
-            if "Cannot copy out of meta tensor" in str(e) and is_meta_device:
+        except (NotImplementedError, RuntimeError) as e:
+            _meta_err_msgs = ("Cannot copy out of meta tensor", "cannot be called on meta tensors")
+            if any(msg in str(e) for msg in _meta_err_msgs) and is_meta_device:
                 logger.warning(
-                    "Model init hit 'Cannot copy out of meta tensor' (e.g. buffer created with meta but "
-                    "called .to(device)); retrying without meta device.",
+                    "Model init hit meta-tensor error (%s); retrying without meta device.",
+                    type(e).__name__,
                 )
                 del model
                 model = None
