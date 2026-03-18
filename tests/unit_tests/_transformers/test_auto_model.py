@@ -937,6 +937,10 @@ class TestBuildModelRetryDepth:
             patch("nemo_automodel._transformers.auto_model._init_model") as mock_init,
             patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=2),
             patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
+            patch(
+                "nemo_automodel._transformers.capabilities.attach_capabilities_and_validate",
+                return_value=sentinel_model,
+            ),
             patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
             patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=mock_config),
             patch("nemo_automodel._transformers.auto_model._maybe_dequantize_fp8_for_peft", return_value=False),
