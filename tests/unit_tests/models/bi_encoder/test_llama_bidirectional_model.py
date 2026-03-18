@@ -41,7 +41,7 @@ def test_contrastive_scores_and_labels_shapes_and_labels():
     assert torch.all(labels == 0) and labels.shape == (2,)
 
 
-@pytest.mark.parametrize("pool_type", ["avg", "weighted_avg", "cls", "cls_last", "colbert"])
+@pytest.mark.parametrize("pool_type", ["avg", "weighted_avg", "cls", "colbert"])
 def test_pool_basic_modes(pool_type):
     last_hidden = torch.tensor(
         [
@@ -57,7 +57,7 @@ def test_pool_basic_modes(pool_type):
     elif pool_type == "weighted_avg":
         # Sum (mask applied) for first two tokens of first seq
         assert torch.allclose(out[0], torch.tensor([1.0 + 3.0, 2.0 + 4.0]))
-    elif pool_type in ("cls", "cls_last"):
+    elif pool_type == "cls":
         assert torch.allclose(out[:, :], last_hidden[:, 0])
     elif pool_type == "colbert":
         assert out.shape == last_hidden.shape

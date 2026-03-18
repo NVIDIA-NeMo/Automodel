@@ -526,7 +526,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         torch.cuda.reset_peak_memory_stats()
 
 
-def main(default_config_path="examples/encoder/bi_encoder/llama3_2_1b.yaml"):
+def main(default_config_path="examples/retrieval/bi_encoder/llama3_2_1b.yaml"):
     cfg = parse_args_and_load_config(default_config_path)
     recipe = TrainBiEncoderRecipe(cfg)
     recipe.setup()
