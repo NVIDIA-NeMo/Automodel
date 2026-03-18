@@ -316,8 +316,7 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
 
         if isinstance(adapter, EncoderStateDictAdapter):
             final_target_modules = {
-                name[len("model."):] if name.startswith("model.") else name
-                for name in final_target_modules
+                name[len("model.") :] if name.startswith("model.") else name for name in final_target_modules
             }
 
     return sorted(final_target_modules)

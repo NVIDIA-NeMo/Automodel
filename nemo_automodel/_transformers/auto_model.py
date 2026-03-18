@@ -735,11 +735,11 @@ class NeMoAutoModelForTextToWaveform(_BaseNeMoAutoModelClass, AutoModelForTextTo
     pass
 
 
-class _NeMoAutoModelEncoderBase:
+class _NeMoAutoModelForRetrievalBase:
     """Private shared base for encoder auto-models.
 
     Subclasses set ``_ENCODER_CLS_NAME`` to select the concrete encoder class
-    from ``nemo_automodel._transformers.encoder``.
+    from ``nemo_automodel._transformers.retrieval``.
     """
 
     _ENCODER_CLS_NAME: Optional[str] = None  # "BiEncoderModel" or "CrossEncoderModel"
@@ -793,7 +793,7 @@ class _NeMoAutoModelEncoderBase:
         Notes:
             If kernel patching fails, the method retries with adjusted parameters.
         """
-        from nemo_automodel._transformers import encoder as _enc_mod
+        from nemo_automodel._transformers import retrieval as _enc_mod
 
         encoder_cls = getattr(_enc_mod, cls._ENCODER_CLS_NAME)
 
@@ -886,7 +886,7 @@ class _NeMoAutoModelEncoderBase:
         return model
 
 
-class NeMoAutoModelBiEncoder(_NeMoAutoModelEncoderBase):
+class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
     """NeMo AutoModel for bi-encoder embedding tasks with full infrastructure support.
 
     Wraps ``BiEncoderModel.build()`` with kernel patching, PEFT, FSDP, and
@@ -915,14 +915,14 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelEncoderBase):
     ) -> PreTrainedModel:
         """Load a bi-encoder model with infrastructure.
 
-        Accepts all arguments from ``_NeMoAutoModelEncoderBase.from_pretrained``
+        Accepts all arguments from ``_NeMoAutoModelForRetrievalBase.from_pretrained``
         plus the bi-encoder-specific parameters below.
 
         Args:
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
             pooling: Pooling strategy (``'avg'``, ``'cls'``, ``'last'``, etc.).
             l2_normalize: Whether to L2-normalize embeddings.
-            **kwargs: Forwarded to ``_NeMoAutoModelEncoderBase.from_pretrained``.
+            **kwargs: Forwarded to ``_NeMoAutoModelForRetrievalBase.from_pretrained``.
 
         Returns:
             BiEncoderModel instance with loaded weights and all infrastructure applied.
@@ -935,7 +935,7 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelEncoderBase):
         )
 
 
-class NeMoAutoModelCrossEncoder(_NeMoAutoModelEncoderBase):
+class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
     """NeMo AutoModel for cross-encoder scoring tasks with full infrastructure support.
 
     Wraps ``CrossEncoderModel.build()`` with kernel patching, PEFT, FSDP, and

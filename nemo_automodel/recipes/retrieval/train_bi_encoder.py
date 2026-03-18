@@ -135,7 +135,7 @@ def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_wor
         return cfg_dl.instantiate(**dl_kwargs)
 
 
-class TrainRetrieverEncoderRecipe(BaseRecipe):
+class TrainBiEncoderRecipe(BaseRecipe):
     """Recipe for training encoder models with contrastive learning."""
 
     def __init__(self, cfg):
@@ -526,9 +526,9 @@ class TrainRetrieverEncoderRecipe(BaseRecipe):
         torch.cuda.reset_peak_memory_stats()
 
 
-def main(default_config_path="examples/encoder/bi_encoder/llama3_2_1b.yaml"):
+def main(default_config_path="examples/retrieval/bi_encoder/llama3_2_1b.yaml"):
     cfg = parse_args_and_load_config(default_config_path)
-    recipe = TrainRetrieverEncoderRecipe(cfg)
+    recipe = TrainBiEncoderRecipe(cfg)
     recipe.setup()
     recipe.run_train_validation_loop()
 

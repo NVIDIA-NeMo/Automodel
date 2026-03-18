@@ -22,10 +22,10 @@ import numpy as np
 import torch
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.datasets.llm import retrieval_dataset_inline as rdi
-from nemo_automodel.components.datasets.llm import RetrievalEncoderCollator
+from nemo_automodel.components.datasets.llm import BiEncoderCollator
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel._transformers.auto_model import NeMoAutoModelBiEncoder
-from nemo_automodel.recipes.encoder.train_retriever_encoder import contrastive_scores_and_labels
+from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
 
 
 def _resolve_latest_checkpoint_dir(ckpt_root: Path) -> Path:
@@ -64,7 +64,7 @@ def _iter_batches(ds, batch_size: int, max_samples: int):
 def _compute_pos_neg_diffs(
     *,
     model,
-    collator: RetrievalEncoderCollator,
+    collator: BiEncoderCollator,
     ds,
     device: torch.device,
     batch_size: int,
@@ -136,7 +136,7 @@ def load_finetuned_model(model, ft_model_dir: Path):
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare baseline vs fine-tuned encoder models (pos-neg separation)."
+        description="Compare baseline vs fine-tuned bi-encoder models (pos-neg separation)."
     )
     parser.add_argument("base_model_path", type=str, help="Path to base/pretrained HF model")
     parser.add_argument("checkpoint_root", type=str, help="Path to fine-tuned model directory")
@@ -198,7 +198,7 @@ def main() -> int:
     # max_samples for the batching iterator: use all rows unless capped via CLI.
     max_samples = args.max_samples if args.max_samples is not None else len(ds)
 
-    collator = RetrievalEncoderCollator(
+    collator = BiEncoderCollator(
         tokenizer=tokenizer,
         q_max_len=max_length,
         p_max_len=max_length,

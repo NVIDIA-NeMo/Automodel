@@ -1,10 +1,10 @@
-# Encoder Retrieval Dataset (Embedding Fine-tuning)
+# Retrieval Dataset (Embedding Fine-tuning)
 
-NeMo Automodel supports **encoder/embedding model fine-tuning** using a retrieval-style dataset: each training example is a **query** paired with **one positive** document and **one or more negative** documents.
+NeMo Automodel supports **retrieval model fine-tuning** using a retrieval-style dataset: each training example is a **query** paired with **one positive** document and **one or more negative** documents.
 
-This dataset is used by the encoder recipes (see `examples/encoder/bi_encoder/` and `examples/encoder/cross_encoder/`) together with the `RetrievalEncoderCollator`.
+This dataset is used by the retrieval recipes (see `examples/retrieval/bi_encoder/` and `examples/retrieval/cross_encoder/`) together with the `BiEncoderCollator`.
 
-## What the Encoder Consumes
+## What the Bi-Encoder Consumes
 
 The dataset factory `nemo_automodel.components.datasets.llm.make_retrieval_dataset` returns a Hugging Face `datasets.Dataset`. At runtime it transforms each raw record into the training-time schema:
 
@@ -78,7 +78,7 @@ This is convenient for custom fine-tuning pipelines where the documents are incl
 
 ## YAML Usage (Dataset + Collator)
 
-Use the dataset factory plus the encoder collator:
+Use the dataset factory plus the bi-encoder collator:
 
 ```yaml
 dataloader:
@@ -92,7 +92,7 @@ dataloader:
     do_shuffle: true
     use_dataset_instruction: false
   collate_fn:
-    _target_: nemo_automodel.components.datasets.llm.RetrievalEncoderCollator
+    _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
     q_max_len: 512
     p_max_len: 512
     query_prefix: "query:"
