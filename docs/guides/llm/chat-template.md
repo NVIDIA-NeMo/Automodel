@@ -24,10 +24,7 @@ Your data format determines which dataset class to use:
 If you need to override the tokenizer's built-in template or provide one where none exists, see [Custom or Missing Template](#custom-or-missing-template). If your data format does not fit either class, see [Integrate Your Own Text Dataset](dataset.md) for writing a custom dataset class.
 
 :::{note}
-**Before you start:**
-- The examples below use `Qwen/Qwen3-4B`, which ships with a built-in chat template. Any instruct model with a `chat_template` in its tokenizer config works the same way.
-- The tokenizer is injected into the dataset by the recipe at runtime. You do not need to specify it in the YAML `dataset` block.
-- **`answer_only_loss_mask`**: When `true`, prompt tokens are masked with `-100` so the training loss is computed only on the assistant response. This is the recommended setting for instruction tuning.
+The examples below use `Qwen/Qwen3-4B`, which ships with a built-in chat template. Any instruct model with a `chat_template` in its tokenizer config works the same way.
 :::
 
 ---
@@ -70,6 +67,9 @@ dataset:
   answer_only_loss_mask: true
   use_hf_chat_template: true  # <-- enables chat template formatting
 ```
+
+- **`answer_only_loss_mask`**: When `true`, prompt tokens are masked with `-100` so the training loss is computed only on the assistant response. This is the recommended setting for instruction tuning.
+- The tokenizer is injected into the dataset by the recipe at runtime — you do not need to specify it in the YAML `dataset` block.
 
 If your dataset has no system/context field, use a two-column mapping:
 
@@ -149,6 +149,17 @@ There are two distinct cases where you need the `chat_template` parameter on `Ch
 1. **Override**: The tokenizer has a built-in template, but you want a different format (e.g., to match your deployment API).
 2. **Provision**: The tokenizer has no template at all (common with base model tokenizers), and you need to supply one.
 
+Here is a simplified ChatML-style template for reference:
+
+```jinja
+{% for message in messages %}
+<|im_start|>{{ message['role'] }}
+{{ message['content'] }}<|im_end|>
+{% endfor %}
+```
+
+Every model family defines its own template with its own control tokens — the template your model ships with will likely differ from this example. Always inspect the tokenizer's built-in template (see [Verifying the Template Before Training](#verifying-the-template-before-training)) before writing a custom one.
+
 In both cases, the `chat_template` parameter accepts the following input forms:
 
 | Input | Behavior |
@@ -222,6 +233,6 @@ messages = [
 tokenized = tokenizer.apply_chat_template(messages, tokenize=True, return_dict=True)
 ```
 
-`ChatDataset` follows the same path but reads the `messages` list directly from the data row. If the tokenizer's template contains a `{%- generation -%}` block, the `return_assistant_tokens_mask` flag is used to obtain a per-token mask; otherwise, the mask is derived by tokenizing the prompt portion separately and computing the length difference.
+`ChatDataset` follows the same path but reads the `messages` list directly from the data row. Some chat templates include a `{%- generation -%}` block — a Jinja directive that marks where the assistant's response begins. When this block is present, `apply_chat_template` can accept a `return_assistant_tokens_mask` flag to return a per-token boolean mask that identifies assistant tokens directly. When the block is absent, the mask is derived by tokenizing the prompt portion separately and computing the length difference.
 
 The underlying formatting functions live in `nemo_automodel/components/datasets/llm/formatting_utils.py`.
