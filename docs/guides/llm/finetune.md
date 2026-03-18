@@ -104,7 +104,7 @@ This structure is ideal for training models in context-based question answering,
 :::{tip}
 In this guide, we use the `SQuAD v1.1` dataset, but you can use your own data.
 
-To do so, edit the YAML `dataset` / `validation_dataset` sections (for example `dataset._target_`, `dataset_name`/`path_or_dataset`, and `split`). See [Integrate Your Own Text Dataset](dataset.md) and [Dataset Overview](../dataset-overview.md).
+To do so, edit the YAML `dataset` / `validation_dataset` sections (for example `dataset._target_`, `dataset_name`/`path_or_dataset`, and `split`). See [Integrate Your Own Text Dataset](dataset.md), [Dataset Overview](../dataset-overview.md), and [Chat Template Guide](chat-template.md) (for instruct model fine-tuning with custom datasets).
 :::
 
 ## Use a Recipe to Fine-Tune the Model

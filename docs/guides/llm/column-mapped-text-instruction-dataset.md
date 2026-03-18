@@ -171,7 +171,7 @@ Delta Lake / Databricks (including `delta_sql_query` and authentication) is supp
 | `split`                 | `"train"` | Which split to pull from a HF repo (`train`, `validation`, etc.). Ignored for local JSON/JSONL. |
 | `name`                  | `None`    | Name of the Hugging Face dataset configuration/subset to load. |
 | `answer_only_loss_mask` | `True`    | Mask prompt tokens in `labels` with `-100` (the standard CrossEntropy `ignore_index`). |
-| `use_hf_chat_template`  | `False`   | If `True` and the tokenizer supports chat templates, format as a system/user/assistant conversation via `tokenizer.apply_chat_template(...)`. |
+| `use_hf_chat_template`  | `False`   | If `True` and the tokenizer supports chat templates, format as a system/user/assistant conversation via `tokenizer.apply_chat_template(...)`. See the [Chat Template Guide](chat-template.md) for a detailed walkthrough. |
 | `seq_length`            | `None`    | Optional max sequence length; used for padding/truncation when enabled. |
 | `padding`               | `"do_not_pad"` | Padding strategy passed to the tokenizer (`"do_not_pad"`, `"max_length"`, `True`, etc.). |
 | `truncation`            | `"do_not_truncate"` | Truncation strategy passed to the tokenizer (`"do_not_truncate"`, `True`, etc.). |
