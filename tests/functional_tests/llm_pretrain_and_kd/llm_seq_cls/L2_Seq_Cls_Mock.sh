@@ -15,13 +15,6 @@
 #!/bin/bash
 set -xeuo pipefail
 
-export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
-
-# Propagate -s flag if PYTEST_PROPAGATE_S is set
-PYTEST_S_FLAG=""
-if [ "${PYTEST_PROPAGATE_S:-}" = "1" ]; then
-    PYTEST_S_FLAG="-s"
-fi
-
-coverage run \
-    -m pytest $PYTEST_S_FLAG tests/functional_tests/hf_peft/test_merge_lora.py::TestMoELoRAMerge -v
+TRANSFORMERS_OFFLINE=1 coverage run \
+examples/llm_seq_cls/seq_cls.py \
+  --config tests/functional_tests/llm_pretrain_and_kd/llm_seq_cls/seq_cls_bert_mock.yaml

@@ -1,4 +1,4 @@
-# Copyright (c) 2020-2025, NVIDIA CORPORATION.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,25 +13,31 @@
 # limitations under the License.
 
 #!/bin/bash
-set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
+set -xeuo pipefail
 
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
-examples/llm_finetune/finetune.py \
-  --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+# Multi-GPU KD smoke test with FSDP2.
+# Validates that the teacher forward pass works correctly under FSDP2 sharding
+# (regression test for torch.inference_mode vs torch.no_grad compatibility).
+TRANSFORMERS_OFFLINE=1 python3 \
+-m torch.distributed.run --nproc_per_node=2 --nnodes=1 \
+-m coverage run \
+examples/llm_kd/kd.py \
+  --config examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml \
   --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
-  --step_scheduler.max_steps 3 \
-  --step_scheduler.global_batch_size 8 \
-  --step_scheduler.local_batch_size 4 \
+  --teacher_model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
+  --step_scheduler.max_steps 2 \
+  --step_scheduler.global_batch_size 2 \
+  --step_scheduler.local_batch_size 1 \
   --step_scheduler.val_every_steps 1 \
   --loss_fn._target_ nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy \
   --dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
   --validation_dataset.tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
   --dataset.dataset_name $HF_CACHE/squad/ \
-  --dataset.limit_dataset_samples 10 \
+  --dataset.limit_dataset_samples 8 \
   --validation_dataset.dataset_name $HF_CACHE/squad/ \
-  --validation_dataset.limit_dataset_samples 10 \
-  --distributed.strategy ddp \
-  --distributed.activation_checkpointing true
+  --validation_dataset.limit_dataset_samples 8 \
+  --distributed.activation_checkpointing true \
+  --checkpoint.enabled false

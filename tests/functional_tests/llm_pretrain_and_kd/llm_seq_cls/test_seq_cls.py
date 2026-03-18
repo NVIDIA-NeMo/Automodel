@@ -1,4 +1,4 @@
-# Copyright (c) 2020-2025, NVIDIA CORPORATION.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,16 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-#!/bin/bash
-set -xeuo pipefail
+import shutil
 
-export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
+from tests.utils.test_utils import run_test_script
 
-# Propagate -s flag if PYTEST_PROPAGATE_S is set
-PYTEST_S_FLAG=""
-if [ "${PYTEST_PROPAGATE_S:-}" = "1" ]; then
-    PYTEST_S_FLAG="-s"
-fi
+TEST_FOLDER = "llm_pretrain_and_kd/llm_seq_cls/"
+SEQ_CLS_MOCK_FILENAME = "L2_Seq_Cls_Mock.sh"
 
-coverage run \
-    -m pytest $PYTEST_S_FLAG tests/functional_tests/hf_peft/test_merge_lora.py::TestMoELoRAMerge -v
+
+class TestSequenceClassification:
+    def test_seq_cls_mock(self):
+        try:
+            run_test_script(TEST_FOLDER, SEQ_CLS_MOCK_FILENAME)
+        finally:
+            shutil.rmtree("checkpoints_seq_cls_test/", ignore_errors=True)
