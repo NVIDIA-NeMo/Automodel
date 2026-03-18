@@ -205,7 +205,7 @@ def _patch_phi4mm_processor():
     """
     import transformers.processing_utils as pu
 
-    if getattr(pu.ProcessorMixin.from_pretrained, "_nemo_phi4mm_patched", False):
+    if getattr(pu.ProcessorMixin.__dict__.get("from_pretrained"), "_nemo_phi4mm_patched", False):
         return
     _orig = pu.ProcessorMixin.from_pretrained.__func__
 
