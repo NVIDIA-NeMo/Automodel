@@ -107,7 +107,7 @@ from nemo_automodel.components.datasets.llm import ChatDataset
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B-Instruct")
 
 ds = ChatDataset(
-    path_or_dataset_id="data/my_chat_data/train.jsonl",
+    path_or_dataset_id="data/my_chat_data/train.jsonl",  # save Data Format examples as one JSON object per line
     tokenizer=tokenizer,
     seq_length=2048,
     padding="max_length",
