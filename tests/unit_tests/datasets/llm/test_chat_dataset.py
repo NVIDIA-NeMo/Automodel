@@ -282,6 +282,24 @@ class TestParquetLoading:
         result = tcd._load_openai_messages(str(tmp_path), split="train[:2]")
         assert len(result) == 2
 
+    def test_load_single_parquet_file(self, tmp_path):
+        """Loading a single .parquet file path should work via data_files."""
+        from datasets import Dataset
+
+        data = [
+            {"messages": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}]},
+            {"messages": [{"role": "user", "content": "ping"}, {"role": "assistant", "content": "pong"}]},
+            {"messages": [{"role": "user", "content": "foo"}, {"role": "assistant", "content": "bar"}]},
+        ]
+        ds = Dataset.from_list(data)
+        pq_file = tmp_path / "single.parquet"
+        ds.to_parquet(pq_file)
+
+        result = tcd._load_openai_messages(str(pq_file), split="train")
+        assert len(result) == 3
+        assert result[0]["messages"][0]["content"] == "hello"
+        assert result[2]["messages"][1]["content"] == "bar"
+
     def test_directory_without_parquet_falls_through(self, tmp_path):
         """A directory without .parquet files should not be handled by the Parquet path."""
         (tmp_path / "data.jsonl").write_text('{"messages": [{"role": "user", "content": "hi"}]}\n')

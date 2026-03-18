@@ -62,8 +62,7 @@ if 'rope_parameters' in cfg and 'rope_theta' in cfg['rope_parameters']:
     print(f'Patched rope_theta={cfg[\"rope_theta\"]} in $CONFIG')
 else:
     print('No rope_parameters.rope_theta found, skipping patch')
-"
-else
+"; else
   echo "WARNING: $CONFIG not found, skipping rope_theta patch"
 fi
 
@@ -87,4 +86,4 @@ lm_eval --model vllm \
     --fewshot_as_multiturn \
     --log_samples \
     --output_path "$OUTPUT_PATH" \
-    "${EXTRA_ARGS[@]}"
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}

@@ -131,6 +131,7 @@ def _load_openai_messages(
                 load_path,
                 name=name,
                 split=base_split or "train",
+                data_files=p.name if is_parquet_file else None,
                 verification_mode=VerificationMode.NO_CHECKS,
             )
 

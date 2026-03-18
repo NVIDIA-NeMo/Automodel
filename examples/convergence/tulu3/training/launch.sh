@@ -94,4 +94,4 @@ torchrun --nproc-per-node "$NPROC" --tee 3 \
     examples/llm_finetune/finetune.py \
     --config "$CONFIG" \
     $WANDB_ARGS \
-    "${EXTRA_ARGS[@]}"
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
