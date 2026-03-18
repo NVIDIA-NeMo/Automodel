@@ -427,7 +427,6 @@ def test_phi4_mm_collate_fn_raw_audio_passthrough(collate_mod, monkeypatch):
 
 
 @pytest.fixture()
-
 def collate_mod():
     import nemo_automodel.components.datasets.vlm.collate_fns as _m
 
