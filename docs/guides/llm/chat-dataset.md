@@ -100,6 +100,8 @@ Store your samples as **one JSON object per line** in a `.jsonl` file.
 
 The fastest way to try it out — point at a local JSONL file and print the first tokenized sample:
 
+> **Prerequisites**: `pip install nemo-automodel transformers` and, for gated models like Llama, run `huggingface-cli login` first. Save one or more of the JSON examples from the [Data Format](#data-format) section as a `.jsonl` file (one object per line).
+
 ```python
 from transformers import AutoTokenizer
 from nemo_automodel.components.datasets.llm import ChatDataset
@@ -115,7 +117,7 @@ ds = ChatDataset(
 )
 
 sample = ds[0]
-print(sample.keys())  # dict_keys(['input_ids', 'labels', 'attention_mask'])
+print(sample.keys())  # dict_keys(['input_ids', 'labels', 'attention_mask', '___PAD_TOKEN_IDS___'])
 ```
 
 For training, configure the dataset entirely from YAML as shown below.
