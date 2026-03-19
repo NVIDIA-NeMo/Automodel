@@ -1,0 +1,156 @@
+diff --git a/nemo_automodel/_transformers/tokenization/nemo_auto_tokenizer.py b/nemo_automodel/_transformers/tokenization/nemo_auto_tokenizer.py
+--- a/nemo_automodel/_transformers/tokenization/nemo_auto_tokenizer.py
++++ b/nemo_automodel/_transformers/tokenization/nemo_auto_tokenizer.py
+@@ -286,16 +286,21 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
+         ):
+             tokenizer.special_tokens_pattern = "none"
+ 
++        # Only set add_bos/eos_token if the tokenizer already declares the attribute.
++        # Forcing them on tokenizers that don't natively support them (e.g. TikToken)
++        # causes spurious BOS/EOS insertion around every text segment.
+         if add_bos_token and getattr(tokenizer, "bos_token", None) is not None:
+-            try:
+-                tokenizer.add_bos_token = add_bos_token
+-            except ValueError:
+-                tokenizer._add_bos_token = add_bos_token
++            if hasattr(tokenizer, "add_bos_token"):
++                try:
++                    tokenizer.add_bos_token = add_bos_token
++                except ValueError:
++                    tokenizer._add_bos_token = add_bos_token
+         if add_eos_token and getattr(tokenizer, "eos_token", None) is not None:
+-            try:
+-                tokenizer.add_eos_token = add_eos_token
+-            except ValueError:
+-                tokenizer._add_eos_token = add_eos_token
++            if hasattr(tokenizer, "add_eos_token"):
++                try:
++                    tokenizer.add_eos_token = add_eos_token
++                except ValueError:
++                    tokenizer._add_eos_token = add_eos_token
+         # Keep the wrapper class name at runtime, but remember the original HF tokenizer class
+         # so we can save an HF-compatible `tokenizer_class` in `save_pretrained()`.
+         base_tokenizer_cls = type(tokenizer)
+@@ -311,20 +316,95 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
+     def apply_chat_template(self, conversation, *args, **kwargs):
+         has_system = any(isinstance(m, dict) and m.get("role") == "system" for m in conversation)
+         if not has_system:
+-            return super().apply_chat_template(conversation, *args, **kwargs)
++            return self._apply_chat_template_with_slow_fallback(conversation, *args, **kwargs)
+ 
+         system_msgs = [m for m in conversation if isinstance(m, dict) and m.get("role") == "system"]
+         if len(system_msgs) > 1:
+             raise ValueError("System role appeared in multiple messages. Only a single system message is supported.")
+ 
+         try:
+-            return super().apply_chat_template(conversation, *args, **kwargs)
++            return self._apply_chat_template_with_slow_fallback(conversation, *args, **kwargs)
+         except TemplateError as e:
+             if "System role not supported" not in str(e):
+                 raise
+             logger.debug("Chat template does not support system role; merging into first user message.")
+             remapped = _remap_system_role(conversation)
+-            return super().apply_chat_template(remapped, *args, **kwargs)
++            return self._apply_chat_template_with_slow_fallback(remapped, *args, **kwargs)
++
++    def _apply_chat_template_with_slow_fallback(self, conversation, *args, **kwargs):
++        """Wrap apply_chat_template with a fallback for slow (Python) tokenizers.
++
++        HF's apply_chat_template uses char_to_token() for generation masks,
++        which only works with fast (Rust) tokenizers. For slow tokenizers
++        (e.g. TikToken), we compute the mask by matching decoded tokens
++        against the rendered text to build a character-to-token mapping.
++        """
++        try:
++            return super().apply_chat_template(conversation, *args, **kwargs)
++        except ValueError as e:
++            if "char_to_token() is not available" not in str(e):
++                raise
++
++        # Slow tokenizer path.
++        from transformers.tokenization_utils_base import render_jinja_template
++
++        return_assistant_tokens_mask = kwargs.get("return_assistant_tokens_mask", False)
++        return_dict = kwargs.get("return_dict", False)
++        tokenize = kwargs.get("tokenize", True)
++
++        if not return_assistant_tokens_mask or not tokenize or not return_dict:
++            kwargs["return_assistant_tokens_mask"] = False
++            return super().apply_chat_template(conversation, *args, **kwargs)
++
++        # 1. Render template to get text + generation char ranges.
++        chat_template = kwargs.get("chat_template") or self.chat_template
++        tools = kwargs.get("tools")
++        documents = kwargs.get("documents")
++        add_generation_prompt = kwargs.get("add_generation_prompt", False)
++        continue_final_message = kwargs.get("continue_final_message", False)
++
++        template_kwargs = {**self.special_tokens_map}
++        rendered_chat, generation_indices = render_jinja_template(
++            conversations=[conversation],
++            tools=tools,
++            documents=documents,
++            chat_template=chat_template,
++            return_assistant_tokens_mask=True,
++            continue_final_message=continue_final_message,
++            add_generation_prompt=add_generation_prompt,
++            **template_kwargs,
++        )
++        rendered_text = rendered_chat[0]
++        gen_ranges = generation_indices[0]
++
++        # 2. Tokenize without the mask (avoids char_to_token).
++        kwargs_no_mask = dict(kwargs)
++        kwargs_no_mask["return_assistant_tokens_mask"] = False
++        out = super().apply_chat_template(conversation, *args, **kwargs_no_mask)
++
++        # 3. Build char-to-token map by matching decoded tokens against the text.
++        input_ids = out["input_ids"]
++        token_char_start = []
++        pos = 0
++        for tid in input_ids:
++            decoded = self.decode([tid])
++            match_pos = rendered_text.find(decoded, pos)
++            if match_pos != -1 and match_pos - pos < len(decoded) + 10:
++                token_char_start.append(match_pos)
++                pos = match_pos + len(decoded)
++            else:
++                # Inserted token (BOS/EOS) not in rendered text.
++                token_char_start.append(pos)
++
++        # 4. Build the mask from generation ranges.
++        mask = [0] * len(input_ids)
++        for start_char, end_char in gen_ranges:
++            for i, cs in enumerate(token_char_start):
++                if cs >= start_char and cs < end_char:
++                    mask[i] = 1
++
++        out["assistant_masks"] = mask
++        return out
+ 
+     def __call__(self, *args, **kwargs):
+         tokenized = super().__call__(*args, **kwargs)
+@@ -332,8 +412,8 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
+             return tokenized
+         if isinstance(tokenized, BatchEncoding):
+             _tokenized_keys = {"input_ids", "attention_mask", "assistant_masks"}
+-            add_bos_ids = self.add_bos_token and (getattr(self, "bos_token_id", None) is not None)
+-            add_eos_ids = self.add_eos_token and (getattr(self, "eos_token_id", None) is not None)
++            add_bos_ids = getattr(self, "add_bos_token", False) and (getattr(self, "bos_token_id", None) is not None)
++            add_eos_ids = getattr(self, "add_eos_token", False) and (getattr(self, "eos_token_id", None) is not None)
+             if not "input_ids" in tokenized:
+                 return tokenized
+             if add_bos_ids:
+@@ -354,10 +434,10 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
+         encoded = super().encode(*args, **kwargs)
+         if not kwargs.get("add_special_tokens", True):
+             return encoded
+-        if self.add_bos_token:
++        if getattr(self, "add_bos_token", False):
+             if encoded and (getattr(self, "bos_token_id", None) is not None) and encoded[0] != self.bos_token_id:
+                 encoded = [self.bos_token_id] + encoded
+-        if self.add_eos_token:
++        if getattr(self, "add_eos_token", False):
+             if encoded and (getattr(self, "eos_token_id", None) is not None) and encoded[-1] != self.eos_token_id:
+                 encoded = encoded + [self.eos_token_id]
+         return encoded
