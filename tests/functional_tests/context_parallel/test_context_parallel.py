@@ -23,6 +23,7 @@ from tests.utils.test_utils import run_test_script
 TEST_FOLDER = "context_parallel"
 CP_QWEN3_MOE_ATTENTION_TEST_FILENAME = "L2_CP_Qwen3MoE_Attention_Test.sh"
 CP_DEEPSEEK_V3_MLA_TEST_FILENAME = "L2_CP_DeepSeekV3_MLA_Test.sh"
+CP_QWEN3_5_MOE_LINEAR_ATTN_TEST_FILENAME = "L2_CP_Qwen3_5MoE_LinearAttn_Test.sh"
 
 
 class TestContextParallelAttention:
@@ -35,3 +36,7 @@ class TestContextParallelAttention:
     def test_cp_deepseek_v3_mla(self):
         """Test DeepSeek V3 MLA layer with CP=1 vs CP=2."""
         run_test_script(TEST_FOLDER, CP_DEEPSEEK_V3_MLA_TEST_FILENAME)
+
+    def test_cp_qwen3_5_moe_linear_attn(self):
+        """Test Qwen3.5 MoE linear attention (GatedDeltaNet) with CP=1 vs CP=2."""
+        run_test_script(TEST_FOLDER, CP_QWEN3_5_MOE_LINEAR_ATTN_TEST_FILENAME)

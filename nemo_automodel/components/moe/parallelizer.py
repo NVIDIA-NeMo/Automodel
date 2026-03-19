@@ -276,16 +276,42 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
         _model = model.model
     else:
         _model = model
+    # Prefer nested text modules when present (VLM models)
+    _model = get_text_module(_model)
+
+    # Set model-level flag so the forward pass can null out attention_mask.
+    # With CP the mask is not sharded along the sequence dim and TE asserts
+    # "Padding mask not supported with context parallelism!".
+    _model._cp_enabled = True
 
     for _, block in _model.layers.named_children():
-        attn_module = block.self_attn.attn_module
-        if isinstance(attn_module, DotProductAttention):
+        layer_type = getattr(block, "layer_type", "full_attention")
+
+        if layer_type == "full_attention":
+            attn_module = block.self_attn.attn_module
+            if not isinstance(attn_module, DotProductAttention):
+                logger.warning(
+                    "Skipping CP setup for block with non-TE attention module: %s",
+                    type(attn_module).__name__,
+                )
+                continue
             attn_module.set_context_parallel_group(
                 cp_mesh.get_group(),
                 torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
                 _get_cp_stream(),
                 cp_comm_type=cp_comm_type,
             )
+        elif layer_type == "linear_attention":
+            # FLA-based CP: store the CP mesh on the linear attention module so it
+            # can recover dense token order and build its CP context during forward.
+            if hasattr(block, "linear_attn") and hasattr(block.linear_attn, "_cp_mesh"):
+                block.linear_attn._cp_mesh = cp_mesh
+            else:
+                logger.warning(
+                    "Block %s has linear_attention but no CP-aware linear_attn module; "
+                    "skipping CP setup for this layer.",
+                    getattr(block, "layer_idx", "?"),
+                )
 
         moe_module = block.moe if hasattr(block, "moe") else block.mlp
         if isinstance(moe_module, MoE):
