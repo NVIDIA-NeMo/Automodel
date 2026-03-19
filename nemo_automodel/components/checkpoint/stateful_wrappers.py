@@ -254,12 +254,27 @@ class ModelState:
         if self.is_init_step:
             return self._get_base_model_state_dict()
 
-        # For PEFT models bypass DCP; instead collect trainable PEFT adapter weights.
-        if self.is_peft:
+        # For PEFT models with quantized parameters or expert parallelism, bypass
+        # PyTorch DCP's get_model_state_dict() which fails when: (1) traversing
+        # quantized parameter types like Params4bit (QLoRA with BitsAndBytes); or
+        # (2) expert weights are sharded across EP ranks (MoE+EP), causing DCP to
+        # raise KeyError on expert-parallel FQNs. Instead, directly collect
+        # trainable PEFT adapter weights.
+        if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
             model_state_dict = {k: v for sd in map(_get_peft_state_dict, self.model) for k, v in sd.items()}
         else:
-            func = partial(get_model_state_dict, options=None)
+            options = None
+            if self.is_peft:
+                options = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=True)
+
+            func = partial(get_model_state_dict, options=options)
             model_state_dict = {k: v for sd in map(func, self.model) for k, v in sd.items()}
+
+        # @akoumpa: the second is_peft statement above keeps buffers in the state dict
+        # this filtering removes them.
+        # TODO: this is a hack and we should find a better way to do this.
+        if self.is_peft:
+            model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k}
 
         if self.is_tied_lm_head:
             # PP models don't have tied embeddings. Safe to pass in model[0] here.
@@ -291,6 +306,7 @@ class ModelState:
             _drop_outer_prefix(state_dict, "base_model.model.")
             # DoRA: reverse the HF PEFT key rename so DCP can match model params
             _rename_dora_keys_from_hf(state_dict)
+            # @akoumpa: I'm not sure about this code.
             # For EP models, DCP's set_model_state_dict silently skips EP-sharded
             # LoRA params (strict=False hides the FQN mismatch caused by custom
             # expert state_dict() keys like gate_up_linear.weight0). Bypass DCP.
@@ -311,8 +327,8 @@ class ModelState:
                 # weight tying guarantees this is identical to the embedding weight
                 state_dict[lm_head_param_name] = lm_head_weight.detach()
 
-        func = partial(set_model_state_dict, model_state_dict=state_dict, options=options)
-        list(map(func, self.model))
+        for model_part in self.model:
+            set_model_state_dict(model_part, state_dict, options=options)
 
     def _get_base_model_state_dict(self) -> dict[str, Any]:
         model_state_dict = {k: v for sd in map(get_model_state_dict, self.model) for k, v in sd.items()}
@@ -394,8 +410,13 @@ class OptimizerState:
         Returns:
             dict: Dictionary containing the optimizer and scheduler state dicts with CPU offloading enabled.
         """
-        # For PEFT models, bypass DCP, use native state_dict instead.
-        if self.is_peft:
+        # For PEFT models with quantized parameters or expert parallelism, bypass
+        # PyTorch DCP's get_optimizer_state_dict() which fails because DCP cannot
+        # build a consistent parameter-ID-to-FQN mapping when the model contains
+        # quantized frozen params (Params4bit/Int8Params) alongside trainable LoRA
+        # params, or when expert weights are sharded across EP ranks (MoE+EP) and
+        # the optimizer only tracks trainable params. Use native state_dict instead.
+        if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
             optimizer_state_dict = self.optimizer[0].state_dict()
         else:
             # this line automatically manages FSDP FQN's, as well as sets the default state dict type
@@ -421,8 +442,8 @@ class OptimizerState:
         Args:
             state_dict (dict): State dictionary containing optimizer and scheduler states to load.
         """
-        # For PEFT models, use native load to match the native save path.
-        if self.is_peft:
+        # For PEFT + quantized or expert-parallel models, use native load to match the native save path.
+        if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
             self.optimizer[0].load_state_dict(state_dict["optim"])
         else:
             # sets our state dicts on the optimizer, now that we've loaded
