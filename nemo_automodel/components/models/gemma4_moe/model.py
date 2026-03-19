@@ -86,8 +86,8 @@ class Gemma4Gate(nn.Module):
     """Gemma4 Router reimplemented to output NeMo Gate format.
 
     HF Gemma4Router applies: RMSNorm(no_scale) → root_size scaling → learnable
-    scale → Linear → softmax → top-k → renormalize. This class reproduces that
-    logic but returns (weights, indices, aux_loss) as expected by GroupedExperts.
+    scale → Linear → softmax → top-k → renormalize which is different from the standard Gate class in layer.py.
+    This class reproduces that logic but returns (weights, indices, aux_loss) as expected by GroupedExperts.
     """
 
     def __init__(self, config: Gemma4TextConfig):
@@ -439,7 +439,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
         if not enable_moe:
             # Dense Gemma4 — keep vanilla HF model, nothing else to do.
-            print("Not enabling MoE block 1")
             return
 
         # --- MoE path: replace the text model ---
@@ -550,7 +549,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         # added for error: AttributeError: 'ModuleList' object has no attribute 'values' with the 31B model.
         if not getattr(text_config, "enable_moe_block", False):
-            print("Not enabling MoE block")
             self.to(dtype)
             return
 

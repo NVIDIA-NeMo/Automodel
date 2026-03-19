@@ -36,12 +36,11 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: /workspace/eevee-4-31b-it_vv3
   torch_dtype: torch.bfloat16
-  use_liger_kernel: false
+  use_liger_kernel: true
   use_sdpa_patching: false
-  # TODO: check if FA2 can be made to work (gives an error currently)
-  attn_implementation: eager
-  # use_cache: true is incompatible with activation checkpointing and will cause an error. Also cache is required only for 
-  # models with kv_shared layers. Gemma4 31B has num_kv_shared_layers=0 unlike gemma4 2B and 4B and using DynamicCache has no effect.
+  attn_implementation: flash_attention_2
+  # use_cache: true is incompatible with activation checkpointing and will cause an error. Also cache is used only for 
+  # models with kv_shared layers. Gemma4 31B has num_kv_shared_layers=0 unlike gemma4 2B and 4B.
   text_config:
     use_cache: false
 

@@ -13,9 +13,7 @@
 # limitations under the License.
 
 # Configuration for fine-tuning Gemma 4 2B with MedPix dataset for image description
-# export WANDB_API_KEY=xxxxx if you want to use wandb
-# python examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_2b.yaml
-# Multi GPU command:
+# Run command:
 # torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_2b.yaml
 
 step_scheduler:
@@ -38,15 +36,13 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: /workspace/eevee-4-e2b-it_vv6
   torch_dtype: torch.bfloat16
-  use_liger_kernel: false
+  use_liger_kernel: true
   use_sdpa_patching: false
-  # TODO: check if FA2 can be made to work (gives an error currently)
-  attn_implementation: eager
+  attn_implementation: flash_attention_2
   text_config:
     use_cache: true
 
-# Without this we get an ImportError: cannot import name 'Gemma4ImageProcessorKwargs' from 'transformers.models.gemma4.image_processing_gemma4' (/opt/venv/lib/python3.12/site-packages/transformers/models/gemma4/image_processing_gemma4.py). 
-# This is a workaround to use the default image processor.
+# Use default image processor, until the gemma4 transformers bug with FastImageProcessor is fixed.
 processor:
   use_fast: false
 

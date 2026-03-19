@@ -541,16 +541,6 @@ def relu2_deepep(x, permuted_probs):
     return (inter * permuted_probs).to(x.dtype)
 
 
-@torch.compile(fullgraph=True, options={"max_autotune": True})
-def geglu_deepep(x, permuted_probs):
-    """GEGLU activation for DeepEP: gelu_tanh(gate) * up, weighted by routing probs."""
-    half = x.shape[-1] // 2
-    gate_out = x[..., :half]
-    up_out = x[..., half:]
-    inter = F.gelu(gate_out, approximate="tanh") * up_out
-    return (inter * permuted_probs).to(x.dtype)
-
-
 def get_expert_activation_for_deepep(config: MoEConfig):
     if config.expert_activation == "swiglu":
         return weighted_bias_swiglu_impl
