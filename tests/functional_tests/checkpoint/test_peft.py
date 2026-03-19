@@ -20,23 +20,24 @@ import os
 import shutil
 from pathlib import Path
 
+import datasets
+import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.distributed.tensor
 import torch.nn as nn
+import yaml
 from peft import PeftModel
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM
-import yaml
-import pytest
 
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction, calculate_loss
 
-import datasets
 datasets.disable_caching()
+
 
 def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
     """
@@ -79,13 +80,15 @@ def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
 
 
 def compare_configs(source_config: dict, restored_config: dict):
-    """ Recursively compare two configs."""
+    """Recursively compare two configs."""
     for k, v in source_config.items():
         if k in restored_config:
             if isinstance(v, dict):
                 compare_configs(v, restored_config[k])
             else:
-                assert v == restored_config[k], f"Config mismatch for key {k}. Expected {v} but got {restored_config[k]}"
+                assert v == restored_config[k], (
+                    f"Config mismatch for key {k}. Expected {v} but got {restored_config[k]}"
+                )
 
 
 def load_safetensors(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:
@@ -124,12 +127,13 @@ def get_validation_loss(
     with torch.no_grad():
         out = model(**val_batch)
         loss = calculate_loss(
-                loss_fn,
-                logits=out.logits,
-                labels=labels,
-                mask=loss_mask,
-            )
+            loss_fn,
+            logits=out.logits,
+            labels=labels,
+            mask=loss_mask,
+        )
         return loss
+
 
 def get_test_hf_peft_checkpoint_expected_keys():
     """
@@ -299,6 +303,7 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
                 trainer.model_parts,
                 trainer.optimizer,
                 trainer.lr_scheduler,
+                is_peft=trainer.checkpointer.config.is_peft,
             ).state_dict()["optim"]
         )
 
@@ -350,7 +355,9 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
             restored_lr_state = trainer.lr_scheduler[0].state_dict()
 
             for key in saved_lr_scheduler_state:
-                assert key in restored_lr_state, f"test_dcp_checkpoint: lr_scheduler key {key} missing in restored state"
+                assert key in restored_lr_state, (
+                    f"test_dcp_checkpoint: lr_scheduler key {key} missing in restored state"
+                )
                 saved_val = saved_lr_scheduler_state[key]
                 restored_val = restored_lr_state[key]
 
@@ -371,20 +378,27 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
         )
         restored_automodel_peft_config = json.load(
             open(
-                Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model" / "automodel_peft_config.json"
+                Path(trainer.checkpointer.config.checkpoint_dir)
+                / "epoch_0_step_9"
+                / "model"
+                / "automodel_peft_config.json"
             ),
         )
         _compare_dicts(expected_config, restored_config)
         _compare_dicts(expected_automodel_peft_config, restored_automodel_peft_config)
 
         # check if new model and current model give the same CE loss
-        val_batch = next(iter(trainer.val_dataloaders['default']))
+        val_batch = next(iter(trainer.val_dataloaders["default"]))
         restored_model = TrainFinetuneRecipeForNextTokenPrediction(cfg)
         restored_model.setup()
         restored_model = restored_model.model_parts[0]
-        source_model_loss = get_validation_loss(trainer.model_parts[0], val_batch, trainer.loss_fn, trainer.dist_env.device)
+        source_model_loss = get_validation_loss(
+            trainer.model_parts[0], val_batch, trainer.loss_fn, trainer.dist_env.device
+        )
         restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
-        for (source_name, source_p), (restore_name, restore_p) in zip(trainer.model_parts[0].named_parameters(), restored_model.named_parameters()):
+        for (source_name, source_p), (restore_name, restore_p) in zip(
+            trainer.model_parts[0].named_parameters(), restored_model.named_parameters()
+        ):
             assert source_name == restore_name, "Parameter name mismatch"
             if isinstance(source_p, torch.distributed.tensor.DTensor):
                 source_p = source_p.to_local()
@@ -478,7 +492,7 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
             try:
                 assert torch.allclose(v, curr_shard), f"Value mismatch for key {k}. Tensors are not numerically close"
             except Exception as e:
-                if 'moe' in k and 'step' in k:
+                if "moe" in k and "step" in k:
                     pass
                 else:
                     raise e
@@ -490,7 +504,8 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
                 device=device, dtype=trainer.model_parts[0].dtype
             )
             peft_model = PeftModel.from_pretrained(
-                base, Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model",
+                base,
+                Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model",
                 autocast_adapter_dtype=False,
             )
 
@@ -498,8 +513,17 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
                 # source key example: 'base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight'
                 for peft_model_key, peft_model_param in peft_model.named_parameters():
                     if "lora" in peft_model_key and source_key.rsplit(".", 1)[0] in peft_model_key:
-                        print('peft_model_key: ', peft_model_key, ' -> ', source_key, source_param.device,
-                        source_param.dtype, ' peft ', peft_model_param.device, peft_model_param.dtype)
+                        print(
+                            "peft_model_key: ",
+                            peft_model_key,
+                            " -> ",
+                            source_key,
+                            source_param.device,
+                            source_param.dtype,
+                            " peft ",
+                            peft_model_param.device,
+                            peft_model_param.dtype,
+                        )
                         assert torch.allclose(source_param, peft_model_param.cpu()), (
                             "Parameter values are different when they should be the same"
                         )
@@ -514,6 +538,7 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
+
 @pytest.mark.parametrize(
     "force_hf",
     [
@@ -525,7 +550,9 @@ def test_hf_peft_dora_checkpoint(force_hf):
     """
     Tests DoRA finetune
     """
-    default_cfg_path = Path(__file__).parents[3] / "examples" / "llm_finetune" / "llama3_2" / "llama3_2_1b_hellaswag_peft.yaml"
+    default_cfg_path = (
+        Path(__file__).parents[3] / "examples" / "llm_finetune" / "llama3_2" / "llama3_2_1b_hellaswag_peft.yaml"
+    )
     cfg = parse_args_and_load_config(default_cfg_path)
     # Limit training to the minimum steps needed for a checkpoint
     cfg.model.force_hf = force_hf
@@ -574,26 +601,23 @@ def test_hf_peft_dora_checkpoint(force_hf):
         # Verify adapter loads with HF PEFT (treat missing keys as errors)
         if torch.distributed.get_rank() == 0:
             import warnings
+
             device = next(trainer.model_parts[0].parameters()).device
             base = AutoModelForCausalLM.from_pretrained(cfg.model.pretrained_model_name_or_path).to(
                 device=device, dtype=trainer.model_parts[0].dtype
             )
             with warnings.catch_warnings(record=True) as caught_warnings:
                 warnings.simplefilter("always")
-                peft_model = PeftModel.from_pretrained(
-                    base, checkpoint_path, autocast_adapter_dtype=False
-                )
-            missing_key_warnings = [
-                w for w in caught_warnings
-                if "missing adapter keys" in str(w.message).lower()
-            ]
+                peft_model = PeftModel.from_pretrained(base, checkpoint_path, autocast_adapter_dtype=False)
+            missing_key_warnings = [w for w in caught_warnings if "missing adapter keys" in str(w.message).lower()]
             assert not missing_key_warnings, (
                 f"HF PEFT reported missing adapter keys:\n{missing_key_warnings[0].message}"
             )
 
             # Verify DoRA magnitude vectors exist in loaded model
             peft_dora_modules = [
-                name for name, mod in peft_model.named_modules()
+                name
+                for name, mod in peft_model.named_modules()
                 if hasattr(mod, "lora_magnitude_vector") and len(mod.lora_magnitude_vector) > 0
             ]
             assert len(peft_dora_modules) > 0, "DoRA should be active in HF PEFT model"
@@ -626,8 +650,7 @@ def test_hf_peft_dora_checkpoint(force_hf):
 
 
 def _rename_keys(d: dict, prepend: str):
-    """Rename the keys of *d* by prepending *prepend* to each key.
-    """
+    """Rename the keys of *d* by prepending *prepend* to each key."""
     flat: dict[str, torch.Tensor] = {}
     for k, v in d.items():
         key = f"{prepend}{k}"

@@ -421,7 +421,7 @@ class OptimizerState:
         Args:
             state_dict (dict): State dictionary containing optimizer and scheduler states to load.
         """
-        # For PEFT + quantized or expert-parallel models, use native load to match the native save path.
+        # For PEFT models, use native load to match the native save path.
         if self.is_peft:
             self.optimizer[0].load_state_dict(state_dict["optim"])
         else:
