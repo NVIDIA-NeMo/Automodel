@@ -1,0 +1,29 @@
+model:
+  pretrained_model_name_or_path: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+  checkpoint: null
+
+inference:
+  num_inference_steps: 50
+  guidance_scale: 5.0
+  height: 480
+  width: 832
+  dtype: "bfloat16"
+  max_samples: 10
+  prompts:
+    - "A cat sitting on a windowsill watching the rain"
+  pipeline_kwargs:
+    num_frames: 81
+    negative_prompt: ""
+
+output:
+  output_dir: "./inference_outputs"
+  fps: 16
+
+distributed: null
+
+vae:
+  enable_slicing: true
+  enable_tiling: true
+  enable_cpu_offload: false
+
+seed: 42
