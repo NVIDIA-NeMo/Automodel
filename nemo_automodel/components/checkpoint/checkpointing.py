@@ -1285,23 +1285,20 @@ def _convert_checkpoint_with_transformers(
 
         # Now apply all the conversions
         for first_param_name, mapping in param_name_to_mapping.items():
-            try:
-                # convert() returns (collected_tensors_dict, conversion_errors)
-                result = mapping.convert(first_param_name, model=model, config=model.config)
-                assert isinstance(result, tuple), (
-                    f"Expected convert() to return (dict, errors) tuple, got {type(result)}"
-                )
-                realized_value, _conversion_errors = result
-                assert isinstance(realized_value, dict), (
-                    f"Expected convert() first element to be dict, got {type(realized_value)}"
-                )
-                for target_name, param in realized_value.items():
-                    param = param[0] if isinstance(param, list) else param
-                    converted_state_dict[target_name] = param
+            # convert() returns (collected_tensors_dict, conversion_errors)
+            result = mapping.convert(first_param_name, model=model, config=model.config)
+            assert isinstance(result, tuple), (
+                f"Expected convert() to return (dict, errors) tuple, got {type(result)}"
+            )
+            realized_value, _conversion_errors = result
+            assert isinstance(realized_value, dict), (
+                f"Expected convert() first element to be dict, got {type(realized_value)}"
+            )
+            for target_name, param in realized_value.items():
+                param = param[0] if isinstance(param, list) else param
+                converted_state_dict[target_name] = param
+            if callable(getattr(mapping, 'reset', None)):
                 mapping.reset()
-            except Exception as e:
-                logging.warning("Conversion failed for {}: {}".format(first_param_name, e))
-                continue
         logging.debug("Converted {} keys using transformers conversion mapping".format(len(converted_state_dict)))
         return converted_state_dict
 
