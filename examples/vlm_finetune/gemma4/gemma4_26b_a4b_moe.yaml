@@ -48,7 +48,7 @@ model:
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
   text_config:
-  # using DynamicCache has no effect since Gemma4 25B-A4B has num_kv_shared_layers=0 similar to Gemma4 31B.
+  # 26B-A4B does not using kv_shared layers (only used in 2B, 4B), hence use_cache: false.
     use_cache: false
 
 # Use default image processor, until the gemma4 transformers bug with FastImageProcessor is fixed.

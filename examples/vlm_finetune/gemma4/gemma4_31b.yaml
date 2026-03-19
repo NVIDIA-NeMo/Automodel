@@ -39,8 +39,7 @@ model:
   use_liger_kernel: true
   use_sdpa_patching: false
   attn_implementation: flash_attention_2
-  # use_cache: true is incompatible with activation checkpointing and will cause an error. Also cache is used only for 
-  # models with kv_shared layers. Gemma4 31B has num_kv_shared_layers=0 unlike gemma4 2B and 4B.
+  # 31B does not using kv_shared layers (only used in 2B, 4B), hence use_cache: false.
   text_config:
     use_cache: false
 

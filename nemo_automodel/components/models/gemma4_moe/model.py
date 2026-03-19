@@ -547,15 +547,23 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
-        # added for error: AttributeError: 'ModuleList' object has no attribute 'values' with the 31B model.
         if not getattr(text_config, "enable_moe_block", False):
+            self.to(dtype)
+            return
+
+        # Guard: HF's super().__init__() calls post_init() -> init_weights() ->
+        # initialize_weights() *before* __init__ replaces the language model
+        # with Gemma4MoETextModelBackend (which uses ModuleDict).  At that
+        # point layers is still HF's ModuleList which leads to an AttributeError, just cast and return.
+        # Needed only when constructing the model directly, doesn't affect when loading a ckpt via from_pretrained().
+        language_model = self.model.language_model
+        if not isinstance(language_model, Gemma4MoETextModelBackend):
             self.to(dtype)
             return
 
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
 
         with buffer_device:
-            language_model = self.model.language_model
             for layer in language_model.layers.values():
                 layer.moe.init_weights(buffer_device)
 
