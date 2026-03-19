@@ -1,43 +1,102 @@
 (diffusion-finetune)=
 
-# Diffusion Model Training and Fine-Tuning
+# Diffusion Model Fine-Tuning with NeMo AutoModel
 
 ## Introduction
 
-NeMo AutoModel supports training and fine-tuning diffusion models using flow matching. Flow matching is a generative modeling framework that learns to transform noise into data by regressing a velocity field along straight interpolation paths. NeMo AutoModel integrates with [Hugging Face Diffusers](https://huggingface.co/docs/diffusers) to provide distributed training for text-to-image and text-to-video models.
+Diffusion models generate images and videos by learning to reverse a noise process — starting from random noise and iteratively refining it into coherent visual output guided by a text prompt. Pretrained diffusion models (like [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) for images or [Wan 2.1](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) for video) produce impressive general-purpose results, but they know nothing about your particular visual domain, style, or subject matter. Fine-tuning bridges that gap — you adapt the model on your own data so it produces outputs that match your requirements, without the cost of training from scratch.
 
-The `TrainDiffusionRecipe` orchestrates the full training pipeline: model loading, dataset preparation, optimizer setup, distributed training with FSDP2, flow matching loss computation, checkpointing, and logging.
+Under the hood, NeMo AutoModel uses [flow matching](https://arxiv.org/abs/2210.02747), a modern generative framework that learns to transform noise into data by regressing a velocity field along straight interpolation paths. It integrates with [Hugging Face Diffusers](https://huggingface.co/docs/diffusers) to provide distributed fine-tuning for text-to-image and text-to-video models. This guide walks you through the process end-to-end — from installation through training and inference — using [Wan 2.1 T2V 1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) as a running example.
 
-### Supported Workflows
+### Workflow Overview
 
-- **Fine-tuning** (`model.mode: finetune`): Loads pretrained weights and adapts them to your dataset
-- **Pretraining** (`model.mode: pretrain`): Initializes random weights for training from scratch
+```text
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│ 1. Install   │--->│ 2. Prepare   │--->│ 3. Configure │--->│  4. Train    │--->│ 5. Generate  │
+│              │    │    Data      │    │              │    │              │    │              │
+│ pip install  │    │ Encode to    │    │ YAML recipe  │    │ torchrun     │    │ Run inference│
+│ or Docker    │    │ .meta files  │    │              │    │              │    │ with ckpt    │
+└──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
+```
 
-## Prerequisites
+| Step | Section | What You Do |
+|------|---------|-------------|
+| **1. Install** | [Install NeMo AutoModel](#install-nemo-automodel) | Install the package via pip or Docker |
+| **2. Prepare Data** | [Prepare Your Dataset](#prepare-your-dataset) | Encode raw images/videos into `.meta` latent files |
+| **3. Configure** | [Configure Your Training Recipe](#configure-your-training-recipe) | Write a YAML config specifying model, data, and training settings |
+| **4. Train** | [Fine-Tune the Model](#fine-tune-the-model) | Launch training with `torchrun` on a single node |
+| **5. Generate** | [Generation / Inference](#generation--inference) | Run inference using the fine-tuned checkpoint |
 
-:::{important}
-Before proceeding, ensure NeMo AutoModel is installed:
+For model-specific configuration (FLUX.1-dev, HunyuanVideo), see [Model-Specific Notes](#model-specific-notes).
+
+### Supported Models
+
+| Model | HF Model ID | Task | Parameters | Example Config |
+|-------|-------------|------|------------|----------------|
+| Wan 2.1 T2V 1.3B | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | Text-to-Video | 1.3B | [wan2_1_t2v_flow.yaml](../../../examples/diffusion/finetune/wan2_1_t2v_flow.yaml) |
+| FLUX.1-dev | `black-forest-labs/FLUX.1-dev` | Text-to-Image | 12B | [flux_t2i_flow.yaml](../../../examples/diffusion/finetune/flux_t2i_flow.yaml) |
+| HunyuanVideo 1.5 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | Text-to-Video | — | [hunyuan_t2v_flow.yaml](../../../examples/diffusion/finetune/hunyuan_t2v_flow.yaml) |
+
+All models use FSDP2 for distributed training and flow matching for loss computation.
+
+## Install NeMo AutoModel
+
 ```bash
 pip3 install nemo-automodel
 ```
-For additional options, see the [Installation Guide](../installation.md).
+
+Alternatively, if you run into dependency or driver issues, use the pre-built Docker container:
+
+```bash
+docker pull nvcr.io/nvidia/nemo-automodel:26.02.00
+docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+:::{important}
+**Docker users:** Checkpoints are lost when the container exits unless you bind-mount the checkpoint directory to the host. See [Install with NeMo Docker Container](../installation.md#install-with-nemo-docker-container) and [Saving Checkpoints When Using Docker](../checkpointing.md#saving-checkpoints-when-using-docker).
 :::
 
-Data must be preprocessed into cache files before training using the built-in preprocessing tool at `tools/diffusion/preprocessing_multiprocess.py`. See the [Diffusion Dataset Preparation](dataset.md) guide for instructions.
+For the full set of installation methods, see the [installation guide](../installation.md).
 
-## Model and Dataset Context
+## Prepare Your Dataset
 
-In this guide, we use **Wan 2.1 T2V 1.3B** as the representative model. Wan 2.1 is a text-to-video diffusion model from Wan-AI that generates video from text prompts. The 1.3B variant is compact enough to train on a single node of 8 GPUs while demonstrating all key training features.
+Diffusion model fine-tuning requires pre-encoded `.meta` files rather than raw images or videos. During preprocessing, a VAE encodes visual data into latent representations and a text encoder produces text embeddings. These are saved as `.meta` files so that training operates entirely in latent space.
 
-The training data consists of pre-encoded `.meta` files containing VAE latents and text embeddings. See the [dataset guide](dataset.md) for the preprocessing pipeline.
+Preprocess your data using the built-in tool at `tools/diffusion/preprocessing_multiprocess.py`. The script provides `image` and `video` subcommands:
 
-:::{tip}
-Wan 2.1 is used as a representative example. The same recipe structure applies to FLUX.1-dev and HunyuanVideo with model-specific configuration changes described in [Model-Specific Notes](#model-specific-notes).
-:::
+**Video preprocessing (Wan 2.1):**
+```bash
+python -m tools.diffusion.preprocessing_multiprocess video \
+    --video_dir /data/videos \
+    --output_dir /cache \
+    --processor wan \
+    --resolution_preset 512p \
+    --caption_format sidecar
+```
 
-## Recipe Walkthrough
+**Image preprocessing (FLUX):**
+```bash
+python -m tools.diffusion.preprocessing_multiprocess image \
+    --image_dir /data/images \
+    --output_dir /cache \
+    --processor flux
+```
 
-The diffusion training recipe is configured through a YAML file. Below is the annotated [wan2_1_t2v_flow.yaml](../../../examples/diffusion/finetune/wan2_1_t2v_flow.yaml) configuration:
+**Video preprocessing (HunyuanVideo):**
+```bash
+python -m tools.diffusion.preprocessing_multiprocess video \
+    --video_dir /data/videos \
+    --output_dir /cache \
+    --processor hunyuan \
+    --target_frames 121 \
+    --caption_format meta_json
+```
+
+For the full set of arguments and input format details, see the [Diffusion Dataset Preparation](dataset.md) guide.
+
+## Configure Your Training Recipe
+
+Fine-tuning is configured through a YAML file. Below is the annotated [wan2_1_t2v_flow.yaml](../../../examples/diffusion/finetune/wan2_1_t2v_flow.yaml) configuration:
 
 ```yaml
 seed: 42
@@ -54,7 +113,7 @@ dist_env:
 
 # Model configuration
 # pretrained_model_name_or_path: Hugging Face model ID
-# mode: "finetune" loads pretrained weights, "pretrain" initializes random weights
+# mode: "finetune" loads pretrained weights and adapts them to your dataset
 model:
   pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-1.3B-Diffusers
   mode: finetune
@@ -126,18 +185,31 @@ checkpoint:
   restore_from: null
 ```
 
-## Pretraining vs Fine-Tuning
+### Config Field Reference
 
-The primary difference between pretraining and fine-tuning is the `model.mode` setting and the hyperparameters used:
+| Section | Required? | What to Change |
+|---------|-----------|----------------|
+| `model` | Yes | Set `pretrained_model_name_or_path` to the Hugging Face model ID. Set `mode: finetune`. |
+| `step_scheduler` | Yes | `global_batch_size` is the effective batch size across all GPUs. `ckpt_every_steps` controls checkpoint frequency. |
+| `data` | Yes | Set `cache_dir` to the path containing your preprocessed `.meta` files. Change `model_type` and `_target_` for different models (see [Model-Specific Notes](#model-specific-notes)). |
+| `optim` | Yes | `learning_rate: 5e-6` is a good default for fine-tuning. |
+| `flow_matching` | Yes | `adapter_type` must match the model (`simple` for Wan, `flux` for FLUX, `hunyuan` for HunyuanVideo). |
+| `fsdp` | Yes | Set `dp_size` to the number of GPUs on your node. |
+| `checkpoint` | Recommended | Set `checkpoint_dir` to a persistent path, especially in Docker. |
+| `wandb` | Optional | Configure to enable Weights & Biases logging. |
 
-| Setting | Fine-Tuning | Pretraining |
-|---------|-------------|-------------|
-| `model.mode` | `finetune` | `pretrain` |
-| `learning_rate` | 5e-6 | 5e-5 |
-| `weight_decay` | 0.01 | 0.1 |
-| `flow_shift` | 3.0 | 2.5 |
-| `logit_std` | 1.0 | 1.5 |
-| Dataset size | 100s--1000s of samples | 10K+ samples |
+(fine-tune-the-model)=
+## Fine-Tune the Model
+
+Launch fine-tuning with `torchrun`:
+
+```bash
+torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/wan2_1_t2v_flow.yaml
+```
+
+Adjust `--nproc-per-node` to match the number of GPUs on your node, and ensure `fsdp.dp_size` in the YAML matches.
 
 (model-specific-notes)=
 ## Model-Specific Notes
@@ -189,54 +261,6 @@ The primary difference between pretraining and fine-tuning is the `model.mode` s
   - Uses `logit_normal` timestep sampling
 - **Config**: [hunyuan_t2v_flow.yaml](../../../examples/diffusion/finetune/hunyuan_t2v_flow.yaml)
 
-## Running the Recipe
-
-### Single-Node Fine-Tuning (8 GPUs)
-
-```bash
-torchrun --nproc-per-node=8 \
-  examples/diffusion/finetune/finetune.py \
-  -c examples/diffusion/finetune/wan2_1_t2v_flow.yaml
-```
-
-### Single-Node Pretraining (8 GPUs)
-
-```bash
-torchrun --nproc-per-node=8 \
-  examples/diffusion/pretrain/pretrain.py \
-  -c examples/diffusion/pretrain/wan2_1_t2v_flow.yaml
-```
-
-### Multi-Node with SLURM
-
-```bash
-#!/bin/bash
-#SBATCH -N 2
-#SBATCH --ntasks-per-node 1
-#SBATCH --gpus-per-node=8
-#SBATCH --exclusive
-
-export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
-export MASTER_PORT=29500
-export NUM_GPUS=8
-
-torchrun \
-  --nnodes=$SLURM_NNODES \
-  --nproc-per-node=$NUM_GPUS \
-  --rdzv_backend=c10d \
-  --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
-  examples/diffusion/finetune/finetune.py \
-  -c examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml
-```
-
-For multi-node training, adjust the FSDP config accordingly:
-
-```yaml
-fsdp:
-  dp_size: 16           # 2 nodes x 8 GPUs
-  dp_replicate_size: 2  # Replicate across 2 nodes
-```
-
 ## Generation / Inference
 
 Use the unified generation script to run inference with any supported diffusion model:
@@ -272,7 +296,6 @@ python examples/diffusion/generate/generate.py \
 | Config | Model | Output | GPUs |
 |--------|-------|--------|------|
 | `generate_wan.yaml` | Wan 2.1 1.3B | Video | 1 |
-| `generate_wan_distributed.yaml` | Wan 2.2 14B | Video | 8 |
 | `generate_flux.yaml` | FLUX.1-dev | Image | 1 |
 | `generate_hunyuan.yaml` | HunyuanVideo | Video | 1 |
 
@@ -285,6 +308,6 @@ You can use `--model.checkpoint ./checkpoints/LATEST` to automatically load the 
 | Component | Minimum | Recommended |
 |-----------|---------|-------------|
 | GPU | A100 40GB | A100 80GB / H100 |
-| GPUs | 4 | 8+ |
+| GPUs | 4 | 8 |
 | RAM | 128 GB | 256 GB+ |
 | Storage | 500 GB SSD | 2 TB NVMe |
