@@ -165,45 +165,65 @@ def get_test_hf_peft_checkpoint_expected_keys():
         "base_model.model.lm_head.lora_A.weight": ([8, 512], torch.bfloat16, "cpu"),
         "base_model.model.lm_head.lora_B.weight": ([32000, 8], torch.bfloat16, "cpu"),
     }
-    # With is_peft=True the optimizer is saved via native state_dict() (integer
-    # param indices) rather than DCP FQN-based keys.  DCP serialises the nested
-    # dict on disk as  optim.state.<param_idx>.<state_key>.
-    # Parameter ordering follows model.parameters() for trainable (LoRA) params:
-    #   0-1  : layer0 q_proj  (lora_A, lora_B)
-    #   2-3  : layer0 k_proj
-    #   4-5  : layer0 v_proj
-    #   6-7  : layer0 o_proj
-    #   8-15 : layer1 (same pattern)
-    #   16-17: lm_head
-    expected_optim_keys = {}
-    # (param_idx, exp_avg_shard_shape, exp_avg_sq_shard_shape)
-    _lora_params = [
-        # Layer 0
-        (0, [4, 512], [4, 512]),      # q_proj.lora_A
-        (1, [256, 8], [256, 8]),      # q_proj.lora_B
-        (2, [4, 512], [4, 512]),      # k_proj.lora_A
-        (3, [64, 8], [64, 8]),        # k_proj.lora_B
-        (4, [4, 512], [4, 512]),      # v_proj.lora_A
-        (5, [64, 8], [64, 8]),        # v_proj.lora_B
-        (6, [4, 512], [4, 512]),      # o_proj.lora_A
-        (7, [256, 8], [256, 8]),      # o_proj.lora_B
-        # Layer 1
-        (8, [4, 512], [4, 512]),      # q_proj.lora_A
-        (9, [256, 8], [256, 8]),      # q_proj.lora_B
-        (10, [4, 512], [4, 512]),     # k_proj.lora_A
-        (11, [64, 8], [64, 8]),       # k_proj.lora_B
-        (12, [4, 512], [4, 512]),     # v_proj.lora_A
-        (13, [64, 8], [64, 8]),       # v_proj.lora_B
-        (14, [4, 512], [4, 512]),     # o_proj.lora_A
-        (15, [256, 8], [256, 8]),     # o_proj.lora_B
-        # lm_head
-        (16, [4, 512], [4, 512]),     # lora_A
-        (17, [16000, 8], [16000, 8]), # lora_B
-    ]
-    for pid, avg_shape, sq_shape in _lora_params:
-        expected_optim_keys[f"optim.state.{pid}.step"] = ([], torch.float32, "cpu")
-        expected_optim_keys[f"optim.state.{pid}.exp_avg"] = (avg_shape, torch.bfloat16, "cpu")
-        expected_optim_keys[f"optim.state.{pid}.exp_avg_sq"] = (sq_shape, torch.bfloat16, "cpu")
+    expected_optim_keys = {
+        # Layer 0 attention optimizer states
+        "optim.state.model.layers.0.self_attn.q_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.layers.0.self_attn.q_proj.lora_A.weight.exp_avg": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.0.self_attn.q_proj.lora_A.weight.exp_avg_sq": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.0.self_attn.q_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.layers.0.self_attn.q_proj.lora_B.weight.exp_avg": ([256, 8], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.0.self_attn.q_proj.lora_B.weight.exp_avg_sq": ([256, 8], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.0.self_attn.k_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.layers.0.self_attn.k_proj.lora_A.weight.exp_avg": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.0.self_attn.k_proj.lora_A.weight.exp_avg_sq": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.0.self_attn.k_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.layers.0.self_attn.k_proj.lora_B.weight.exp_avg": ([64, 8], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.0.self_attn.k_proj.lora_B.weight.exp_avg_sq": ([64, 8], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.0.self_attn.v_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.layers.0.self_attn.v_proj.lora_A.weight.exp_avg": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.0.self_attn.v_proj.lora_A.weight.exp_avg_sq": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.0.self_attn.v_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.layers.0.self_attn.v_proj.lora_B.weight.exp_avg": ([64, 8], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.0.self_attn.v_proj.lora_B.weight.exp_avg_sq": ([64, 8], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.0.self_attn.o_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.layers.0.self_attn.o_proj.lora_A.weight.exp_avg": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.0.self_attn.o_proj.lora_A.weight.exp_avg_sq": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.0.self_attn.o_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.layers.0.self_attn.o_proj.lora_B.weight.exp_avg": ([256, 8], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.0.self_attn.o_proj.lora_B.weight.exp_avg_sq": ([256, 8], torch.bfloat16, "cpu"),
+        # Layer 1 attention optimizer states
+        "optim.state.model.layers.1.self_attn.q_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.layers.1.self_attn.q_proj.lora_A.weight.exp_avg": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.1.self_attn.q_proj.lora_A.weight.exp_avg_sq": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.1.self_attn.q_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.layers.1.self_attn.q_proj.lora_B.weight.exp_avg": ([256, 8], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.1.self_attn.q_proj.lora_B.weight.exp_avg_sq": ([256, 8], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.1.self_attn.k_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.layers.1.self_attn.k_proj.lora_A.weight.exp_avg": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.1.self_attn.k_proj.lora_A.weight.exp_avg_sq": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.1.self_attn.k_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.layers.1.self_attn.k_proj.lora_B.weight.exp_avg": ([64, 8], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.1.self_attn.k_proj.lora_B.weight.exp_avg_sq": ([64, 8], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.1.self_attn.v_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.layers.1.self_attn.v_proj.lora_A.weight.exp_avg": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.1.self_attn.v_proj.lora_A.weight.exp_avg_sq": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.1.self_attn.v_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.layers.1.self_attn.v_proj.lora_B.weight.exp_avg": ([64, 8], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.1.self_attn.v_proj.lora_B.weight.exp_avg_sq": ([64, 8], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.1.self_attn.o_proj.lora_A.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.layers.1.self_attn.o_proj.lora_A.weight.exp_avg": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.1.self_attn.o_proj.lora_A.weight.exp_avg_sq": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.1.self_attn.o_proj.lora_B.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.model.layers.1.self_attn.o_proj.lora_B.weight.exp_avg": ([256, 8], torch.bfloat16, "cpu"),
+        "optim.state.model.layers.1.self_attn.o_proj.lora_B.weight.exp_avg_sq": ([256, 8], torch.bfloat16, "cpu"),
+        # lm_head optimizer states
+        "optim.state.lm_head.lora_A.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.lm_head.lora_A.weight.exp_avg": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.lm_head.lora_A.weight.exp_avg_sq": ([4, 512], torch.bfloat16, "cpu"),
+        "optim.state.lm_head.lora_B.weight.step": ([], torch.float32, "cpu"),
+        "optim.state.lm_head.lora_B.weight.exp_avg": ([16000, 8], torch.bfloat16, "cpu"),
+        "optim.state.lm_head.lora_B.weight.exp_avg_sq": ([16000, 8], torch.bfloat16, "cpu"),
+    }
     return expected_model_keys, expected_optim_keys
 
 
@@ -261,6 +281,14 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
     cfg.model.force_hf = force_hf
 
     try:
+        # Clean up any leftover checkpoints from previous runs to avoid
+        # auto-detection loading stale state into the fresh model.
+        ckpt_dir = Path(cfg.get("checkpoint.checkpoint_dir", "checkpoints"))
+        if ckpt_dir.exists() and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
+            shutil.rmtree(ckpt_dir)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
         # set use_triton value based on parsed input
         expected_automodel_peft_config["use_triton"] = cfg.peft.use_triton
 
@@ -274,21 +302,14 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
             trainer.model_parts,
             trainer.checkpointer.config.is_peft,
         ).state_dict()
-        native_optim_sd = OptimizerState(
-            trainer.model_parts,
-            trainer.optimizer,
-            trainer.lr_scheduler,
-            is_peft=trainer.checkpointer.config.is_peft,
-        ).state_dict()["optim"]
-        # Flatten native optimizer state dict to match the DCP on-disk layout:
-        #   state.<param_idx>.<state_key>  →  (after _rename_keys)  optim.state.<idx>.<key>
-        optimizer_state_dict = {}
-        for pid, param_state in native_optim_sd['state'].items():
-            for key, value in param_state.items():
-                if isinstance(value, torch.Tensor):
-                    if isinstance(value, torch.distributed.tensor.DTensor):
-                        value = value.to_local()
-                    optimizer_state_dict[f"state.{pid}.{key}"] = value.cpu()
+        optimizer_state_dict = to_cpu(
+            OptimizerState(
+                trainer.model_parts,
+                trainer.optimizer,
+                trainer.lr_scheduler,
+                is_peft=trainer.checkpointer.config.is_peft,
+            ).state_dict()["optim"]
+        )
 
         # assert the correct paths exist
         output_files = [
@@ -372,18 +393,23 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
         restored_model = restored_model.model_parts[0]
         source_model_loss = get_validation_loss(trainer.model_parts[0], val_batch, trainer.loss_fn, trainer.dist_env.device)
         restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
+        errors = []
         for (source_name, source_p), (restore_name, restore_p) in zip(trainer.model_parts[0].named_parameters(), restored_model.named_parameters()):
             assert source_name == restore_name, "Parameter name mismatch"
-            # PEFT checkpoints only save adapter weights; frozen base-model
-            # weights are reloaded from the pretrained model and may differ
-            # due to FSDP2 DTensor re-sharding.  Only compare trainable params.
-            if not source_p.requires_grad:
-                continue
             if isinstance(source_p, torch.distributed.tensor.DTensor):
-                source_p = source_p.to_local()
+                source_p = source_p.full_tensor()
             if isinstance(restore_p, torch.distributed.tensor.DTensor):
-                restore_p = restore_p.to_local()
-            assert torch.allclose(source_p, restore_p), "Parameter value mismatch for " + source_name
+                restore_p = restore_p.full_tensor()
+            if not torch.allclose(source_p, restore_p):
+                errors.append(("Parameter value mismatch for " + source_name, source_p, restore_p))
+        if errors:
+            print("Parameter value mismatches:")
+            for error in errors:
+                print(error[0])
+                print(error[1])
+                print(error[2])
+                print("-"*80)
+            raise Exception("Parameter value mismatches")
         assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
 
         # compare the recipe configs
