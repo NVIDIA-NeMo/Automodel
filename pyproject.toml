@@ -271,6 +271,7 @@ pythonpath = ["."]
 source = [".", "/opt/Automodel", "/home/runner/work/Automodel/Automodel"]
 
 [tool.coverage.run]
+source = ["nemo_automodel"]
 parallel = true
 concurrency = ["thread", "multiprocessing"]
 omit = [
