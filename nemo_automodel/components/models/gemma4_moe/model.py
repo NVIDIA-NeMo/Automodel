@@ -479,6 +479,11 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         token_type_ids: torch.Tensor | None = None,
         **kwargs: Any,
     ):
+        # Newer transformers requires cache_position (can't be None); generate if not provided (uses the standard default that HF uses).
+        if cache_position is None and input_ids is not None:
+            seq_len = input_ids.shape[-1]
+            cache_position = torch.arange(seq_len, device=input_ids.device)
+
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         if not getattr(text_config, "enable_moe_block", False):
             # Dense path — delegate to HF forward

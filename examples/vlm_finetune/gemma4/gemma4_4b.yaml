@@ -20,7 +20,7 @@ step_scheduler:
   local_batch_size: 1
   ckpt_every_steps: 100
   val_every_steps: 100
-  max_steps: 100
+  max_steps: 1000
 
 dist_env:
   backend: nccl
@@ -33,10 +33,11 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /workspace/eevee-4-e4b-it_vv5
+  pretrained_model_name_or_path: /workspace/eevee-4-e4b-it_vv6
   torch_dtype: torch.bfloat16
   use_liger_kernel: false
   use_sdpa_patching: false
+  # TODO: check if FA2 can be made to work (gives an error currently)
   attn_implementation: eager
   text_config:
     use_cache: true
@@ -96,5 +97,5 @@ freeze_config:
 
 # wandb:
 #   project: eevee-4
-#   name: eevee4-e4b-it_vv4
+#   name: eevee4-e4b-it_vv6
 #   dir: vlm_checkpoints/gemma4_4b/
