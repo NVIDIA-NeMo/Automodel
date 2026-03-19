@@ -11,4 +11,4 @@ coverage:
         if_not_found: success
 
 fixes:
-  - "/workspace/::"
+  - "/opt/Automodel/::"
