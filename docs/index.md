@@ -82,6 +82,10 @@ Find the right guide for your task.
 | **Pretrain (NanoGPT)**      | You want quick pretraining experiments on a single node                             | FineWeb / text corpus                             | LLM       | [Try NanoGPT](guides/llm/nanogpt-pretraining.md)          |
 
 
+|                 | Embedding Fine-Tuning |
+|-----------------|----------------------|
+| **Retriever**   | [Guide](guides/retriever/embedding-finetuning.md) |
+
 ## Performance
 
 Training throughput on NVIDIA GPUs with optimized kernels for Hugging Face models.
@@ -262,6 +266,13 @@ guides/omni/gemma3-3n.md
 guides/vlm/qwen3_5.md
 guides/quantization-aware-training.md
 guides/llm/databricks.md
+::::
+
+::::{toctree}
+:hidden:
+:caption: NeMo Retriever
+
+guides/retriever/embedding-finetuning.md
 ::::
 
 ::::{toctree}

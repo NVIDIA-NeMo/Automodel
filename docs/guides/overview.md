@@ -1,6 +1,6 @@
 ## Recipes and End-to-End Examples
 
-NeMo Automodel is organized around two key concepts: recipes and components.
+NeMo AutoModel is organized around two key concepts: recipes and components.
 
 Recipes are executable scripts configured with YAML files. Each recipe defines its own training and validation loop, orchestrated through a `step_scheduler`. It specifies the model, dataset, loss function, optimizer, scheduler, checkpointing, and distributed training settings—allowing end-to-end training with a single command.
 
@@ -12,6 +12,7 @@ This page maps the ready-to-run recipes found in the `examples/` directory to th
 - Getting started: [Installation](installation.md)
 
 ## Large Language Models (LLM)
+
 This section provides practical recipes and configurations for working with large language models across three core workflows: fine-tuning, pretraining, and knowledge distillation.
 
 ### Fine-Tuning
@@ -49,6 +50,7 @@ Curated configurations for benchmarking different training stacks and settings (
 
 
 ## Vision Language Models (VLM)
+
 This section provides practical recipes and configurations for working with vision language models, covering fine-tuning and generation workflows for multimodal tasks.
 
 ### Fine-Tuning
@@ -64,6 +66,26 @@ Fine-tuning recipes for VLMs.
 Simple generation script and configurations for VLMs.
 
 - Folder: [examples/vlm_generate](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/vlm_generate)
+
+## NeMo Retriever
+
+Recipes for training retrieval models used in semantic search and RAG pipelines.
+
+### Embedding Model Fine-Tuning
+
+Fine-tune a biencoder (dual-encoder) embedding model using contrastive learning on (query, positive document, hard negatives) triples. Supports shared or separate query/passage encoders, multiple pooling strategies, and LoRA.
+
+- Folder: [examples/biencoder](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/biencoder)
+- Representative backbone: Llama 3.2 1B (bidirectional variant)
+- How-to guide: [Embedding model fine-tuning](retriever/embedding-finetuning.md)
+
+### Hard Negative Mining
+
+Mine high-quality hard negatives from your corpus using a trained embedding model, improving the quality of subsequent fine-tuning rounds.
+
+- Script: [examples/biencoder/mine_hard_negatives.py](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/biencoder/mine_hard_negatives.py)
+- Config: [examples/biencoder/mining_config.yaml](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/biencoder/mining_config.yaml)
+- How-to guide: [Embedding model fine-tuning — Hard Negative Mining](retriever/embedding-finetuning.md#hard-negative-mining)
 
 ## Diffusion Generation
 
