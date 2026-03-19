@@ -271,8 +271,6 @@ pythonpath = ["."]
 source = [".", "/opt/Automodel", "/home/runner/work/Automodel/Automodel"]
 
 [tool.coverage.run]
-data_file = "/opt/Automodel/.coverage"
-source = ["/opt/Automodel/"]
 parallel = true
 concurrency = ["thread", "multiprocessing"]
 omit = [
