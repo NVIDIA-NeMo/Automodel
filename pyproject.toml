@@ -115,7 +115,8 @@ cuda = [
 cuda_source = [
     "bitsandbytes",
 ]
-extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
+# CP for linear attention (fla.ops.cp) requires fla > 0.4.1; pin to main until a release includes it.
+extra = ["flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@7cbe461b10bde60180c32c5f9381a04d41887514", "perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
 delta-databricks = [
     "deltalake>=1.0.0",  # For Delta Lake metadata
