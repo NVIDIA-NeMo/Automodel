@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from typing import Any, Optional
 
 from transformers import AutoConfig
+
+logger = logging.getLogger(__name__)
 
 
 def _should_load_before_shard(
@@ -28,16 +31,27 @@ def _should_load_before_shard(
 ) -> bool:
     """Decide whether to load the checkpoint before FSDP/TP/EP sharding.
 
-    Load-before-shard is only safe when running single-GPU (no PP, TP, or EP),
-    a checkpoint actually needs loading, and no PEFT adapter is involved.
+    Load-before-shard is only safe when running single-GPU (no PP, TP, or EP)
+    and a checkpoint actually needs loading.
     With any model parallelism the post-shard load path must be used to avoid
     NCCL collective mismatches or key/device inconsistencies.
+
+    PEFT models also use this path: the in-place LoRA replacement preserves
+    base-weight FQNs, so pretrained weights load correctly before sharding.
+    The PEFT adapter checkpoint is loaded separately (post-shard) by
+    ``load_checkpoint`` in the recipe, so there is no base/adapter sync issue.
     """
     no_pp = autopipeline is None
     no_tp = tp_size <= 1
     no_ep = ep_size <= 1
     need_checkpoint_load = bool(pretrained_model_name_or_path and load_base_model)
-    return no_pp and no_tp and no_ep and need_checkpoint_load and (peft_config is None)
+    result = no_pp and no_tp and no_ep and need_checkpoint_load
+    logger.debug(
+        "[_should_load_before_shard] no_pp={} no_tp={} no_ep={} need_load={} peft={} -> {}".format(
+            no_pp, no_tp, no_ep, need_checkpoint_load, peft_config is not None, result
+        )
+    )
+    return result
 
 
 def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
