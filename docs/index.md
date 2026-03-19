@@ -270,6 +270,7 @@ guides/llm/databricks.md
 
 guides/dataset-overview.md
 guides/llm/dataset.md
+guides/llm/chat-template.md
 guides/llm/retrieval-dataset.md
 guides/llm/column-mapped-text-instruction-dataset.md
 guides/llm/column-mapped-text-instruction-iterable-dataset.md

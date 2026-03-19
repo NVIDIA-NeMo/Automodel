@@ -179,6 +179,10 @@ The `packed_sequence` has two options:
 - **split_across_pack**: If two will split a sequence across different packed sequences.
 
 
+## Chat Templates
+
+If you are fine-tuning an instruct model and want the training data formatted with the model's chat template, see the [Chat Template Guide](chat-template.md).
+
 ## Troubleshooting Tips
 
 - **Tokenization Mismatch?** Ensure your tokenizer aligns with the model's expected inputs.
