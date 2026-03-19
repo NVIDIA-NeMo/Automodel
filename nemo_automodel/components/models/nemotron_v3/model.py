@@ -444,7 +444,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             past_key_values = NemotronHybridCache(self.config, batch_size, self.dtype, self.device)
             # First call: cache_position covers the full prompt
             if cache_position is None:
-                cache_position = torch.arange(input_ids.shape[1], device=input_ids.device)
+                prompt_len = inputs_embeds.shape[1] if inputs_embeds is not None else input_ids.shape[1]
+                cache_position = torch.arange(prompt_len, device=input_ids.device)
 
         # After prefill, send only the new token
         if past_key_values.has_previous_state:
@@ -452,6 +453,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             if cache_position is None:
                 kv_len = past_key_values.get_seq_length()
                 cache_position = torch.tensor([kv_len], device=input_ids.device)
+            elif cache_position.ndim == 1 and cache_position.numel() > 1:
+                # GenerationMixin may forward the full prompt positions on decode
+                # even though only the last token is being decoded. Nemotron-v3's
+                # Mamba cache update expects a single decode position here.
+                cache_position = cache_position[-1:]
 
         # On the first step, prefer inputs_embeds when available
         if inputs_embeds is not None and not past_key_values.has_previous_state:

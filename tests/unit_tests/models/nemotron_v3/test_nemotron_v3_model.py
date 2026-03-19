@@ -575,6 +575,63 @@ class TestNemotronHForCausalLM:
         assert model_inputs["input_ids"].shape == (batch_size, seq_len)
         assert (model_inputs["attention_mask"] == attention_mask).all()
 
+    def test_causal_lm_prepare_inputs_for_generation_uses_inputs_embeds_length(self, config, backend):
+        """Inputs-embeds prefill should derive cache positions from the embed sequence length."""
+        from transformers import PretrainedConfig
+
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        hf_config = PretrainedConfig(is_encoder_decoder=False, eos_token_id=1, pad_token_id=0)
+        for attr, val in vars(config).items():
+            setattr(hf_config, attr, val)
+
+        model = NemotronHForCausalLM(hf_config, backend=backend).to(torch.bfloat16)
+
+        batch_size, prompt_len = 2, 6
+        input_ids = torch.empty(batch_size, 0, dtype=torch.long)
+        inputs_embeds = torch.randn(batch_size, prompt_len, config.hidden_size, dtype=torch.bfloat16)
+        attention_mask = torch.ones(batch_size, prompt_len)
+
+        model_inputs = model.prepare_inputs_for_generation(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+        )
+
+        assert model_inputs["input_ids"] is None
+        assert model_inputs["inputs_embeds"] is inputs_embeds
+        torch.testing.assert_close(
+            model_inputs["cache_position"],
+            torch.arange(prompt_len, device=model_inputs["cache_position"].device),
+        )
+        assert model_inputs["causal_mask_mapping"]["full_attention"].shape == (batch_size, 1, prompt_len, prompt_len)
+
+    def test_causal_lm_prepare_inputs_for_generation_trims_decode_cache_position(self, config, backend):
+        """Decode steps should keep only the last cache position for Nemotron-v3's Mamba cache update."""
+        from transformers import PretrainedConfig
+
+        from nemo_automodel.components.models.nemotron_v3.cache import NemotronHybridCache
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        hf_config = PretrainedConfig(is_encoder_decoder=False, eos_token_id=1, pad_token_id=0)
+        for attr, val in vars(config).items():
+            setattr(hf_config, attr, val)
+
+        model = NemotronHForCausalLM(hf_config, backend=backend).to(torch.bfloat16)
+
+        cache = NemotronHybridCache(hf_config, batch_size=1, dtype=torch.bfloat16, device=torch.device("cpu"))
+        cache.has_previous_state = True
+
+        model_inputs = model.prepare_inputs_for_generation(
+            input_ids=torch.tensor([[5, 6, 7]], dtype=torch.long),
+            attention_mask=torch.ones(1, 8),
+            past_key_values=cache,
+            cache_position=torch.arange(8),
+        )
+
+        assert model_inputs["input_ids"].shape == (1, 1)
+        torch.testing.assert_close(model_inputs["cache_position"], torch.tensor([7]))
+
     def test_causal_lm_generate(self, config, backend):
         """Test that .generate() produces token sequences of the requested length."""
         from transformers import PretrainedConfig
@@ -887,6 +944,46 @@ class TestNemotronV3MambaCacheGPU:
         assert output_ids.shape[0] == batch_size
         assert output_ids.shape[1] >= prompt_len
         assert output_ids.shape[1] <= prompt_len + max_new_tokens
+
+    @skip_if_no_mamba
+    def test_hybrid_model_generate_with_inputs_embeds_matches_manual_decode(self, config, backend):
+        """Cached generate(inputs_embeds=...) should match full-recompute decoding."""
+        from transformers import PretrainedConfig
+
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        hf_config = PretrainedConfig(is_encoder_decoder=False, eos_token_id=1, pad_token_id=0)
+        for attr, val in vars(config).items():
+            setattr(hf_config, attr, val)
+
+        model = NemotronHForCausalLM(hf_config, backend=backend)
+        model = model.to(torch.bfloat16).cuda()
+        model.eval()
+
+        batch_size, prompt_len, max_new_tokens = 1, 4, 5
+        input_ids = torch.randint(2, config.vocab_size, (batch_size, prompt_len), device="cuda")
+        inputs_embeds = model.model.embed_tokens(input_ids).to(torch.bfloat16)
+        attention_mask = torch.ones(batch_size, prompt_len, dtype=torch.long, device="cuda")
+
+        output_cached = model.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+        )
+
+        generated = input_ids.clone()
+        with torch.no_grad():
+            for _ in range(max_new_tokens):
+                out = model(generated, use_cache=False)
+                next_token = out.logits[:, -1:, :].argmax(dim=-1)
+                generated = torch.cat([generated, next_token], dim=1)
+                if next_token.item() == hf_config.eos_token_id:
+                    break
+
+        expected_new_tokens = generated[:, prompt_len:]
+        min_len = min(output_cached.shape[1], expected_new_tokens.shape[1])
+        assert torch.equal(output_cached[:, :min_len], expected_new_tokens[:, :min_len])
 
     @skip_if_no_mamba
     def test_hybrid_mamba_cache_deterministic(self, config, backend):
