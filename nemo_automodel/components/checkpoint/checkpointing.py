@@ -1294,7 +1294,6 @@ def _convert_checkpoint_with_transformers(
                 realized_value, _conversion_errors = result
                 assert isinstance(realized_value, dict), (
                     f"Expected convert() first element to be dict, got {type(realized_value)}"
-
                 )
                 for target_name, param in realized_value.items():
                     param = param[0] if isinstance(param, list) else param
