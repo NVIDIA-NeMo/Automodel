@@ -36,16 +36,15 @@ def _should_load_before_shard(
     With any model parallelism the post-shard load path must be used to avoid
     NCCL collective mismatches or key/device inconsistencies.
 
-    PEFT models also use this path: the in-place LoRA replacement preserves
-    base-weight FQNs, so pretrained weights load correctly before sharding.
-    The PEFT adapter checkpoint is loaded separately (post-shard) by
-    ``load_checkpoint`` in the recipe, so there is no base/adapter sync issue.
+    PEFT models skip this path and use the post-shard load so that base and
+    adapter weights load in the same way as multi-GPU.
     """
     no_pp = autopipeline is None
     no_tp = tp_size <= 1
     no_ep = ep_size <= 1
+    no_peft = peft_config is None
     need_checkpoint_load = bool(pretrained_model_name_or_path and load_base_model)
-    result = no_pp and no_tp and no_ep and need_checkpoint_load
+    result = no_pp and no_tp and no_ep and no_peft and need_checkpoint_load
     logger.debug(
         "[_should_load_before_shard] no_pp={} no_tp={} no_ep={} need_load={} peft={} -> {}".format(
             no_pp, no_tp, no_ep, need_checkpoint_load, peft_config is not None, result
