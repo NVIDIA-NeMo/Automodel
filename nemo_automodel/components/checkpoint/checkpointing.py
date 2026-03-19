@@ -1276,7 +1276,15 @@ def _convert_checkpoint_with_transformers(
         # Now apply all the conversions
         for first_param_name, mapping in param_name_to_mapping.items():
             try:
-                realized_value = mapping.convert(first_param_name, model=model, config=model.config)
+                # convert() returns (collected_tensors_dict, conversion_errors)
+                result = mapping.convert(first_param_name, model=model, config=model.config)
+                assert isinstance(result, tuple), "Expected convert() to return (dict, errors) tuple, got {}".format(
+                    type(result)
+                )
+                realized_value, _conversion_errors = result
+                assert isinstance(realized_value, dict), "Expected convert() first element to be dict, got {}".format(
+                    type(realized_value)
+                )
                 for target_name, param in realized_value.items():
                     param = param[0] if isinstance(param, list) else param
                     converted_state_dict[target_name] = param
