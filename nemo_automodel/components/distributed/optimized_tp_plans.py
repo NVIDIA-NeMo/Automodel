@@ -160,9 +160,13 @@ def _parallelize_llama(
     # Compute per-section sizes for the fused QKV projection (GQA-aware).
     # For GQA, Q has more heads than K/V so the sections are unequal;
     # FusedColwiseParallel shards each section independently.
-    head_dim = getattr(model.config, "head_dim", model.config.hidden_size // model.config.num_attention_heads)
-    q_size = model.config.num_attention_heads * head_dim
-    kv_size = model.config.num_key_value_heads * head_dim
+    # model may be None when called from get_llama_nemotron_super_tp_plan.
+    if model is not None and hasattr(model, "config"):
+        head_dim = getattr(model.config, "head_dim", model.config.hidden_size // model.config.num_attention_heads)
+        q_size = model.config.num_attention_heads * head_dim
+        kv_size = model.config.num_key_value_heads * head_dim
+    else:
+        head_dim = q_size = kv_size = None
 
     base_model_tp_plan: dict[str, ParallelStyle] = {
         "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
@@ -171,7 +175,9 @@ def _parallelize_llama(
         "model.layers.*.self_attn.v_proj": ColwiseParallel(),
         "model.layers.*.self_attn.qkv_proj": FusedColwiseParallel(
             section_sizes=(q_size, kv_size, kv_size),
-        ),
+        )
+        if q_size is not None
+        else FusedColwiseParallel(num_sections=3),
         "model.layers.*.mlp.gate_up_proj": FusedColwiseParallel(num_sections=2),
         "model.layers.*.self_attn.o_proj": RowwiseParallel(),
         "model.layers.*.mlp.up_proj": ColwiseParallel(),
