@@ -367,14 +367,19 @@ def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tens
     return mask_4d.unsqueeze(1)  # [B, 1, S, S]
 
 
-def neat_packed_collater(batch: list[dict]) -> dict:
+def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -> dict:
     """Collater for neat-packed LLM sequences.
 
     Stacks ``input_ids``, ``labels``, ``position_ids`` and converts the
-    indexed ``attention_mask`` into a 4D block-causal mask.
+    indexed ``attention_mask`` to the format required by the attention backend.
+
+    For ``flash_attention_2``: keeps the indexed 2D mask ``[B, S]``.
+    For ``sdpa`` / ``eager``: converts to a 4D block-causal float mask.
 
     Args:
         batch: List of sample dicts produced by ``neat_pack_dataset``.
+        attn_implementation: Attention backend (``"flash_attention_2"``,
+            ``"sdpa"``, or ``"eager"``).
 
     Returns:
         Dict with batched tensors ready for model forward.
@@ -387,13 +392,16 @@ def neat_packed_collater(batch: list[dict]) -> dict:
     position_ids = batchify(torch.stack([torch.as_tensor(x["position_ids"]) for x in batch]))
     attention_mask = batchify(torch.stack([torch.as_tensor(x["attention_mask"]) for x in batch]))
 
-    attention_mask_4d = _indexed_mask_to_4d_block_causal(attention_mask)
+    if attn_implementation == "flash_attention_2":
+        mask_out = attention_mask
+    else:
+        mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
 
     return {
         "input_ids": input_ids,
         "labels": labels,
         "position_ids": position_ids,
-        "attention_mask": attention_mask_4d,
+        "attention_mask": mask_out,
     }
 
 

@@ -491,6 +491,8 @@ def build_dataloader(
 
             if packing_strategy == "neat":
                 from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
+                from nemo_automodel.components.datasets.utils import neat_packed_collater
+                from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
 
                 ds = neat_pack_dataset(
                     ds,
@@ -500,6 +502,11 @@ def build_dataloader(
                     padding_idx=getattr(tokenizer, "pad_token_id", 0),
                     drop_long_samples=getattr(cfg_ps, "drop_long_samples", False),
                 )
+                _attn_impl = get_attn_implementation(cfg_model)
+                configure_packing(attn_implementation=_attn_impl)
+                # Set collater with attn_implementation so it produces the right mask format
+                cfg_dl.collate_fn = lambda batch, _ai=_attn_impl: neat_packed_collater(batch, attn_implementation=_ai)
+                logger.info(f"Configured neat packing for attn_implementation={_attn_impl}")
             else:
                 # "thd" — existing packing logic
                 ds = pack_dataset(

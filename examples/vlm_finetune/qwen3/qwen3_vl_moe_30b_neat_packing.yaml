@@ -1,0 +1,100 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Example recipe to finetune Qwen/Qwen3-VL-30B-A3B-Instruct with neat packing.
+# Uses greedy knapsack bin-packing for reduced padding waste.
+# Requires flash_attention_2 and a meta-dataset in ShareGPT format.
+#
+# To run this recipe:
+# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py \
+#   --config examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_neat_packing.yaml
+
+step_scheduler:
+  global_batch_size: 16
+  local_batch_size: 1
+  ckpt_every_steps: 500
+  val_every_steps: 100
+  num_epochs: 2
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-VL-30B-A3B-Instruct
+  attn_implementation: flash_attention_2
+  # Note: backend.attn is not set here so the model uses attn_implementation
+  # (flash_attention_2) which is required for neat packing.
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    linear: te
+    rms_norm: te
+    rope_fusion: false
+    experts: te
+    enable_deepep: true
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /tmp/checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8
+  sequence_parallel: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_meta_dataset
+  path_or_dataset: mockdata/meta.json
+  pretokenize: true
+  max_length: 512
+  packing:
+    enabled: true
+    pack_size: 512
+    packing_ratio: 0.9
+    drop_long_samples: true
+    balance_media_tokens: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
