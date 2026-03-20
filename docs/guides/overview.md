@@ -92,7 +92,7 @@ Pretraining recipes for training diffusion models from scratch on large-scale da
 Generation scripts and configs for running inference with pretrained or fine-tuned diffusion models.
 
 - Folder: [examples/diffusion/generate](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/diffusion/generate)
-- Representative models: Wan 2.1 1.3B, Wan 2.2 14B, FLUX.1-dev, HunyuanVideo
+- Representative models: Wan 2.1 1.3B, FLUX.1-dev, HunyuanVideo
 - How-to guide: [Diffusion generation](diffusion/finetune.md#generation--inference)
 
 ### Dataset Preparation
