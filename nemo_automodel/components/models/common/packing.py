@@ -97,10 +97,38 @@ def get_unpad_data(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     return indices, cu_seqlens, max_seqlen_in_batch
 
 
-def configure_packing(attn_implementation: str = "sdpa") -> None:
-    """Apply monkey-patches for flash attention packing support.
+def _passthrough_create_causal_mask(
+    config, input_embeds, attention_mask, cache_position, past_key_values, position_ids, **kwargs
+):
+    """Replacement for ``create_causal_mask`` that returns the mask unchanged."""
+    return attention_mask
 
-    Call this **after** the model is created and **before** training starts.
+
+def get_attn_implementation(cfg_model):
+    """Determine the attention backend from model config.
+
+    Custom models store it in ``backend.attn``; HF models use ``attn_implementation``.
+    """
+    if cfg_model is not None and hasattr(cfg_model, "backend") and hasattr(cfg_model.backend, "attn"):
+        return cfg_model.backend.attn
+    if cfg_model is not None:
+        return cfg_model.get("attn_implementation", "sdpa")
+    return "sdpa"
+
+
+# Model modules whose ``create_causal_mask`` must be patched for neat packing.
+_PACKING_PATCH_MODULES = [
+    "transformers.models.qwen2.modeling_qwen2",
+    "transformers.models.qwen2_5_vl.modeling_qwen2_5_vl",
+    "transformers.models.qwen2_vl.modeling_qwen2_vl",
+    "transformers.models.qwen3_vl.modeling_qwen3_vl",
+    "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
+]
+
+
+def configure_packing(attn_implementation: str = "sdpa") -> None:
+    """Apply monkey-patches for packed-sequence training with flash_attention_2.
+
     Only patches when ``attn_implementation == "flash_attention_2"``.
 
     Args:
@@ -109,36 +137,21 @@ def configure_packing(attn_implementation: str = "sdpa") -> None:
     if attn_implementation != "flash_attention_2":
         return
 
-    # Patch 1: Replace _get_unpad_data to handle indexed attention masks
+    import sys
+
     import transformers.modeling_flash_attention_utils
 
     transformers.modeling_flash_attention_utils._get_unpad_data = get_unpad_data
 
-    # Patch 2: Replace create_causal_mask for Qwen3-VL models
-    # When using flash_attention_2 with packing, we pass the indexed mask
-    # directly to the attention layer (bypassing 4D mask creation).
-    try:
-        from transformers.models.qwen3_vl import modeling_qwen3_vl
+    # Each model module imports create_causal_mask into its own namespace at
+    # import time, so we must patch each module individually.
+    for mod_name in _PACKING_PATCH_MODULES:
+        mod = sys.modules.get(mod_name)
+        if mod is not None and hasattr(mod, "create_causal_mask"):
+            mod.create_causal_mask = _passthrough_create_causal_mask
 
-        def _create_causal_mask(
-            config, input_embeds, attention_mask, cache_position, past_key_values, position_ids, **kwargs
-        ):
-            return attention_mask
-
-        modeling_qwen3_vl.create_causal_mask = _create_causal_mask
-    except ImportError:
-        pass
-
-    try:
-        from transformers.models.qwen3_vl_moe import modeling_qwen3_vl_moe
-
-        def _create_causal_mask_moe(
-            config, input_embeds, attention_mask, cache_position, past_key_values, position_ids, **kwargs
-        ):
-            return attention_mask
-
-        modeling_qwen3_vl_moe.create_causal_mask = _create_causal_mask_moe
-    except ImportError:
-        pass
-
-    logger.info("Configured flash attention packing: patched _get_unpad_data and create_causal_mask.")
+    logger.info(
+        "Configured packing (%s): patched create_causal_mask in %d model modules.",
+        attn_implementation,
+        sum(1 for m in _PACKING_PATCH_MODULES if sys.modules.get(m) is not None),
+    )
