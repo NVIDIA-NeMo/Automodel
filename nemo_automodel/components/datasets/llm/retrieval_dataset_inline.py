@@ -103,7 +103,14 @@ def _resolve_doc_to_example(doc: Any) -> dict:
 
 
 def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True):
-    """Load inline retrieval datasets from JSON/JSONL files. Returns ``(dataset, corpus_dict)``."""
+    """
+    Load retrieval datasets from JSON/JSONL files.
+
+    Copied from nemo-retriever-research/src/data/datasets.py
+
+    Returns:
+        Tuple of (dataset, corpus_dict)
+    """
     if not isinstance(data_dir_list, list):
         data_dir_list = [data_dir_list]
     datasets = []
@@ -173,9 +180,19 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
 
 
 def _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
-    """Transform raw inline examples to training format with resolved document text/images."""
+    """
+    Transform function to convert from raw format to training format.
+    Args:
+        examples: Batch of examples with question, corpus_id, pos_doc, neg_doc
+        num_neg_docs: Number of negative documents to use
+        corpus_dict: Dictionary mapping corpus_id to corpus objects
+        use_dataset_instruction: Whether to use instruction from dataset's metadata
+    """
+    # Handle both batched and single examples
     is_batched = isinstance(examples["question"], list)
+
     if not is_batched:
+        # Convert single example to batch for uniform processing
         examples = {k: [v] for k, v in examples.items()}
 
     questions = examples["question"]
@@ -188,6 +205,7 @@ def _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_i
     for i_example in range(len(questions)):
         cur_pos_neg_doc = []
 
+        # Get one positive doc (take first one)
         positives = batch_positives[i_example]
         if isinstance(positives, list) and len(positives) > 0:
             cur_pos_neg_doc.append(positives[0])
@@ -196,6 +214,7 @@ def _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_i
         else:
             cur_pos_neg_doc.append(positives)
 
+        # Get negatives (limit to num_neg_docs)
         negatives = batch_negatives[i_example]
         if not isinstance(negatives, list):
             negatives = _coerce_to_list(negatives)
@@ -205,10 +224,13 @@ def _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_i
                 f"for question='{questions[i_example]}'"
             )
         if num_neg_docs > 0:
-            cur_pos_neg_doc += [negatives[idx % len(negatives)] for idx in range(num_neg_docs)]
+            neg_ids = [i for i in range(len(negatives))]
+            cur_neg_ids = [neg_ids[idx % len(neg_ids)] for idx in range(num_neg_docs)]
+            cur_pos_neg_doc += [negatives[n_id] for n_id in cur_neg_ids]
 
         cur_pos_neg_doc_batch.append(cur_pos_neg_doc)
 
+    # Extract text and images from corpus
     cur_pos_neg_text_batch = []
     cur_pos_neg_image_batch = []
     query_instruction_batch = []
@@ -222,6 +244,7 @@ def _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_i
         for doc in docs:
             cur_doc = _resolve_doc_to_example(doc)
 
+            # Extract text
             if cur_doc["text"] != "" and not cur_doc["image"]:
                 text = cur_doc["text"]
             elif cur_doc["image"]:
@@ -232,6 +255,7 @@ def _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_i
 
             cur_pos_neg_text.append(text)
 
+            # Extract image
             if cur_doc["image"] != "":
                 cur_doc["image"] = cur_doc["image"].convert("RGB")
             cur_pos_neg_image.append(cur_doc["image"])
@@ -262,22 +286,32 @@ def _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_i
 
 
 def flatten_bi_encoder_to_cross_encoder(data: dict) -> dict:
-    """Flatten grouped bi-encoder output so each query-doc pair becomes a separate entry."""
-    images = data["doc_image"]
-    texts = data["doc_text"]
+    """Flatten grouped bi-encoder output into cross-encoder format.
+
+    Takes bi-encoder-style data (queries with grouped doc lists) and flattens it
+    so each query-doc pair becomes a separate entry. Used by cross-encoder transforms
+    in both retrieval_dataset.py and retrieval_dataset_inline.py.
+    """
+    cur_pos_neg_image_batch = data["doc_image"]
+    cur_pos_neg_text_batch = data["doc_text"]
     questions = data["question"]
 
-    flat_images = [img for group in images for img in group]
-    flat_texts = [txt for group in texts for txt in group]
-    flat_questions = [q for q, group in zip(questions, images) for _ in group]
+    # Flattening query-grouped docs images and text and repeating queries
+    cur_pos_neg_image_batch_flatten = [y for x in cur_pos_neg_image_batch for y in x]
+    cur_pos_neg_text_batch_flatten = [y for x in cur_pos_neg_text_batch for y in x]
+    questions_repeated = [[q] * len(i) for q, i in zip(questions, cur_pos_neg_image_batch)]
+    questions_repeated_flatten = [y for x in questions_repeated for y in x]
     num_labels = len(questions)
 
-    assert len(flat_images) == len(flat_texts) == len(flat_questions)
+    assert (
+        len(cur_pos_neg_image_batch_flatten) == len(cur_pos_neg_text_batch_flatten) == len(questions_repeated_flatten)
+    )
     return {
-        "doc_image": flat_images,
-        "doc_text": flat_texts,
-        "question": flat_questions,
-        "num_labels": [num_labels] * len(flat_questions),
+        "doc_image": cur_pos_neg_image_batch_flatten,
+        "doc_text": cur_pos_neg_text_batch_flatten,
+        "question": questions_repeated_flatten,
+        # Only necessary for training. Collator might use it to create the labels with the right shape
+        "num_labels": [num_labels] * len(questions_repeated_flatten),
     }
 
 

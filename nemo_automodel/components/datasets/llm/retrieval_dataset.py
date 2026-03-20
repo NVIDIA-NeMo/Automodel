@@ -78,35 +78,54 @@ DATASETS = {
 
 @dataclass
 class CorpusInfo:
-    """Corpus metadata paired with its dataset object."""
+    """
+    Data structure to hold corpus metadata and dataset object together.
+    Provides easy access to both components with descriptive attribute names.
+    """
 
     metadata: dict
     corpus: AbstractDataset
 
     @property
     def corpus_id(self) -> str:
+        """Get corpus ID from metadata"""
         return self.metadata["corpus_id"]
 
     @property
     def query_instruction(self) -> str:
-        return self.metadata.get("query_instruction", "")
+        """Get query instruction from metadata"""
+        if "query_instruction" in self.metadata:
+            return self.metadata["query_instruction"]
+        else:
+            return ""
 
     @property
     def passage_instruction(self) -> str:
-        return self.metadata.get("passage_instruction", "")
+        """Get passage instruction from metadata"""
+        if "passage_instruction" in self.metadata:
+            return self.metadata["passage_instruction"]
+        else:
+            return ""
 
     @property
     def task_type(self) -> str:
-        return self.metadata.get("task_type", "")
+        """Get task type from metadata"""
+        if "task_type" in self.metadata:
+            return self.metadata["task_type"]
+        else:
+            return ""
 
     @property
     def path(self) -> str:
+        """Get corpus path from the corpus object"""
         return self.corpus.path
 
     def get_document_by_id(self, doc_id: str):
+        """Delegate to corpus for convenience"""
         return self.corpus.get_document_by_id(doc_id)
 
     def get_all_ids(self):
+        """Delegate to corpus for convenience"""
         return self.corpus.get_all_ids()
 
 
@@ -151,16 +170,15 @@ def add_corpus(qa_corpus_paths: Union[dict, list], corpus_dict: dict):
             corpus_dict[corpus_id] = CorpusInfo(corpus_metadata, corpus)
 
 
-def _normalize_doc_list(docs):
-    """Normalize a list of doc references to ``[{"id": str}, ...]``."""
-    return [
-        {"id": str(doc["id"])} if isinstance(doc, dict) and "id" in doc else {"id": str(doc)}
-        for doc in docs
-    ]
-
-
 def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True):
-    """Load datasets from JSON files. Returns ``(dataset, corpus_dict)``."""
+    """
+    Load datasets from JSON files.
+
+    Copied from nemo-retriever-research/src/data/datasets.py
+
+    Returns:
+        Tuple of (dataset, corpus_dict)
+    """
     REQUIRED_FIELDS = ["question_id", "question", "corpus_id", "pos_doc", "neg_doc"]
     if not isinstance(data_dir_list, list):
         data_dir_list = [data_dir_list]
@@ -183,18 +201,37 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
 
         add_corpus(qa_corpus_paths, corpus_dict)
 
+        # Extract only the required fields for training, ignoring extra fields
         normalized_data = []
         for item in train_data["data"]:
+            # Extract only the essential fields we need
             missing = [f for f in REQUIRED_FIELDS if f not in item]
             if missing:
                 raise ValueError(f"Missing required fields: {missing} in train_data item: {item}")
-            normalized_data.append({
+            normalized_item = {
                 "question_id": item["question_id"],
                 "question": item["question"],
                 "corpus_id": item["corpus_id"],
-                "pos_doc": _normalize_doc_list(item["pos_doc"]),
-                "neg_doc": _normalize_doc_list(item["neg_doc"]),
-            })
+            }
+            # Extract pos_doc with only id field
+            normalized_item["pos_doc"] = []
+            for doc in item["pos_doc"]:
+                if isinstance(doc, dict) and "id" in doc:
+                    normalized_item["pos_doc"].append({"id": doc["id"]})
+                else:
+                    # Handle case where doc might be just a string ID
+                    doc_id = doc if isinstance(doc, str) else str(doc)
+                    normalized_item["pos_doc"].append({"id": doc_id})
+            # Extract neg_doc with only id field
+            normalized_item["neg_doc"] = []
+            for doc in item["neg_doc"]:
+                if isinstance(doc, dict) and "id" in doc:
+                    normalized_item["neg_doc"].append({"id": doc["id"]})
+                else:
+                    # Handle case where doc might be just a string ID
+                    doc_id = doc if isinstance(doc, str) else str(doc)
+                    normalized_item["neg_doc"].append({"id": doc_id})
+            normalized_data.append(normalized_item)
 
         datasets.append(Dataset.from_list(normalized_data))
 
@@ -314,25 +351,37 @@ def _load_hf_subset(repo_id: str, subset: str):
             f"adapter/preprocessor before using direct hf:// loading."
         )
 
+    # 5. Normalize to the standard {question_id, question, corpus_id, pos_doc, neg_doc} shape
     normalized_data = []
     for idx, item in enumerate(queries_hf):
+        normalized_item = {
+            "question_id": str(item.get("question_id", f"{subset}:{idx}")),
+            "question": item["question"],
+            "corpus_id": corpus_id,
+        }
+        # pos_doc
         pos_docs = item["pos_doc"]
         if not isinstance(pos_docs, list):
             pos_docs = [pos_docs]
         if not pos_docs:
             raise ValueError(f"HF subset {repo_id}/{subset} record {idx} has empty pos_doc")
-
+        normalized_item["pos_doc"] = []
+        for doc in pos_docs:
+            if isinstance(doc, dict) and "id" in doc:
+                normalized_item["pos_doc"].append({"id": str(doc["id"])})
+            else:
+                normalized_item["pos_doc"].append({"id": str(doc)})
+        # neg_doc (may be absent or empty — validated later at transform time)
         neg_docs = item.get("neg_doc", [])
         if not isinstance(neg_docs, list):
             neg_docs = [neg_docs]
-
-        normalized_data.append({
-            "question_id": str(item.get("question_id", f"{subset}:{idx}")),
-            "question": item["question"],
-            "corpus_id": corpus_id,
-            "pos_doc": _normalize_doc_list(pos_docs),
-            "neg_doc": _normalize_doc_list(neg_docs),
-        })
+        normalized_item["neg_doc"] = []
+        for doc in neg_docs:
+            if isinstance(doc, dict) and "id" in doc:
+                normalized_item["neg_doc"].append({"id": str(doc["id"])})
+            else:
+                normalized_item["neg_doc"].append({"id": str(doc)})
+        normalized_data.append(normalized_item)
 
     return normalized_data, corpus_info
 
@@ -364,9 +413,20 @@ def _load_hf_sources(hf_uris: List[str]):
 
 
 def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
-    """Transform raw examples to training format with resolved document text/images."""
+    """
+    Transform function to convert from raw format to training format.
+
+    Args:
+        examples: Batch of examples with question, corpus_id, pos_doc, neg_doc
+        num_neg_docs: Number of negative documents to use
+        corpus_dict: Dictionary mapping corpus_id to corpus objects
+        use_dataset_instruction: Whether to use instruction from dataset's metadata
+    """
+    # Handle both batched and single examples
     is_batched = isinstance(examples["question"], list)
+
     if not is_batched:
+        # Convert single example to batch for uniform processing
         examples = {k: [v] for k, v in examples.items()}
 
     questions = examples["question"]
@@ -379,12 +439,14 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
     for i_example in range(len(questions)):
         cur_pos_neg_doc = []
 
+        # Get one positive doc (take first one)
         positives = batch_positives[i_example]
         if isinstance(positives, list) and len(positives) > 0:
             cur_pos_neg_doc.append(positives[0])
         else:
             cur_pos_neg_doc.append(positives)
 
+        # Get negatives (limit to num_neg_docs)
         negatives = batch_negatives[i_example]
         if num_neg_docs > 0 and len(negatives) == 0:
             raise ValueError(
@@ -392,10 +454,13 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
                 f"(n_passages > 1). Provide negatives or set n_passages=1."
             )
         if num_neg_docs > 0:
-            cur_pos_neg_doc += [negatives[idx % len(negatives)] for idx in range(num_neg_docs)]
+            neg_ids = [i for i in range(len(negatives))]
+            cur_neg_ids = [neg_ids[idx % len(neg_ids)] for idx in range(num_neg_docs)]
+            cur_pos_neg_doc += [negatives[n_id] for n_id in cur_neg_ids]
 
         cur_pos_neg_doc_batch.append(cur_pos_neg_doc)
 
+    # Extract text and images from corpus
     cur_pos_neg_text_batch = []
     cur_pos_neg_image_batch = []
     query_instruction_batch = []
@@ -407,8 +472,10 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         cur_corpus_id = corpus_ids[idx_doc]
 
         for doc in docs:
-            cur_doc = corpus_dict[cur_corpus_id].get_document_by_id(doc["id"])
+            cur_id = doc["id"]
+            cur_doc = corpus_dict[cur_corpus_id].get_document_by_id(cur_id)
 
+            # Extract text
             if cur_doc["text"] != "" and not cur_doc["image"]:
                 text = cur_doc["text"]
             elif cur_doc["image"]:
@@ -419,6 +486,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
 
             cur_pos_neg_text.append(text)
 
+            # Extract image
             if cur_doc["image"] != "":
                 cur_doc["image"] = cur_doc["image"].convert("RGB")
             cur_pos_neg_image.append(cur_doc["image"])
