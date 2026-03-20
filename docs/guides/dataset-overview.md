@@ -499,7 +499,11 @@ See [Gemma-3n](omni/gemma3-3n.md) and [VLM dataset](vlm/dataset.md) for end-to-e
 
 ## Diffusion Datasets
 
-Diffusion models in NeMo AutoModel use pre-encoded cache files rather than raw images or videos. The built-in preprocessing tool at `tools/diffusion/preprocessing_multiprocess.py` uses model-specific processors to encode visual data into VAE latents and text embeddings, organized into resolution-bucketed cache directories compatible with the multiresolution dataloader.
+Diffusion models don't train directly on raw images or videos. Instead, the data is first encoded into a compact numerical representation called a latent — this is what the model actually learns from. Text captions are similarly converted into text embeddings that the model uses as conditioning.
+
+This encoding is done once during preprocessing, and the results are saved as cache files (.meta). Training then reads these cache files directly, which is significantly faster than re-encoding on every step.
+
+The built-in preprocessing tool ([`tools/diffusion/preprocessing_multiprocess.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/diffusion/preprocessing_multiprocess.py)) handles this conversion. It uses a VAE (Variational Autoencoder) to encode visual data and a text encoder for captions, grouping outputs into resolution-bucketed directories compatible with the multiresolution dataloader.
 
 ### Dataloader Builders
 
