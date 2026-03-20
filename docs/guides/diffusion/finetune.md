@@ -276,7 +276,11 @@ Adjust `--nproc-per-node` to match the number of GPUs on your node, and ensure `
 
 ## Generation / Inference
 
-Use the unified generation script to run inference with any supported diffusion model:
+Once training is complete, you can use the model to generate images or videos from text prompts. This step is called inference — as opposed to training, where the model learns from data, inference is where it produces new outputs.
+
+In diffusion models, generation works by starting from random noise and iteratively denoising it, guided by your text prompt, until a clean image or video emerges.
+
+The generation script ([`generate.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/generate.py)) handles this: it loads your model weights (pretrained or fine-tuned), configures the diffusion sampler, and produces outputs for one or more prompts.
 
 **Single-GPU (Wan 2.1 1.3B):**
 ```bash
