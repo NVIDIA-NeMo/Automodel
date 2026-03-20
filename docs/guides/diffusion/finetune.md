@@ -60,7 +60,14 @@ For the full set of installation methods, see the [installation guide](../instal
 
 ## Prepare Your Dataset
 
-Diffusion model fine-tuning requires pre-encoded `.meta` files rather than raw images or videos. During preprocessing, a VAE encodes visual data into latent representations and a text encoder produces text embeddings. These are saved as `.meta` files so that training operates entirely in latent space.
+Diffusion models operate in latent space — a compressed representation of visual data — rather than directly on raw images or videos. To avoid re-encoding data on every training step, the preprocessing
+  pipeline encodes all inputs ahead of time and saves them as .meta files.
+
+ Each .meta file contains:
+ - Latent representations produced by a VAE (Variational Autoencoder) from the raw visual data
+ - Text embeddings produced by a text encoder from the associated captions/prompts
+
+Fine-tuning then operates entirely on these pre-encoded .meta files, which is significantly faster than encoding on the fly.
 
 Preprocess your data using the built-in tool at `tools/diffusion/preprocessing_multiprocess.py`. The script provides `image` and `video` subcommands:
 
