@@ -49,15 +49,7 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
 class MockModel:
     """Mock model class for testing."""
     def __init__(self, model_type="llama", tie_word_embeddings=False):
-        config_kwargs = dict(tie_word_embeddings=tie_word_embeddings)
-        if model_type == "llama":
-            config_kwargs.update(
-                hidden_size=256,
-                num_attention_heads=8,
-                num_key_value_heads=8,
-                head_dim=32,
-            )
-        self.config = SimpleNamespace(**config_kwargs)
+        self.config = SimpleNamespace(tie_word_embeddings=tie_word_embeddings)
         self.__class__ = {
             "llama": LlamaForCausalLM,
             "qwen2": Qwen2ForCausalLM,
@@ -436,15 +428,7 @@ class TestParallelizeFunctionsMapping:
             # @akoumparouli: explicitly deleting the lm_head because the parallelizer asserts on it
             if model_type == Qwen3ForSequenceClassification:
                 del mock_model.lm_head
-            config_kwargs = dict(tie_word_embeddings=False)
-            if func is _parallelize_llama:
-                config_kwargs.update(
-                    hidden_size=256,
-                    num_attention_heads=8,
-                    num_key_value_heads=8,
-                    head_dim=32,
-                )
-            mock_model.config = SimpleNamespace(**config_kwargs)
+            mock_model.config = SimpleNamespace(tie_word_embeddings=False)
 
             result = func(mock_model, sequence_parallel=False)
             assert isinstance(result, dict)
