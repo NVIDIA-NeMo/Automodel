@@ -270,6 +270,12 @@ class ModelState:
             func = partial(get_model_state_dict, options=options)
             model_state_dict = {k: v for sd in map(func, self.model) for k, v in sd.items()}
 
+        # @akoumpa: the second is_peft statement above keeps buffers in the state dict
+        # this filtering removes them.
+        # TODO: this is a hack and we should find a better way to do this.
+        if self.is_peft:
+            model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k}
+
         if self.is_tied_lm_head:
             # PP models don't have tied embeddings. Safe to pass in model[0] here.
             model_state_dict.pop(self.lm_head_param_name, None)
@@ -300,6 +306,7 @@ class ModelState:
             _drop_outer_prefix(state_dict, "base_model.model.")
             # DoRA: reverse the HF PEFT key rename so DCP can match model params
             _rename_dora_keys_from_hf(state_dict)
+            # @akoumpa: I'm not sure about this code.
             # For EP models, DCP's set_model_state_dict silently skips EP-sharded
             # LoRA params (strict=False hides the FQN mismatch caused by custom
             # expert state_dict() keys like gate_up_linear.weight0). Bypass DCP.
@@ -320,8 +327,8 @@ class ModelState:
                 # weight tying guarantees this is identical to the embedding weight
                 state_dict[lm_head_param_name] = lm_head_weight.detach()
 
-        func = partial(set_model_state_dict, model_state_dict=state_dict, options=options)
-        list(map(func, self.model))
+        for model_part in self.model:
+            set_model_state_dict(model_part, state_dict, options=options)
 
     def _get_base_model_state_dict(self) -> dict[str, Any]:
         model_state_dict = {k: v for sd in map(get_model_state_dict, self.model) for k, v in sd.items()}

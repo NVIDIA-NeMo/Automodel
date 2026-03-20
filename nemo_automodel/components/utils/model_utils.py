@@ -243,11 +243,32 @@ def apply_parameter_freezing(model, freeze_config):
 
     # Freeze audio tower
     if freeze_audio_tower:
-        _freeze_module_by_attribute_and_patterns(model, "audio_tower", ["audio", "audio_encoder"])
+        _freeze_module_by_attribute_and_patterns(model, "audio_tower", ["audio", "audio_encoder", "speech"])
 
     # Freeze language model backbone
     if freeze_language_model:
         _freeze_module_by_attribute_and_patterns(model, "language_model", ["language", "text", "llm"])
+
+    # Phi4MM: cast internal fp32 LoRA adapters to bf16 for FSDP2 compatibility,
+    # and disable KV cache (remote code uses legacy DynamicCache.key_cache
+    # attribute removed in transformers v5.x).
+    model_type = getattr(getattr(model, "config", None), "model_type", "")
+    if model_type == "phi4mm":
+        cast_mixed_dtype_params_to_bf16(model)
+        if hasattr(model, "config"):
+            model.config.use_cache = False
+
+
+def cast_mixed_dtype_params_to_bf16(model):
+    """Cast fp32 parameters and buffers to bf16 for FSDP2 compatibility."""
+    import torch
+
+    for p in model.parameters():
+        if p.dtype == torch.float32:
+            p.data = p.data.to(torch.bfloat16)
+    for b in model.buffers():
+        if b.dtype == torch.float32:
+            b.data = b.data.to(torch.bfloat16)
 
 
 def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, seqlens_padding_value=-1000):

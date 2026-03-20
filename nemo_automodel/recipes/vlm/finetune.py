@@ -32,7 +32,11 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 from wandb import Settings
 
-from nemo_automodel._transformers import NeMoAutoModelForImageTextToText, NeMoAutoModelForMultimodalLM
+from nemo_automodel._transformers import (
+    NeMoAutoModelForCausalLM,
+    NeMoAutoModelForImageTextToText,
+    NeMoAutoModelForMultimodalLM,
+)
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -140,6 +144,8 @@ def build_model(
             NeMoAutoModelForImageTextToText.from_pretrained,
             NeMoAutoModelForMultimodalLM.from_config,
             NeMoAutoModelForMultimodalLM.from_pretrained,
+            NeMoAutoModelForCausalLM.from_config,
+            NeMoAutoModelForCausalLM.from_pretrained,
         )
 
         if is_nemo_auto_model:
@@ -1007,7 +1013,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             total_tokens = 0
             total_num_label_tokens = 0
             for batch in val_dataloader:
-                batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
+                batch = {
+                    k: (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
+                    for k, v in batch.items()
+                }
                 labels = batch.pop("labels")
                 num_label_tokens = (labels != -100).sum().item()
 
