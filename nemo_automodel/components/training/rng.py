@@ -30,6 +30,7 @@ def init_all_rng(seed: int, ranked: bool = False):
     assert isinstance(ranked, bool), "Ranked must be a boolean"
 
     if ranked:
+        # Example: use PyTorch's distributed rank if available
         try:
             import torch.distributed as dist
 
@@ -54,6 +55,11 @@ class RNGState:
 
 
 def _get_rng_state():
+    """Get current RNG states.
+
+    Returns:
+        dict: RNG states for random, NumPy, and PyTorch.
+    """
     return RNGState(
         random_rng_state=random.getstate(),
         np_rng_state=np.random.get_state(),
@@ -63,6 +69,11 @@ def _get_rng_state():
 
 
 def _restore_rng_state(state):
+    """Restore RNG states from a saved state.
+
+    Args:
+        state (dict): RNG states as returned by state_dict().
+    """
     random.setstate(state.random_rng_state)
     np.random.set_state(state.np_rng_state)
     torch.set_rng_state(state.torch_rng_state)
@@ -70,34 +81,59 @@ def _restore_rng_state(state):
 
 
 class StatefulRNG:
-    """RNG manager for reproducible RNG states across random, NumPy, and PyTorch."""
+    """
+    RNG manager for reproducible RNG states across random, NumPy, and PyTorch."""
 
     def __init__(self, seed: int, ranked: bool = False):
+        """Initialize and optionally rank-adjust RNGs with a given seed.
+
+        Args:
+            seed (int): Base seed for RNGs.
+            ranked (bool): Adjust seed based on process rank.
+        """
         self.seed = seed
         self.ranked = ranked
         init_all_rng(self.seed, self.ranked)
 
     def state_dict(self):
+        """Get current RNG states.
+
+        Returns:
+            dict: RNG states for random, NumPy, and PyTorch.
+        """
         return _get_rng_state()
 
     def load_state_dict(self, state):  # pragma: no cover
+        """Restore RNG states from a saved state.
+
+        Args:
+            state (dict): RNG states as returned by state_dict().
+        """
         _restore_rng_state(state)
 
 
 class ScopedRNG:
-    """Context manager that saves/restores RNG states across random, NumPy, and PyTorch."""
+    """Context manager for reproducible RNG states across random, NumPy, and PyTorch."""
 
     def __init__(self, seed: int = 95050, ranked: bool = False):
+        """Initialize and optionally rank-adjust RNGs with a given seed.
+
+        Args:
+            seed (int): Base seed for RNGs.
+            ranked (bool): Adjust seed based on process rank.
+        """
         self._saved_state = None
         self.seed = seed
         self.ranked = ranked
 
     def __enter__(self):
+        """Save current RNG states."""
         assert self._saved_state is None
         self._saved_state = _get_rng_state()
         init_all_rng(self.seed, self.ranked)
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        """Restore RNG states on context exit."""
         _restore_rng_state(self._saved_state)
         self._saved_state = None
