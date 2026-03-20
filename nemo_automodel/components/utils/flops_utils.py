@@ -508,6 +508,49 @@ def _nemotronh_mlp_layer_flops(config, gbs, seq_len):
     return 6 * gbs * seq_len * config.hidden_size * config.intermediate_size * 3
 
 
+def _nemotronh_moe_layer_flops(config, gbs, seq_len):
+    """Model FLOPs for a MoE layer in Nemotron V3/Super V3 (hybrid Mamba/Attention/MoE).
+
+    Nemotron V3 uses relu2 (non-gated) for both routed and shared experts,
+    so each expert has 2 linear projections (up_proj + down_proj), not 3.
+
+    When moe_latent_size is set (Super V3), routed experts operate in a reduced
+    latent space with additional projection layers (fc1_latent_proj, fc2_latent_proj).
+    The shared expert and gate always operate in the full hidden_size dimension.
+
+    Accounts for:
+      1. Routed experts: only num_experts_per_tok activated per token.
+      2. Shared expert: always active for every token (full hidden_size).
+      3. Router/gate: linear projection hidden_size -> n_routed_experts.
+      4. Latent projections (if moe_latent_size is set): down and up projections.
+    """
+    hs = config.hidden_size
+    num_tokens = gbs * seq_len
+
+    # Determine if latent MoE is used
+    moe_latent_size = getattr(config, "moe_latent_size", None)
+
+    if moe_latent_size is not None:
+        # Latent MoE: experts operate in reduced latent space
+        expert_dim = moe_latent_size
+        # fc1_latent_proj (hs -> latent) + fc2_latent_proj (latent -> hs)
+        latent_proj_flops = 6 * num_tokens * hs * moe_latent_size * 2
+    else:
+        expert_dim = hs
+        latent_proj_flops = 0
+
+    # Routed experts: num_experts_per_tok activated, each up_proj + down_proj
+    routed_expert_flops = 6 * num_tokens * config.num_experts_per_tok * expert_dim * config.moe_intermediate_size * 2
+
+    # Shared expert: always active on full hidden_size, up_proj + down_proj
+    shared_expert_flops = 6 * num_tokens * hs * config.moe_shared_expert_intermediate_size * 2
+
+    # Router/gate: hidden_size -> n_routed_experts (always full dimension)
+    gate_flops = 6 * num_tokens * hs * config.n_routed_experts
+
+    return routed_expert_flops + shared_expert_flops + gate_flops + latent_proj_flops
+
+
 def _non_mla_attn_layer_flops(config, gbs, seq_len):
     """Model FLOPs for attention layer"""
     hs = config.hidden_size
@@ -571,7 +614,7 @@ def _hybrid_model_flops(config, gbs, seq_len):
     hs = config.hidden_size
     vocab_size = config.vocab_size
 
-    num_attn_layers, num_mamba_layers, num_mlp_layers = 0, 0, 0
+    num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers = 0, 0, 0, 0
     for c in hybrid_override_pattern:
         if c == "M":
             num_mamba_layers += 1
@@ -579,11 +622,14 @@ def _hybrid_model_flops(config, gbs, seq_len):
             num_mlp_layers += 1
         elif c == "*":
             num_attn_layers += 1
+        elif c == "E":
+            num_moe_layers += 1
 
     return (
         num_attn_layers * _non_mla_attn_layer_flops(config, gbs, seq_len)
         + num_mamba_layers * _mamba_layer_flops(config, gbs, seq_len)
         + num_mlp_layers * _nemotronh_mlp_layer_flops(config, gbs, seq_len)
+        + num_moe_layers * _nemotronh_moe_layer_flops(config, gbs, seq_len)
         + 6 * gbs * seq_len * hs * vocab_size
     )
 

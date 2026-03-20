@@ -34,12 +34,13 @@ env:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.69.1
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.80.1
     with:
       default_runner_prefix: ${{ vars.DEFAULT_RUNNER_PREFIX }}
       non_nvidia_runner_prefix: ${{ vars.NON_NVIDIA_RUNNER_PREFIX }}
       default_test_data_path: ${{ vars.DEFAULT_TEST_DATA_PATH }}
       non_nvidia_test_data_path: ${{ vars.NON_NVIDIA_TEST_DATA_PATH }}
+      sso_users_filename: ${{ vars.SSO_USERS_FILENAME }}
     secrets:
       NVIDIA_MANAGEMENT_ORG_PAT: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
 
@@ -103,8 +104,55 @@ jobs:
           source ./venv/bin/activate
           uv run lint-imports --debug --verbose --no-cache
 
+  type_checking:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Set up UV
+        uses: astral-sh/setup-uv@v1
+        with:
+          version: 0.8.22
+      - name: Install ty
+        env:
+          UV_PROJECT_ENVIRONMENT: ./venv
+        run: |
+          uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+          source ./venv/bin/activate
+
+          export PATH="./bin/:$PATH"
+
+          uv sync --link-mode copy --locked --group linting
+
+      - name: Run ty
+        run: |
+          source ./venv/bin/activate
+          uv run --active ty --version
+
+          uv pip install -q tomli
+          TY_DIRS=$(python3 -c "
+          try:
+              import tomllib
+          except ModuleNotFoundError:
+              import tomli as tomllib
+          from pathlib import Path
+          data = tomllib.loads(Path('pyproject.toml').read_text())
+          dirs = set()
+          for override in data.get('tool', {}).get('ty', {}).get('overrides', []):
+              for pattern in override.get('include', []):
+                  dirs.add(pattern.replace('/**', ''))
+          print(' '.join(sorted(dirs)))
+          ")
+
+          echo "ty check targets: $TY_DIRS"
+          uv run --active ty check --verbose $TY_DIRS
+
   Nemo_Linting_Test:
-    needs: [linting, import_linting]
+    needs: [linting, import_linting, type_checking]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -112,17 +160,20 @@ jobs:
         env:
           LINTING_RESULT: ${{ toJson(needs.linting) }}
           IMPORT_LINTING_RESULT: ${{ toJson(needs.import_linting) }}
+          TYPE_CHECKING_RESULT: ${{ toJson(needs.type_checking) }}
         run: |
           LINTING=$(echo "$LINTING_RESULT" | jq -r '.result')
           IMPORT_LINTING=$(echo "$IMPORT_LINTING_RESULT" | jq -r '.result')
+          TYPE_CHECKING=$(echo "$TYPE_CHECKING_RESULT" | jq -r '.result')
 
-          if [[ "$LINTING" == "success" ]] && [[ "$IMPORT_LINTING" == "success" ]]; then
+          if [[ "$LINTING" == "success" ]] && [[ "$IMPORT_LINTING" == "success" ]] && [[ "$TYPE_CHECKING" == "success" ]]; then
             echo "All linting checks passed."
             exit 0
           else
             echo "Some linting checks failed:"
             echo "  - linting: $LINTING"
             echo "  - import_linting: $IMPORT_LINTING"
+            echo "  - type_checking: $TYPE_CHECKING"
             exit 1
           fi
 
@@ -215,8 +266,8 @@ jobs:
           - test-name: L2_Pretrain_and_KD
             test-folder: llm_pretrain_and_kd
             timeout: 20
-            runner: self-hosted-nemo
-            test-data-path: "/mnt/datadrive/TestData"
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_DCP
             test-folder: hf_dcp
             timeout: 40
@@ -377,6 +428,7 @@ jobs:
           ls -al coverage-*/
           coverage combine --keep $(ls coverage-*/.coverage)
           coverage report -i
+          coverage xml
           rm -rf coverage-*
           ls -al
 

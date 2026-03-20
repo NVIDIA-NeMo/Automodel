@@ -26,7 +26,6 @@ This test module covers every branch, including error conditions.
 
 from __future__ import annotations
 
-import types
 from types import SimpleNamespace
 from typing import Dict
 
@@ -34,6 +33,12 @@ import pytest
 
 # Function under test and collaborators
 import nemo_automodel.components.distributed.parallelizer as parallelizer
+from nemo_automodel.components.distributed.optimized_tp_plans import (
+    LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
+    _get_class_qualname,
+    get_decilm_nemotron_tp_plan,
+    get_llama_nemotron_super_tp_plan,
+)
 from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan
 
 
@@ -130,7 +135,7 @@ def test_optimised_plan_success(monkeypatch):
     plan = {"opt": "plan"}
 
     # Register dummy entry
-    parallelizer.PARALLELIZE_FUNCTIONS[_DummyModel] = lambda m, sp: plan
+    parallelizer.PARALLELIZE_FUNCTIONS[_get_class_qualname(_DummyModel)] = lambda m, sp: plan
     _set_global_model_cls(monkeypatch, _DummyModel)
 
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False)
@@ -144,7 +149,7 @@ def test_optimised_plan_fallback_to_hf(monkeypatch):
     def _broken_fn(model, seq):  # noqa: D401
         raise RuntimeError("fail")
 
-    parallelizer.PARALLELIZE_FUNCTIONS[_DummyModel] = _broken_fn
+    parallelizer.PARALLELIZE_FUNCTIONS[_get_class_qualname(_DummyModel)] = _broken_fn
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda m: sentinel, raising=True)
     _set_global_model_cls(monkeypatch, _DummyModel)
 
@@ -179,12 +184,15 @@ def test_hf_fallback_sequence_parallel_assert(monkeypatch):
 
 def test_optimised_plan_and_hf_both_fail_raises_sp_false(monkeypatch):
     """Optimised plan raises and HF raises → runtime error (SP=False)."""
+
     def _broken_fn(model, seq):
         raise RuntimeError("fail")
 
-    parallelizer.PARALLELIZE_FUNCTIONS[_DummyModel] = _broken_fn
+    parallelizer.PARALLELIZE_FUNCTIONS[_get_class_qualname(_DummyModel)] = _broken_fn
+
     def _raise_hf(_model):
         raise RuntimeError("hf fail")
+
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf, raising=True)
     _set_global_model_cls(monkeypatch, _DummyModel)
 
@@ -194,12 +202,15 @@ def test_optimised_plan_and_hf_both_fail_raises_sp_false(monkeypatch):
 
 def test_optimised_plan_and_hf_both_fail_assert_sp_true(monkeypatch):
     """Optimised plan raises then HF path asserts (SP=True)."""
+
     def _broken_fn(model, seq):
         raise RuntimeError("fail")
 
-    parallelizer.PARALLELIZE_FUNCTIONS[_DummyModel] = _broken_fn
+    parallelizer.PARALLELIZE_FUNCTIONS[_get_class_qualname(_DummyModel)] = _broken_fn
+
     def _raise_hf2(_model):
         raise RuntimeError("hf fail")
+
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf2, raising=True)
     _set_global_model_cls(monkeypatch, _DummyModel)
 
@@ -210,9 +221,11 @@ def test_optimised_plan_and_hf_both_fail_assert_sp_true(monkeypatch):
 def test_not_registered_and_hf_fail_base_plan(monkeypatch):
     """No optimised plan and HF raises → base plan (with/without SP)."""
     # Ensure dummy not in mapping
-    parallelizer.PARALLELIZE_FUNCTIONS.pop(_DummyModel, None)
+    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_DummyModel), None)
+
     def _raise_hf3(_model):
         raise RuntimeError("hf fail")
+
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf3, raising=True)
     _set_global_model_cls(monkeypatch, _DummyModel)
 
@@ -227,6 +240,7 @@ def test_not_registered_and_hf_fail_base_plan(monkeypatch):
 
 def test_custom_plan_imports_non_dict_raises(monkeypatch):
     """If import resolves but returns non-dict object, raise ValueError."""
+
     def _fake_import(path):
         return ["not", "a", "dict"]
 
@@ -235,3 +249,114 @@ def test_custom_plan_imports_non_dict_raises(monkeypatch):
 
     with pytest.raises(ValueError):
         _get_parallel_plan(_DummyModel(), tp_shard_plan="some.module.NOT_A_DICT")
+
+
+# ---------------------------------------------------------------------------
+# Named TP plan constant and plan builder functions
+# ---------------------------------------------------------------------------
+
+
+def test_named_plan_constant_value():
+    assert LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME == "llama_nemotron_super_tp_plan"
+
+
+class TestGetLlamaNemotronSuperTpPlan:
+    def test_returns_expected_keys(self):
+        plan = get_llama_nemotron_super_tp_plan(sequence_parallel=False)
+        assert isinstance(plan, dict)
+        assert "model.embed_tokens" in plan
+        assert "model.layers.*.self_attn.qkv_proj" in plan
+        assert "model.layers.*.self_attn.o_proj" in plan
+        assert "model.layers.*.mlp.gate_up_proj" in plan
+        assert "model.layers.*.mlp.down_proj" in plan
+        assert "lm_head" in plan
+
+    def test_sp_adds_norm_and_layernorm_entries(self):
+        plan = get_llama_nemotron_super_tp_plan(sequence_parallel=True)
+        assert "model.norm" in plan
+        assert "model.layers.*.input_layernorm" in plan
+        assert "model.layers.*.post_attention_layernorm" in plan
+
+
+class TestGetDecilmNemotronTpPlan:
+    def test_returns_separate_qkv_projections(self):
+        plan = get_decilm_nemotron_tp_plan(sequence_parallel=False)
+        assert isinstance(plan, dict)
+        assert "model.layers.*.self_attn.q_proj" in plan
+        assert "model.layers.*.self_attn.k_proj" in plan
+        assert "model.layers.*.self_attn.v_proj" in plan
+        assert "model.layers.*.self_attn.o_proj" in plan
+        assert "model.layers.*.mlp.up_proj" in plan
+        assert "model.layers.*.mlp.gate_proj" in plan
+        assert "model.layers.*.mlp.down_proj" in plan
+        assert "lm_head" in plan
+        # Must NOT have fused projections (those are Llama-specific)
+        assert "model.layers.*.self_attn.qkv_proj" not in plan
+        assert "model.layers.*.mlp.gate_up_proj" not in plan
+
+    def test_sp_adds_norm_entries(self):
+        plan = get_decilm_nemotron_tp_plan(sequence_parallel=True)
+        assert "model.norm" in plan
+        assert "model.layers.*.input_layernorm" in plan
+
+
+# ---------------------------------------------------------------------------
+# Named plan resolution inside _get_parallel_plan
+# ---------------------------------------------------------------------------
+
+
+def test_named_plan_resolves_to_llama_for_generic_model():
+    """Named plan on a model without DeciLM config → fused Llama plan."""
+    model = _DummyModel()
+    result = _get_parallel_plan(
+        model,
+        sequence_parallel=False,
+        tp_shard_plan=LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
+    )
+    assert "model.layers.*.self_attn.qkv_proj" in result
+
+
+def test_named_plan_resolves_to_decilm_for_nemotron_nas():
+    """Named plan on DeciLM/nemotron-nas model → separate-projection plan."""
+    model = _DummyModel()
+    model.config = SimpleNamespace(
+        architectures=["DeciLMForCausalLM"],
+        model_type="nemotron-nas",
+    )
+    result = _get_parallel_plan(
+        model,
+        sequence_parallel=False,
+        tp_shard_plan=LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
+    )
+    assert "model.layers.*.self_attn.q_proj" in result
+    assert "model.layers.*.self_attn.k_proj" in result
+    assert "model.layers.*.self_attn.v_proj" in result
+    assert "model.layers.*.self_attn.qkv_proj" not in result
+
+
+def test_named_plan_llama_with_sequence_parallel():
+    """Named plan + SP on a generic model includes norm entries."""
+    model = _DummyModel()
+    result = _get_parallel_plan(
+        model,
+        sequence_parallel=True,
+        tp_shard_plan=LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
+    )
+    assert "model.norm" in result
+    assert "model.layers.*.input_layernorm" in result
+
+
+def test_named_plan_decilm_with_sequence_parallel():
+    """Named plan + SP on DeciLM model includes norm entries."""
+    model = _DummyModel()
+    model.config = SimpleNamespace(
+        architectures=["DeciLMForCausalLM"],
+        model_type="nemotron-nas",
+    )
+    result = _get_parallel_plan(
+        model,
+        sequence_parallel=True,
+        tp_shard_plan=LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
+    )
+    assert "model.norm" in result
+    assert "model.layers.*.self_attn.q_proj" in result

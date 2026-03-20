@@ -142,7 +142,7 @@ class BackendConfig:
     Attributes:
         attn: Attention backend ("te", "sdpa", or "flex").
         linear: Linear layer backend ("torch" or "te").
-        rms_norm: RMSNorm backend ("torch" or "te").
+        rms_norm: RMSNorm backend ("torch", "torch_fp32", or "te").
         rope_fusion: Whether to use fused RoPE (requires TE).
         experts: MoE expert GEMM backend. "torch" uses per-expert loop,
             "te" uses TE GroupedLinear, "gmm" uses grouped_gemm.ops.gmm,
@@ -165,7 +165,7 @@ class BackendConfig:
 
     attn: Literal["te", "sdpa", "flex"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
-    rms_norm: Literal["torch", "torch_fp32", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
+    rms_norm: Literal["torch", "torch_fp32", "te"] = "torch_fp32"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
     experts: Literal["torch", "te", "gmm", "torch_mm"] = "torch_mm" if torch.cuda.is_available() else "torch"
     dispatcher: Literal["torch", "deepep"] = "deepep" if HAVE_DEEP_EP and torch.cuda.is_available() else "torch"
@@ -224,6 +224,30 @@ class BackendConfig:
             )
 
 
+class Float32RMSNorm(nn.Module):
+    """RMSNorm with explicit fp32 computation for training stability.
+
+    Weights stay in the model's dtype (e.g. bf16) for FSDP2 compatibility.
+    Inputs are upcast to fp32, norm is computed in fp32, and the output
+    is cast back to the original input dtype.
+    """
+
+    def __init__(self, dim, eps=1e-5, device=None, dtype=torch.bfloat16):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim, device=device, dtype=dtype))
+
+    def reset_parameters(self):
+        torch.nn.init.ones_(self.weight)
+
+    @torch.compile(fullgraph=True, dynamic=True)
+    def forward(self, x):
+        input_dtype = x.dtype
+        x = x.float()
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (self.weight * x).to(input_dtype)
+
+
 def initialize_rms_norm_module(
     rms_norm_impl: str,
     dim: int,
@@ -240,7 +264,7 @@ def initialize_rms_norm_module(
         rms_norm_impl: Backend implementation ("te", "torch", or "torch_fp32")
             - "te": Transformer Engine fused RMSNorm kernel
             - "torch": PyTorch native nn.RMSNorm (computes in input dtype)
-            - "torch_fp32": Float32 input upcast RMSNorm
+            - "torch_fp32": torch.compiled fp32 RMSNorm for training stability
         dim: Normalized dimension
         eps: Epsilon for numerical stability
         device: Device to create module on (None uses PyTorch default, typically CPU)
@@ -257,10 +281,7 @@ def initialize_rms_norm_module(
     elif rms_norm_impl == "torch":
         return nn.RMSNorm(dim, eps=eps, device=device, dtype=dtype)
     elif rms_norm_impl == "torch_fp32":
-        # LlamaRMSNorm reference: generic fp32-upcast implementation for accuracy matching
-        from transformers.models.llama.modeling_llama import LlamaRMSNorm as Float32RMSNorm
-
-        return Float32RMSNorm(dim, eps=eps).to(device=device, dtype=dtype)
+        return Float32RMSNorm(dim, eps=eps, device=device, dtype=dtype)
     else:
         raise ValueError(f"Unsupported RMSNorm implementation: {rms_norm_impl}")
 
@@ -362,11 +383,123 @@ def _make_lazy_te_patcher():
 _patch_te_modules = _make_lazy_te_patcher()
 
 
+def get_rope_config(config) -> tuple[float, dict, float]:
+    """Extract rope configuration from ``config.rope_parameters``.
+
+    Args:
+        config: A HuggingFace model config object.
+
+    Returns:
+        Tuple of (rope_theta, rope_parameters, partial_rotary_factor).
+    """
+    rope_parameters = config.rope_parameters
+    rope_theta = rope_parameters["rope_theta"]
+    partial_rotary_factor = rope_parameters.get("partial_rotary_factor", 1.0)
+    return rope_theta, rope_parameters, partial_rotary_factor
+
+
+def cast_model_to_dtype(model: nn.Module, dtype: torch.dtype = torch.bfloat16) -> None:
+    """Cast model parameters to the target dtype, keeping fp32 modules in full precision.
+
+    Respects ``_keep_in_fp32_modules`` / ``_keep_in_fp32_modules_strict`` on
+    the model (the same attributes HuggingFace transformers uses).
+
+    Uses ``nn.Module.to()`` which is safe for both plain tensors and DTensors
+    (FSDP2 sharded parameters).  When the model is already FSDP2-sharded
+    (parameters are DTensors), only buffers of matching modules are restored
+    to fp32 (parameters are left as-is since FSDP2 requires uniform dtype).
+
+    Args:
+        model: The model whose parameters should be cast.
+        dtype: Target dtype (e.g. ``torch.bfloat16``).
+    """
+    fp32_keywords = _get_fp32_module_keywords(model)
+
+    model.to(dtype)
+    if fp32_keywords:
+        if _has_dtensor_params(model):
+            logger.warning(
+                "Model parameters are DTensors (FSDP2) — skipping fp32 parameter "
+                "restoration for keywords=%s. Only buffers will be restored to fp32. "
+                "FSDP2 requires uniform dtype within each parameter group.",
+                fp32_keywords,
+            )
+            _restore_fp32_buffers(model, fp32_keywords)
+        else:
+            _restore_fp32_modules(model, fp32_keywords)
+
+
+def _get_fp32_module_keywords(model: nn.Module) -> list[str]:
+    """Collect module name patterns that must remain in fp32.
+
+    Reads ``_keep_in_fp32_modules`` and ``_keep_in_fp32_modules_strict``
+    from the model (the same attributes HuggingFace transformers uses).
+
+    Args:
+        model: The model to inspect.
+
+    Returns:
+        De-duplicated list of module-name keywords to keep in fp32.
+    """
+    keywords: list[str] = []
+    for attr in ("_keep_in_fp32_modules_strict", "_keep_in_fp32_modules"):
+        val = getattr(model, attr, None)
+        if isinstance(val, list):
+            keywords.extend(val)
+
+    # de-duplicate while preserving order
+    return list(dict.fromkeys(keywords))
+
+
+def _has_dtensor_params(model: nn.Module) -> bool:
+    """Check if any model parameter is a DTensor (FSDP2 sharded)."""
+    try:
+        from torch.distributed.tensor import DTensor
+    except ImportError:
+        return False
+    return any(isinstance(p, DTensor) for p in model.parameters())
+
+
+def _restore_fp32_modules(model: nn.Module, fp32_keywords: list[str]) -> None:
+    """Cast modules matching *fp32_keywords* back to float32.
+
+    Only safe for unsharded models (plain tensors).  FSDP2 requires uniform
+    dtype within each parameter group, so this must not be called on
+    DTensor-sharded models.
+
+    Args:
+        model: The model (already cast to the target dtype).
+        fp32_keywords: Substrings matched against dot-separated module names.
+    """
+    for name, module in model.named_modules():
+        if any(kw in name for kw in fp32_keywords):
+            module.to(torch.float32)
+
+
+def _restore_fp32_buffers(model: nn.Module, fp32_keywords: list[str]) -> None:
+    """Cast only buffers (not parameters) of matching modules back to float32.
+
+    Safe for FSDP2-sharded models because buffers are plain tensors, not
+    DTensors managed by FSDP2.
+
+    Args:
+        model: The model (already cast to the target dtype).
+        fp32_keywords: Substrings matched against dot-separated module names.
+    """
+    for name, module in model.named_modules():
+        if any(kw in name for kw in fp32_keywords):
+            for buf_name, buf in module.named_buffers(recurse=False):
+                module._buffers[buf_name] = buf.to(torch.float32)
+
+
 __all__ = [
     "BackendConfig",
+    "Float32RMSNorm",
     "TEFp8Config",
+    "cast_model_to_dtype",
     "get_is_first_microbatch",
     "get_is_optim_step",
+    "get_rope_config",
     "initialize_linear_module",
     "initialize_rms_norm_module",
     "set_is_first_microbatch",

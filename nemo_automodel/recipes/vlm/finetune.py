@@ -32,10 +32,15 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 from wandb import Settings
 
-from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+from nemo_automodel._transformers import (
+    NeMoAutoModelForCausalLM,
+    NeMoAutoModelForImageTextToText,
+    NeMoAutoModelForMultimodalLM,
+)
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
@@ -47,6 +52,7 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample, build
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -136,6 +142,10 @@ def build_model(
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
             NeMoAutoModelForImageTextToText.from_config,
             NeMoAutoModelForImageTextToText.from_pretrained,
+            NeMoAutoModelForMultimodalLM.from_config,
+            NeMoAutoModelForMultimodalLM.from_pretrained,
+            NeMoAutoModelForCausalLM.from_config,
+            NeMoAutoModelForCausalLM.from_pretrained,
         )
 
         if is_nemo_auto_model:
@@ -253,21 +263,28 @@ def build_dataloader(
     with ScopedRNG(seed=seed, ranked=True):
         processor = None
         processor_kwargs = {}
-        if cfg_processor is not None and hasattr(cfg_processor, "instantiate"):
-            processor = cfg_processor.instantiate()
-        elif cfg_processor is not None:
-            processor_kwargs = cfg_processor.to_dict()
-
-        # If no processor was instantiated, try AutoProcessor
-        if processor is None:
-            try:
-                processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
-            except Exception as e:
-                # Some models do not provide an AutoProcessor
-                processor = None
-                logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
 
         with FirstRankPerNode():
+            if cfg_processor is not None and hasattr(cfg_processor, "instantiate"):
+                processor = cfg_processor.instantiate()
+            elif cfg_processor is not None:
+                processor_kwargs = cfg_processor.to_dict()
+
+            # If no processor was instantiated, try AutoProcessor
+            if processor is None:
+                try:
+                    processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
+                except Exception as e:
+                    # Some models do not provide an AutoProcessor
+                    processor = None
+                    logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
+
+            chat_template_raw = cfg_ds.__dict__.pop("chat_template", None)
+            # Update chat_template if chat_template is given
+            if chat_template_raw is not None and processor is not None:
+                processor.chat_template = _resolve_chat_template(chat_template_raw)
+                processor.tokenizer.chat_template = processor.chat_template
+
             ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
 
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -560,6 +577,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
+        # Disable fused RoPE when context parallelism is enabled (cp > 1)
+        if self.dist_setup.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", False):
+            logging.info("Disabling rope_fusion because cp_size=%d > 1", self.dist_setup.cp_size)
+            self.cfg.model.backend.rope_fusion = False
+
         model = build_model(
             self.cfg.model,
             self.cfg.get("freeze_config", None),
@@ -618,6 +640,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self._get_dp_group_size(),
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
         )
+        self._setup_garbage_collection(self.step_scheduler)
 
         # Build learning rate scheduler
         self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
@@ -678,6 +701,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         val_loss,
                         best_metric_key=self.best_metric_key,
                     )
+                self._maybe_collect_garbage()
 
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
@@ -729,8 +753,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 pixel_values = batch.pop("pixel_values", None)
                 image_grid_hws = batch.pop("image_grid_hws", None)
                 image_grid_thw = batch.pop("image_grid_thw", None)
+                image_sizes = batch.pop("image_sizes", None)
 
                 image_grid = image_grid_hws if image_grid_hws is not None else image_grid_thw
+                if image_grid is None and image_sizes is not None:
+                    image_grid = image_sizes
 
                 if self.pp.info.has_first_stage and pixel_values is not None and image_grid is not None:
                     stage0_model = self.model_parts[0]
@@ -738,14 +765,20 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     batch_size = input_ids.shape[0]
                     n_images = image_grid.shape[0]
 
-                    patch_counts = image_grid.prod(dim=1)
-                    cumsum = torch.cumsum(patch_counts, dim=0)
-
                     pixel_values_chunks = []
                     image_grid_chunks = []
 
-                    if n_images == batch_size:
-                        # 1 image per sample
+                    if pixel_values.dim() == 4 and pixel_values.shape[0] == batch_size:
+                        # pixel_values is [N_images, C, H, W] with one full image per
+                        # batch sample. Simply split along dim 0 to distribute across microbatches.
+                        pixel_values_chunks = list(pixel_values.chunk(n_microbatches, dim=0))
+                        image_grid_chunks = list(image_grid.chunk(n_microbatches, dim=0))
+                    elif n_images == batch_size:
+                        # Qwen/Kimi-style: pixel_values is 2D/3D flat patches [total_patches, hidden_dim].
+                        # Use cumsum-based slicing to split variable-length patch sequences.
+                        patch_counts = image_grid.prod(dim=1)
+                        cumsum = torch.cumsum(patch_counts, dim=0)
+
                         images_per_mb = batch_size // n_microbatches
                         for mb_idx in range(n_microbatches):
                             img_start = mb_idx * images_per_mb
@@ -835,6 +868,27 @@ class FinetuneRecipeForVLM(BaseRecipe):
             sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+
+        # MoE aux loss gradients are injected via MoEAuxLossAutoScaler, which
+        # multiplies them by main_loss_backward_scale during backward.  This
+        # counteracts the unwanted scaling that FSDP and PP post-hoc rescaling
+        # apply to *all* gradients (including aux loss):
+        #
+        #   Non-PP: FSDP allreduce divides grads by dp_group_size.
+        #           Scale = dp_group_size  →  net = 1.
+        #
+        #   PP:     FSDP divides by dp_group_size, then
+        #           scale_grads_and_clip_grad_norm divides by
+        #           (num_label_tokens / dp_group_size).  The dp_group_size
+        #           factors cancel, leaving net 1/num_label_tokens.
+        #           Scale = num_label_tokens  →  net = 1.
+        if self.pp_enabled:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(float(num_label_tokens))
+        else:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+                float(self._get_dp_group_size(include_cp=True))
+            )
+
         loss_buffer = []
 
         # number of tokens in the batch, excluding any tail padding.
@@ -959,7 +1013,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             total_tokens = 0
             total_num_label_tokens = 0
             for batch in val_dataloader:
-                batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
+                batch = {
+                    k: (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
+                    for k, v in batch.items()
+                }
                 labels = batch.pop("labels")
                 num_label_tokens = (labels != -100).sum().item()
 

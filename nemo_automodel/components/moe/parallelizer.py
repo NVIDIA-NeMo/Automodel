@@ -112,22 +112,32 @@ def apply_ac(
         model: The model to apply activation checkpointing to.
         ignore_router: If True, uses selective checkpointing that saves router outputs.
         hidden_size: Hidden dimension size. If None, derived from model.config.hidden_size.
-        num_experts: Number of routed experts. If None, derived from model.config.num_experts.
+        num_experts: Number of routed experts. If None, derived from moe_config.n_routed_experts
+            first, then falls back to model.config attributes.
     """
     # Derive hidden_size and num_experts from model.config if not provided
     if hidden_size is None:
-        if hasattr(model, "config") and hasattr(model.config, "hidden_size"):
-            hidden_size = model.config.hidden_size
-        else:
+        cfg = getattr(model, "config", None)
+        # VLM models nest language model config under text_config
+        hidden_size = getattr(getattr(cfg, "text_config", None), "hidden_size", None) or getattr(
+            cfg, "hidden_size", None
+        )
+        if hidden_size is None:
             raise ValueError("hidden_size must be provided or model must have config.hidden_size attribute")
 
     if num_experts is None:
-        for attr in ["num_experts", "moe_num_experts", "n_routed_experts"]:
-            if hasattr(model, "config") and hasattr(model.config, attr):
-                num_experts = getattr(model.config, attr)
-                break
+        _inner = getattr(model, "model", model)
+        if hasattr(_inner, "moe_config") and hasattr(_inner.moe_config, "n_routed_experts"):
+            num_experts = _inner.moe_config.n_routed_experts
         else:
-            raise ValueError("num_experts must be provided or model must have config.num_experts attribute")
+            cfg = getattr(model, "config", None)
+            text_cfg = getattr(cfg, "text_config", cfg)
+            for attr in ["num_experts", "moe_num_experts", "n_routed_experts"]:
+                if text_cfg is not None and hasattr(text_cfg, attr):
+                    num_experts = getattr(text_cfg, attr)
+                    break
+            else:
+                raise ValueError("num_experts must be provided or model must have config.num_experts attribute")
 
     def _custom_policy(ctx, func, *args, **kwargs):
         if func == torch.ops.aten.mm.default:
@@ -266,18 +276,46 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
         _model = model.model
     else:
         _model = model
+    # Prefer nested text modules when present (VLM models)
+    _model = get_text_module(_model)
+
+    # Set model-level flag so the forward pass can null out attention_mask.
+    # With CP the mask is not sharded along the sequence dim and TE asserts
+    # "Padding mask not supported with context parallelism!".
+    _model._cp_enabled = True
 
     for _, block in _model.layers.named_children():
-        attn_module = block.self_attn.attn_module
-        assert isinstance(attn_module, DotProductAttention), (
-            "Context parallelism is only supported for TransformerEngine's DotProductAttention"
-        )
-        attn_module.set_context_parallel_group(
-            cp_mesh.get_group(),
-            torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
-            _get_cp_stream(),
-            cp_comm_type=cp_comm_type,
-        )
+        layer_type = getattr(block, "layer_type", "full_attention")
+
+        if layer_type == "full_attention":
+            attn_module = block.self_attn.attn_module
+            if not isinstance(attn_module, DotProductAttention):
+                logger.warning(
+                    "Skipping CP setup for block with non-TE attention module: %s",
+                    type(attn_module).__name__,
+                )
+                continue
+            attn_module.set_context_parallel_group(
+                cp_mesh.get_group(),
+                torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
+                _get_cp_stream(),
+                cp_comm_type=cp_comm_type,
+            )
+        elif layer_type == "linear_attention":
+            # FLA-based CP: store the CP mesh on the linear attention module so it
+            # can recover dense token order and build its CP context during forward.
+            if hasattr(block, "linear_attn") and hasattr(block.linear_attn, "_cp_mesh"):
+                block.linear_attn._cp_mesh = cp_mesh
+            else:
+                logger.warning(
+                    "Block %s has linear_attention but no CP-aware linear_attn module; "
+                    "skipping CP setup for this layer.",
+                    getattr(block, "layer_idx", "?"),
+                )
+
+        moe_module = block.moe if hasattr(block, "moe") else block.mlp
+        if isinstance(moe_module, MoE):
+            moe_module.cp_mesh = cp_mesh
 
 
 def parallelize_model(
@@ -295,6 +333,7 @@ def parallelize_model(
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
+    mp_policy: MixedPrecisionPolicy | None = None,
 ):
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
         "Tensor parallelism not supported for custom MoE models"
@@ -330,6 +369,7 @@ def parallelize_model(
             ep_enabled=ep_enabled,
             ep_shard_enabled=ep_shard_mesh is not None and ep_shard_mesh.size() > 1,
             ep_shard_mesh=ep_shard_mesh,
+            mp_policy=mp_policy,
             reshard_after_forward=reshard_after_forward,
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,

@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-from nemo_automodel.components.models.biencoder.state_dict_adapter import BiencoderStateDictAdapter
+from nemo_automodel.components.models.common.bidirectional import BiencoderStateDictAdapter
 
 
 class TestBiencoderStateDictAdapter:
@@ -81,22 +81,6 @@ class TestBiencoderStateDictAdapter:
         assert "model.layer1.weight" in hf_state_dict
         assert "model.layer1.bias" in hf_state_dict
 
-    def test_to_hf_includes_linear_pooler(self, adapter):
-        """Pooler weights should be retained during HF conversion."""
-        biencoder_state_dict = {
-            "lm_q.layer.weight": torch.randn(2, 2),
-            "linear_pooler.weight": torch.randn(4, 4),
-            "linear_pooler.bias": torch.randn(4),
-        }
-
-        hf_state_dict = adapter.to_hf(biencoder_state_dict)
-
-        assert "model.layer.weight" in hf_state_dict  # sanity for lm_q path
-        assert "linear_pooler.weight" in hf_state_dict
-        assert "linear_pooler.bias" in hf_state_dict
-        assert torch.equal(hf_state_dict["linear_pooler.weight"], biencoder_state_dict["linear_pooler.weight"])
-        assert torch.equal(hf_state_dict["linear_pooler.bias"], biencoder_state_dict["linear_pooler.bias"])
-
     def test_from_hf_basic(self, adapter):
         """Test basic conversion from HuggingFace to biencoder format."""
         hf_state_dict = {
@@ -118,23 +102,6 @@ class TestBiencoderStateDictAdapter:
         assert torch.equal(biencoder_state_dict["lm_p.layer1.weight"], hf_state_dict["model.layer1.weight"])
         assert torch.equal(biencoder_state_dict["lm_q.layer2.bias"], hf_state_dict["model.layer2.bias"])
         assert torch.equal(biencoder_state_dict["lm_p.layer2.bias"], hf_state_dict["model.layer2.bias"])
-
-    def test_from_hf_includes_linear_pooler(self, adapter):
-        """Pooler weights should be retained when converting from HF."""
-        hf_state_dict = {
-            "model.layer.weight": torch.randn(2, 2),
-            "linear_pooler.weight": torch.randn(4, 4),
-            "linear_pooler.bias": torch.randn(4),
-        }
-
-        biencoder_state_dict = adapter.from_hf(hf_state_dict)
-
-        assert "lm_q.layer.weight" in biencoder_state_dict
-        assert "lm_p.layer.weight" in biencoder_state_dict
-        assert "linear_pooler.weight" in biencoder_state_dict
-        assert "linear_pooler.bias" in biencoder_state_dict
-        assert torch.equal(biencoder_state_dict["linear_pooler.weight"], hf_state_dict["linear_pooler.weight"])
-        assert torch.equal(biencoder_state_dict["linear_pooler.bias"], hf_state_dict["linear_pooler.bias"])
 
     def test_from_hf_empty_state_dict(self, adapter):
         """Test conversion with empty state dict."""
@@ -186,15 +153,6 @@ class TestBiencoderStateDictAdapter:
 
         assert result == []
 
-    def test_convert_single_tensor_to_hf_linear_pooler(self, adapter):
-        """Test converting linear_pooler tensor (should be passed through)."""
-        tensor = torch.randn(4)
-        result = adapter.convert_single_tensor_to_hf("linear_pooler.bias", tensor)
-
-        assert len(result) == 1
-        assert result[0][0] == "linear_pooler.bias"
-        assert torch.equal(result[0][1], tensor)
-
     def test_convert_single_tensor_to_hf_with_kwargs(self, adapter):
         """Test that convert_single_tensor_to_hf accepts kwargs."""
         tensor = torch.randn(10, 10)
@@ -232,3 +190,45 @@ class TestBiencoderStateDictAdapter:
         # Should only replace the first occurrence of lm_q.
         assert "model.model.layer.sublayer.weight" in hf_state_dict
         assert "lm_q.model.layer.sublayer.weight" not in hf_state_dict
+
+    def test_to_hf_peft_keys_strip_lm_q(self, adapter):
+        """PEFT keys should have lm_q. stripped without adding model. prefix."""
+        state_dict = {
+            "base_model.model.lm_q.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(8, 64),
+            "base_model.model.lm_q.layers.0.self_attn.q_proj.lora_B.weight": torch.randn(64, 8),
+        }
+
+        hf_state_dict = adapter.to_hf(state_dict)
+
+        assert "base_model.model.layers.0.self_attn.q_proj.lora_A.weight" in hf_state_dict
+        assert "base_model.model.layers.0.self_attn.q_proj.lora_B.weight" in hf_state_dict
+        # Should NOT have extra model. prefix
+        assert "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight" not in hf_state_dict
+
+    def test_from_hf_peft_keys_add_lm_q(self, adapter):
+        """PEFT keys should get lm_q. inserted after base_model.model. prefix (not lm_p)."""
+        hf_state_dict = {
+            "base_model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(8, 64),
+        }
+
+        biencoder_state_dict = adapter.from_hf(hf_state_dict)
+
+        assert "base_model.model.lm_q.layers.0.self_attn.q_proj.lora_A.weight" in biencoder_state_dict
+        # PEFT keys should NOT be fanned out to lm_p (shared encoder)
+        assert "base_model.model.lm_p.layers.0.self_attn.q_proj.lora_A.weight" not in biencoder_state_dict
+
+    def test_peft_roundtrip(self, adapter):
+        """PEFT lm_q keys should survive a to_hf → from_hf roundtrip."""
+        original = {
+            "base_model.model.lm_q.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(8, 64),
+            "base_model.model.lm_q.layers.0.mlp.down_proj.lora_B.weight": torch.randn(64, 8),
+        }
+
+        hf = adapter.to_hf(original)
+        restored = adapter.from_hf(hf)
+
+        for key in original:
+            assert key in restored, f"Missing key {key} after roundtrip"
+            torch.testing.assert_close(restored[key], original[key])
+        # lm_p should NOT appear in PEFT roundtrip
+        assert not any("lm_p" in k for k in restored)

@@ -30,14 +30,14 @@ rng:
   ranked: true
 
 model:
-  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  _target_: nemo_automodel.NeMoAutoModelForMultimodalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
   #Customize this backend for fine grained control
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
     linear: te
-    rms_norm: te
+    rms_norm: torch_fp32
     rope_fusion: false
     experts: te
     enable_deepep: true

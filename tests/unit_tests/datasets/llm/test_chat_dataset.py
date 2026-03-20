@@ -14,11 +14,11 @@
 # limitations under the License.
 
 import json
-from pathlib import Path
 
 import pytest
 
 import nemo_automodel.components.datasets.llm.chat_dataset as tcd
+from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 
 
 def test_is_hf_repo_id_and_as_iter_and_normalize():
@@ -73,11 +73,59 @@ def test_load_openai_messages_local_and_errors(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError):
         tcd._load_openai_messages([])
 
-    # HF branch: force as repo-id and ensure delegated call is returned
+    # HF branch: force as repo-id and ensure delegated call is returned.
+    # Default shuffle_seed is None so no .shuffle() call is made.
     monkeypatch.setattr(tcd, "_is_hf_repo_id", lambda v: True)
     sentinel = object()
     monkeypatch.setattr(tcd, "load_dataset", lambda *a, **k: sentinel)
     assert tcd._load_openai_messages("org/name", split="train") is sentinel
+
+
+def test_load_openai_messages_hf_shuffle_and_slice(monkeypatch):
+    """Verify that HF datasets are shuffled before slicing."""
+    monkeypatch.setattr(tcd, "_is_hf_repo_id", lambda v: True)
+
+    call_log = {}
+
+    class _FakeDataset:
+        def __init__(self, items):
+            self._items = items
+
+        def __len__(self):
+            return len(self._items)
+
+        def shuffle(self, seed=None):
+            call_log["shuffle_seed"] = seed
+            return self
+
+        def select(self, indices):
+            call_log["select_indices"] = list(indices)
+            return _FakeDataset([self._items[i] for i in indices])
+
+    fake_ds = _FakeDataset(list(range(100)))
+    monkeypatch.setattr(tcd, "load_dataset", lambda *a, **k: fake_ds)
+
+    # Default (shuffle_seed=None) — no shuffling
+    result = tcd._load_openai_messages("org/name", split="train")
+    assert "shuffle_seed" not in call_log
+    assert result is fake_ds
+
+    # With shuffle seed — shuffle then return
+    call_log.clear()
+    result = tcd._load_openai_messages("org/name", split="train", shuffle_seed=42)
+    assert call_log["shuffle_seed"] == 42
+    assert "select_indices" not in call_log
+
+    # Split with slice — shuffle then select
+    call_log.clear()
+    result = tcd._load_openai_messages("org/name", split="train[10:20]", shuffle_seed=42)
+    assert call_log["shuffle_seed"] == 42
+    assert call_log["select_indices"] == list(range(10, 20))
+
+    # Custom seed
+    call_log.clear()
+    tcd._load_openai_messages("org/name", split="train", shuffle_seed=123)
+    assert call_log["shuffle_seed"] == 123
 
 
 def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
@@ -148,6 +196,41 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
         _ = ds_bad[0]
 
 
+def test_resolve_chat_template_none():
+    assert _resolve_chat_template(None) is None
+
+
+def test_resolve_chat_template_plain_text_file(tmp_path):
+    template = "{% for msg in messages %}{{ msg.content }}{% endfor %}"
+    f = tmp_path / "template.jinja"
+    f.write_text(template, encoding="utf-8")
+    assert _resolve_chat_template(str(f)) == template
+
+
+def test_resolve_chat_template_json_file(tmp_path):
+    template = "{% for msg in messages %}{{ msg.role }}: {{ msg.content }}{% endfor %}"
+    f = tmp_path / "tokenizer_config.json"
+    f.write_text(json.dumps({"chat_template": template, "other_key": 123}), encoding="utf-8")
+    assert _resolve_chat_template(str(f)) == template
+
+
+def test_resolve_chat_template_json_file_without_key(tmp_path):
+    data = {"model_type": "llama", "vocab_size": 32000}
+    f = tmp_path / "config.json"
+    raw = json.dumps(data)
+    f.write_text(raw, encoding="utf-8")
+    assert _resolve_chat_template(str(f)) == raw
+
+
+def test_resolve_chat_template_literal_string():
+    template = "{% for msg in messages %}{{ msg.content }}{% endfor %}"
+    assert _resolve_chat_template(template) == template
+
+
+def test_resolve_chat_template_nonexistent_path():
+    assert _resolve_chat_template("/no/such/file/template.jinja") == "/no/such/file/template.jinja"
+
+
 def test_tool_calling_chat_dataset_errors(monkeypatch):
     # No tokenizer
     with pytest.raises(ValueError):
@@ -161,5 +244,3 @@ def test_tool_calling_chat_dataset_errors(monkeypatch):
     monkeypatch.setattr(tcd, "_has_chat_template", lambda _tok: False)
     with pytest.raises(ValueError):
         tcd.ChatDataset("ignored", Tok())
-
-

@@ -18,6 +18,7 @@ from dataclasses import dataclass, fields
 from typing import Any, Dict, Literal, Optional, Union
 
 import torch
+from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy
 
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -30,6 +31,7 @@ class MoEParallelizerConfig:
     reshard_after_forward: bool = False
     lm_head_precision: Optional[Union[str, torch.dtype]] = None
     wrap_outer_model: bool = True
+    mp_policy: Optional[MixedPrecisionPolicy] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {f.name: getattr(self, f.name) for f in fields(self)}
@@ -62,6 +64,12 @@ class MoEConfig:
     shared_expert_inter_dim: int | None = None
     shared_expert_activation: str = "swiglu"  # Activation for shared experts ("swiglu" or "relu2")
     force_e_score_correction_bias: bool = False  # Force creation of e_score_correction_bias buffer
+    moe_latent_size: int | None = None
+
+    @property
+    def expert_dim(self) -> int:
+        """Dimension used for expert projections (latent size when set, otherwise model dim)."""
+        return self.moe_latent_size if self.moe_latent_size is not None else self.dim
 
     def __post_init__(self):
         if isinstance(self.dtype, str):
@@ -80,9 +88,10 @@ class MoEMetricsConfig:
             None means every step.
         top_k_experts: Number of top (highest) and bottom (lowest) utilization experts
             to emit per layer. Reduces wandb key count for models with many experts.
+            Set to 0 to disable per-expert utilization logging entirely.
     """
 
     enabled: bool = False
     mode: str = "brief"
     detailed_every_steps: Optional[int] = None
-    top_k_experts: int = 5
+    top_k_experts: int = 0

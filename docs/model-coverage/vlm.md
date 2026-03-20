@@ -35,9 +35,24 @@ NeMo AutoModel supports [AutoModelForImageTextToText](https://huggingface.co/doc
 | Qwen3-Omni-30BA3B                  | MedPix-VQA                   | Supported  | Supported  | [qwen3_omni_moe_30b_te_deepep.yaml](../../examples/vlm_finetune/qwen3/qwen3_omni_moe_30b_te_deepep.yaml) |
 | InternVL3.5-4B                     | MedPix-VQA                   | Supported  | Supported  | [internvl_3_5_4b.yaml](../../examples/vlm_finetune/internvl/internvl_3_5_4b.yaml) |
 | Ministral3-{3B,8B,14B}             | MedPix-VQA                   | Supported  | Supported  | [ministral3_3b_medpix.yaml](../../examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml), [ministral3_8b_medpix.yaml](../../examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml), [ministral3_14b_medpix.yaml](../../examples/vlm_finetune/mistral/ministral3_14b_medpix.yaml) |
+| Qwen3.5-MoE                       | MedPix-VQA                   | Supported  | Supported  | [qwen3_5_moe_medpix.yaml](../../examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml) |
 | Phi-4-multimodal-instruct          | commonvoice_17_tr_fixed      | Supported  | Supported  | [phi4_mm_cv17.yaml](../../examples/vlm_finetune/phi4/phi4_mm_cv17.yaml) |
 
 For detailed instructions on fine-tuning these models using both SFT and PEFT approaches, please refer to the [Gemma 3 and Gemma 3n Fine-Tuning Guide](../guides/omni/gemma3-3n.md). The guide covers dataset preparation, configuration, and running both full fine-tuning and LoRA-based parameter efficient fine-tuning.
+
+## Additional VLMs with FSDP2 Support
+
+The following VLM architectures have built-in FSDP2 parallelization support in NeMo AutoModel. They can be loaded via `NeMoAutoModelForImageTextToText.from_pretrained` and used with FSDP2 for distributed fine-tuning, though they do not yet have dedicated example configs.
+
+| Architecture | Example HF Models |
+|--------------|-------------------|
+| `Qwen2VLForConditionalGeneration` | `Qwen/Qwen2-VL-7B-Instruct`, `Qwen/Qwen2-VL-2B-Instruct` |
+| `SmolVLMForConditionalGeneration` | `HuggingFaceTB/SmolVLM-Instruct`, `HuggingFaceTB/SmolVLM-256M-Instruct` |
+| `LlavaForConditionalGeneration` | `llava-hf/llava-1.5-7b-hf`, `llava-hf/llava-1.5-13b-hf` |
+| `LlavaNextForConditionalGeneration` | `llava-hf/llava-v1.6-mistral-7b-hf`, `llava-hf/llava-v1.6-34b-hf` |
+| `LlavaNextVideoForConditionalGeneration` | `llava-hf/LLaVA-NeXT-Video-7B-hf` |
+| `LlavaOnevisionForConditionalGeneration` | `llava-hf/llava-onevision-qwen2-7b-ov-hf` |
+| `Llama4ForConditionalGeneration` | `meta-llama/Llama-4-Scout-17B-16E-Instruct`, `meta-llama/Llama-4-Maverick-17B-128E-Instruct` |
 
 
 ## Dataset Examples

@@ -13,11 +13,12 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 import torch
 
+from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.models.glm4_moe_lite.model import (
     Block,
     Glm4MoeLiteForCausalLM,
@@ -25,8 +26,6 @@ from nemo_automodel.components.models.glm4_moe_lite.model import (
     ModelClass,
 )
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
-from nemo_automodel.components.models.common.utils import BackendConfig
-
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -43,6 +42,8 @@ class MockGlm4MoeLiteConfig:
     max_position_embeddings: int = 256
     rope_theta: float = 5000.0
     torch_dtype: str = "bfloat16"
+
+    rope_parameters: dict = None
 
     # MLA config
     num_attention_heads: int = 4
@@ -70,6 +71,8 @@ class MockGlm4MoeLiteConfig:
     def __post_init__(self):
         if self.mlp_layer_types is None:
             self.mlp_layer_types = ["dense"] + ["sparse"] * (self.num_hidden_layers - 1)
+        if self.rope_parameters is None:
+            self.rope_parameters = {"rope_theta": self.rope_theta, "rope_type": "default"}
 
 
 @pytest.fixture

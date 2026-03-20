@@ -20,21 +20,21 @@ import os
 import shutil
 from pathlib import Path
 
+import datasets
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.distributed.tensor
 import torch.nn as nn
+import yaml
 from peft import PeftModel
 from safetensors import safe_open
 from transformers import AutoModelForImageTextToText
-import yaml
 
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, calculate_loss
 
-import datasets
 datasets.disable_caching()
 
 
@@ -634,6 +634,7 @@ def test_hf_peft_checkpoint():
         "lora_A_init": "xavier",
         "lora_dtype": None,
         "match_all_linear": False,
+        "moe_rank_scaling": False,
         "target_modules": [],
         "use_dora": False,
         "use_triton": True,
@@ -666,7 +667,7 @@ def test_hf_peft_checkpoint():
         # PEFT model state is consolidated - use FULL tensor shape (no splitting)
         curr_shard = v
         model_keys_fixture[k] = (list(curr_shard.shape), curr_shard.dtype, str(curr_shard.device))
-    
+
     # the saved optimizer state has an "optim." prefix that DCP adds.
     # For the on-disk view to match, it needs to be prepended with the "optim." prefix
     flattened_optim_dict = _rename_keys(optimizer_state_dict, "optim.")

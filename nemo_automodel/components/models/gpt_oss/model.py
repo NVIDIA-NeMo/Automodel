@@ -19,8 +19,14 @@ import torch
 import torch.nn as nn
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common import (
+    BackendConfig,
+    get_rope_config,
+    initialize_linear_module,
+    initialize_rms_norm_module,
+)
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
@@ -120,26 +126,15 @@ class GptOssModel(nn.Module):
         # Rotary embedding cached at model-level (inv_freq + concentration via YaRN/NTK-by-parts)
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        if rope_scaling is None:
-            rope_scaling = {
-                "factor": 1.0,
-                "beta_fast": 32.0,
-                "beta_slow": 1.0,
-                "original_max_position_embeddings": 4096,
-            }
-        if hasattr(config, "rope_parameters") and config.rope_parameters:
-            rope_theta = config.rope_parameters.get("rope_theta", 10000.0)
-        else:
-            rope_theta = getattr(config, "rope_theta", 10000.0)
+        rope_theta, rope_scaling, _ = get_rope_config(config)
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
             base=rope_theta,
             dtype=torch.float32,
-            initial_context_length=rope_scaling["original_max_position_embeddings"],
-            scaling_factor=rope_scaling["factor"],
-            ntk_alpha=rope_scaling["beta_slow"],
-            ntk_beta=rope_scaling["beta_fast"],
+            initial_context_length=rope_scaling.get("original_max_position_embeddings", 4096),
+            scaling_factor=rope_scaling.get("factor", 1.0),
+            ntk_alpha=rope_scaling.get("beta_slow", 1.0),
+            ntk_beta=rope_scaling.get("beta_fast", 32.0),
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
         )
 
@@ -198,6 +193,8 @@ class GptOssModel(nn.Module):
 
 
 class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    _keep_in_fp32_modules = ["post_attention_layernorm", "input_layernorm", "norm"]
+
     @classmethod
     def from_config(
         cls,
@@ -234,6 +231,18 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             self.state_dict_adapter = GPTOSSStateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
             )
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
 
     def forward(
         self,
@@ -272,7 +281,7 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
         with buffer_device:
             # Ensure rotary embedding uses correct device after dtype move
             self.model.rotary_emb.device = buffer_device

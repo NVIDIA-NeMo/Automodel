@@ -24,10 +24,10 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from nemo_automodel._transformers.auto_model import NeMoAutoModelBiencoder
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.datasets.llm.retrieval_dataset import load_datasets
 from nemo_automodel.components.distributed.init_utils import DistInfo, initialize_distributed
-from nemo_automodel.components.models.biencoder import NeMoAutoModelBiencoder
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,8 @@ MINING_DEFAULTS = {
     # Model loading parameters (loaded directly, not from config)
     "model_name_or_path": None,  # Required: path to model checkpoint
     "tokenizer_name_or_path": None,  # Optional: defaults to model_name_or_path
+    # Attention implementation for model loading
+    "attn_implementation": None,  # None = use model default; "sdpa", "flash_attention_2", "eager"
 }
 
 
@@ -175,6 +177,7 @@ class MineHardNegativesRecipe:
         self.tokenizer_name_or_path = None
         self.add_bos_token = None
         self.add_eos_token = None
+        self.attn_implementation = None
 
         # Model and tokenizer (populated in setup)
         self.model = None
@@ -234,11 +237,15 @@ class MineHardNegativesRecipe:
         # Load model directly from checkpoint path
         # This loads the saved model without requiring architecture config
         logger.info(f"Loading biencoder model from {self.model_name_or_path}...")
+        model_kwargs = {
+            "use_liger_kernel": False,  # Not needed for inference
+            "use_sdpa_patching": True,
+        }
+        if self.attn_implementation is not None:
+            model_kwargs["attn_implementation"] = self.attn_implementation
         self.model = NeMoAutoModelBiencoder.from_pretrained(
             self.model_name_or_path,
-            # Use inference-appropriate settings
-            use_liger_kernel=False,  # Not needed for inference
-            use_sdpa_patching=True,
+            **model_kwargs,
         )
         self.model = self.model.to(self.dist_env.device)
         self.model.eval()
@@ -296,6 +303,9 @@ class MineHardNegativesRecipe:
         # Tokenizer special token behavior (optional; defaults to tokenizer behavior if None)
         self.add_bos_token = self._get_mining_param("add_bos_token")
         self.add_eos_token = self._get_mining_param("add_eos_token")
+
+        # Attention implementation for model loading
+        self.attn_implementation = self._get_mining_param("attn_implementation")
 
         # Prefix and length parameters for embedding generation
         self.query_prefix = self._get_mining_param("query_prefix")
@@ -521,8 +531,7 @@ class MineHardNegativesRecipe:
 
             # Encode using the appropriate encoder
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
-                encoder = self.model.lm_q if encoder_type == "query" else self.model.lm_p
-                batch_embeds = self.model._encode(encoder, inputs)
+                batch_embeds = self.model.encode(inputs, encoder=encoder_type)
 
             embeddings.append(batch_embeds.cpu().float().numpy())
 

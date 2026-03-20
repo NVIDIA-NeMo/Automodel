@@ -33,6 +33,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 
+from nemo_automodel._transformers.utils import _should_load_before_shard
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
@@ -60,6 +61,7 @@ from nemo_automodel.components.utils.compile_utils import compile_model
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     apply_parameter_freezing,
+    count_model_parameters,
     init_empty_weights,
     print_trainable_parameters,
 )
@@ -198,7 +200,7 @@ def _apply_peft_and_lower_precision(
 
 #  Sharding helpers
 def _shard_pp(autopipeline, model, loss_fn, parallelize_fn):
-    trainable_params, total_params = print_trainable_parameters(model)
+    trainable_params, total_params = count_model_parameters(model)
     # Store param info on autopipeline before splitting so it can be accessed later
     # This captures the full model's param counts before PP shards it across ranks
     autopipeline.trainable_params_before_pp = trainable_params
@@ -392,6 +394,23 @@ def instantiate_infrastructure(
     return model_wrapper, autopipeline, parallelize_fn, qat_quantizer
 
 
+def _uses_te_attention(model) -> bool:
+    """Return True if any self_attn module uses TE's DotProductAttention."""
+    try:
+        from transformer_engine.pytorch.attention import DotProductAttention
+    except ImportError:
+        return False
+
+    model_parts = model.parts if hasattr(model, "parts") else [model]
+    for part in model_parts:
+        for name, module in part.named_modules():
+            if name.endswith("self_attn"):
+                attn_module = getattr(module, "attn_module", None)
+                if isinstance(attn_module, DotProductAttention):
+                    return True
+    return False
+
+
 #  apply_model_infrastructure  --  the main post-init orchestration function
 def apply_model_infrastructure(
     model,
@@ -469,14 +488,11 @@ def apply_model_infrastructure(
     )
 
     # Handle checkpointer config updates if checkpointer is provided
-    dequantize_base_checkpoint = False
     if checkpointer is not None:
         if checkpointer.config.dequantize_base_checkpoint is None:
-            # try to infer whether the base weights are quantized
             checkpointer.config.dequantize_base_checkpoint = hasattr(
                 getattr(model, "config", None), "quantization_config"
             )
-        dequantize_base_checkpoint = checkpointer.config.dequantize_base_checkpoint
 
     # Apply PEFT and lower precision if configured
     # When on meta device, wrap in init_empty_weights() so new LoRA modules are also on meta device
@@ -494,27 +510,38 @@ def apply_model_infrastructure(
     # Skip load-before-shard for PEFT: base load into unwrapped PEFT then later adapter load
     # after shard can leave base/adapter out of sync (e.g. key/device mismatch). Use the
     # post-shard load path so base and adapter load in the same way as multi-GPU.
-    no_pp = autopipeline is None
-    no_tp = mesh.tp_size <= 1
     need_checkpoint_load = bool(pretrained_model_name_or_path and load_base_model)
-    load_before_shard = no_pp and no_tp and need_checkpoint_load and (peft_config is None)
+    load_before_shard = _should_load_before_shard(
+        autopipeline=autopipeline,
+        tp_size=mesh.tp_size,
+        ep_size=mesh.ep_size,
+        pretrained_model_name_or_path=pretrained_model_name_or_path,
+        load_base_model=load_base_model,
+        peft_config=peft_config,
+    )
 
     checkpoint_already_loaded = False
     if load_before_shard:
-        lora_a_init = getattr(peft_config, "lora_A_init", None)
-        checkpointer.load_base_model(
-            model,
-            device,
-            cache_dir,
-            pretrained_model_name_or_path,
-            lora_a_init,
-            load_base_model=load_base_model,
-        )
+        if is_meta_device:
+            lora_a_init = getattr(peft_config, "lora_A_init", None)
+            checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
+            checkpointer.load_base_model(
+                model,
+                device,
+                cache_dir,
+                pretrained_model_name_or_path,
+                load_base_model=load_base_model,
+            )
+        else:
+            # Non-meta models already have weights from from_pretrained.
+            # Still call load_base_model with load_base_model=False to
+            # handle weight tying
+            checkpointer.load_base_model(model, device, cache_dir, pretrained_model_name_or_path, load_base_model=False)
         checkpoint_already_loaded = True
 
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
     pre_shard_hf_state_dict_keys = list(
-        _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=dequantize_base_checkpoint).keys()
+        _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=False).keys()
     )
 
     # Apply freezing before sharding
@@ -541,31 +568,37 @@ def apply_model_infrastructure(
         else:
             setattr(model, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
 
-    # Load the checkpoint if needed (meta path, or PP/TP path where we did not load before shard)
-    should_load_checkpoint = (
-        need_checkpoint_load
-        and not checkpoint_already_loaded
-        and (
-            is_meta_device
-            and any(
-                [
-                    get_world_size_safe() == 1,
-                    parallelize_fn is not None and get_world_size_safe() > 1,
-                    callable(getattr(model_wrapper, "parallelize", None)),
-                ]
-            )
+    # Materialize meta-device parameters and initialize weights after sharding.
+    # This is needed for both from_pretrained (before checkpoint loading overwrites)
+    # and from_config (where this is the only weight initialization).
+    # Skipped when load_before_shard already handled materialization + init.
+    need_post_shard_init = (
+        is_meta_device
+        and not load_before_shard
+        and any(
+            [
+                get_world_size_safe() == 1,
+                parallelize_fn is not None and get_world_size_safe() > 1,
+                callable(getattr(model_wrapper, "parallelize", None)),
+            ]
         )
     )
-    if should_load_checkpoint:
-        models_to_load = model.parts if hasattr(model, "parts") else [model]
+    if need_post_shard_init:
+        model_parts = model.parts if hasattr(model, "parts") else [model]
         lora_a_init = getattr(peft_config, "lora_A_init", None)
-        for mp in models_to_load:
+        for mp in model_parts:
+            checkpointer.initialize_model_weights(mp, device, peft_init_method=lora_a_init)
+
+    # Load the checkpoint if needed (meta path, or PP/TP path where we did not load before shard)
+    should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded and need_post_shard_init
+    if should_load_checkpoint:
+        model_parts = model.parts if hasattr(model, "parts") else [model]
+        for mp in model_parts:
             checkpointer.load_base_model(
                 mp,
                 device,
                 cache_dir,
                 pretrained_model_name_or_path,
-                lora_a_init,
                 load_base_model=load_base_model,
             )
 
@@ -579,16 +612,26 @@ def apply_model_infrastructure(
                     param.requires_grad_(False)
 
     if autopipeline is None:
-        print_trainable_parameters(model)  # Once model's been sharded
         # Ensure model is on the correct device; AutoPipeline takes care of it internally
         try:
-            model.to(device)
+            model.to(device, non_blocking=True)
         except NotImplementedError as e:
             if "Cannot copy out of meta tensor" in str(e):
                 logger.warning("model.to(device) failed (meta tensors); using model.to_empty(device=device) instead.")
                 model.to_empty(device=device)
             else:
                 raise
+        print_trainable_parameters(model)  # Once model's been sharded
+
+    # Attach CP attention-mask hooks for dense (non-TE) context parallelism.
+    # These hooks strip attention_mask and set is_causal=True on self_attn modules
+    # so that SDPA handles causal masking internally (compatible with DTensor sharding).
+    if mesh.cp_size > 1 and not _uses_te_attention(model):
+        from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+
+        model_parts = model.parts if hasattr(model, "parts") else [model]
+        for mp in model_parts:
+            attach_context_parallel_hooks(mp)
 
     # When training from scratch on meta device (from_config path) without a
     # pretrained checkpoint, the model has been materialised with

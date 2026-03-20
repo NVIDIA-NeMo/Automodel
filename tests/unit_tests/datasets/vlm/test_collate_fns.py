@@ -17,7 +17,7 @@ import types
 
 import pytest
 import torch
-
+from PIL import Image as PILImage
 
 CONVERSATION = [
     {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
@@ -100,17 +100,21 @@ class DummyQwen3OmniProcessor:
         return {"input_ids": input_ids}
 
 
-class DummyPhi4Processor:
-    def __init__(self):
-        self.tokenizer = DummyTokenizer(pad_token_id=0)
-        self.chat_calls = []
-        self.forward_calls = []
-        self.produced_input_ids = None
+class _DummyPhi4Tokenizer(DummyTokenizer):
+    """Tokenizer with apply_chat_template for Phi4 tests."""
 
     def apply_chat_template(self, conversation, *, tokenize, **kwargs):
         assert tokenize is False
-        self.chat_calls.append({"conversation": conversation, "kwargs": kwargs})
+        self._chat_calls = getattr(self, "_chat_calls", [])
+        self._chat_calls.append({"conversation": conversation, "kwargs": kwargs})
         return "chat::" + conversation[0]["content"][0]["text"]
+
+
+class DummyPhi4Processor:
+    def __init__(self):
+        self.tokenizer = _DummyPhi4Tokenizer(pad_token_id=0)
+        self.forward_calls = []
+        self.produced_input_ids = None
 
     def __call__(
         self,
@@ -194,6 +198,77 @@ class DummyKimiVLProcessor:
         return {"input_ids": input_ids}
 
 
+def test_build_labels_retries_with_stripped_whitespace(collate_mod, monkeypatch):
+    """When a tokenizer produces different tokens for leading-whitespace text,
+    build_labels should retry with lstripped text and still find the answer."""
+
+    class WhitespaceTokenizer:
+        """Tokenizer that produces different tokens for ' Hello' vs 'Hello'."""
+
+        def __call__(self, text, add_special_tokens, return_tensors):
+            assert add_special_tokens is False
+            assert return_tensors == "pt"
+            if text == " Hello":
+                return {"input_ids": torch.tensor([[90, 91]])}
+            if text == "Hello":
+                return {"input_ids": torch.tensor([[10, 11]])}
+            return {"input_ids": torch.tensor([[99]])}
+
+        def decode(self, token):
+            return ""
+
+    class StubProcessor:
+        def __init__(self):
+            self.tokenizer = WhitespaceTokenizer()
+
+    monkeypatch.setattr(collate_mod, "default_stop_tokens", lambda processor: (), raising=True)
+
+    # Encoded sequence contains stripped tokens [10, 11] but NOT whitespace tokens [90, 91]
+    input_ids_batch = torch.tensor([[1, 2, 10, 11, 3]])
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "question"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": " Hello"}]},
+    ]
+
+    labels = collate_mod.build_labels(input_ids_batch, [conversation], StubProcessor())
+    assert labels.shape == input_ids_batch.shape
+    # Tokens at positions 2,3 (the answer) should be unmasked; rest stays -100
+    assert labels.tolist()[0] == [-100, -100, 10, 11, -100]
+
+
+def test_build_labels_no_retry_when_no_leading_whitespace(collate_mod, monkeypatch):
+    """When assistant text has no leading whitespace and tokens are not found,
+    build_labels should NOT retry and should warn (answer_start stays -1)."""
+
+    call_count = [0]
+
+    class NoRetryTokenizer:
+        def __call__(self, text, add_special_tokens, return_tensors):
+            call_count[0] += 1
+            return {"input_ids": torch.tensor([[90, 91]])}
+
+        def decode(self, token):
+            return ""
+
+    class StubProcessor:
+        def __init__(self):
+            self.tokenizer = NoRetryTokenizer()
+
+    monkeypatch.setattr(collate_mod, "default_stop_tokens", lambda processor: (), raising=True)
+
+    input_ids_batch = torch.tensor([[1, 2, 3, 4, 5]])
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "question"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
+    ]
+
+    labels = collate_mod.build_labels(input_ids_batch, [conversation], StubProcessor())
+    # No match found, all labels stay -100
+    assert labels.tolist()[0] == [-100, -100, -100, -100, -100]
+    # Tokenizer called only once (no retry since text has no leading whitespace)
+    assert call_count[0] == 1
+
+
 def test_build_labels_includes_stop_token(collate_mod, monkeypatch):
     """
     Ensure `build_labels` copies the trailing stop token when it matches the configured set.
@@ -259,8 +334,9 @@ def test_phi4_mm_collate_fn_handles_audio_and_trimming(collate_mod, monkeypatch)
 
     batch = collate_mod.phi4_mm_collate_fn(examples, processor)
 
-    assert len(processor.chat_calls) == len(examples)
-    for call, example in zip(processor.chat_calls, examples, strict=True):
+    # Chat template is called on the tokenizer, not the processor
+    assert len(processor.tokenizer._chat_calls) == len(examples)
+    for call, example in zip(processor.tokenizer._chat_calls, examples, strict=True):
         assert call["conversation"] is example["conversation"]
 
     assert len(processor.forward_calls) == 1
@@ -271,9 +347,10 @@ def test_phi4_mm_collate_fn_handles_audio_and_trimming(collate_mod, monkeypatch)
     assert forward_call["max_length"] == 1024
     assert forward_call["text"] == ["chat::Hi", "chat::Hola"]
 
+    # Audio inputs are converted to (array, sampling_rate) tuples
     expected_audio0 = (examples[0]["audio"]["array"], examples[0]["audio"]["sampling_rate"])
     assert forward_call["audios"][0] == expected_audio0
-    assert forward_call["audios"][1] == examples[1]["audio"]
+    assert forward_call["audios"][1] == tuple(examples[1]["audio"])
 
     assert torch.equal(captured["input_ids"], processor.produced_input_ids)
     assert captured["conversations"] == [example["conversation"] for example in examples]
@@ -283,7 +360,72 @@ def test_phi4_mm_collate_fn_handles_audio_and_trimming(collate_mod, monkeypatch)
     assert torch.equal(batch["input_ids"], trimmed_input)
     assert torch.equal(batch["attention_mask"], torch.ones_like(trimmed_input))
     assert torch.equal(batch["extra"], torch.arange(len(examples), dtype=torch.long))
-    assert torch.equal(batch["labels"], labels_stub)
+    # Labels are shifted by [:, 1:] — not overwritten with full labels
+    assert torch.equal(batch["labels"], labels_stub[:, 1:])
+
+
+def test_phi4_mm_collate_fn_input_mode_from_processor(collate_mod, monkeypatch):
+    """When the processor already sets input_mode, the collate fn should not override it."""
+
+    class Phi4ProcessorWithInputMode:
+        def __init__(self):
+            self.tokenizer = _DummyPhi4Tokenizer(pad_token_id=0)
+
+        def __call__(self, *, text, audios, return_tensors, padding, truncation, max_length):
+            bs = len(text)
+            ids = torch.arange(1, bs * 3 + 1, dtype=torch.long).reshape(bs, 3)
+            return {"input_ids": ids, "attention_mask": torch.ones_like(ids), "input_mode": torch.tensor([2])}
+
+    examples = [{"conversation": CONVERSATION, "audio": {"array": [0.1], "sampling_rate": 16000}}]
+    monkeypatch.setattr(
+        collate_mod, "build_labels", lambda *a, **kw: torch.tensor([[1, 2, 3]], dtype=torch.long), raising=True
+    )
+    batch = collate_mod.phi4_mm_collate_fn(examples, Phi4ProcessorWithInputMode())
+    assert torch.equal(batch["input_mode"], torch.tensor([2]))
+
+
+def test_phi4_mm_collate_fn_input_mode_fallback(collate_mod, monkeypatch):
+    """When processor doesn't set input_mode, collate fn computes it from batch keys."""
+
+    class Phi4ProcessorWithAudioEmbeds:
+        def __init__(self):
+            self.tokenizer = _DummyPhi4Tokenizer(pad_token_id=0)
+
+        def __call__(self, *, text, audios, return_tensors, padding, truncation, max_length):
+            bs = len(text)
+            ids = torch.arange(1, bs * 3 + 1, dtype=torch.long).reshape(bs, 3)
+            return {
+                "input_ids": ids,
+                "attention_mask": torch.ones_like(ids),
+                "input_audio_embeds": torch.randn(bs, 4, 80),
+            }
+
+    examples = [{"conversation": CONVERSATION, "audio": {"array": [0.1], "sampling_rate": 16000}}]
+    monkeypatch.setattr(
+        collate_mod, "build_labels", lambda *a, **kw: torch.tensor([[1, 2, 3]], dtype=torch.long), raising=True
+    )
+    batch = collate_mod.phi4_mm_collate_fn(examples, Phi4ProcessorWithAudioEmbeds())
+    assert batch["input_mode"] == 2  # SPEECH
+
+
+def test_phi4_mm_collate_fn_raw_audio_passthrough(collate_mod, monkeypatch):
+    """Audio that is neither a dict nor a tuple/list should pass through as-is."""
+    import numpy as np
+
+    processor = DummyPhi4Processor()
+    raw_array = np.array([0.5, -0.5])
+    examples = [
+        {"conversation": CONVERSATION, "audio": raw_array},
+    ]
+    monkeypatch.setattr(
+        collate_mod, "build_labels", lambda *a, **kw: torch.tensor([[1, 2, 3]], dtype=torch.long), raising=True
+    )
+    collate_mod.phi4_mm_collate_fn(examples, processor)
+    # The raw array should be wrapped as a single-element tuple by the collate fn
+    forward_call = processor.forward_calls[0]
+    assert forward_call["audios"][0] is raw_array
+
+
 @pytest.fixture()
 def collate_mod():
     import nemo_automodel.components.datasets.vlm.collate_fns as _m
@@ -1042,3 +1184,146 @@ def test_kimi_k25_vl_collate_fn_labels_shifted(collate_mod, monkeypatch):
     # Then input_ids[:, :-1] means labels also become [:, :-1] from the shape matching
     # Final: [20, 30, 40]
     assert batch["labels"].shape[1] == 4  # 5 - 1 = 4
+
+
+# =============================================================================
+# Tests for _ensure_rgb
+# =============================================================================
+
+
+class TestEnsureRgb:
+    """Tests for _ensure_rgb helper that converts PIL images to RGB."""
+
+    def test_rgba_image_converted_to_rgb(self, collate_mod):
+        img = PILImage.new("RGBA", (4, 4), (255, 0, 0, 128))
+        conversations = [[
+            {"role": "user", "content": [{"image": img}]},
+        ]]
+        collate_mod._ensure_rgb(conversations)
+        assert conversations[0][0]["content"][0]["image"].mode == "RGB"
+
+    def test_grayscale_image_converted_to_rgb(self, collate_mod):
+        img = PILImage.new("L", (4, 4), 128)
+        conversations = [[
+            {"role": "user", "content": [{"image": img}]},
+        ]]
+        collate_mod._ensure_rgb(conversations)
+        assert conversations[0][0]["content"][0]["image"].mode == "RGB"
+
+    def test_palette_image_converted_to_rgb(self, collate_mod):
+        img = PILImage.new("P", (4, 4))
+        conversations = [[
+            {"role": "user", "content": [{"image": img}]},
+        ]]
+        collate_mod._ensure_rgb(conversations)
+        assert conversations[0][0]["content"][0]["image"].mode == "RGB"
+
+    def test_rgb_image_unchanged(self, collate_mod):
+        img = PILImage.new("RGB", (4, 4), (255, 0, 0))
+        conversations = [[
+            {"role": "user", "content": [{"image": img}]},
+        ]]
+        collate_mod._ensure_rgb(conversations)
+        result = conversations[0][0]["content"][0]["image"]
+        assert result.mode == "RGB"
+
+    def test_no_images_passthrough(self, collate_mod):
+        conversations = [[
+            {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+        ]]
+        result = collate_mod._ensure_rgb(conversations)
+        assert result == conversations
+
+    def test_string_content_skipped(self, collate_mod):
+        conversations = [[
+            {"role": "assistant", "content": "plain string"},
+        ]]
+        result = collate_mod._ensure_rgb(conversations)
+        assert result[0][0]["content"] == "plain string"
+
+    def test_empty_conversations(self, collate_mod):
+        assert collate_mod._ensure_rgb([]) == []
+
+    def test_multiple_images_in_one_turn(self, collate_mod):
+        rgba = PILImage.new("RGBA", (4, 4))
+        gray = PILImage.new("L", (4, 4))
+        rgb = PILImage.new("RGB", (4, 4))
+        conversations = [[
+            {"role": "user", "content": [
+                {"image": rgba},
+                {"type": "text", "text": "describe these"},
+                {"image": gray},
+                {"image": rgb},
+            ]},
+        ]]
+        collate_mod._ensure_rgb(conversations)
+        items = conversations[0][0]["content"]
+        assert items[0]["image"].mode == "RGB"
+        assert items[1] == {"type": "text", "text": "describe these"}
+        assert items[2]["image"].mode == "RGB"
+        assert items[3]["image"].mode == "RGB"
+
+    def test_multiple_conversations(self, collate_mod):
+        img1 = PILImage.new("RGBA", (4, 4))
+        img2 = PILImage.new("L", (4, 4))
+        conversations = [
+            [{"role": "user", "content": [{"image": img1}]}],
+            [{"role": "user", "content": [{"image": img2}]}],
+        ]
+        collate_mod._ensure_rgb(conversations)
+        assert conversations[0][0]["content"][0]["image"].mode == "RGB"
+        assert conversations[1][0]["content"][0]["image"].mode == "RGB"
+
+    def test_non_image_dict_items_untouched(self, collate_mod):
+        conversations = [[
+            {"role": "user", "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "video", "video": "clip.mp4"},
+            ]},
+        ]]
+        result = collate_mod._ensure_rgb(conversations)
+        items = result[0][0]["content"]
+        assert items[0] == {"type": "text", "text": "hi"}
+        assert items[1] == {"type": "video", "video": "clip.mp4"}
+
+    def test_returns_same_list_object(self, collate_mod):
+        conversations = [[{"role": "user", "content": [{"type": "text", "text": "x"}]}]]
+        result = collate_mod._ensure_rgb(conversations)
+        assert result is conversations
+
+
+class TestDefaultCollateFnEnsureRgb:
+    """Test that default_collate_fn integrates _ensure_rgb correctly."""
+
+    def test_rgba_image_converted_before_processing(self, collate_mod, fake_qwen_utils, monkeypatch):
+        monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
+
+        captured_conversations = []
+
+        class CapturingProcessor:
+            tokenizer = DummyTokenizer()
+
+            def apply_chat_template(self, conv_list, **kwargs):
+                for conv in conv_list:
+                    for turn in conv:
+                        content = turn.get("content")
+                        if isinstance(content, list):
+                            for item in content:
+                                if isinstance(item, dict) and isinstance(item.get("image"), PILImage.Image):
+                                    captured_conversations.append(item["image"].mode)
+                batch_size = len(conv_list)
+                input_ids = torch.arange(1, 5).unsqueeze(0).repeat(batch_size, 1)
+                pixel_values = torch.ones(batch_size, 3, 64, 64, dtype=torch.float32)
+                return {"input_ids": input_ids, "pixel_values": pixel_values}
+
+        rgba_img = PILImage.new("RGBA", (4, 4), (255, 0, 0, 128))
+        conversation = [
+            {"role": "user", "content": [{"image": rgba_img}, {"type": "text", "text": "describe"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "red"}]},
+        ]
+
+        processor = CapturingProcessor()
+        collate_mod.default_collate_fn([{"conversation": conversation}], processor)
+
+        assert captured_conversations == ["RGB"]

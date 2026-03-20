@@ -20,22 +20,22 @@ import os
 import shutil
 from pathlib import Path
 
+import datasets
+import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.distributed.tensor
 import torch.nn as nn
+import yaml
 from peft import PeftModel
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM
-import yaml
-import pytest
 
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction, calculate_loss
 
-import datasets
 datasets.disable_caching()
 
 def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
@@ -267,6 +267,7 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
         "lora_A_init": "xavier",
         "lora_dtype": None,
         "match_all_linear": True,
+        "moe_rank_scaling": False,
         "target_modules": [],
         "use_dora": False,
         "use_triton": False,
@@ -280,6 +281,14 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
     cfg.model.force_hf = force_hf
 
     try:
+        # Clean up any leftover checkpoints from previous runs to avoid
+        # auto-detection loading stale state into the fresh model.
+        ckpt_dir = Path(cfg.get("checkpoint.checkpoint_dir", "checkpoints"))
+        if ckpt_dir.exists() and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
+            shutil.rmtree(ckpt_dir)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
         # set use_triton value based on parsed input
         expected_automodel_peft_config["use_triton"] = cfg.peft.use_triton
 
@@ -298,6 +307,7 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
                 trainer.model_parts,
                 trainer.optimizer,
                 trainer.lr_scheduler,
+                is_peft=trainer.checkpointer.config.is_peft,
             ).state_dict()["optim"]
         )
 
@@ -383,6 +393,23 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
         restored_model = restored_model.model_parts[0]
         source_model_loss = get_validation_loss(trainer.model_parts[0], val_batch, trainer.loss_fn, trainer.dist_env.device)
         restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
+        errors = []
+        for (source_name, source_p), (restore_name, restore_p) in zip(trainer.model_parts[0].named_parameters(), restored_model.named_parameters()):
+            assert source_name == restore_name, "Parameter name mismatch"
+            if isinstance(source_p, torch.distributed.tensor.DTensor):
+                source_p = source_p.full_tensor()
+            if isinstance(restore_p, torch.distributed.tensor.DTensor):
+                restore_p = restore_p.full_tensor()
+            if not torch.allclose(source_p, restore_p):
+                errors.append(("Parameter value mismatch for " + source_name, source_p, restore_p))
+        if errors:
+            print("Parameter value mismatches:")
+            for error in errors:
+                print(error[0])
+                print(error[1])
+                print(error[2])
+                print("-"*80)
+            raise Exception("Parameter value mismatches")
         assert torch.allclose(source_model_loss, restored_model_loss), "Model loss mismatch"
 
         # compare the recipe configs

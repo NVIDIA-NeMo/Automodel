@@ -12,16 +12,90 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
+import torch
+
 logger = logging.getLogger(__name__)
+
+
+def _resolve_chat_template(chat_template: Optional[str]) -> Optional[str]:
+    """Resolve a chat template string that may be a file path.
+
+    If *chat_template* points to an existing file, its contents are returned.
+    If opening it as a file fails and the string contains Jinja-like characters
+    (``{``, ``}``, or newlines) it is treated as a literal template.  Otherwise
+    a :class:`ValueError` is raised so the caller knows the path was invalid.
+
+    Args:
+        chat_template: A Jinja template string or path to a template file.
+
+    Returns:
+        The resolved template string, or ``None`` when the input is ``None``.
+    """
+    if chat_template is None:
+        return None
+
+    p = Path(chat_template)
+    if p.exists():
+        content = p.read_text(encoding="utf-8")
+        try:
+            content = json.loads(content)["chat_template"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+        return content
+    return chat_template
+
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
 
 GENERATION_REGEX = re.compile(r"\{%-?\s+generation\s+-?%\}")
+
+
+@torch.no_grad()
+def _get_right_trailing_pad_mask(
+    sequence: torch.Tensor,
+    pad_token_id: int,
+    eos_token_id: int,
+) -> torch.Tensor:
+    """Boolean mask identifying right-trailing padding positions.
+
+    When *pad_token_id != eos_token_id*, it is simply ``sequence == pad_token_id``.
+
+    When the two IDs collide, a plain equality check would also match real EOS
+    tokens inside the content.  In that case the function locates the trailing
+    contiguous run of the shared token and treats all positions **after the
+    first one** in that run as padding.  The first token in the trailing run is
+    the real EOS and is kept unmasked so the model still learns to predict
+    end-of-sequence.
+
+    Args:
+        sequence: 1-D token id tensor.
+        pad_token_id: The token id used for padding.
+        eos_token_id: The token id used for end-of-sequence.  When equal to
+            *pad_token_id* the positional trailing-run logic is used.
+
+    Returns:
+        Boolean tensor (same shape as *sequence*) where ``True`` = padding.
+    """
+    if pad_token_id != eos_token_id:
+        return sequence == pad_token_id
+
+    mask = torch.zeros(sequence.shape, dtype=torch.bool, device=sequence.device)
+    non_pad_positions = (sequence != pad_token_id).nonzero(as_tuple=True)[0]
+    if non_pad_positions.numel() > 0:
+        last_content_idx = non_pad_positions[-1].item()
+        # last_content_idx + 1 → real EOS (keep), last_content_idx + 2 → padding
+        mask[last_content_idx + 2 :] = True
+    else:
+        # Entire sequence is the pad/eos token; keep the first as real EOS.
+        mask[1:] = True
+    return mask
 
 
 def _pad_to_seq_length(sample, pad_token_id, seq_length):
@@ -32,15 +106,38 @@ def _pad_to_seq_length(sample, pad_token_id, seq_length):
     return sample + [pad_token_id] * n
 
 
+_warned_add_pad_token = set()
+
+
 def _add_pad_token(tokenizer):
     """Add pad token to tokenizer if not present."""
     pad_token_id = None
     if getattr(tokenizer, "pad_token_id", None) is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+        if not "no_pad_id" in _warned_add_pad_token:
+            _warned_add_pad_token.add("no_pad_id")
+            logger.warning(
+                "Tokenizer has no pad_token_id; falling back to eos_token_id (%s). "
+                "This may cause issues if downstream code masks padding by token ID.",
+                tokenizer.eos_token_id,
+            )
     else:
         pad_token_id = tokenizer.pad_token_id
     if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
         tokenizer.pad_token = tokenizer.eos_token
+    if (
+        pad_token_id
+        and pad_token_id == getattr(tokenizer, "eos_token_id", None)
+        and not "pad_eq_eos" in _warned_add_pad_token
+    ):
+        _warned_add_pad_token.add("pad_eq_eos")
+        logger.warning(
+            "pad_token_id (%s) == eos_token_id (%s) for tokenizer '%s'. "
+            "Ensure loss masking uses positional logic rather than token-ID comparison.",
+            tokenizer.pad_token_id,
+            tokenizer.eos_token_id,
+            getattr(tokenizer, "name_or_path", "unknown"),
+        )
     return pad_token_id
 
 
@@ -85,9 +182,24 @@ def _package_tokenized_example(
         A dictionary with input_ids, labels, and attention_mask.
     """
     labels = input_ids.copy()
+    # Compute content length on the original input_ids (before the next-token
+    # shift) so that pre-padded and non-padded inputs produce identical
+    # attention masks.  The shift removes one token; when the input is padded
+    # that token is a pad, but when unpadded it is the last real token.
+    # Computing on the original and subtracting 1 gives the same result in
+    # both cases.
+    content_length = len(input_ids)
+    if pad_token_id is not None and content_length > 0:
+        end = content_length
+        while end > 0 and input_ids[end - 1] == pad_token_id:
+            end -= 1
+        if pad_token_id == eos_token_id:
+            content_length = min(end + 1, content_length)
+        else:
+            content_length = end
     input_ids = input_ids[:-1]
-    # input_ids= [a, b] -> attention_mask = [1, 1]
-    attention_mask = [1] * len(input_ids)
+    content_length = max(0, min(content_length - 1, len(input_ids)))
+    attention_mask = [1] * content_length + [0] * (len(input_ids) - content_length)
     # Labels: mask out prompt tokens
     labels[:] = [label if bool(m) else -100 for label, m in zip(labels, assistant_masks)]
     # remove BOS
@@ -97,7 +209,10 @@ def _package_tokenized_example(
         assert input_ids[-1] != eos_token_id, f"input_ids[-1]={input_ids[-1]} == eos_token_id={eos_token_id}"
     assert len(input_ids) == len(labels), f"len(input_ids)={len(input_ids)} != len(labels)={len(labels)}"
 
-    if isinstance(seq_length, int) and padding not in [None, "do_not_pad", False]:
+    # Only pad to a fixed length for "max_length".  For "longest" / True the
+    # collator pads to the longest sample in the batch, so the dataset must
+    # return variable-length sequences (same as "do_not_pad").
+    if isinstance(seq_length, int) and padding in ("max_length",):
         input_ids = _pad_to_seq_length(input_ids, pad_token_id, seq_length)
         labels = _pad_to_seq_length(labels, -100, seq_length)
 
@@ -152,15 +267,24 @@ def format_prompt_completion(
     else:
         len_prompt_ids = 0
     # Tokenize full text
-    input_ids = tokenizer(
+    tokenized = tokenizer(
         full_text,
         padding=padding,
         truncation=truncation,
         max_length=seq_length,
-    )["input_ids"]
+    )
+    input_ids = tokenized["input_ids"]
 
     # Create assistant_masks: 0 for prompt tokens, 1 for answer tokens
     assistant_masks = [0] * len_prompt_ids + [1] * (len(input_ids) - len_prompt_ids)
+
+    # Zero out the loss mask at padding positions using the tokenizer's
+    # own attention_mask so pad tokens are never treated as supervised.
+    tokenizer_attn_mask = tokenized.get("attention_mask")
+    if tokenizer_attn_mask is not None:
+        for i in range(min(len(assistant_masks), len(tokenizer_attn_mask))):
+            if not tokenizer_attn_mask[i]:
+                assistant_masks[i] = 0
 
     return _package_tokenized_example(
         tokenizer=tokenizer,
@@ -217,13 +341,12 @@ def format_chat_template(
         max_length=seq_length,
     )
 
-    # Choose the last conversation as answer other history are context by finding the last masked token
-    # which indicates end of context and beginning of answer
     input_ids = tokenized_chat.get("input_ids")
     if template_has_generation_kwd:
         mask = tokenized_chat["assistant_masks"]
     elif not template_has_generation_kwd and answer_only_loss_mask:
-        # in this case we need to manually split up the formatted_text. Only the final assistant turn should be considered as answer.
+        # Tokenize prompt-only without padding to get its real length,
+        # then derive the mask from the length difference.
         answer_text = formatted_text.pop()
         assert answer_text["role"] == "assistant", "The last message in the formatted_text must be an assistant message"
         tokenized_prompt = tokenizer.apply_chat_template(
@@ -232,7 +355,7 @@ def format_chat_template(
             tokenize=True,
             return_dict=True,
             return_assistant_tokens_mask=template_has_generation_kwd,
-            padding=padding,
+            padding=False,
             truncation=truncation,
             max_length=seq_length,
         )
@@ -241,9 +364,13 @@ def format_chat_template(
     else:
         mask = [1] * len(input_ids)
 
-    if getattr(tokenizer, "eos_token_id", None) and input_ids[-1] != tokenizer.eos_token_id:
-        input_ids += [tokenizer.eos_token_id]
-        mask += [1]
+    # Zero out the loss mask at padding positions using the tokenizer's
+    # own attention_mask so pad tokens are never treated as supervised.
+    tokenizer_attn_mask = tokenized_chat.get("attention_mask")
+    if tokenizer_attn_mask is not None:
+        for i in range(min(len(mask), len(tokenizer_attn_mask))):
+            if not tokenizer_attn_mask[i]:
+                mask[i] = 0
 
     return _package_tokenized_example(
         tokenizer=tokenizer,

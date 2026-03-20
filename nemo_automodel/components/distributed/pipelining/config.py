@@ -81,6 +81,8 @@ class PipelineConfig:
         loss_fn (Optional[Callable]): Loss function used for pipeline training.
             Required when pipeline is enabled. The function signature should be
             compatible with the model's output format.
+        pp_seq_len (Optional[int]): Sequence length hint for pipeline parallel
+            shape inference. If None, it will be inferred from the dataset config.
     """
 
     pp_schedule: Optional[str] = "1f1b"
@@ -96,36 +98,7 @@ class PipelineConfig:
     dtype: Optional[torch.dtype] = None
     scale_grads_in_schedule: bool = False
     loss_fn: Optional[Callable] = None
-
-    def __init__(
-        self,
-        pp_schedule: Optional[str] = "1f1b",
-        pp_schedule_csv: Optional[str] = None,
-        pp_microbatch_size: int = 1,
-        pp_batch_size: int = 1,
-        layers_per_stage: Optional[int] = None,
-        round_virtual_stages_to_pp_multiple: Optional[Literal["up", "down"]] = None,
-        module_fqns_per_model_part: Optional[List[List[str]]] = None,
-        patch_inner_model: bool = True,
-        patch_causal_lm_model: bool = True,
-        patch_stage_backward_maybe_with_nosync: bool = False,
-        dtype: Optional[torch.dtype] = None,
-        scale_grads_in_schedule: bool = False,
-        loss_fn: Optional[Callable] = None,
-    ):
-        self.pp_schedule = pp_schedule
-        self.pp_schedule_csv = pp_schedule_csv
-        self.pp_microbatch_size = pp_microbatch_size
-        self.pp_batch_size = pp_batch_size
-        self.layers_per_stage = layers_per_stage
-        self.round_virtual_stages_to_pp_multiple = round_virtual_stages_to_pp_multiple
-        self.module_fqns_per_model_part = module_fqns_per_model_part
-        self.patch_inner_model = patch_inner_model
-        self.patch_causal_lm_model = patch_causal_lm_model
-        self.patch_stage_backward_maybe_with_nosync = patch_stage_backward_maybe_with_nosync
-        self.dtype = dtype
-        self.scale_grads_in_schedule = scale_grads_in_schedule
-        self.loss_fn = loss_fn
+    pp_seq_len: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
@@ -143,4 +116,5 @@ class PipelineConfig:
             "dtype": self.dtype,
             "scale_grads_in_schedule": self.scale_grads_in_schedule,
             "loss_fn": self.loss_fn,
+            "pp_seq_len": self.pp_seq_len,
         }

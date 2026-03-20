@@ -96,8 +96,64 @@ def _parallelize_gemma3(
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
+def get_llama_nemotron_super_tp_plan(
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """Return the tensor parallel plan for Llama / Llama-3.3-Nemotron Super.
+
+    Same topology as Llama-3.3-Nemotron (e.g. nvidia/Llama-3_3-Nemotron-Super-49B-v1_5):
+    fused QKV, fused gate+up, VocabParallelEmbedding, Row/ColwiseParallel for attention and MLP.
+
+    Use this plan explicitly by passing it as tp_shard_plan (dict) or by name
+    ``llama_nemotron_super_tp_plan`` when calling fsdp2_strategy_parallelize / _get_parallel_plan.
+    """
+    return _parallelize_llama(None, sequence_parallel)  # type: ignore[arg-type]
+
+
+def get_decilm_nemotron_tp_plan(
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """Return a TP plan for remote-code DeciLM Nemotron-NAS checkpoints.
+
+    DeciLM/Nemotron-NAS is close to Llama structurally, but its remote-code forward
+    path performs model-level rotary embedding setup and per-layer block-config
+    dispatch. In practice, the generic base-style plan is a safer match than the
+    Llama-optimized named plan for this architecture.
+    """
+    base_model_tp_plan: dict[str, ParallelStyle] = {
+        "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+        "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+        "model.layers.*.mlp.up_proj": ColwiseParallel(),
+        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+        "model.layers.*.mlp.down_proj": RowwiseParallel(),
+        "lm_head": ColwiseParallel(output_layouts=Replicate()),
+    }
+
+    base_model_sp_plan = {
+        "model.embed_tokens": VocabParallelEmbedding(
+            input_layouts=Replicate(),
+            output_layouts=Shard(1),
+            use_local_output=False,
+        ),
+        "model.norm": SequenceParallel(),
+        "model.layers.*.input_layernorm": SequenceParallel(),
+        "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+        "model.layers.*.post_attention_layernorm": SequenceParallel(),
+        "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+        "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
+    }
+
+    if sequence_parallel:
+        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
+
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
+
 def _parallelize_llama(
-    model: LlamaForCausalLM,
+    model: LlamaForCausalLM | None,
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """Parallelizes a LlamaForCausalLM model across data and tensor parallel dimensions."""
@@ -296,18 +352,44 @@ def _parallelize_phi3(
     )
 
 
-# Create the model-specific parallel plan mapping
-PARALLELIZE_FUNCTIONS: Dict[type, Callable[..., Dict[str, ParallelStyle]]] = {
-    Qwen2ForCausalLM: _parallelize_qwen,
-    Qwen3ForCausalLM: _parallelize_qwen,
-    Qwen3ForSequenceClassification: _parallelize_qwen_classification,
-    LlamaForCausalLM: _parallelize_llama,
-    Ministral3ForCausalLM: _parallelize_ministral3,
+# Named TP plan for use with tp_shard_plan="llama_nemotron_super_tp_plan" in parallelizer
+LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME = "llama_nemotron_super_tp_plan"
+
+
+def _get_class_qualname(cls: type) -> str:
+    """Return the fully qualified name of a class as ``module.qualname``.
+
+    Used as a stable dict key for PARALLELIZE_FUNCTIONS instead of the class
+    object itself.
+
+    When NeMo-RL uses automodel, ``force_hf=True`` is auto-set for models
+    (e.g. ``LlamaForCausalLM``) whose adapter does not implement
+    ``convert_single_tensor_to_hf``. This causes ``_get_mixin_wrapped_class``
+    in ``model_init.py`` to create a new class via ``type(...)`` that wraps
+    the original with ``HFCheckpointingMixin``. The wrapper copies
+    ``__module__`` and ``__qualname__`` from the original but is a **different
+    Python object**, so ``type(model) in PARALLELIZE_FUNCTIONS`` (identity
+    check) returns ``False`` and the default plan is used instead of the
+    optimized one.
+
+    String comparison on ``module.qualname`` survives this wrapping and
+    correctly identifies the model class.
+    """
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+# Keyed by qualified class name — see _get_class_qualname for why.
+PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
+    _get_class_qualname(Qwen2ForCausalLM): _parallelize_qwen,
+    _get_class_qualname(Qwen3ForCausalLM): _parallelize_qwen,
+    _get_class_qualname(Qwen3ForSequenceClassification): _parallelize_qwen_classification,
+    _get_class_qualname(LlamaForCausalLM): _parallelize_llama,
+    _get_class_qualname(Ministral3ForCausalLM): _parallelize_ministral3,
     # gemma-3-1b-it uses Gemma3ForCausalLM since it is a text-only model
-    Gemma3ForCausalLM: _parallelize_gemma3,
+    _get_class_qualname(Gemma3ForCausalLM): _parallelize_gemma3,
     # The larger gemma models use Gemma3ForConditionalGeneration, which are for text-image input
-    Gemma3ForConditionalGeneration: _parallelize_gemma3,
-    Phi3ForCausalLM: _parallelize_phi3,
-    CustomLlamaForCausalLM: _parallelize_llama,
-    CustomQwen2ForCausalLM: _parallelize_qwen,
+    _get_class_qualname(Gemma3ForConditionalGeneration): _parallelize_gemma3,
+    _get_class_qualname(Phi3ForCausalLM): _parallelize_phi3,
+    _get_class_qualname(CustomLlamaForCausalLM): _parallelize_llama,
+    _get_class_qualname(CustomQwen2ForCausalLM): _parallelize_qwen,
 }
