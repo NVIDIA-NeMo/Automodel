@@ -1178,3 +1178,35 @@ def test_make_retrieval_dataset_model_type_invalid(tmp_path):
 
     with pytest.raises(ValueError, match="model_type must be one of"):
         rdi.make_retrieval_dataset(data_dir_list=str(f), model_type="foo")
+
+
+def test_eval_negative_size_defaults_from_n_passages(tmp_path, monkeypatch):
+    """When eval_negative_size is None it should derive from n_passages - 1."""
+    corpus_dir = tmp_path / "corpusF"
+    corpus_dir.mkdir()
+    (corpus_dir / "merlin_metadata.json").write_text(json.dumps({"class": "TextQADataset", "corpus_id": "F"}))
+
+    monkeypatch.setattr(
+        rd,
+        "load_dataset",
+        _mock_hf_load_dataset_returning(
+            [
+                {"id": "p", "text": "P"},
+                {"id": "n1", "text": "N1"},
+                {"id": "n2", "text": "N2"},
+                {"id": "n3", "text": "N3"},
+                {"id": "n4", "text": "N4"},
+            ]
+        ),
+    )
+
+    train_file = _make_train_file(tmp_path, corpus_dir, data_len=1, corpus_id="F")
+    ds_eval = rd.make_retrieval_dataset(
+        data_dir_list=str(train_file),
+        data_type="eval",
+        eval_negative_size=None,
+        n_passages=5,
+    )
+    ex = ds_eval[0]
+    # 1 positive + 4 negatives = 5 docs total
+    assert len(ex["doc_text"]) == 5

@@ -16,7 +16,7 @@ from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAda
 
 
 class EncoderStateDictAdapter(StateDictAdapter):
-    """Adapter for EncoderModel state dicts.
+    """Adapter for encoder model state dicts.
 
     Internal format uses a ``model.`` prefix on all keys.  HF format does not.
     This adapter strips or adds the ``model.`` prefix as needed, including

@@ -66,6 +66,112 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
     return emb
 
 
+def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
+    """Configure HuggingFace consolidated checkpoint metadata on a model.
+
+    Sets the model's ``name_or_path``, ``state_dict_adapter``, and updates
+    ``config.architectures`` and ``config.auto_map`` so that the saved
+    checkpoint can be reloaded via HuggingFace Auto classes.
+
+    Args:
+        model: The backbone ``PreTrainedModel`` instance.
+        config: The model's config object (typically ``model.config``).
+    """
+    encoder_class_name = model.__class__.__name__
+    config_class_name = config.__class__.__name__
+    config.architectures = [encoder_class_name]
+    config.auto_map = {
+        "AutoModel": f"model.{encoder_class_name}",
+        "AutoConfig": f"model.{config_class_name}",
+    }
+
+
+def build_encoder_backbone(
+    model_name_or_path: str,
+    task: str,
+    trust_remote_code: bool = False,
+    **hf_kwargs,
+) -> PreTrainedModel:
+    """Build a bidirectional encoder backbone from a pretrained checkpoint.
+
+    Resolves the HuggingFace config, looks up the correct bidirectional
+    architecture class from :data:`SUPPORTED_BACKBONES` and
+    :class:`ModelRegistry`, and returns the constructed model.
+
+    Args:
+        model_name_or_path: Path or HuggingFace Hub identifier.
+        task: The encoder task (e.g. ``"embedding"``, ``"score"``).
+        trust_remote_code: Whether to allow custom remote code.
+        **hf_kwargs: Extra keyword arguments forwarded to ``from_pretrained``.
+
+    Returns:
+        The constructed ``PreTrainedModel`` backbone.
+
+    Raises:
+        ValueError: If the model type or task is unsupported, or the
+            architecture class is missing from :class:`ModelRegistry`.
+    """
+    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+    model_type = getattr(config, "model_type", "")
+
+    task_map = SUPPORTED_BACKBONES.get(model_type.lower())
+    if task_map is None:
+        raise ValueError(
+            f"Unsupported model type '{model_type}' for encoder. "
+            f"Supported types: {', '.join(SUPPORTED_BACKBONES)}."
+        )
+
+    arch_name = task_map.get(task)
+    if arch_name is None:
+        raise ValueError(
+            f"Unsupported task '{task}' for model type '{model_type}'. "
+            f"Available tasks: {', '.join(task_map)}."
+        )
+
+    if arch_name not in ModelRegistry.model_arch_name_to_cls:
+        raise ValueError(f"Model class '{arch_name}' not found in ModelRegistry.")
+
+    BidirectionalModelClass = ModelRegistry.model_arch_name_to_cls[arch_name]
+    logger.info(f"Using {arch_name} from registry")
+
+    return BidirectionalModelClass.from_pretrained(
+        model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
+    )
+
+
+def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> None:
+    """Save an encoder model to an output directory.
+
+    If ``checkpointer`` is present in *kwargs*, delegates to
+    ``Checkpointer.save_model`` for distributed/FSDP-safe saving.
+    Otherwise falls back to the inner ``PreTrainedModel.save_pretrained``.
+
+    The inner model is expected to be stored as ``model.model`` (the
+    backbone wrapped by the encoder).
+
+    Args:
+        model: The encoder ``nn.Module`` (must have a ``.model`` attribute
+            that is the ``PreTrainedModel`` backbone).
+        save_directory: Filesystem path where the checkpoint is written.
+        **kwargs: Optional keys:
+            - ``checkpointer``: a Checkpointer instance for distributed saves.
+            - ``peft_config``: PEFT configuration (forwarded to checkpointer).
+            - ``tokenizer``: tokenizer instance (forwarded to checkpointer).
+    """
+    checkpointer = kwargs.get("checkpointer", None)
+    if checkpointer is not None:
+        checkpointer.save_model(
+            model=model,
+            weights_path=save_directory,
+            peft_config=kwargs.get("peft_config", None),
+            tokenizer=kwargs.get("tokenizer", None),
+        )
+        return
+
+    logger.info(f"Saving encoder model to {save_directory}")
+    model.model.save_pretrained(save_directory)
+
+
 # HuggingFace model_type -> task -> bidirectional architecture class name in ModelRegistry
 _LLAMA_TASKS = {
     "embedding": "LlamaBidirectionalModel",
@@ -101,29 +207,25 @@ def _register_bidirectional_models():
 _register_bidirectional_models()
 
 
-class EncoderModel(nn.Module):
-    """Base encoder model with shared backbone loading and saving logic."""
+def _init_encoder_common(encoder: nn.Module, model: PreTrainedModel) -> None:
+    """Shared init for BiEncoderModel and CrossEncoderModel."""
+    encoder.model = model
+    encoder.config = model.config
+    encoder.name_or_path = os.path.dirname(inspect.getfile(type(model)))
+    encoder.state_dict_adapter = EncoderStateDictAdapter()
+    configure_encoder_metadata(model, model.config)
 
-    _TASK = None
 
-    def __init__(self, model: PreTrainedModel):
+class BiEncoderModel(nn.Module):
+    """Bi-encoder model that produces embeddings using a bidirectional backbone."""
+
+    _TASK = "embedding"
+
+    def __init__(self, model: PreTrainedModel, pooling: str = "avg", l2_normalize: bool = True):
         super().__init__()
-        self.model = model
-        self.config = self.model.config
-
-        # HuggingFace consolidated checkpoint compatibility
-        self.name_or_path = os.path.dirname(inspect.getfile(type(self.model)))
-        self.state_dict_adapter = EncoderStateDictAdapter()
-        encoder_class_name = self.model.__class__.__name__
-        self.config.architectures = [encoder_class_name]
-        self.config.auto_map = {
-            "AutoModel": f"model.{encoder_class_name}",
-            "AutoConfig": f"model.{encoder_class_name.replace('Model', 'Config')}",
-        }
-
-    def forward(self, input_dict: dict = None, **kwargs) -> Optional[torch.Tensor]:
-        """Forward pass -- subclasses must implement."""
-        raise NotImplementedError
+        _init_encoder_common(self, model)
+        self.pooling = pooling
+        self.l2_normalize = l2_normalize
 
     @classmethod
     def build(
@@ -135,83 +237,21 @@ class EncoderModel(nn.Module):
         trust_remote_code: bool = False,
         **hf_kwargs,
     ):
-        """Build encoder model from a pretrained backbone."""
+        """Build bi-encoder model from a pretrained backbone."""
         effective_task = cls._TASK if cls._TASK is not None else task
         if effective_task is None:
-            raise ValueError("task must be specified when calling build() on EncoderModel directly")
+            raise ValueError("task must be specified when calling build()")
 
-        # Resolve to correct subclass if called on base
-        if cls is EncoderModel:
-            _SUBCLASS_MAP = {"embedding": BiEncoderModel, "score": CrossEncoderModel}
-            target_cls = _SUBCLASS_MAP.get(effective_task)
-            if target_cls is None:
-                raise ValueError(f"Unknown task '{effective_task}'. Available: {list(_SUBCLASS_MAP)}")
-        else:
-            target_cls = cls
+        logger.info(f"Building BiEncoderModel from {model_name_or_path}")
 
-        logger.info(f"Building EncoderModel from {model_name_or_path}")
-
-        config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
-        model_type = getattr(config, "model_type", "")
-
-        task_map = SUPPORTED_BACKBONES.get(model_type.lower())
-        if task_map is None:
-            raise ValueError(
-                f"Unsupported model type '{model_type}' for encoder. Supported types: {', '.join(SUPPORTED_BACKBONES)}."
-            )
-
-        arch_name = task_map.get(effective_task)
-        if arch_name is None:
-            raise ValueError(
-                f"Unsupported task '{effective_task}' for model type '{model_type}'. "
-                f"Available tasks: {', '.join(task_map)}."
-            )
-
-        if arch_name not in ModelRegistry.model_arch_name_to_cls:
-            raise ValueError(f"Model class '{arch_name}' not found in ModelRegistry.")
-        BidirectionalModelClass = ModelRegistry.model_arch_name_to_cls[arch_name]
-        logger.info(f"Using {arch_name} from registry")
-
-        backbone = BidirectionalModelClass.from_pretrained(
-            model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
+        backbone = build_encoder_backbone(
+            model_name_or_path, effective_task, trust_remote_code=trust_remote_code, pooling=pooling, **hf_kwargs
         )
 
-        # Subclass-specific construction
-        if issubclass(target_cls, BiEncoderModel):
-            return target_cls(model=backbone, pooling=pooling, l2_normalize=l2_normalize)
-        return target_cls(model=backbone)
+        return cls(model=backbone, pooling=pooling, l2_normalize=l2_normalize)
 
     def save_pretrained(self, save_directory: str, **kwargs):
-        """Save model to output directory.
-
-        If ``checkpointer`` is in kwargs, delegates to Checkpointer.save_model
-        for distributed/FSDP-safe saving. Otherwise falls back to HF-native save.
-        """
-        checkpointer = kwargs.get("checkpointer", None)
-        if checkpointer is not None:
-            checkpointer.save_model(
-                model=self,
-                weights_path=save_directory,
-                peft_config=kwargs.get("peft_config", None),
-                tokenizer=kwargs.get("tokenizer", None),
-            )
-
-            return
-
-        logger.info(f"Saving EncoderModel to {save_directory}")
-
-        self.model.save_pretrained(save_directory)
-
-
-class BiEncoderModel(EncoderModel):
-    """Bi-encoder model that produces embeddings using a bidirectional backbone."""
-
-    _TASK = "embedding"
-
-    def __init__(self, model: PreTrainedModel, pooling: str = "avg", l2_normalize: bool = True):
-        super().__init__(model)
-        self.pooling = pooling
-        self.l2_normalize = l2_normalize
+        save_encoder_pretrained(self, save_directory, **kwargs)
 
     def encode(self, input_dict: dict) -> Optional[torch.Tensor]:
         """Encode inputs and return pooled embeddings.
@@ -254,13 +294,36 @@ class BiEncoderModel(EncoderModel):
         return self.encode(input_dict)
 
 
-class CrossEncoderModel(EncoderModel):
+class CrossEncoderModel(nn.Module):
     """Cross-encoder model for scoring/classification tasks."""
 
     _TASK = "score"
 
+    def __init__(self, model: PreTrainedModel):
+        super().__init__()
+        _init_encoder_common(self, model)
+
+    @classmethod
+    def build(
+        cls,
+        model_name_or_path: str,
+        trust_remote_code: bool = False,
+        **hf_kwargs,
+    ):
+        """Build cross-encoder model from a pretrained backbone."""
+        logger.info(f"Building CrossEncoderModel from {model_name_or_path}")
+        backbone = build_encoder_backbone(
+            model_name_or_path,
+            task=cls._TASK,
+            trust_remote_code=trust_remote_code,
+            **hf_kwargs,
+        )
+        return cls(model=backbone)
+
+    def save_pretrained(self, save_directory: str, **kwargs):
+        save_encoder_pretrained(self, save_directory, **kwargs)
+
     def forward(self, input_dict: dict = None, **kwargs) -> Optional[torch.Tensor]:
-        """Forward pass -- going through __call__ ensures FSDP2 unshard hooks fire."""
         inputs = input_dict if input_dict is not None else kwargs
         inputs.setdefault("return_dict", True)
         return self.model(**inputs)
