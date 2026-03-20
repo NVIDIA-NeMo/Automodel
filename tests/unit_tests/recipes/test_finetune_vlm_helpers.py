@@ -434,7 +434,6 @@ def test_autoprocessor_exception_handling(caplog):
 
 def test_autoprocessor_loads_inside_first_rank_per_node():
     """Test that processor instantiation happens inside the FirstRankPerNode context."""
-    import logging
 
     from nemo_automodel.recipes.vlm.finetune import build_dataloader
 

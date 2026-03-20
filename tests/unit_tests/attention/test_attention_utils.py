@@ -21,8 +21,8 @@ import torch.nn.functional as F
 
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
-    preprocess_args_and_kwargs_for_attn,
     postprocess_output_for_attn,
+    preprocess_args_and_kwargs_for_attn,
 )
 
 
