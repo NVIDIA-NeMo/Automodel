@@ -29,7 +29,7 @@ If no caption is found for a sample, the filename (with underscores replaced by 
 
 ## Preprocessing
 
-NeMo AutoModel includes a unified preprocessing tool at [`tools/diffusion/preprocessing_multiprocess.py`](../../../tools/diffusion/preprocessing_multiprocess.py) that encodes raw images and videos into cache files compatible with the multiresolution dataloader. It uses model-specific processors from [`tools/diffusion/processors/`](../../../tools/diffusion/processors/) to handle VAE encoding, text embedding, and cache data formatting for each supported model.
+NeMo AutoModel includes a unified preprocessing tool at [`tools/diffusion/preprocessing_multiprocess.py`](../../../tools/diffusion/preprocessing_multiprocess.py) that encodes raw images and videos into cache files compatible with the multiresolution dataloader. It uses model-specific processors from `tools/diffusion/processors/` to handle VAE encoding, text embedding, and cache data formatting for each supported model.
 
 The tool automatically distributes work across all available GPUs using multiprocessing, with one worker per GPU.
 

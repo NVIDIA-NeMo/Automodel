@@ -85,7 +85,7 @@ Pretraining recipes for training diffusion models from scratch on large-scale da
 
 - Folder: [examples/diffusion/pretrain](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/diffusion/pretrain)
 - Representative models: Wan 2.1 T2V 1.3B, FLUX.1-dev
-- How-to guide: [Diffusion fine-tuning (pretraining section)](diffusion/finetune.md#pretraining-vs-fine-tuning)
+- How-to guide: [Diffusion fine-tuning (pretraining section)](diffusion/finetune.md#configure-your-training-recipe)
 
 ### Generation
 

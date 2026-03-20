@@ -83,9 +83,9 @@ Find the right guide for your task.
 
 |            | SFT | PEFT (LoRA) | Tool Calling | QAT | Knowledge Distillation | Pretrain |
 |------------|-----|-------------|--------------|-----|------------------------|----------|
-| **LLM**    | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/finetune.md#recipe-config) | [Guide](guides/llm/toolcalling.md) | [Guide](guides/quantization-aware-training.md) | [Guide](guides/llm/knowledge-distillation.md) | [Guide](guides/llm/pretraining.md) |
+| **LLM**    | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/finetune.md#peft-optional) | [Guide](guides/llm/toolcalling.md) | [Guide](guides/quantization-aware-training.md) | [Guide](guides/llm/knowledge-distillation.md) | [Guide](guides/llm/pretraining.md) |
 | **VLM**    | [Guide](guides/overview.md) | [Guide](guides/omni/gemma3-3n.md) | -- | -- | -- | -- |
-| **Diffusion** | [Guide](guides/diffusion/finetune.md) | -- | -- | -- | -- | [Guide](guides/diffusion/finetune.md#pretraining-vs-fine-tuning) |
+| **Diffusion** | [Guide](guides/diffusion/finetune.md) | -- | -- | -- | -- | [Guide](guides/diffusion/finetune.md#configure-your-training-recipe) |
 
 ## Performance
 
