@@ -822,16 +822,30 @@ class Checkpointer:
         """
         Construct a Hugging Face storage reader when loading safetensors or during init.
 
+        Prefers the upstream ``torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader``
+        when no ``key_mapping`` is needed, since it uses safetensors' native ``get_slice()`` for
+        efficient partial reads (only the bytes for the local DTensor shard are read from disk).
+        Falls back to the backported reader when ``key_mapping`` is required or when the upstream
+        reader is not available.
+
         Args:
             model_path: Path to the model checkpoint directory or HF snapshot.
             key_mapping: Optional key remapping for conversion.
             is_init_step: If True, always produce a reader for base HF load.
 
         Returns:
-            Configured `_HuggingFaceStorageReader` or None for other formats.
+            Configured storage reader or None for other formats.
         """
-        # If loading the model from the base checkpoint, we need to read the base model from the Hugging Face checkpoint
         if self.config.model_save_format == SerializationFormat.SAFETENSORS or is_init_step:
+            if key_mapping is None:
+                try:
+                    from torch.distributed.checkpoint.hf_storage import (
+                        HuggingFaceStorageReader as _UpstreamHFReader,
+                    )
+
+                    return _UpstreamHFReader(path=model_path)
+                except ImportError:
+                    pass
             return _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
 
     def _get_original_model_path(self, model_state: ModelState) -> str | None:
