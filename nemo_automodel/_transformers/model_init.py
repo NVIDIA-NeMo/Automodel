@@ -164,6 +164,24 @@ def _is_config_compatible_with_custom_model(arch_name: str, config) -> bool:
     return True
 
 
+def _resolve_custom_model_cls_for_config(config):
+    """Resolve the custom model class for *config*, if the config is compatible."""
+    architectures = get_architectures(config)
+    if not architectures:
+        return None
+
+    arch_name = architectures[0]
+    if not ModelRegistry.has_custom_model(arch_name):
+        return None
+
+    # Some architecture names are shared across multiple upstream variants.
+    # Screen them here before asking the registry for the custom implementation.
+    if not _is_config_compatible_with_custom_model(arch_name, config):
+        return None
+
+    return ModelRegistry.resolve_custom_model_cls(arch_name, config)
+
+
 def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
     """
     Get the HF config for the model.
@@ -196,13 +214,10 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
 
 
 def get_is_hf_model(config, force_hf):
-    """
-    Resolve trust_remote_code default and determine if model is HF-based.
-    """
-    # Finally make sure flash_attention is available
-    architectures = getattr(config, "architectures", None) or []
-    is_hf_model = (not architectures or architectures[0] not in ModelRegistry.model_arch_name_to_cls) or force_hf
-    return is_hf_model
+    """Determine whether the model should use the HF (not custom) implementation."""
+    if force_hf:
+        return True
+    return _resolve_custom_model_cls_for_config(config) is None
 
 
 def _download_model_weights(hf_config, pretrained_model_name_or_path):
@@ -271,16 +286,16 @@ def _init_model(
         model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
         return False, model
 
-    architectures = get_architectures(hf_config)
     # 2. If we have a custom model implementation available, we prioritize that over HF
-    if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
+    architectures = get_architectures(hf_config)
+    model_cls = _resolve_custom_model_cls_for_config(hf_config)
+    if model_cls is not None:
         # if we are able to init the custom model, we will now download the model weights on local rank 0
         # Skip download for from_config (no pretrained path) or local paths
         if pretrained_model_name_or_path:
             _download_model_weights(hf_config, pretrained_model_name_or_path)
         logger.info(f"Using custom model implementation for {architectures[0]}")
         kwargs.pop("trust_remote_code", None)
-        model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
         # Treat config-related kwargs as config overrides (HF behavior) and
         # avoid forwarding them into model __init__.
         init_param_names = _get_init_param_names(model_cls)

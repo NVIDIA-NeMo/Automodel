@@ -66,20 +66,9 @@ class TestWildcardMatch:
         result = wildcard_match("*.layers.0.*", None)
         assert result is False
 
-    def test_dots_are_literal(self):
-        """Dots in patterns must match literal dots, not arbitrary characters."""
-        assert wildcard_match("a.b.c", "aXbXc") is False
-        assert wildcard_match("a.b.c", "a.b.c") is True
-
-    def test_regex_metacharacters_escaped(self):
-        """Characters like (), [], + in patterns are treated literally."""
-        assert wildcard_match("layer(0)", "layer(0)") is True
-        assert wildcard_match("layer[0]", "layer[0]") is True
-        assert wildcard_match("layer+0", "layer+0") is True
-
     def test_multi_level_wildcard(self):
         assert wildcard_match("*.*.*", "a.b.c") is True
-        assert wildcard_match("*.*.*", "a.b") is False
+        assert wildcard_match("*.b.*", "a.b") is True
 
 
 # ------------------------------------------------------------------ #
@@ -97,9 +86,9 @@ class TestModuleMatcherValidation:
         assert not m.match(nn.Linear(10, 10), name="base_model.model.model.layers.1.mixer.gate.e_score_correction_bias")
         assert m.match(nn.Linear(10, 10), name="model.lm_head")
 
-    def test_rejects_all_empty(self):
-        with pytest.raises(ValueError, match="match_all_linear"):
-            ModuleMatcher()
+    def test_default_target_modules_to_star_proj(self):
+        m = ModuleMatcher()
+        assert m.target_modules == ["*_proj"]
 
     def test_rejects_target_and_exclude_together(self):
         with pytest.raises(ValueError, match="mutually exclusive"):

@@ -1,20 +1,23 @@
 ---
+
 description: "NeMo AutoModel is a PyTorch DTensor-native SPMD open-source training library for scalable LLM and VLM training and fine-tuning with day-0 Hugging Face model support"
+
 categories:
-  - documentation
-  - home
+
+- documentation
+- home
 tags:
-  - training
-  - fine-tuning
-  - distributed
-  - gpu-accelerated
-  - spmd
-  - dtensor
+- training
+- fine-tuning
+- distributed
+- gpu-accelerated
+- spmd
+- dtensor
 personas:
-  - Machine Learning Engineers
-  - Data Scientists
-  - Researchers
-  - DevOps Professionals
+- Machine Learning Engineers
+- Data Scientists
+- Researchers
+- DevOps Professionals
 difficulty: beginner
 content_type: index
 ---
@@ -22,11 +25,12 @@ content_type: index
 (automodel-home)=
 
 # NeMo AutoModel Documentation
+
 PyTorch SPMD (Single Program, Multiple Data) training for LLMs and VLMs with day-0 Hugging Face model support.
 
 ## Introduction to NeMo AutoModel
-Learn about NeMo AutoModel, how it works at a high-level, and the key features.
 
+Learn about NeMo AutoModel, how it works at a high-level, and the key features.
 
 ::::{grid} 1 2 2 2
 :gutter: 1 1 1 2
@@ -57,24 +61,43 @@ Built on `transformers` for day-0 model support and OOTB compatibility.
 
 ::::
 
-## Quickstart
+## I Want To...
 
-Select a modality and task to find the right guide.
+Find the right guide for your task.
+
+
+| I want to...                | Choose this when...                                                                 | Input Data                                        | Model     | Guide                                                     |
+| --------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------- | --------- | --------------------------------------------------------- |
+| **SFT (full fine-tune)**    | You need maximum accuracy and have the GPU budget to update all weights             | Instruction / chat dataset                        | LLM       | [Start fine-tuning](guides/llm/finetune.md)               |
+| **PEFT (LoRA)**             | You want to fine-tune on limited GPU memory; updates <1 % of parameters             | Instruction / chat dataset                        | LLM       | [Start LoRA](guides/llm/finetune.md)        |
+| **Tool / function calling** | Your model needs to call APIs or tools with structured arguments                    | Function-calling dataset (queries + tool schemas) | LLM       | [Add tool calling](guides/llm/toolcalling.md)             |
+| **Fine-tune VLM**           | Your task involves both images and text (e.g., visual QA, captioning)               | Image + text dataset                              | VLM       | [Fine-tune VLM](guides/omni/gemma3-3n.md)                 |
+| **Fine-tune VLM-MoE**       | You need large-scale vision-language training with sparse MoE efficiency            | Image + text dataset                              | VLM (MoE) | [Fine-tune VLM-MoE](guides/vlm/qwen3_5.md)                |
+| **Embedding fine-tune**     | You want to improve text similarity for search, retrieval, or RAG         | Text pairs / retrieval corpus                     | LLM       | {bdg-info}`Coming Soon`                                   |
+| **Fine-tune a large MoE**   | You are adapting a large sparse MoE model (DeepSeek-V3, GLM-5, etc.) to your domain | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune MoE](guides/llm/large_moe_finetune.md)         |
+| **Sequence classification** | You need to classify text into categories (sentiment, topic, NLI)                   | Text + labels (e.g., GLUE MRPC)                   | LLM       | [Train classifier](guides/llm/sequence-classification.md) |
+| **QAT fine-tune**           | You want a quantized model that keeps accuracy for efficient deployment             | Text dataset                                      | LLM       | [Enable QAT](guides/quantization-aware-training.md)       |
+| **Knowledge distillation**  | You want a smaller, faster model that retains most of the teacher's quality         | Instruction dataset + teacher model               | LLM       | [Distill a model](guides/llm/knowledge-distillation.md)   |
+| **Pretrain an LLM**         | You are building a base model from scratch on your own corpus                       | Large unlabeled text corpus (e.g., FineWeb-Edu)   | LLM       | [Start pretraining](guides/llm/pretraining.md)            |
+| **Pretrain (NanoGPT)**      | You want quick pretraining experiments on a single node                             | FineWeb / text corpus                             | LLM       | [Try NanoGPT](guides/llm/nanogpt-pretraining.md)          |
 
 |            | SFT | PEFT (LoRA) | Tool Calling | QAT | Knowledge Distillation | Pretrain |
 |------------|-----|-------------|--------------|-----|------------------------|----------|
-| **LLM**    | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/finetune.md#recipe-config) | [Guide](guides/llm/toolcalling.md) | [Guide](guides/quantization-aware-training.md) | [Guide](guides/llm/knowledge-distillation.md) | [Guide](guides/llm/pretraining.md) |
+| **LLM**    | [Guide](guides/llm/finetune.md) | [Guide](guides/llm/finetune.md#peft-optional) | [Guide](guides/llm/toolcalling.md) | [Guide](guides/quantization-aware-training.md) | [Guide](guides/llm/knowledge-distillation.md) | [Guide](guides/llm/pretraining.md) |
 | **VLM**    | [Guide](guides/overview.md) | [Guide](guides/omni/gemma3-3n.md) | -- | -- | -- | -- |
+| **Diffusion** | [Guide](guides/diffusion/finetune.md) | -- | -- | -- | -- | [Guide](guides/diffusion/finetune.md#configure-your-training-recipe) |
 
 ## Performance
 
 Training throughput on NVIDIA GPUs with optimized kernels for Hugging Face models.
 
-| Model | GPUs | TFLOPs/sec/GPU | Tokens/sec/GPU | Optimizations |
-|-------|-----:|---------------:|---------------:|---------------|
-| DeepSeek V3 671B | 256 | 250 | 1,002 | TE + DeepEP |
-| GPT-OSS 20B | 8 | 279 | 13,058 | TE + DeepEP + FlexAttn |
-| Qwen3 MoE 30B | 8 | 277 | 12,040 | TE + DeepEP |
+
+| Model            | GPUs | TFLOPs/sec/GPU | Tokens/sec/GPU | Optimizations          |
+| ---------------- | ---- | -------------- | -------------- | ---------------------- |
+| DeepSeek V3 671B | 256  | 250            | 1,002          | TE + DeepEP            |
+| GPT-OSS 20B      | 8    | 279            | 13,058         | TE + DeepEP + FlexAttn |
+| Qwen3 MoE 30B    | 8    | 277            | 12,040         | TE + DeepEP            |
+
 
 See the [full benchmark results](performance-summary.md) for configuration details and more models.
 
@@ -118,6 +141,7 @@ Bring your own dataset for LLM, VLM, or retrieval training.
 ::::
 
 ## Advanced Topics
+
 Parallelism, precision, checkpointing strategies and experiment tracking.
 
 ::::{grid} 1 2 2 3
@@ -225,6 +249,7 @@ performance-summary.md
 model-coverage/overview.md
 model-coverage/llm.md
 model-coverage/vlm.md
+model-coverage/diffusion.md
 model-coverage/troubleshooting.md
 ::::
 
@@ -241,10 +266,10 @@ guides/llm/nanogpt-pretraining.md
 guides/llm/sequence-classification.md
 guides/omni/gemma3-3n.md
 guides/vlm/qwen3_5.md
+guides/diffusion/finetune.md
 guides/quantization-aware-training.md
 guides/llm/databricks.md
 ::::
-
 
 ::::{toctree}
 :hidden:
@@ -256,6 +281,7 @@ guides/llm/retrieval-dataset.md
 guides/llm/column-mapped-text-instruction-dataset.md
 guides/llm/column-mapped-text-instruction-iterable-dataset.md
 guides/vlm/dataset.md
+guides/diffusion/dataset.md
 ::::
 
 ::::{toctree}

@@ -4,13 +4,8 @@ model:
   cache_dir: null
   attention_backend: "flash"
 
-  pipeline_spec:
-    transformer_cls: "FluxTransformer2DModel"
-    subfolder: "transformer"
-    load_full_pipeline: false
-
 optim:
-  learning_rate: 1e-5
+  learning_rate: 2e-5
 
   optimizer:
     weight_decay: 0.01
@@ -28,19 +23,18 @@ fsdp:
 flow_matching:
   adapter_type: "flux"
   adapter_kwargs:
-    #Critical: use 3.5 guidance scale for finetuning
-    guidance_scale: 3.5
-    use_guidance_embeds: true
+    guidance_scale: 1
+    use_guidance_embeds: false
   timestep_sampling: "logit_normal"
   logit_mean: 0.0
   logit_std: 1.0
-  flow_shift: 3.0
-  mix_uniform_ratio: 0.1
+  flow_shift: 1.0
+  mix_uniform_ratio: 0.0
   sigma_min: 0.0
   sigma_max: 1.0
   num_train_timesteps: 1000
   i2v_prob: 0.0
-  use_loss_weighting: true
+  use_loss_weighting: false
   log_interval: 100
   summary_log_interval: 10
 
@@ -48,7 +42,7 @@ step_scheduler:
   num_epochs: 5000
   local_batch_size: 1
   global_batch_size: 8
-  ckpt_every_steps: 2000
+  ckpt_every_steps: 500
   log_every: 1
 
 data:

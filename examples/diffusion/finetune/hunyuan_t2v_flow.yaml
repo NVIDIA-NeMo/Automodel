@@ -2,7 +2,7 @@ model:
   pretrained_model_name_or_path: "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v"
   mode: "finetune"
   cache_dir: null
-  attention_backend: "_flash_3_hub"
+  attention_backend: "flash"
 
 optim:
   learning_rate: 5e-6
