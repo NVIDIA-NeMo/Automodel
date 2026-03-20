@@ -69,7 +69,7 @@ Diffusion models operate in latent space — a compressed representation of visu
 
 Fine-tuning then operates entirely on these pre-encoded .meta files, which is significantly faster than encoding on the fly.
 
-Preprocess your data using the built-in tool at `tools/diffusion/preprocessing_multiprocess.py`. The script provides `image` and `video` subcommands:
+Preprocess your data using the built-in tool at [`tools/diffusion/preprocessing_multiprocess.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/diffusion/preprocessing_multiprocess.py). The script provides `image` and `video` subcommands:
 
 **Video preprocessing (Wan 2.1):**
 ```bash
