@@ -14,32 +14,20 @@
 
 """Unit tests for optimized_tp_plans module."""
 
-import types
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
-    ParallelStyle,
     PrepareModuleInput,
     PrepareModuleOutput,
     RowwiseParallel,
     SequenceParallel,
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
-
-from nemo_automodel.components.distributed.optimized_tp_plans import (
-    RotaryEmbedParallel,
-    _get_class_qualname,
-    _parallelize_gemma3,
-    _parallelize_llama,
-    _parallelize_qwen,
-    PARALLELIZE_FUNCTIONS,
-)
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForCausalLM,
     Gemma3ForConditionalGeneration,
@@ -48,11 +36,26 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
+from nemo_automodel.components.distributed.optimized_tp_plans import (
+    PARALLELIZE_FUNCTIONS,
+    RotaryEmbedParallel,
+    _get_class_qualname,
+    _parallelize_gemma3,
+    _parallelize_llama,
+    _parallelize_qwen,
+)
+
 
 class MockModel:
     """Mock model class for testing."""
     def __init__(self, model_type="llama", tie_word_embeddings=False):
-        self.config = SimpleNamespace(tie_word_embeddings=tie_word_embeddings)
+        self.config = SimpleNamespace(
+            tie_word_embeddings=tie_word_embeddings,
+            hidden_size=4096,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            head_dim=128,
+        )
         self.__class__ = {
             "llama": LlamaForCausalLM,
             "qwen2": Qwen2ForCausalLM,
@@ -431,7 +434,13 @@ class TestParallelizeFunctionsMapping:
             # @akoumparouli: explicitly deleting the lm_head because the parallelizer asserts on it
             if model_type == Qwen3ForSequenceClassification:
                 del mock_model.lm_head
-            mock_model.config = SimpleNamespace(tie_word_embeddings=False)
+            mock_model.config = SimpleNamespace(
+                tie_word_embeddings=False,
+                hidden_size=4096,
+                num_attention_heads=32,
+                num_key_value_heads=8,
+                head_dim=128,
+            )
 
             result = func(mock_model, sequence_parallel=False)
             assert isinstance(result, dict)
