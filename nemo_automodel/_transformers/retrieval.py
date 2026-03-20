@@ -80,10 +80,11 @@ def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
     encoder_class_name = model.__class__.__name__
     config_class_name = config.__class__.__name__
     config.architectures = [encoder_class_name]
-    config.auto_map = {
-        "AutoModel": f"model.{encoder_class_name}",
-        "AutoConfig": f"model.{config_class_name}",
-    }
+    config.auto_map = {"AutoConfig": f"model.{config_class_name}"}
+    if "ForSequenceClassification" in encoder_class_name:
+        config.auto_map["AutoModelForSequenceClassification"] = f"model.{encoder_class_name}"
+    else:
+        config.auto_map["AutoModel"] = f"model.{encoder_class_name}"
 
 
 def build_encoder_backbone(
