@@ -242,6 +242,41 @@ def test_resolve_custom_model_cls_passes_config_to_supports():
     assert inst.resolve_custom_model_cls("ConfigAwareModel", bad) is None
 
 
+def test_custom_config_registrations_in_config_mapping():
+    """Models in _CUSTOM_CONFIG_REGISTRATIONS must be registered in CONFIG_MAPPING after import.
+
+    This ensures that AutoConfig.from_pretrained can resolve custom model types
+    (e.g. kimi_k25, kimi_vl) from local checkpoints without trust_remote_code=True.
+    """
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS
+
+    missing = []
+    for model_type in _CUSTOM_CONFIG_REGISTRATIONS:
+        if model_type not in CONFIG_MAPPING:
+            missing.append(model_type)
+
+    assert not missing, (
+        f"Model type(s) {missing} are in _CUSTOM_CONFIG_REGISTRATIONS but not in "
+        f"CONFIG_MAPPING. The _register_custom_configs() call at module level may "
+        f"have failed for these entries."
+    )
+
+
+def test_kimi_k25_arch_alias_in_model_arch_mapping():
+    """KimiK25ForConditionalGeneration (checkpoint arch) must map to KimiK25VLForConditionalGeneration."""
+    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+
+    assert "KimiK25ForConditionalGeneration" in MODEL_ARCH_MAPPING, (
+        "KimiK25ForConditionalGeneration missing from MODEL_ARCH_MAPPING. "
+        "Kimi-K2.5 checkpoints use this architecture name and need it mapped "
+        "to KimiK25VLForConditionalGeneration."
+    )
+    module_path, cls_name = MODEL_ARCH_MAPPING["KimiK25ForConditionalGeneration"]
+    assert cls_name == "KimiK25VLForConditionalGeneration"
+
+
 def test_all_model_folders_registered_in_auto_map():
     """Every model folder with a model.py must have at least one entry in MODEL_ARCH_MAPPING.
 
