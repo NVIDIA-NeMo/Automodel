@@ -14,7 +14,6 @@
 
 """Unit tests for MoE load balance metrics."""
 
-import math
 
 import pytest
 import torch

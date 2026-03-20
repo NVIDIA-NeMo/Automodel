@@ -28,7 +28,6 @@ Usage:
 
 import argparse
 import json
-import sys
 
 LOSS_THRESHOLD = 0.05
 

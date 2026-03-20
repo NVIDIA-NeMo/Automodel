@@ -20,12 +20,11 @@ import torch
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
 
 from nemo_automodel.components.attention.utils import postprocess_output_for_attn, preprocess_args_and_kwargs_for_attn
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_next.layers import (
     Qwen3NextAttention,
     Qwen3NextRMSNorm,
 )
-from nemo_automodel.components.models.common import BackendConfig
-
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 

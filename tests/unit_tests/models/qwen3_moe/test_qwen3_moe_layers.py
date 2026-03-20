@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import math
-from functools import partial
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,11 +20,10 @@ import torch
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from nemo_automodel.components.attention.utils import postprocess_output_for_attn, preprocess_args_and_kwargs_for_attn
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_moe.layers import (
     Qwen3MoeAttention,
 )
-from nemo_automodel.components.models.common import BackendConfig
-
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
