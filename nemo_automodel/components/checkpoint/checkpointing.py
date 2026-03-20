@@ -365,7 +365,7 @@ class Checkpointer:
         # For models that need tensor merging and don't have an adapter, try using transformers' conversion
         if is_init_step and model_type and requires_tensor_merging(model_type) and not has_state_dict_adapter:
             converted_state_dict = _convert_checkpoint_with_transformers(model_state.model[0], model_path, key_mapping)
-            if converted_state_dict is not None:
+            if converted_state_dict:
                 # Load using full_state_dict=True to properly convert tensors to DTensors for FSDP
                 _load_full_state_dict_into_model(model_state.model, converted_state_dict)
                 return
@@ -1231,41 +1231,53 @@ def _convert_checkpoint_with_transformers(
         # Sort by key for consistent ordering
         sorted_items = sorted(checkpoint_state_dict.items(), key=lambda kv: dot_natural_key(kv[0]))
 
+        n_converter_keys = 0
+        n_rename_keys = 0
         for original_key, tensor in sorted_items:
             # Rename the key
             renamed_key, source_pattern = rename_source_key(original_key, renamings, converters)
 
             # Check if this needs conversion
             if source_pattern is not None:
+                n_converter_keys += 1
                 # This key is part of a WeightConverter operation
                 new_converter = deepcopy(pattern_to_converter[source_pattern])
                 mapping = param_name_to_mapping.setdefault(renamed_key, new_converter)
                 mapping.add_tensor(renamed_key, original_key, source_pattern, tensor)
             else:
+                n_rename_keys += 1
                 # Simple rename or pass-through
                 mapping = param_name_to_mapping.setdefault(renamed_key, WeightRenaming(original_key, renamed_key))
                 mapping.add_tensor(renamed_key, original_key, original_key, tensor)
 
+        logging.debug(
+            "[convert_ckpt] {} keys matched converters, {} keys simple rename, {} total mappings".format(
+                n_converter_keys, n_rename_keys, len(param_name_to_mapping)
+            )
+        )
+
         # Now apply all the conversions
         for first_param_name, mapping in param_name_to_mapping.items():
-            try:
-                realized_value, _ = mapping.convert(first_param_name, model=model, config=model.config)
-                for target_name, param in realized_value.items():
-                    param = param[0] if isinstance(param, list) else param
-                    converted_state_dict[target_name] = param
+            # convert() returns dict or (dict, errors) depending on transformers version
+            result = mapping.convert(first_param_name, model=model, config=model.config)
+            if isinstance(result, tuple):
+                realized_value = result[0]
+            elif isinstance(result, dict):
+                realized_value = result
+            else:
+                raise TypeError(
+                    "Expected convert() to return dict or (dict, errors) tuple, got {}".format(type(result))
+                )
+            for target_name, param in realized_value.items():
+                param = param[0] if isinstance(param, list) else param
+                converted_state_dict[target_name] = param
+            if callable(getattr(mapping, "reset", None)):
                 mapping.reset()
-            except Exception as e:
-                logging.warning(f"Conversion failed for {first_param_name}: {e}")
-                continue
-
-        logging.info(f"Converted {len(converted_state_dict)} keys using transformers conversion mapping")
+        logging.debug("Converted {} keys using transformers conversion mapping".format(len(converted_state_dict)))
         return converted_state_dict
 
     except Exception as e:
-        logging.warning(f"Failed to convert checkpoint with transformers: {e}")
-        import traceback
-
-        traceback.print_exc()
+        logging.warning("Failed to convert checkpoint with transformers: {}".format(e))
         return None
 
 
