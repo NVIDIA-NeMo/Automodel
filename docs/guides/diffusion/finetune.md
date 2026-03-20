@@ -103,7 +103,13 @@ For the full set of arguments and input format details, see the [Diffusion Datas
 
 ## Configure Your Training Recipe
 
-Fine-tuning is configured through a YAML file. Below is the annotated [wan2_1_t2v_flow.yaml](../../../examples/diffusion/finetune/wan2_1_t2v_flow.yaml) configuration:
+Fine-tuning is driven by two components:
+
+1. A recipe script (e.g., [`train.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/diffusion/train.py)) — the Python entry point that orchestrates the training loop: loading the model, building the dataloader, running forward/backward passes, computing the flow matching loss, checkpointing, and logging.
+2. A YAML configuration file — a text file in YAML format that specifies all settings the recipe uses: which model to fine-tune, where the data lives, optimizer hyperparameters, parallelism strategy, etc.
+  You customize training by editing this file rather than modifying code, allowing you to scale from 1 to 100s of GPUs seamlessly.
+
+Below is the annotated [wan2_1_t2v_flow.yaml](../../../examples/diffusion/finetune/wan2_1_t2v_flow.yaml), with each section explained:
 
 ```yaml
 seed: 42
