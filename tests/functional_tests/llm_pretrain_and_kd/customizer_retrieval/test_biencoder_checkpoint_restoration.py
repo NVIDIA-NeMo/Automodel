@@ -81,9 +81,6 @@ def _run_training(recipe_yaml: str, checkpoint_dir: str) -> Path:
     cmd = [
         sys.executable,
         "-m", "coverage", "run",
-        "--data-file=/workspace/.coverage",
-        "--source=/workspace/",
-        "--parallel-mode",
         "-m", "nemo_automodel.recipes.biencoder.train_biencoder",
         "--config",
         recipe_yaml,
@@ -235,8 +232,8 @@ class TestBiencoderCheckpointRestoration:
         """Train biencoder with LoRA -> load in NeMo -> save -> verify base
         weights restored by transformers + LoRA weights by safetensors."""
 
-        from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
         from nemo_automodel._transformers.biencoder import BiencoderModel
+        from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
         from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel
 
         # ---- Step 1: Train with PEFT -------------------------------------

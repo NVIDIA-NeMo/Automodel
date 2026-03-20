@@ -82,6 +82,7 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
     PARALLELIZE_FUNCTIONS,
     VocabParallelEmbedding,
+    _get_class_qualname,
     get_decilm_nemotron_tp_plan,
     get_llama_nemotron_super_tp_plan,
 )
@@ -101,6 +102,7 @@ except:
 import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_utils
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 class ParallelizationStrategy(ABC):
@@ -1117,15 +1119,12 @@ def _get_parallel_plan(
                 f"Error: {e}"
             )
 
-    elif model_cls in PARALLELIZE_FUNCTIONS or model_cls.__name__ in {k.__name__ for k in PARALLELIZE_FUNCTIONS}:
-        func = PARALLELIZE_FUNCTIONS.get(model_cls) or next(
-            f for k, f in PARALLELIZE_FUNCTIONS.items() if k.__name__ == model_cls.__name__
-        )
+    elif (func := PARALLELIZE_FUNCTIONS.get(_get_class_qualname(model_cls))) is not None:
         try:
             model_parallel_plan = func(model, sequence_parallel)
-            logger.info("Using optimized parallel plan.")
+            logger.info(f"Using optimized parallel plan for {model_cls.__name__}.")
         except Exception as e:
-            logger.info(f"Optimized parallel plan is not available: {e}. Falling back to the HF tp plan.")
+            logger.info(f"Optimized parallel plan not available: {e}. Falling back to the HF tp plan.")
             model_parallel_plan = get_hf_tp_shard_plan(model)
 
     else:

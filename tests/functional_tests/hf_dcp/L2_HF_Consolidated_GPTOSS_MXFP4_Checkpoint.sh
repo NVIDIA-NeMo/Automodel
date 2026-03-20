@@ -26,7 +26,7 @@ python tests/functional_tests/checkpoint/create_gptoss_2l_mxfp4.py \
     --tokenizer-dir "$TEST_DATA_DIR/hf_mixtral_2l/"
 
 TRANSFORMERS_OFFLINE=1 TORCH_COMPILE_DISABLE=1 \
-python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
+python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
 -m pytest tests/functional_tests/checkpoint/test_hf_consolidated_gptoss_mxfp4.py \
     --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --model.pretrained_model_name_or_path "$GPTOSS_MODEL_DIR" \

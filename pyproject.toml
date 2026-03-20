@@ -115,7 +115,7 @@ cuda = [
 cuda_source = [
     "bitsandbytes",
 ]
-extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
+extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
 delta-databricks = [
     "deltalake>=1.0.0",  # For Delta Lake metadata
@@ -172,7 +172,13 @@ linting = [
     "ty>=0.0.20",
 ]
 test = ["coverage", "pytest", "peft>=0.18.1", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
-dev = ["cut-cross-entropy", "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')", "dion @ git+https://github.com/microsoft/dion.git; platform_machine == 'x86_64' and platform_system != 'Darwin'"]
+# CP for linear attention (fla.ops.cp) requires fla > 0.4.1; pin to main until a release includes it.
+dev = [
+    "cut-cross-entropy",
+    "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@7cbe461b10bde60180c32c5f9381a04d41887514",
+    "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "dion @ git+https://github.com/microsoft/dion.git; platform_machine == 'x86_64' and platform_system != 'Darwin'",
+]
 
 [tool.uv]
 default-groups = ["build", "docs", "test"]
@@ -267,9 +273,11 @@ requires-dist = ["torch", "packaging", "ninja", "setuptools"]
 pythonpath = ["."]
 
 [tool.coverage.paths]
-source = [".", "/workspace", "/home/runner/work/Automodel/Automodel"]
+source = [".", "/opt/Automodel", "/home/runner/work/Automodel/Automodel"]
 
 [tool.coverage.run]
+source = ["nemo_automodel"]
+parallel = true
 concurrency = ["thread", "multiprocessing"]
 omit = [
     "nemo_automodel/components/checkpoint/_backports/*.py",

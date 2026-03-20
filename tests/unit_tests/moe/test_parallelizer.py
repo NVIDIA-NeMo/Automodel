@@ -14,7 +14,7 @@
 
 import sys
 import types
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1980,3 +1980,127 @@ def test_apply_cp_mixed_te_and_non_te(monkeypatch):
 
     # TE block configured, non-TE block skipped (no error)
     te_attn.set_context_parallel_group.assert_called_once()
+
+
+# ============================================================================
+# Tests for apply_cp – linear_attention (FLA CP) branches
+# ============================================================================
+
+
+class _FakeLinearAttn:
+    """CP-aware linear attention module stub."""
+
+    def __init__(self):
+        self._cp_mesh = None
+
+
+class _FakeLinearAttnNoCPAttr:
+    """Linear attention module without _cp_mesh attribute."""
+
+    pass
+
+
+class _FakeBlockLinearAttn:
+    """Block with layer_type='linear_attention'."""
+
+    def __init__(self, linear_attn=None, moe=None):
+        self.layer_type = "linear_attention"
+        self.layer_idx = 0
+        self.linear_attn = linear_attn
+        self.mlp = moe if moe is not None else object()
+
+
+def test_apply_cp_sets_cp_mesh_on_linear_attention(monkeypatch):
+    """apply_cp should attach cp_mesh to blocks with layer_type='linear_attention'."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class DotProductAttention:
+        pass
+
+    _setup_te_and_dist_stubs(monkeypatch, DotProductAttention)
+
+    linear_attn = _FakeLinearAttn()
+    block = _FakeBlockLinearAttn(linear_attn=linear_attn)
+    model = DummyModel([block])
+
+    cp_mesh = MagicMock()
+
+    P.apply_cp(model, cp_mesh)
+
+    assert linear_attn._cp_mesh is cp_mesh
+
+
+def test_apply_cp_linear_attention_warns_when_no_cp_aware_module(monkeypatch):
+    """apply_cp should warn when linear_attention block has no CP-aware linear_attn."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class DotProductAttention:
+        pass
+
+    _setup_te_and_dist_stubs(monkeypatch, DotProductAttention)
+
+    # Block has linear_attn but without _cp_mesh attribute
+    block = _FakeBlockLinearAttn(linear_attn=_FakeLinearAttnNoCPAttr())
+    block.layer_idx = 3
+    model = DummyModel([block])
+
+    cp_mesh = MagicMock()
+
+
+    with patch.object(P.logger, "warning") as mock_warn:
+        P.apply_cp(model, cp_mesh)
+    mock_warn.assert_called_once()
+    assert "linear_attention" in str(mock_warn.call_args) or "CP-aware" in str(mock_warn.call_args)
+
+
+def test_apply_cp_linear_attention_warns_when_no_linear_attn_attr(monkeypatch):
+    """apply_cp should warn when linear_attention block lacks linear_attn entirely."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class DotProductAttention:
+        pass
+
+    _setup_te_and_dist_stubs(monkeypatch, DotProductAttention)
+
+    # Block without linear_attn attribute at all
+    block = _FakeBlockLinearAttn()
+    block.linear_attn = None
+    delattr(block, "linear_attn")
+    model = DummyModel([block])
+
+    cp_mesh = MagicMock()
+
+    with patch.object(P.logger, "warning") as mock_warn:
+        P.apply_cp(model, cp_mesh)
+    mock_warn.assert_called_once()
+
+
+def test_apply_cp_mixed_full_and_linear_attention(monkeypatch):
+    """apply_cp should handle models with both full_attention and linear_attention blocks."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class DotProductAttention:
+        def __init__(self):
+            self.set_context_parallel_group = MagicMock()
+
+    _setup_te_and_dist_stubs(monkeypatch, DotProductAttention)
+
+    # full_attention block
+    te_attn = DotProductAttention()
+    block_full = _FakeBlockWithAttn(te_attn)
+
+    # linear_attention block
+    linear_attn = _FakeLinearAttn()
+    block_linear = _FakeBlockLinearAttn(linear_attn=linear_attn)
+
+    model = DummyModel([block_full, block_linear])
+
+    cp_mesh = MagicMock()
+    cp_mesh.get_group.return_value = MagicMock()
+
+    P.apply_cp(model, cp_mesh)
+
+    # full_attention block: TE attention configured
+    te_attn.set_context_parallel_group.assert_called_once()
+    # linear_attention block: cp_mesh attached
+    assert linear_attn._cp_mesh is cp_mesh
