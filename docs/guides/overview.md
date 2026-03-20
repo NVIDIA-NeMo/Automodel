@@ -67,7 +67,9 @@ Simple generation script and configurations for VLMs.
 
 ## Diffusion Models (Text-to-Image & Text-to-Video)
 
-This section provides practical recipes and configurations for training and generating with diffusion models using flow matching.
+Text-to-image and text-to-video diffusion models can generate visual content from natural language descriptions. Fine-tuning lets you adapt these models to a specific style, domain, or dataset — for example, generating product videos in your brand's aesthetic. Pretraining gives you full control when no existing model fits your needs.
+ 
+This section walks through the full workflow in NeMo AutoModel: preparing your dataset, training the model, and generating outputs.
 
 ### Fine-Tuning
 
