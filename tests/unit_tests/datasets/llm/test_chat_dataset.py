@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import json
+from pathlib import Path
 
 import pytest
 

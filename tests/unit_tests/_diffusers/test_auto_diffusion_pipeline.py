@@ -20,6 +20,7 @@ import torch
 
 # Check if diffusers can be imported properly (may fail due to peft/transformers incompatibility)
 try:
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _choose_device
     DIFFUSERS_AVAILABLE = True
 except Exception:
     DIFFUSERS_AVAILABLE = False

@@ -437,7 +437,6 @@ def _make_hf_expert_model():
 def _write_adapter_dir(tmp_path, hf_lora_sd, lora_r, lora_alpha, target_modules):
     """Persist adapter_model.safetensors + adapter_config.json to *tmp_path*."""
     import json
-
     from safetensors.torch import save_file
 
     save_file(hf_lora_sd, str(tmp_path / "adapter_model.safetensors"))

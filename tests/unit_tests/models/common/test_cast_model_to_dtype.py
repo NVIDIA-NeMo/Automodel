@@ -14,6 +14,7 @@
 
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -24,6 +25,7 @@ from nemo_automodel.components.models.common.utils import (
     _restore_fp32_modules,
     cast_model_to_dtype,
 )
+
 
 # ---------------------------------------------------------------------------
 # Helpers

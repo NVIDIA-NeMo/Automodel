@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib.util
 import sys
 import types
-from unittest.mock import Mock, patch
+import importlib.util
 
 import pytest
 import torch
+from unittest.mock import Mock, patch
 
 try:
     import fast_hadamard_transform  # noqa: F401
@@ -29,10 +29,11 @@ except ImportError:
         mock_hadamard.hadamard_transform = lambda x, scale: x
         sys.modules["fast_hadamard_transform"] = mock_hadamard
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.glm4_moe.state_dict_adapter import Glm4MoeStateDictAdapter
 from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
+from nemo_automodel.components.models.glm4_moe.state_dict_adapter import Glm4MoeStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.models.common import BackendConfig
+
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 

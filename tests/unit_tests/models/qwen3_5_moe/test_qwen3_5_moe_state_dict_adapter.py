@@ -17,9 +17,9 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import Qwen3_5MoeStateDictAdapter
 from nemo_automodel.components.moe.layers import MoEConfig
+from nemo_automodel.components.models.common import BackendConfig
 
 
 @pytest.fixture

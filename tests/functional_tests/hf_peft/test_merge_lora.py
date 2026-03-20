@@ -110,7 +110,7 @@ def _make_tiny_dense_model(tmp_path):
 
 def _train_dense_lora_adapter(base_model_path, adapter_path):
     """Apply HF PEFT LoRA to a tiny dense model and save the adapter."""
-    from peft import LoraConfig, get_peft_model
+    from peft import LoraConfig, PeftModel, get_peft_model
     from transformers import AutoModelForCausalLM
 
     model = AutoModelForCausalLM.from_pretrained(base_model_path)
@@ -184,9 +184,8 @@ class TestDenseLoRAMerge:
 
     def test_merged_weights_differ_from_base(self):
         """Merged model weights must differ from the base model."""
-        from transformers import AutoModelForCausalLM
-
         from tools.merge_lora import merge_lora
+        from transformers import AutoModelForCausalLM
 
         base_sd = {
             n: p.data.clone()
@@ -215,9 +214,8 @@ class TestDenseLoRAMerge:
 
     def test_no_lora_params_remain(self):
         """After merge, no LoRA parameters or modules should be present."""
-        from transformers import AutoModelForCausalLM
-
         from tools.merge_lora import merge_lora
+        from transformers import AutoModelForCausalLM
 
         output_dir = os.path.join(self.tmp_path, "merged_clean")
         merge_lora(
@@ -238,9 +236,8 @@ class TestDenseLoRAMerge:
     def test_merged_logits_kl_div_vs_unmerged(self):
         """KL-div between merged model and adapter-applied model must be ~0."""
         from peft import PeftModel
-        from transformers import AutoModelForCausalLM
-
         from tools.merge_lora import merge_lora
+        from transformers import AutoModelForCausalLM
 
         output_dir = os.path.join(self.tmp_path, "merged_kl")
         merge_lora(

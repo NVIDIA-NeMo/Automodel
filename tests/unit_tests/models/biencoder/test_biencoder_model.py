@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 
 import nemo_automodel._transformers.auto_model as am
 from nemo_automodel._transformers.biencoder import BiencoderModel

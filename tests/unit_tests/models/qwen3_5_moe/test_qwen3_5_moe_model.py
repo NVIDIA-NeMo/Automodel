@@ -31,7 +31,6 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeModelOutputWithPast,
 )
 
-from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.model import (
     Fp32SafeQwen3_5MoeTextRotaryEmbedding,
     Fp32SafeQwen3_5MoeVisionRotaryEmbedding,
@@ -42,6 +41,7 @@ from nemo_automodel.components.models.qwen3_5_moe.model import (
     Qwen3_5MoeTextModelBackend,
 )
 from nemo_automodel.components.moe.layers import MoEConfig
+from nemo_automodel.components.models.common import BackendConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 

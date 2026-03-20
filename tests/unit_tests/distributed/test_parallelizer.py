@@ -28,8 +28,6 @@ from torch.distributed.tensor.parallel import (
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
-from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
-
 # Import the function under test
 from nemo_automodel.components.distributed.parallelizer import (
     _attention_is_head_sharded,
@@ -40,6 +38,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     import_class_from_path,
     megatron_fsdp_strategy_parallelize,
 )
+from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
 
 
 class MockModel(nn.Module):

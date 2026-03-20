@@ -16,7 +16,10 @@
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from nemo_automodel._transformers.auto_model import _maybe_dequantize_fp8_for_peft
+
 
 # ---------------------------------------------------------------------------
 # Tests: FP8 + PEFT auto-dequantize
@@ -117,8 +120,9 @@ class TestMetaDeviceWithNativeQuantConfig:
     @staticmethod
     def _compute_is_meta_device(model_wrapper, world_size, is_hf_model, quantization_config, hf_native_quant_cfg):
         """Replicate the is_meta_device logic from _build_model."""
-        from nemo_automodel.components.distributed.ddp import DDPManager
+        from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
         from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
+        from nemo_automodel.components.distributed.ddp import DDPManager
 
         return all(
             [
