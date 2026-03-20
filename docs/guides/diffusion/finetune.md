@@ -25,6 +25,7 @@ Under the hood, NeMo AutoModel uses [flow matching](https://arxiv.org/abs/2210.0
 | **2. Prepare Data** | [Prepare Your Dataset](#prepare-your-dataset) | Encode raw images/videos into `.meta` latent files |
 | **3. Configure** | [Configure Your Training Recipe](#configure-your-training-recipe) | Write a YAML config specifying model, data, and training settings |
 | **4. Train** | [Fine-Tune the Model](#fine-tune-the-model) | Launch training with `torchrun` on a single node |
+| **4b. Multi-Node** | [Multi-Node Training](#multi-node-training) | Scale training across multiple nodes |
 | **5. Generate** | [Generation / Inference](#generation--inference) | Run inference using the fine-tuned checkpoint |
 
 For model-specific configuration (FLUX.1-dev, HunyuanVideo), see [Model-Specific Notes](#model-specific-notes).
@@ -144,7 +145,7 @@ data:
   dataloader:
     _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
     cache_dir: PATH_TO_YOUR_DATA
-    model_type: wan
+    model_type: wan # "wan" for Wan 2.1, "hunyuan" for HunyuanVideo
     base_resolution: [512, 512]
     dynamic_batch_size: false
     shuffle: true
@@ -224,8 +225,57 @@ torchrun --nproc-per-node=8 \
 
 Adjust `--nproc-per-node` to match the number of GPUs on your node, and ensure `fsdp.dp_size` in the YAML matches.
 
+(multi-node-training)=
+## Multi-Node Training
+
+When a single node doesn't provide enough GPUs or memory for your workload, you can scale training across multiple nodes. NeMo AutoModel handles multi-node distributed training through `torchrun` rendezvous and FSDP2 — the same recipe script works on one node or many.
+
+### YAML Configuration Changes
+
+The main change is in the `fsdp` section. Set `dp_size` to the **total number of GPUs across all nodes**, and optionally increase `dp_replicate_size` for gradient replication across nodes.
+
+For example, to train on 2 nodes with 8 GPUs each (16 GPUs total):
+
+```yaml
+fsdp:
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  dp_replicate_size: 2   # Replicate across 2 nodes for robustness
+  dp_size: 16             # Total GPUs: 2 nodes × 8 GPUs
+```
+
+A complete multi-node config is provided at [wan2_1_t2v_flow_multinode.yaml](../../../examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml).
+
+### Launch with torchrun
+
+Run the following command on **each node**, setting `NODE_RANK` to `0` on the first node, `1` on the second, and so on:
+
+```bash
+export MASTER_ADDR=node0.hostname   # hostname or IP of the first node
+export MASTER_PORT=29500
+export NODE_RANK=0                  # 0 on master, 1 on second node, etc.
+
+torchrun \
+  --nnodes=2 \
+  --nproc-per-node=8 \
+  --node_rank=${NODE_RANK} \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml
+```
+
 (model-specific-notes)=
 ## Model-Specific Notes
+
+Use the table below to pick the right model for your use case:
+
+| Use Case | Model | Why Choose It |
+|----------|-------|---------------|
+| **Video generation on limited hardware** | [Wan 2.1 T2V 1.3B](#wan-21-t2v-13b) | Smallest model (1.3B params) — fast iteration, fits on a single A100 40GB |
+| **High-quality image generation** | [FLUX.1-dev](#flux1-dev-text-to-image) | State-of-the-art text-to-image with 12B params and guidance-based control |
+| **High-quality video generation** | [HunyuanVideo 1.5](#hunyuanvideo-15) | Larger video model with condition-latent support for richer motion and detail |
 
 ### Wan 2.1 T2V 1.3B
 
@@ -288,6 +338,18 @@ python examples/diffusion/generate/generate.py \
   -c examples/diffusion/generate/configs/generate_wan.yaml
 ```
 
+**Multi-GPU (Wan 2.1 1.3B):**
+
+Wan 2.1 supports tensor parallelism for inference, which shards the transformer across GPUs to reduce per-GPU memory. Pass the `distributed` config via CLI overrides:
+
+```bash
+torchrun --nproc-per-node=8 \
+  examples/diffusion/generate/generate.py \
+  -c examples/diffusion/generate/configs/generate_wan.yaml \
+  --distributed.backend nccl \
+  --distributed.parallel_scheme.transformer.tp_size 8
+```
+
 **With a fine-tuned checkpoint:**
 ```bash
 python examples/diffusion/generate/generate.py \
@@ -312,9 +374,9 @@ python examples/diffusion/generate/generate.py \
 
 | Config | Model | Output | GPUs |
 |--------|-------|--------|------|
-| `generate_wan.yaml` | Wan 2.1 1.3B | Video | 1 |
-| `generate_flux.yaml` | FLUX.1-dev | Image | 1 |
-| `generate_hunyuan.yaml` | HunyuanVideo | Video | 1 |
+| [`generate_wan.yaml`](../../../examples/diffusion/generate/configs/generate_wan.yaml) | Wan 2.1 1.3B | Video | 1 |
+| [`generate_flux.yaml`](../../../examples/diffusion/generate/configs/generate_flux.yaml) | FLUX.1-dev | Image | 1 |
+| [`generate_hunyuan.yaml`](../../../examples/diffusion/generate/configs/generate_hunyuan.yaml) | HunyuanVideo | Video | 1 |
 
 :::{note}
 You can use `--model.checkpoint ./checkpoints/LATEST` to automatically load the most recent checkpoint.
