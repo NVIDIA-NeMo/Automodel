@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# QLora configuration for Llama-3.1-8B on SQuAD dataset
+# QLoRA configuration for Llama-3.3-70B-Instruct on SQuAD dataset (DGX Spark)
 # Uses 4-bit quantization with LoRA adapters
-# 
+#
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=1 examples/llm_finetune/finetune.py --config examples/llm_finetune/llama3_1/llama3_1_8b_squad_qlora.yaml
+# torchrun --nproc-per-node=1 examples/llm_finetune/finetune.py --config examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_peft_qlora_spark.yaml
 
 step_scheduler:
   global_batch_size: 32
@@ -36,7 +36,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Meta-Llama-3-70B
+  pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
   torch_dtype: bfloat16
 
 peft:
@@ -99,5 +99,5 @@ optimizer:
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
-#   name: llama3_1_8b_squad_qlora
+#   name: llama3_3_70b_instruct_squad_qlora_spark
 #   save_dir: <your_wandb_save_dir> 
