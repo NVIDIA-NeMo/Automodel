@@ -524,18 +524,121 @@ Applies context parallelism to attention layers. The `cp_comm_type` parameter (d
 
 ---
 
-## Load Balance Metrics
+## Load Balance Metrics & Visualization
 
-Enable MoE load balance monitoring for debugging expert utilization:
+Monitoring expert load balance is critical for MoE training — unbalanced routing leads to wasted capacity (underloaded experts), bottlenecks (overloaded experts), and in extreme cases "dead experts" that receive zero tokens. Automodel provides built-in load balance tracking, metrics computation, and W&B integration.
+
+> **See also:** [GitHub Discussion #1266](https://github.com/NVIDIA-NeMo/Automodel/discussions/1266) for community examples and visualizations.
+
+### Configuration
+
+Enable load balance metrics via the `moe_metrics` section in your training config:
 
 ```yaml
-# In your training config
 moe_metrics:
-  enabled: true
-  mode: brief              # "brief" = scalar metrics, "detailed" = per-layer breakdown
-  detailed_every_steps: 100  # log detailed metrics every N steps
-  top_k_experts: 5          # log top/bottom N experts per layer
+  enabled: true               # enable load balance tracking
+  mode: brief                 # "brief" = aggregated scalars, "detailed" = per-layer breakdowns
+  detailed_every_steps: 100   # log detailed metrics every N steps (only when mode="detailed")
+  top_k_experts: 5            # emit top/bottom N experts by utilization (0 = disable per-expert logging)
 ```
+
+**`MoEMetricsConfig` fields** (from `nemo_automodel/components/moe/config.py`):
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | `bool` | `false` | Enable load balance metric tracking. Adds negligible overhead (one `.detach()` copy per Gate per forward pass). |
+| `mode` | `str` | `"brief"` | `"brief"` emits aggregated scalars only; `"detailed"` adds per-layer breakdowns. |
+| `detailed_every_steps` | `int \| None` | `None` | When `mode="detailed"`, emit detailed metrics every N steps. Falls back to brief metrics on other steps. `None` = every step. |
+| `top_k_experts` | `int` | `0` | Number of top (highest) and bottom (lowest) utilization experts to log. Keeps W&B key count bounded to `2 * top_k` regardless of model size. `0` = disable per-expert logging. |
+
+### Available Metrics
+
+#### Brief Mode
+
+Brief mode produces aggregated scalar metrics suitable for monitoring training runs at a glance:
+
+| Metric Key | Description |
+|---|---|
+| `moe/cv_mean`, `moe/cv_median`, `moe/cv_min`, `moe/cv_max` | Coefficient of variation (std/mean) of expert loads, aggregated across all MoE layers. Lower is better — 0.0 means perfectly balanced. |
+| `moe/aux_loss_mean` | Auxiliary load balancing loss averaged across layers (only when `aux_loss_coeff > 0`). |
+| `moe/expert_utilization_p25`, `_median`, `_p75`, `_min`, `_max` | Utilization ratio percentiles across all experts globally. 1.0 = ideal load; >1 = overloaded; <1 = underloaded; 0 = dead. |
+| `moe/dead_expert_frac_mean` | Fraction of experts receiving zero tokens, averaged across layers. |
+| `moe/expert_diversity_mean`, `moe/expert_diversity_min` | Shannon entropy-based diversity: `exp(H) / N` where H is entropy of routing distribution. 1.0 = all experts equally used; low values = collapsed routing. |
+| `moe_expert_utilization/layer_{i}_expert_{j}` | Individual utilization ratios for the top-K highest and bottom-K lowest experts globally. |
+
+#### Detailed Mode (adds per-layer breakdowns)
+
+When `mode: "detailed"`, all brief metrics are emitted plus per-layer keys:
+
+| Metric Key | Description |
+|---|---|
+| `moe/layer_{i}/cv` | Coefficient of variation for layer i. |
+| `moe/layer_{i}/aux_loss` | Auxiliary loss for layer i. |
+| `moe/layer_{i}/utilization_mean` | Mean utilization ratio for layer i. |
+| `moe/layer_{i}/dead_expert_frac` | Dead expert fraction for layer i. |
+| `moe/layer_{i}/expert_diversity` | Expert diversity score for layer i. |
+
+### Auxiliary Loss Configuration
+
+The auxiliary loss is the primary training-time mechanism for encouraging balanced routing. It is configured via `MoEConfig.aux_loss_coeff` (set in the model's HuggingFace config):
+
+```
+aux_loss = aux_loss_coeff * sum(f_i * P_i)
+```
+
+Where:
+- `f_i = expert_load[i] * n_experts / (top_k * context_length)` — normalized load fraction
+- `P_i = expert_scores[i] / context_length` — average routing probability per expert
+
+| `aux_loss_coeff` | Effect |
+|---|---|
+| `0.0` | No auxiliary loss — rely on expert bias correction or other mechanisms. |
+| `0.001` | Typical for DeepSeek-V3/V3.2-style models. Gentle load balancing. |
+| `0.01` | Stronger load balancing for models with severe imbalance. |
+
+The loss is automatically scaled during backpropagation via `MoEAuxLossAutoScaler` to maintain stable gradients relative to the main loss.
+
+### Visualization with Weights & Biases
+
+Metrics are logged directly to W&B via the training recipe. The integration works as follows:
+
+1. **Collection phase** (`_collect_moe_load_balance`): After each training step, expert loads are all-reduced across the DP group so metrics reflect global routing, not a single rank's view.
+2. **Logging phase** (`_log_moe_metrics`): On the logging rank, metrics are computed and passed to `wandb.log()`.
+
+**Recommended W&B panel setup:**
+
+| Panel | Metric Keys | Purpose |
+|---|---|---|
+| Load Balance Overview | `moe/cv_mean`, `moe/cv_median` | Track overall routing balance over training |
+| Expert Health | `moe/dead_expert_frac_mean`, `moe/expert_diversity_mean` | Detect expert collapse early |
+| Aux Loss | `moe/aux_loss_mean` | Monitor load balancing loss convergence |
+| Utilization Distribution | `moe/expert_utilization_p25`, `_median`, `_p75` | Understand the spread of expert utilization |
+| Hot/Cold Experts | `moe_expert_utilization/*` | Identify specific overloaded/underloaded experts |
+
+### Interpretation Guidelines
+
+| Metric | Healthy Range | Warning Signs |
+|---|---|---|
+| `cv_mean` | < 0.3 | > 0.5 indicates significant imbalance; > 1.0 indicates severe skew |
+| `dead_expert_frac_mean` | 0.0 | > 0.05 (5%) means some experts are wasted; investigate routing |
+| `expert_diversity_mean` | > 0.7 | < 0.5 indicates routing collapse — many experts are underutilized |
+| `expert_utilization_max` | < 2.0 | > 3.0 indicates extreme hotspotting on certain experts |
+| `expert_utilization_min` | > 0.3 | < 0.1 (or 0.0) indicates near-dead experts |
+| `aux_loss_mean` | Decreasing over training | Flat or increasing suggests `aux_loss_coeff` is too low or routing is stuck |
+
+### Common Tuning Tips
+
+1. **Start with brief mode**: Use `mode: "brief"` during initial training runs. Switch to `"detailed"` only when debugging specific layer-level issues.
+
+2. **Set `top_k_experts` thoughtfully**: For models with many experts (128–256), set `top_k_experts: 5–10` to keep W&B dashboards manageable. The top/bottom experts are the ones that matter for diagnosis.
+
+3. **Use `detailed_every_steps` to reduce logging overhead**: For long training runs with detailed mode, `detailed_every_steps: 100` logs per-layer metrics every 100 steps while emitting brief metrics on intervening steps.
+
+4. **Tune `aux_loss_coeff` based on `cv_mean`**: If `cv_mean` remains high (> 0.5) after initial training, increase `aux_loss_coeff`. If training loss is unstable, decrease it. The auxiliary loss should be roughly 1–2 orders of magnitude smaller than the main loss.
+
+5. **Watch for dead experts early**: Check `dead_expert_frac_mean` in the first few hundred steps. Dead experts that appear early rarely recover. Consider increasing `aux_loss_coeff` or using expert bias correction (`gate_bias_update_factor > 0`).
+
+6. **Expert bias correction as an alternative**: For models that use sigmoid routing (DeepSeek-V3, Nemotron-V3), expert bias correction via `gate_bias_update_factor` can be more effective than auxiliary loss alone. The two mechanisms can be used together.
 
 ---
 
