@@ -44,7 +44,7 @@ assert model.model.moe_config.n_routed_experts % moe_mesh[ep_axis_name].size() =
 |---|---|---|
 | **FSDP2** | Fully supported | Expert parameters are sharded on dim=1 (token dimension) via EP shard mesh. Non-expert parameters use standard FSDP. |
 | **PP** (pipeline) | Supported | Large models use PP+EP together. Example: Qwen3-235B uses `pp_size: 4, ep_size: 32`. |
-| **CP** (context) | Supported with caveats | The MoE layer receives the CP mesh for aggregating auxiliary loss across CP ranks. **Requires `rope_fusion: false`** — see [Common Pitfalls](#7-common-pitfalls). |
+| **CP** (context) | Supported with caveats | The MoE layer receives the CP mesh for aggregating auxiliary loss across CP ranks. **Requires `rope_fusion: false`** — see [Common Pitfalls](#6-common-pitfalls). |
 | **TP** (tensor) | **Not supported** | Automodel asserts `tp_size == 1` for custom MoE models. |
 
 ### EP + FSDP Shard Mesh
@@ -220,31 +220,35 @@ model:
 
 ---
 
-## 5. Token Dropping and Capacity Factor
+## 5. Kernel Backends
 
-Automodel inherits token dropping infrastructure from its Megatron MoE components. The behavior is controlled by the token dispatcher:
+### Complete `BackendConfig` Reference
 
-### Strategies
+All fields in the `BackendConfig` dataclass (defined in `nemo_automodel/components/models/common/utils.py`):
 
-1. **Dropless** (default): No tokens are dropped or padded. All tokens are routed to their assigned experts regardless of load imbalance. This is the standard behavior in Automodel.
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `attn` | `"te"`, `"sdpa"`, `"flex"` | `"te"` (GPU), `"sdpa"` (CPU) | Attention backend. `"te"` uses Transformer Engine, `"sdpa"` uses PyTorch scaled dot-product attention, `"flex"` uses FlexAttention. |
+| `linear` | `"torch"`, `"te"` | `"te"` (GPU), `"torch"` (CPU) | Linear layer backend. `"te"` uses Transformer Engine fused linear. |
+| `rms_norm` | `"torch"`, `"torch_fp32"`, `"te"` | `"torch_fp32"` | RMSNorm backend. See [Normalization](#4-normalization--rms-norm-options). |
+| `rope_fusion` | `bool` | `true` (GPU) | Whether to use fused RoPE (requires TE). Must be `false` when `cp_size > 1`. |
+| `experts` | `"torch"`, `"te"`, `"gmm"`, `"torch_mm"` | `"torch_mm"` (GPU), `"torch"` (CPU) | MoE expert GEMM backend (see below). |
+| `dispatcher` | `"torch"`, `"deepep"` | `"deepep"` (if available), `"torch"` | MoE token dispatcher (see below). |
+| `fake_balanced_gate` | `bool` | `false` | Replace learned Gate with synthetic balanced routing. **Benchmarking only.** |
+| `fake_gate_noise` | `float` | `0.0` | Noise level [0, 1] for `FakeBalancedGate`. Higher values create more realistic imbalance. Approximate max/mean load ratios (64 experts, top-8, 4096 tokens): 0.0→1.00x, 0.1→~1.2x, 0.3→~1.6x, 0.5→~2.0x, 1.0→~2.8x. |
+| `enable_hf_state_dict_adapter` | `bool` | `true` | Enable HuggingFace state dict adapter for checkpoint loading. |
+| `enable_fsdp_optimizations` | `bool` | `false` | Enable FSDP2-specific optimizations. |
+| `te_fp8` | `TEFp8Config \| None` | `None` | FP8 quantization config (see [FP8 Training](#fp8-training)). Requires `linear: te` or `experts: te`. |
+| `gate_precision` | `str \| torch.dtype \| None` | `None` | Optional dtype override for gate computation (e.g., `"float32"` for higher-precision routing). |
+| `enable_deepep` | `bool \| None` | `None` | **Deprecated.** Use `dispatcher: "deepep"` and `experts: "gmm"` instead. |
 
-2. **Capacity-based dropping**: Tokens exceeding expert capacity are dropped based on routing probability. Capacity is computed as:
-   ```
-   capacity = num_tokens_per_rank * top_k * capacity_factor / num_experts
-   ```
-   This is available via the Megatron dispatcher path (`--moe-expert-capacity-factor`).
-
-3. **Pad to capacity**: Experts with fewer tokens than capacity are padded, ensuring uniform computation. Useful for hardware efficiency at the cost of wasted compute.
-
-In practice, most Automodel configs use the **dropless** strategy with load balancing handled via auxiliary loss and/or expert bias correction rather than token dropping.
-
----
-
-## 6. Kernel Backends
+> **Validation rules** enforced by `BackendConfig.__post_init__`:
+> - If `experts` is `"te"` or `"gmm"` but `dispatcher` is not `"deepep"`, the config auto-corrects to `dispatcher: "torch"` and `experts: "torch_mm"` with a warning.
+> - `te_fp8` requires at least one TE backend (`linear: "te"` or `experts: "te"`).
 
 ### Expert GEMM Backends
 
-The `experts` field in `BackendConfig` selects the matrix multiplication implementation for expert computation:
+The `experts` field selects the matrix multiplication implementation for expert computation:
 
 | Value | Implementation | Description |
 |---|---|---|
@@ -314,7 +318,7 @@ model:
 
 ---
 
-## 7. Common Pitfalls
+## 6. Common Pitfalls
 
 ### EP must divide `n_routed_experts`
 
@@ -395,19 +399,128 @@ The `te_fp8` setting requires at least one backend component to use TE (e.g., `l
 
 ## MoE Parallelizer Settings
 
-The `distributed.moe` section maps to `MoEParallelizerConfig` and controls MoE-specific FSDP and activation checkpointing behavior:
+The MoE parallelizer (`nemo_automodel/components/moe/parallelizer.py`) orchestrates how MoE models are distributed across GPUs. It is configured via the `distributed:` section and applies expert parallelism, FSDP, context parallelism, and activation checkpointing.
+
+### Configuration
 
 ```yaml
 distributed:
+  strategy: fsdp2
+  ep_size: 8
+  cp_size: 1
+  pp_size: 1
+  activation_checkpointing: true
   moe:
     reshard_after_forward: false    # reshard expert weights after forward pass
     wrap_outer_model: true          # wrap outer model for FSDP (false for PP)
     ignore_router_for_ac: false     # save router outputs during activation checkpointing
 ```
 
-### `ignore_router_for_ac`
+### `parallelize_model()` — Main Entry Point
 
-When `true`, uses selective activation checkpointing that preserves router outputs (the routing weight matrix multiply). This avoids recomputing expert routing during the backward pass, which can be beneficial when routing is expensive relative to the expert computation.
+The `parallelize_model()` function applies all parallelism strategies to the model in order.
+
+**Full signature:**
+
+```python
+def parallelize_model(
+    model: torch.nn.Module,
+    world_mesh: DeviceMesh,
+    moe_mesh: DeviceMesh | None,
+    *,
+    dp_axis_names: tuple[str, ...],
+    cp_axis_name: str | None = None,
+    tp_axis_name: str | None = None,
+    ep_axis_name: str | None = None,
+    ep_shard_axis_names: tuple[str, ...] | None = None,
+    activation_checkpointing: bool = False,
+    ignore_router_for_ac: bool = False,
+    reshard_after_forward: bool = False,
+    lm_head_precision: str | torch.dtype | None = None,
+    wrap_outer_model: bool = True,
+    mp_policy: MixedPrecisionPolicy | None = None,
+):
+```
+
+**Key user-facing parameters:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `activation_checkpointing` | `bool` | `false` | Enable activation checkpointing for MoE layers. Reduces memory at the cost of recomputation during backward pass. |
+| `ignore_router_for_ac` | `bool` | `false` | When `true`, uses selective checkpointing that preserves router outputs, avoiding recomputation of expert routing during backward. Beneficial when routing is expensive relative to expert computation. |
+| `reshard_after_forward` | `bool` | `false` | Reshard expert parameters after the forward pass to free memory. Useful for very large models where expert params are memory-bound. |
+| `wrap_outer_model` | `bool` | `true` | Wrap the outer model with FSDP. Set to `false` when using pipeline parallelism (`pp_size > 1`) to avoid double wrapping. |
+| `mp_policy` | `MixedPrecisionPolicy` | `None` | Mixed precision policy for FSDP. When `None`, defaults to BF16 params/output with FP32 reduce and `cast_forward_inputs=True`. |
+| `lm_head_precision` | `str \| torch.dtype` | `None` | Optional custom precision for the language model head. When set to `"float32"`, uses FP32 for param, reduce, and output dtypes on the LM head. |
+
+**Mesh axis parameters** (configured internally based on `distributed:` settings):
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `dp_axis_names` | `tuple[str, ...]` | — (required) | Data parallelism axis names in the device mesh. |
+| `cp_axis_name` | `str \| None` | `None` | Context parallelism axis name. Set when `cp_size > 1`. |
+| `tp_axis_name` | `str \| None` | `None` | Tensor parallelism axis name. Currently unsupported for MoE (`tp_size` must be 1). |
+| `ep_axis_name` | `str \| None` | `None` | Expert parallelism axis name. Set when `ep_size > 1`. |
+| `ep_shard_axis_names` | `tuple[str, ...] \| None` | `None` | Axes for additional FSDP sharding of expert parameters when `ep_size < dp_size * cp_size`. |
+
+### `apply_ep()` — Expert Parallelism
+
+Distributes experts across GPUs using `DTensor` with the `ExpertParallel` placement strategy. Shards grouped expert weight tensors on dimension 0 (the expert dimension) and configures the token dispatcher with the MoE mesh.
+
+Expert types are handled differently:
+- **`GroupedExpertsTE`**: Initializes the token dispatcher without DTensor wrapping (TE manages its own distribution).
+- **Other expert types**: Uses `distribute_module` with the `ExpertParallel` style, which also handles `GroupedExpertsDeepEP` by calling `init_token_dispatcher(ep_mesh=device_mesh)`.
+
+**Constraint:** `n_routed_experts` must be divisible by `ep_size`.
+
+### `apply_fsdp()` — FSDP for MoE
+
+Applies Fully Sharded Data Parallel to the model with MoE-aware wrapping:
+
+- **Expert parameters** are sharded on the EP shard mesh (dim=1, token dimension) when `ep_shard_enabled` is true (i.e., `ep_size < dp_size * cp_size`).
+- **Non-expert parameters** use standard FSDP on the main data-parallel mesh.
+
+**Additional parameters:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `offload_policy` | `OffloadPolicy \| None` | `None` | Parameter offload policy for CPU offloading to reduce GPU memory. |
+
+**Default mixed precision policy** (when `mp_policy` is `None`):
+
+```python
+MixedPrecisionPolicy(
+    param_dtype=torch.bfloat16,
+    reduce_dtype=torch.float32,
+    output_dtype=torch.bfloat16,
+    cast_forward_inputs=True,
+)
+```
+
+**Components wrapped by FSDP:**
+- Transformer blocks (with expert parameters excluded if EP is enabled)
+- `embed_tokens` (if present)
+- `lm_head` (with optional custom precision via `lm_head_precision`)
+- `audio_tower` (if present and has trainable parameters — for audio-language models)
+- `visual` (if present and has trainable parameters — for vision-language models)
+
+### `apply_ac()` — Activation Checkpointing
+
+When `ignore_router_for_ac: false` (default), wraps MoE block layers with standard `torch.utils.checkpoint`. When `true`, uses a selective policy that saves router outputs (based on tensor shape matching `[*, hidden_size, num_experts]`), avoiding recomputation of the routing decision.
+
+The `hidden_size` and `num_experts` values for selective checkpointing are auto-derived from the model config:
+- `hidden_size`: tries `model.config.text_config.hidden_size` (VLM models) then `model.config.hidden_size`
+- `num_experts`: tries `model.model.moe_config.n_routed_experts`, then config attributes `num_experts`, `moe_num_experts`, `n_routed_experts` in order
+
+### `apply_cp()` — Context Parallelism
+
+Applies context parallelism to attention layers. The `cp_comm_type` parameter (default `"p2p"`) controls the communication pattern used by TE attention modules for CP.
+
+**Layer handling:**
+- **Full attention layers**: Sets context parallel group on TE's `DotProductAttention`
+- **Linear attention layers**: Stores `cp_mesh` on the module for custom CP logic
+- **MoE modules**: Sets `moe_module.cp_mesh` for aggregating auxiliary loss across CP ranks
+- Sets `model._cp_enabled = True` to enable attention mask nulling in the forward pass
 
 ---
 
