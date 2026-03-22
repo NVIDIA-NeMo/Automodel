@@ -520,8 +520,8 @@ def apply_model_infrastructure(
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
         # Ensure model is on the correct device.
-        # Skip if checkpoint was loaded (params are already on device) to avoid triggering
-        # FSDP's reset_sharded_param which fails on tied parameters after parallelization.
+        # Skip when post-shard init was performed (params are already on the target device)
+        # to avoid triggering FSDP's reset_sharded_param which fails on tied parameters.
         if not need_post_shard_init:
             try:
                 model.to(device, non_blocking=True)
