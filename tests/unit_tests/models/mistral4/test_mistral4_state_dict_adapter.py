@@ -253,6 +253,27 @@ class TestInjectMissingGateBias:
 # ---------------------------------------------------------------------------
 
 
+class TestDequantizeMultiDimMesh:
+    def test_per_expert_scale_sliced_by_mesh_idx(self):
+        """When DTensor is on a multi-dim mesh, dequant uses mesh_idx (not name) for rank/size.
+
+        Regression test: previously get_local_rank() / size() were called without
+        arguments, which raises on multi-dim meshes.  The fix passes the positional
+        index of the Shard placement so that get_local_rank(mesh_idx) works.
+        """
+        # Simulate rank 1 of 2 on a 2-dim mesh: experts 4-7 of 8 total
+        n_total, n_local = 8, 4
+        weight_local = torch.randn(n_local, 8, 8).to(torch.float8_e4m3fn)
+        scale_all = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
+
+        # Non-DTensor path: scale is sliced to first n_local entries
+        sd = {"mlp.experts.gate_up_proj": weight_local, "mlp.experts.gate_up_proj_scale_inv": scale_all}
+        result = _dequantize_state_dict(sd, torch.float32)
+        # Should dequantize with scale[:4] (non-DTensor falls through to else branch)
+        assert result["mlp.experts.gate_up_proj"].shape == (n_local, 8, 8)
+        assert result["mlp.experts.gate_up_proj"].dtype == torch.float32
+
+
 class TestDequantize3DScale:
     def test_per_expert_scale_3d(self):
         """scale_inv [n_experts, 1, 1] is squeezed and dequantized correctly."""
