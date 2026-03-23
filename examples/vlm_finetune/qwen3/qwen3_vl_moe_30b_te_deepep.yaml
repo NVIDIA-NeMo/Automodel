@@ -113,3 +113,6 @@ freeze_config:
 #   save_dir: <your_wandb_save_dir>
 
 
+
+ci:
+  time: "00:30:00"

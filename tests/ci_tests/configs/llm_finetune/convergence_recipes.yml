@@ -1,0 +1,8 @@
+configs:
+  - deepseek_v32/deepseek_v32_hellaswag_pp.yaml
+  - gemma/functiongemma_xlam.yaml
+  - glm/glm_4.7_te_deepep.yaml
+  - minimax_m2/minimax_m2.1_hellaswag_pp.yaml
+  - nemotron/nemotron_nano_v3_hellaswag.yaml
+  - nemotron/nemotron_nano_v3_hellaswag_peft.yaml
+  - stepfun/step_3.5_flash_hellaswag_pp.yaml

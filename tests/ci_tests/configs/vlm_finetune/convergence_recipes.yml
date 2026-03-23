@@ -1,0 +1,3 @@
+configs:
+  - kimi/kimi25vl_medpix.yaml
+  - qwen3/qwen3_vl_moe_235b.yaml

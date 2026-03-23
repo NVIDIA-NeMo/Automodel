@@ -1,0 +1,48 @@
+exempt_models:
+  baichuan:
+    reason: "OOTB support deprecated in v5"
+  cohere:
+    reason: "Missing hf cache"
+  llama3_3:
+    reason: "Missing hf cache"
+
+exempt_configs:
+  deepseek_v32_hellaswag_pp:
+    reason: "Requires custom model cache, PIC: @hemild"
+  functiongemma_xlam:
+    reason: "Missing Salesforce/xlam-function-calling-60k dataset"
+  gpt_oss_20b_single_gpu_peft:
+    reason: "Skip single gpu test"
+  llama3_2_1b_hellaswag_megatron_fsdp:
+    reason: "Known issue megatron fsdp support,PIC: @akoumparouli, 3680"
+  llama3_2_1b_squad_megatron_fsdp:
+    reason: "Known issue megatron fsdp support,PIC: @akoumparouli, 3680"
+  mixtral-8x7b-v0-1_squad:
+    reason: "Known issue,PIC: @adasif, 3715"
+  mixtral-8x7b-v0-1_squad_peft:
+    reason: "Known issue,PIC: @adasif. 3715"
+  nemotron_flash_1b_squad:
+    reason: "OOTB support deprecated in v5"
+  nemotron_flash_1b_squad_peft:
+    reason: "OOTB support deprecated in v5"
+  nemotron_nano_9b_squad_peft:
+    reason: "Requires 4GPU, PIC: @adasif"
+  nemotron_nano_v3_hellaswag_peft:
+    reason: "Requires 4GPU, PIC: @adasif"
+  qwen2_5_7b_instruct_chat:
+    reason: "Missing chat dataset"
+  qwen3_8b_hellaswag_pp_peft:
+    reason: "Missing hf cache"
+
+known_issue:
+  glm_4.5_air_te_deepep:
+    reason: "Cluster specific failures"
+  glm_4.7_te_deepep:
+    reason: "Cluster specific failures"
+  gpt_oss_120b:
+    reason: "Cluster specific failures"
+  qwen3_moe_2layer_proxy_torch_sdpa:
+    reason: "Cluster specific failures"
+  step_3.5_flash_hellaswag_pp:
+    reason: "Cluster specific failures"
+
