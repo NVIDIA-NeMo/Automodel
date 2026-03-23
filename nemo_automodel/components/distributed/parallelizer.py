@@ -791,12 +791,6 @@ def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None
     config = getattr(model, "config", None)
     if config is None or not hasattr(config, "num_attention_heads"):
         return
-    model_arch = None
-    if hasattr(config, "architectures") and config.architectures:
-        try:
-            model_arch = config.architectures[0]
-        except Exception:
-            model_arch = None
     inner = getattr(model, "model", model)
     layers = getattr(inner, "layers", None)
     if layers is None and hasattr(model, "language_model"):
