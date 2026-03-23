@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#!/bin/bash
+# Copyright (c) 2025, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.shared.transformers_patches import patch_t5_layer_norm
-from nemo_automodel.shared.utils import dtype_from_str
+set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
-__all__ = ["dtype_from_str", "patch_t5_layer_norm"]
+export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
+export CUDA_VISIBLE_DEVICES="0,1"
+
+# Run Qwen3.5 MoE linear attention CP test with 2 GPUs
+TRANSFORMERS_OFFLINE=1 \
+  python \
+  -m torch.distributed.run --nproc_per_node=2 --nnodes=1 \
+  -m coverage run \
+  -m pytest \
+  tests/functional_tests/context_parallel/run_qwen3_5_moe_linear_attn_cp.py

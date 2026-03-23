@@ -65,11 +65,41 @@ Simple generation script and configurations for VLMs.
 
 - Folder: [examples/vlm_generate](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/vlm_generate)
 
-## Diffusion Generation
+## Diffusion Models (Text-to-Image & Text-to-Video)
 
-WAN 2.2 example for diffusion-based image generation.
+Text-to-image and text-to-video diffusion models can generate visual content from natural language descriptions. Fine-tuning lets you adapt these models to a specific style, domain, or dataset — for example, generating product videos in your brand's aesthetic. Pretraining gives you full control when no existing model fits your needs.
+ 
+This section walks through the full workflow in NeMo AutoModel: preparing your dataset, training the model, and generating outputs.
 
-- Folder: [examples/diffusion/wan2.2](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/diffusion/wan2.2)
+### Fine-Tuning
+
+Fine-tuning recipes for adapting pretrained diffusion models to your data.
+
+- Folder: [examples/diffusion/finetune](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/diffusion/finetune)
+- Representative models: FLUX.1-dev (T2I, 12B), Wan 2.1 T2V 1.3B, HunyuanVideo 1.5
+- How-to guide: [Diffusion fine-tuning](diffusion/finetune.md)
+
+### Pretraining
+
+Pretraining recipes for training diffusion models from scratch on large-scale datasets.
+
+- Folder: [examples/diffusion/pretrain](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/diffusion/pretrain)
+- Representative models: Wan 2.1 T2V 1.3B, FLUX.1-dev
+- How-to guide: [Diffusion fine-tuning (pretraining section)](diffusion/finetune.md#configure-your-training-recipe)
+
+### Generation
+
+Generation scripts and configs for running inference with pretrained or fine-tuned diffusion models.
+
+- Folder: [examples/diffusion/generate](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/diffusion/generate)
+- Representative models: Wan 2.1 1.3B, FLUX.1-dev, HunyuanVideo
+- How-to guide: [Diffusion generation](diffusion/finetune.md#generation--inference)
+
+### Dataset Preparation
+
+Preprocessing pipeline to create `.meta` files containing VAE latents and text embeddings.
+
+- How-to guide: [Diffusion dataset preparation](diffusion/dataset.md)
 
 ---
 

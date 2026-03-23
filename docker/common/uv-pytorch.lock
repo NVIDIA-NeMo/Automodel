@@ -1476,19 +1476,6 @@ wheels = [
 ]
 
 [[package]]
-name = "fla-core"
-version = "0.4.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "einops" },
-    { name = "torch", marker = "sys_platform == 'never'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/db/3d/79a9d5c8cd973c86f35403931031787dfc6cc97d838a42d4c62e8cbbb66f/fla_core-0.4.0.tar.gz", hash = "sha256:d975022b074e97bfd086dc6b767dccb35e27a9fe36f26f3b26b1c2b68b36a1c8", size = 316316, upload-time = "2025-10-27T08:18:51.673Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/d5/0c/d52ab65e9c163631895052d70d4111f8530ca52f45beb0895378d1a2a8b5/fla_core-0.4.0-py3-none-any.whl", hash = "sha256:5396f36a9838c99f9e45c70e88e2e0b26688f719d07d2ddd61be16d29327f4ea", size = 438519, upload-time = "2025-10-27T08:18:49.561Z" },
-]
-
-[[package]]
 name = "flash-attn"
 version = "2.8.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1500,15 +1487,12 @@ sdist = { url = "https://files.pythonhosted.org/packages/3b/b2/8d76c41ad7974ee26
 
 [[package]]
 name = "flash-linear-attention"
-version = "0.4.0"
-source = { registry = "https://pypi.org/simple" }
+version = "0.4.2"
+source = { git = "https://github.com/fla-org/flash-linear-attention.git?rev=7cbe461b10bde60180c32c5f9381a04d41887514#7cbe461b10bde60180c32c5f9381a04d41887514" }
 dependencies = [
-    { name = "fla-core" },
+    { name = "einops" },
+    { name = "torch", marker = "sys_platform == 'never'" },
     { name = "transformers" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/44/9a/e546815da2bf149e0af58449ff1ca10074165af4384febead438ad46f74c/flash_linear_attention-0.4.0.tar.gz", hash = "sha256:c5d2bf6e1a766af3a4426f07f710b0b87809f7218de21eb313314be6ff1b0dba", size = 157646, upload-time = "2025-10-27T08:18:52.445Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/3c/76/4f716c953608204c970de7cd4045db1af02643d7f19c94a49254834b7563/flash_linear_attention-0.4.0-py3-none-any.whl", hash = "sha256:50c97163f7cb64dc53585194ef36af44d2a6bc545227c4f73bb3ba9062630f1a", size = 290439, upload-time = "2025-10-27T08:18:50.589Z" },
 ]
 
 [[package]]
@@ -3262,7 +3246,6 @@ all = [
     { name = "databricks-sql-connector" },
     { name = "deltalake" },
     { name = "diffusers" },
-    { name = "flash-linear-attention" },
     { name = "ftfy" },
     { name = "imageio" },
     { name = "imageio-ffmpeg" },
@@ -3314,7 +3297,6 @@ diffusion = [
     { name = "torchvision", marker = "sys_platform == 'never'" },
 ]
 extra = [
-    { name = "flash-linear-attention" },
     { name = "perceptron" },
     { name = "sentencepiece" },
 ]
@@ -3355,6 +3337,7 @@ build = [
 dev = [
     { name = "cut-cross-entropy" },
     { name = "dion", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "flash-linear-attention" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
 ]
 docs = [
@@ -3394,7 +3377,6 @@ requires-dist = [
     { name = "deltalake", marker = "extra == 'delta-databricks'", specifier = ">=1.0.0" },
     { name = "diffusers", marker = "extra == 'diffusion'", specifier = ">=0.36.0" },
     { name = "flash-attn", marker = "extra == 'fa'", specifier = "<=2.8.3" },
-    { name = "flash-linear-attention", marker = "extra == 'extra'" },
     { name = "flashoptim", specifier = ">=0.1.3" },
     { name = "ftfy", marker = "extra == 'diffusion'" },
     { name = "imageio", marker = "extra == 'diffusion'" },
@@ -3454,6 +3436,7 @@ build = [
 dev = [
     { name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" },
     { name = "dion", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", git = "https://github.com/microsoft/dion.git" },
+    { name = "flash-linear-attention", git = "https://github.com/fla-org/flash-linear-attention.git?rev=7cbe461b10bde60180c32c5f9381a04d41887514" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", git = "https://github.com/linkedin/Liger-Kernel.git?rev=1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" },
 ]
 docs = [
