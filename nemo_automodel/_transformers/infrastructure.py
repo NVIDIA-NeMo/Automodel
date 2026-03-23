@@ -520,9 +520,11 @@ def apply_model_infrastructure(
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
         # Ensure model is on the correct device.
-        # Skip when post-shard init was performed (params are already on the target device)
-        # to avoid triggering FSDP's reset_sharded_param which fails on tied parameters.
-        if not need_post_shard_init:
+        # Skip when checkpoint was loaded post-shard (params are already on the
+        # target device) to avoid triggering FSDP's reset_sharded_param which
+        # fails on tied parameters (e.g. lm_head/embed_tokens with TP>1).
+        # See: https://github.com/pytorch/pytorch/issues/151085
+        if not should_load_checkpoint:
             try:
                 model.to(device, non_blocking=True)
             except NotImplementedError as e:

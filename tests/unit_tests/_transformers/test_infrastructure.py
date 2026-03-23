@@ -222,8 +222,8 @@ class TestApplyModelInfrastructurePostShardInit:
             # FSDP's reset_sharded_param failure on tied parameters.
             mock_to.assert_not_called()
 
-    def test_skips_model_to_device_when_need_post_shard_init(self):
-        """model.to(device) should be skipped when need_post_shard_init is True (from_config meta path)."""
+    def test_calls_model_to_device_when_from_config_meta(self):
+        """model.to(device) should still be called on the from_config meta path (no checkpoint loaded)."""
         from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
 
         model = _DummyModel()
@@ -240,7 +240,9 @@ class TestApplyModelInfrastructurePostShardInit:
             mock_ckpt.config = MagicMock()
             mock_ckpt.config.dequantize_base_checkpoint = False
 
-            # from_config on meta device: need_post_shard_init = True
+            # from_config on meta device: need_post_shard_init = True,
+            # but should_load_checkpoint = False (no pretrained path).
+            # model.to(device) should still be called to move buffers.
             apply_model_infrastructure(
                 model=model,
                 is_meta_device=True,
@@ -249,8 +251,7 @@ class TestApplyModelInfrastructurePostShardInit:
                 pretrained_model_name_or_path="",
             )
 
-            # model.to(device) should NOT be called when need_post_shard_init is True
-            mock_to.assert_not_called()
+            mock_to.assert_called_once_with(torch.device("cpu"), non_blocking=True)
 
     def test_model_to_falls_back_to_to_empty_on_meta_tensor_error(self):
         """model.to() raising 'Cannot copy out of meta tensor' should fall back to model.to_empty()."""
