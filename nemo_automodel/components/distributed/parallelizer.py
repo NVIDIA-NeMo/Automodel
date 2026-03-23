@@ -816,12 +816,6 @@ def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None
     if hasattr(config, "num_key_value_heads") and config.num_key_value_heads is not None:
         local_num_key_value_heads = config.num_key_value_heads // tp_size
 
-    is_decilm_nemotron_nas = model_arch == "DeciLMForCausalLM" and getattr(config, "model_type", None) == "nemotron-nas"
-    if not is_decilm_nemotron_nas:
-        config.num_attention_heads = local_num_attention_heads
-        if local_num_key_value_heads is not None:
-            config.num_key_value_heads = local_num_key_value_heads
-
     for layer in layers:
         if hasattr(layer, "self_attn"):
             attn = layer.self_attn
