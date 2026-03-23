@@ -1,18 +1,16 @@
-# MoE Configuration Guide for Automodel
+# MoE Configuration Guide for AutoModel
 
-This guide explains the Mixture-of-Experts (MoE) configuration settings in Automodel and how to use them effectively for training and fine-tuning MoE models.
+This guide explains the Mixture-of-Experts (MoE) configuration settings in AutoModel and how to use them effectively for training and fine-tuning MoE models.
 
 ## Overview
 
-Automodel supports a wide range of MoE architectures including Qwen3-MoE, DeepSeek-V3/V3.2, GPT-OSS, Nemotron-V3, GLM4-MoE, Mixtral, Step-3.5 Flash, and MiniMax-M2. MoE configuration spans three areas:
+AutoModel supports a wide range of MoE architectures including Qwen3-MoE, DeepSeek-V3/V3.2, GPT-OSS, Nemotron-V3, GLM4-MoE, Mixtral, Step-3.5 Flash, and MiniMax-M2. MoE configuration spans three areas:
 
 1. **Distributed settings** (`distributed:`) — parallelism dimensions including expert parallelism
 2. **Backend settings** (`model.backend:`) — kernel and dispatcher selection
-3. **Model-intrinsic settings** — expert count, routing, activation functions (defined in the HuggingFace model config and mapped to `MoEConfig` at runtime)
+3. **Model-intrinsic settings** — expert count, routing, activation functions (defined in the Hugging Face model config and mapped to `MoEConfig` at runtime)
 
----
-
-## 1. Expert Parallelism (EP)
+## Expert Parallelism (EP)
 
 Expert parallelism shards experts across GPUs so that each GPU holds a subset of experts. It is controlled by the `ep_size` field in the `distributed:` section.
 
@@ -44,7 +42,7 @@ assert model.model.moe_config.n_routed_experts % moe_mesh[ep_axis_name].size() =
 |---|---|---|
 | **FSDP2** | Fully supported | Expert parameters are sharded on dim=1 (token dimension) via EP shard mesh. Non-expert parameters use standard FSDP. |
 | **PP** (pipeline) | Supported | Large models use PP+EP together. Example: Qwen3-235B uses `pp_size: 4, ep_size: 32`. |
-| **CP** (context) | Supported with caveats | The MoE layer receives the CP mesh for aggregating auxiliary loss across CP ranks. **Requires `rope_fusion: false`** — see [Common Pitfalls](#6-common-pitfalls). |
+| **CP** (context) | Supported with caveats | The MoE layer receives the CP mesh for aggregating auxiliary loss across CP ranks. **Requires `rope_fusion: false`** — see [Common Pitfalls](#common-pitfalls). |
 | **TP** (tensor) | **Not supported** | Automodel asserts `tp_size == 1` for custom MoE models. |
 
 ### EP + FSDP Shard Mesh
@@ -55,9 +53,9 @@ When `ep_size < dp_size * cp_size`, expert parameters are additionally sharded a
 ep_shard_size = (dp_size * cp_size) / ep_size
 ```
 
-The constraint `dp_size * cp_size` must be divisible by `ep_size` is enforced at mesh creation.
+The constraint that `dp_size * cp_size` must be divisible by `ep_size` is enforced at mesh creation.
 
-For very large models where expert params are already fully sharded by EP alone, set `reshard_after_forward: true` in the MoE config to free memory between forward/backward:
+For very large models where expert parameters are already fully sharded by EP alone, set `reshard_after_forward: true` in the MoE config to free memory between forward/backward:
 
 ```yaml
 distributed:
@@ -76,11 +74,9 @@ distributed:
 | GPT-OSS 120B | 8 | 64 | 1 | `examples/benchmark/configs/gptoss_120b_te_deepep.yaml` |
 | Step-3.5 Flash | 8 | 32 | 2 | `examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml` |
 
----
+## Expert Routing
 
-## 2. Expert Routing
-
-Expert routing determines how tokens are assigned to experts. These parameters are defined in the model's HuggingFace config and mapped to `MoEConfig` fields at model construction time.
+Expert routing determines how tokens are assigned to experts. These parameters are defined in the model's Hugging Face config and mapped to `MoEConfig` fields at model construction time.
 
 ### Core Routing Parameters
 
@@ -138,11 +134,9 @@ Shared experts process all tokens (not routed). They run in parallel with routed
 | `shared_expert_inter_dim` | Intermediate dimension for shared experts |
 | `shared_expert_activation` | Activation function for shared experts (`"swiglu"` or `"relu2"`) |
 
----
+## Expert Architecture
 
-## 3. Expert Architecture
-
-### Gated vs Non-Gated Experts
+### Gated vs. Non-Gated Experts
 
 Expert FFN layers support two structural patterns based on the `expert_activation` field:
 
@@ -151,7 +145,7 @@ Expert FFN layers support two structural patterns based on the `expert_activatio
 - **SwiGLU** (`expert_activation: "swiglu"`): `silu(gate_proj(x)) * up_proj(x)` → `down_proj(...)`. Default for Qwen3-MoE, DeepSeek-V3.
 - **Quick-GeGLU** (`expert_activation: "quick_geglu"`): `sigmoid(alpha * gate_proj(x)) * up_proj(x)` with clamping. Used by GPT-OSS. Additional parameters: `activation_alpha` (default 1.702), `activation_limit` (default 7.0).
 
-Gated experts use separate `gate_proj` and `up_proj` projections (or a fused `gate_and_up_proj`). The HuggingFace config typically stores these as either:
+Gated experts use separate `gate_proj` and `up_proj` projections (or a fused `gate_and_up_proj`). The Hugging Face config typically stores these as either:
 - `gate_proj` + `up_proj` (separate weights)
 - `gate_and_up_projs` (fused single weight, split at runtime)
 
@@ -169,7 +163,7 @@ Gated experts use separate `gate_proj` and `up_proj` projections (or a fused `ga
 
 ### Intermediate Sizes
 
-The `moe_inter_dim` field controls the expert FFN hidden dimension (typically different from the dense MLP `inter_dim`). For example, Qwen3-30B-A3B uses `moe_intermediate_size: 2560` for experts vs `intermediate_size: 18944` for dense layers.
+The `moe_inter_dim` field controls the expert FFN hidden dimension (typically different from the dense MLP `inter_dim`). For example, Qwen3-30B-A3B uses `moe_intermediate_size: 2560` for experts vs. `intermediate_size: 18944` for dense layers.
 
 ### Latent Projections
 
@@ -180,9 +174,7 @@ Some models project inputs to a lower dimension before routing to experts. Contr
 # input (dim) → fc1_latent_proj (moe_latent_size) → experts → fc2_latent_proj (dim)
 ```
 
----
-
-## 4. Normalization — RMS Norm Options
+## Normalization — RMS Norm Options
 
 The `rms_norm` backend setting in `model.backend` controls which RMSNorm implementation is used throughout the model, including within MoE layers.
 
@@ -200,7 +192,7 @@ The `rms_norm` backend setting in `model.backend` controls which RMSNorm impleme
 - **`te`**: Recommended for benchmarking and maximum throughput. Used in all benchmark configs (Qwen3-MoE, DeepSeek-V3, GPT-OSS, Nemotron-V3).
 - **`torch`**: Fallback when neither TE nor FP32 precision is needed. Used in pure-torch configs.
 
-### Example: Qwen3-MoE Fine-tuning (Stability)
+### Example: Qwen3-MoE Fine-Tuning (Stability)
 
 ```yaml
 # From examples/llm_finetune/qwen/qwen3_moe_30b_te_packed_sequence_flashoptim.yaml
@@ -218,9 +210,7 @@ model:
     rms_norm: te           # TE fused kernel for speed
 ```
 
----
-
-## 5. Kernel Backends
+## Kernel Backends
 
 ### Complete `BackendConfig` Reference
 
@@ -230,21 +220,23 @@ All fields in the `BackendConfig` dataclass (defined in `nemo_automodel/componen
 |---|---|---|---|
 | `attn` | `"te"`, `"sdpa"`, `"flex"` | `"te"` (GPU), `"sdpa"` (CPU) | Attention backend. `"te"` uses Transformer Engine, `"sdpa"` uses PyTorch scaled dot-product attention, `"flex"` uses FlexAttention. |
 | `linear` | `"torch"`, `"te"` | `"te"` (GPU), `"torch"` (CPU) | Linear layer backend. `"te"` uses Transformer Engine fused linear. |
-| `rms_norm` | `"torch"`, `"torch_fp32"`, `"te"` | `"torch_fp32"` | RMSNorm backend. See [Normalization](#4-normalization--rms-norm-options). |
+| `rms_norm` | `"torch"`, `"torch_fp32"`, `"te"` | `"torch_fp32"` | RMSNorm backend. See [Normalization](#normalization--rms-norm-options). |
 | `rope_fusion` | `bool` | `true` (GPU) | Whether to use fused RoPE (requires TE). Must be `false` when `cp_size > 1`. |
 | `experts` | `"torch"`, `"te"`, `"gmm"`, `"torch_mm"` | `"torch_mm"` (GPU), `"torch"` (CPU) | MoE expert GEMM backend (see below). |
 | `dispatcher` | `"torch"`, `"deepep"` | `"deepep"` (if available), `"torch"` | MoE token dispatcher (see below). |
 | `fake_balanced_gate` | `bool` | `false` | Replace learned Gate with synthetic balanced routing. **Benchmarking only.** |
 | `fake_gate_noise` | `float` | `0.0` | Noise level [0, 1] for `FakeBalancedGate`. Higher values create more realistic imbalance. Approximate max/mean load ratios (64 experts, top-8, 4096 tokens): 0.0→1.00x, 0.1→~1.2x, 0.3→~1.6x, 0.5→~2.0x, 1.0→~2.8x. |
-| `enable_hf_state_dict_adapter` | `bool` | `true` | Enable HuggingFace state dict adapter for checkpoint loading. |
+| `enable_hf_state_dict_adapter` | `bool` | `true` | Enable Hugging Face state dict adapter for checkpoint loading. |
 | `enable_fsdp_optimizations` | `bool` | `false` | Enable FSDP2-specific optimizations. |
 | `te_fp8` | `TEFp8Config \| None` | `None` | FP8 quantization config (see [FP8 Training](#fp8-training)). Requires `linear: te` or `experts: te`. |
 | `gate_precision` | `str \| torch.dtype \| None` | `None` | Optional dtype override for gate computation (e.g., `"float32"` for higher-precision routing). |
 | `enable_deepep` | `bool \| None` | `None` | **Deprecated.** Use `dispatcher: "deepep"` and `experts: "gmm"` instead. |
 
-> **Validation rules** enforced by `BackendConfig.__post_init__`:
-> - If `experts` is `"te"` or `"gmm"` but `dispatcher` is not `"deepep"`, the config auto-corrects to `dispatcher: "torch"` and `experts: "torch_mm"` with a warning.
-> - `te_fp8` requires at least one TE backend (`linear: "te"` or `experts: "te"`).
+:::{note}
+**Validation rules** enforced by `BackendConfig.__post_init__`:
+- If `experts` is `"te"` or `"gmm"` but `dispatcher` is not `"deepep"`, the config auto-corrects to `dispatcher: "torch"` and `experts: "torch_mm"` with a warning.
+- `te_fp8` requires at least one TE backend (`linear: "te"` or `experts: "te"`).
+:::
 
 ### Expert GEMM Backends
 
@@ -275,7 +267,7 @@ The `dispatcher` field controls how tokens are communicated between EP ranks:
 | Pure PyTorch (CPU/debug) | `torch` | `torch` | No CUDA or external dependencies needed |
 | FP8 training | `te` | `deepep` | Enables FP8 quantized expert computation |
 
-### Optimizer Choice: Adam vs FlashAdamW
+### Optimizer Choice: Adam vs. FlashAdamW
 
 The optimizer impacts MoE training memory footprint:
 
@@ -306,7 +298,7 @@ FlashAdamW is particularly valuable for MoE models because the large number of e
 
 ### FP8 Training
 
-Enable FP8 quantization for expert computation via `te_fp8`:
+Enable FP8 quantization for expert computation using `te_fp8`:
 
 ```yaml
 model:
@@ -316,11 +308,9 @@ model:
       recipe: current    # or "block" for block-level scaling
 ```
 
----
+## Common Pitfalls
 
-## 6. Common Pitfalls
-
-### EP must divide `n_routed_experts`
+### EP Must Divide `n_routed_experts`
 
 `ep_size` must evenly divide the model's `n_routed_experts`. The framework will raise an assertion error otherwise.
 
@@ -331,7 +321,7 @@ AssertionError: n_routed_experts 128 must be divisible by expert_parallel_degree
 # Good: 128 experts with ep_size=8 (128/8 = 16 experts per GPU)
 ```
 
-### CP + EP requires `rope_fusion: false`
+### CP + EP Requires `rope_fusion: false`
 
 When using context parallelism (`cp_size > 1`) with EP, fused RoPE must be disabled. Automodel automatically disables it with a warning:
 
@@ -344,7 +334,7 @@ if self.dist_setup.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", Fal
 
 Best practice: explicitly set `rope_fusion: false` in your config when using CP to avoid confusion.
 
-### `dp_size * cp_size` must be divisible by `ep_size`
+### `dp_size * cp_size` Must Be Divisible by `ep_size`
 
 The EP mesh is carved out of the data-parallel and context-parallel dimensions. This constraint is enforced at mesh creation:
 
@@ -353,11 +343,11 @@ dp_cp_size = dp_size * cp_size
 assert dp_cp_size % ep_size == 0
 ```
 
-### TP is not supported with MoE
+### TP Is Not Supported with MoE
 
 Tensor parallelism (`tp_size > 1`) is not supported for custom MoE models and will raise an assertion error. Use EP instead for distributing expert computation.
 
-### `reshard_after_forward` and `wrap_outer_model` for large models
+### `reshard_after_forward` and `wrap_outer_model` for Large Models
 
 For large MoE models using PP + EP, set these in the `distributed.moe` section to manage memory:
 
@@ -370,7 +360,7 @@ distributed:
     wrap_outer_model: false       # false when using PP to avoid double wrapping
 ```
 
-### Choosing `rms_norm` for training stability
+### Choosing `rms_norm` for Training Stability
 
 Using `rms_norm: te` (or `torch`) during fine-tuning can cause loss divergence for some models (notably Qwen3-MoE). Switch to `rms_norm: torch_fp32` for stable training:
 
@@ -380,7 +370,7 @@ model:
     rms_norm: torch_fp32   # required for Qwen3-MoE fine-tuning stability
 ```
 
-### `fake_balanced_gate` for benchmarking only
+### `fake_balanced_gate` for Benchmarking Only
 
 Setting `fake_balanced_gate: true` replaces the learned router with a synthetic balanced gate. This is useful for throughput benchmarking but produces meaningless model outputs. Never use it for actual training:
 
@@ -391,11 +381,9 @@ model:
     fake_gate_noise: 0.0        # 0.0 = perfectly balanced, higher = more realistic imbalance
 ```
 
-### FP8 requires at least one TE backend
+### FP8 Requires at Least One TE Backend
 
 The `te_fp8` setting requires at least one backend component to use TE (e.g., `linear: te` or `experts: te`).
-
----
 
 ## MoE Parallelizer Settings
 
@@ -522,17 +510,17 @@ Applies context parallelism to attention layers. The `cp_comm_type` parameter (d
 - **MoE modules**: Sets `moe_module.cp_mesh` for aggregating auxiliary loss across CP ranks
 - Sets `model._cp_enabled = True` to enable attention mask nulling in the forward pass
 
----
-
 ## Load Balance Metrics & Visualization
 
-Monitoring expert load balance is critical for MoE training — unbalanced routing leads to wasted capacity (underloaded experts), bottlenecks (overloaded experts), and in extreme cases "dead experts" that receive zero tokens. Automodel provides built-in load balance tracking, metrics computation, and W&B integration.
+Monitoring expert load balance is critical for MoE training — unbalanced routing leads to wasted capacity (underloaded experts), bottlenecks (overloaded experts), and in extreme cases "dead experts" that receive zero tokens. AutoModel provides built-in load balance tracking, metrics computation, and W&B integration.
 
-> **See also:** [GitHub Discussion #1266](https://github.com/NVIDIA-NeMo/Automodel/discussions/1266) for community examples and visualizations.
+:::{seealso}
+[GitHub Discussion #1266](https://github.com/NVIDIA-NeMo/Automodel/discussions/1266) for community examples and visualizations.
+:::
 
 ### Configuration
 
-Enable load balance metrics via the `moe_metrics` section in your training config:
+Enable load balance metrics using the `moe_metrics` section in your training config:
 
 ```yaml
 moe_metrics:
@@ -566,7 +554,7 @@ Brief mode produces aggregated scalar metrics suitable for monitoring training r
 | `moe/expert_diversity_mean`, `moe/expert_diversity_min` | Shannon entropy-based diversity: `exp(H) / N` where H is entropy of routing distribution. 1.0 = all experts equally used; low values = collapsed routing. |
 | `moe_expert_utilization/layer_{i}_expert_{j}` | Individual utilization ratios for the top-K highest and bottom-K lowest experts globally. |
 
-#### Detailed Mode (adds per-layer breakdowns)
+#### Detailed Mode (Adds Per-Layer Breakdowns)
 
 When `mode: "detailed"`, all brief metrics are emitted plus per-layer keys:
 
@@ -580,7 +568,7 @@ When `mode: "detailed"`, all brief metrics are emitted plus per-layer keys:
 
 ### Auxiliary Loss Configuration
 
-The auxiliary loss is the primary training-time mechanism for encouraging balanced routing. It is configured via `MoEConfig.aux_loss_coeff` (set in the model's HuggingFace config):
+The auxiliary loss is the primary training-time mechanism for encouraging balanced routing. It is configured using `MoEConfig.aux_loss_coeff` (set in the model's Hugging Face config):
 
 ```
 aux_loss = aux_loss_coeff * sum(f_i * P_i)
@@ -596,7 +584,7 @@ Where:
 | `0.001` | Typical for DeepSeek-V3/V3.2-style models. Gentle load balancing. |
 | `0.01` | Stronger load balancing for models with severe imbalance. |
 
-The loss is automatically scaled during backpropagation via `MoEAuxLossAutoScaler` to maintain stable gradients relative to the main loss.
+The loss is automatically scaled during backpropagation by `MoEAuxLossAutoScaler` to maintain stable gradients relative to the main loss.
 
 ### Visualization with Weights & Biases
 
@@ -638,9 +626,7 @@ Metrics are logged directly to W&B via the training recipe. The integration work
 
 5. **Watch for dead experts early**: Check `dead_expert_frac_mean` in the first few hundred steps. Dead experts that appear early rarely recover. Consider increasing `aux_loss_coeff` or using expert bias correction (`gate_bias_update_factor > 0`).
 
-6. **Expert bias correction as an alternative**: For models that use sigmoid routing (DeepSeek-V3, Nemotron-V3), expert bias correction via `gate_bias_update_factor` can be more effective than auxiliary loss alone. The two mechanisms can be used together.
-
----
+6. **Expert bias correction as an alternative**: For models that use sigmoid routing (DeepSeek-V3, Nemotron-V3), expert bias correction using `gate_bias_update_factor` can be more effective than auxiliary loss alone. The two mechanisms can be used together.
 
 ## Quick Reference: Complete MoE Config Example
 
@@ -676,6 +662,6 @@ optimizer:
 
 ## Further Reading
 
-- [Large MoE Fine-tuning Guide](guides/llm/large_moe_finetune.md) — step-by-step recipes for GLM-5, MiniMax-M2.5, Step-3.5 Flash, DeepSeek-V3.2
+- [Large MoE Fine-Tuning Guide](large_moe_finetune.md) — step-by-step recipes for GLM-5, MiniMax-M2.5, Step-3.5 Flash, DeepSeek-V3.2
 - [Megatron MoE README](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/moe/megatron/README.md) — technical details on token dispatching and load balancing
 - Example configs in `examples/benchmark/configs/` and `examples/llm_finetune/`
