@@ -375,6 +375,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
 
         self.checkpointer.maybe_wait_for_staging()
+        lr = self.optimizer[0].param_groups[0]["lr"]
         for opt in self.optimizer:
             opt.step()
             opt.zero_grad()
@@ -389,8 +390,6 @@ class TrainBiEncoderRecipe(BaseRecipe):
             reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
             reporting_loss = reporting_loss / self._get_dp_group_size(include_cp=True)
         reporting_loss = reporting_loss.cpu().item()
-
-        lr = self.optimizer[0].param_groups[0]["lr"]
         elapsed = time.perf_counter() - self.timestamp
         self.timestamp = time.perf_counter()
         mem_allocated = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0

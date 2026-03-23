@@ -103,4 +103,4 @@ dataloader:
 ## Requirements
 
 - `pos_doc` must be **non-empty**.
-- If training requests negatives (e.g., `n_passages > 1`), `neg_doc` must contain **at least one** document (the loader will cycle negatives if you provide fewer than needed).
+- If training requests negatives (e.g., `n_passages > 1`), `neg_doc` must contain **at least one** document.

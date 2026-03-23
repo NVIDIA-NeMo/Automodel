@@ -451,7 +451,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         if num_neg_docs > 0 and len(negatives) == 0:
             raise ValueError(
                 f"neg_doc is empty for example {i_example} but {num_neg_docs} negative(s) requested "
-                f"(n_passages > 1). Provide negatives or set n_passages=1."
+                f"(n_passages > 1). Provide negatives."
             )
         if num_neg_docs > 0:
             neg_ids = [i for i in range(len(negatives))]
