@@ -25,6 +25,7 @@ sys.modules["nemo_run"] = mock.MagicMock()
 sys.modules["torch.distributed.run"] = mock.MagicMock()
 
 import cli.app as module
+import nemo_automodel._cli.utils as utils
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -127,9 +128,9 @@ def nemo_run_yaml(tmp_path):
 
 @pytest.fixture
 def clear_recipe_discovery_cache():
-    module._discover_recipe_classes.cache_clear()
+    utils._discover_recipe_classes.cache_clear()
     yield
-    module._discover_recipe_classes.cache_clear()
+    utils._discover_recipe_classes.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -177,9 +178,9 @@ def test_discover_recipe_classes_scans_recipe_modules(monkeypatch, tmp_path, cle
     private_file = recipes_dir / "_private.py"
     private_file.write_text("class HiddenRecipe:\n    pass\n")
 
-    monkeypatch.setattr(module, "_RECIPES_DIR", recipes_dir)
+    monkeypatch.setattr(utils, "_RECIPES_DIR", recipes_dir)
 
-    assert module._discover_recipe_classes() == {
+    assert utils._discover_recipe_classes() == {
         "EvalRecipe": "nemo_automodel.recipes.llm.train_ft.EvalRecipe",
         "TrainFinetuneRecipeForNextTokenPrediction": (
             "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction"
@@ -190,7 +191,7 @@ def test_discover_recipe_classes_scans_recipe_modules(monkeypatch, tmp_path, cle
 def test_resolve_recipe_name_resolves_bare_class_name(monkeypatch):
     expected = "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction"
     monkeypatch.setattr(
-        module,
+        utils,
         "_discover_recipe_classes",
         lambda: {"TrainFinetuneRecipeForNextTokenPrediction": expected},
     )
@@ -201,21 +202,21 @@ def test_resolve_recipe_name_resolves_bare_class_name(monkeypatch):
 def test_resolve_recipe_name_returns_fqn_unchanged(monkeypatch):
     raw = "nemo_automodel.recipes.llm.train_ft.Foo"
     discover = mock.MagicMock()
-    monkeypatch.setattr(module, "_discover_recipe_classes", discover)
+    monkeypatch.setattr(utils, "_discover_recipe_classes", discover)
 
-    assert module.resolve_recipe_name(raw) == raw
+    assert utils.resolve_recipe_name(raw) == raw
     discover.assert_not_called()
 
 
 def test_resolve_recipe_name_raises_for_unknown_bare_name(monkeypatch):
     monkeypatch.setattr(
-        module,
+        utils,
         "_discover_recipe_classes",
         lambda: {"KnownRecipe": "nemo_automodel.recipes.llm.train_ft.KnownRecipe"},
     )
 
     with pytest.raises(ValueError, match="Unknown recipe class 'MissingRecipe'") as exc_info:
-        module.resolve_recipe_name("MissingRecipe")
+        utils.resolve_recipe_name("MissingRecipe")
 
     assert "  - KnownRecipe" in str(exc_info.value)
 

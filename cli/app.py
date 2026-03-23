@@ -20,10 +20,10 @@ Usage
 ::
 
     # Recommended — the CLI handles torchrun internally:
-    python3 app.py <config.yaml> [--nproc-per-node N] [--key.subkey=override ...]
+    python3 cli/app.py <config.yaml> [--nproc-per-node N] [--key.subkey=override ...]
 
     # Also supported — external torchrun launch:
-    torchrun --nproc-per-node N app.py <config.yaml> [--key.subkey=override ...]
+    torchrun --nproc-per-node N cli/app.py <config.yaml> [--key.subkey=override ...]
 
     # Via console entry-points (if installed):
     automodel <config.yaml> [--nproc-per-node N] [--key.subkey=override ...]
@@ -46,71 +46,13 @@ re-spawning torchrun.
 
 import argparse
 import logging
-import re
 import sys
-from functools import lru_cache
 from pathlib import Path
 
-import yaml
+from nemo_automodel._cli.utils import load_yaml, resolve_recipe_name
 
 logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
-
-_RECIPES_DIR = Path(__file__).resolve().parent.parent / "nemo_automodel" / "recipes"
-
-
-@lru_cache(maxsize=1)
-def _discover_recipe_classes() -> dict[str, str]:
-    """Scan ``nemo_automodel/recipes/`` for concrete recipe classes.
-
-    Returns a mapping from bare class name to fully-qualified dotted path,
-    e.g. ``{"TrainFinetuneRecipeForNextTokenPrediction":
-    "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction"}``.
-    """
-    registry: dict[str, str] = {}
-    pkg_root = _RECIPES_DIR.parent.parent
-    for py_file in _RECIPES_DIR.rglob("*.py"):
-        if py_file.name.startswith("_"):
-            continue
-        module_dotted = ".".join(py_file.relative_to(pkg_root).with_suffix("").parts)
-        source = py_file.read_text()
-        for m in re.finditer(r"^class\s+(\w*Recipe\w*)\s*[\(:]", source, re.MULTILINE):
-            cls_name = m.group(1)
-            if cls_name == "BaseRecipe":
-                continue
-            registry[cls_name] = f"{module_dotted}.{cls_name}"
-    return registry
-
-
-def resolve_recipe_name(raw: str) -> str:
-    """Resolve a recipe name to its fully-qualified dotted path.
-
-    Accepts:
-      - Bare class name: ``"TrainFinetuneRecipeForNextTokenPrediction"``
-      - Full FQN: ``"nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction"``
-
-    Raises ``ValueError`` when a bare name cannot be found.
-    """
-    if "." in raw:
-        return raw
-    registry = _discover_recipe_classes()
-    if raw in registry:
-        return registry[raw]
-    available = "\n".join(f"  - {name}" for name in sorted(registry))
-    raise ValueError(f"Unknown recipe class '{raw}'. Available short names:\n{available}")
-
-
-def load_yaml(file_path):
-    """Load and return a YAML file as a dict."""
-    try:
-        with open(file_path, "r") as file:
-            return yaml.safe_load(file)
-    except FileNotFoundError as e:
-        logging.error("File '%s' was not found.", file_path)
-        raise e
-    except yaml.YAMLError as e:
-        logging.error("parsing YAML file '%s' failed: %s", file_path, e)
-        raise e
 
 
 def build_parser() -> argparse.ArgumentParser:
