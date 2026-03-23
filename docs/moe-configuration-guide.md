@@ -677,5 +677,5 @@ optimizer:
 ## Further Reading
 
 - [Large MoE Fine-tuning Guide](guides/llm/large_moe_finetune.md) — step-by-step recipes for GLM-5, MiniMax-M2.5, Step-3.5 Flash, DeepSeek-V3.2
-- [Megatron MoE README](../nemo_automodel/components/moe/megatron/README.md) — technical details on token dispatching and load balancing
+- [Megatron MoE README](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/moe/megatron/README.md) — technical details on token dispatching and load balancing
 - Example configs in `examples/benchmark/configs/` and `examples/llm_finetune/`
