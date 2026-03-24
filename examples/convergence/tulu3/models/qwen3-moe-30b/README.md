@@ -7,9 +7,10 @@ MoE 30B (3B active) model. 8 GPUs, EP=8, FSDP baselines plus a corrected CP=2 re
 | Config | Optimizer | lr | Notes |
 |--------|-----------|---:|-------|
 | `qwen3_moe_30b_ep8_flashoptim.yaml` | FlashAdamW | 1e-5 | 24-bit master weights |
+| `experiments/qwen3_moe_30b_ep8_cp2_flashoptim_fp32_attn_res.yaml` | FlashAdamW | 1e-5 | Corrected CP=2 rerun, 32-bit master weights, aux=1e-5, AttnRes-compatible |
 | `qwen3_moe_30b_ep8_te_fusedadam.yaml` | TE FusedAdam | 1e-5 | FP32 master weights, BF16 moments |
 
-All configs use `chat_template.jinja`, `seq_length: 2048`, `betas: [0.9, 0.95]`, `ep_size: 8`, `rms_norm: torch_fp32`, TE attn+linear backends, `router_aux_loss_coef: 0.0001`, `moe_metrics: brief`.
+All configs use `chat_template.jinja`, `seq_length: 2048`, `betas: [0.9, 0.95]`, `ep_size: 8`, `rms_norm: torch_fp32`, and TE attn+linear backends. The baseline configs use `router_aux_loss_coef: 0.0001`; the 32-bit AttnRes CP=2 rerun pins `router_aux_loss_coef: 0.00001`.
 
 ## Results
 

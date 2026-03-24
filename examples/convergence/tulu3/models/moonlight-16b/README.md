@@ -9,6 +9,7 @@ MoE 16B (3B active) model based on DeepSeek V3 architecture. 64 routed experts, 
 | Config | Optimizer | lr | Notes |
 |--------|-----------|---:|-------|
 | `moonlight_16b_ep8_flashoptim.yaml` | FlashAdamW | 1e-5 | 24-bit master weights, `fp32_upcast: false` |
+| `moonlight_16b_ep8_cp2_flashoptim.yaml` | FlashAdamW | 1e-5 | Corrected CP=2 rerun, 24-bit master weights, `fp32_upcast: false` |
 | `moonlight_16b_ep8_te_fusedadam.yaml` | TE FusedAdam | 1e-5 | FP32 master weights, BF16 moments, `fp32_upcast: true` |
 
 All configs use `chat_template.jinja`, `seq_length: 2048`, `betas: [0.9, 0.95]`, `ep_size: 8`, `rms_norm: te`, TE attn+linear backends, `enable_fsdp_optimizations: true`, `gate_bias_update_factor: 0.0001`, `moe_metrics: brief`.

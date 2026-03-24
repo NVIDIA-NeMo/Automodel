@@ -7,6 +7,7 @@ Dense 4B model. 8 GPUs, FSDP, with CP=1 baselines plus a corrected CP=2 rerun on
 | Config | Optimizer | lr | Notes |
 |--------|-----------|---:|-------|
 | `qwen3_4b_cp1_flashoptim.yaml` | FlashAdamW | 1e-5 | 24-bit master weights |
+| `qwen3_4b_cp2_flashoptim.yaml` | FlashAdamW | 1e-5 | Corrected CP=2 rerun, 24-bit master weights |
 | `qwen3_4b_cp1_te_fusedadam.yaml` | TE FusedAdam | 1e-5 | FP32 master weights, FP32 moments |
 
 All configs use `chat_template.jinja` (strips `<think>` tags), `seq_length: 2048`, `betas: [0.9, 0.95]`.
