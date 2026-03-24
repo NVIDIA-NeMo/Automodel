@@ -94,6 +94,6 @@ from cli.app import main
 
 ## Example Wrapper Scripts Deprecated
 
-The Python wrapper scripts in `examples/` (e.g., `examples/llm_finetune/finetune.py`)
+The Python wrapper scripts in `examples/` (for example, `examples/llm_finetune/finetune.py`)
 are deprecated. They now print a deprecation warning and delegate to the recipe
 directly. Use `automodel <config.yaml>` instead.
