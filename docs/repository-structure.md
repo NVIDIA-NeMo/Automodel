@@ -72,7 +72,7 @@ automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node
 ```
 
 The above command will fine-tune the Llama3.2-1B model on the SQuAD dataset with two GPUs using the [`llama3_2_1b_squad.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) config.
-For a single-GPU run, simply omit `--nproc-per-node`:
+For a single-GPU run, omit `--nproc-per-node`:
 ```bash
 automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```

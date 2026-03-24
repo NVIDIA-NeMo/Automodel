@@ -167,7 +167,7 @@ The CLI simplifies job launch across environments:
 automodel config.yaml
 
 # Multi-node SLURM batch (add a slurm: section to the YAML)
-automodel config.yaml
+automodel config.yaml  # CLI detects slurm: section and submits to Slurm
 ```
 
 See the [Local Workstation](../launcher/local-workstation.md) and [Cluster](../launcher/cluster.md) guides.

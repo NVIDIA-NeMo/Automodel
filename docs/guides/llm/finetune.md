@@ -165,11 +165,10 @@ step_scheduler:
 
 You can run the recipe using the AutoModel CLI.
 
-``` bash
 automodel --nproc-per-node=8 sft_guide.yaml
 ```
 
-With the `--nproc-per-node=8` specifies the number of GPUs per node, adjust to your case (for single GPU you can omit the `--nproc-per-node` option).
+The `--nproc-per-node=8` flag specifies the number of GPUs per node. Adjust to your case (for a single GPU, omit the `--nproc-per-node` option).
 
 ### Invoke the Recipe Script Directly (advanced)
 
