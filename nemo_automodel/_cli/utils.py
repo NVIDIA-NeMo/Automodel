@@ -19,8 +19,7 @@ from pathlib import Path
 
 import yaml
 
-_RECIPES_DIR = Path(__file__).resolve().parent / "recipes"
-
+_RECIPES_DIR = Path(__file__).resolve().parent.parent / "recipes"
 logger = logging.getLogger(__name__)
 
 
