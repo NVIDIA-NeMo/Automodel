@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from cli.app import resolve_recipe_name
+from nemo_automodel.cli.app import resolve_recipe_name
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _EXAMPLES_DIR = _PROJECT_ROOT / "examples"

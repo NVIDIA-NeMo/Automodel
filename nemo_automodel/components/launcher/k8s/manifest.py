@@ -32,7 +32,7 @@ def _container_spec(
         "--rdzv_backend=c10d",
         f"--rdzv_endpoint=$(MASTER_ADDR):{cfg.master_port}",
         "-m",
-        "cli.app",
+        "nemo_automodel.cli.app",
         config_mount_path,
     ]
     command.extend(extra_args)

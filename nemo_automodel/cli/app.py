@@ -20,13 +20,13 @@ Usage
 ::
 
     # Recommended — the CLI handles torchrun internally:
-    python3 cli/app.py <config.yaml> [--nproc-per-node N] [--key.subkey=override ...]
+    automodel <config.yaml> [--nproc-per-node N] [--key.subkey=override ...]
 
     # Also supported — external torchrun launch:
-    torchrun --nproc-per-node N cli/app.py <config.yaml> [--key.subkey=override ...]
+    torchrun --nproc-per-node N -m nemo_automodel.cli.app <config.yaml> [--key.subkey=override ...]
 
-    # Via console entry-points (if installed):
-    automodel <config.yaml> [--nproc-per-node N] [--key.subkey=override ...]
+    # Convenience wrapper for development (not installed):
+    python app.py <config.yaml> [--nproc-per-node N] [--key.subkey=override ...]
 
 The YAML config must specify which recipe class to instantiate.  All three
 forms are accepted::
@@ -49,7 +49,7 @@ import logging
 import sys
 from pathlib import Path
 
-from nemo_automodel._cli.utils import load_yaml, resolve_recipe_name
+from nemo_automodel.cli.utils import load_yaml, resolve_recipe_name
 
 logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)

@@ -183,9 +183,9 @@ Running the recipe using either the `automodel` app or by directly invoking the 
 the following log:
 ```
 $ automodel sft_guide.yaml
-INFO:cli.app:Config: /mnt/4tb/auto/Automodel/sft_guide.yaml
-INFO:cli.app:Recipe: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
-INFO:cli.app:Launching job interactively (local)
+INFO:nemo_automodel.cli.app:Config: /mnt/4tb/auto/Automodel/sft_guide.yaml
+INFO:nemo_automodel.cli.app:Recipe: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
+INFO:nemo_automodel.cli.app:Launching job interactively (local)
 cfg-path: /mnt/4tb/auto/Automodel/sft_guide.yaml
 INFO:root:step 4 | epoch 0 | loss 1.5514 | grad_norm 102.0000 | mem: 11.66 GiB | tps 6924.50
 INFO:root:step 8 | epoch 0 | loss 0.7913 | grad_norm 46.2500 | mem: 14.58 GiB | tps 9328.79

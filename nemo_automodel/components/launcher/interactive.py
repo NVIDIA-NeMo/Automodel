@@ -76,8 +76,8 @@ class InteractiveLauncher(Launcher):
 
         torchrun (``torch.distributed.run``) sets ``LOCAL_RANK`` in the
         environment of every worker it spawns.  When the user launches the CLI
-        via ``torchrun --nproc-per-node N cli/app.py config.yaml``, each
-        worker must run the recipe in-process instead of re-launching torchrun.
+        via ``torchrun --nproc-per-node N -m nemo_automodel.cli.app config.yaml``,
+        each worker must run the recipe in-process instead of re-launching torchrun.
         """
         return "LOCAL_RANK" in os.environ
 
@@ -104,7 +104,7 @@ class InteractiveLauncher(Launcher):
             return 1
 
         # Already inside a torchrun worker (e.g. user ran
-        # ``torchrun --nproc-per-node N cli/app.py config.yaml``).
+        # ``torchrun --nproc-per-node N -m nemo_automodel.cli.app config.yaml``).
         # Run the recipe directly; do NOT re-launch torchrun.
         if self._is_torchrun_worker():
             logger.info(

@@ -24,8 +24,8 @@ import yaml
 sys.modules["nemo_run"] = mock.MagicMock()
 sys.modules["torch.distributed.run"] = mock.MagicMock()
 
-import cli.app as module
-import nemo_automodel._cli.utils as utils
+import nemo_automodel.cli.app as module
+import nemo_automodel.cli.utils as utils
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -373,8 +373,7 @@ def test_main_passes_extra_args(monkeypatch, recipe_yaml):
 
 def test_repo_structure():
     repo_root = Path(__file__).parents[3]
-    assert (repo_root / "cli").exists()
-    assert (repo_root / "cli" / "app.py").exists()
+    assert (repo_root / "nemo_automodel" / "cli" / "app.py").exists()
     assert (repo_root / "nemo_automodel").exists()
     assert (repo_root / "nemo_automodel" / "components").exists()
     assert (repo_root / "nemo_automodel" / "recipes").exists()

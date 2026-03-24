@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import cli.app as app
+import nemo_automodel.cli.app as app
 
 
 def test_cli_accepts_config_positional(tmp_path):
     parser = app.build_parser()
     cfg = tmp_path / "cfg.yaml"
-    cfg.write_text("recipe:\n  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction\n")
+    cfg.write_text(
+        "recipe:\n  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction\n"
+    )
     args, _ = parser.parse_known_args([str(cfg)])
     assert args.config == cfg
     assert args.nproc_per_node is None

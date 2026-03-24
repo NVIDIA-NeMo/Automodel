@@ -74,23 +74,12 @@ separately (`pip install nemo-run`). If you try to run a local/interactive job
 with the CLI-only install, you will get a clear error message with instructions
 to install the full package.
 
-## CLI Module Moved to Repository Root
+## CLI Module Lives Inside the Package
 
-The CLI entry-point has moved from `nemo_automodel/_cli/app.py` to
-`cli/app.py` at the repository root. This separates the CLI from the
-core `nemo_automodel` library, making it possible to install and evolve them
-independently.
-
-A backward-compatibility shim remains at the old location and will emit a
-`DeprecationWarning` on import. Update any direct imports:
-
-```python
-# Before
-from nemo_automodel._cli.app import main
-
-# After
-from cli.app import main
-```
+The CLI entry-point lives at `nemo_automodel/cli/app.py` and is registered as
+the `automodel` / `am` console entry-points. A thin convenience wrapper
+(`app.py`) at the repository root is available for running from a source
+checkout but is **not** installed as part of the package.
 
 ## Example Wrapper Scripts Deprecated
 

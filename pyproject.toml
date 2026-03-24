@@ -20,7 +20,7 @@ build-backend = "setuptools.build_meta"
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["nemo_automodel", "nemo_automodel.*", "cli"]
+include = ["nemo_automodel", "nemo_automodel.*"]
 
 [tool.setuptools.package-data]
 nemo_automodel = [
@@ -155,8 +155,8 @@ Repository = "https://github.com/NVIDIA/NeMo-Automodel"
 Download = "https://github.com/NVIDIA/NeMo-Automodel/releases"
 
 [project.scripts]
-automodel = "cli.app:main"
-am = "cli.app:main"
+automodel = "nemo_automodel.cli.app:main"
+am = "nemo_automodel.cli.app:main"
 
 [dependency-groups]
 build = ["setuptools", "torch<=2.10.0", "packaging", "psutil"]
