@@ -86,11 +86,13 @@ def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
     # Standard HF models don't need auto_map pointing to a local model.py.
     if ModelRegistry.has_retrieval_model(encoder_class_name):
         config_class_name = config.__class__.__name__
-        config.auto_map = {"AutoConfig": f"model.{config_class_name}"}
+        config_module = config.__class__.__module__.rsplit(".", 1)[-1]
+        model_module = model.__class__.__module__.rsplit(".", 1)[-1]
+        config.auto_map = {"AutoConfig": f"{config_module}.{config_class_name}"}
         if "ForSequenceClassification" in encoder_class_name:
-            config.auto_map["AutoModelForSequenceClassification"] = f"model.{encoder_class_name}"
+            config.auto_map["AutoModelForSequenceClassification"] = f"{model_module}.{encoder_class_name}"
         else:
-            config.auto_map["AutoModel"] = f"model.{encoder_class_name}"
+            config.auto_map["AutoModel"] = f"{model_module}.{encoder_class_name}"
 
 
 def build_encoder_backbone(
