@@ -45,6 +45,7 @@ def _has_optimized_tp_plan(model_cls: type) -> bool:
         PARALLELIZE_FUNCTIONS,
         _get_class_qualname,
     )
+
     return _get_class_qualname(model_cls) in PARALLELIZE_FUNCTIONS
 
 
