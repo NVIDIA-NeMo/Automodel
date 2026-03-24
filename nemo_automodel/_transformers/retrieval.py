@@ -21,7 +21,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig, AutoModel, PreTrainedModel
+from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PreTrainedModel
 from transformers.utils import logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
@@ -69,22 +69,28 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
 def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
     """Configure HuggingFace consolidated checkpoint metadata on a model.
 
-    Sets the model's ``name_or_path``, ``state_dict_adapter``, and updates
-    ``config.architectures`` and ``config.auto_map`` so that the saved
-    checkpoint can be reloaded via HuggingFace Auto classes.
+    Sets ``config.architectures`` unconditionally.  For custom retrieval
+    architectures registered in :class:`ModelRegistry`, also writes
+    ``config.auto_map`` so that the saved checkpoint can be reloaded via
+    HuggingFace Auto classes.  Standard HF models already have their own
+    auto-resolution and do not need ``auto_map`` entries.
 
     Args:
         model: The backbone ``PreTrainedModel`` instance.
         config: The model's config object (typically ``model.config``).
     """
     encoder_class_name = model.__class__.__name__
-    config_class_name = config.__class__.__name__
     config.architectures = [encoder_class_name]
-    config.auto_map = {"AutoConfig": f"model.{config_class_name}"}
-    if "ForSequenceClassification" in encoder_class_name:
-        config.auto_map["AutoModelForSequenceClassification"] = f"model.{encoder_class_name}"
-    else:
-        config.auto_map["AutoModel"] = f"model.{encoder_class_name}"
+
+    # Only set auto_map for custom retrieval architectures.
+    # Standard HF models don't need auto_map pointing to a local model.py.
+    if ModelRegistry.has_retrieval_model(encoder_class_name):
+        config_class_name = config.__class__.__name__
+        config.auto_map = {"AutoConfig": f"model.{config_class_name}"}
+        if "ForSequenceClassification" in encoder_class_name:
+            config.auto_map["AutoModelForSequenceClassification"] = f"model.{encoder_class_name}"
+        else:
+            config.auto_map["AutoModel"] = f"model.{encoder_class_name}"
 
 
 def build_encoder_backbone(
@@ -93,11 +99,13 @@ def build_encoder_backbone(
     trust_remote_code: bool = False,
     **hf_kwargs,
 ) -> PreTrainedModel:
-    """Build a bidirectional encoder backbone from a pretrained checkpoint.
+    """Build an encoder backbone from a pretrained checkpoint.
 
-    Resolves the HuggingFace config, looks up the correct bidirectional
-    architecture class from :data:`SUPPORTED_BACKBONES` and
-    :class:`ModelRegistry`, and returns the constructed model.
+    For model types listed in :data:`SUPPORTED_BACKBONES`, resolves the
+    custom bidirectional architecture class from :class:`ModelRegistry`.
+    For all other model types, falls back to
+    ``AutoModel.from_pretrained`` (or ``AutoModelForSequenceClassification``
+    for the ``"score"`` task).
 
     Args:
         model_name_or_path: Path or HuggingFace Hub identifier.
@@ -109,33 +117,41 @@ def build_encoder_backbone(
         The constructed ``PreTrainedModel`` backbone.
 
     Raises:
-        ValueError: If the model type or task is unsupported, or the
+        ValueError: If the task is unsupported for a known model type, or the
             architecture class is missing from :class:`ModelRegistry`.
     """
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
     model_type = getattr(config, "model_type", "")
 
     task_map = SUPPORTED_BACKBONES.get(model_type.lower())
-    if task_map is None:
-        raise ValueError(
-            f"Unsupported model type '{model_type}' for encoder. "
-            f"Supported types: {', '.join(SUPPORTED_BACKBONES)}."
+    if task_map is not None:
+        arch_name = task_map.get(task)
+        if arch_name is None:
+            raise ValueError(
+                f"Unsupported task '{task}' for model type '{model_type}'. "
+                f"Available tasks: {', '.join(task_map)}."
+            )
+
+        if arch_name not in ModelRegistry.model_arch_name_to_cls:
+            raise ValueError(f"Model class '{arch_name}' not found in ModelRegistry.")
+
+        BidirectionalModelClass = ModelRegistry.model_arch_name_to_cls[arch_name]
+        logger.info(f"Using {arch_name} from registry")
+
+        return BidirectionalModelClass.from_pretrained(
+            model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
         )
 
-    arch_name = task_map.get(task)
-    if arch_name is None:
-        raise ValueError(
-            f"Unsupported task '{task}' for model type '{model_type}'. "
-            f"Available tasks: {', '.join(task_map)}."
+    # Fallback: use HuggingFace Auto classes for model types not in SUPPORTED_BACKBONES
+    logger.info(
+        f"Model type '{model_type}' not in SUPPORTED_BACKBONES; "
+        f"falling back to HuggingFace Auto classes"
+    )
+    if task == "score":
+        return AutoModelForSequenceClassification.from_pretrained(
+            model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
         )
-
-    if arch_name not in ModelRegistry.model_arch_name_to_cls:
-        raise ValueError(f"Model class '{arch_name}' not found in ModelRegistry.")
-
-    BidirectionalModelClass = ModelRegistry.model_arch_name_to_cls[arch_name]
-    logger.info(f"Using {arch_name} from registry")
-
-    return BidirectionalModelClass.from_pretrained(
+    return AutoModel.from_pretrained(
         model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
     )
 
@@ -184,35 +200,15 @@ SUPPORTED_BACKBONES = {
 }
 
 
-def _register_bidirectional_models():
-    """Register bidirectional models with HuggingFace Auto classes.
-
-    This is needed so that AutoModel.from_config(LlamaBidirectionalConfig)
-    works inside LlamaForSequenceClassification.__init__.
-    """
-    from nemo_automodel.components.models.llama_bidirectional.model import (
-        LlamaBidirectionalConfig,
-        LlamaBidirectionalModel,
-    )
-
-    try:
-        AutoConfig.register(LlamaBidirectionalConfig.model_type, LlamaBidirectionalConfig)
-    except ValueError:
-        pass  # Already registered
-    try:
-        AutoModel.register(LlamaBidirectionalConfig, LlamaBidirectionalModel)
-    except ValueError:
-        pass  # Already registered
-
-
-_register_bidirectional_models()
-
 
 def _init_encoder_common(encoder: nn.Module, model: PreTrainedModel) -> None:
     """Shared init for BiEncoderModel and CrossEncoderModel."""
     encoder.model = model
     encoder.config = model.config
-    encoder.name_or_path = os.path.dirname(inspect.getfile(type(model)))
+    if ModelRegistry.has_retrieval_model(model.__class__.__name__):
+        encoder.name_or_path = os.path.dirname(inspect.getfile(type(model)))
+    else:
+        encoder.name_or_path = getattr(model.config, "name_or_path", "")
     encoder.state_dict_adapter = EncoderStateDictAdapter()
     configure_encoder_metadata(model, model.config)
 

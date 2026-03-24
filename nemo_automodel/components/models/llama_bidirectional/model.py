@@ -279,6 +279,27 @@ class LlamaBidirectionalForSequenceClassification(LlamaPreTrainedModel):
 # Export for ModelRegistry auto-discovery
 ModelClass = [LlamaBidirectionalModel, LlamaBidirectionalForSequenceClassification]
 
+
+def _register_with_hf_auto_classes():
+    """Register bidirectional models with HuggingFace Auto classes.
+
+    This is needed so that AutoModel.from_config(LlamaBidirectionalConfig)
+    works inside LlamaForSequenceClassification.__init__.
+    """
+    from transformers import AutoConfig, AutoModel
+
+    try:
+        AutoConfig.register(LlamaBidirectionalConfig.model_type, LlamaBidirectionalConfig)
+    except ValueError:
+        pass  # Already registered
+    try:
+        AutoModel.register(LlamaBidirectionalConfig, LlamaBidirectionalModel)
+    except ValueError:
+        pass  # Already registered
+
+
+_register_with_hf_auto_classes()
+
 __all__ = [
     "LlamaBidirectionalModel",
     "LlamaBidirectionalConfig",

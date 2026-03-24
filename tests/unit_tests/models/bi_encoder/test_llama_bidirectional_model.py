@@ -21,6 +21,9 @@ from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 
 from nemo_automodel._transformers.retrieval import (
     BiEncoderModel,
+    CrossEncoderModel,
+    configure_encoder_metadata,
+    _init_encoder_common,
     pool,
 )
 from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
@@ -417,12 +420,23 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
     ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
     monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
 
-    # Unsupported model type from config
-    bad_dir = tmp_path / "bad"
-    bad_dir.mkdir()
-    (bad_dir / "config.json").write_text(json.dumps({"model_type": "bert"}))
-    with pytest.raises(ValueError):
-        BiEncoderModel.build(model_name_or_path=str(bad_dir))
+    # Model type not in SUPPORTED_BACKBONES should fall back to AutoModel
+    import nemo_automodel._transformers.retrieval as encoder_module
+
+    class FakeAutoModel(FakeLM):
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            inst = cls(hidden=16)
+            inst.config.name_or_path = args[0] if args else ""
+            return inst
+
+    monkeypatch.setattr(encoder_module.AutoModel, "from_pretrained", FakeAutoModel.from_pretrained)
+
+    bert_dir = tmp_path / "bert_model"
+    bert_dir.mkdir()
+    (bert_dir / "config.json").write_text(json.dumps({"model_type": "bert"}))
+    m_bert = BiEncoderModel.build(model_name_or_path=str(bert_dir))
+    assert isinstance(m_bert, BiEncoderModel)
 
     # For hub path tests, we need to mock AutoConfig.from_pretrained since the new code
     # calls it first to determine model type before using the registry
@@ -439,3 +453,98 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
     # Hub path
     m1 = BiEncoderModel.build(model_name_or_path="llama-tiny")
     assert isinstance(m1, BiEncoderModel)
+
+
+def test_build_generic_hf_model_score_task(tmp_path, monkeypatch):
+    """CrossEncoderModel should use AutoModelForSequenceClassification for unsupported model types."""
+    import nemo_automodel._transformers.retrieval as encoder_module
+
+    class FakeSeqClsModel(FakeLM):
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            inst = cls(hidden=16)
+            inst.config.name_or_path = args[0] if args else ""
+            return inst
+
+        def forward(self, input_ids=None, attention_mask=None, return_dict=True, **kwargs):
+            bsz = input_ids.shape[0]
+            return SequenceClassifierOutputWithPast(logits=torch.zeros(bsz, 2))
+
+    class FakeConfig:
+        model_type = "qwen3"
+
+    monkeypatch.setattr(encoder_module.AutoConfig, "from_pretrained", lambda *a, **kw: FakeConfig())
+    monkeypatch.setattr(
+        encoder_module.AutoModelForSequenceClassification, "from_pretrained", FakeSeqClsModel.from_pretrained
+    )
+
+    model = CrossEncoderModel.build(model_name_or_path=str(tmp_path), trust_remote_code=True)
+    assert isinstance(model, CrossEncoderModel)
+
+
+def test_configure_encoder_metadata_skips_auto_map_for_generic():
+    """auto_map should only be set for retrieval architectures, not generic HF models."""
+    Qwen3Model = type("Qwen3Model", (), {})
+    fake = Qwen3Model()
+
+    class FakeCfg:
+        pass
+
+    fake.config = FakeCfg()
+    configure_encoder_metadata(fake, fake.config)
+
+    assert fake.config.architectures == ["Qwen3Model"]
+    assert not hasattr(fake.config, "auto_map")
+
+
+def test_configure_encoder_metadata_sets_auto_map_for_retrieval():
+    """auto_map should be set for registered retrieval architectures."""
+
+    class FakeRetrievalModel:
+        pass
+
+    FakeRetrievalModel.__name__ = "LlamaBidirectionalModel"
+    FakeRetrievalModel = type("LlamaBidirectionalModel", (), {})
+    fake = FakeRetrievalModel()
+
+    class FakeCfg:
+        pass
+
+    FakeCfg.__name__ = "LlamaBidirectionalConfig"
+    FakeCfg = type("LlamaBidirectionalConfig", (), {})
+    fake.config = FakeCfg()
+
+    configure_encoder_metadata(fake, fake.config)
+
+    assert fake.config.architectures == ["LlamaBidirectionalModel"]
+    assert "auto_map" in vars(fake.config)
+    assert "AutoModel" in fake.config.auto_map
+
+
+def test_init_encoder_common_name_or_path_for_generic():
+    """For generic HF models, name_or_path should come from config, not inspect.getfile."""
+
+    class FakeCfg:
+        name_or_path = "Qwen/Qwen3-1.7B"
+        hidden_size = 16
+
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = FakeCfg()
+            self.linear = nn.Linear(16, 16)
+
+    # Use a class name that is NOT a retrieval arch
+    FakeModel.__name__ = "Qwen3Model"
+    FakeModel = type("Qwen3Model", (nn.Module,), {
+        "__init__": FakeModel.__init__,
+        "config": property(lambda self: self._config),
+    })
+    fake = object.__new__(FakeModel)
+    nn.Module.__init__(fake)
+    fake._config = FakeCfg()
+
+    encoder = nn.Module()
+    _init_encoder_common(encoder, fake)
+
+    assert encoder.name_or_path == "Qwen/Qwen3-1.7B"
