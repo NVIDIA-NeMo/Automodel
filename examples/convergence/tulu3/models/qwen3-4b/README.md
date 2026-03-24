@@ -1,6 +1,6 @@
 # Qwen3-4B — Tulu-3 Convergence
 
-Dense 4B model. 8 GPUs, CP=1, FSDP, 1000 steps on Tulu-3 (pre-filtered to seq_length=2048).
+Dense 4B model. 8 GPUs, FSDP, with CP=1 baselines plus a corrected CP=2 rerun on Tulu-3 (pre-filtered to seq_length=2048).
 
 ## Configs
 
@@ -27,13 +27,16 @@ Then pass the cached path via `--dataset.path_or_dataset_id <cached_dir>`.
 
 ## Results (rebased on main)
 
+**CP=2 eval note:** On the current vLLM/lm-eval stack, Qwen3 needs `--thinking --gen-kwargs "until=<|im_end|>"` to match the historical README-era scores. Without explicit `<|im_end|>` stopping, newer stacks underreport Qwen3 instruction-following quality.
+
 ### IFEval Results
 
 | Model | prompt_strict | prompt_loose | inst_strict | inst_loose |
 |-------|-------------:|-------------:|------------:|-----------:|
 | Qwen3-4B-Base (pretrained) | 0.274 | 0.296 | 0.416 | 0.444 |
-| SFT from Base, FlashAdamW | **0.610** | 0.625 | **0.704** | 0.719 |
-| SFT from Base, TE FusedAdam | 0.612 | **0.634** | 0.705 | **0.725** |
+| SFT from Base, FlashAdamW | 0.610 | 0.625 | 0.704 | 0.719 |
+| SFT from Base, FlashAdamW + CP=2 | **0.623** | **0.653** | **0.717** | **0.741** |
+| SFT from Base, TE FusedAdam | 0.612 | 0.634 | 0.705 | 0.725 |
 
 ### Inference Quality
 
@@ -41,11 +44,12 @@ Failure modes detected by `inference/analyze_quality.py` on IFEval outputs.
 
 | Model | Death Loop | Abrupt Ending | Missing EOS | Empty |
 |-------|----------:|--------------:|------------:|------:|
-| Qwen3-4B-Base (pretrained) | 12.0% | **61.4%** | 0% | 0% |
+| Qwen3-4B-Base (pretrained) | 12.0% | 61.4% | 0% | 0% |
 | SFT from Base, FlashAdamW | 15.0% | 20.0% | 0% | 0% |
+| SFT from Base, FlashAdamW + CP=2 | 20.1% | 21.8% | 0% | 0% |
 | SFT from Base, TE FusedAdam | 17.6% | 22.2% | 0% | 0% |
 
-SFT dramatically reduces abrupt endings (61% → 20%) as the model learns complete response patterns. Death loop rate increases slightly (12% → 15-18%) — the model sometimes gets stuck repeating content it learned from training.
+SFT dramatically reduces abrupt endings (61% → ~20-22%) as the model learns complete response patterns. Death loop rate increases from the pretrained baseline (12%) into the low-20% range on the fine-tuned runs, suggesting response completion improved more than stop-behavior robustness.
 
 ### Training Loss
 

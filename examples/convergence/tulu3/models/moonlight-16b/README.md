@@ -1,6 +1,6 @@
 # Moonlight 16B (A3B) — Tulu-3 Convergence
 
-MoE 16B (3B active) model based on DeepSeek V3 architecture. 64 routed experts, 2 shared experts, top-6 routing. 8 GPUs, EP=8, FSDP, 1000 steps on Tulu-3 (pre-filtered to seq_length=2048).
+MoE 16B (3B active) model based on DeepSeek V3 architecture. 64 routed experts, 2 shared experts, top-6 routing. 8 GPUs, EP=8, FSDP baselines plus a corrected CP=2 rerun on Tulu-3 (pre-filtered to seq_length=2048).
 
 **Model:** [moonshotai/Moonlight-16B-A3B](https://huggingface.co/moonshotai/Moonlight-16B-A3B)
 
@@ -61,10 +61,11 @@ bash examples/convergence/tulu3/eval/run_eval.sh \
     --tokenizer moonshotai/Moonlight-16B-A3B \
     --tasks ifeval \
     --tp-size 1 --dp-size 1 \
-    -- --model_args "pretrained=$CKPT,tokenizer=moonshotai/Moonlight-16B-A3B,tensor_parallel_size=1,dtype=auto,gpu_memory_utilization=0.8,data_parallel_size=1,enable_thinking=False,trust_remote_code=True"
+    --extra-model-args "trust_remote_code=True" \
+    --gen-kwargs "until=<|im_end|>"
 ```
 
-**Note:** `trust_remote_code=True` must be passed via `--model_args` for the TikToken tokenizer.
+**Note:** Moonlight's assistant turns end with `<|im_end|>`, so newer vLLM/lm-eval stacks need `--gen-kwargs "until=<|im_end|>"` for correct stopping. `trust_remote_code=True` is also required for the TikToken tokenizer.
 
 ## Results
 
@@ -75,6 +76,7 @@ bash examples/convergence/tulu3/eval/run_eval.sh \
 | Moonlight-16B-A3B (pretrained) | 0.148 | 0.179 | 0.278 | 0.312 |
 | TE FusedAdam FP32+BF16, gate=1e-4 | 0.381 | 0.473 | 0.534 | 0.607 |
 | FlashAdamW 32-bit, fp32_upcast | 0.412 | 0.501 | 0.559 | 0.634 |
+| FlashAdamW 32-bit, fp32_upcast, CP=2 | **0.568** | **0.595** | **0.673** | **0.697** |
 
 ### Training Loss
 
@@ -105,13 +107,15 @@ MoE load balancing is healthy: zero dead experts, diversity ~0.89 (1.0=uniform),
 | Moonlight-16B-A3B (pretrained) | 22.2% | 73.4% | 0% | 0% |
 | TE FusedAdam FP32+BF16, gate=1e-4 | 22.7% | 47.1% | 0% | 0% |
 | FlashAdamW 32-bit, fp32_upcast | 22.2% | 19.2% | 0% | 0% |
+| FlashAdamW 32-bit, fp32_upcast, CP=2 | **12.2%** | **15.0%** | 0% | 0% |
 
 ### Key Takeaways
 
-- SFT significantly improves instruction following: prompt_strict 0.148 → 0.412 (+179%), inst_strict 0.278 → 0.559 (+101%).
-- **FlashAdamW 32-bit with fp32_upcast is the best configuration** — highest IFEval scores (prompt_strict=0.412, inst_loose=0.634) and dramatically lower abrupt ending rate (19.2% vs 47-62%).
-- The combination of FP32 master weights + FP32 loss upcasting provides better numerical precision that translates to significantly improved generation quality.
-- Death loop rate (~20-22%) remains consistent across all runs — needs further investigation (lower lr, more steps, or thinking-aware template).
+- SFT significantly improves instruction following: prompt_strict 0.148 → 0.568 (+284%), inst_strict 0.278 → 0.673 (+142%).
+- **FlashAdamW 32-bit with fp32_upcast remains the strongest setup, and the corrected CP=2 rerun is the best published result on the current eval stack**.
+- The combination of FP32 master weights + FP32 loss upcasting continues to translate into better generation quality.
+- Moonlight evals need explicit `<|im_end|>` stopping on newer vLLM/lm-eval stacks; without it, both IFEval and inference-quality numbers are understated.
+- The corrected CP=2 rerun also reduces death loops materially (12.2%) while keeping abrupt endings low (15.0%).
 - Dataset pre-filtering is required — variable-length batching can hit sequences that cause memory spikes with the large vocabulary.
 - `rms_norm: te` and `enable_fsdp_optimizations: true` from the benchmark config are needed for reasonable memory usage.
 - The TikToken tokenizer requires a patch for `{% generation %}` tag support (slow tokenizer fallback) and to prevent spurious BOS/EOS insertion.
