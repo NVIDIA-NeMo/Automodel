@@ -190,17 +190,26 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         return state_dict
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
-        """Rename a single native key to HF format and transpose expert tensors."""
+        """Rename a single native key to HF format and transpose expert tensors.
+
+        Expert tensors are materialized via to_local() before transposing so that
+        DCP sees plain local-shard tensors with HF layout, not transposed DTensor
+        views whose shard placements would confuse the DCP planner.
+        """
         exclude_key_regex = kwargs.get("exclude_key_regex")
 
         new_fqn = fqn
         value = tensor
         if ".mlp.experts.gate_and_up_projs" in fqn:
             new_fqn = fqn.replace(".mlp.experts.gate_and_up_projs", ".mlp.experts.gate_up_proj")
-            value = tensor.transpose(1, 2)
+            if state_dict_utils.is_dtensor(tensor):
+                tensor = tensor.to_local()
+            value = tensor.transpose(1, 2).contiguous()
         elif ".mlp.experts.down_projs" in fqn:
             new_fqn = fqn.replace(".mlp.experts.down_projs", ".mlp.experts.down_proj")
-            value = tensor.transpose(1, 2)
+            if state_dict_utils.is_dtensor(tensor):
+                tensor = tensor.to_local()
+            value = tensor.transpose(1, 2).contiguous()
 
         # Apply shared_experts → shared_expert reverse mapping
         for pattern, replacement in self.internal_to_hf_map.items():
