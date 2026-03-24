@@ -12,17 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 # To run this recipe, please use the following command:
 # torchrun --nproc-per-node=8 recipes/llm/finetune.py --config recipes/llm/qwen_3_0p6b_hellaswag.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
 benchmark:
-  description: Llama-3.1-8B SFT on hellaswag with pipeline parallelism
+  description: Llama-3.1-8B SFT fine-tuning on HellaSwag, with pipeline parallelism
   warmup_steps: 20
   max_steps: 200
   num_nodes: 1
-  num_gpus: 2
+  num_gpus: 8
   cadence: 1
 
 step_scheduler:
@@ -64,7 +63,6 @@ distributed:
     pp_schedule: interleaved1f1b
     pp_microbatch_size: 4
     scale_grads_in_schedule: false
-
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

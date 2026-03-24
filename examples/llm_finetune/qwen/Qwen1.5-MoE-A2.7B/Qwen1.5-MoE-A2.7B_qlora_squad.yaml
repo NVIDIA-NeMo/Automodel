@@ -1,0 +1,104 @@
+# ------------------------------------------------------------------------------------------------
+# Single-GPU QLoRA Example for Qwen1.5-MoE-A2.7B
+# ------------------------------------------------------------------------------------------------
+# This config demonstrates MoE LoRA training on a single GPU using 4-bit quantization (QLoRA).
+#
+# Key differences from multi-GPU DeepEP configs:
+# - Uses 4-bit quantization to fit in single GPU memory
+# - No Expert Parallelism (ep_size defaults to 1)
+# - No DeepEP backend (requires multi-GPU)
+# - Smaller batch sizes appropriate for single GPU
+# ------------------------------------------------------------------------------------------------
+
+benchmark:
+  description: Qwen1.5-MoE-A2.7B QLoRA fine-tuning on SQuAD
+  warmup_steps: 20
+  max_steps: 200
+  num_nodes: 1
+  num_gpus: 8
+  cadence: 1
+  fake_balanced_gate: True
+
+quantization:
+  load_in_4bit: true
+  bnb_4bit_compute_dtype: bfloat16
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_quant_type: "nf4"
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 4
+  ckpt_every_steps: 50
+  val_every_steps: 50
+  num_epochs: 1
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen1.5-MoE-A2.7B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  force_hf: true
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: True
+  dim: 16
+  alpha: 32
+  dropout: 0.05
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/qwen_moe_lora
+  model_save_format: safetensors
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+
+  sequence_parallel: false
+  activation_checkpointing: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+  tokenizer:
+    pretrained_model_name_or_path: Qwen/Qwen1.5-MoE-A2.7B
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+  num_workers: 2
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: validation
+  limit_dataset_samples: 64
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 2
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
