@@ -58,6 +58,7 @@ except ModuleNotFoundError:
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.model import Block
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -65,6 +66,7 @@ from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
+from .cp_linear_attn import CPAwareGatedDeltaNet
 from .state_dict_adapter import Qwen3_5MoeStateDictAdapter
 
 
@@ -74,9 +76,9 @@ class Qwen3_5MoeBlock(Block):
 
     def __init__(self, layer_idx, config, moe_config, backend):
         super().__init__(layer_idx, config, moe_config, backend)
-        # Replace the Qwen3Next fused GatedDeltaNet with the Qwen3.5-MoE native one
+        # Replace the Qwen3Next fused GatedDeltaNet with CP-aware variant
         if self.layer_type == "linear_attention":
-            self.linear_attn = Qwen3_5MoeGatedDeltaNet(config, layer_idx)
+            self.linear_attn = CPAwareGatedDeltaNet(config, layer_idx)
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
@@ -95,7 +97,11 @@ class Qwen3_5MoeBlock(Block):
             ]
             for linear in linear_list:
                 nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-            self.linear_attn.norm.reset_parameters()
+            if hasattr(self.linear_attn.norm, "reset_parameters"):
+                self.linear_attn.norm.reset_parameters()
+            else:
+                # HF Qwen3_5MoeRMSNormGated has no reset_parameters; manually reset weight to ones
+                self.linear_attn.norm.weight.data.fill_(1.0)
         self.mlp.init_weights(buffer_device)
 
 
@@ -303,6 +309,14 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
             position_ids = position_ids[1:]
 
+        # When context parallelism is active the attention_mask is NOT sharded
+        # along the sequence dimension (it keeps shape [B, S_global] while
+        # hidden_states are [B, S_local]).  Both TE ring-attention and FLA CP
+        # do not support padding masks, so we null them out.
+        if getattr(self, "_cp_enabled", False):
+            attention_mask = None
+            padding_mask = None
+
         if padding_mask is None and attention_mask is not None:
             padding_mask = attention_mask.bool().logical_not()
 
@@ -320,6 +334,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
                 freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
+                position_ids=position_ids,
                 **attn_kwargs,
             )
 
@@ -541,7 +556,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
 
         with buffer_device:
             self.model.language_model.rotary_emb.device = buffer_device

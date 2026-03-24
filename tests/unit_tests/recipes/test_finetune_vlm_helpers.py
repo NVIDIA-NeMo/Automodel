@@ -434,7 +434,6 @@ def test_autoprocessor_exception_handling(caplog):
 
 def test_autoprocessor_loads_inside_first_rank_per_node():
     """Test that processor instantiation happens inside the FirstRankPerNode context."""
-    import logging
 
     from nemo_automodel.recipes.vlm.finetune import build_dataloader
 
@@ -516,6 +515,71 @@ def test_autoprocessor_with_processor_kwargs(caplog):
         # Verify the results
         assert processor is None
         mock_from_pretrained.assert_called_once_with("test/model", trust_remote_code=True, some_param="value")
+
+
+# -----------------------------------------------------------------------------
+# chat_template override tests for build_dataloader
+# -----------------------------------------------------------------------------
+
+
+def test_build_dataloader_chat_template_applied():
+    """chat_template in dataset config is applied to processor and not leaked to dataset target."""
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    ds_calls = []
+
+    def ds_factory(path_or_dataset, split=None):
+        ds_calls.append({"path_or_dataset": path_or_dataset, "split": split})
+        return []
+
+    class DummyProcessor:
+        def __init__(self):
+            self.chat_template = "{{ default }}"
+            self.tokenizer = SimpleNamespace(chat_template="{{ default }}")
+
+    processor = DummyProcessor()
+    cfg_ds = ConfigNode(
+        {"_target_": ds_factory, "path_or_dataset": "ds/path", "split": "train", "chat_template": "{{ custom }}"}
+    )
+    cfg_dl = MagicMock()
+    cfg_dl.get.return_value = None
+    cfg_dl.instantiate.return_value = MagicMock()
+
+    with patch("transformers.AutoProcessor.from_pretrained", return_value=processor), \
+         patch("torch.utils.data.distributed.DistributedSampler"), \
+         patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"default": MagicMock()}):
+        _, built_processor = build_dataloader(cfg_ds, cfg_dl, "model", None, None, 42, 1)
+
+    assert built_processor.chat_template == "{{ custom }}"
+    assert built_processor.tokenizer.chat_template == "{{ custom }}"
+    assert ds_calls == [{"path_or_dataset": "ds/path", "split": "train"}]
+
+
+def test_build_dataloader_no_chat_template():
+    """Without chat_template, processor template stays unchanged."""
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    def ds_factory(path_or_dataset, split=None):
+        return []
+
+    class DummyProcessor:
+        def __init__(self):
+            self.chat_template = "{{ original }}"
+            self.tokenizer = SimpleNamespace(chat_template="{{ original }}")
+
+    processor = DummyProcessor()
+    cfg_ds = ConfigNode({"_target_": ds_factory, "path_or_dataset": "ds/path", "split": "train"})
+    cfg_dl = MagicMock()
+    cfg_dl.get.return_value = None
+    cfg_dl.instantiate.return_value = MagicMock()
+
+    with patch("transformers.AutoProcessor.from_pretrained", return_value=processor), \
+         patch("torch.utils.data.distributed.DistributedSampler"), \
+         patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"default": MagicMock()}):
+        _, built_processor = build_dataloader(cfg_ds, cfg_dl, "model", None, None, 42, 1)
+
+    assert built_processor.chat_template == "{{ original }}"
+    assert built_processor.tokenizer.chat_template == "{{ original }}"
 
 
 # -----------------------------------------------------------------------------
@@ -1329,6 +1393,83 @@ class TestForwardBackwardStepPP:
 
         # Should log warning about mismatched images
         assert any("giving all images to first microbatch" in record.message for record in caplog.records)
+
+    def test_pp_vlm_chunking_with_image_sizes(self, pp_recipe, monkeypatch):
+        """Test VLM pixel_values chunking with image_sizes fallback (e.g., Mistral4-style)."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+        )
+
+        batch_size = 4
+        # image_sizes: [N_images, 2] — no image_grid_hws or image_grid_thw
+        image_sizes = torch.tensor([[224, 224], [224, 224], [224, 224], [224, 224]])
+        # 4D pixel_values: [N_images, C, H, W]
+        pixel_values = torch.randn(batch_size, 3, 224, 224)
+
+        batch = {
+            "labels": torch.randint(0, 100, (batch_size, 10)),
+            "input_ids": torch.randint(0, 100, (batch_size, 10)),
+            "pixel_values": pixel_values,
+            "image_sizes": image_sizes,
+        }
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=40,
+            num_batches=1,
+            is_train=True,
+        )
+
+        model = pp_recipe.model_parts[0]
+        assert model._vlm_pixel_values_chunks is None  # Cleared after step
+        assert model._vlm_image_grid_hws_chunks is None
+        assert model._vlm_chunk_idx is None
+        pp_recipe.pp.info.schedule.step.assert_called_once()
+        assert len(loss_buffer) == 1
+
+    def test_pp_vlm_chunking_4d_pixel_values(self, pp_recipe, monkeypatch):
+        """Test VLM pixel_values chunking when pixel_values is 4D [N, C, H, W]."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+        )
+
+        batch_size = 4
+        image_grid_hws = torch.tensor([[224, 224], [224, 224], [224, 224], [224, 224]])
+        # 4D pixel_values — triggers the new dim==4 chunking path
+        pixel_values = torch.randn(batch_size, 3, 224, 224)
+
+        batch = {
+            "labels": torch.randint(0, 100, (batch_size, 10)),
+            "input_ids": torch.randint(0, 100, (batch_size, 10)),
+            "pixel_values": pixel_values,
+            "image_grid_hws": image_grid_hws,
+        }
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=40,
+            num_batches=1,
+            is_train=True,
+        )
+
+        model = pp_recipe.model_parts[0]
+        assert model._vlm_pixel_values_chunks is None  # Cleared after step
+        assert model._vlm_image_grid_hws_chunks is None
+        assert model._vlm_chunk_idx is None
+        pp_recipe.pp.info.schedule.step.assert_called_once()
+        assert len(loss_buffer) == 1
 
     def test_pp_last_stage_computes_loss(self, pp_recipe, monkeypatch):
         """Test that last stage computes and buffers loss."""

@@ -344,7 +344,7 @@ def make_cv17_dataset(path_or_dataset="ysdede/commonvoice_17_tr_fixed", split="t
     def format(example):
         return {
             "conversation": [
-                {"role": "user", "content": "<|audio_1|>Transcribe the Turkish audio clip."},
+                {"role": "user", "content": "<|endoftext11|>Transcribe the Turkish audio clip."},
                 {"role": "assistant", "content": example["transcription"]},
             ],
             "audio": (example["audio"]["array"], example["audio"]["sampling_rate"]),

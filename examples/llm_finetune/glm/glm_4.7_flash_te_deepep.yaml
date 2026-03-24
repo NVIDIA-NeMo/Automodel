@@ -34,7 +34,7 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
-    rms_norm: te
+    rms_norm: torch_fp32
     experts: gmm
     dispatcher: deepep
     fake_balanced_gate: false
@@ -63,6 +63,13 @@ distributed:
   ep_size: 8
   sequence_parallel: false
   activation_checkpointing: true
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+  sequence_parallel: false
+  activation_checkpointing: true
+
   moe:
     reshard_after_forward: false
     wrap_outer_model: false

@@ -21,6 +21,9 @@
 </div>
 
 ## 📣 News and Discussions
+- [03/16/2026][Mistral Small 4](https://huggingface.co/mistralai/Mistral-Small-4-119B-2603) We support fine-tuning for Mistral4 119B! Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml).
+- [03/11/2026][Nemotron Super v3](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16) We support fine-tuning for `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16`. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml).
+- [03/11/2026][GLM-5](https://huggingface.co/zai-org/GLM-5) We now support finetuning `zai-org/GLM-5`. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml).
 - [03/02/2026][Qwen3.5 small models](https://huggingface.co/collections/Qwen/qwen35) We support finetuning for Qwen3.5 small models 0.8B, 2B, 4B ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_4b.yaml)) and 9B ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_9b.yaml))
 - [02/16/2026][Qwen3.5 MoE](https://huggingface.co/collections/Qwen/qwen35) We support finetuning for `Qwen/Qwen3.5-397B-A17B` ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml)) and `Qwen/Qwen3.5-35B-A3B` ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml))
 - [02/13/2026][MiniMax-M2.5](https://huggingface.co/MiniMaxAI/MiniMax-M2.5) We support finetuning for `MiniMaxAI/MiniMax-M2.5`. Checkout our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml)
