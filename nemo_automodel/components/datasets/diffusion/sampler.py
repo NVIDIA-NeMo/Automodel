@@ -170,8 +170,12 @@ class SequentialBucketSampler(Sampler[List[int]]):
             total_size = math.ceil(len(indices) / self.num_replicas) * self.num_replicas
             padding_size = total_size - len(indices)
             if padding_size > 0:
-                # Pad by repeating indices from the beginning
-                indices = indices + indices[:padding_size]
+                # Pad by cycling through indices to reach the required size.
+                # Simple slicing (indices[:padding_size]) fails when
+                # padding_size > len(indices), producing fewer elements than
+                # needed and causing uneven per-rank splits.
+                padding = [indices[i % len(indices)] for i in range(padding_size)]
+                indices = indices + padding
 
             # 5. DDP Splitting: Subsample indices for this rank
             indices = indices[self.rank :: self.num_replicas]
