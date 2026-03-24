@@ -53,7 +53,7 @@ class LlamaBidirectionalConfig(LlamaConfig):
     and pooling configurations.
     """
 
-    model_type = "LlamaBidirectionalModel"
+    model_type = "llama_bidirec"
 
     def __init__(
         self,
