@@ -23,7 +23,7 @@ benchmark:
   warmup_steps: 5
   max_steps: 200
   num_nodes: 1
-  num_gpus: 8
+  num_gpus: 1
   cadence: 1
   nsys_end: -1
   nsys_ranks: []

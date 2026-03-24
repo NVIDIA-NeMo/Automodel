@@ -21,7 +21,7 @@ benchmark:
   warmup_steps: 20
   max_steps: 200
   num_nodes: 1
-  num_gpus: 8
+  num_gpus: 1
   cadence: 1
 
 step_scheduler:
