@@ -17,12 +17,6 @@ exempt_models:
 exempt_configs:
   gemma3_vl_4b_cord_v2_megatron_fsdp:
     reason: "Known issue megatron fsdp support,PIC: @akoumparouli, 3680"
-  kimi25vl_medpix:
-    reason: "Missing hf cache"
-  qwen3_vl_moe_235b:
-    reason: "Cluster specific failures"
 
 known_issue:
-  phi4_mm_cv17:
-    reason: "Won't fix in 26.02"
 
