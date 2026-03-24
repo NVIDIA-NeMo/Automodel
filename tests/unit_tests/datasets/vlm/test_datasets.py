@@ -230,7 +230,7 @@ def test_make_cv17_dataset(monkeypatch):
         # Test user turn
         user_turn = conversation[0]
         assert user_turn["role"] == "user"
-        assert user_turn["content"] == "<|audio_1|>Transcribe the Turkish audio clip."
+        assert user_turn["content"] == "<|endoftext11|>Transcribe the Turkish audio clip."
 
         # Test assistant turn
         assistant_turn = conversation[1]

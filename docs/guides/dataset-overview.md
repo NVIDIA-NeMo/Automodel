@@ -466,6 +466,18 @@ Each example follows the conversation schema expected by `apply_chat_template`, 
 }
 ```
 
+### Custom Chat Template
+By default, VLM fine-tuning uses the chat template built into the model's `AutoProcessor`. To override it, add `chat_template` under `dataset:` in your YAML config:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  split: train
+  chat_template: "{% for msg in messages %}{{ msg.role }}: {{ msg.content }}\n{% endfor %}"
+```
+
+`chat_template` accepts a Jinja template string, a path to a `.jinja` file, or a path to a JSON file containing a `chat_template` key. The override is applied to both the processor and its tokenizer before dataset instantiation.
+
 ### Collate Functions
 - `nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn`
 - `nemo_automodel.components.datasets.vlm.collate_fns.qwen2_5_collate_fn` (Qwen2.5 VL)
@@ -482,6 +494,38 @@ dataloader:
 If you want answer-only loss masking, provide a model-appropriate `start_of_response_token` to the collate function.
 
 See [Gemma-3n](omni/gemma3-3n.md) and [VLM dataset](vlm/dataset.md) for end-to-end examples.
+
+---
+
+## Diffusion Datasets
+
+Diffusion models don't train directly on raw images or videos. Instead, the data is first encoded into a compact numerical representation called a latent — this is what the model actually learns from. Text captions are similarly converted into text embeddings that the model uses as conditioning.
+
+This encoding is done once during preprocessing, and the results are saved as cache files (.meta). Training then reads these cache files directly, which is significantly faster than re-encoding on every step.
+
+The built-in preprocessing tool ([`tools/diffusion/preprocessing_multiprocess.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/diffusion/preprocessing_multiprocess.py)) handles this conversion. It uses a VAE (Variational Autoencoder) to encode visual data and a text encoder for captions, grouping outputs into resolution-bucketed directories compatible with the multiresolution dataloader.
+
+### Dataloader Builders
+
+- **Video (T2V)**: `nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader` — for Wan 2.1 and HunyuanVideo
+- **Image (T2I)**: `nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader` — for FLUX.1-dev
+
+### Example YAML (Video Dataloader)
+
+```yaml
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
+    cache_dir: /path/to/processed_meta
+    model_type: wan
+    base_resolution: [512, 512]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+    num_workers: 0
+```
+
+See the [Diffusion Dataset Preparation](diffusion/dataset.md) guide for full preprocessing instructions and configuration details.
 
 ---
 

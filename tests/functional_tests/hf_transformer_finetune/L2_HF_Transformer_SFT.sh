@@ -15,7 +15,7 @@
 #!/bin/bash
 set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
-TRANSFORMERS_OFFLINE=1 coverage run --data-file=/workspace/.coverage --source=/workspace --parallel-mode \
+TRANSFORMERS_OFFLINE=1 coverage run \
 examples/llm_finetune/finetune.py \
   --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
   --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \

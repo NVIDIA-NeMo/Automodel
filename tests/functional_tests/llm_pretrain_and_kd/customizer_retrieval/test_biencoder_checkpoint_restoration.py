@@ -81,9 +81,6 @@ def _run_training(recipe_yaml: str, checkpoint_dir: str) -> Path:
     cmd = [
         sys.executable,
         "-m", "coverage", "run",
-        "--data-file=/workspace/.coverage",
-        "--source=/workspace/",
-        "--parallel-mode",
         "-m", "nemo_automodel.recipes.biencoder.train_biencoder",
         "--config",
         recipe_yaml,
