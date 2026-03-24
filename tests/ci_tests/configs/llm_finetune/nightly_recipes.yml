@@ -38,3 +38,13 @@ configs:
   - seed/seed_coder_8b_instruct_squad_peft.yaml
   - starcoder/starcoder_2_7b_squad.yaml
   - stepfun/step_3.5_flash_hellaswag_pp.yaml
+  - phi/phi_4_squad.yaml
+  - phi/phi_4_squad_tp2_peft.yaml
+  - phi/phi_3_mini_it_squad.yaml
+  - phi/phi_2_squad_tp2_peft.yaml
+  - phi/phi_2_squad_peft.yaml
+  - nemotron/llama3_3_nemotron_super_49B_squad.yaml
+  - nemotron/llama3_3_nemotron_super_49B_squad_peft.yaml
+  - nemotron/llama3_3_nemotron_super_49B_squad_tp2.yaml
+  - gpt_oss/gpt_oss_20b_single_gpu.yaml
+  - gpt_oss/gpt_oss_20b_single_gpu_peft.yaml
