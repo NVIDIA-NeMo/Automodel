@@ -100,3 +100,6 @@ optimizer:
 #   entity: <your_wandb_entity>
 #   name: llama3_1_8b_squad_qlora
 #   save_dir: <your_wandb_save_dir> 
+
+ci:
+  time: "00:15:00"

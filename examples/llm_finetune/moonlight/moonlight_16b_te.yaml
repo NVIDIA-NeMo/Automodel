@@ -126,3 +126,6 @@ optimizer:
 #   entity: Nemo-automodel
 #   name: moonlight-16b-te-grouped-linear
 #   dir: /tmp/wandb
+
+ci:
+  node_multiplier: true
