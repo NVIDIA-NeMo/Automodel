@@ -38,7 +38,6 @@ configs:
   - seed/seed_coder_8b_instruct_squad_peft.yaml
   - starcoder/starcoder_2_7b_squad.yaml
   - stepfun/step_3.5_flash_hellaswag_pp.yaml
-  - phi/phi_4_squad.yaml
   - phi/phi_4_squad_tp2_peft.yaml
   - phi/phi_3_mini_it_squad.yaml
   - phi/phi_2_squad_tp2_peft.yaml
