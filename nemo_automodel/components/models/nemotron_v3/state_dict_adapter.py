@@ -97,7 +97,8 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             HuggingFace format state dict
         """
         hf_state_dict = {}
-        for fqn, tensor in state_dict.items():
+        for fqn in list(state_dict.keys()):
+            tensor = state_dict.pop(fqn)
             converted_tensors = self.convert_single_tensor_to_hf(
                 fqn, tensor, exclude_key_regex=exclude_key_regex, **kwargs
             )
@@ -129,13 +130,14 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         """
         # Detect if HF checkpoint uses 'backbone' or 'model' prefix
         for key in hf_state_dict.keys():
-            if ".mixer.experts." in key and key.endswith(".weight"):
+            if ".mixer.experts." in key:
                 self._uses_model_prefix = not key.startswith("backbone.")
                 break
 
         # First, rename backbone → model and norm_f → norm
         renamed_state_dict = {}
-        for key, value in hf_state_dict.items():
+        for key in list(hf_state_dict.keys()):
+            value = hf_state_dict.pop(key)
             new_key = key
             if new_key.startswith("backbone."):
                 new_key = "model." + new_key[len("backbone.") :]

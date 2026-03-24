@@ -82,10 +82,11 @@ dependencies = [
     "pyyaml",
     "torch>=2.6.0,<=2.10.0",
     "torchdata",
-    "transformers>=5.0.0",
+    "transformers>=5.3.0",
     "wandb",
     "torchao",
     "mlflow",
+    "flashoptim>=0.1.3",
 ]
 
 [project.optional-dependencies]
@@ -94,7 +95,9 @@ diffusion = [
     "ftfy",
     "imageio",
     "imageio-ffmpeg",
+    "kernels",
     "opencv-python-headless",
+    "torchvision",
 ]
 # nvidia-cudnn-cu12 pin: This is required for GPTOSS TE support + faster cudnn attention (only on Linux where CUDA is available)
 # "nvidia-cudnn-cu12>=9.18.0.0; sys_platform == 'linux'",
@@ -102,7 +105,6 @@ diffusion = [
 # https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
 # "flash-attn==2.8.1",
 cuda = [
-    "bitsandbytes",
     "causal-conv1d",
     "mamba-ssm",
     "nv-grouped-gemm",
@@ -110,7 +112,10 @@ cuda = [
     "onnxscript>=0.5.6",
     "transformer-engine[pytorch]<=2.11.0",
 ]
-extra = ["flash-linear-attention", "perceptron", "sentencepiece"]
+cuda_source = [
+    "bitsandbytes",
+]
+extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
 delta-databricks = [
     "deltalake>=1.0.0",  # For Delta Lake metadata
@@ -167,7 +172,13 @@ linting = [
     "ty>=0.0.20",
 ]
 test = ["coverage", "pytest", "peft>=0.18.1", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
-dev = ["cut-cross-entropy", "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')", "dion @ git+https://github.com/microsoft/dion.git; platform_machine == 'x86_64' and platform_system != 'Darwin'"]
+# CP for linear attention (fla.ops.cp) requires fla > 0.4.1; pin to main until a release includes it.
+dev = [
+    "cut-cross-entropy",
+    "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@7cbe461b10bde60180c32c5f9381a04d41887514",
+    "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "dion @ git+https://github.com/microsoft/dion.git; platform_machine == 'x86_64' and platform_system != 'Darwin'",
+]
 
 [tool.uv]
 default-groups = ["build", "docs", "test"]
@@ -201,7 +212,13 @@ prerelease = "allow"
 deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "e3908bf5bd0cc6265bcb225d15cd8c996d4759ef" }
 cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
 liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" }
+onnxruntime-gpu = { index = "onnxruntime-cuda-13" }
 torch = [
+  { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
+  { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
+  { index = "pypi", marker = "sys_platform == 'darwin'" },
+]
+torchvision = [
   { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
   { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
@@ -225,6 +242,11 @@ explicit = true
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "onnxruntime-cuda-13"
+url = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-13/pypi/simple/"
 explicit = true
 
 # Augment build dependencies for packages that need torch at build time
@@ -251,9 +273,11 @@ requires-dist = ["torch", "packaging", "ninja", "setuptools"]
 pythonpath = ["."]
 
 [tool.coverage.paths]
-source = [".", "/workspace", "/home/runner/work/Automodel/Automodel"]
+source = [".", "/opt/Automodel", "/home/runner/work/Automodel/Automodel"]
 
 [tool.coverage.run]
+source = ["nemo_automodel"]
+parallel = true
 concurrency = ["thread", "multiprocessing"]
 omit = [
     "nemo_automodel/components/checkpoint/_backports/*.py",
@@ -295,6 +319,8 @@ select = [
     "I",    # isort
     "D101", # docstring
     "D103",
+    "S301", # no pickle
+    "S403", # no pickle
 ]
 
 ignore = [

@@ -68,7 +68,7 @@ def build_model_and_optimizer(
             Required when finetune_mode is False. Should contain:
             - transformer_cls: str (e.g., "WanTransformer3DModel", "FluxTransformer2DModel")
             - subfolder: str (e.g., "transformer")
-            - Optional: pipeline_cls, load_full_pipeline, enable_gradient_checkpointing
+            - Optional: pipeline_cls, load_full_pipeline
 
     Returns:
         Tuple of (pipeline, optimizer, device_mesh or None).
@@ -620,7 +620,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                         )
 
                 if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(epoch, global_step)
+                    self.save_checkpoint(epoch, global_step, epoch_loss / num_steps)
 
             avg_loss = epoch_loss / num_steps
             logging.info(f"[INFO] Epoch {epoch + 1} complete. avg_loss={avg_loss:.6f}")

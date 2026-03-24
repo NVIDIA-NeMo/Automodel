@@ -63,11 +63,6 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Checkout repository
-      uses: actions/checkout@v2
-      with:
-        path: NeMo-Automodel
-
     - name: Install Azure CLI
       if: ${{ inputs.has-azure-credentials == 'true' }}
       shell: bash
@@ -120,9 +115,7 @@ runs:
           --env HF_HOME=/home/TestData/HF_HOME \
           --env RUN_ID=${{ github.run_id }} \
           --env TEST_DATA_DIR=/home/TestData/automodel \
-          --volume $(pwd)/NeMo-Automodel:/workspace \
           --volume ${{ inputs.test-data-path }}:/home/TestData \
-          --workdir /workspace \
           ${{ inputs.container-image }} \
           bash -c "sleep $(( ${{ inputs.timeout }} * 60 + 60 ))"
         RUN_TEST_EOF
@@ -178,8 +171,8 @@ runs:
         echo "::group::Check result"
         docker exec nemo_container_${{ github.run_id }} /opt/venv/bin/coverage combine || true
         docker exec nemo_container_${{ github.run_id }} /opt/venv/bin/coverage xml || true
-        docker cp nemo_container_${{ github.run_id }}:/workspace/.coverage .coverage
-        docker cp nemo_container_${{ github.run_id }}:/workspace/coverage.xml coverage.xml
+        docker cp nemo_container_${{ github.run_id }}:/opt/Automodel/.coverage .coverage
+        docker cp nemo_container_${{ github.run_id }}:/opt/Automodel/coverage.xml coverage.xml
 
         coverage_report=coverage-${{ steps.create.outputs.coverage-prefix }}-${{ github.run_id }}-$(uuidgen)
         echo "coverage_report=$coverage_report" >> "$GITHUB_OUTPUT"

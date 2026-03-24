@@ -316,11 +316,36 @@ def phi4_mm_collate_fn(examples, processor):
     # Extract conversations and audio data
     conversations = [example["conversation"] for example in examples]
     audios = [example["audio"] for example in examples]
-    texts = [processor.apply_chat_template(conversation, tokenize=False) for conversation in conversations]
-    audio_inputs = [(audio["array"], audio["sampling_rate"]) if isinstance(audio, dict) else audio for audio in audios]
+    tokenizer = getattr(processor, "tokenizer", processor)
+    texts = [tokenizer.apply_chat_template(conversation, tokenize=False) for conversation in conversations]
+
+    # Prepare audio inputs as (array, sampling_rate) tuples for the remote processor
+    audio_inputs = []
+    for audio in audios:
+        if isinstance(audio, dict):
+            audio_inputs.append((audio["array"], audio["sampling_rate"]))
+        elif isinstance(audio, (list, tuple)) and len(audio) == 2:
+            audio_inputs.append(tuple(audio))
+        else:
+            audio_inputs.append(audio)
+
     batch = processor(
         text=texts, audios=audio_inputs, return_tensors="pt", padding=True, truncation=True, max_length=1024
     )
+
+    # The remote Phi4MM processor sets input_mode as a tensor.
+    # Only set it as fallback if the processor didn't provide it.
+    if "input_mode" not in batch:
+        has_audio = "input_audio_embeds" in batch and batch["input_audio_embeds"].numel() > 0
+        has_image = "input_image_embeds" in batch and batch["input_image_embeds"].numel() > 0
+        if has_image and has_audio:
+            batch["input_mode"] = 3
+        elif has_image:
+            batch["input_mode"] = 1
+        elif has_audio:
+            batch["input_mode"] = 2
+        else:
+            batch["input_mode"] = 0
 
     labels = build_labels_from_template(
         batch["input_ids"],
@@ -334,8 +359,6 @@ def phi4_mm_collate_fn(examples, processor):
     for key, value in list(batch.items()):
         if isinstance(value, torch.Tensor) and value.shape == input_shape:
             batch[key] = value[:, :-1]
-
-    batch["labels"] = labels
 
     # Remove specified batch features if present
     for key in ["input_image_embeds", "image_sizes", "image_attention_mask"]:
