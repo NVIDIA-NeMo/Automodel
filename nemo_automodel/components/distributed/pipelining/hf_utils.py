@@ -68,10 +68,6 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         causal_mask_mapping: Optional[dict] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        seq_lens: Optional[torch.Tensor] = None,
-        seq_lens_padded: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
         # Embeddings handling
@@ -143,6 +139,23 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         if hasattr(self, "layers") and self.layers is not None:
             # Works for dict-like or list-like containers
             layer_iter = self.layers.values() if hasattr(self.layers, "values") else self.layers
+
+            # Filter kwargs to only those accepted by the decoder layer's forward().
+            # This prevents model-level kwargs (seq_lens, padding_mask, etc.) from
+            # leaking into decoder layers that don't accept them.
+            import inspect
+
+            first_layer = next(iter(self.layers.values() if hasattr(self.layers, "values") else self.layers))
+            layer_sig = inspect.signature(first_layer.forward)
+            layer_accepts_var_keyword = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in layer_sig.parameters.values()
+            )
+            if layer_accepts_var_keyword:
+                filtered_kwargs = kwargs
+            else:
+                layer_params = set(layer_sig.parameters.keys())
+                filtered_kwargs = {k: v for k, v in kwargs.items() if k in layer_params}
+
             for decoder_layer in layer_iter:
                 layer_attention_mask = causal_mask_mapping.get("full_attention")
                 if hasattr(decoder_layer, "attention_type"):
@@ -158,7 +171,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
-                    **kwargs,
+                    **filtered_kwargs,
                 )
 
         if hasattr(self, "norm") and self.norm is not None:
