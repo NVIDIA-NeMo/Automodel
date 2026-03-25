@@ -89,9 +89,12 @@ validation_dataloader:
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 5e-6
+  lr: 1e-5
   weight_decay: 0.01
   betas: [0.9, 0.95]
+
+lr_scheduler:
+  lr_decay_style: cosine
 
 freeze_config:
   freeze_embeddings: true
@@ -100,7 +103,7 @@ freeze_config:
   freeze_language_model: false
 
 # Uncomment and set WANDB_API_KEY env var to enable W&B logging
-# wandb:
-#   project: eevee-4
-#   name: eevee4-31b-it_vv5_lossfixed
-#   dir: vlm_checkpoints/gemma4_31b_it/
+wandb:
+  project: eevee-4
+  name: eevee4-31b-it_vv5
+  dir: vlm_checkpoints/gemma4_31b_it/
