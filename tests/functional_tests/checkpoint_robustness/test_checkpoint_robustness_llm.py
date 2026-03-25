@@ -14,7 +14,9 @@
 
 """Train -> checkpoint -> reload via automodel & vanilla HF from consolidated, verify logits match via KL divergence.
 
-Launch: torchrun --nproc-per-node=<N> -m pytest <this_file> -c <config.yaml> [--kl_threshold <float>] [--hf_kl_threshold <float>]
+Launch: torchrun --nproc-per-node=<N> -m pytest <this_file> -c <config.yaml>
+    [--kl_threshold <float>] [--hf_kl_threshold <float>]
+    [--cross_tp_size <int>] [--cross_tp_kl_threshold <float>]
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ INPUT_IDS = [791, 4996, 14198, 39935, 35308, 927, 279, 16053, 5679]
 
 def _extract_custom_args(argv):
     """Separate test-specific CLI flags from config parser arguments."""
-    custom_keys = {"--kl_threshold", "--hf_kl_threshold"}
+    custom_keys = {"--kl_threshold", "--hf_kl_threshold", "--cross_tp_size", "--cross_tp_kl_threshold"}
     custom = {}
     remaining = []
     i = 0
@@ -90,6 +92,8 @@ def test_checkpoint_robustness():
     sys.argv = [sys.argv[0]] + config_argv
     kl_threshold = float(custom_args.get("kl_threshold", "0"))
     hf_kl_threshold = float(custom_args.get("hf_kl_threshold", "5e-3"))
+    cross_tp_size = int(custom_args.get("cross_tp_size", "0"))
+    cross_tp_kl_threshold = float(custom_args.get("cross_tp_kl_threshold", "5e-3"))
 
     # Phase 1: Train and checkpoint
     cfg = parse_args_and_load_config()
@@ -162,3 +166,31 @@ def test_checkpoint_robustness():
         )
 
     _barrier()
+
+    # Phase 5 (optional): Cross-TP — reload consolidated with a different TP size
+    if cross_tp_size > 0 and not is_peft:
+        cfg = parse_args_and_load_config()
+        cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
+        cfg.checkpoint.enabled = False
+        cfg.distributed.tp_size = cross_tp_size
+        cfg.distributed.dp_size = None
+        cross_tp_trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+        cross_tp_trainer.setup()
+
+        cross_tp_logits = _get_logits(cross_tp_trainer.model_parts[0], INPUT_IDS, device)
+
+        kl_cross_tp = _kl_divergence_from_logits(reference_logits, cross_tp_logits)
+        max_kl_cross_tp = kl_cross_tp.max().item()
+        if _rank0():
+            print(
+                f"[Phase 5] Cross-TP (tp_size={cross_tp_size}) max KL: "
+                f"{max_kl_cross_tp:.6e} (threshold: {cross_tp_kl_threshold:.6e})"
+            )
+        assert max_kl_cross_tp <= cross_tp_kl_threshold, (
+            f"KL divergence between original and cross-TP model too large: "
+            f"max per-token KL = {max_kl_cross_tp:.6e} > threshold {cross_tp_kl_threshold:.6e}"
+        )
+
+        del cross_tp_trainer
+        torch.cuda.empty_cache()
+        _barrier()

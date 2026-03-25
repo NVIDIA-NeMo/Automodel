@@ -112,6 +112,8 @@ _OVERRIDES = [
     "validation_dataloader.collate_fn.pad_seq_len_divisible",
     "kl_threshold",
     "hf_kl_threshold",
+    "cross_tp_size",
+    "cross_tp_kl_threshold",
     "model_path",
     "tokenizer",
     "max_new_tokens",
