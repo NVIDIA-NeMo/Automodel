@@ -906,9 +906,7 @@ def _inject_thinking_prefix_tokens(
     max_new_len = max(s.size(0) for s in new_seqs["input_ids"])
     for k in seq_keys:
         fill = fill_defaults[k]
-        padded = torch.full(
-            (B, max_new_len), fill, dtype=batch[k].dtype, device=batch[k].device
-        )
+        padded = torch.full((B, max_new_len), fill, dtype=batch[k].dtype, device=batch[k].device)
         for i, t in enumerate(new_seqs[k]):
             L = t.size(0)
             padded[i, :L] = t[:L]

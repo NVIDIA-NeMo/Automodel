@@ -33,6 +33,7 @@ def _make_missing(name: str):
 
 
 try:
+    from transformers.modeling_outputs import BaseModelOutputWithPast
     from transformers.models.gemma4.configuration_gemma4 import (
         Gemma4Config,
         Gemma4TextConfig,
@@ -52,7 +53,6 @@ try:
     from transformers.models.gemma4.modeling_gemma4 import (
         Gemma4Model as HFGemma4Model,
     )
-    from transformers.modeling_outputs import BaseModelOutputWithPast
 
     _GEMMA4_HF_AVAILABLE = True
 except ModuleNotFoundError:
@@ -100,7 +100,7 @@ class Gemma4Gate(nn.Module):
         self.norm = Gemma4RMSNorm(hidden_size, eps=config.rms_norm_eps, with_scale=False)
         self.proj = nn.Linear(hidden_size, num_experts, bias=False)
         self.scale = nn.Parameter(torch.ones(hidden_size))
-        scalar_root_size = hidden_size ** -0.5
+        scalar_root_size = hidden_size**-0.5
         self.register_buffer("root_size", torch.tensor(scalar_root_size), persistent=False)
 
     def forward(self, x, token_mask=None, cp_mesh=None):
@@ -174,7 +174,7 @@ class Gemma4MoEDecoderLayer(nn.Module):
         # NeMo MoE
         self.moe = Gemma4MoE(moe_config, backend, config)
 
-        # layer_scalar: per-layer output scaling. We register a buffer on every layer so DCP 
+        # layer_scalar: per-layer output scaling. We register a buffer on every layer so DCP
         # can always load the weight when present.
         # It is present only for sliding window layers. Regular attentionlayers without a
         # checkpoint value for the layer_scalar keep ones (identity scaling).
@@ -277,7 +277,7 @@ class Gemma4MoETextModelBackend(nn.Module):
             config.vocab_size,
             config.hidden_size,
             self.padding_idx,
-            embed_scale=config.hidden_size ** 0.5,
+            embed_scale=config.hidden_size**0.5,
         )
 
         self.layers = nn.ModuleDict(

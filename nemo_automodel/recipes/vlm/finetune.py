@@ -266,7 +266,11 @@ def build_dataloader(
 
         with FirstRankPerNode():
             # Ensure the processor has a _target_ attribute too
-            if cfg_processor is not None and hasattr(cfg_processor, "instantiate") and hasattr(cfg_processor, "_target_"):
+            if (
+                cfg_processor is not None
+                and hasattr(cfg_processor, "instantiate")
+                and hasattr(cfg_processor, "_target_")
+            ):
                 processor = cfg_processor.instantiate()
             elif cfg_processor is not None:
                 processor_kwargs = cfg_processor.to_dict()

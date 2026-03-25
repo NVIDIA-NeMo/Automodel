@@ -133,9 +133,9 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
                     f"Available keys: {list(tensors.keys())}"
                 )
 
-            gate_proj = tensors["gate_proj"]           # [E, hidden, inter]
-            up_proj = tensors["up_proj"]               # [E, hidden, inter]
-            down_proj = tensors["down_proj"]            # [E, inter, hidden]
+            gate_proj = tensors["gate_proj"]  # [E, hidden, inter]
+            up_proj = tensors["up_proj"]  # [E, hidden, inter]
+            down_proj = tensors["down_proj"]  # [E, inter, hidden]
             per_expert_scale = tensors["per_expert_scale"]  # [E]
 
             # Concatenate gate + up projections (no transpose needed)
@@ -149,11 +149,11 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
             down_local = down[start_expert:end_expert].to(self.dtype)
 
             prefix = f"{model_prefix}language_model.{layer_path}"
-            state_dict[f"{prefix}.moe.experts.gate_and_up_projs"] = (
-                state_dict_utils.create_dtensor_from_local(gate_and_up_local, device_mesh, rank)
+            state_dict[f"{prefix}.moe.experts.gate_and_up_projs"] = state_dict_utils.create_dtensor_from_local(
+                gate_and_up_local, device_mesh, rank
             )
-            state_dict[f"{prefix}.moe.experts.down_projs"] = (
-                state_dict_utils.create_dtensor_from_local(down_local, device_mesh, rank)
+            state_dict[f"{prefix}.moe.experts.down_projs"] = state_dict_utils.create_dtensor_from_local(
+                down_local, device_mesh, rank
             )
 
         return state_dict
@@ -201,9 +201,7 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
                 global_tensor = self._gather_expert_tensor(tensor, device_mesh, n_experts)
                 layer_prefix = f"{prefix}language_model.layers.{layer_num}"
                 hf_state_dict[f"{layer_prefix}.moe.down_proj"] = global_tensor.contiguous()
-                hf_state_dict[f"{layer_prefix}.moe.per_expert_scale"] = torch.ones(
-                    n_experts, dtype=self.dtype
-                )
+                hf_state_dict[f"{layer_prefix}.moe.per_expert_scale"] = torch.ones(n_experts, dtype=self.dtype)
                 continue
 
             # --- Pass-through ---
@@ -227,8 +225,11 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
             return tensor
 
         global_tensor = torch.zeros(
-            (n_experts, tensor.shape[1] if not state_dict_utils.is_dtensor(tensor) else tensor.to_local().shape[1],
-             tensor.shape[2] if not state_dict_utils.is_dtensor(tensor) else tensor.to_local().shape[2]),
+            (
+                n_experts,
+                tensor.shape[1] if not state_dict_utils.is_dtensor(tensor) else tensor.to_local().shape[1],
+                tensor.shape[2] if not state_dict_utils.is_dtensor(tensor) else tensor.to_local().shape[2],
+            ),
             dtype=self.dtype,
             device="cpu",
         )
