@@ -61,12 +61,6 @@ distributed:
 
   sequence_parallel: false
 
-freeze_config:
-  freeze_embeddings: false
-  freeze_vision_tower: false
-  freeze_audio_tower: true
-  freeze_language_model: false
-
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
