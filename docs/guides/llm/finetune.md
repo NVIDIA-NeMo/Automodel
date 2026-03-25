@@ -163,34 +163,30 @@ step_scheduler:
 
 ## Fine-Tune the Model
 
-You can run the recipe using the AutoModel CLI or directly with `torchrun`.
+You can run the recipe using the AutoModel CLI.
 
-### AutoModel CLI
-
-```bash
-automodel finetune llm -c finetune_config.yaml
+automodel --nproc-per-node=8 sft_guide.yaml
 ```
 
-where `finetune` is the command and `llm` is the model domain.
+The `--nproc-per-node=8` flag specifies the number of GPUs per node. Adjust to your case (for a single GPU, omit the `--nproc-per-node` option).
 
-### Run with `torchrun`
+### Invoke the Recipe Script Directly (advanced)
 
-```bash
-torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config finetune_config.yaml
+Alternatively, you can invoke the recipe [script](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py) directly using [torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html), as shown below.
+
+``` bash
+torchrun --nproc-per-node=8 nemo_automodel/recipes/llm/train_ft.py -c sft_guide.yaml
 ```
-
-See the recipe [source](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py) and [torchrun docs](https://docs.pytorch.org/docs/stable/elastic/run.html) for details.
 
 ### Sample Output
-
-```text
-$ automodel finetune llm -c finetune_config.yaml
-INFO:root:Domain:  llm
-INFO:root:Command: finetune
-INFO:root:Config:  /mnt/4tb/auto/Automodel/finetune_config.yaml
-INFO:root:Running job using source from: /mnt/4tb/auto/Automodel
-INFO:root:Launching job locally on 2 devices
-cfg-path: /mnt/4tb/auto/Automodel/finetune_config.yaml
+Running the recipe using either the `automodel` app or by directly invoking the recipe script should produce
+the following log:
+```
+$ automodel sft_guide.yaml
+INFO:nemo_automodel.cli.app:Config: /mnt/4tb/auto/Automodel/sft_guide.yaml
+INFO:nemo_automodel.cli.app:Recipe: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
+INFO:nemo_automodel.cli.app:Launching job interactively (local)
+cfg-path: /mnt/4tb/auto/Automodel/sft_guide.yaml
 INFO:root:step 4 | epoch 0 | loss 1.5514 | grad_norm 102.0000 | mem: 11.66 GiB | tps 6924.50
 INFO:root:step 8 | epoch 0 | loss 0.7913 | grad_norm 46.2500 | mem: 14.58 GiB | tps 9328.79
 Saving checkpoint to checkpoints/epoch_0_step_10

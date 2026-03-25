@@ -29,11 +29,9 @@ Note that we've selected a small number of instances for demo purposes, but you 
 
 With the above compute resources provisioned, we're ready to fine-tune a model using AutoModel.
 
-AutoModel uses YAML file recipes to configure various settings for the training process (for example, model, dataset, loss function, optimizer, etc.). Here we'll use this [preconfigured recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) for fine-tuning a Llama-3.2-1B model using the SQuAD dataset from Hugging Face. In a notebook connected to our compute resource, download the training script and configuration file with these `curl` commands:
+AutoModel uses YAML file recipes to configure various settings for the training process (for example, model, dataset, loss function, optimizer, etc.). Here we'll use this [preconfigured recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) for fine-tuning a Llama-3.2-1B model using the SQuAD dataset from Hugging Face. In a notebook connected to our compute resource, download the configuration file:
 
 ```bash
-# Download training script
-!curl -O https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/refs/heads/main/examples/llm_finetune/finetune.py
 # Download configuration file
 !curl -O https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/refs/heads/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
@@ -74,13 +72,12 @@ hf_token = getpass("HF token: ")
 
 ### Single-Node
 
-To run fine-tuning, we'll use the `finetune.py` script from the AutoModel repository and our config file.
+Since AutoModel is installed via the init script, the `automodel` CLI is available on all nodes.
 
 To run training on a single GPU, use this command:
 
 ```bash
-!python finetune.py \
-    --config llama3_2_1b_squad.yaml \
+!automodel llama3_2_1b_squad.yaml \
     --step_scheduler.max_steps 20 \
     --checkpoint.checkpoint_dir /Volumes/<catalog_name>/<schema_name>/<volume_name>/checkpoints_single/ \
     --checkpoint.staging_dir /local_disk0/checkpoints_single/ \
@@ -104,18 +101,18 @@ Looking at GPU metrics in Databricks, we see our single GPU is being well utiliz
 Single GPU utilization of ~95% during model training.
 :::
 
-To utilize all four GPUs available on this `g6e.12xlarge` instance, use `torchrun --nproc-per-node=4` with our same training script and config file: 
+To utilize all four GPUs available on this `g6e.12xlarge` instance, add `--nproc-per-node=4` to the same command:
 
 ```bash
-!torchrun --nproc-per-node=4 finetune.py \
-    --config llama3_2_1b_squad.yaml \
+!automodel llama3_2_1b_squad.yaml \
+    --nproc-per-node=4 \
     --step_scheduler.max_steps 20 \
     --checkpoint.checkpoint_dir /Volumes/<catalog_name>/<schema_name>/<volume_name>/checkpoints_multi/ \
     --checkpoint.staging_dir /local_disk0/checkpoints_multi/ \
     --checkpoint.is_async True
 ```
 
-This uses PyTorch's [Elastic Launch](https://docs.pytorch.org/docs/stable/elastic/run.html) functionality to spawn and coordinate multiple training processes on the VM. Each training process runs on a separate GPU, and we can now see all four GPUs are being used (~95% utilization for each GPU).
+The `automodel` CLI uses PyTorch's [Elastic Launch](https://docs.pytorch.org/docs/stable/elastic/run.html) internally to spawn and coordinate multiple training processes on the VM. Each training process runs on a separate GPU, and we can now see all four GPUs are being used (~95% utilization for each GPU).
 
 :::{figure} ./databricks-gpu-metrics-multi.png
 :name: databricks-gpu-metrics-multi
@@ -150,6 +147,7 @@ Next, we use PySpark's [TorchDistributor](https://spark.apache.org/docs/latest/a
 
 ```py
 from pyspark.ml.torch.distributor import TorchDistributor
+import nemo_automodel.recipes.llm.train_ft as recipe_mod
 
 num_executor = 2            # Number of workers in cluster
 num_gpus_per_executor = 4   # Number of GPUs per worker
@@ -159,7 +157,7 @@ distributor = TorchDistributor(
     use_gpu=True,
 )
 
-train_file = "finetune.py"
+train_file = recipe_mod.__file__
 args = [
     "--config", "llama3_2_1b_squad.yaml",
     "--step_scheduler.max_steps", "20",
@@ -170,7 +168,7 @@ args = [
 distributor.run(train_file, *args)
 ```
 
-`TorchDistributor` uses `torchrun` internally and also handles constructing and submitting training jobs to the cluster.
+`TorchDistributor` uses `torchrun` internally, so we point it at the recipe module directly (rather than the `automodel` CLI, which also wraps `torchrun`).
 
 We now see GPU utilization is \~95% for all GPUs on all worker nodes during training (8 GPUs in this particular case).
 
@@ -211,22 +209,23 @@ Run training with MLflow tracking enabled using the same commands as before. The
 
 **Single-node:**
 ```bash
-!python finetune.py \
-    --config llama3_2_1b_squad.yaml \
+!automodel llama3_2_1b_squad.yaml \
     --step_scheduler.max_steps 20 \
     --checkpoint.checkpoint_dir /Volumes/<catalog_name>/<schema_name>/<volume_name>/checkpoints/
 ```
 
 **Multi-GPU:**
 ```bash
-!torchrun --nproc-per-node=4 finetune.py \
-    --config llama3_2_1b_squad.yaml \
+!automodel llama3_2_1b_squad.yaml \
+    --nproc-per-node=4 \
     --step_scheduler.max_steps 20 \
     --checkpoint.checkpoint_dir /Volumes/<catalog_name>/<schema_name>/<volume_name>/checkpoints/
 ```
 
 **Multi-node with TorchDistributor:**
 ```python
+import nemo_automodel.recipes.llm.train_ft as recipe_mod
+
 distributor = TorchDistributor(
     num_processes=num_executor * num_gpus_per_executor,
     local_mode=False,
@@ -238,7 +237,7 @@ args = [
     "--step_scheduler.max_steps", "20",
     "--checkpoint.checkpoint_dir", "/Volumes/<catalog_name>/<schema_name>/<volume_name>/checkpoints/",
 ]
-distributor.run("finetune.py", *args)
+distributor.run(recipe_mod.__file__, *args)
 ```
 
 ### View Results
@@ -283,8 +282,7 @@ This ensures your artifacts are stored in a governed, versioned location within 
 You can override MLflow settings from the command line:
 
 ```bash
-!python finetune.py \
-    --config llama3_2_1b_squad.yaml \
+!automodel llama3_2_1b_squad.yaml \
     --mlflow.experiment_name "custom-experiment-name" \
     --mlflow.run_name "baseline-run-1" \
     --mlflow.tags.learning_rate "1e-5"
