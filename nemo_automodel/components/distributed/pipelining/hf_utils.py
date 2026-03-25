@@ -70,6 +70,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         causal_mask_mapping: Optional[dict] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        seq_lens: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
         # Embeddings handling
