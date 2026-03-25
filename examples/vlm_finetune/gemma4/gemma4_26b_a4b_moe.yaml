@@ -34,7 +34,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /workspace/eevee-4-26b-a4b-it_vv3
+  pretrained_model_name_or_path: /workspace/eevee-4-26b-a4b-it_vv5
   torch_dtype: torch.bfloat16
   trust_remote_code: true
   backend:
@@ -57,7 +57,7 @@ processor:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: vlm_checkpoints/gemma4_25b_a4b_moe/
+  checkpoint_dir: vlm_checkpoints/gemma4_26b_a4b_moe/
   model_save_format: torch_save
   save_consolidated: false
 
@@ -108,5 +108,5 @@ freeze_config:
 #Uncomment and set WANDB_API_KEY env var to enable W&B logging
 # wandb:
 #   project: eevee-4
-#   name: eevee4-26b-a4b-moe-it_vv3
+#   name: eevee4-26b-a4b-moe-it_vv5
 #   dir: vlm_checkpoints/gemma4_26b_a4b_moe/

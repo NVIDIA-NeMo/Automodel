@@ -174,10 +174,11 @@ class Gemma4MoEDecoderLayer(nn.Module):
         # NeMo MoE
         self.moe = Gemma4MoE(moe_config, backend, config)
 
-        if self.attention_type == "full_attention":
-            self.register_buffer("layer_scalar", torch.ones(1))
-        else:
-            self.layer_scalar = None
+        # layer_scalar: per-layer output scaling. We register a buffer on every layer so DCP 
+        # can always load the weight when present.
+        # It is present only for sliding window layers. Regular attentionlayers without a
+        # checkpoint value for the layer_scalar keep ones (identity scaling).
+        self.register_buffer("layer_scalar", torch.ones(1))
 
     def forward(
         self,
@@ -225,8 +226,9 @@ class Gemma4MoEDecoderLayer(nn.Module):
         x = self.post_feedforward_layernorm(x)
         x = residual + x
 
-        if self.layer_scalar is not None:
-            x = x * self.layer_scalar
+        # Apply per-layer output scaling, multiplied by 1 if it is not present in the checkpoint,
+        # otherwise uses the scalar value from the checkpoint.
+        x = x * self.layer_scalar
 
         return x
 

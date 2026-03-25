@@ -21,7 +21,7 @@ step_scheduler:
   local_batch_size: 1
   ckpt_every_steps: 100
   val_every_steps: 100
-  max_steps: 1000
+  max_steps: 100
 
 dist_env:
   backend: nccl
@@ -34,7 +34,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /workspace/eevee-4-e2b-it_vv6
+  pretrained_model_name_or_path: /workspace/eevee-4-e2b-it_vv7
   torch_dtype: torch.bfloat16
   use_liger_kernel: true
   use_sdpa_patching: false
@@ -98,5 +98,5 @@ freeze_config:
 
 # wandb:
 #   project: eevee-4
-#   name: eevee4-e2b-it_vv6
+#   name: eevee4-e2b-it_vv7
 #   dir: vlm_checkpoints/gemma4_2b_it/

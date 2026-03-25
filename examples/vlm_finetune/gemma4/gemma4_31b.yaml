@@ -34,7 +34,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /workspace/eevee-4-31b-it_vv3
+  pretrained_model_name_or_path: /workspace/eevee-4-31b-it_vv5
   torch_dtype: torch.bfloat16
   use_liger_kernel: true
   use_sdpa_patching: false
@@ -100,5 +100,5 @@ freeze_config:
 # Uncomment and set WANDB_API_KEY env var to enable W&B logging
 # wandb:
 #   project: eevee-4
-#   name: eevee4-31b-it_vv3
+#   name: eevee4-31b-it_vv5
 #   dir: vlm_checkpoints/gemma4_31b_it/

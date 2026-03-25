@@ -248,16 +248,11 @@ class TestGemma4MoEDecoderLayer:
             layer = Gemma4MoEDecoderLayer(text_config, layer_idx=idx, moe_config=moe_config, backend=backend_config)
             assert layer.attention_type == expected_type
 
-    def test_full_attention_has_layer_scalar(self, text_config, moe_config, backend_config):
-        full_idx = text_config.layer_types.index("full_attention")
-        layer = Gemma4MoEDecoderLayer(text_config, layer_idx=full_idx, moe_config=moe_config, backend=backend_config)
-        assert layer.layer_scalar is not None
-        torch.testing.assert_close(layer.layer_scalar, torch.ones(1))
-
-    def test_sliding_attention_no_layer_scalar(self, text_config, moe_config, backend_config):
-        sliding_idx = text_config.layer_types.index("sliding_attention")
-        layer = Gemma4MoEDecoderLayer(text_config, layer_idx=sliding_idx, moe_config=moe_config, backend=backend_config)
-        assert layer.layer_scalar is None
+    def test_all_layers_have_layer_scalar_buffer(self, text_config, moe_config, backend_config):
+        for idx in range(text_config.num_hidden_layers):
+            layer = Gemma4MoEDecoderLayer(text_config, layer_idx=idx, moe_config=moe_config, backend=backend_config)
+            assert layer.layer_scalar is not None
+            torch.testing.assert_close(layer.layer_scalar, torch.ones(1))
 
     def test_moe_is_gemma4_moe_instance(self, text_config, moe_config, backend_config):
         layer = Gemma4MoEDecoderLayer(text_config, layer_idx=0, moe_config=moe_config, backend=backend_config)
