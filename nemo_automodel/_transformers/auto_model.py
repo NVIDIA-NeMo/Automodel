@@ -18,7 +18,6 @@ import inspect
 import logging
 import os
 import types
-from pydoc import classify_class_attrs
 from typing import List, Optional, Union
 
 import torch
@@ -38,10 +37,7 @@ from transformers.models.auto.auto_factory import _BaseAutoModelClass
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel import __version__
 from nemo_automodel._transformers.registry import ModelRegistry
-from nemo_automodel.components.distributed.init_utils import (
-    get_local_world_size_preinit,
-    get_world_size_safe,
-)
+from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
@@ -715,6 +711,27 @@ class NeMoAutoModelForTextToWaveform(_BaseNeMoAutoModelClass, AutoModelForTextTo
 
 
 class NeMoAutoModelForTokenClassification(_BaseNeMoAutoModelClass, AutoModelForTokenClassification):
-    def __init__(self, config, *args, **kwargs):
-        print("NeMoAutoModelForTokenClassification __init__", config)
-        super().__init__(config, *args, **kwargs)
+    """Drop-in replacement for ``transformers.AutoModelForTokenClassification`` with custom-kernels.
+
+    The class only overrides ``from_pretrained`` and ``from_config`` to add the
+    optional ``use_liger_kernel`` flag.  If the flag is ``True`` (default) and
+    the Liger kernel is available, the model's attention layers are
+    monkey-patched in place.  If patching fails for any reason, the call is
+    retried once with ``use_liger_kernel=False`` so that users still obtain a
+    functional model.
+
+    Notes:
+    -----
+    - No changes are made to the model's public API; forward signatures,
+      generation utilities, and weight shapes remain identical.
+    - Only decoder-style (causal) architectures are currently supported by the
+      Liger patch.  Unsupported models will silently fall back.
+
+    Examples:
+    --------
+    >>> model = NeMoAutoModelForTokenClassification.from_pretrained(\"dbmdz/bert-large-cased-finetuned-conll03-english\") # try Liger
+    >>> model = NeMoAutoModelForTokenClassification.from_pretrained(
+    ...     \"dbmdz/bert-large-cased-finetuned-conll03-english\", use_liger_kernel=False)   # skip Liger
+    """
+
+    pass
