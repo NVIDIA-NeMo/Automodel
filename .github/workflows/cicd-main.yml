@@ -45,7 +45,7 @@ jobs:
       NVIDIA_MANAGEMENT_ORG_PAT: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
 
   linting:
-    runs-on: ubuntu-latest
+    runs-on: linux-amd64-cpu16
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -76,7 +76,7 @@ jobs:
           uv run --active ruff format --check --verbose .
 
   import_linting:
-    runs-on: ubuntu-latest
+    runs-on: linux-amd64-cpu16
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -105,7 +105,7 @@ jobs:
           uv run lint-imports --debug --verbose --no-cache
 
   type_checking:
-    runs-on: ubuntu-latest
+    runs-on: linux-amd64-cpu16
     steps:
       - name: Checkout
         uses: actions/checkout@v6
