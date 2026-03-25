@@ -141,9 +141,11 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        enable_async_tensor_parallel: bool = False,
     ) -> nn.Module:
         """Apply the default parallelization flow."""
         tp_mesh = device_mesh[tp_mesh_name]
+        pp_enabled = "pp" in device_mesh.mesh_dim_names and device_mesh["pp"].size() > 1
 
         # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
         # if dp_replicate_size > 1, use HSDP, else use FSDP
@@ -180,6 +182,10 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 if _attention_is_head_sharded(model_parallel_plan):
                     _update_attention_head_counts_for_tp(model, tp_mesh.size())
 
+            if enable_async_tensor_parallel:
+                torch._inductor.config._micro_pipeline_tp = True
+                logger.info("Async tensor parallel enabled — ensure torch.compile is also enabled")
+
         # Apply activation checkpointing to linear layers if requested
         if activation_checkpointing:
             # Disable KV caching during training to ensure deterministic
@@ -215,7 +221,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             )
 
         # Find transformer layers and apply parallelisms
-        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
+        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy, pp_enabled)
 
         # Apply FSDP to the root model
         # Do not reshard after forward for root model because its parameters
@@ -530,6 +536,7 @@ def apply_fsdp2_sharding_recursively(
     mesh: DeviceMesh,
     mp_policy: Optional[MixedPrecisionPolicy],
     offload_policy: Optional[OffloadPolicy] = None,
+    pp_enabled: bool = False,
 ) -> None:
     """
     Recursively apply FSDP2 sharding to modules, with optimizations for ModuleList.
@@ -559,15 +566,18 @@ def apply_fsdp2_sharding_recursively(
             # If child is also a ModuleList (nested structure), recurse instead of wrapping
             # since ModuleList doesn't have a forward() method required by fully_shard
             if isinstance(child_module, nn.ModuleList):
-                apply_fsdp2_sharding_recursively(child_module, mesh, mp_policy, offload_policy)
+                apply_fsdp2_sharding_recursively(child_module, mesh, mp_policy, offload_policy, pp_enabled)
             else:
                 # Pre-shard combined projection submodules on dim 1 so that
                 # the parent fully_shard (dim 0) skips them automatically.
                 _pre_shard_combined_projections(child_module, mesh, mp_policy, offload_policy)
 
-                # As an optimization, do not reshard after forward for the last
-                # transformer block since FSDP would prefetch it immediately
-                reshard_after_forward = int(layer_id) < len(module) - 1
+                # With PP: keep weights gathered across microbatches (no per-microbatch all-gather).
+                # Without PP: reshard all but last layer to enable forward+backward weight prefetching.
+                if pp_enabled:
+                    reshard_after_forward = False
+                else:
+                    reshard_after_forward = int(layer_id) < len(module) - 1
                 fully_shard(
                     child_module,
                     mesh=mesh,
@@ -576,9 +586,18 @@ def apply_fsdp2_sharding_recursively(
                     offload_policy=offload_policy,
                 )
                 module[layer_id] = child_module
+
+        # Set up explicit forward/backward prefetch chains when layers are being resharded.
+        # With PP, reshard_after_forward=False so weights are always gathered — no prefetch needed.
+        if not pp_enabled:
+            layers = [module[i] for i in range(len(module)) if not isinstance(module[i], nn.ModuleList)]
+            for i in range(len(layers) - 1):
+                layers[i].set_modules_to_forward_prefetch([layers[i + 1]])
+            for i in range(1, len(layers)):
+                layers[i].set_modules_to_backward_prefetch([layers[i - 1]])
     else:
         for name, sub_module in module.named_children():
-            apply_fsdp2_sharding_recursively(sub_module, mesh, mp_policy, offload_policy)
+            apply_fsdp2_sharding_recursively(sub_module, mesh, mp_policy, offload_policy, pp_enabled)
 
 
 def get_hf_tp_shard_plan(model):
@@ -1175,6 +1194,7 @@ def fsdp2_strategy_parallelize(
     dp_replicate_mesh_name: str = "dp_replicate",
     dp_shard_cp_mesh_name: str = "dp_shard_cp",
     tp_mesh_name: str = "tp",
+    enable_async_tensor_parallel: bool = False,
 ):
     """
     Apply parallelisms and activation checkpointing to the model.
@@ -1228,6 +1248,7 @@ def fsdp2_strategy_parallelize(
         dp_replicate_mesh_name=dp_replicate_mesh_name,
         dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
         tp_mesh_name=tp_mesh_name,
+        enable_async_tensor_parallel=enable_async_tensor_parallel,
     )
 
 

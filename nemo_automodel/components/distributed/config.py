@@ -70,6 +70,7 @@ class FSDP2Config:
     activation_checkpointing: bool = False
     defer_fsdp_grad_sync: bool = True
     backend: str = "nccl"
+    enable_async_tensor_parallel: bool = False
 
     def __post_init__(self):
         if self.mp_policy is None:

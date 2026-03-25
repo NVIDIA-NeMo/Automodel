@@ -68,6 +68,7 @@ class FSDP2Manager:
         self.activation_checkpointing = config.activation_checkpointing
         self.defer_fsdp_grad_sync = config.defer_fsdp_grad_sync
         self.backend = config.backend
+        self.enable_async_tensor_parallel = config.enable_async_tensor_parallel
 
     def parallelize(self, model):
         """
@@ -106,5 +107,6 @@ class FSDP2Manager:
             offload_policy=self.offload_policy,
             sequence_parallel=bool(self.sequence_parallel),
             activation_checkpointing=self.activation_checkpointing,
+            enable_async_tensor_parallel=self.enable_async_tensor_parallel,
         )
         return model
