@@ -12,22 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import MagicMock, Mock, patch
+
 import pytest
 import torch
-from unittest.mock import Mock, MagicMock, patch
 from torch.distributed.pipelining.schedules import (
-    PipelineScheduleSingle,
     PipelineScheduleMulti,
+    PipelineScheduleSingle,
 )
 
 from nemo_automodel.components.distributed.pipelining.functional import (
-    stage_ids_this_rank,
-    generate_hf_model_fqn_per_model_part,
-    calculate_virtual_stages,
-    split_model_into_stages,
-    build_pipeline_schedule,
-    pipeline_model,
     _precompute_stage_shapes,
+    build_pipeline_schedule,
+    calculate_virtual_stages,
+    generate_hf_model_fqn_per_model_part,
+    pipeline_model,
+    split_model_into_stages,
+    stage_ids_this_rank,
 )
 
 
@@ -64,6 +65,10 @@ class TestStageIdsThisRank:
         # Test V-style with != 2 stages per rank
         with pytest.raises(AssertionError):
             stage_ids_this_rank(0, 4, 12, "v")  # 3 stages per rank
+
+    def test_invalid_style_raises(self):
+        with pytest.raises(ValueError, match="Unsupported pipeline schedule style"):
+            stage_ids_this_rank(0, 4, 8, "unknown")
 
 
 class TestGenerateHfModelFqnPerModelPart:
@@ -317,9 +322,10 @@ class TestCalculateVirtualStages:
 
 class TestSplitModelIntoStages:
     """Test split_model_into_stages function with mocks."""
-    @patch('nemo_automodel.components.distributed.pipelining.functional.get_text_module')
-    @patch('nemo_automodel.components.distributed.pipelining.functional.calculate_virtual_stages')
-    @patch('nemo_automodel.components.distributed.pipelining.functional.generate_hf_model_fqn_per_model_part')
+
+    @patch("nemo_automodel.components.distributed.pipelining.functional.get_text_module")
+    @patch("nemo_automodel.components.distributed.pipelining.functional.calculate_virtual_stages")
+    @patch("nemo_automodel.components.distributed.pipelining.functional.generate_hf_model_fqn_per_model_part")
     def test_auto_generate_module_names(self, mock_generate_fqn, mock_calc_stages, mock_get_text_module):
         # Setup mocks
         mock_pp_mesh = Mock()
@@ -357,20 +363,27 @@ class TestSplitModelIntoStages:
             ["model.layers.1", "model.norm"],
         ]
 
-        with patch('nemo_automodel.components.distributed.pipelining.functional.PipelineStage'), \
-             patch('nemo_automodel.components.distributed.pipelining.functional.get_schedule_class') as mock_get_schedule_class, \
-             patch('nemo_automodel.components.distributed.pipelining.functional.stage_ids_this_rank') as mock_stage_ids, \
-             patch('copy.deepcopy') as mock_deepcopy:
-
+        with (
+            patch("nemo_automodel.components.distributed.pipelining.functional.PipelineStage"),
+            patch(
+                "nemo_automodel.components.distributed.pipelining.functional.get_schedule_class"
+            ) as mock_get_schedule_class,
+            patch("nemo_automodel.components.distributed.pipelining.functional.stage_ids_this_rank") as mock_stage_ids,
+            patch("copy.deepcopy") as mock_deepcopy,
+        ):
             # Make sure get_schedule_class returns an actual class
             mock_get_schedule_class.return_value = PipelineScheduleSingle
 
             # Mock stage_ids_this_rank
             mock_stage_ids.return_value = (0,)
 
-            # Mock deepcopy to return a mock with proper structure
-            mock_copy = Mock()
-            mock_copy.named_children.return_value = []
+            # Mock deepcopy to return a lightweight object that only exposes
+            # the methods split_model_into_stages uses in this test.
+            class MockStageModel:
+                def named_children(self):
+                    return []
+
+            mock_copy = MockStageModel()
             mock_deepcopy.return_value = mock_copy
 
             stages, models = split_model_into_stages(
@@ -385,11 +398,13 @@ class TestSplitModelIntoStages:
             # Verify FQN generation was called
             mock_generate_fqn.assert_called_once()
 
-    @patch('nemo_automodel.components.distributed.pipelining.functional.get_text_module')
-    @patch('nemo_automodel.components.distributed.pipelining.functional.calculate_virtual_stages')
-    @patch('nemo_automodel.components.distributed.pipelining.functional.generate_hf_model_fqn_per_model_part')
+    @patch("nemo_automodel.components.distributed.pipelining.functional.get_text_module")
+    @patch("nemo_automodel.components.distributed.pipelining.functional.calculate_virtual_stages")
+    @patch("nemo_automodel.components.distributed.pipelining.functional.generate_hf_model_fqn_per_model_part")
     @pytest.mark.parametrize("lm_head_on_top_level", [True, False])
-    def test_nested_language_model_structure(self, mock_generate_fqn, mock_calc_stages, mock_get_text_module, lm_head_on_top_level):
+    def test_nested_language_model_structure(
+        self, mock_generate_fqn, mock_calc_stages, mock_get_text_module, lm_head_on_top_level
+    ):
         """Test split_model_into_stages with nested language_model structure (covers lines 311-318)."""
         mock_pp_mesh = Mock()
         mock_pp_mesh.get_local_rank.return_value = 0
@@ -428,11 +443,14 @@ class TestSplitModelIntoStages:
             ["model.language_model.model.layers.1", "model.language_model.model.norm"],
         ]
 
-        with patch('nemo_automodel.components.distributed.pipelining.functional.PipelineStage'), \
-             patch('nemo_automodel.components.distributed.pipelining.functional.get_schedule_class') as mock_get_schedule, \
-             patch('nemo_automodel.components.distributed.pipelining.functional.stage_ids_this_rank') as mock_stage_ids, \
-             patch('copy.deepcopy') as mock_deepcopy:
-
+        with (
+            patch("nemo_automodel.components.distributed.pipelining.functional.PipelineStage"),
+            patch(
+                "nemo_automodel.components.distributed.pipelining.functional.get_schedule_class"
+            ) as mock_get_schedule,
+            patch("nemo_automodel.components.distributed.pipelining.functional.stage_ids_this_rank") as mock_stage_ids,
+            patch("copy.deepcopy") as mock_deepcopy,
+        ):
             mock_get_schedule.return_value = PipelineScheduleSingle
             mock_stage_ids.return_value = (0,)
             mock_copy = Mock()
@@ -440,31 +458,35 @@ class TestSplitModelIntoStages:
             mock_deepcopy.return_value = mock_copy
 
             stages, models = split_model_into_stages(
-                mock_model, mock_pp_mesh, "pp", "PipelineScheduleSingle",
-                torch.device("cuda:0"), layers_per_stage=2,
+                mock_model,
+                mock_pp_mesh,
+                "pp",
+                "PipelineScheduleSingle",
+                torch.device("cuda:0"),
+                layers_per_stage=2,
             )
 
             # Verify generate_fqn was called with correct parameters for nested model
             call_kwargs = mock_generate_fqn.call_args[1]
-            assert call_kwargs['include_multimodal_encoders'] is False
-            assert any('model.' in fqn for fqn in call_kwargs['extra_module_fqns'])
+            assert call_kwargs["include_multimodal_encoders"] is False
+            assert any("model." in fqn for fqn in call_kwargs["extra_module_fqns"])
             if lm_head_on_top_level:
-                assert call_kwargs['lm_head_fqn'] == "lm_head"
+                assert call_kwargs["lm_head_fqn"] == "lm_head"
             else:
-                assert "language_model.lm_head" in call_kwargs['lm_head_fqn']
+                assert "language_model.lm_head" in call_kwargs["lm_head_fqn"]
 
 
 class TestBuildPipelineSchedule:
     """Test build_pipeline_schedule function."""
 
-    @patch('nemo_automodel.components.distributed.pipelining.functional.get_schedule_class')
+    @patch("nemo_automodel.components.distributed.pipelining.functional.get_schedule_class")
     def test_build_schedule_single(self, mock_get_schedule):
         # Create a mock schedule class that properly inherits from PipelineScheduleSingle
         class MockScheduleSingle(PipelineScheduleSingle):
             def __init__(self, *args, **kwargs):
                 self.stage = args[0] if args else None
-                self.n_microbatches = kwargs.get('n_microbatches', 0)
-                self.loss_fn = kwargs.get('loss_fn', None)
+                self.n_microbatches = kwargs.get("n_microbatches", 0)
+                self.loss_fn = kwargs.get("loss_fn", None)
 
             def _step_microbatches(self, *args, **kwargs):
                 # Mock implementation of abstract method
@@ -474,12 +496,13 @@ class TestBuildPipelineSchedule:
 
         # Mock stages
         mock_stage = Mock()
+        mock_stage.num_stages = 1
         stages = [mock_stage]
 
         # Mock loss function
         loss_fn = Mock()
 
-                # Call function
+        # Call function
         schedule = build_pipeline_schedule(
             pipeline_parallel_schedule_csv=None,
             pipeline_parallel_schedule="PipelineScheduleSingle",
@@ -495,24 +518,28 @@ class TestBuildPipelineSchedule:
         assert schedule.n_microbatches == 4
         assert schedule.loss_fn == loss_fn
 
-    @patch('nemo_automodel.components.distributed.pipelining.functional.get_schedule_class')
+    @patch("nemo_automodel.components.distributed.pipelining.functional.get_schedule_class")
     def test_build_schedule_multi(self, mock_get_schedule):
         # Create a mock schedule class that properly inherits from PipelineScheduleMulti
         class MockScheduleMulti(PipelineScheduleMulti):
             def __init__(self, *args, **kwargs):
                 self.stages = args[0] if args else None
-                self.n_microbatches = kwargs.get('n_microbatches', 0)
-                self.loss_fn = kwargs.get('loss_fn', None)
+                self.n_microbatches = kwargs.get("n_microbatches", 0)
+                self.loss_fn = kwargs.get("loss_fn", None)
 
         mock_get_schedule.return_value = MockScheduleMulti
 
         # Mock stages
-        stages = [Mock(), Mock()]
+        stage0 = Mock()
+        stage0.num_stages = 2
+        stage1 = Mock()
+        stage1.num_stages = 2
+        stages = [stage0, stage1]
 
         # Mock loss function
         loss_fn = Mock()
 
-                # Call function
+        # Call function
         schedule = build_pipeline_schedule(
             pipeline_parallel_schedule_csv=None,
             pipeline_parallel_schedule="PipelineScheduleMulti",
@@ -540,7 +567,7 @@ class TestBuildPipelineSchedule:
                 loss_fn=Mock(),
             )
 
-    @patch('os.path.isfile')
+    @patch("os.path.isfile")
     def test_csv_schedule(self, mock_isfile):
         # Mock file exists
         mock_isfile.return_value = True
@@ -549,20 +576,25 @@ class TestBuildPipelineSchedule:
         class MockPipelineScheduleRuntime:
             def __init__(self, *args, **kwargs):
                 self.stage = args[0] if args else None
-                self.n_microbatches = kwargs.get('n_microbatches', 0)
-                self.loss_fn = kwargs.get('loss_fn', None)
+                self.n_microbatches = kwargs.get("n_microbatches", 0)
+                self.loss_fn = kwargs.get("loss_fn", None)
                 self._load_csv = Mock()
                 self._mock_instance = self  # Store reference for assertions
 
         # Patch _PipelineScheduleRuntime with our mock class
-        with patch('nemo_automodel.components.distributed.pipelining.functional._PipelineScheduleRuntime', MockPipelineScheduleRuntime):
+        with patch(
+            "nemo_automodel.components.distributed.pipelining.functional._PipelineScheduleRuntime",
+            MockPipelineScheduleRuntime,
+        ):
             # Call with CSV
+            stage = Mock()
+            stage.num_stages = 1
             schedule = build_pipeline_schedule(
                 pipeline_parallel_schedule_csv="/path/to/schedule.csv",
                 pipeline_parallel_schedule=None,
                 microbatch_size=2,
                 local_batch_size=8,
-                stages=[Mock()],
+                stages=[stage],
                 loss_fn=Mock(),
             )
 
@@ -571,7 +603,7 @@ class TestBuildPipelineSchedule:
             assert isinstance(schedule, MockPipelineScheduleRuntime)
 
     def test_csv_file_not_found(self):
-        with patch('os.path.isfile', return_value=False):
+        with patch("os.path.isfile", return_value=False):
             with pytest.raises(FileNotFoundError):
                 build_pipeline_schedule(
                     pipeline_parallel_schedule_csv="/nonexistent/file.csv",
@@ -582,12 +614,77 @@ class TestBuildPipelineSchedule:
                     loss_fn=Mock(),
                 )
 
+    @patch("nemo_automodel.components.distributed.pipelining.functional.get_schedule_class")
+    def test_skip_output_merge_patch_supported(self, mock_get_schedule, monkeypatch):
+        class MockScheduleSingle(PipelineScheduleSingle):
+            def __init__(self, *args, **kwargs):
+                self._stage = Mock()
+                self._stage.clear_runtime_states = Mock()
+                self._has_backward = False
+                self._n_microbatches = kwargs.get("n_microbatches", 0)
+                self._split_inputs = Mock(return_value=([], []))
+                self._step_microbatches_mock = Mock()
+
+            def _step_microbatches(self, *args, **kwargs):
+                return self._step_microbatches_mock(*args, **kwargs)
+
+            def step(self, *args, **kwargs):
+                return "original-step-output"
+
+        mock_get_schedule.return_value = MockScheduleSingle
+        monkeypatch.setenv("NEMOAUTOMODEL_PP_SKIP_OUTPUT_MERGE", "1")
+
+        stage = Mock()
+        stage.num_stages = 1
+        schedule = build_pipeline_schedule(
+            pipeline_parallel_schedule_csv=None,
+            pipeline_parallel_schedule="PipelineScheduleSingle",
+            microbatch_size=2,
+            local_batch_size=8,
+            stages=[stage],
+            loss_fn=Mock(),
+        )
+
+        assert hasattr(schedule, "_nemo_original_step")
+        assert schedule.step(losses=[]) is None
+        schedule._step_microbatches_mock.assert_called_once()
+
+    @patch("nemo_automodel.components.distributed.pipelining.functional.get_schedule_class")
+    def test_skip_output_merge_patch_incompatible_schedule(self, mock_get_schedule, monkeypatch):
+        class IncompatibleSchedule(PipelineScheduleSingle):
+            def __init__(self, *args, **kwargs):
+                # intentionally missing private attrs used by patch path
+                pass
+
+            def _step_microbatches(self, *args, **kwargs):
+                pass
+
+            def step(self, *args, **kwargs):
+                return "original"
+
+        mock_get_schedule.return_value = IncompatibleSchedule
+        monkeypatch.setenv("NEMOAUTOMODEL_PP_SKIP_OUTPUT_MERGE", "1")
+
+        stage = Mock()
+        stage.num_stages = 1
+        schedule = build_pipeline_schedule(
+            pipeline_parallel_schedule_csv=None,
+            pipeline_parallel_schedule="PipelineScheduleSingle",
+            microbatch_size=2,
+            local_batch_size=8,
+            stages=[stage],
+            loss_fn=Mock(),
+        )
+
+        assert not hasattr(schedule, "_nemo_original_step")
+        assert schedule.step() == "original"
+
 
 class TestPipelineModel:
     """Test pipeline_model function."""
 
-    @patch('nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages')
-    @patch('nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule')
+    @patch("nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages")
+    @patch("nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule")
     def test_basic_pipeline_model(self, mock_build_schedule, mock_split_stages):
         # Setup mocks
         mock_world_mesh = MagicMock()
@@ -664,8 +761,8 @@ class TestPipelineModel:
                 device=torch.device("cuda:0"),
             )
 
-    @patch('nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages')
-    @patch('nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule')
+    @patch("nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages")
+    @patch("nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule")
     def test_with_parallelization_fn(self, mock_build_schedule, mock_split_stages):
         # Setup mocks
         mock_world_mesh = MagicMock()
@@ -704,7 +801,7 @@ class TestPipelineModel:
         # Verify parallelize_fn was called
         mock_parallelize_fn.assert_called_once()
         call_kwargs = mock_parallelize_fn.call_args[1]
-        assert call_kwargs['dp_axis_names'] == ("dp",)
+        assert call_kwargs["dp_axis_names"] == ("dp",)
 
 
 class TestPrecomputeStageShapes:
@@ -731,6 +828,7 @@ class TestPrecomputeStageShapes:
 
     def _make_config(self, hidden_size=64, vocab_size=128):
         import types
+
         return types.SimpleNamespace(hidden_size=hidden_size, vocab_size=vocab_size)
 
     def test_first_stage_shapes(self):
@@ -836,8 +934,8 @@ class TestPrecomputeStageShapes:
         out_call = stage._configure_outputs_meta.call_args[0][0]
         assert out_call[0].device.type == "meta"
 
-    @patch('nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages')
-    @patch('nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule')
+    @patch("nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages")
+    @patch("nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule")
     def test_pipeline_model_with_seq_len(self, mock_build_schedule, mock_split_stages):
         """Test that pipeline_model calls _precompute_stage_shapes when seq_len is provided."""
         mock_world_mesh = MagicMock()
@@ -874,8 +972,8 @@ class TestPrecomputeStageShapes:
         assert mock_stage2.inputs_meta is not None
         assert mock_stage2.inputs_meta[0].shape == (2, 16, 64)  # hidden_states
 
-    @patch('nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages')
-    @patch('nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule')
+    @patch("nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages")
+    @patch("nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule")
     def test_pipeline_model_without_seq_len(self, mock_build_schedule, mock_split_stages):
         """Test that pipeline_model skips precomputation when seq_len is None."""
         mock_world_mesh = MagicMock()
