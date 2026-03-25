@@ -18,9 +18,9 @@
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1
-  ckpt_every_steps: 100
-  val_every_steps: 100
-  max_steps: 1000
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  num_epochs: 2
 
 dist_env:
   backend: nccl
@@ -96,5 +96,5 @@ freeze_config:
 
 # wandb:
 #   project: eevee-4
-#   name: eevee4-e4b-it_vv7
+#   name: eevee4-e4b-it_vv7_2epochs
 #   dir: vlm_checkpoints/gemma4_4b/

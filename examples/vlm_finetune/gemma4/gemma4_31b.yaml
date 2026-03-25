@@ -19,9 +19,9 @@
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1
-  ckpt_every_steps: 100
-  val_every_steps: 100
-  max_steps: 1000
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  num_epochs: 2
 
 dist_env:
   backend: nccl
@@ -102,5 +102,5 @@ freeze_config:
 # Uncomment and set WANDB_API_KEY env var to enable W&B logging
 # wandb:
 #   project: eevee-4
-#   name: eevee4-31b-it_vv5
+#   name: eevee4-31b-it_vv5_lossfixed
 #   dir: vlm_checkpoints/gemma4_31b_it/

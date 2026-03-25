@@ -19,9 +19,9 @@
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1
-  ckpt_every_steps: 100
-  val_every_steps: 100
-  max_steps: 100
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  num_epochs: 2
 
 dist_env:
   backend: nccl
@@ -97,7 +97,7 @@ validation_dataloader:
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 5e-6
+  lr: 2e-5
   weight_decay: 0.01
   betas: [0.9, 0.95]
 
@@ -110,5 +110,5 @@ freeze_config:
 #Uncomment and set WANDB_API_KEY env var to enable W&B logging
 # wandb:
 #   project: eevee-4
-#   name: eevee4-26b-a4b-moe-it_vv5
+#   name: eevee4-26b-a4b-moe-it_vv5_lr2e-5_2epochs
 #   dir: vlm_checkpoints/gemma4_26b_a4b_moe/
