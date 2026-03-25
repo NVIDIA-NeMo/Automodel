@@ -82,10 +82,10 @@ dataloader:
 #     question: inputs
 #     answer: targets
 
-dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: false
+# validation_dataloader:
+#   _target_: torchdata.stateful_dataloader.StatefulDataLoader
+#   collate_fn: nemo_automodel.components.datasets.utils.default_collater
+#   shuffle: false
 
 optimizer:
   _target_: torch.optim.AdamW
