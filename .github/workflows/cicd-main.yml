@@ -28,6 +28,7 @@ concurrency:
 permissions:
   id-token: write
   contents: read
+  pull-requests: read
 
 env:
   container-registry: nemoci.azurecr.io
