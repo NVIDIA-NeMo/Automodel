@@ -165,7 +165,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                         getattr(decoder_layer, "attention_type"), causal_mask_mapping.get("full_attention")
                     )
 
-                hidden_states = decoder_layer(
+                layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=layer_attention_mask,
                     position_ids=position_ids,
@@ -175,6 +175,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                     position_embeddings=position_embeddings,
                     **filtered_kwargs,
                 )
+                hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
 
         if hasattr(self, "norm") and self.norm is not None:
             hidden_states = self.norm(hidden_states)
