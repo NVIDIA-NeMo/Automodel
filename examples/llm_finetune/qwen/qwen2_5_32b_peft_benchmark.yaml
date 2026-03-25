@@ -93,4 +93,4 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
-  time: "00:20:00"
+  time: "00:30:00"

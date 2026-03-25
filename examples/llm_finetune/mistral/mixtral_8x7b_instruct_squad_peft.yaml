@@ -100,4 +100,4 @@ optimizer:
 #   save_dir: <your_wandb_save_dir> 
 
 ci:
-  time: "00:15:00"
+  time: "00:30:00"
