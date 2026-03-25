@@ -140,21 +140,23 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
             # Works for dict-like or list-like containers
             layer_iter = self.layers.values() if hasattr(self.layers, "values") else self.layers
 
-            # Filter kwargs to only those accepted by the decoder layer's forward().
+            # Filter kwargs to only the named parameters of the decoder layer's forward().
             # This prevents model-level kwargs (seq_lens, padding_mask, etc.) from
-            # leaking into decoder layers that don't accept them.
-            import inspect
+            # leaking through decoder layers that accept **kwargs and blindly forward
+            # them to sub-modules (e.g. attention) that don't accept them.
+            # We intentionally ignore VAR_KEYWORD (**kwargs) — even if the layer
+            # accepts **kwargs, it may forward them to sub-modules that don't.
+            if not hasattr(self, "_layer_forward_params"):
+                import inspect
 
-            first_layer = next(iter(self.layers.values() if hasattr(self.layers, "values") else self.layers))
-            layer_sig = inspect.signature(first_layer.forward)
-            layer_accepts_var_keyword = any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in layer_sig.parameters.values()
-            )
-            if layer_accepts_var_keyword:
-                filtered_kwargs = kwargs
-            else:
-                layer_params = set(layer_sig.parameters.keys())
-                filtered_kwargs = {k: v for k, v in kwargs.items() if k in layer_params}
+                first_layer = next(iter(self.layers.values() if hasattr(self.layers, "values") else self.layers))
+                sig = inspect.signature(first_layer.forward)
+                self._layer_forward_params = frozenset(
+                    name
+                    for name, p in sig.parameters.items()
+                    if p.kind not in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
+                )
+            filtered_kwargs = {k: v for k, v in kwargs.items() if k in self._layer_forward_params}
 
             for decoder_layer in layer_iter:
                 layer_attention_mask = causal_mask_mapping.get("full_attention")
