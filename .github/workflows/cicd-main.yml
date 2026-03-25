@@ -255,7 +255,7 @@ jobs:
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
-          container-image: ${{ env.container-registry }}/automodel:${{ github.sha }}
+          container-image: ${{ env.container-registry }}/internal-automodel:${{ github.sha }}
           runner: ${{ matrix.runner }}
 
   cicd-e2e-tests:
@@ -330,7 +330,7 @@ jobs:
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ matrix.test-data-path }}
-          container-image: ${{ env.container-registry }}/automodel:${{ github.sha }}
+          container-image: ${{ env.container-registry }}/internal-automodel:${{ github.sha }}
           runner: ${{ matrix.runner }}
 
   Nemo_CICD_Test:
