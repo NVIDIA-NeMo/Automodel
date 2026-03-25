@@ -810,7 +810,9 @@ def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None
     if hasattr(config, "num_key_value_heads") and config.num_key_value_heads is not None:
         local_num_key_value_heads = config.num_key_value_heads // tp_size
 
-    for layer in layers:
+    # PP converts ModuleList → ModuleDict; iterating a ModuleDict yields keys, not modules.
+    layer_iter = layers.values() if isinstance(layers, nn.ModuleDict) else layers
+    for layer in layer_iter:
         if hasattr(layer, "self_attn"):
             attn = layer.self_attn
             if hasattr(attn, "num_heads"):
