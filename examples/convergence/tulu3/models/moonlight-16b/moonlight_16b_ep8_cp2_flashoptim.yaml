@@ -1,6 +1,7 @@
 # Moonlight 16B (3B active) SFT on Tulu-3 with EP=8, CP=2, FSDP on 8 GPUs.
 # Uses ChatDataset with default collater.
 # Backend settings aligned with examples/benchmark/configs/moonlight_16b_te_deepep.yaml
+# Uses FlashAdamW with 32-bit master weights and fp32 loss upcasting.
 
 step_scheduler:
   global_batch_size: 128
@@ -37,7 +38,7 @@ model:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: checkpoints_convergence/moonlight_16b_flashoptim_cp2/
+  checkpoint_dir: checkpoints_convergence/moonlight_16b_flashoptim_cp2_fp32_upcast/
   model_save_format: safetensors
   save_consolidated: true
 
@@ -66,7 +67,7 @@ autocast:
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
-  fp32_upcast: false
+  fp32_upcast: true
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
@@ -109,7 +110,7 @@ optimizer:
   betas: [0.9, 0.95]
   eps: 1e-8
   weight_decay: 0
-  master_weight_bits: 24
+  master_weight_bits: 32
   compress_state_dict: false
 
 moe_metrics:
