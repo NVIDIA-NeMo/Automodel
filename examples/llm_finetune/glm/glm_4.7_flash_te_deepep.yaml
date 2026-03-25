@@ -67,10 +67,6 @@ distributed:
     reshard_after_forward: false
     wrap_outer_model: false
 
-  moe:
-    reshard_after_forward: false
-    wrap_outer_model: false
-
 distributed_config:
   _target_: nemo_automodel.components.distributed.config.FSDP2Config
 
