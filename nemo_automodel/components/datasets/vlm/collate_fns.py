@@ -653,8 +653,17 @@ def default_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
     max_length: Optional[int] = None,
+    _post_tokenize_hook=None,
 ) -> Dict[str, torch.Tensor]:
-    """Default collate function for multimodal VLM datasets."""
+    """Default collate function for multimodal VLM datasets.
+
+    Args:
+        _post_tokenize_hook: Optional callable ``(batch, processor) -> batch``
+            invoked right after ``apply_chat_template`` and before
+            ``build_labels``.  Used by model-specific collate wrappers
+            (e.g. Gemma4 thinking-channel injection) to transform the
+            tokenized batch without duplicating the rest of the pipeline.
+    """
     if not HAVE_QWEN_VL_UTILS:
         raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
 
@@ -670,6 +679,9 @@ def default_collate_fn(
         processor_kwargs["max_length"] = max_length
         processor_kwargs["padding"] = "max_length"
     batch = processor.apply_chat_template(conversations, **processor_kwargs)
+
+    if _post_tokenize_hook is not None:
+        batch = _post_tokenize_hook(batch, processor)
 
     if "position_ids" not in batch:
         batch_size, seq_len = batch["input_ids"].shape
@@ -811,6 +823,125 @@ def neat_packed_vlm_collater(
         result["n_videos_per_sample"] = torch.tensor(video_counts, dtype=torch.long)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Gemma4 thinking-channel prefix injection
+# ---------------------------------------------------------------------------
+_GEMMA4_MODEL_TURN = "<|turn>model\n"
+_GEMMA4_THINKING_PREFIX = "<|channel>thought\n<channel|>"
+
+
+def _inject_thinking_prefix_tokens(
+    batch: Dict[str, torch.Tensor],
+    tokenizer,
+) -> Dict[str, torch.Tensor]:
+    """Insert ``<|channel>thought\\n<channel|>`` tokens after every ``<|turn>model\\n`` marker.
+
+    Gemma4 31B / 26B-A4B MoE instruction-tuned models always emit a thinking-
+    channel prefix before the actual response.  When this prefix is absent from
+    training sequences the model predicts ``<|channel>`` but the label says
+    answer text, inflating initial loss to ~9.  Injecting the prefix (masked
+    as -100 in labels) lets the model see its expected pattern and brings
+    initial loss down to ~3.
+
+    Only modifies ``input_ids``, ``attention_mask``, and ``token_type_ids``
+    (if present).  Other tensors (e.g. ``pixel_values``) are untouched.
+    """
+    marker_ids = tokenizer.encode(_GEMMA4_MODEL_TURN, add_special_tokens=False)
+    prefix_ids = tokenizer.encode(_GEMMA4_THINKING_PREFIX, add_special_tokens=False)
+
+    if not prefix_ids or not marker_ids:
+        return batch
+
+    marker_len = len(marker_ids)
+    prefix_len = len(prefix_ids)
+    marker_t = torch.tensor(marker_ids, dtype=batch["input_ids"].dtype)
+    prefix_t = torch.tensor(prefix_ids, dtype=batch["input_ids"].dtype)
+    pad_id = getattr(tokenizer, "pad_token_id", 0) or 0
+
+    seq_keys = ["input_ids", "attention_mask"]
+    if "token_type_ids" in batch:
+        seq_keys.append("token_type_ids")
+
+    fill_defaults = {"input_ids": pad_id, "attention_mask": 0, "token_type_ids": 0}
+    inject_defaults = {"input_ids": prefix_t, "attention_mask": 1, "token_type_ids": 0}
+
+    B = batch["input_ids"].size(0)
+    new_seqs: Dict[str, List[torch.Tensor]] = {k: [] for k in seq_keys}
+
+    for b in range(B):
+        seq = batch["input_ids"][b]
+        dev = seq.device
+
+        insert_after: List[int] = []
+        i = 0
+        while i <= len(seq) - marker_len:
+            if torch.all(seq[i : i + marker_len] == marker_t.to(dev)):
+                insert_after.append(i + marker_len)
+                i += marker_len
+            else:
+                i += 1
+
+        if not insert_after:
+            for k in seq_keys:
+                new_seqs[k].append(batch[k][b])
+            continue
+
+        for k in seq_keys:
+            src = batch[k][b]
+            chunks: List[torch.Tensor] = []
+            prev = 0
+            for pos in insert_after:
+                chunks.append(src[prev:pos])
+                if k == "input_ids":
+                    chunks.append(prefix_t.to(dev))
+                else:
+                    val = inject_defaults[k]
+                    chunks.append(torch.full((prefix_len,), val, dtype=src.dtype, device=dev))
+                prev = pos
+            chunks.append(src[prev:])
+            new_seqs[k].append(torch.cat(chunks))
+
+    max_new_len = max(s.size(0) for s in new_seqs["input_ids"])
+    for k in seq_keys:
+        fill = fill_defaults[k]
+        padded = torch.full(
+            (B, max_new_len), fill, dtype=batch[k].dtype, device=batch[k].device
+        )
+        for i, t in enumerate(new_seqs[k]):
+            L = t.size(0)
+            padded[i, :L] = t[:L]
+        batch[k] = padded
+
+    return batch
+
+
+def gemma4_prefix_collate_fn(
+    examples: Sequence[Dict[str, Any]],
+    processor,
+    max_length: Optional[int] = None,
+) -> Dict[str, torch.Tensor]:
+    """Collate function for Gemma4 models with thinking-channel prefix.
+
+    Wraps ``default_collate_fn`` and injects ``<|channel>thought\\n<channel|>``
+    after every ``<|turn>model\\n`` marker before labels are built.  The injected
+    tokens are automatically masked to -100 by ``build_labels`` (which only
+    unmasks tokens matching the assistant answer text), so the model sees its
+    expected thinking prefix without being penalised for it.
+    """
+
+    def _inject(batch, proc):
+        tokenizer = getattr(proc, "tokenizer", proc)
+        batch = _inject_thinking_prefix_tokens(batch, tokenizer)
+        if max_length is not None and batch["input_ids"].size(1) > max_length:
+            for key in list(batch.keys()):
+                v = batch[key]
+                if isinstance(v, torch.Tensor) and v.dim() >= 2 and v.size(1) > max_length and key != "pixel_values":
+                    batch[key] = v[:, :max_length]
+        return batch
+
+    return default_collate_fn(examples, processor, max_length, _post_tokenize_hook=_inject)
 
 
 # Mapping of processor types to their collate functions

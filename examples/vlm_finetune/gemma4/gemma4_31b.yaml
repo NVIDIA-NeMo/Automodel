@@ -75,7 +75,7 @@ dataloader:
   num_workers: 0
   pin_memory: true
   collate_fn:
-    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_prefix_collate_fn
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
@@ -84,6 +84,8 @@ validation_dataset:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_prefix_collate_fn
 
 optimizer:
   _target_: torch.optim.AdamW
