@@ -114,4 +114,4 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
-  node_count: 2
+  nodes: 2

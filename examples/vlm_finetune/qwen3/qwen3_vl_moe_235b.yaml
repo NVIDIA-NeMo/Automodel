@@ -119,3 +119,4 @@ optimizer:
 ci:
   nodes: 32
   time: "01:00:00"
+  local_batch_size: 4

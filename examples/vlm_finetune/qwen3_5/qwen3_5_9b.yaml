@@ -94,6 +94,9 @@ optimizer:
   lr: 1.0e-5
   weight_decay: 0.1
 
+ci:
+  time: "00:30:00"
+
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>

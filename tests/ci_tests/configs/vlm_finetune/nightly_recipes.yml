@@ -13,4 +13,19 @@
 # limitations under the License.
 
 configs:
+  # SFT
+  - gemma3/gemma3_vl_4b_cord_v2.yaml
+  - gemma3n/gemma3n_vl_4b_medpix.yaml
+  - internvl/internvl_3_5_4b.yaml
   - kimi/kimi2vl_cordv2.yaml
+  - mistral/ministral3_3b_medpix.yaml
+  - mistral4/mistral4_medpix.yaml
+  - nemotron/nemotron_parse_v1_1.yaml
+  - phi4/phi4_mm_cv17.yaml
+  - qwen2_5/qwen2_5_vl_3b_rdr.yaml
+  - qwen3/qwen3_vl_4b_instruct_rdr.yaml
+  - qwen3_5/qwen3_5_4b.yaml
+  - qwen3_5_moe/qwen3_5_35b.yaml
+  # PEFT
+  - gemma3/gemma3_vl_4b_cord_v2_peft.yaml
+  - gemma3n/gemma3n_vl_4b_medpix_peft.yaml
