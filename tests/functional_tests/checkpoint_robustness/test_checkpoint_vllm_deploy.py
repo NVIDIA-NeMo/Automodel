@@ -70,10 +70,19 @@ def test_vllm_greedy_matches_hf():
     if smoke_test:
         # Smoke test: just verify vLLM can load the model and generate non-empty output.
         # Uses native vLLM backend (no model_impl="transformers"), no HF comparison.
-        print(f"[vLLM smoke test] Loading model from {model_path}")
-        llm = LLM(model=model_path)
-        sampling_params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
-        vllm_results = llm.generate(PROMPTS, sampling_params)
+        if adapter_path is not None:
+            from vllm.lora.request import LoRARequest
+
+            print(f"[vLLM smoke test] Loading model from {model_path} with enable_lora=True")
+            llm = LLM(model=model_path, enable_lora=True, max_lora_rank=64)
+            lora_request = LoRARequest("adapter", 1, adapter_path)
+            sampling_params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
+            vllm_results = llm.generate(PROMPTS, sampling_params, lora_request=lora_request)
+        else:
+            print(f"[vLLM smoke test] Loading model from {model_path}")
+            llm = LLM(model=model_path)
+            sampling_params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
+            vllm_results = llm.generate(PROMPTS, sampling_params)
 
         for idx, result in enumerate(vllm_results):
             tokens = list(result.outputs[0].token_ids)

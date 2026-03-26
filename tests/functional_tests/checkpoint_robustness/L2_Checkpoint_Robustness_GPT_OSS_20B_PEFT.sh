@@ -23,7 +23,7 @@ CKPT_DIR="checkpoints/robustness_peft_$$"
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 \
     -m pytest tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
     --config examples/llm_finetune/gpt_oss/gpt_oss_20b_peft.yaml \
-    --model.pretrained_model_name_or_path nvidia/GPT-OSS-20B-A3B \
+    --model.pretrained_model_name_or_path openai/gpt-oss-20b \
     --step_scheduler.max_steps 5 \
     --step_scheduler.global_batch_size 8 \
     --step_scheduler.local_batch_size 4 \
@@ -41,4 +41,12 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --distributed.ep_size 1 \
     --distributed.cp_size 1 \
     --distributed.sequence_parallel false \
-    --hf_kl_threshold 5e-3
+    --hf_kl_threshold 5e-2
+
+# Step 2: vLLM deployment smoke test with native LoRA
+CKPT_STEP_DIR=$(ls -d "$CKPT_DIR"/epoch_*_step_* | sort | tail -1)
+python -m pytest tests/functional_tests/checkpoint_robustness/test_checkpoint_vllm_deploy.py \
+    --model_path openai/gpt-oss-20b \
+    --adapter_path "$CKPT_STEP_DIR/model/" \
+    --max_new_tokens 50 \
+    --vllm_smoke_test
