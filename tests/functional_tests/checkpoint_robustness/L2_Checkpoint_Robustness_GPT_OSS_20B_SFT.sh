@@ -16,12 +16,12 @@
 set -xeuo pipefail
 
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
-export CUDA_VISIBLE_DEVICES="0,1"
+export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 
 CKPT_DIR="checkpoints/robustness_sft_$$"
 
 # Step 1: Checkpoint robustness (torchrun + pytest)
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 \
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     -m pytest tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
     --config examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml \
     --model.pretrained_model_name_or_path openai/gpt-oss-20b \

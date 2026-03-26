@@ -16,18 +16,18 @@
 set -xeuo pipefail
 
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
-export CUDA_VISIBLE_DEVICES="0,1"
+export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 
 CKPT_DIR="checkpoints/robustness_sft_$$"
 
 # Step 1: Checkpoint robustness (torchrun + pytest)
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 \
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     -m pytest tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
     --config examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml \
     --model.pretrained_model_name_or_path meta-llama/Llama-3.2-3B-Instruct \
     --step_scheduler.max_steps 5 \
-    --step_scheduler.global_batch_size 8 \
-    --step_scheduler.local_batch_size 4 \
+    --step_scheduler.global_batch_size 16 \
+    --step_scheduler.local_batch_size 2 \
     --step_scheduler.ckpt_every_steps 5 \
     --step_scheduler.val_every_steps 5 \
     --dataset.path_or_dataset $HF_CACHE/hellaswag/ \
@@ -40,7 +40,9 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --distributed.tp_size 1 \
     --distributed.cp_size 1 \
     --distributed.sequence_parallel false \
-    --hf_kl_threshold 5e-3
+    --hf_kl_threshold 5e-3 \
+    --cross_tp_size 2 \
+    --cross_tp_kl_threshold 5e-3
 
 # Find the checkpoint directory for vLLM test
 CKPT_STEP_DIR=$(ls -d "$CKPT_DIR"/epoch_*_step_* | sort | tail -1)
