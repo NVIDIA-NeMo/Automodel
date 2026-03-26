@@ -94,4 +94,4 @@ optimizer:
 
 ci:
   time: "00:30:00"
-  node_count: 2
+  nodes: 2
