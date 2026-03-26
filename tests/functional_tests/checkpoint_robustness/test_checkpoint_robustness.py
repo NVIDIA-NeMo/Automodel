@@ -20,26 +20,31 @@ TEST_FOLDER = "checkpoint_robustness"
 
 
 class TestCheckpointRobustness:
-    def test_checkpoint_robustness_llama3_2_3b_sft(self):
-        try:
-            run_test_script(TEST_FOLDER, "L2_Checkpoint_Robustness_Llama3_2_3B_SFT.sh")
-        finally:
-            shutil.rmtree("checkpoints/", ignore_errors=True)
+    """Checkpoint save/load robustness tests (SFT + PEFT + cross-TP).
 
-    def test_checkpoint_robustness_llama3_2_3b_peft(self):
-        try:
-            run_test_script(TEST_FOLDER, "L2_Checkpoint_Robustness_Llama3_2_3B_PEFT.sh")
-        finally:
-            shutil.rmtree("checkpoints/", ignore_errors=True)
+    Checkpoints are written to /adasif/checkpoints/ and kept for vLLM tests.
+    """
 
-    def test_checkpoint_robustness_gpt_oss_20b_sft(self):
-        try:
-            run_test_script(TEST_FOLDER, "L2_Checkpoint_Robustness_GPT_OSS_20B_SFT.sh")
-        finally:
-            shutil.rmtree("checkpoints/", ignore_errors=True)
+    def test_checkpoint_robustness_llama3_2_3b(self):
+        run_test_script(TEST_FOLDER, "L2_Checkpoint_Robustness_Llama3_2_3B.sh")
 
-    def test_checkpoint_robustness_gpt_oss_20b_peft(self):
+    def test_checkpoint_robustness_gpt_oss_20b(self):
+        run_test_script(TEST_FOLDER, "L2_Checkpoint_Robustness_GPT_OSS_20B.sh")
+
+
+class TestVLLMDeploy:
+    """vLLM deployment tests. Must run after TestCheckpointRobustness (uses their checkpoints)."""
+
+    def test_vllm_deploy_llama3_2_3b(self):
         try:
-            run_test_script(TEST_FOLDER, "L2_Checkpoint_Robustness_GPT_OSS_20B_PEFT.sh")
+            run_test_script(TEST_FOLDER, "L2_vLLM_Deploy_Llama3_2_3B.sh")
         finally:
-            shutil.rmtree("checkpoints/", ignore_errors=True)
+            shutil.rmtree("/adasif/checkpoints/robustness_llama_sft", ignore_errors=True)
+            shutil.rmtree("/adasif/checkpoints/robustness_llama_peft", ignore_errors=True)
+
+    def test_vllm_deploy_gpt_oss_20b(self):
+        try:
+            run_test_script(TEST_FOLDER, "L2_vLLM_Deploy_GPT_OSS_20B.sh")
+        finally:
+            shutil.rmtree("/adasif/checkpoints/robustness_gptoss_sft", ignore_errors=True)
+            shutil.rmtree("/adasif/checkpoints/robustness_gptoss_peft", ignore_errors=True)

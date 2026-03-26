@@ -18,37 +18,49 @@ set -xeuo pipefail
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 
-CKPT_DIR="checkpoints/robustness_sft_$$"
+SFT_CKPT_DIR="/adasif/checkpoints/robustness_gptoss_sft"
+PEFT_CKPT_DIR="/adasif/checkpoints/robustness_gptoss_peft"
 
-# Step 1: Checkpoint robustness (torchrun + pytest)
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
+# Step 1: SFT checkpoint robustness
+python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     -m pytest tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
     --config examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml \
     --model.pretrained_model_name_or_path openai/gpt-oss-20b \
     --step_scheduler.max_steps 5 \
-    --step_scheduler.global_batch_size 8 \
-    --step_scheduler.local_batch_size 4 \
+    --step_scheduler.global_batch_size 16 \
+    --step_scheduler.local_batch_size 2 \
     --step_scheduler.ckpt_every_steps 5 \
     --step_scheduler.val_every_steps 5 \
-    --dataset.path_or_dataset $HF_CACHE/hellaswag/ \
-    --validation_dataset.path_or_dataset $HF_CACHE/hellaswag/ \
     --checkpoint.enabled true \
-    --checkpoint.checkpoint_dir "$CKPT_DIR" \
+    --checkpoint.checkpoint_dir "$SFT_CKPT_DIR" \
     --checkpoint.model_save_format safetensors \
     --checkpoint.save_consolidated true \
     --distributed.dp_size none \
     --distributed.tp_size 1 \
     --distributed.pp_size 1 \
-    --distributed.ep_size 1 \
+    --distributed.ep_size 8 \
     --distributed.cp_size 1 \
     --distributed.sequence_parallel false \
     --hf_kl_threshold 5e-2
 
-# Step 2: vLLM deployment smoke test (native backend, no HF comparison).
-# Full HF comparison requires model_impl="transformers" which needs transformers>=5.0 for MoE.
-CKPT_STEP_DIR=$(ls -d "$CKPT_DIR"/epoch_*_step_* | sort | tail -1)
-python -m pytest tests/functional_tests/checkpoint_robustness/test_checkpoint_vllm_deploy.py \
-    --model_path "$CKPT_STEP_DIR/model/consolidated/" \
-    --tokenizer openai/gpt-oss-20b \
-    --max_new_tokens 50 \
-    --vllm_smoke_test
+# Step 2: PEFT checkpoint robustness
+python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
+    -m pytest tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
+    --config examples/llm_finetune/gpt_oss/gpt_oss_20b_peft.yaml \
+    --model.pretrained_model_name_or_path openai/gpt-oss-20b \
+    --step_scheduler.max_steps 5 \
+    --step_scheduler.global_batch_size 16 \
+    --step_scheduler.local_batch_size 2 \
+    --step_scheduler.ckpt_every_steps 5 \
+    --step_scheduler.val_every_steps 5 \
+    --checkpoint.enabled true \
+    --checkpoint.checkpoint_dir "$PEFT_CKPT_DIR" \
+    --checkpoint.save_consolidated true \
+    --peft.use_triton false \
+    --distributed.dp_size none \
+    --distributed.tp_size 1 \
+    --distributed.pp_size 1 \
+    --distributed.ep_size 8 \
+    --distributed.cp_size 1 \
+    --distributed.sequence_parallel false \
+    --hf_kl_threshold 5e-2
