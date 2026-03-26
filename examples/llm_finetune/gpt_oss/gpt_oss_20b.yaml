@@ -44,7 +44,7 @@ model:
   #   enable_fsdp_optimizations: true
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors # torch_save or safetensors
   save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
@@ -109,3 +109,6 @@ optimizer:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
+
+ci:
+  node_multiplier: true

@@ -61,7 +61,7 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
     linear: torch
-    rms_norm: te
+    rms_norm: torch_fp32
     rope_fusion: false  # failed in CI test
     experts: torch
     dispatcher: torch
@@ -130,3 +130,6 @@ optimizer:
   weight_decay: 0.01
   betas: [0.9, 0.95]
   eps: 1e-8
+
+ci:
+  local_batch_size: 1

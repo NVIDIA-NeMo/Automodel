@@ -26,6 +26,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention, Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.state_dict_adapter import Qwen3NextStateDictAdapter
@@ -76,6 +77,10 @@ class Block(nn.Module):
             attn_out = self.linear_attn(
                 hidden_states=self.input_layernorm(x),
                 attention_mask=attention_mask,
+                position_ids=position_ids,
+                qkv_format=attn_kwargs.get("qkv_format"),
+                cu_seqlens=attn_kwargs.get("cu_seqlens"),
+                seq_index=attn_kwargs.get("seq_index"),
             )
         elif self.layer_type == "full_attention":
             attn_out = self.self_attn(
@@ -318,7 +323,7 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
         with buffer_device:
             # Ensure rotary embedding uses correct device after dtype move
             self.model.rotary_emb.device = buffer_device

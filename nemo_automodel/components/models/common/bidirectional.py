@@ -40,8 +40,11 @@ class BiencoderStateDictAdapter(StateDictAdapter):
         self._uses_model_prefix = True
 
     @staticmethod
-    def _swap_key(key: str, src: str, dst: str, peft_prefix: str) -> Optional[str]:
+    def _swap_key(key: str, src: str, dst: str, peft_prefix: str, peft_dst: Optional[str] = None) -> Optional[str]:
         """Return *key* with *src* prefix replaced by *dst*, handling an optional PEFT wrapper.
+
+        Args:
+            peft_dst: Destination prefix for PEFT-wrapped keys.  Defaults to *dst*.
 
         Returns ``None`` when *key* doesn't match *src* (bare or PEFT-wrapped).
         """
@@ -49,14 +52,21 @@ class BiencoderStateDictAdapter(StateDictAdapter):
             return dst + key[len(src) :]
         peft_src = peft_prefix + src
         if key.startswith(peft_src):
-            return peft_prefix + dst + key[len(peft_src) :]
+            effective_dst = peft_dst if peft_dst is not None else dst
+            return peft_prefix + effective_dst + key[len(peft_src) :]
         return None
 
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
-        """Convert biencoder state dict to HF format (lm_q -> model)."""
+        """Convert biencoder state dict to HF format.
+
+        Base-model weights: ``lm_q.X`` → ``model.X``.
+        PEFT adapter weights: ``base_model.model.lm_q.X`` → ``base_model.model.X``
+        (strips ``lm_q.`` without adding ``model.`` so keys match the standalone
+        ``LlamaBidirectionalModel`` which extends ``LlamaModel`` directly).
+        """
         hf_state_dict = {}
         for key, value in state_dict.items():
-            new_key = self._swap_key(key, "lm_q.", "model.", self._PEFT_PREFIX)
+            new_key = self._swap_key(key, "lm_q.", "model.", self._PEFT_PREFIX, peft_dst="")
             if new_key is not None:
                 hf_state_dict[new_key] = value
         return hf_state_dict
@@ -67,14 +77,24 @@ class BiencoderStateDictAdapter(StateDictAdapter):
         device_mesh: Optional["DeviceMesh"] = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Convert HF state dict to biencoder format (model -> lm_q + lm_p)."""
+        """Convert HF state dict to biencoder format (model -> lm_q + lm_p).
+
+        Handles both bare keys (``model.X``) and PEFT keys (``base_model.model.X``).
+        """
         biencoder_state_dict = {}
         for key, value in hf_state_dict.items():
-            q_key = self._swap_key(key, "model.", "lm_q.", self._PEFT_PREFIX)
-            if q_key is not None:
-                p_key = self._swap_key(key, "model.", "lm_p.", self._PEFT_PREFIX)
-                biencoder_state_dict[q_key] = value
-                biencoder_state_dict[p_key] = value
+            if key.startswith(self._PEFT_PREFIX):
+                # PEFT format: base_model.model.X → base_model.model.lm_q.X
+                # Only restore to lm_q; lm_p shares parameters in shared-encoder
+                # mode and loading into lm_p would fail with FSDP DTensors.
+                suffix = key[len(self._PEFT_PREFIX) :]
+                biencoder_state_dict[self._PEFT_PREFIX + "lm_q." + suffix] = value
+            else:
+                q_key = self._swap_key(key, "model.", "lm_q.", self._PEFT_PREFIX)
+                if q_key is not None:
+                    p_key = self._swap_key(key, "model.", "lm_p.", self._PEFT_PREFIX)
+                    biencoder_state_dict[q_key] = value
+                    biencoder_state_dict[p_key] = value
         return biencoder_state_dict
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:

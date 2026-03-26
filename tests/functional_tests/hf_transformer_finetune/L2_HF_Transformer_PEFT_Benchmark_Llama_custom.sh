@@ -22,13 +22,13 @@ export CUDA_VISIBLE_DEVICES="0,1"
 MODEL_PATH=/home/TestData/HF_HOME/hub/models--meta-llama--Llama-3.2-1B/snapshots/4e20de362430cd3b72f300e6b0f18e50e7166e08/
 
 # override with a smaller model meta-llama/Llama-3.2-1B for testing
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
 nemo_automodel/recipes/llm/benchmark.py \
     --config examples/llm_finetune/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark.yaml \
     --model.pretrained_model_name_or_path=${MODEL_PATH} \
     --model.num_hidden_layers=2 \
     --distributed.tp_size=2 \
     --distributed.pp_size=1 \
-    --distributed.sequence_parallel=False \
+    --distributed_config.sequence_parallel=False \
     --benchmark.warmup_steps=2 \
     --step_scheduler.max_steps=4

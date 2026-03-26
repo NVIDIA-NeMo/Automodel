@@ -147,6 +147,29 @@ def _split_batch_bshd_for_cp(batch, cp_mesh):
     return batch
 
 
+def attach_context_parallel_hooks(model: torch.nn.Module):
+    """Attach forward pre-hooks to self_attn modules to fix attention masks for context parallelism.
+
+    Context parallelism shards Q/K/V on the sequence dimension as DTensors,
+    so explicit 4D attention masks would have mismatched shapes.  This function
+    registers a hook on every ``self_attn`` sub-module that strips the
+    ``attention_mask`` kwarg and sets ``is_causal=True`` instead, letting
+    SDPA handle causal masking internally.
+
+    Based on ``accelerate.big_modeling._attach_context_parallel_hooks``.
+    """
+
+    def _self_attn_pre_forward_hook(_module, module_args, module_kwargs):
+        if "attention_mask" in module_kwargs:
+            module_kwargs["attention_mask"] = None
+            module_kwargs["is_causal"] = True
+        return module_args, module_kwargs
+
+    for name, module in model.named_modules():
+        if name.endswith("self_attn"):
+            module.register_forward_pre_hook(_self_attn_pre_forward_hook, with_kwargs=True, prepend=True)
+
+
 def make_cp_batch_and_ctx(
     device_mesh,
     batch,
@@ -204,24 +227,43 @@ def make_cp_batch_and_ctx(
     if _get_mesh_size(cp_mesh) <= 1:
         return nullcontext, batch
 
-    # CP doesn't support packed sequence currently. Let torch SDPA handle attention mask.
+    # Remove attention_mask from the batch so the model does not attempt to
+    # build a 4D causal mask (which would have mismatched shapes with
+    # DTensor-sharded Q/K/V).  Each self_attn module's forward_pre_hook
+    # (registered by attach_context_parallel_hooks) will set is_causal=True
+    # so that SDPA handles causal masking internally.
     batch.pop("attention_mask", None)
 
+    # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed)
     if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
         batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(batch["input_ids"].device)
 
     input_ids = batch["input_ids"]
     position_ids = batch["position_ids"]
 
+    # Determine correct seq dim for CP sharding
+    # mRoPE: [3, B, S] → shard on dim 2; standard: [B, S] → shard on dim 1
+    pos_seq_dim = 2 if position_ids.ndim == 3 else 1
+
     labels = batch["labels"]
+
+    # Collect all available tensors for context parallel
+    cp_buffers = [input_ids, labels, position_ids]
+    cp_seq_dims = [1, 1, pos_seq_dim]
+    cp_no_restore_buffers = {input_ids, labels}
+
+    # Add loss_mask if available
     if loss_mask is not None:
-        cp_buffers = [input_ids, labels, position_ids, loss_mask]
-        cp_seq_dims = [1, 1, 1, 1]
-        cp_no_restore_buffers = {input_ids, labels, loss_mask}
-    else:
-        cp_buffers = [input_ids, labels, position_ids]
-        cp_seq_dims = [1, 1, 1]
-        cp_no_restore_buffers = {input_ids, labels}
+        cp_buffers.append(loss_mask)
+        cp_seq_dims.append(1)
+        cp_no_restore_buffers.add(loss_mask)
+
+    # Add padding_mask if available in batch
+    if "padding_mask" in batch:
+        padding_mask = batch["padding_mask"]
+        cp_buffers.append(padding_mask)
+        cp_seq_dims.append(1)
+        cp_no_restore_buffers.add(padding_mask)
 
     cp_ctx = create_context_parallel_ctx(
         cp_mesh=cp_mesh,
@@ -332,7 +374,7 @@ def make_cp_batch_for_te(
             _shard_thd_chunk_for_te(chunk_batch, cp_mesh, qkv_format, seq_lens_padding_value, padding_token_id)
         )
 
-    return {
+    return_dict = {
         "input_ids": torch.stack([chunk["input_ids"] for chunk in chunks]),
         "labels": torch.stack([chunk["labels"] for chunk in chunks]),
         "position_ids": torch.stack([chunk["position_ids"] for chunk in chunks]),
@@ -343,6 +385,8 @@ def make_cp_batch_for_te(
         "cp_size": cp_mesh.size() if cp_mesh is not None else 1,
         "cp_rank": torch.distributed.get_rank(group=cp_mesh.get_group()) if cp_mesh is not None else 0,
     }
+
+    return return_dict
 
 
 def _shard_thd_chunk_for_te(
@@ -368,11 +412,16 @@ def _shard_thd_chunk_for_te(
     cp_size = cp_mesh.size()
 
     cp_rank = torch.distributed.get_rank(group=cp_mesh.get_group()) if cp_mesh is not None else 0
-    for key in ["input_ids", "labels", "position_ids", "padding_mask"]:
-        val = batch[key]
-        index = tex.thd_get_partitioned_indices(filtered_cu_seqlens_padded, val.size(0), cp_size, cp_rank)
-        val = val.index_select(0, index)
-        batch[key] = val
+
+    # Handle all mask keys that may be present in the batch
+    mask_keys = ["input_ids", "labels", "position_ids", "padding_mask"]
+
+    for key in mask_keys:
+        if key in batch:
+            val = batch[key]
+            index = tex.thd_get_partitioned_indices(filtered_cu_seqlens_padded, val.size(0), cp_size, cp_rank)
+            val = val.index_select(0, index)
+            batch[key] = val
 
     max_seqlen = (filtered_cu_seqlens_padded[1:] - filtered_cu_seqlens_padded[:-1]).max().item()
     output_batch = {
@@ -386,4 +435,5 @@ def _shard_thd_chunk_for_te(
         "cp_size": cp_size,
         "cp_rank": cp_rank,
     }
+
     return output_batch

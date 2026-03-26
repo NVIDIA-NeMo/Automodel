@@ -86,6 +86,7 @@ def _get_logical_numel(param) -> int:
     return param.numel()
 
 
+@torch.no_grad()
 def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
     """
     Get the number of trainable parameters and the L2 norm of the model.
@@ -108,9 +109,11 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
         if p.requires_grad:
             trainable_params += n
         try:
-            local_sq_norm += float(p.detach().float().norm(2).item() ** 2)
+            local_sq_norm += p.detach().norm(2) ** 2
         except Exception:
             pass
+    if isinstance(local_sq_norm, torch.Tensor):
+        local_sq_norm = local_sq_norm.item()
     return total_params, trainable_params, local_sq_norm
 
 
@@ -147,6 +150,27 @@ def resolve_trust_remote_code(pretrained_model_name_or_path):
     return not os.path.isdir(pretrained_model_name_or_path) and pretrained_model_name_or_path.startswith("nvidia/")
 
 
+def count_model_parameters(model: nn.Module) -> tuple[int, int]:
+    """Count total and trainable parameters. Safe to call on meta-device models.
+
+    Args:
+        model: Model to analyze
+
+    Returns:
+        trainable_params: int
+        total_params: int
+    """
+    total_params = 0
+    trainable_params = 0
+    for p in model.parameters():
+        n = _get_logical_numel(p)
+        total_params += n
+        if p.requires_grad:
+            trainable_params += n
+    return trainable_params, total_params
+
+
+@torch.no_grad()
 def print_trainable_parameters(model: nn.Module) -> tuple[int, int]:
     """Print the number of trainable parameters in the model.
 
@@ -219,11 +243,32 @@ def apply_parameter_freezing(model, freeze_config):
 
     # Freeze audio tower
     if freeze_audio_tower:
-        _freeze_module_by_attribute_and_patterns(model, "audio_tower", ["audio", "audio_encoder"])
+        _freeze_module_by_attribute_and_patterns(model, "audio_tower", ["audio", "audio_encoder", "speech"])
 
     # Freeze language model backbone
     if freeze_language_model:
         _freeze_module_by_attribute_and_patterns(model, "language_model", ["language", "text", "llm"])
+
+    # Phi4MM: cast internal fp32 LoRA adapters to bf16 for FSDP2 compatibility,
+    # and disable KV cache (remote code uses legacy DynamicCache.key_cache
+    # attribute removed in transformers v5.x).
+    model_type = getattr(getattr(model, "config", None), "model_type", "")
+    if model_type == "phi4mm":
+        cast_mixed_dtype_params_to_bf16(model)
+        if hasattr(model, "config"):
+            model.config.use_cache = False
+
+
+def cast_mixed_dtype_params_to_bf16(model):
+    """Cast fp32 parameters and buffers to bf16 for FSDP2 compatibility."""
+    import torch
+
+    for p in model.parameters():
+        if p.dtype == torch.float32:
+            p.data = p.data.to(torch.bfloat16)
+    for b in model.buffers():
+        if b.dtype == torch.float32:
+            b.data = b.data.to(torch.bfloat16)
 
 
 def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, seqlens_padding_value=-1000):

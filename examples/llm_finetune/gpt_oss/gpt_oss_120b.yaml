@@ -33,7 +33,7 @@ model:
   pretrained_model_name_or_path: openai/gpt-oss-120b
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors # torch_save or safetensors
   save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
@@ -98,3 +98,8 @@ optimizer:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
+
+ci:
+  local_batch_size: 16
+  nodes: 4
+  time: "01:00:00"

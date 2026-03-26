@@ -41,7 +41,7 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
-    rms_norm: te
+    rms_norm: torch_fp32
     experts: te
     dispatcher: deepep
     fake_balanced_gate: false
@@ -126,3 +126,6 @@ optimizer:
 #   entity: Nemo-automodel
 #   name: moonlight-16b-te-grouped-linear
 #   dir: /tmp/wandb
+
+ci:
+  node_multiplier: true

@@ -33,6 +33,9 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen2.5-7B
   torch_dtype: bf16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    rms_norm: "torch_fp32"
 
 checkpoint:
   enabled: true
@@ -90,3 +93,6 @@ optimizer:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir> 
+
+ci:
+  time: "00:15:00"

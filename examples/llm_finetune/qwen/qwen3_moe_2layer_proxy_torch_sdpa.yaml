@@ -60,7 +60,7 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
     linear: torch
-    rms_norm: torch
+    rms_norm: torch_fp32
     experts: torch
     dispatcher: torch
     fake_balanced_gate: true
@@ -129,3 +129,7 @@ optimizer:
   weight_decay: 0.0
 
 
+
+ci:
+  local_batch_size: 2
+  time: "00:30:00"

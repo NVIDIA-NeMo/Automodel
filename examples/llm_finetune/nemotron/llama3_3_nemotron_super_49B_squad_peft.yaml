@@ -61,6 +61,12 @@ distributed:
 
   sequence_parallel: false
 
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
+
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
@@ -97,3 +103,6 @@ optimizer:
 lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
+
+ci:
+  time: "00:30:00"

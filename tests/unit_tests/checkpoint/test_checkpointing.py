@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from nemo_automodel.components.checkpoint.checkpointing import (
@@ -266,7 +266,6 @@ class TestIsCustomModel:
 
     def test_module_from_custom_namespace_is_custom(self):
         """A class whose __module__ starts with nemo_automodel.components.models. is custom."""
-        model = torch.nn.Module()
         # Simulate a custom model by patching __module__ on the class's MRO
         FakeCustom = type("FakeCustom", (torch.nn.Module,), {})
         FakeCustom.__module__ = "nemo_automodel.components.models.deepseek_v3.model"
@@ -357,7 +356,7 @@ class TestLoadModelCustomModelGuard:
 
     def _make_checkpointer(self):
         """Create a minimally configured Checkpointer for testing."""
-        from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig, Checkpointer
+        from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
         config = CheckpointingConfig(
             enabled=True,
@@ -392,6 +391,26 @@ class TestLoadModelCustomModelGuard:
         # DCP path should NOT be used
         mock_dcp_load.assert_not_called()
 
+    @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=False)
+    @patch("nemo_automodel.components.checkpoint.checkpointing._is_bin_checkpoint", return_value=True)
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
+    def test_bin_checkpoint_uses_fast_path(self, mock_load_full, mock_load_hf, mock_is_bin, mock_is_st):
+        """Non-custom (HF) models with .bin checkpoints use the fast loading path."""
+        checkpointer = self._make_checkpointer()
+        model = torch.nn.Linear(4, 4)
+
+        mock_load_hf.return_value = {"weight": torch.randn(4, 4), "bias": torch.randn(4)}
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch.object(checkpointer, "_do_load") as mock_dcp_load,
+        ):
+            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
+
+        mock_load_full.assert_called_once()
+        mock_dcp_load.assert_not_called()
+
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
@@ -417,9 +436,7 @@ class TestLoadModelCustomModelGuard:
 
         with (
             patch("os.path.exists", return_value=True),
-            patch(
-                "nemo_automodel.components.checkpoint.checkpointing.ModelState"
-            ) as MockModelState,
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as MockModelState,
             patch(
                 "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
                 side_effect=lambda m, sd, **kw: sd,
@@ -530,6 +547,23 @@ class TestInitializeModelWeights:
 
         model.initialize_weights.assert_called_once()
 
+    @pytest.mark.parametrize(
+        "architecture",
+        ["Gemma3ForCausalLM", "Gemma3ForConditionalGeneration"],
+        ids=["causal_lm", "conditional_generation"],
+    )
+    def test_skips_for_gemma3(self, architecture):
+        """Gemma3 models should skip init — _init_weights zeros embedding padding_idx which fails with DTensors."""
+        model = self._make_meta_model()
+        model.config = SimpleNamespace(architectures=[architecture])
+        model._is_hf_initialized = True
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_not_called()
+        assert model._is_hf_initialized is True
+
     def test_handles_missing_config_gracefully(self):
         """Model without config.architectures should not raise."""
         with torch.device("meta"):
@@ -567,3 +601,59 @@ class TestInitializeModelWeights:
 
         sig = inspect.signature(Checkpointer.load_base_model)
         assert "peft_init_method" not in sig.parameters
+
+
+class TestLmHeadWeightTying:
+    """Tests that load_base_model calls tie_weights for tied models."""
+
+    def test_tie_weights_called_when_tied(self):
+        """load_base_model should call model.tie_weights() when tie_word_embeddings=True."""
+        import torch.nn as nn
+
+        class FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = nn.Embedding(10, 4)
+                self.lm_head = nn.Linear(4, 10, bias=False)
+                self.config = SimpleNamespace(tie_word_embeddings=True)
+                self.tie_weights_called = False
+
+            def tie_weights(self, **kwargs):
+                self.lm_head.weight = self.embed_tokens.weight
+                self.tie_weights_called = True
+
+        model = FakeModel()
+        assert model.lm_head.weight.data_ptr() != model.embed_tokens.weight.data_ptr()
+
+        from nemo_automodel.components.checkpoint.checkpointing import is_tied_word_embeddings
+
+        is_tied = is_tied_word_embeddings(model)
+        if hasattr(model, "tie_weights") and is_tied:
+            model.tie_weights()
+
+        assert model.tie_weights_called
+        assert model.lm_head.weight.data_ptr() == model.embed_tokens.weight.data_ptr()
+
+    def test_tie_weights_skipped_when_not_tied(self):
+        """load_base_model should skip tie_weights when tie_word_embeddings=False."""
+        import torch.nn as nn
+
+        class FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(4, 10, bias=False)
+                self.config = SimpleNamespace(tie_word_embeddings=False)
+                self.tie_weights_called = False
+
+            def tie_weights(self, **kwargs):
+                self.tie_weights_called = True
+
+        model = FakeModel()
+
+        from nemo_automodel.components.checkpoint.checkpointing import is_tied_word_embeddings
+
+        is_tied = is_tied_word_embeddings(model)
+        if hasattr(model, "tie_weights") and is_tied:
+            model.tie_weights()
+
+        assert not model.tie_weights_called

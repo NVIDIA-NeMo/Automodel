@@ -58,6 +58,7 @@ from nemo_automodel.components.utils.compile_utils import compile_model
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     apply_parameter_freezing,
+    count_model_parameters,
     init_empty_weights,
     print_trainable_parameters,
 )
@@ -105,7 +106,7 @@ def _apply_peft_and_lower_precision(
 
 #  Sharding helpers
 def _shard_pp(autopipeline, model, loss_fn, parallelize_fn):
-    trainable_params, total_params = print_trainable_parameters(model)
+    trainable_params, total_params = count_model_parameters(model)
     # Store param info on autopipeline before splitting so it can be accessed later
     # This captures the full model's param counts before PP shards it across ranks
     autopipeline.trainable_params_before_pp = trainable_params
@@ -299,6 +300,23 @@ def instantiate_infrastructure(
     return model_wrapper, autopipeline, parallelize_fn, qat_quantizer
 
 
+def _uses_te_attention(model) -> bool:
+    """Return True if any self_attn module uses TE's DotProductAttention."""
+    try:
+        from transformer_engine.pytorch.attention import DotProductAttention
+    except ImportError:
+        return False
+
+    model_parts = model.parts if hasattr(model, "parts") else [model]
+    for part in model_parts:
+        for name, module in part.named_modules():
+            if name.endswith("self_attn"):
+                attn_module = getattr(module, "attn_module", None)
+                if isinstance(attn_module, DotProductAttention):
+                    return True
+    return False
+
+
 #  apply_model_infrastructure  --  the main post-init orchestration function
 def apply_model_infrastructure(
     model,
@@ -376,14 +394,11 @@ def apply_model_infrastructure(
     )
 
     # Handle checkpointer config updates if checkpointer is provided
-    dequantize_base_checkpoint = False
     if checkpointer is not None:
         if checkpointer.config.dequantize_base_checkpoint is None:
-            # try to infer whether the base weights are quantized
             checkpointer.config.dequantize_base_checkpoint = hasattr(
                 getattr(model, "config", None), "quantization_config"
             )
-        dequantize_base_checkpoint = checkpointer.config.dequantize_base_checkpoint
 
     # Apply PEFT and lower precision if configured
     # When on meta device, wrap in init_empty_weights() so new LoRA modules are also on meta device
@@ -413,20 +428,26 @@ def apply_model_infrastructure(
 
     checkpoint_already_loaded = False
     if load_before_shard:
-        lora_a_init = getattr(peft_config, "lora_A_init", None)
-        checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
-        checkpointer.load_base_model(
-            model,
-            device,
-            cache_dir,
-            pretrained_model_name_or_path,
-            load_base_model=load_base_model,
-        )
+        if is_meta_device:
+            lora_a_init = getattr(peft_config, "lora_A_init", None)
+            checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
+            checkpointer.load_base_model(
+                model,
+                device,
+                cache_dir,
+                pretrained_model_name_or_path,
+                load_base_model=load_base_model,
+            )
+        else:
+            # Non-meta models already have weights from from_pretrained.
+            # Still call load_base_model with load_base_model=False to
+            # handle weight tying
+            checkpointer.load_base_model(model, device, cache_dir, pretrained_model_name_or_path, load_base_model=False)
         checkpoint_already_loaded = True
 
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
     pre_shard_hf_state_dict_keys = list(
-        _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=dequantize_base_checkpoint).keys()
+        _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=False).keys()
     )
 
     # Apply freezing before sharding
@@ -498,14 +519,31 @@ def apply_model_infrastructure(
 
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
-        # Ensure model is on the correct device; AutoPipeline takes care of it internally
-        try:
-            model.to(device)
-        except NotImplementedError as e:
-            if "Cannot copy out of meta tensor" in str(e):
-                logger.warning("model.to(device) failed (meta tensors); using model.to_empty(device=device) instead.")
-                model.to_empty(device=device)
-            else:
-                raise
+        # Ensure model is on the correct device.
+        # Skip when checkpoint was loaded post-shard (params are already on the
+        # target device) to avoid triggering FSDP's reset_sharded_param which
+        # fails on tied parameters (e.g. lm_head/embed_tokens with TP>1).
+        # See: https://github.com/pytorch/pytorch/issues/151085
+        if not should_load_checkpoint:
+            try:
+                model.to(device, non_blocking=True)
+            except NotImplementedError as e:
+                if "Cannot copy out of meta tensor" in str(e):
+                    logger.warning(
+                        "model.to(device) failed (meta tensors); using model.to_empty(device=device) instead."
+                    )
+                    model.to_empty(device=device)
+                else:
+                    raise
+
+    # Attach CP attention-mask hooks for dense (non-TE) context parallelism.
+    # These hooks strip attention_mask and set is_causal=True on self_attn modules
+    # so that SDPA handles causal masking internally (compatible with DTensor sharding).
+    if mesh.cp_size > 1 and not _uses_te_attention(model):
+        from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+
+        model_parts = model.parts if hasattr(model, "parts") else [model]
+        for mp in model_parts:
+            attach_context_parallel_hooks(mp)
 
     return model
