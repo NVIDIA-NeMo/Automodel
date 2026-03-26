@@ -254,24 +254,53 @@ class TestInjectMissingGateBias:
 
 
 class TestDequantizeMultiDimMesh:
-    def test_per_expert_scale_sliced_by_mesh_idx(self):
-        """When DTensor is on a multi-dim mesh, dequant uses mesh_idx (not name) for rank/size.
+    def test_mesh_idx_passed_to_get_local_rank_and_size(self):
+        """Regression: get_local_rank / size must receive the mesh_idx of the Shard(0) placement.
 
-        Regression test: previously get_local_rank() / size() were called without
-        arguments, which raises on multi-dim meshes.  The fix passes the positional
-        index of the Shard placement so that get_local_rank(mesh_idx) works.
+        Simulates rank 1 of 2 on a 2D mesh (EP_SHARD=2, EP=16).  Shard(0) sits at
+        placement index 1 (the EP dim), so the fix should call get_local_rank(1) and
+        size(1) — NOT the no-arg versions that crash on multi-dim meshes.
         """
-        # Simulate rank 1 of 2 on a 2-dim mesh: experts 4-7 of 8 total
-        n_total, n_local = 8, 4
+        from unittest.mock import MagicMock, PropertyMock, patch
+
+        from torch.distributed._tensor import Shard
+
+        n_local = 4  # this rank's experts after sharding
         weight_local = torch.randn(n_local, 8, 8).to(torch.float8_e4m3fn)
         scale_all = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
 
-        # Non-DTensor path: scale is sliced to first n_local entries
-        sd = {"mlp.experts.gate_up_proj": weight_local, "mlp.experts.gate_up_proj_scale_inv": scale_all}
-        result = _dequantize_state_dict(sd, torch.float32)
-        # Should dequantize with scale[:4] (non-DTensor falls through to else branch)
-        assert result["mlp.experts.gate_up_proj"].shape == (n_local, 8, 8)
-        assert result["mlp.experts.gate_up_proj"].dtype == torch.float32
+        # Mock DTensor: placements=(Replicate(), Shard(0)) — Shard(0) at mesh_idx=1
+        mock_weight = MagicMock()
+        mock_weight.to_local.return_value = weight_local
+        type(mock_weight).placements = PropertyMock(return_value=(MagicMock(), Shard(0)))
+        type(mock_weight).dtype = PropertyMock(return_value=torch.float8_e4m3fn)
+
+        mock_mesh = MagicMock()
+        mock_mesh.ndim = 2
+        # rank 1 of 2 in the EP dimension → experts 4..7
+        mock_mesh.get_local_rank.return_value = 1
+        mock_mesh.size.return_value = 2
+        type(mock_weight).device_mesh = PropertyMock(return_value=mock_mesh)
+
+        sd = {"mlp.experts.gate_up_proj": mock_weight, "mlp.experts.gate_up_proj_scale_inv": scale_all}
+
+        with (
+            patch(
+                "nemo_automodel.components.models.mistral4.state_dict_adapter.is_dtensor",
+                side_effect=lambda t: t is mock_weight,
+            ),
+            patch("torch.distributed._tensor.DTensor.from_local", side_effect=lambda t, *a, **kw: t),
+        ):
+            result = _dequantize_state_dict(sd, torch.float32)
+
+        # Shard(0) is at placement index 1, so mesh_idx=1 must be passed
+        mock_mesh.get_local_rank.assert_called_once_with(1)
+        mock_mesh.size.assert_called_once_with(1)
+
+        # Rank 1 of 2 over 8 experts → chunk_size=4, start=4 → scale[4:8]
+        expected_scale = scale_all[4:8].float().view(-1, 1, 1)
+        expected = (weight_local.float() * expected_scale).to(torch.float32)
+        torch.testing.assert_close(result["mlp.experts.gate_up_proj"], expected)
 
 
 class TestDequantize3DScale:
