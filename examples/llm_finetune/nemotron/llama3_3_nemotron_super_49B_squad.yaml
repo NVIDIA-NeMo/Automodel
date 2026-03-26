@@ -49,6 +49,7 @@ compile:
   backend: null  # Use default backend (inductor)
 
 distributed:
+  strategy: fsdp2
   dp_size: none
   tp_size: 4
   cp_size: 1

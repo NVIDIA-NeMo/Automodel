@@ -8,7 +8,7 @@ NeMo AutoModel LLM APIs can be easily extended to support VLM tasks. While most 
 
 ## Run VLMs with NeMo AutoModel
 
-To run VLMs with NeMo AutoModel, use NeMo container version [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) or later. If the model you want to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest NeMo AutoModel using:
+To run VLMs with NeMo AutoModel, use NeMo container version [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) or later. If the model you want to finetune requires a newer version of Transformers, you may need to upgrade to the latest NeMo AutoModel using:
 
 ```bash
 
