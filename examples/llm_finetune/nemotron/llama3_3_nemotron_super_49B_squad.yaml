@@ -49,7 +49,6 @@ compile:
   backend: null  # Use default backend (inductor)
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
   tp_size: 4
   cp_size: 1
