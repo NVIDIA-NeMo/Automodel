@@ -91,4 +91,4 @@ lr_scheduler:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
-  node_count: 4
+  nodes: 4
