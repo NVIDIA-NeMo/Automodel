@@ -117,6 +117,11 @@ _OVERRIDES = [
     "model_path",
     "tokenizer",
     "max_new_tokens",
+    "adapter_path",
+]
+
+_BOOLEAN_OVERRIDES = [
+    "vllm_smoke_test",
 ]
 
 
@@ -132,3 +137,6 @@ def pytest_addoption(parser: pytest.Parser):
         # ``dest`` must be a valid Python identifier, so replace dots.
         dest = opt.replace(".", "_")
         parser.addoption(f"--{opt}", dest=dest, action="store", help=f"(passthrough) {opt}")
+    for opt in _BOOLEAN_OVERRIDES:
+        dest = opt.replace(".", "_")
+        parser.addoption(f"--{opt}", dest=dest, action="store_true", default=False, help=f"(passthrough) {opt}")

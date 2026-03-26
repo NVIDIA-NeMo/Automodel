@@ -71,7 +71,7 @@ def _get_logits(model, input_ids, device) -> torch.Tensor:
     attention_mask = torch.ones_like(ids)
     with torch.no_grad():
         out = model(input_ids=ids, attention_mask=attention_mask, use_cache=False)
-        logits = out.logits
+        logits = out.logits if hasattr(out, "logits") else out
         if isinstance(logits, DTensor):
             logits = logits.full_tensor()
         return logits.float().cpu()

@@ -31,3 +31,15 @@ class TestCheckpointRobustness:
             run_test_script(TEST_FOLDER, "L2_Checkpoint_Robustness_Llama3_2_3B_PEFT.sh")
         finally:
             shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_checkpoint_robustness_gpt_oss_20b_sft(self):
+        try:
+            run_test_script(TEST_FOLDER, "L2_Checkpoint_Robustness_GPT_OSS_20B_SFT.sh")
+        finally:
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_checkpoint_robustness_gpt_oss_20b_peft(self):
+        try:
+            run_test_script(TEST_FOLDER, "L2_Checkpoint_Robustness_GPT_OSS_20B_PEFT.sh")
+        finally:
+            shutil.rmtree("checkpoints/", ignore_errors=True)

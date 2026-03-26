@@ -20,11 +20,10 @@ export CUDA_VISIBLE_DEVICES="0,1"
 
 CKPT_DIR="checkpoints/robustness_peft_$$"
 
-# Step 1: Checkpoint robustness (torchrun + pytest)
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 \
     -m pytest tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
-    --config examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml \
-    --model.pretrained_model_name_or_path meta-llama/Llama-3.2-3B-Instruct \
+    --config examples/llm_finetune/gpt_oss/gpt_oss_20b_peft.yaml \
+    --model.pretrained_model_name_or_path nvidia/GPT-OSS-20B-A3B \
     --step_scheduler.max_steps 5 \
     --step_scheduler.global_batch_size 8 \
     --step_scheduler.local_batch_size 4 \
@@ -38,15 +37,8 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --peft.use_triton false \
     --distributed.dp_size none \
     --distributed.tp_size 1 \
+    --distributed.pp_size 1 \
+    --distributed.ep_size 1 \
     --distributed.cp_size 1 \
     --distributed.sequence_parallel false \
     --hf_kl_threshold 5e-3
-
-# Find the checkpoint directory for vLLM test
-CKPT_STEP_DIR=$(ls -d "$CKPT_DIR"/epoch_*_step_* | sort | tail -1)
-
-# Step 2: vLLM deployment with PEFT adapter merge (single-process pytest)
-python -m pytest tests/functional_tests/checkpoint_robustness/test_checkpoint_vllm_deploy.py \
-    --model_path meta-llama/Llama-3.2-3B-Instruct \
-    --adapter_path "$CKPT_STEP_DIR/model/" \
-    --max_new_tokens 50
