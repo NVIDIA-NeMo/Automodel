@@ -110,4 +110,4 @@ optimizer:
   weight_decay: 0
 
 ci:
-  node_count: 8
+  nodes: 8

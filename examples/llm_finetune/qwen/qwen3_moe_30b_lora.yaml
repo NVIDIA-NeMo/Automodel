@@ -94,4 +94,4 @@ optimizer:
   eps: 1e-8
 
 ci:
-  node_count: 2
+  nodes: 2

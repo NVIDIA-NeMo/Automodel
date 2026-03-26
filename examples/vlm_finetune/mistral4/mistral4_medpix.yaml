@@ -112,3 +112,6 @@ wandb:
   project: huiyingl_workspace
   entity: Nemo-automodel
   name: mistral4-medpix
+
+ci:
+  nodes: 4

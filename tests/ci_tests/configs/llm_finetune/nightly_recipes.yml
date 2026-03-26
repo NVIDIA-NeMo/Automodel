@@ -44,6 +44,5 @@ configs:
   - phi/phi_2_squad_peft.yaml
   - nemotron/llama3_3_nemotron_super_49B_squad.yaml
   - nemotron/llama3_3_nemotron_super_49B_squad_peft.yaml
-  - nemotron/llama3_3_nemotron_super_49B_squad_tp2.yaml
   - gpt_oss/gpt_oss_20b_single_gpu.yaml
   - gpt_oss/gpt_oss_20b_single_gpu_peft.yaml
