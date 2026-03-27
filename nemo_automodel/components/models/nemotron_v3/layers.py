@@ -601,6 +601,18 @@ class NemotronV3Block(nn.Module):
             raise ValueError(f"Invalid block_type: {self.block_type}")
 
     @property
+    def layer_type(self):
+        """Map block_type to MoE parallelizer's layer_type convention."""
+        if self.block_type == "attention":
+            return "full_attention"
+        return self.block_type
+
+    @property
+    def self_attn(self):
+        """Alias for mixer, for compatibility with MoE parallelizer."""
+        return self.mixer
+
+    @property
     def mlp(self):
         """Return mixer for MoE blocks for compatibility with parallelizer."""
         if self.block_type == "moe":
