@@ -1,0 +1,82 @@
+seed: 42
+
+wandb:
+  project: ltx-t2v-flow-matching
+  mode: online
+  name: ltx_t2v_fm_v1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  pretrained_model_name_or_path: Lightricks/LTX-Video
+  mode: finetune
+  attention_backend: "flash"
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 500
+  num_epochs: 100
+  log_every: 2
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
+    cache_dir: PATH_TO_YOUR_DATA
+    model_type: ltx
+    base_resolution: [512, 512]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+    num_workers: 0
+
+optim:
+  # Official LTX trainer uses 1e-4 for LoRA, 5e-5 for full finetune
+  learning_rate: 5e-5
+  optimizer:
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 100
+  min_lr: 1e-6
+
+# Flow matching settings derived from Lightricks LTX-Video-Trainer and LTX-Video paper (arXiv:2501.00103)
+# LTX uses "shifted_logit_normal" timestep sampling with dynamic shift based on sequence length
+# (shift range 0.95-2.05 for 1024-4096 tokens). We approximate this with logit_normal + logit_mean=1.0.
+# Official trainer also uses 10% uniform mixing for training stability.
+flow_matching:
+  adapter_type: "ltx"
+  adapter_kwargs:
+    patch_size: 1
+    patch_size_t: 1
+  timestep_sampling: "logit_normal"  # Approximates official "shifted_logit_normal"
+  logit_mean: 1.0  # Shifted toward higher noise, matching LTX dynamic shift midpoint (range 0.95-2.05)
+  logit_std: 1.0   # Matches official LTX trainer default
+  flow_shift: 1.0  # Dynamic in official (0.95-2.05 by token count); 1.0 is reasonable for 512p
+  mix_uniform_ratio: 0.1  # 10% uniform mixing, matches official LTX trainer
+  sigma_min: 0.0
+  sigma_max: 1.0
+  num_train_timesteps: 1000
+  i2v_prob: 0.0
+  use_loss_weighting: false
+  log_interval: 100
+  summary_log_interval: 10
+
+# Adjust dp_size to the total number of GPUs
+fsdp:
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  dp_replicate_size: 1
+  dp_size: 8
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
+  model_save_format: torch_save
+  save_consolidated: false
+  restore_from: null

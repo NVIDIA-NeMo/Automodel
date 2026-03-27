@@ -41,6 +41,7 @@ from .adapters import (
     FlowMatchingContext,
     FluxAdapter,
     HunyuanAdapter,
+    LTXAdapter,
     ModelAdapter,
     SimpleAdapter,
 )
@@ -569,6 +570,7 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
         "hunyuan": HunyuanAdapter,
         "simple": SimpleAdapter,
         "flux": FluxAdapter,
+        "ltx": LTXAdapter,
     }
 
     if adapter_type not in adapters:
