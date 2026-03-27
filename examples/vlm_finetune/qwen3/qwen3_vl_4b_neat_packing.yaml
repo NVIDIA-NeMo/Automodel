@@ -68,14 +68,14 @@ loss_fn:
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_meta_dataset
   path_or_dataset: mockdata/meta.json
+
+packed_sequence:
   pretokenize: true
   max_length: 512
-  packing:
-    enabled: true
-    pack_size: 512
-    packing_ratio: 0.9
-    drop_long_samples: true
-    balance_media_tokens: true
+  pack_size: 512
+  packing_ratio: 0.9
+  drop_long_samples: true
+  balance_media_tokens: true
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

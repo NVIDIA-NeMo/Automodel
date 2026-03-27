@@ -66,13 +66,13 @@ from nemo_automodel.components.datasets.vlm.fake_image import (  # noqa: F401
 # torchcodec.  This is applied at import time so all video processors that
 # inherit from BaseVideoProcessor benefit automatically.
 # ---------------------------------------------------------------------------
-def _fetch_videos_decord(self, video_url_or_urls, sample_indices_fn=None):
-    if isinstance(video_url_or_urls, list):
-        return list(zip(*[self.fetch_videos(x, sample_indices_fn=sample_indices_fn) for x in video_url_or_urls]))
-    return load_video(video_url_or_urls, backend="decord", sample_indices_fn=sample_indices_fn)
+# def _fetch_videos_decord(self, video_url_or_urls, sample_indices_fn=None):
+#     if isinstance(video_url_or_urls, list):
+#         return list(zip(*[self.fetch_videos(x, sample_indices_fn=sample_indices_fn) for x in video_url_or_urls]))
+#     return load_video(video_url_or_urls, backend="decord", sample_indices_fn=sample_indices_fn)
 
 
-BaseVideoProcessor.fetch_videos = _fetch_videos_decord
+# BaseVideoProcessor.fetch_videos = _fetch_videos_decord
 
 
 def _find_pattern_indices(template, pattern, search_start_index=0, allow_first_token_mismatch=False):
@@ -347,7 +347,7 @@ def phi4_mm_collate_fn(examples, processor):
         else:
             batch["input_mode"] = 0
 
-    labels = build_labels_from_template(
+    labels = build_labels(
         batch["input_ids"],
         conversations,
         processor,
@@ -592,7 +592,7 @@ def kimi_vl_collate_fn(
 
     batch = processor(**processor_kwargs)
 
-    labels = build_labels_from_template(
+    labels = build_labels(
         batch["input_ids"],
         conversations,
         processor,
