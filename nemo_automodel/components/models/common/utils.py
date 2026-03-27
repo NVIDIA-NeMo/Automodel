@@ -113,12 +113,12 @@ class TEFp8Config:
         it is returned directly.  String values ``"current"`` and ``"block"`` are
         mapped to the corresponding TE recipe class.
         """
-        if not HAVE_TE:
-            return None
-
         # Pass through pre-built recipe objects directly
         if not isinstance(self.recipe, str):
             return self.recipe
+
+        if not HAVE_TE:
+            return None
 
         from transformer_engine.common.recipe import Float8BlockScaling, Float8CurrentScaling
 
