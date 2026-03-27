@@ -20,6 +20,7 @@ from .delta_lake_dataset import (  # noqa: F401
     is_delta_lake_path,
 )
 from .nanogpt_dataset import NanogptDataset  # noqa: F401
+from .packed_parquet_dataset import PackedParquetDataset  # noqa: F401
 from .neat_packing import neat_pack_dataset  # noqa: F401
 from .retrieval_collator import RetrievalBiencoderCollator  # noqa: F401
 from .retrieval_dataset import make_retrieval_dataset  # noqa: F401
@@ -37,4 +38,5 @@ __all__ = [
     "ChatDataset",
     "DeltaLakeDataset",
     "is_delta_lake_path",
+    "PackedParquetDataset",
 ]
