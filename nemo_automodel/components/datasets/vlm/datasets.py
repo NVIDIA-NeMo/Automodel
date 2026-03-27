@@ -1180,28 +1180,9 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
 
     def robust_collate(self, collate_fn):
         """Wrap *collate_fn* so that on failure the entire batch is re-sampled."""
-        dataset = self
+        from nemo_automodel.components.datasets.vlm.collate_fns import make_robust_collate
 
-        def wrapper(examples):
-            last_error = None
-            for attempt in range(dataset.max_retries):
-                try:
-                    return collate_fn(examples)
-                except Exception as e:
-                    last_error = e
-                    logger.warning(
-                        f"Collate failed (attempt {attempt + 1}/{dataset.max_retries}): {e}. "
-                        "Re-sampling batch."
-                    )
-                    examples = [
-                        dataset[random.randint(0, len(dataset) - 1)]
-                        for _ in range(len(examples))
-                    ]
-            raise RuntimeError(
-                f"Collate failed after {dataset.max_retries} retries. Last error: {last_error}"
-            )
-
-        return wrapper
+        return make_robust_collate(self, collate_fn, self.max_retries)
 
 
 class RobustDatasetWrapper(torch.utils.data.Dataset):
@@ -1245,24 +1226,6 @@ class RobustDatasetWrapper(torch.utils.data.Dataset):
 
     def robust_collate(self, collate_fn):
         """Wrap a collate_fn so that on failure the entire batch is re-sampled and retried."""
-        dataset = self
+        from nemo_automodel.components.datasets.vlm.collate_fns import make_robust_collate
 
-        def wrapper(examples):
-            last_error = None
-            for attempt in range(dataset.max_retries):
-                try:
-                    return collate_fn(examples)
-                except Exception as e:
-                    last_error = e
-                    logger.warning(
-                        f"Collate failed (attempt {attempt + 1}/{dataset.max_retries}): {e}. "
-                        "Re-sampling batch."
-                    )
-                    examples = [
-                        dataset[random.randint(0, len(dataset) - 1)] for _ in range(len(examples))
-                    ]
-            raise RuntimeError(
-                f"Collate failed after {dataset.max_retries} retries. Last error: {last_error}"
-            )
-
-        return wrapper
+        return make_robust_collate(self, collate_fn, self.max_retries)
