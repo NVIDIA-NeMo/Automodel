@@ -75,6 +75,38 @@ from nemo_automodel.components.datasets.vlm.fake_image import (  # noqa: F401
 # BaseVideoProcessor.fetch_videos = _fetch_videos_decord
 
 
+def make_robust_collate(dataset, collate_fn, max_retries=10):
+    """Wrap *collate_fn* so that on failure the entire batch is re-sampled.
+
+    Args:
+        dataset: The dataset to re-sample from on failure.
+        collate_fn: The collate function to wrap.
+        max_retries: Maximum number of retry attempts.
+    """
+    import random
+
+    def wrapper(examples):
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                return collate_fn(examples)
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"Collate failed (attempt {attempt + 1}/{max_retries}): {e}. "
+                    "Re-sampling batch."
+                )
+                examples = [
+                    dataset[random.randint(0, len(dataset) - 1)]
+                    for _ in range(len(examples))
+                ]
+        raise RuntimeError(
+            f"Collate failed after {max_retries} retries. Last error: {last_error}"
+        )
+
+    return wrapper
+
+
 def _find_pattern_indices(template, pattern, search_start_index=0, allow_first_token_mismatch=False):
     template_len = len(template)
     pattern_len = len(pattern)
