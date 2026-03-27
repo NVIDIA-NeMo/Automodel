@@ -15,6 +15,7 @@
 from packaging.version import Version
 from typing import Optional
 
+import argparse
 import requests
 import tomllib
 
@@ -75,6 +76,10 @@ def write_results(results_dic: dict, path: str = "/tmp/transformers_version_chec
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--automodel-dir", default=".", help="Path to the Automodel repository root")
+    args = parser.parse_args()
+
     package = "transformers"
     results = {
         "UPDATE_TRANSFORMERS": False,
@@ -88,7 +93,8 @@ def main() -> None:
     print(f"Pypi latest version: {latest_version}")
 
     # Check version in uv.lock
-    uv_package_version = find_lockfile_dependency(package).get("version")
+    lockfile = f"{args.automodel_dir}/uv.lock"
+    uv_package_version = find_lockfile_dependency(package, lockfile=lockfile).get("version")
     print(f"uv.lock package version: {uv_package_version}")
 
     if Version(latest_version) > Version(uv_package_version):
