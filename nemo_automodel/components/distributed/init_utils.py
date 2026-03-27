@@ -132,6 +132,10 @@ def initialize_distributed(
             rank = get_local_rank_preinit()
             device = torch.device("cuda", rank)
             torch.cuda.set_device(device)
+            # Eagerly bind NCCL process-group device to avoid lazy device inference
+            # warnings and reduce init-time communicator ambiguity.
+            if backend == "nccl":
+                init_pg_kwargs["device_id"] = device
 
         if get_world_size_safe() == 1:
             init_pg_kwargs["world_size"] = 1
