@@ -115,3 +115,4 @@ lr_scheduler:
 
 ci:
   nodes: 2
+  time: "00:30:00"
