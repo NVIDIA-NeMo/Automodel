@@ -33,26 +33,31 @@ data:
     num_workers: 0
 
 optim:
-  learning_rate: 5e-6
+  # Official LTX trainer uses 1e-4 for LoRA, 5e-5 for full finetune
+  learning_rate: 5e-5
   optimizer:
     weight_decay: 0.01
     betas: [0.9, 0.999]
 
 lr_scheduler:
   lr_decay_style: cosine
-  lr_warmup_steps: 0
+  lr_warmup_steps: 100
   min_lr: 1e-6
 
+# Flow matching settings derived from Lightricks LTX-Video-Trainer and LTX-Video paper (arXiv:2501.00103)
+# LTX uses "shifted_logit_normal" timestep sampling with dynamic shift based on sequence length
+# (shift range 0.95-2.05 for 1024-4096 tokens). We approximate this with logit_normal + logit_mean=1.0.
+# Official trainer also uses 10% uniform mixing for training stability.
 flow_matching:
   adapter_type: "ltx"
   adapter_kwargs:
     patch_size: 1
     patch_size_t: 1
-  timestep_sampling: "logit_normal"
-  logit_mean: 0.0
-  logit_std: 1.0
-  flow_shift: 1.0
-  mix_uniform_ratio: 0.0
+  timestep_sampling: "logit_normal"  # Approximates official "shifted_logit_normal"
+  logit_mean: 1.0  # Shifted toward higher noise, matching LTX dynamic shift midpoint (range 0.95-2.05)
+  logit_std: 1.0   # Matches official LTX trainer default
+  flow_shift: 1.0  # Dynamic in official (0.95-2.05 by token count); 1.0 is reasonable for 512p
+  mix_uniform_ratio: 0.1  # 10% uniform mixing, matches official LTX trainer
   sigma_min: 0.0
   sigma_max: 1.0
   num_train_timesteps: 1000

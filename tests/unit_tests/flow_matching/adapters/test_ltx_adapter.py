@@ -388,9 +388,17 @@ class TestLTXAdapterForward:
 
     def test_forward_with_tuple_output(self, ltx_adapter, sample_context):
         class TupleOutputModel(nn.Module):
-            def forward(self, hidden_states, encoder_hidden_states, timestep,
-                        encoder_attention_mask, num_frames=None, height=None,
-                        width=None, return_dict=False):
+            def forward(
+                self,
+                hidden_states,
+                encoder_hidden_states,
+                timestep,
+                encoder_attention_mask,
+                num_frames=None,
+                height=None,
+                width=None,
+                return_dict=False,
+            ):
                 return (torch.randn_like(hidden_states), "extra", {"k": "v"})
 
         model = TupleOutputModel()
@@ -400,9 +408,17 @@ class TestLTXAdapterForward:
 
     def test_forward_with_tensor_output(self, ltx_adapter, sample_context):
         class TensorOutputModel(nn.Module):
-            def forward(self, hidden_states, encoder_hidden_states, timestep,
-                        encoder_attention_mask, num_frames=None, height=None,
-                        width=None, return_dict=False):
+            def forward(
+                self,
+                hidden_states,
+                encoder_hidden_states,
+                timestep,
+                encoder_attention_mask,
+                num_frames=None,
+                height=None,
+                width=None,
+                return_dict=False,
+            ):
                 return torch.randn_like(hidden_states)
 
         model = TensorOutputModel()

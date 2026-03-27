@@ -66,9 +66,7 @@ class LTXAdapter(ModelAdapter):
         self.patch_size_t = patch_size_t
 
     @staticmethod
-    def _pack_latents(
-        latents: torch.Tensor, patch_size: int = 1, patch_size_t: int = 1
-    ) -> torch.Tensor:
+    def _pack_latents(latents: torch.Tensor, patch_size: int = 1, patch_size_t: int = 1) -> torch.Tensor:
         """
         Pack latents from [B, C, F, H, W] to [B, S, D] for the transformer.
 
@@ -149,9 +147,7 @@ class LTXAdapter(ModelAdapter):
             text_mask = text_mask.to(device, dtype=dtype)
         else:
             # Create all-ones mask if not provided
-            text_mask = torch.ones(
-                batch_size, text_embeddings.shape[1], device=device, dtype=dtype
-            )
+            text_mask = torch.ones(batch_size, text_embeddings.shape[1], device=device, dtype=dtype)
 
         # Handle CFG dropout
         if random.random() < context.cfg_dropout_prob:
@@ -159,9 +155,7 @@ class LTXAdapter(ModelAdapter):
             text_mask = torch.zeros_like(text_mask)
 
         # Pack latents: [B, C, F, H, W] -> [B, S, D]
-        packed_latents = self._pack_latents(
-            noisy_latents, self.patch_size, self.patch_size_t
-        )
+        packed_latents = self._pack_latents(noisy_latents, self.patch_size, self.patch_size_t)
 
         # Compute post-patch dimensions for RoPE
         post_patch_num_frames = num_frames // self.patch_size_t
