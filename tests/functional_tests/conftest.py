@@ -110,6 +110,18 @@ _OVERRIDES = [
     "qat.qat_config.groupsize",
     "dataloader.collate_fn.pad_seq_len_divisible",
     "validation_dataloader.collate_fn.pad_seq_len_divisible",
+    "kl_threshold",
+    "hf_kl_threshold",
+    "cross_tp_size",
+    "cross_tp_kl_threshold",
+    "model_path",
+    "tokenizer",
+    "max_new_tokens",
+    "adapter_path",
+]
+
+_BOOLEAN_OVERRIDES = [
+    "vllm_smoke_test",
 ]
 
 
@@ -125,3 +137,6 @@ def pytest_addoption(parser: pytest.Parser):
         # ``dest`` must be a valid Python identifier, so replace dots.
         dest = opt.replace(".", "_")
         parser.addoption(f"--{opt}", dest=dest, action="store", help=f"(passthrough) {opt}")
+    for opt in _BOOLEAN_OVERRIDES:
+        dest = opt.replace(".", "_")
+        parser.addoption(f"--{opt}", dest=dest, action="store_true", default=False, help=f"(passthrough) {opt}")
