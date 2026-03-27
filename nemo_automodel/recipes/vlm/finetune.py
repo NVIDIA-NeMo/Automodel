@@ -236,7 +236,7 @@ def build_loss_fn(cfg_loss):
 
 def build_dataloader(
     cfg_ds, cfg_dl, pretrained_model_name_or_path, cfg_processor, device_mesh, seed, local_batch_size,
-    cfg_model=None,
+    cfg_model=None, cfg_ps=None,
 ) -> tuple[DataLoader, ProcessorMixin]:
     """Build a DataLoader for the VLM dataset.
 
@@ -248,6 +248,9 @@ def build_dataloader(
         device_mesh: Device mesh for distributed training.
         seed: Random seed.
         local_batch_size: Local batch size.
+        cfg_model: Model configuration (used to detect attention backend).
+        cfg_ps: Packed sequence configuration (top-level ``packed_sequence:`` section).
+            When provided, takes precedence over ``dataset.packing``.
 
     Returns:
         The instantiated DataLoader and processor.
@@ -288,18 +291,28 @@ def build_dataloader(
 
             ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
 
-        pretokenize = cfg_ds.get("pretokenize", False)
+        # Resolve packing config: top-level packed_sequence (LLM-style) takes
+        # precedence over legacy dataset.packing (backward compat).
+        if cfg_ps is not None:
+            _ps_enabled = getattr(cfg_ps, "pack_size", 0) > 0
+            packing_cfg = cfg_ps if _ps_enabled else None
+            pretokenize = getattr(cfg_ps, "pretokenize", True) if _ps_enabled else cfg_ds.get("pretokenize", False)
+            max_length = getattr(cfg_ps, "max_length", None) if _ps_enabled else cfg_ds.get("max_length", None)
+        else:
+            _legacy = cfg_ds.get("packing", None)
+            _ps_enabled = _legacy is not None and _legacy.get("enabled", False)
+            packing_cfg = _legacy if _ps_enabled else None
+            pretokenize = cfg_ds.get("pretokenize", False)
+            max_length = cfg_ds.get("max_length", None)
 
         if pretokenize:
             from nemo_automodel.components.datasets.vlm.collate_fns import pad_collate_fn
             from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
 
             ds_raw = ds
-            max_length = cfg_ds.get("max_length", None)
             ds = PreTokenizedDatasetWrapper(ds_raw, processor, max_length=max_length)
 
-            packing_cfg = cfg_ds.get("packing", None)
-            if packing_cfg and packing_cfg.get("enabled", False):
+            if packing_cfg:
                 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
                 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import neat_pack_dataset_vlm
                 from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
@@ -669,6 +682,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             seed=self.cfg.get("seed", 42),
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
             cfg_model=self.cfg.model,
+            cfg_ps=self.cfg.get("packed_sequence", None),
         )
 
         # Build validation dataloader if the config provides it
