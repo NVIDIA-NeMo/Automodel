@@ -272,7 +272,7 @@ class Gemma4MoETextModelBackend(nn.Module):
             softmax_before_topk=False,
         )
 
-        embed_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.embed_tokens = Gemma4TextScaledWordEmbedding(
             config.vocab_size,
             config.hidden_size,
