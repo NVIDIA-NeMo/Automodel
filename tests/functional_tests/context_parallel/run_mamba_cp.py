@@ -22,7 +22,7 @@ parallelism (CP=1) across four configurations:
   Config 1 (bshd_te):        3D BSHD input, TE p2p CP, DualChunkSwap
   Config 2 (thd_te):         2D THD input, TE p2p CP, DualChunkSwap, cu_seqlens
   Config 3 (thd_te_packed):  2D THD input, TE p2p CP, multi-sequence packing, seq_idx
-  Config 4 (bshd_sdpa):      3D BSHD input, DTensor context_parallel(), MambaCP(uses_te_cp=False)
+  Config 4 (bshd_sdpa):      3D BSHD input, DualChunkSwap split (matches context_parallel allgather)
 
 Usage:
     torchrun --nproc_per_node=2 tests/functional_tests/context_parallel/run_mamba_cp.py
@@ -206,11 +206,7 @@ def run_bshd_te(rank, world_size, device, config):
         head_dim=config.mamba_head_dim,
         n_groups=config.n_groups,
         d_state=config.ssm_state_size,
-        conv1d=mixer_cp.conv1d,
-        dt_bias=mixer_cp.dt_bias,
-        A_log=mixer_cp.A_log,
-        D=mixer_cp.D,
-        uses_te_cp=True,
+        mixer=mixer_cp,
     )
 
     import transformer_engine.pytorch  # noqa: F401
@@ -295,11 +291,7 @@ def run_thd_te(rank, world_size, device, config):
         head_dim=config.mamba_head_dim,
         n_groups=config.n_groups,
         d_state=config.ssm_state_size,
-        conv1d=mixer_cp.conv1d,
-        dt_bias=mixer_cp.dt_bias,
-        A_log=mixer_cp.A_log,
-        D=mixer_cp.D,
-        uses_te_cp=True,
+        mixer=mixer_cp,
     )
 
     import transformer_engine.pytorch  # noqa: F401
@@ -392,11 +384,7 @@ def run_thd_te_packed(rank, world_size, device, config):
         head_dim=config.mamba_head_dim,
         n_groups=config.n_groups,
         d_state=config.ssm_state_size,
-        conv1d=mixer_cp.conv1d,
-        dt_bias=mixer_cp.dt_bias,
-        A_log=mixer_cp.A_log,
-        D=mixer_cp.D,
-        uses_te_cp=True,
+        mixer=mixer_cp,
     )
 
     import transformer_engine.pytorch  # noqa: F401
@@ -453,10 +441,14 @@ def run_thd_te_packed(rank, world_size, device, config):
 # Config 4: BSHD + SDPA
 # ---------------------------------------------------------------------------
 def run_bshd_sdpa(rank, world_size, device, config):
-    """Config 4: 3D BSHD input with DTensor context_parallel() and MambaCP(uses_te_cp=False)."""
+    """Config 4: 3D BSHD input with DualChunkSwap split (matches context_parallel allgather)."""
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+    from nemo_automodel.components.distributed.mamba_cp import (
+        MambaContextParallel,
+        _redo_attention_load_balancing,
+        _undo_attention_load_balancing,
+    )
 
     mixer_baseline, mixer_cp = _create_mixer_pair(config, device)
 
@@ -474,7 +466,7 @@ def run_bshd_sdpa(rank, world_size, device, config):
     param_grad_base = mixer_baseline.in_proj.weight.grad.detach().clone()
     dist.barrier()
 
-    # CP=2 with SDPA (contiguous split, no DualChunkSwap)
+    # CP=2 with DualChunkSwap (same reordering as context_parallel allgather)
     cp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))
     cp_group = cp_mesh["cp"].get_group()
     mixer_cp.cp = MambaContextParallel(
@@ -483,20 +475,18 @@ def run_bshd_sdpa(rank, world_size, device, config):
         head_dim=config.mamba_head_dim,
         n_groups=config.n_groups,
         d_state=config.ssm_state_size,
-        conv1d=mixer_cp.conv1d,
-        dt_bias=mixer_cp.dt_bias,
-        A_log=mixer_cp.A_log,
-        D=mixer_cp.D,
-        uses_te_cp=False,
+        mixer=mixer_cp,
     )
 
+    # Apply DualChunkSwap then take this rank's contiguous half
+    x_swapped = _redo_attention_load_balancing(x_full.detach(), world_size)
     chunk = seq_len // world_size
-    x_local = x_full.detach()[:, rank * chunk : (rank + 1) * chunk, :].clone().requires_grad_(True)
+    x_local = x_swapped[:, rank * chunk : (rank + 1) * chunk, :].clone().requires_grad_(True)
 
     output_cp = mixer_cp(x_local)
     output_cp.sum().backward()
 
-    # Gather outputs (contiguous split -- simple cat along seq_dim)
+    # Gather outputs and undo DualChunkSwap to restore sequential order
     half_seq = x_local.shape[1]
     output_gathered = [
         torch.zeros(batch_size, half_seq, config.hidden_size, device=device, dtype=torch.bfloat16)
@@ -509,8 +499,8 @@ def run_bshd_sdpa(rank, world_size, device, config):
     dist.all_gather(output_gathered, output_cp.contiguous())
     dist.all_gather(grad_gathered, x_local.grad.contiguous())
 
-    out_cp_full = torch.cat(output_gathered, dim=1)
-    grad_cp_full = torch.cat(grad_gathered, dim=1)
+    out_cp_full = _undo_attention_load_balancing(torch.cat(output_gathered, dim=1), world_size)
+    grad_cp_full = _undo_attention_load_balancing(torch.cat(grad_gathered, dim=1), world_size)
 
     param_grad_cp = mixer_cp.in_proj.weight.grad.detach().clone()
     dist.all_reduce(param_grad_cp, op=dist.ReduceOp.SUM)

@@ -151,11 +151,7 @@ def _wire_te_cp(model, cp_group, config):
                 head_dim=mixer.head_dim,
                 n_groups=mixer.n_groups,
                 d_state=mixer.ssm_state_size,
-                conv1d=mixer.conv1d,
-                dt_bias=mixer.dt_bias,
-                A_log=mixer.A_log,
-                D=mixer.D,
-                uses_te_cp=True,
+                mixer=mixer,
             )
         elif layer.block_type == "attention":
             attn_module = layer.mixer.attn_module
@@ -171,10 +167,9 @@ def _wire_te_cp(model, cp_group, config):
 def _wire_sdpa_cp(model, cp_group):
     """Wire SDPA-based CP on mamba layers. Attention uses context_parallel().
 
-    Uses uses_te_cp=True because context_parallel()'s allgather rotate method
-    shards buffers with the same DualChunkSwap pattern that TE CP uses.
-    MambaContextParallel(uses_te_cp=True) correctly undoes/redoes this reordering
-    around the SSM kernel.
+    MambaContextParallel always undoes/redoes DualChunkSwap around the SSM
+    kernel, matching the reordering applied by both TE CP and PyTorch's
+    context_parallel(allgather).
     """
     from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
 
@@ -187,11 +182,7 @@ def _wire_sdpa_cp(model, cp_group):
                 head_dim=mixer.head_dim,
                 n_groups=mixer.n_groups,
                 d_state=mixer.ssm_state_size,
-                conv1d=mixer.conv1d,
-                dt_bias=mixer.dt_bias,
-                A_log=mixer.A_log,
-                D=mixer.D,
-                uses_te_cp=True,
+                mixer=mixer,
             )
         # Attention layers use DTensor context_parallel() -- no explicit CP wiring needed
 

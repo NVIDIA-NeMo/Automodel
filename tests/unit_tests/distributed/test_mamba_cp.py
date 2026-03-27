@@ -64,6 +64,16 @@ def _make_conv1d(d_inner: int, n_groups: int, d_state: int, kernel_size: int = 4
         conv.bias.copy_(torch.arange(conv_dim, dtype=torch.float32))
     return conv
 
+class _FakeMixer:
+    """Minimal object that exposes the attributes MambaContextParallel needs."""
+
+    def __init__(self, conv1d, dt_bias, A_log, D):
+        self.conv1d = conv1d
+        self.dt_bias = dt_bias
+        self.A_log = A_log
+        self.D = D
+
+
 def _make_mamba_cp(
     num_heads: int,
     head_dim: int,
@@ -79,16 +89,14 @@ def _make_mamba_cp(
     dt_bias = torch.arange(num_heads, dtype=torch.float32)
     A_log = torch.arange(num_heads, dtype=torch.float32) + 100.0
     D = torch.arange(num_heads, dtype=torch.float32) + 200.0
+    mixer = _FakeMixer(conv1d, dt_bias, A_log, D)
     return MambaContextParallel(
         cp_group=pg,
         num_heads=num_heads,
         head_dim=head_dim,
         n_groups=n_groups,
         d_state=d_state,
-        conv1d=conv1d,
-        dt_bias=dt_bias,
-        A_log=A_log,
-        D=D,
+        mixer=mixer,
     )
 
 @pytest.mark.parametrize(
@@ -268,16 +276,14 @@ class TestParameterSlicing:
         dt_bias = torch.zeros(self.NUM_HEADS)
         A_log = torch.zeros(self.NUM_HEADS)
         D = torch.zeros(self.NUM_HEADS)
+        mixer = _FakeMixer(conv, dt_bias, A_log, D)
         mcp = MambaContextParallel(
             cp_group=pg,
             num_heads=self.NUM_HEADS,
             head_dim=self.HEAD_DIM,
             n_groups=self.N_GROUPS,
             d_state=self.D_STATE,
-            conv1d=conv,
-            dt_bias=dt_bias,
-            A_log=A_log,
-            D=D,
+            mixer=mixer,
         )
         assert mcp.get_conv1d_bias() is None
 
@@ -585,10 +591,10 @@ def test_parameter_slices_allow_gradient_flow():
     mcp = _make_mamba_cp(num_heads=4, head_dim=2, n_groups=2, d_state=3, cp_size=2, cp_rank=0)
 
     dt_slice = mcp.get_dt_bias()
-    assert dt_slice.data_ptr() == mcp.dt_bias[:2].data_ptr()
+    assert dt_slice.data_ptr() == mcp._mixer.dt_bias[:2].data_ptr()
 
     a_slice = mcp.get_A_log()
-    assert a_slice.data_ptr() == mcp.A_log[:2].data_ptr()
+    assert a_slice.data_ptr() == mcp._mixer.A_log[:2].data_ptr()
 
     d_slice = mcp.get_D()
-    assert d_slice.data_ptr() == mcp.D[:2].data_ptr()
+    assert d_slice.data_ptr() == mcp._mixer.D[:2].data_ptr()

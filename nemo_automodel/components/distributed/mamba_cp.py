@@ -299,9 +299,14 @@ def _redo_attention_load_balancing(
 class MambaContextParallel:
     """Hidden-parallel context parallelism for a Mamba2 mixer layer.
 
-    This class does **not** own trainable parameters.  It stores *references*
-    to the mixer's parameters (conv1d, dt_bias, A_log, D) and slices them on
-    the fly so that gradients propagate to the original (full) parameters.
+    This class does **not** own trainable parameters.  It stores a *reference*
+    to the mixer module and accesses its parameters (conv1d, dt_bias, A_log, D)
+    on the fly so that gradients propagate to the original (full) parameters
+    and FSDP-managed DTensor replacements are picked up correctly.
+
+    DualChunkSwap reordering is always undone before the SSM kernel and redone
+    after, because both TE CP (p2p) and PyTorch's ``context_parallel(allgather)``
+    reorder sequence chunks for load balancing.
 
     Args:
         cp_group: Context-parallel process group.
@@ -309,10 +314,7 @@ class MambaContextParallel:
         head_dim: Dimension per head.
         n_groups: Number of SSM groups (for grouped B/C states).
         d_state: SSM state dimension.
-        conv1d: Reference to the mixer's ``nn.Conv1d`` module.
-        dt_bias: Reference to the mixer's ``dt_bias`` parameter.
-        A_log: Reference to the mixer's ``A_log`` parameter.
-        D: Reference to the mixer's ``D`` parameter.
+        mixer: Reference to the Mamba mixer module (owns conv1d, dt_bias, A_log, D).
     """
 
     def __init__(
@@ -322,23 +324,14 @@ class MambaContextParallel:
         head_dim: int,
         n_groups: int,
         d_state: int,
-        conv1d: nn.Conv1d,
-        dt_bias: torch.Tensor,
-        A_log: torch.Tensor,
-        D: torch.Tensor,
-        uses_te_cp: bool = True,
+        mixer: nn.Module,
     ) -> None:
         self.cp_group = cp_group
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.n_groups = n_groups
         self.d_state = d_state
-        self.conv1d = conv1d
-        self.dt_bias = dt_bias
-        self.A_log = A_log
-        self.D = D
-
-        self.uses_te_cp = uses_te_cp
+        self._mixer = mixer
 
         self.cp_size = cp_group.size()
         self.cp_rank = cp_group.rank()
@@ -399,19 +392,19 @@ class MambaContextParallel:
         dt = _all_to_all_cp2hp(dt, self.cp_group, B)
 
         result = torch.cat([z, x, B_state, C_state, dt], dim=-1)
-        if self.uses_te_cp:
-            # After all-to-all the tensor has global sequence length (L_local * cp_size
-            # per sequence), so scale cu_seqlens to match.
-            if cu_seqlens is not None:
-                # For packed data (multiple sequences), the all-to-all produces a
-                # rank-major layout where sequences from different ranks are
-                # interleaved.  Deinterleave so each sequence is contiguous
-                # before applying the DualChunkSwap undo.
-                result = _deinterleave_packed_seqs(result, cu_seqlens, self.cp_size)
-                cu_seqlens_global = cu_seqlens * self.cp_size
-            else:
-                cu_seqlens_global = None
-            result = _undo_attention_load_balancing(result, self.cp_size, cu_seqlens=cu_seqlens_global)
+        # After all-to-all the tensor has global sequence length (L_local * cp_size
+        # per sequence).  Undo DualChunkSwap so the SSM kernel sees tokens in
+        # their true sequential order.
+        if cu_seqlens is not None:
+            # For packed data (multiple sequences), the all-to-all produces a
+            # rank-major layout where sequences from different ranks are
+            # interleaved.  Deinterleave so each sequence is contiguous
+            # before applying the DualChunkSwap undo.
+            result = _deinterleave_packed_seqs(result, cu_seqlens, self.cp_size)
+            cu_seqlens_global = cu_seqlens * self.cp_size
+        else:
+            cu_seqlens_global = None
+        result = _undo_attention_load_balancing(result, self.cp_size, cu_seqlens=cu_seqlens_global)
         return result
 
     def post_conv_ssm(
@@ -424,18 +417,17 @@ class MambaContextParallel:
             return output
 
         B = 1 if cu_seqlens is not None else output.shape[0]
-        if self.uses_te_cp:
-            # The tensor still has global sequence length before the all-to-all back,
-            # so scale cu_seqlens to match.
-            if cu_seqlens is not None:
-                cu_seqlens_global = cu_seqlens * self.cp_size
-            else:
-                cu_seqlens_global = None
-            output = _redo_attention_load_balancing(output, self.cp_size, cu_seqlens=cu_seqlens_global)
-            if cu_seqlens is not None:
-                # Reverse the deinterleaving done in pre_conv_ssm so that the
-                # inverse all-to-all restores the original per-rank layout.
-                output = _reinterleave_packed_seqs(output, cu_seqlens, self.cp_size)
+        # Redo DualChunkSwap before the inverse all-to-all so that the
+        # sequence-parallel layout matches what attention layers expect.
+        if cu_seqlens is not None:
+            cu_seqlens_global = cu_seqlens * self.cp_size
+        else:
+            cu_seqlens_global = None
+        output = _redo_attention_load_balancing(output, self.cp_size, cu_seqlens=cu_seqlens_global)
+        if cu_seqlens is not None:
+            # Reverse the deinterleaving done in pre_conv_ssm so that the
+            # inverse all-to-all restores the original per-rank layout.
+            output = _reinterleave_packed_seqs(output, cu_seqlens, self.cp_size)
         return _all_to_all_hp2cp(output, self.cp_group, B)
 
     # ------------------------------------------------------------------ #
@@ -449,28 +441,28 @@ class MambaContextParallel:
         ``conv_dim = d_inner + 2 * n_groups * d_state``.
         Returns ``[conv_dim_local, kernel_size]`` (squeezed for causal_conv1d kernel).
         """
-        return self._slice_conv_param(self.conv1d.weight).squeeze(1)
+        return self._slice_conv_param(self._mixer.conv1d.weight).squeeze(1)
 
     def get_conv1d_bias(self) -> torch.Tensor:
         """Slice ``conv1d.bias`` for the current CP rank.
 
         Bias shape: ``[conv_dim]``.  Returns ``[conv_dim_local]``.
         """
-        if self.conv1d.bias is None:
+        if self._mixer.conv1d.bias is None:
             return None
-        return self._slice_conv_param(self.conv1d.bias)
+        return self._slice_conv_param(self._mixer.conv1d.bias)
 
     def get_dt_bias(self) -> torch.Tensor:
         """Slice ``dt_bias`` for the current CP rank."""
-        return self._slice_vector_param(self.dt_bias)
+        return self._slice_vector_param(self._mixer.dt_bias)
 
     def get_A_log(self) -> torch.Tensor:
         """Slice ``A_log`` for the current CP rank."""
-        return self._slice_vector_param(self.A_log)
+        return self._slice_vector_param(self._mixer.A_log)
 
     def get_D(self) -> torch.Tensor:
         """Slice ``D`` for the current CP rank."""
-        return self._slice_vector_param(self.D)
+        return self._slice_vector_param(self._mixer.D)
 
     # ------------------------------------------------------------------ #
     #  Internal helpers                                                    #

@@ -284,12 +284,6 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     # "Padding mask not supported with context parallelism!".
     _model._cp_enabled = True
 
-    # Detect whether any attention layer uses TE (for Mamba CP load-balancing flag)
-    uses_te_cp = any(
-        isinstance(getattr(getattr(b, "self_attn", None), "attn_module", None), DotProductAttention)
-        for _, b in _model.layers.named_children()
-    )
-
     for _, block in _model.layers.named_children():
         layer_type = getattr(block, "layer_type", "full_attention")
 
@@ -317,11 +311,7 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
                 head_dim=mixer.head_dim,
                 n_groups=mixer.n_groups,
                 d_state=mixer.ssm_state_size,
-                conv1d=mixer.conv1d,
-                dt_bias=mixer.dt_bias,
-                A_log=mixer.A_log,
-                D=mixer.D,
-                uses_te_cp=uses_te_cp,
+                mixer=mixer,
             )
         elif layer_type == "linear_attention":
             # FLA-based CP: store the CP mesh on the linear attention module so it

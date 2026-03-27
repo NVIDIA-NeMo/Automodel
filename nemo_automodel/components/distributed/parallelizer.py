@@ -274,21 +274,6 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         if cp_mesh is not None and cp_mesh.size() > 1:
             cp_group = cp_mesh.get_group()
 
-            # Detect whether any attention layer uses TE's DotProductAttention for CP.
-            # When TE CP is active, attention layers apply DualChunkSwap reordering,
-            # and Mamba layers must undo/redo it around their conv+SSM kernels.
-            try:
-                from transformer_engine.pytorch.attention import DotProductAttention
-
-                uses_te_cp = any(
-                    hasattr(layer, "block_type")
-                    and layer.block_type == "attention"
-                    and isinstance(layer.mixer.attn_module, DotProductAttention)
-                    for layer in layers
-                )
-            except ImportError:
-                uses_te_cp = False
-
             for layer in layers:
                 if hasattr(layer, "block_type") and layer.block_type == "mamba":
                     from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
@@ -300,11 +285,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                         head_dim=mixer.head_dim,
                         n_groups=mixer.n_groups,
                         d_state=mixer.ssm_state_size,
-                        conv1d=mixer.conv1d,
-                        dt_bias=mixer.dt_bias,
-                        A_log=mixer.A_log,
-                        D=mixer.D,
-                        uses_te_cp=uses_te_cp,
+                        mixer=mixer,
                     )
                 elif hasattr(layer, "block_type") and layer.block_type == "attention":
                     from transformer_engine.pytorch.attention import DotProductAttention
