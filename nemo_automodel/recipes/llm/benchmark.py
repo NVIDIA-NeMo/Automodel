@@ -315,6 +315,24 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     if ga_step_idx == 0:
                         prepare_after_first_microbatch()
 
+                # Print LoRA grad norms once at iteration 1 (first compiled pass) for correctness check
+                if i == 1 and rank == 0:
+                    lora_grads = {
+                        name: param.grad.norm().item()
+                        for name, param in self.model_parts[0].named_parameters()
+                        if "lora_" in name and param.grad is not None
+                    }
+                    no_grad = [
+                        name for name, param in self.model_parts[0].named_parameters()
+                        if "lora_" in name and param.grad is None
+                    ]
+                    if lora_grads:
+                        sample = list(lora_grads.items())[:4]
+                        logger.info(f"[grad_check] LoRA grad norms (first 4): {sample}")
+                        logger.info(f"[grad_check] Total LoRA params with grad: {len(lora_grads)}, without grad: {len(no_grad)}")
+                    else:
+                        logger.warning(f"[grad_check] NO LoRA grads found! (no_grad params: {len(no_grad)})")
+
                 # Optimizer step
                 with self.timers("optimizer", log_level=2):
                     for opt in self.optimizer:

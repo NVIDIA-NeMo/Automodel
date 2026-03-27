@@ -570,29 +570,57 @@ def _patch_dtensor_spec_hash_for_symint() -> None:
 
 
 def _apply_per_layer_compile(model: nn.Module) -> None:
-    """Compile attention and MLP submodules inside each checkpoint_wrapper.
+    """Apply NO_REENTRANT AC to self_attn/mlp, then compile the whole decoder layer.
 
-    Compiling the full decoder layer causes graph breaks because checkpoint_wrapper
-    is a Higher Order Operator (HOP) — dynamo cannot trace side effects across it.
-    Instead, compile the modules *inside* the checkpoint wrapper (self_attn, mlp).
-    These contain only LoRA matmuls (no DTensor ops) when TP=1 — inductor can fuse them.
+    Strategy: wrap self_attn and mlp with NO_REENTRANT checkpoint_wrapper, then call
+    torch.compile on the *whole decoder layer* (not on the sub-modules).
 
-    Linear layers use torch.bmm (not F.linear) for DTensor weights so that
-    torch.compile's AOT autograd backward tracing avoids the aten.view slow-path
-    recursion in DTensor's sharding propagation.  See TPLinear in parallel_styles.py
-    and _dtensor_linear() in lora.py.
+    Why this order matters for LoRA gradients:
+
+    REENTRANT's first forward runs under torch.no_grad() (CheckpointFunction.forward
+    always wraps the run_function call in no_grad).  When torch.compile is called on a
+    sub-module from inside that no_grad context, AOT autograd traces a *forward-only*
+    graph — it never compiles a backward, because no gradients can flow under no_grad.
+    When REENTRANT's backward then re-runs the sub-module under torch.enable_grad(),
+    it reuses that cached forward-only graph → LoRA weight gradients are never computed
+    (640/642 params showed zero grad in both sub-module REENTRANT and layer REENTRANT).
+
+    By compiling at the *decoder-layer* level instead:
+    - The outer model's training loop calls torch.compile(actual_layer) for the first
+      time during a normal forward pass under torch.enable_grad().
+    - AOT autograd traces a *joint* fwd+bwd graph that includes LoRA weight gradients.
+    - NO_REENTRANT AC is handled as a higher-order op *inside* the compiled graph, so
+      the recompute also runs inside the compiled backward — still under enable_grad,
+      with the full joint graph — and LoRA grads accumulate correctly.
+
+    Why NO_REENTRANT (not REENTRANT) at sub-module level:
+    - REENTRANT sub-module AC would add extra graph breaks and interact badly with the
+      layer-level compile; NO_REENTRANT is handled natively by AOT autograd as a
+      higher-order op (torch._higher_order_ops.tag_activation_checkpoint).
+    - Memory is equivalent: each sub-module discards and recomputes its own activations.
+
+    FSDP2 compatibility:
+    - FSDP2 pre/post-forward hooks on actual_layer have @torch._dynamo.disable, so they
+      create graph breaks and fire as Python during compiled execution.
+    - All-gather for LoRA weights happens at the decoder-layer boundary (before the
+      compiled attn/mlp subgraphs), with requires_grad=True, ensuring the joint graph
+      can compute LoRA gradients.
+
+    Previous failed approaches (documented for reference):
+    1. Sub-module REENTRANT + layer REENTRANT: REENTRANT first-forward under no_grad
+       → AOT traces forward-only graph → no LoRA grads.
+    2. Sub-module compile + layer NO_REENTRANT: NO_REENTRANT recompute runs under
+       no_grad → sub-module compiled forward-only → CheckpointError (different tensors
+       saved in forward vs recompute at positions 30-35).
+    3. Sub-module compile + layer REENTRANT: same first-forward under no_grad problem
+       as case 1 above.
+
+    Linear layers use torch.bmm (not F.linear) for DTensor weights to avoid the
+    aten.view slow-path recursion in DTensor's sharding propagation during AOT backward
+    tracing.  See TPLinear in parallel_styles.py and _dtensor_linear() in lora.py.
 
     _patch_dtensor_spec_hash_for_symint() is called here to allow torch.compile with
     dynamic shapes to coexist with DTensor's lru_cache-based sharding propagation.
-
-    CheckpointImpl.REENTRANT: PyTorch 2.8 defaults CheckpointWrapper to NO_REENTRANT
-    (use_reentrant=False), which runs recomputation under torch.no_grad().  When the
-    inner module is torch.compiled, AOT autograd traces TWO different functions:
-      - forward (grad enabled): joint fwd+bwd graph → saves weights + activations
-      - recompute (no_grad):    forward-only graph  → saves activations only
-    These produce different saved_tensors sets, triggering CheckpointError.  REENTRANT
-    (use_reentrant=True) runs recomputation with grad enabled, so torch.compile sees
-    the same execution context and reuses the same compiled function for both passes.
     """
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
@@ -607,19 +635,51 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
         return
 
     compiled_count = 0
-    for layer in module_list:
+    for i, layer in enumerate(module_list):
+        # Unwrap any existing layer-level checkpoint wrapper (e.g. from PP path).
+        if isinstance(layer, CheckpointWrapper):
+            actual_layer = layer._checkpoint_wrapped_module
+            layer_was_wrapped = True
+        else:
+            actual_layer = layer
+            layer_was_wrapped = False
+
+        any_ac = False
         for attr in ("self_attn", "mlp"):
-            existing_wrapper = getattr(layer, attr, None)
-            if isinstance(existing_wrapper, CheckpointWrapper):
-                inner = existing_wrapper._checkpoint_wrapped_module
-                # Wrap compiled inner in a REENTRANT checkpoint so recomputation runs
-                # with grad enabled — same Dynamo context as the forward pass.
-                setattr(layer, attr, checkpoint_wrapper(
-                    torch.compile(inner),
-                    checkpoint_impl=CheckpointImpl.REENTRANT,
-                ))
-                compiled_count += 1
-    logger.info("Sub-module torch.compile applied to %d checkpoint-wrapped attention/MLP blocks", compiled_count)
+            existing = getattr(actual_layer, attr, None)
+            if existing is None:
+                continue
+            # Unwrap any existing checkpoint wrapper so we can re-apply NO_REENTRANT.
+            if isinstance(existing, CheckpointWrapper):
+                inner = existing._checkpoint_wrapped_module
+            else:
+                inner = existing
+            # NO_REENTRANT: handled as a higher-order op inside the compiled layer graph.
+            # The recompute runs within the compiled backward under enable_grad, ensuring
+            # AOT autograd sees requires_grad=True LoRA weights and computes their grads.
+            setattr(actual_layer, attr, checkpoint_wrapper(inner, checkpoint_impl=CheckpointImpl.NO_REENTRANT))
+            any_ac = True
+
+        # Unwrap layernorms — they are lightweight and do not need AC.
+        for attr in ("input_layernorm", "post_attention_layernorm"):
+            existing = getattr(actual_layer, attr, None)
+            if isinstance(existing, CheckpointWrapper):
+                setattr(actual_layer, attr, existing._checkpoint_wrapped_module)
+
+        if any_ac:
+            # Compile the whole decoder layer with NO_REENTRANT AC already inside it.
+            # First invocation happens during training under torch.enable_grad(), so
+            # AOT autograd traces a joint fwd+bwd graph with full LoRA grad support.
+            module_list[i] = torch.compile(actual_layer)
+            compiled_count += 1
+        elif layer_was_wrapped:
+            module_list[i] = layer
+
+    logger.info(
+        "Per-layer torch.compile applied to %d decoder layers "
+        "(self_attn + mlp with NO_REENTRANT AC inside layer-level compile)",
+        compiled_count,
+    )
 
 
 def apply_fsdp2_sharding_recursively(
