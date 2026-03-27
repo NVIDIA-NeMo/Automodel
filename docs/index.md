@@ -256,6 +256,7 @@ guides/llm/finetune.md
 guides/llm/toolcalling.md
 guides/llm/knowledge-distillation.md
 guides/llm/large_moe_finetune.md
+guides/llm/moe-configuration-guide.md
 guides/llm/pretraining.md
 guides/llm/nanogpt-pretraining.md
 guides/llm/sequence-classification.md
