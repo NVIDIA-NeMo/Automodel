@@ -280,6 +280,25 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
         dp_mesh = device_mesh[dp_mesh_dim_names]
 
+        # Per-layer FSDP2 must NOT use output_dtype=float32 — that would cast each
+        # backbone layer's output (hidden_states) to float32. The ROOT fully_shard
+        # below keeps output_dtype=float32 for the final model output. But if the
+        # per-layer shards also cast to float32, hidden_states flow as float32 into
+        # lm_head, whose weight is cast to bfloat16 by param_dtype — causing:
+        #   RuntimeError: expected mat1 and mat2 to have the same dtype: float != BFloat16
+        # Fix: for per-layer sharding override output_dtype to match param_dtype so
+        # hidden_states stay in bfloat16. This matches the MoE parallelizer behaviour.
+        # output_dtype in mp_policy casts each FSDP2-wrapped module's output, making
+        # hidden_states float32 while lm_head.weight stays bfloat16 (param_dtype):
+        #   RuntimeError: expected mat1 and mat2 to have the same dtype: float != BFloat16
+        # NemotronH forward already calls .float() on logits, so output_dtype is redundant.
+        if mp_policy is not None and mp_policy.output_dtype is not None:
+            mp_policy = MixedPrecisionPolicy(
+                param_dtype=mp_policy.param_dtype,
+                reduce_dtype=mp_policy.reduce_dtype,
+                output_dtype=None,
+            )
+
         for layer in layers:
             parallelizer_utils.fully_shard_by_dtype(
                 layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy
@@ -287,13 +306,43 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
 
         # do not reshard after forward for root model
         # because its parameters will be used in backward immediately
-        return fully_shard(
+        # Capture inner model before sharding so we can restore .model attribute.
+        # When force_hf=True, the model is loaded via trust_remote_code __init__
+        # (sets self.backbone) then class-swapped to native NemotronHForCausalLM
+        # (forward calls self.model). Since the trust_remote_code __init__ never
+        # set self.model in _modules, self.model raises AttributeError at forward.
+        # Fix: after fully_shard, set result.__dict__['model'] = inner_model via
+        # object.__setattr__ to bypass nn.Module.__setattr__.  This makes
+        # self.model accessible without registering it as a submodule, so
+        # named_parameters() does not produce duplicate backbone.*/model.* paths
+        # that would break set_model_state_dict.
+        inner_model = getattr(model, "backbone", None) or getattr(model, "model", None)
+        result = fully_shard(
             model,
             mesh=dp_mesh,
             mp_policy=mp_policy,
             offload_policy=offload_policy,
             reshard_after_forward=False,
         )
+        if inner_model is not None:
+            # When force_hf=True the backbone is the trust_remote_code NemotronHModel,
+            # whose forward returns NemotronHOutput(cache_params=...) — not
+            # BaseModelOutputWithPast(past_key_values=...) as the native
+            # NemotronHForCausalLM.forward expects at line:
+            #   past_key_values=outputs.past_key_values
+            # Register a forward hook to translate the output on the fly.
+            def _compat_output_hook(module, args, output):
+                if type(output).__name__ == "NemotronHOutput":
+                    from transformers.modeling_outputs import BaseModelOutputWithPast
+
+                    return BaseModelOutputWithPast(
+                        last_hidden_state=output[0],
+                        past_key_values=getattr(output, "cache_params", None),
+                    )
+
+            inner_model.register_forward_hook(_compat_output_hook)
+            object.__setattr__(result, "model", inner_model)
+        return result
 
 
 class WanParallelizationStrategy(ParallelizationStrategy):
