@@ -61,6 +61,13 @@ class FSDP2Config:
         activation_checkpointing (bool): Enable activation checkpointing.
         defer_fsdp_grad_sync (bool): Defer FSDP gradient sync to final micro-batch.
         backend (str): Distributed backend.
+        enable_compile (bool): Enable per-layer torch.compile independently of async TP.
+            Compiles each transformer block to fuse ops (e.g. LoRA matmuls + addition).
+            When enable_async_tensor_parallel is also True, compile is enabled automatically
+            and this flag has no additional effect. Default: False.
+        enable_fsdp2_prefetch (bool): Enable explicit FSDP2 forward/backward weight prefetching.
+            When True, each layer prefetches the next layer's all-gathers during its own
+            copy-out, overlapping communication with compute. Default: True.
     """
 
     sequence_parallel: bool = False
@@ -71,6 +78,8 @@ class FSDP2Config:
     defer_fsdp_grad_sync: bool = True
     backend: str = "nccl"
     enable_async_tensor_parallel: bool = False
+    enable_compile: bool = False
+    enable_fsdp2_prefetch: bool = True
 
     def __post_init__(self):
         if self.mp_policy is None:

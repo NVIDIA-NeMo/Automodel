@@ -75,6 +75,33 @@ class PeftConfig:
         )
 
 
+def _dtensor_linear(x: torch.Tensor, weight: torch.Tensor, bias=None) -> torch.Tensor:
+    """Drop-in for F.linear that avoids DTensor+compile backward recursion.
+
+    Both F.linear and torch.matmul decompose 3D × 2D input as:
+        view(x, [-1, in]) + mm + view(out, [b, seq, out])
+    In AOT-autograd backward tracing the view on a Shard(2) DTensor activation
+    (e.g. [1, seq, hidden/tp]) hits _propagate_op_sharding_dispatch_slow_path for
+    aten.view (no DTensor rule for the shard-dim-index change) → infinite recursion.
+
+    torch.bmm is a native 3D op whose backward is also bmm — no view is emitted.
+    We expand the 2D weight to 3D with an extra batch dim to match x's batch size.
+    DTensor has explicit strategies for bmm (Replicate × Shard(2) → Shard(2) for
+    ColwiseParallel; Shard(2) × Shard(1) → Partial for RowwiseParallel reduce).
+
+    Note: expand(b, -1, -1) dispatches through DTensor's ShardingPropagator lru_cache
+    keyed on DTensorSpec. With dynamic shapes, b is a SymInt making DTensorSpec hash
+    raise TypeError.  This is handled by _patch_dtensor_spec_hash_for_symint() in
+    parallelizer.py which falls back to a placement-only hash for SymInt shapes.
+    """
+    if x.dim() == 3:
+        b = x.shape[0]
+        out = torch.bmm(x, weight.t().unsqueeze(0).expand(b, -1, -1))
+    else:
+        out = torch.mm(x, weight.t())
+    return out + bias if bias is not None else out
+
+
 class LinearLoRA(nn.Linear):
     """
     Linear + LoRA, maintains ckpts structure (i.e. Linear's weight/bias remain at the same FQN).
@@ -236,7 +263,7 @@ class LinearLoRA(nn.Linear):
             bias = self.bias
             if bias is not None and bias.numel() == 0:
                 bias = None
-            res = F.linear(x, self.weight, bias)
+            res = _dtensor_linear(x, self.weight, bias)
 
         if not self.use_dora:
             if self.dropout_position == "pre":

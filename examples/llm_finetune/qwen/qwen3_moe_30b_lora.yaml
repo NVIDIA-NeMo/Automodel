@@ -58,10 +58,8 @@ distributed:
   cp_size: 1
   pp_size: 1
   ep_size: 8
-  activation_checkpointing: true
-
-  sequence_parallel: false
   activation_checkpointing: false
+  sequence_parallel: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

@@ -37,6 +37,40 @@ def _distribute_param(_module, name, device_mesh, src_data_rank, placements):
     _module.register_parameter(name, dist_param)
 
 
+class TPLinear(nn.Linear):
+    """nn.Linear variant safe for torch.compile + DTensor tensor-parallel weights.
+
+    F.linear decomposes to aten.view + aten.mm + aten.view for 3-D input.  In
+    AOT-autograd backward tracing the view on a sharded DTensor activation hits
+    DTensor's slow-path sharding propagation (no explicit rule for aten.view that
+    changes the shard-dim index), which recurses infinitely.
+
+    torch.bmm is a native 3-D op whose backward is also bmm — no view is ever
+    emitted.  DTensor has explicit strategies for bmm covering the ColwiseParallel
+    (Replicate × Shard(2) → Shard(2)) and RowwiseParallel (Shard(2) × Shard(1) →
+    Partial) patterns.
+
+    Note: expand(b, -1, -1) dispatches through DTensor's ShardingPropagator which
+    caches via lru_cache keyed on DTensorSpec.  With dynamic shapes, b = x.shape[0]
+    is a SymInt, making DTensorSpec._hash_impl raise TypeError.  This is handled by
+    _patch_dtensor_spec_hash_for_symint() in parallelizer.py which falls back to a
+    placement-only hash for SymInt shapes.
+
+    Usage: after TP weight sharding, convert an nn.Linear instance by setting
+    ``linear.__class__ = TPLinear``.  This is the same __class__-swap trick used
+    by translate_to_lora, and ensures torch.compile/dynamo sees the correct
+    type(module).forward rather than nn.Linear.forward.
+    """
+
+    def forward(self, x):
+        if x.dim() == 3:
+            b = x.shape[0]
+            out = torch.bmm(x, self.weight.t().unsqueeze(0).expand(b, -1, -1))
+        else:
+            out = torch.mm(x, self.weight.t())
+        return out + self.bias if self.bias is not None else out
+
+
 class ColwiseParallelLora(ColwiseParallel):
     def _partition_linear_fn(self, name, module, device_mesh):
         # colwise shard weight/bias to Shard(0), weight be Shard(0)
@@ -65,6 +99,17 @@ class ColwiseParallelLora(ColwiseParallel):
 
         if hasattr(module, "lora_A"):
             module.lora_A.register_forward_hook(lora_a_output_hook)
+            # lora_A/lora_B are nn.Linear sub-modules whose weights are now DTensors.
+            # Convert to TPLinear so torch.compile sees matmul-based forward and
+            # avoids the aten.view recursion in the backward.
+            module.lora_A.__class__ = TPLinear
+        if hasattr(module, "lora_B"):
+            module.lora_B.__class__ = TPLinear
+
+        # Plain nn.Linear (not a LinearLoRA subclass): same conversion needed.
+        # LinearLoRA already uses _dtensor_linear (matmul) in its own forward.
+        if type(module) is nn.Linear:
+            module.__class__ = TPLinear
 
     def _partition_embedding_fn(self, name, module, device_mesh):
         # colwise shard embedding.weight is straight forward as Shard(1)
@@ -83,6 +128,12 @@ class RowwiseParallelLora(RowwiseParallel):
         if hasattr(module, "lora_A"):
             _distribute_param(module.lora_A, "weight", device_mesh, self.src_data_rank, [Shard(1)])
             _distribute_param(module.lora_B, "weight", device_mesh, self.src_data_rank, [Shard(1)])
+            module.lora_A.__class__ = TPLinear
+            module.lora_B.__class__ = TPLinear
+        # Plain nn.Linear: convert to TPLinear for compile safety.
+        # LinearLoRA subclasses are already handled by their own _dtensor_linear forward.
+        if type(module) is nn.Linear:
+            module.__class__ = TPLinear
         if hasattr(module, "lora_magnitude"):
             _distribute_param(module, "lora_magnitude", device_mesh, self.src_data_rank, [Replicate()])
 

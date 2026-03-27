@@ -142,6 +142,8 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
         enable_async_tensor_parallel: bool = False,
+        enable_compile: bool = False,
+        enable_fsdp2_prefetch: bool = True,
     ) -> nn.Module:
         """Apply the default parallelization flow."""
         tp_mesh = device_mesh[tp_mesh_name]
@@ -212,6 +214,12 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                         layers[i].post_attention_layernorm  # type: ignore
                     )
 
+        # Per-layer compile: deferred to after checkpoint loading in apply_model_infrastructure
+        # to avoid _orig_mod key prefix mismatch when loading HF checkpoints.
+        # Set the flag here so whole-model compile is skipped; actual compile applied later.
+        if (enable_async_tensor_parallel and tp_mesh.size() > 1) or enable_compile:
+            model._skip_whole_model_compile = True
+
         # Set up mixed precision policy
         if not mp_policy:
             mp_policy = MixedPrecisionPolicy(
@@ -221,7 +229,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             )
 
         # Find transformer layers and apply parallelisms
-        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy, pp_enabled)
+        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy, pp_enabled, enable_fsdp2_prefetch)
 
         # Apply FSDP to the root model
         # Do not reshard after forward for root model because its parameters
@@ -531,12 +539,96 @@ def _pre_shard_combined_projections(
             )
 
 
+def _patch_dtensor_spec_hash_for_symint() -> None:
+    """Patch DTensorSpec._hash_impl to tolerate SymInt shapes during torch.compile.
+
+    DTensor's ShardingPropagator caches sharding decisions via lru_cache keyed on
+    DTensorSpec.  _hash_impl hashes tensor_meta.shape, which contains non-nested
+    SymInts during dynamic torch.compile tracing → "unhashable type: non-nested
+    SymInt".
+
+    The fix: catch TypeError and fall back to a placement-only hash.  This trades
+    cache specificity (more misses) for correctness.  __eq__ still compares shapes
+    exactly via SymInt equality, so cache correctness is preserved — only efficiency
+    is slightly reduced for traced calls with symbolic shapes.
+    """
+    from torch.distributed.tensor._dtensor_spec import DTensorSpec
+
+    if getattr(DTensorSpec, "_symint_hash_patched", False):
+        return
+
+    _original_hash_impl = DTensorSpec._hash_impl
+
+    def _hash_impl_symint_safe(self) -> int:
+        try:
+            return _original_hash_impl(self)
+        except TypeError:
+            return hash((self.mesh, self.placements))
+
+    DTensorSpec._hash_impl = _hash_impl_symint_safe
+    DTensorSpec._symint_hash_patched = True
+
+
+def _apply_per_layer_compile(model: nn.Module) -> None:
+    """Compile attention and MLP submodules inside each checkpoint_wrapper.
+
+    Compiling the full decoder layer causes graph breaks because checkpoint_wrapper
+    is a Higher Order Operator (HOP) — dynamo cannot trace side effects across it.
+    Instead, compile the modules *inside* the checkpoint wrapper (self_attn, mlp).
+    These contain only LoRA matmuls (no DTensor ops) when TP=1 — inductor can fuse them.
+
+    Linear layers use torch.bmm (not F.linear) for DTensor weights so that
+    torch.compile's AOT autograd backward tracing avoids the aten.view slow-path
+    recursion in DTensor's sharding propagation.  See TPLinear in parallel_styles.py
+    and _dtensor_linear() in lora.py.
+
+    _patch_dtensor_spec_hash_for_symint() is called here to allow torch.compile with
+    dynamic shapes to coexist with DTensor's lru_cache-based sharding propagation.
+
+    CheckpointImpl.REENTRANT: PyTorch 2.8 defaults CheckpointWrapper to NO_REENTRANT
+    (use_reentrant=False), which runs recomputation under torch.no_grad().  When the
+    inner module is torch.compiled, AOT autograd traces TWO different functions:
+      - forward (grad enabled): joint fwd+bwd graph → saves weights + activations
+      - recompute (no_grad):    forward-only graph  → saves activations only
+    These produce different saved_tensors sets, triggering CheckpointError.  REENTRANT
+    (use_reentrant=True) runs recomputation with grad enabled, so torch.compile sees
+    the same execution context and reuses the same compiled function for both passes.
+    """
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+    _patch_dtensor_spec_hash_for_symint()
+
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        module_list = model.model.layers
+    elif hasattr(model, "layers"):
+        module_list = model.layers
+    else:
+        logger.warning("_apply_per_layer_compile: cannot find transformer layers, skipping")
+        return
+
+    compiled_count = 0
+    for layer in module_list:
+        for attr in ("self_attn", "mlp"):
+            existing_wrapper = getattr(layer, attr, None)
+            if isinstance(existing_wrapper, CheckpointWrapper):
+                inner = existing_wrapper._checkpoint_wrapped_module
+                # Wrap compiled inner in a REENTRANT checkpoint so recomputation runs
+                # with grad enabled — same Dynamo context as the forward pass.
+                setattr(layer, attr, checkpoint_wrapper(
+                    torch.compile(inner),
+                    checkpoint_impl=CheckpointImpl.REENTRANT,
+                ))
+                compiled_count += 1
+    logger.info("Sub-module torch.compile applied to %d checkpoint-wrapped attention/MLP blocks", compiled_count)
+
+
 def apply_fsdp2_sharding_recursively(
     module: nn.Module,
     mesh: DeviceMesh,
     mp_policy: Optional[MixedPrecisionPolicy],
     offload_policy: Optional[OffloadPolicy] = None,
     pp_enabled: bool = False,
+    enable_fsdp2_prefetch: bool = True,
 ) -> None:
     """
     Recursively apply FSDP2 sharding to modules, with optimizations for ModuleList.
@@ -566,7 +658,7 @@ def apply_fsdp2_sharding_recursively(
             # If child is also a ModuleList (nested structure), recurse instead of wrapping
             # since ModuleList doesn't have a forward() method required by fully_shard
             if isinstance(child_module, nn.ModuleList):
-                apply_fsdp2_sharding_recursively(child_module, mesh, mp_policy, offload_policy, pp_enabled)
+                apply_fsdp2_sharding_recursively(child_module, mesh, mp_policy, offload_policy, pp_enabled, enable_fsdp2_prefetch)
             else:
                 # Pre-shard combined projection submodules on dim 1 so that
                 # the parent fully_shard (dim 0) skips them automatically.
@@ -589,7 +681,7 @@ def apply_fsdp2_sharding_recursively(
 
         # Set up explicit forward/backward prefetch chains when layers are being resharded.
         # With PP, reshard_after_forward=False so weights are always gathered — no prefetch needed.
-        if not pp_enabled:
+        if not pp_enabled and enable_fsdp2_prefetch:
             layers = [module[i] for i in range(len(module)) if not isinstance(module[i], nn.ModuleList)]
             for i in range(len(layers) - 1):
                 layers[i].set_modules_to_forward_prefetch([layers[i + 1]])
@@ -597,7 +689,7 @@ def apply_fsdp2_sharding_recursively(
                 layers[i].set_modules_to_backward_prefetch([layers[i - 1]])
     else:
         for name, sub_module in module.named_children():
-            apply_fsdp2_sharding_recursively(sub_module, mesh, mp_policy, offload_policy, pp_enabled)
+            apply_fsdp2_sharding_recursively(sub_module, mesh, mp_policy, offload_policy, pp_enabled, enable_fsdp2_prefetch)
 
 
 def get_hf_tp_shard_plan(model):
@@ -1195,6 +1287,8 @@ def fsdp2_strategy_parallelize(
     dp_shard_cp_mesh_name: str = "dp_shard_cp",
     tp_mesh_name: str = "tp",
     enable_async_tensor_parallel: bool = False,
+    enable_compile: bool = False,
+    enable_fsdp2_prefetch: bool = True,
 ):
     """
     Apply parallelisms and activation checkpointing to the model.
@@ -1249,6 +1343,8 @@ def fsdp2_strategy_parallelize(
         dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
         tp_mesh_name=tp_mesh_name,
         enable_async_tensor_parallel=enable_async_tensor_parallel,
+        enable_compile=enable_compile,
+        enable_fsdp2_prefetch=enable_fsdp2_prefetch,
     )
 
 

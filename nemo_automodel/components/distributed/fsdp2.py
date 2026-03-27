@@ -69,6 +69,8 @@ class FSDP2Manager:
         self.defer_fsdp_grad_sync = config.defer_fsdp_grad_sync
         self.backend = config.backend
         self.enable_async_tensor_parallel = config.enable_async_tensor_parallel
+        self.enable_compile = config.enable_compile
+        self.enable_fsdp2_prefetch = config.enable_fsdp2_prefetch
 
     def parallelize(self, model):
         """
@@ -108,5 +110,7 @@ class FSDP2Manager:
             sequence_parallel=bool(self.sequence_parallel),
             activation_checkpointing=self.activation_checkpointing,
             enable_async_tensor_parallel=self.enable_async_tensor_parallel,
+            enable_compile=self.enable_compile,
+            enable_fsdp2_prefetch=self.enable_fsdp2_prefetch,
         )
         return model

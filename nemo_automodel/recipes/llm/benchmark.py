@@ -58,11 +58,11 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Infer max_steps from step_scheduler
         self._bench_steps = cfg.step_scheduler.max_steps
 
-        # Get seq_len from dataset config
-        self._bench_seq_len = cfg.dataset.seq_len
+        # Get seq_len: prefer benchmark.seq_len, fall back to dataset.seq_len (MockIterableDataset)
+        self._bench_seq_len = getattr(cfg.benchmark, "seq_len", None) or cfg.dataset.seq_len
 
-        # Infer vocab_size from model config and inject it into dataset config
-        if hasattr(cfg, "dataset") and hasattr(cfg, "model"):
+        # Infer vocab_size from model config and inject it into dataset config (MockIterableDataset only)
+        if hasattr(cfg, "dataset") and hasattr(cfg.dataset, "vocab_size") and hasattr(cfg, "model"):
             # Get vocab_size from model config
             if hasattr(cfg.model, "config") and hasattr(cfg.model.config, "pretrained_model_name_or_path"):
                 from transformers import AutoConfig
@@ -78,8 +78,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 if logger.isEnabledFor(logging.INFO):
                     logger.info(f"Inferred vocab_size={vocab_size} from model config")
 
-        # Inject batch_size from step_scheduler into dataset config
-        if hasattr(cfg, "dataset") and hasattr(cfg, "step_scheduler"):
+        # Inject batch_size from step_scheduler into dataset config (MockIterableDataset only)
+        if hasattr(cfg, "dataset") and hasattr(cfg.dataset, "seq_len") and hasattr(cfg, "step_scheduler"):
             local_batch_size = getattr(cfg.step_scheduler, "local_batch_size", 1)
             cfg.dataset.batch_size = local_batch_size
             if logger.isEnabledFor(logging.INFO):
@@ -167,6 +167,64 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             reset=True,
             barrier=True,
         )
+
+        if self.dist_env.is_main:
+            self._verify_fsdp2_features()
+
+    def _verify_fsdp2_features(self):
+        """Verify that FSDP2 prefetch and async TP features are active."""
+        model = self.model_parts[0]
+
+        # --- Async TP check ---
+        try:
+            import torch._inductor.config as inductor_cfg
+            async_tp_active = getattr(inductor_cfg, "_micro_pipeline_tp", False)
+        except Exception:
+            async_tp_active = False
+        logger.info(f"[verify] Async TP (_micro_pipeline_tp): {async_tp_active}")
+
+        # --- Per-layer compile check ---
+        skip_whole_compile = getattr(model, "_skip_whole_model_compile", False)
+        logger.info(f"[verify] Per-layer compile active (_skip_whole_model_compile): {skip_whole_compile}")
+
+        # --- FSDP2 prefetch check ---
+        layers = None
+        if hasattr(model, "model") and hasattr(model.model, "layers"):
+            layers = list(model.model.layers)
+        elif hasattr(model, "layers"):
+            layers = list(model.layers)
+
+        if layers:
+            first, last = layers[0], layers[-1]
+
+            # FSDP2 stores state in a global WeakKeyDictionary (not __dict__).
+            # Access via _get_fsdp_state() which is mixed into the module class by fully_shard().
+            try:
+                def _fmt_layer(idx, layer, note=""):
+                    state = layer._get_fsdp_state()
+                    fwd = getattr(state, "_states_to_forward_prefetch", [])
+                    bwd = getattr(state, "_states_to_backward_prefetch", [])
+                    pg = state._fsdp_param_group
+                    reshard = pg._reshard_after_forward if pg is not None else "N/A"
+                    # When explicit bwd prefetch is set, default_prefetch=False → implicit suppressed.
+                    # When not set, FSDP2 falls back to implicit (reverse post-forward order).
+                    bwd_mode = "explicit" if len(bwd) > 0 else "implicit(default)"
+                    logger.info(
+                        f"[verify] layer[{idx}]{note}: "
+                        f"fwd_prefetch={len(fwd)}, bwd_prefetch={len(bwd)}({bwd_mode}), "
+                        f"reshard_after_forward={reshard}"
+                    )
+
+                _fmt_layer(0, first, " — last in bwd, no bwd prefetch expected")
+                if len(layers) > 1:
+                    _fmt_layer(1, layers[1], " — should have bwd_prefetch=1 (prefetches layer[0])")
+                _fmt_layer(-1, last, " — first in bwd, should have bwd_prefetch=1 and fwd_prefetch=0")
+            except AttributeError:
+                logger.warning("[verify] Layer does not have _get_fsdp_state() — not an FSDP2 module?")
+                fsdp_dir = [k for k in dir(first) if "fsdp" in k.lower() or "prefetch" in k.lower() or "reshard" in k.lower()]
+                logger.info(f"[verify] FSDP-related attrs via dir(): {fsdp_dir}")
+        else:
+            logger.warning("[verify] Could not locate transformer layers for prefetch check.")
 
     def run_benchmark(self):
         """Run the benchmarking loop.
