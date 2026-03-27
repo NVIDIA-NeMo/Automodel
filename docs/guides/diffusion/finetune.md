@@ -37,6 +37,7 @@ For model-specific configuration (FLUX.1-dev, HunyuanVideo), see [Model-Specific
 | Wan 2.1 T2V 1.3B | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | Text-to-Video | 1.3B | [wan2_1_t2v_flow.yaml](../../../examples/diffusion/finetune/wan2_1_t2v_flow.yaml) |
 | FLUX.1-dev | `black-forest-labs/FLUX.1-dev` | Text-to-Image | 12B | [flux_t2i_flow.yaml](../../../examples/diffusion/finetune/flux_t2i_flow.yaml) |
 | HunyuanVideo 1.5 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | Text-to-Video | — | [hunyuan_t2v_flow.yaml](../../../examples/diffusion/finetune/hunyuan_t2v_flow.yaml) |
+| LTX-Video | `Lightricks/LTX-Video` | Text-to-Video | 2B–22B | [ltx_t2v_flow.yaml](../../../examples/diffusion/finetune/ltx_t2v_flow.yaml) |
 
 All models use FSDP2 for distributed training and flow matching for loss computation.
 
@@ -276,6 +277,7 @@ Use the table below to pick the right model for your use case:
 | **Video generation on limited hardware** | [Wan 2.1 T2V 1.3B](#wan-21-t2v-13b) | Smallest model (1.3B params) — fast iteration, fits on a single A100 40GB |
 | **High-quality image generation** | [FLUX.1-dev](#flux1-dev-text-to-image) | State-of-the-art text-to-image with 12B params and guidance-based control |
 | **High-quality video generation** | [HunyuanVideo 1.5](#hunyuanvideo-15) | Larger video model with condition-latent support for richer motion and detail |
+| **Fast video generation** | [LTX-Video](#ltx-video) | DiT-based video model with high compression ratio VAE (1:192) for efficient generation |
 
 ### Wan 2.1 T2V 1.3B
 
@@ -324,6 +326,26 @@ Use the table below to pick the right model for your use case:
   - Uses `logit_normal` timestep sampling
 - **Config**: [hunyuan_t2v_flow.yaml](../../../examples/diffusion/finetune/hunyuan_t2v_flow.yaml)
 
+### LTX-Video
+
+- **Adapter type**: `ltx`
+- **Dataloader**: `build_video_multiresolution_dataloader` with `model_type: ltx`
+- **Key differences**:
+  - Frame count must satisfy **8n+1** constraint (9, 17, 25, 33, ...)
+  - Resolution must be divisible by **32** (not 16 like Wan)
+  - Uses 3D latent packing/unpacking for the DiT transformer
+  - VAE has 128 latent channels with 8x8x8 spatio-temporal compression
+  - Uses `logit_normal` timestep sampling
+  - Adapter accepts `patch_size` and `patch_size_t` kwargs (default 1):
+    ```yaml
+    flow_matching:
+      adapter_type: "ltx"
+      adapter_kwargs:
+        patch_size: 1
+        patch_size_t: 1
+    ```
+- **Config**: [ltx_t2v_flow.yaml](../../../examples/diffusion/finetune/ltx_t2v_flow.yaml)
+
 ## Generation / Inference
 
 Once training is complete, you can use the model to generate images or videos from text prompts. This step is called inference — as opposed to training, where the model learns from data, inference is where it produces new outputs.
@@ -370,6 +392,12 @@ python examples/diffusion/generate/generate.py \
   -c examples/diffusion/generate/configs/generate_hunyuan.yaml
 ```
 
+**LTX-Video:**
+```bash
+python examples/diffusion/generate/generate.py \
+  -c examples/diffusion/generate/configs/generate_ltx.yaml
+```
+
 ### Available Generation Configs
 
 | Config | Model | Output | GPUs |
@@ -377,6 +405,7 @@ python examples/diffusion/generate/generate.py \
 | [`generate_wan.yaml`](../../../examples/diffusion/generate/configs/generate_wan.yaml) | Wan 2.1 1.3B | Video | 1 |
 | [`generate_flux.yaml`](../../../examples/diffusion/generate/configs/generate_flux.yaml) | FLUX.1-dev | Image | 1 |
 | [`generate_hunyuan.yaml`](../../../examples/diffusion/generate/configs/generate_hunyuan.yaml) | HunyuanVideo | Video | 1 |
+| [`generate_ltx.yaml`](../../../examples/diffusion/generate/configs/generate_ltx.yaml) | LTX-Video | Video | 1 |
 
 :::{note}
 You can use `--model.checkpoint ./checkpoints/LATEST` to automatically load the most recent checkpoint.

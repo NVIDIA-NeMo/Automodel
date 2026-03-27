@@ -40,6 +40,7 @@ The tool automatically distributes work across all available GPUs using multipro
 | `flux` | Image | FLUX.1-dev |
 | `wan` | Video | Wan 2.1 |
 | `hunyuan` | Video | HunyuanVideo 1.5 |
+| `ltx` | Video | LTX-Video |
 
 You can list all registered processors with:
 
@@ -93,13 +94,27 @@ python -m tools.diffusion.preprocessing_multiprocess video \
   --caption_format meta_json
 ```
 
+### Video Preprocessing (LTX-Video)
+
+```bash
+python -m tools.diffusion.preprocessing_multiprocess video \
+  --video_dir /path/to/videos \
+  --output_dir /path/to/cache \
+  --processor ltx \
+  --resolution_preset 512p
+```
+
+:::{note}
+LTX-Video has a frame count constraint of **8n+1** (9, 17, 25, 33, ...). The LTX processor automatically adjusts frame counts to the nearest valid value during preprocessing. Resolution must be divisible by 32.
+:::
+
 ### Key Arguments
 
 **Common arguments:**
 
 | Argument | Description |
 |----------|-------------|
-| `--processor` | Processor name (`flux`, `wan`, `hunyuan`) |
+| `--processor` | Processor name (`flux`, `wan`, `hunyuan`, `ltx`) |
 | `--model_name` | HuggingFace model name (uses processor default if omitted) |
 | `--output_dir` | Output directory for cached data |
 | `--shard_size` | Number of samples per metadata shard (default: 10000) |
