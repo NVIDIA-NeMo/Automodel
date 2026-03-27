@@ -2046,7 +2046,6 @@ def test_apply_cp_linear_attention_warns_when_no_cp_aware_module(monkeypatch):
 
     cp_mesh = MagicMock()
 
-    import logging
 
     with patch.object(P.logger, "warning") as mock_warn:
         P.apply_cp(model, cp_mesh)

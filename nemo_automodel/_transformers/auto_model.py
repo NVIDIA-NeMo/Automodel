@@ -362,6 +362,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         if is_hf_model:
             _verify_sdpa_support(model, mesh.cp_size)
 
+        # HF from_pretrained on a real device loads (and potentially quantizes) weights
+        # during init.  Custom models and meta-device initialization do not load weights
+        # here; they rely on apply_model_infrastructure to load the checkpoint later.
+        weights_already_loaded = not is_custom_model and not is_meta_device and load_base_model
+
         from nemo_automodel._transformers.capabilities import attach_capabilities_and_validate
 
         attach_capabilities_and_validate(model, mesh)
@@ -384,6 +389,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             load_base_model=load_base_model,
             cache_dir=cache_dir,
             freeze_config=freeze_config,
+            weights_already_loaded=weights_already_loaded,
         )
 
         return model

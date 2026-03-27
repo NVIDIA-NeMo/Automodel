@@ -246,7 +246,7 @@ def run_test():
         )
 
         if rank == 0:
-            print(f"PASSED: Forward outputs and gradients match between CP=1 and CP=2")
+            print("PASSED: Forward outputs and gradients match between CP=1 and CP=2")
             print(f"{'=' * 70}\n")
         return 0
 
