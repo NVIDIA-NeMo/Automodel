@@ -76,7 +76,13 @@ class NemotronV3Attention(nn.Module):
         layer_idx: int | None = None,
         **attn_kwargs,
     ) -> torch.Tensor:
-        bsz, seqlen, _ = hidden_states.size()
+        if hidden_states.dim() == 2:
+            qkv_format = "thd"
+            num_tokens = hidden_states.shape[0]
+        else:
+            qkv_format = "bshd"
+            bsz, seqlen, _ = hidden_states.size()
+
         q, k, v = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
 
         # Inference path: KV cache with SDPA
@@ -101,16 +107,22 @@ class NemotronV3Attention(nn.Module):
             return self.o_proj(output)
 
         # Training path: backend-aware attention (TE or SDPA)
-        q = q.view(bsz, seqlen, self.num_attention_heads, self.head_dim)
-        k = k.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
-        v = v.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
+        if qkv_format == "thd":
+            q = q.view(num_tokens, self.num_attention_heads, self.head_dim)
+            k = k.view(num_tokens, self.num_key_value_heads, self.head_dim)
+            v = v.view(num_tokens, self.num_key_value_heads, self.head_dim)
+        else:
+            q = q.view(bsz, seqlen, self.num_attention_heads, self.head_dim)
+            k = k.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
+            v = v.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
 
         q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(
             q, k, v, attention_mask, self.backend.attn, **attn_kwargs
         )
         output = self.attn_func(q, k, v, **_attn_kwargs)
         output = postprocess_output_for_attn(output, self.backend.attn)
-        output = self.o_proj(output.flatten(2))
+        flatten_dim = 2 if qkv_format == "bshd" else 1
+        output = self.o_proj(output.flatten(flatten_dim))
         return output
 
     @torch.no_grad()
@@ -233,6 +245,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_values=None,
         cache_position: torch.LongTensor | None = None,
+        **kwargs,
     ) -> torch.Tensor:
         """Forward pass with three code paths.
 
@@ -249,6 +262,10 @@ class NemotronV3Mamba2Mixer(nn.Module):
         Returns:
             Output tensor of shape (batch, seq_len, hidden_size)
         """
+        squeezed = hidden_states.dim() == 2
+        if squeezed:
+            hidden_states = hidden_states.unsqueeze(0)
+
         batch_size, seq_len, _ = hidden_states.shape
 
         use_cache = past_key_values is not None
@@ -259,6 +276,19 @@ class NemotronV3Mamba2Mixer(nn.Module):
             and cache_position is not None
             and cache_position[0] > 0
         )
+
+        # Build seq_idx for Mamba kernel (marks sequence boundaries for packing / CP).
+        seq_idx = kwargs.get("seq_idx", None)
+        if seq_idx is None and "cu_seqlens" in kwargs:
+            cu_seqlens = kwargs["cu_seqlens"]
+            # When CP is active, the mamba kernel receives the global sequence (after
+            # all-to-all gather).  Scale cu_seqlens and total_len accordingly so that
+            # seq_idx has the correct global length.
+            cp_size = self.cp.cp_size if self.cp is not None else 1
+            cu_seqlens_global = cu_seqlens * cp_size
+            total_len = (hidden_states.shape[1] if hidden_states.dim() == 3 else hidden_states.shape[0]) * cp_size
+            positions = torch.arange(total_len, device=hidden_states.device)
+            seq_idx = (torch.searchsorted(cu_seqlens_global[1:], positions)).unsqueeze(0).to(torch.int32)
 
         # --- Path A: Training (no cache) → fused kernel ---
         if not use_cache:
@@ -272,7 +302,14 @@ class NemotronV3Mamba2Mixer(nn.Module):
             dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
 
             if self.cp is not None:
-                projected_states = self.cp.pre_conv_ssm(projected_states)
+                cu_seqlens_cp = kwargs.get("cu_seqlens")
+                # CP reorder helpers expect 2D [T, H] when cu_seqlens is provided (THD format).
+                # The mixer unsqueezes 2D input to [1, T, H] above, so squeeze back for CP methods.
+                if squeezed and cu_seqlens_cp is not None:
+                    projected_states = projected_states.squeeze(0)
+                projected_states = self.cp.pre_conv_ssm(projected_states, cu_seqlens=cu_seqlens_cp)
+                if squeezed and cu_seqlens_cp is not None:
+                    projected_states = projected_states.unsqueeze(0).contiguous()
                 A = -torch.exp(self.cp.get_A_log().float())
 
                 out = mamba_split_conv1d_scan_combined(
@@ -283,6 +320,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
                     A,
                     D=self.cp.get_D(),
                     chunk_size=self.chunk_size,
+                    seq_idx=seq_idx,
                     activation=self.activation,
                     rmsnorm_weight=None,
                     outproj_weight=None,
@@ -295,9 +333,16 @@ class NemotronV3Mamba2Mixer(nn.Module):
                 if out.ndim == 4:
                     out = out.reshape(out.shape[0], out.shape[1], -1)
 
-                out = self.cp.post_conv_ssm(out)
+                # Squeeze back to 2D for post_conv_ssm when in THD mode.
+                if squeezed and cu_seqlens_cp is not None:
+                    out = out.squeeze(0)
+                out = self.cp.post_conv_ssm(out, cu_seqlens=cu_seqlens_cp)
+                if squeezed and cu_seqlens_cp is not None:
+                    out = out.unsqueeze(0)
                 out = self.norm(out, gate=None)
                 out = self.out_proj(out)
+                if squeezed:
+                    out = out.squeeze(0)
                 return out
             else:
                 A = -torch.exp(self.A_log.float())
@@ -310,7 +355,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
                     A,
                     D=self.D,
                     chunk_size=self.chunk_size,
-                    seq_idx=None,
+                    seq_idx=seq_idx,
                     activation=self.activation,
                     rmsnorm_weight=self.norm.weight,
                     rmsnorm_eps=self.norm.variance_epsilon,
@@ -322,6 +367,8 @@ class NemotronV3Mamba2Mixer(nn.Module):
                     return_final_states=False,
                     **dt_limit_kwargs,
                 )
+                if squeezed:
+                    out = out.squeeze(0)
                 return out
 
         # --- Path C: Decode (single token, cached state) ---
@@ -601,6 +648,7 @@ class NemotronV3Block(nn.Module):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 cache_position=cache_position,
+                **attn_kwargs,
             )
         elif self.block_type == "attention":
             hidden_states = self.mixer(

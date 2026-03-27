@@ -261,8 +261,6 @@ def apply_parameter_freezing(model, freeze_config):
 
 def cast_mixed_dtype_params_to_bf16(model):
     """Cast fp32 parameters and buffers to bf16 for FSDP2 compatibility."""
-    import torch
-
     for p in model.parameters():
         if p.dtype == torch.float32:
             p.data = p.data.to(torch.bfloat16)

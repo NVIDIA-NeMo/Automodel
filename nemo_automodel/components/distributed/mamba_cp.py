@@ -54,6 +54,7 @@ class _AllToAll(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         group = ctx.group
+        grad_output = grad_output.contiguous()
         grad_input = torch.empty_like(grad_output)
         torch.distributed.all_to_all_single(grad_input, grad_output, group=group)
         return grad_input, None
@@ -77,14 +78,18 @@ def _all_to_all_cp2hp(
     """Transform from sequence-sharded to hidden-sharded layout (batch-first).
 
     Args:
-        input_: Tensor of shape ``[B, L_local, H]`` where H is the full hidden
-            dimension on this rank.
+        input_: Tensor of shape ``[B, L_local, H]`` (BSHD) or ``[T, H]`` (THD)
+            where H is the full hidden dimension on this rank.
         cp_group: Context-parallel process group.
         batch_size: Batch size ``B`` (needed to recover dimensions after reshape).
 
     Returns:
-        Tensor of shape ``[B, L_global, H / cp_size]``.
+        Tensor of shape ``[B, L_global, H / cp_size]`` (BSHD) or ``[T, H / cp_size]`` (THD).
     """
+    is_2d = input_.dim() == 2
+    if is_2d:
+        input_ = input_.unsqueeze(0)
+
     cp_size = cp_group.size()
     B, L_local, H = input_.shape
     H_local = H // cp_size
@@ -100,12 +105,16 @@ def _all_to_all_cp2hp(
     recv_tensor = _all_to_all(send_tensor, cp_group)
 
     # [cp, B, L_local, H_local] -> [B, cp*L_local, H_local]
-    return (
+    result = (
         recv_tensor.reshape(cp_size, B, L_local, H_local)
         .permute(1, 0, 2, 3)
         .contiguous()
         .reshape(B, cp_size * L_local, H_local)
     )
+
+    if is_2d:
+        result = result.squeeze(0)
+    return result
 
 
 def _all_to_all_hp2cp(
@@ -118,14 +127,19 @@ def _all_to_all_hp2cp(
     This is the inverse of :func:`_all_to_all_cp2hp`.
 
     Args:
-        input_: Tensor of shape ``[B, L_global, H_local]`` where ``H_local = H / cp_size``.
+        input_: Tensor of shape ``[B, L_global, H_local]`` (BSHD) or ``[T, H_local]`` (THD)
+            where ``H_local = H / cp_size``.
         cp_group: Context-parallel process group.
         batch_size: Batch size ``B``.
 
     Returns:
-        Tensor of shape ``[B, L_local, H]`` where ``L_local = L_global / cp_size``
-        and ``H = H_local * cp_size``.
+        Tensor of shape ``[B, L_local, H]`` (BSHD) or ``[T, H]`` (THD)
+        where ``L_local = L_global / cp_size`` and ``H = H_local * cp_size``.
     """
+    is_2d = input_.dim() == 2
+    if is_2d:
+        input_ = input_.unsqueeze(0)
+
     cp_size = cp_group.size()
     B, L_global, H_local = input_.shape
     L_local = L_global // cp_size
@@ -141,38 +155,140 @@ def _all_to_all_hp2cp(
     recv_tensor = _all_to_all(send_tensor, cp_group)
 
     # [cp, B*L_local, H_local] -> [B*L_local, cp, H_local] -> [B, L_local, H]
-    return (
+    result = (
         recv_tensor.reshape(cp_size, B * L_local, H_local)
         .permute(1, 0, 2)
         .contiguous()
         .reshape(B, L_local, cp_size * H_local)
     )
 
+    if is_2d:
+        result = result.squeeze(0)
+    return result
 
-def _undo_attention_load_balancing(input_: torch.Tensor, cp_size: int) -> torch.Tensor:
-    """Reorder from DualChunkSwap to sequential for SSM processing.
 
-    Operates on dim=1 (sequence) of [B, L_global, H_local].
-    For cp_size=2 (4 chunks): reorder [0,3,1,2] → [0,1,2,3].
+def _reorder_chunks(
+    input_: torch.Tensor,
+    order: list[int],
+    cu_seqlens: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Reorder equal-sized chunks of a tensor according to *order*.
+
+    Args:
+        input_: ``[B, L, H]`` (BSHD) or ``[T, H]`` (THD).
+        order: Permutation indices (length must equal the number of chunks).
+        cu_seqlens: If provided, reorder per-sequence on dim=0 (THD).
     """
-    num_chunks = 2 * cp_size
+    num_chunks = len(order)
+
+    if cu_seqlens is not None:
+        parts = []
+        for i in range(len(cu_seqlens) - 1):
+            start, end = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+            chunks = input_[start:end].split((end - start) // num_chunks, dim=0)
+            parts.append(torch.cat([chunks[j] for j in order], dim=0))
+        return torch.cat(parts, dim=0)
+
     chunks = torch.chunk(input_, chunks=num_chunks, dim=1)
-    # Even indices select from first halves, odd indices (reversed) select from second halves
-    order = [2 * i for i in range(cp_size)] + [num_chunks - 1 - 2 * i for i in range(cp_size)]
     return torch.cat([chunks[i] for i in order], dim=1)
 
 
-def _redo_attention_load_balancing(input_: torch.Tensor, cp_size: int) -> torch.Tensor:
+def _deinterleave_packed_seqs(
+    input_: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cp_size: int,
+) -> torch.Tensor:
+    """Rearrange tokens from rank-major to sequence-major order after all-to-all.
+
+    After ``_all_to_all_cp2hp`` on packed 2-D data the token layout along
+    the sequence dimension is::
+
+        [rank0_seq0 | rank0_seq1 | ... | rank1_seq0 | rank1_seq1 | ...]
+
+    This function rearranges to::
+
+        [rank0_seq0 | rank1_seq0 | ... | rank0_seq1 | rank1_seq1 | ...]
+
+    so that each sequence's tokens are contiguous (required by the
+    ``_undo_attention_load_balancing`` reorder that follows).
+
+    Args:
+        input_: 2-D tensor ``[T_global, H]``.
+        cu_seqlens: **Local** (pre-all-to-all) cumulative sequence lengths.
+        cp_size: Context-parallel world size.
+
+    Returns:
+        Rearranged 2-D tensor with the same shape.
+    """
+    num_seqs = len(cu_seqlens) - 1
+    if num_seqs <= 1:
+        return input_
+
+    # Each rank contributes a contiguous block of T_local tokens.
+    T_local = input_.shape[0] // cp_size
+
+    parts: list[torch.Tensor] = []
+    for s in range(num_seqs):
+        start_s = cu_seqlens[s].item()
+        end_s = cu_seqlens[s + 1].item()
+        for r in range(cp_size):
+            offset = r * T_local
+            parts.append(input_[offset + start_s : offset + end_s])
+    return torch.cat(parts, dim=0)
+
+
+def _reinterleave_packed_seqs(
+    input_: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cp_size: int,
+) -> torch.Tensor:
+    """Inverse of :func:`_deinterleave_packed_seqs`.
+
+    Rearranges from sequence-major back to rank-major order before the
+    inverse all-to-all in ``post_conv_ssm``.
+    """
+    num_seqs = len(cu_seqlens) - 1
+    if num_seqs <= 1:
+        return input_
+
+    # Build per-rank blocks by gathering each rank's portion of every sequence.
+    seq_lens = [(cu_seqlens[s + 1] - cu_seqlens[s]).item() for s in range(num_seqs)]
+    # In the deinterleaved (sequence-major) layout each sequence occupies
+    # seq_len_local * cp_size contiguous tokens.
+    rank_blocks: list[list[torch.Tensor]] = [[] for _ in range(cp_size)]
+    offset = 0
+    for s in range(num_seqs):
+        for r in range(cp_size):
+            rank_blocks[r].append(input_[offset : offset + seq_lens[s]])
+            offset += seq_lens[s]
+    return torch.cat([torch.cat(rb, dim=0) for rb in rank_blocks], dim=0)
+
+
+def _undo_attention_load_balancing(
+    input_: torch.Tensor,
+    cp_size: int,
+    cu_seqlens: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Reorder from DualChunkSwap to sequential for SSM processing."""
+    num_chunks = 2 * cp_size
+    order = [2 * i for i in range(cp_size)] + [num_chunks - 1 - 2 * i for i in range(cp_size)]
+    return _reorder_chunks(input_, order, cu_seqlens)
+
+
+def _redo_attention_load_balancing(
+    input_: torch.Tensor,
+    cp_size: int,
+    cu_seqlens: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Reorder from sequential back to DualChunkSwap for attention.
 
-    Inverse of _undo_attention_load_balancing.
+    Inverse of :func:`_undo_attention_load_balancing`.
     """
     num_chunks = 2 * cp_size
-    chunks = torch.chunk(input_, chunks=num_chunks, dim=1)
     order = [None] * num_chunks
     order[::2] = range(cp_size)
     order[1::2] = reversed(range(cp_size, num_chunks))
-    return torch.cat([chunks[i] for i in order], dim=1)
+    return _reorder_chunks(input_, order, cu_seqlens)
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +326,7 @@ class MambaContextParallel:
         dt_bias: torch.Tensor,
         A_log: torch.Tensor,
         D: torch.Tensor,
+        uses_te_cp: bool = True,
     ) -> None:
         self.cp_group = cp_group
         self.num_heads = num_heads
@@ -220,6 +337,8 @@ class MambaContextParallel:
         self.dt_bias = dt_bias
         self.A_log = A_log
         self.D = D
+
+        self.uses_te_cp = uses_te_cp
 
         self.cp_size = cp_group.size()
         self.cp_rank = cp_group.rank()
@@ -249,16 +368,16 @@ class MambaContextParallel:
     #  Activation transforms (before / after conv+SSM)                    #
     # ------------------------------------------------------------------ #
 
-    def pre_conv_ssm(self, projected_states: torch.Tensor) -> torch.Tensor:
-        """Redistribute ``[B, L_local, proj_dim]`` to ``[B, L_global, proj_dim_local]``.
-
-        Splits the packed projection into [z, x, B, C, dt], optionally replicates
-        B/C states, performs cp2hp all-to-all on each, and re-concatenates.
-        """
+    def pre_conv_ssm(
+        self,
+        projected_states: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Redistribute from sequence-sharded to hidden-sharded layout, undoing DualChunkSwap."""
         if self.cp_size == 1:
             return projected_states
 
-        B = projected_states.shape[0]
+        B = 1 if cu_seqlens is not None else projected_states.shape[0]
         groups_state_size = self.n_groups * self.d_state
 
         z, x, B_state, C_state, dt = torch.split(
@@ -280,23 +399,43 @@ class MambaContextParallel:
         dt = _all_to_all_cp2hp(dt, self.cp_group, B)
 
         result = torch.cat([z, x, B_state, C_state, dt], dim=-1)
-        return _undo_attention_load_balancing(result, self.cp_size)
+        if self.uses_te_cp:
+            # After all-to-all the tensor has global sequence length (L_local * cp_size
+            # per sequence), so scale cu_seqlens to match.
+            if cu_seqlens is not None:
+                # For packed data (multiple sequences), the all-to-all produces a
+                # rank-major layout where sequences from different ranks are
+                # interleaved.  Deinterleave so each sequence is contiguous
+                # before applying the DualChunkSwap undo.
+                result = _deinterleave_packed_seqs(result, cu_seqlens, self.cp_size)
+                cu_seqlens_global = cu_seqlens * self.cp_size
+            else:
+                cu_seqlens_global = None
+            result = _undo_attention_load_balancing(result, self.cp_size, cu_seqlens=cu_seqlens_global)
+        return result
 
-    def post_conv_ssm(self, output: torch.Tensor) -> torch.Tensor:
-        """Redistribute SSM output from hidden-sharded back to sequence-sharded layout.
-
-        Args:
-            output: ``[B, L_global, d_inner / cp_size]`` — the (already gated)
-                SSM output on this rank.
-
-        Returns:
-            ``[B, L_local, d_inner]`` — sequence-sharded output.
-        """
+    def post_conv_ssm(
+        self,
+        output: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Redistribute SSM output from hidden-sharded back to sequence-sharded layout."""
         if self.cp_size == 1:
             return output
 
-        B = output.shape[0]
-        output = _redo_attention_load_balancing(output, self.cp_size)
+        B = 1 if cu_seqlens is not None else output.shape[0]
+        if self.uses_te_cp:
+            # The tensor still has global sequence length before the all-to-all back,
+            # so scale cu_seqlens to match.
+            if cu_seqlens is not None:
+                cu_seqlens_global = cu_seqlens * self.cp_size
+            else:
+                cu_seqlens_global = None
+            output = _redo_attention_load_balancing(output, self.cp_size, cu_seqlens=cu_seqlens_global)
+            if cu_seqlens is not None:
+                # Reverse the deinterleaving done in pre_conv_ssm so that the
+                # inverse all-to-all restores the original per-rank layout.
+                output = _reinterleave_packed_seqs(output, cu_seqlens, self.cp_size)
         return _all_to_all_hp2cp(output, self.cp_group, B)
 
     # ------------------------------------------------------------------ #

@@ -138,17 +138,6 @@ def _get_num_thd_chunks(pp_enabled, cfg):
     return 1
 
 
-def _is_hybrid_mamba_attention(cfg_model):
-    """Check if model has mixed Mamba and Attention layers (e.g., NemotronV3)."""
-    config = getattr(cfg_model, "config", None)
-    if config is None:
-        return False
-    block_types = getattr(config, "layers_block_type", None)
-    if block_types is None:
-        return False
-    return "mamba" in block_types and "attention" in block_types
-
-
 def build_model(
     cfg_model,
     cfg_peft,
@@ -1290,7 +1279,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.device_mesh,
             batch,
             use_te=_uses_te_dot_product_attention(self.cfg.model) and _uses_thd_collater(self.cfg.dataloader),
-            use_hybrid_cp=_is_hybrid_mamba_attention(self.cfg.model),
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
             num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
         )
