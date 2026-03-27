@@ -296,8 +296,8 @@ def build_dataloader(
         if cfg_ps is not None:
             _ps_enabled = getattr(cfg_ps, "pack_size", 0) > 0
             packing_cfg = cfg_ps if _ps_enabled else None
-            pretokenize = getattr(cfg_ps, "pretokenize", True) if _ps_enabled else cfg_ds.get("pretokenize", False)
-            max_length = getattr(cfg_ps, "max_length", None) if _ps_enabled else cfg_ds.get("max_length", None)
+            pretokenize = getattr(cfg_ps, "pretokenize", _ps_enabled)
+            max_length = getattr(cfg_ps, "max_length", None)
         else:
             _legacy = cfg_ds.get("packing", None)
             _ps_enabled = _legacy is not None and _legacy.get("enabled", False)

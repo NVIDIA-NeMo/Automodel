@@ -35,6 +35,7 @@ except ImportError:
 
 import copy
 import logging
+import random
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from PIL import Image as PILImage
@@ -83,7 +84,6 @@ def make_robust_collate(dataset, collate_fn, max_retries=10):
         collate_fn: The collate function to wrap.
         max_retries: Maximum number of retry attempts.
     """
-    import random
 
     def wrapper(examples):
         last_error = None
