@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Union
 
 import torch
-from transformers import PreTrainedTokenizerBase
+from transformers import DataCollatorWithPadding, PreTrainedTokenizerBase
 from transformers.file_utils import PaddingStrategy
+
+if TYPE_CHECKING:
+    from transformers import BatchEncoding
 
 
 def _unpack_doc_values(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -37,15 +40,15 @@ def _unpack_doc_values(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return doc_examples
 
 
-class RetrievalBiencoderCollator:
+class BiEncoderCollator:
     """
-    Collator for biencoder retrieval training.
+    Collator for encoder retrieval training.
 
     This collator handles tokenization of queries and documents at batch time,
     which is more memory-efficient than pre-tokenization and allows for
     dynamic padding based on batch max length.
 
-    Based on BiencoderCollator from nemo-retriever-research but adapted for Automodel.
+    Based on EncoderCollator from nemo-retriever-research but adapted for Automodel.
     """
 
     def __init__(
@@ -233,3 +236,45 @@ class RetrievalBiencoderCollator:
                 tmp[key] = input_dict[key][i]
             out_list.append(tmp)
         return out_list
+
+
+class CrossEncoderCollator(DataCollatorWithPadding):
+    def __init__(self, rerank_max_length: int, *args, prompt_template: str = "question:{query} \n \n passage:{passage}", **kwargs):
+        self.rerank_max_length = rerank_max_length
+        self.prompt_template = prompt_template
+        # Call Base with all args and kwargs
+        self.args = None
+        if "args" in kwargs:
+            self.args = kwargs.pop("args")
+        super().__init__(*args, **kwargs)
+
+    def __call__(self, features: List[Dict[str, Any]]) -> "BatchEncoding":
+        query_examples = [x["question"] for x in features]
+        doc_examples = [x["doc_text"] for x in features]
+        num_labels = features[0].get("num_labels") if features else None
+
+        def format_text(q, p):
+            return self.prompt_template.format(query=q, passage=p)
+
+        examples = [format_text(q, d) for q, d in zip(query_examples, doc_examples)]
+
+        # Tokenize without tensors first (so NeMoAutoTokenizer BOS/EOS insertion works on lists),
+        # then pad and convert to tensors in a separate step.
+        encodings = self.tokenizer(
+            examples,
+            max_length=self.rerank_max_length,
+            padding=PaddingStrategy.DO_NOT_PAD,
+            truncation=True,
+        )
+        tok_features = [{k: encodings[k][i] for k in encodings} for i in range(len(examples))]
+        batch_dict = self.tokenizer.pad(
+            tok_features,
+            padding=True,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors=self.return_tensors,
+        )
+
+        if num_labels is not None:
+            batch_dict["labels"] = torch.zeros(num_labels, dtype=torch.long)
+
+        return batch_dict
