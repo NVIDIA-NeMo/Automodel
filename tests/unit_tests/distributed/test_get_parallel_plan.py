@@ -30,6 +30,7 @@ from types import SimpleNamespace
 from typing import Dict
 
 import pytest
+from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
 
 # Function under test and collaborators
 import nemo_automodel.components.distributed.parallelizer as parallelizer
@@ -73,15 +74,15 @@ def _set_global_model_cls(monkeypatch, cls):
 
 # 1. Custom plan provided directly as *dict*
 def test_custom_dict_plan(monkeypatch):
-    plan = {"foo": "bar"}
+    plan = {"foo": ColwiseParallel()}
     _set_global_model_cls(monkeypatch, _DummyModel)  # irrelevant but required
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False, tp_shard_plan=plan)
-    assert result is plan  # identity check
+    assert result == plan
 
 
 # 2. Custom plan via *import path*
 def test_custom_plan_imports_dict(monkeypatch):
-    plan = {"baz": "qux"}
+    plan = {"baz": ColwiseParallel()}
 
     # Fake import path resolution
     def _fake_import_class_from_path(path):  # noqa: D401
@@ -92,11 +93,11 @@ def test_custom_plan_imports_dict(monkeypatch):
     _set_global_model_cls(monkeypatch, _DummyModel)
 
     result = _get_parallel_plan(_DummyModel(), tp_shard_plan="some.module.PLAN")
-    assert result is plan
+    assert result == plan
 
 
 def test_custom_plan_imports_function(monkeypatch):
-    plan = {"alpha": "omega"}
+    plan = {"alpha": RowwiseParallel()}
 
     def _dummy_fn():
         return plan
@@ -108,7 +109,7 @@ def test_custom_plan_imports_function(monkeypatch):
     _set_global_model_cls(monkeypatch, _DummyModel)
 
     result = _get_parallel_plan(_DummyModel(), tp_shard_plan="some.module.func")
-    assert result is plan
+    assert result == plan
 
 
 def test_custom_plan_invalid_path(monkeypatch):
