@@ -499,10 +499,39 @@ def get_check_model_inputs_decorator():
     In older versions, it was directly a decorator.
     In transformers >= 5.2.0, check_model_inputs was removed and split into
     ``merge_with_config_defaults`` and ``capture_outputs``.
+    In transformers >= 5.4.0, check_model_inputs was re-added as a deprecated
+    direct decorator wrapping ``merge_with_config_defaults`` only.
 
     Returns:
         Decorator function to validate model inputs.
     """
+    # transformers >= 5.4.0: check_model_inputs is back as a deprecated direct decorator
+    # wrapping merge_with_config_defaults only. We still combine with capture_outputs.
+    if is_transformers_min_version("5.4.0"):
+        try:
+            from transformers.utils.generic import merge_with_config_defaults
+            from transformers.utils.output_capturing import capture_outputs
+
+            def _combined_decorator(func):
+                return merge_with_config_defaults(capture_outputs(func))
+
+            return _combined_decorator
+        except ImportError:
+            pass
+
+    # transformers >= 5.2.0: check_model_inputs was removed and split into two decorators
+    if is_transformers_min_version("5.2.0"):
+        try:
+            from transformers.utils.generic import merge_with_config_defaults
+            from transformers.utils.output_capturing import capture_outputs
+
+            def _combined_decorator(func):
+                return merge_with_config_defaults(capture_outputs(func))
+
+            return _combined_decorator
+        except ImportError:
+            pass
+
     try:
         from transformers.utils.generic import check_model_inputs
 
@@ -512,18 +541,6 @@ def get_check_model_inputs_decorator():
         else:
             # Old API: check_model_inputs is directly a decorator
             return check_model_inputs
-    except ImportError:
-        pass
-
-    # transformers >= 5.2.0: check_model_inputs was split into two decorators
-    try:
-        from transformers.utils.generic import merge_with_config_defaults
-        from transformers.utils.output_capturing import capture_outputs
-
-        def _combined_decorator(func):
-            return merge_with_config_defaults(capture_outputs(func))
-
-        return _combined_decorator
     except ImportError:
         pass
 
