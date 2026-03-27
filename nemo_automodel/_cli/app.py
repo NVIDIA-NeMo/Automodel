@@ -204,6 +204,68 @@ def launch_with_slurm(args, job_conf_path, job_dir, slurm_config, extra_args=Non
     return submit_slurm_job(SlurmConfig(**slurm_config, command=command, chdir=repo_root), job_dir)
 
 
+def _parse_gpus_per_node(accelerators: str) -> int:
+    """Extract the GPU count from an accelerators string like 'T4:1' or 'A100:8'."""
+    parts = accelerators.split(":")
+    if len(parts) == 2:
+        try:
+            return int(parts[1])
+        except ValueError:
+            pass
+    return 1
+
+
+def launch_with_skypilot(args, job_conf_path, job_dir, skypilot_config, extra_args=None):
+    from nemo_automodel.components.launcher.skypilot.config import SkyPilotConfig
+    from nemo_automodel.components.launcher.skypilot.utils import REMOTE_CONFIG_PATH, submit_skypilot_job
+
+    # Determine GPUs per node from accelerators string, or explicit override.
+    accelerators = skypilot_config.get("accelerators", "T4:1")
+    gpus_per_node = skypilot_config.pop("gpus_per_node", None)
+    if gpus_per_node is None:
+        gpus_per_node = _parse_gpus_per_node(accelerators)
+
+    num_nodes = skypilot_config.get("num_nodes", 1)
+
+    if skypilot_config.get("job_name", "") == "":
+        skypilot_config["job_name"] = f"{args.domain}_{args.command}"
+
+    # Build the torchrun command that runs on the remote VM.
+    # ~/sky_workdir is where SkyPilot syncs the local workdir.
+    script_path = get_recipe_script_path(args.command, args.domain, "~/sky_workdir")
+
+    if num_nodes > 1:
+        run_parts = [
+            "PYTHONPATH=~/sky_workdir:$PYTHONPATH",
+            "torchrun",
+            f"--nproc_per_node={gpus_per_node}",
+            "--nnodes=$SKYPILOT_NUM_NODES",
+            "--node_rank=$SKYPILOT_NODE_RANK",
+            "--master_addr=$(echo $SKYPILOT_NODE_IPS | cut -d' ' -f1)",
+            "--master_port=13742",
+            "--rdzv_backend=c10d",
+            script_path,
+            "-c",
+            REMOTE_CONFIG_PATH,
+        ]
+    else:
+        run_parts = [
+            "PYTHONPATH=~/sky_workdir:$PYTHONPATH",
+            "torchrun",
+            f"--nproc_per_node={gpus_per_node}",
+            script_path,
+            "-c",
+            REMOTE_CONFIG_PATH,
+        ]
+
+    if extra_args:
+        run_parts.extend(extra_args)
+
+    skypilot_config["command"] = " ".join(run_parts)
+
+    return submit_skypilot_job(SkyPilotConfig(**skypilot_config), job_dir)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """
     Builds a parser with automodel's app options
@@ -335,6 +397,18 @@ def main():
             yaml.dump(config, fp, default_flow_style=False, sort_keys=False)
         logging.info(f"Logging Slurm job in: {job_dir}")
         return launch_with_slurm(args, job_conf_path, job_dir, slurm_config, extra_args=extra)
+    elif skypilot_config := config.pop("skypilot", None):
+        logging.info("Launching job via SkyPilot")
+        job_dir = os.path.join(
+            skypilot_config.pop("job_dir", os.path.join(os.getcwd(), "skypilot_jobs")), str(int(time.time()))
+        )
+        os.makedirs(job_dir, exist_ok=True)
+
+        job_conf_path = os.path.join(job_dir, "job_config.yaml")
+        with open(job_conf_path, "w") as fp:
+            yaml.dump(config, fp, default_flow_style=False, sort_keys=False)
+        logging.info(f"Logging SkyPilot job in: {job_dir}")
+        return launch_with_skypilot(args, job_conf_path, job_dir, skypilot_config, extra_args=extra)
     elif "k8s" in config or "kubernetes" in config:
         # launch job on kubernetes.
         raise NotImplementedError("kubernetes support is pending")

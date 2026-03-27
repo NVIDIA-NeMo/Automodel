@@ -281,6 +281,14 @@ guides/diffusion/dataset.md
 
 ::::{toctree}
 :hidden:
+:caption: Job Launchers
+
+launcher/skypilot.md
+::::
+
+
+::::{toctree}
+:hidden:
 :caption: Development
 guides/checkpointing.md
 guides/gradient-checkpointing.md
