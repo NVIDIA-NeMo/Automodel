@@ -105,6 +105,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.nemotron_v3.model", "NemotronHForCausalLM"),
         ),
         (
+            "NemotronFlashForCausalLM",
+            ("nemo_automodel.components.models.nemotron_flash.model", "NemotronFlashForCausalLM"),
+        ),
+        (
             "NemotronParseForConditionalGeneration",
             ("nemo_automodel.components.models.nemotron_parse.model", "NemotronParseForConditionalGeneration"),
         ),
@@ -151,6 +155,10 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
+    "nemotron_flash": (
+        "nemo_automodel.components.models.nemotron_flash.configuration",
+        "NemotronFlashConfig",
+    ),
 }
 
 

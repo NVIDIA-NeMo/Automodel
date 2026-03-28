@@ -12,19 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import types
 from typing import List, Tuple
 
-import pytest
 import torch
 import torch.nn as nn
 
 from nemo_automodel.components.distributed.parallelizer_utils import (
-    iter_maximal_uniform_dtype_subtrees,
-    _group_params_by_dtype,
-    _get_module_from_path,
     _fully_shard,
+    _get_module_from_path,
+    _group_params_by_dtype,
     fully_shard_by_dtype,
+    iter_maximal_uniform_dtype_subtrees,
 )
 
 
@@ -67,15 +65,11 @@ class ToyModel(nn.Module):
             self.c = nn.Linear(4, 4, bias=False).to(c_dtype)
 
 
-def _collect_return_paths_items(
-    items: List[Tuple[str, nn.Module, torch.dtype]]
-) -> dict[str, torch.dtype]:
+def _collect_return_paths_items(items: List[Tuple[str, nn.Module, torch.dtype]]) -> dict[str, torch.dtype]:
     return {path: dtype for path, _mod, dtype in items}
 
 
-def _collect_return_modules_items(
-    items: List[Tuple[nn.Module, torch.dtype]]
-) -> dict[int, torch.dtype]:
+def _collect_return_modules_items(items: List[Tuple[nn.Module, torch.dtype]]) -> dict[int, torch.dtype]:
     return {id(mod): dtype for mod, dtype in items}
 
 
@@ -167,7 +161,7 @@ def test_get_module_from_path():
 def test__fully_shard_calls_for_single_module(monkeypatch):
     calls: list[tuple[nn.Module, object, object, object]] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, **kwargs):
         calls.append((mod, mesh, mp_policy, offload_policy))
 
     # Monkeypatch the symbol inside the utils module
@@ -187,7 +181,7 @@ def test__fully_shard_calls_for_single_module(monkeypatch):
 def test__fully_shard_calls_for_modulelist(monkeypatch):
     calls: list[nn.Module] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, **kwargs):
         calls.append(mod)
 
     monkeypatch.setattr(
@@ -208,10 +202,10 @@ def test_fully_shard_by_dtype_no_params(monkeypatch):
     fully_calls: list[nn.Module] = []
     sub_calls: list[nn.Module] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, **kwargs):
         fully_calls.append(mod)
 
-    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, **kwargs):
         sub_calls.append(mod)
 
     monkeypatch.setattr(
@@ -233,6 +227,7 @@ def test_combined_projection_adapter_gate_up_bias_paths_tensor_only():
     This exercises the renamed helper calls in those code paths.
     """
     import types
+
     import nemo_automodel.components.models.common.combined_projection.state_dict_adapter as mod
 
     cfg = types.SimpleNamespace(
@@ -264,10 +259,10 @@ def test_fully_shard_by_dtype_single_dtype(monkeypatch):
     fully_calls: list[nn.Module] = []
     sub_calls: list[nn.Module] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, **kwargs):
         fully_calls.append(mod)
 
-    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, **kwargs):
         sub_calls.append(mod)
 
     monkeypatch.setattr(
@@ -289,10 +284,10 @@ def test_fully_shard_by_dtype_two_dtypes(monkeypatch):
     fully_calls: list[nn.Module] = []
     sub_calls: list[nn.Module] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, **kwargs):
         fully_calls.append(mod)
 
-    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, **kwargs):
         sub_calls.append(mod)
 
     monkeypatch.setattr(
@@ -316,10 +311,10 @@ def test_fully_shard_by_dtype_three_dtypes(monkeypatch):
     fully_calls: list[nn.Module] = []
     sub_calls: list[nn.Module] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, **kwargs):
         fully_calls.append(mod)
 
-    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, **kwargs):
         sub_calls.append(mod)
 
     monkeypatch.setattr(
@@ -343,5 +338,3 @@ def test_fully_shard_by_dtype_three_dtypes(monkeypatch):
     # Expect all three subtrees to be individually sharded
     # Note: the 'b' subtree should be sharded as a whole since it is uniform float16
     assert set(sub_calls) == {model.a, model.b, model.c}
-
-

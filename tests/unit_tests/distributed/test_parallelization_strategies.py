@@ -142,6 +142,13 @@ def mock_distributed_env(monkeypatch):
         "nemo_automodel.components.distributed.parallelizer.fully_shard", fully_shard_mock, raising=False
     )
 
+    fully_shard_by_dtype_mock = MagicMock(side_effect=lambda model, **kwargs: model)
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype",
+        fully_shard_by_dtype_mock,
+        raising=False,
+    )
+
     # Mock tensor parallel functions
     parallelize_module_mock = MagicMock()
     monkeypatch.setattr(
@@ -182,6 +189,7 @@ def mock_distributed_env(monkeypatch):
 
     return {
         "fully_shard": fully_shard_mock,
+        "fully_shard_by_dtype": fully_shard_by_dtype_mock,
         "parallelize_module": parallelize_module_mock,
         "checkpoint_wrapper": checkpoint_wrapper_mock,
         "apply_fsdp": apply_fsdp_mock,
@@ -291,12 +299,15 @@ class TestDefaultParallelizationStrategy:
         """Test parallelization with activation checkpointing enabled."""
         mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh = mock_device_mesh
 
-        # Mock layers with all the attributes that get checkpointed
-        mock_layer = MagicMock()
+        # Mock a layer with all attributes checkpointed by the shared default path.
+        mock_layer = nn.Module()
         mock_layer.mlp = nn.Linear(10, 10)
         mock_layer.self_attn = MagicMock()
         mock_layer.input_layernorm = MagicMock()
         mock_layer.post_attention_layernorm = MagicMock()
+        mock_layer.mamba = MagicMock()
+        mock_layer.gla = MagicMock()
+        mock_layer.pre_ffn_layernorm = MagicMock()
         mock_distributed_env["extract_layers"].return_value = [mock_layer]
 
         model = MockModel()
@@ -317,8 +328,41 @@ class TestDefaultParallelizationStrategy:
             call(mock_layer.self_attn),
             call(mock_layer.input_layernorm),
             call(mock_layer.post_attention_layernorm),
+            call(mock_layer.mamba),
+            call(mock_layer.gla),
+            call(mock_layer.pre_ffn_layernorm),
         ]
         checkpoint_wrapper_mock.assert_has_calls(expected_calls, any_order=False)
+
+    def test_parallelize_uses_dtype_aware_sharding_for_extracted_layers(
+        self, strategy, mock_device_mesh, mock_distributed_env
+    ):
+        """Test that extracted layers use fully_shard_by_dtype in the default path."""
+        mesh, _, dp_shard_mesh, _ = mock_device_mesh
+        layer0 = nn.Linear(10, 10)
+        layer1 = nn.Linear(10, 10)
+        mock_distributed_env["extract_layers"].return_value = [layer0, layer1]
+
+        model = MockModel()
+
+        strategy.parallelize(
+            model=model,
+            device_mesh=mesh,
+            sequence_parallel=False,
+            activation_checkpointing=False,
+        )
+
+        mock_distributed_env["apply_fsdp"].assert_not_called()
+        sharding_calls = mock_distributed_env["fully_shard_by_dtype"].call_args_list
+        assert len(sharding_calls) == 2
+
+        assert sharding_calls[0].args[0] is layer0
+        assert sharding_calls[0].kwargs["mesh"] is dp_shard_mesh
+        assert sharding_calls[0].kwargs["reshard_after_forward"] is True
+
+        assert sharding_calls[1].args[0] is layer1
+        assert sharding_calls[1].kwargs["mesh"] is dp_shard_mesh
+        assert sharding_calls[1].kwargs["reshard_after_forward"] is False
 
     def test_parallelize_with_custom_mesh_names(self, strategy, mock_device_mesh, mock_distributed_env):
         """Test parallelization with custom mesh names."""
@@ -497,6 +541,10 @@ class TestStrategyRegistry:
         assert "NemotronHForCausalLM" in PARALLELIZATION_STRATEGIES
         assert isinstance(PARALLELIZATION_STRATEGIES["NemotronHForCausalLM"], NemotronHParallelizationStrategy)
 
+    def test_registry_does_not_contain_nemotron_flash_strategy(self):
+        """Test that Nemotron Flash now uses the shared default strategy."""
+        assert "NemotronFlashForCausalLM" not in PARALLELIZATION_STRATEGIES
+
     def test_default_strategy_exists(self):
         """Test that the default strategy exists."""
         assert _DEFAULT_STRATEGY is not None
@@ -508,6 +556,14 @@ class TestStrategyRegistry:
         strategy = get_parallelization_strategy(model)
 
         assert isinstance(strategy, NemotronHParallelizationStrategy)
+
+    def test_get_parallelization_strategy_for_nemotron_flash(self):
+        """Test strategy selection for Nemotron Flash model."""
+        model = MockModel("NemotronFlashForCausalLM")
+        strategy = get_parallelization_strategy(model)
+
+        assert isinstance(strategy, DefaultParallelizationStrategy)
+        assert strategy is _DEFAULT_STRATEGY
 
     def test_get_parallelization_strategy_for_regular_model(self):
         """Test strategy selection for regular models."""

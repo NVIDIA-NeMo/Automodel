@@ -36,7 +36,6 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  force_hf: true
   pretrained_model_name_or_path: nvidia/Nemotron-Flash-1B
   trust_remote_code: true
   config:
@@ -63,12 +62,12 @@ dataset:
   split: train
 
 packed_sequence:
-  packed_sequence_size: 0
+  packed_sequence_size: 1024
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: false
+  shuffle: true
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
