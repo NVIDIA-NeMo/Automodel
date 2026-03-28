@@ -103,11 +103,12 @@ def _dequantize_state_dict(state_dict: dict[str, Any], dtype: torch.dtype) -> di
                 if weight_is_dtensor:
                     from torch.distributed._tensor import Shard
 
-                    for placement in weight.placements:
+                    for mesh_idx, placement in enumerate(weight.placements):
                         if isinstance(placement, Shard) and placement.dim == 0:
-                            rank_in_ep = weight.device_mesh.get_local_rank()
+                            # Use the mesh dimension that corresponds to this Shard placement
+                            rank_in_ep = weight.device_mesh.get_local_rank(mesh_idx)
                             n_total = scale_local.shape[0]
-                            chunk_size = n_total // weight.device_mesh.size()
+                            chunk_size = n_total // weight.device_mesh.size(mesh_idx)
                             start = rank_in_ep * chunk_size
                             scale_local = scale_local[start : start + n_local]
                             break
