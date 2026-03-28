@@ -13,14 +13,11 @@
 # limitations under the License.
 
 # To run this recipe, please use the following command:
-# python examples/biencoder/finetune.py --config examples/biencoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml
+# python examples/biencoder/finetune.py --config examples/biencoder/llama_nemotron_embed_1b_v2_biencoder.yaml
 # Or with torchrun for multi-GPU:
-# torchrun --nproc-per-node=8 examples/biencoder/finetune.py --config examples/biencoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml
+# torchrun --nproc-per-node=8 examples/biencoder/finetune.py --config examples/biencoder/llama_nemotron_embed_1b_v2_biencoder.yaml
 
-seed: 125
-
-train_n_passages: 5
-temperature: 0.02
+seed: 42
 
 step_scheduler:
   global_batch_size: 128
@@ -34,19 +31,32 @@ dist_env:
   timeout_minutes: 30
 
 model:
-  _target_: nemo_automodel.NeMoAutoModelBiencoder.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
+  _target_: nemo_automodel.components.models.biencoder.NeMoAutoModelBiencoder.from_pretrained
+  pretrained_model_name_or_path: nvidia/llama-nemotron-embed-1b-v2
+  share_encoder: true
+  add_linear_pooler: false
+  do_gradient_checkpointing: false
+  train_n_passages: 5
   pooling: avg
+  l2_normalize: true
+  t: 0.02
+  use_liger_kernel: true
+  use_sdpa_patching: true
   torch_dtype: bfloat16
 
 tokenizer:
-  _target_: transformers.AutoTokenizer.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
+  _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: nvidia/llama-nemotron-embed-1b-v2
+  # Many Llama-based embedding models expect BOS but not EOS.
+  # If you see a quality regression, verify these in the model card.
+  add_bos_token: true
+  add_eos_token: false
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   dataset:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
+    # Example training data (download via examples/biencoder/llama_embed_nemotron_8b/data_preparation.py)
     data_dir_list:
       - ./embed_nemotron_dataset_v1/EmotionClassification/EmotionClassification.json
       - ./embed_nemotron_dataset_v1/FEVER/FEVER.json
@@ -64,7 +74,7 @@ dataloader:
       - ./embed_nemotron_dataset_v1/TriviaQA/TriviaQA.json
     data_type: train
     train_n_passages: 5
-    seed: 125
+    seed: 42
     do_shuffle: true
     use_dataset_instruction: true
   collate_fn:
@@ -91,14 +101,15 @@ lr_scheduler:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: ./output/llama_embed_nemotron_8b
+  checkpoint_dir: ./output/llama_nemotron_embed_1b_v2
   model_save_format: safetensors
   save_consolidated: true
 
 distributed:
-  strategy: fsdp2
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
+  dp_replicate_size: 1
   tp_size: 1
   cp_size: 1
-
   sequence_parallel: false
+
