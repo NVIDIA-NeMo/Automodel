@@ -34,11 +34,11 @@ def _make_missing(name: str):
 
 try:
     from transformers.modeling_outputs import BaseModelOutputWithPast
+    from transformers.models.gemma4 import modeling_gemma4 as _g4
     from transformers.models.gemma4.configuration_gemma4 import (
         Gemma4Config,
         Gemma4TextConfig,
     )
-    from transformers.models.gemma4 import modeling_gemma4 as _g4
 
     Gemma4RMSNorm = _g4.Gemma4RMSNorm
     Gemma4TextModel = _g4.Gemma4TextModel

@@ -506,7 +506,7 @@ def get_check_model_inputs_decorator():
     try:
         from transformers.utils.generic import check_model_inputs
 
-        if is_transformers_min_version("4.57.3"): # transformers >= 4.57.3
+        if is_transformers_min_version("4.57.3"):  # transformers >= 4.57.3
             try:
                 # 4.57.3 – 5.3.x API: check_model_inputs() is a factory
                 return check_model_inputs()
