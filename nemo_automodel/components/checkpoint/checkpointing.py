@@ -477,17 +477,16 @@ class Checkpointer:
         to_empty_parameters_only(model, device=device)
 
         # to_empty_parameters_only only materializes parameters, not buffers.
-        # Buffers (e.g. RoPE inv_freq) may still be on meta device.  Move them
-        # to *device* with uninitialized storage so that the subsequent
-        # initialize_weights() call can overwrite them with proper values
-        # (HF's _init_weights recomputes non-persistent buffers from config).
-        # Without this, meta buffers would survive until a later model.to_empty()
-        # call, which fills them with recycled GPU memory — values that may
-        # differ between successive model builds in the same process.
+        # Buffers (e.g. RoPE inv_freq) may be on meta device or on CPU
+        # (init_empty_weights only patches register_parameter, not
+        # register_buffer, so buffers default to CPU).  Move any buffer
+        # that isn't already on *device* so that the subsequent
+        # initialize_weights() call and set_model_state_dict (which
+        # requires a single device) work correctly.
         for module in model.modules():
             for key in list(module._buffers):
                 buf = module._buffers[key]
-                if buf is not None and buf.device.type == "meta":
+                if buf is not None and buf.device != device:
                     module._buffers[key] = torch.empty_like(buf, device=device)
 
         # HF models set _is_hf_initialized to True after initialization.
@@ -515,7 +514,13 @@ class Checkpointer:
             and hasattr(model, "backbone")  # is HF remote code
         )
         skip_initialize_weights = (
-            model_class in ["Gemma3ForConditionalGeneration", "Gemma3ForCausalLM"]
+            model_class
+            in [
+                "Gemma3ForConditionalGeneration",
+                "Gemma3ForCausalLM",
+                "Gemma4ForConditionalGeneration",
+                "Gemma4ForCausalLM",
+            ]
             or is_nemotron_v2
             or is_nemotron_v3_hf
         )

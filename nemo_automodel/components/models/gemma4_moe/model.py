@@ -38,15 +38,18 @@ try:
         Gemma4Config,
         Gemma4TextConfig,
     )
-    from transformers.models.gemma4.modeling_gemma4 import (
-        Gemma4Attention,
-        Gemma4DecoderLayer,
-        Gemma4MLP,
-        Gemma4RMSNorm,
-        Gemma4RotaryEmbedding,
-        Gemma4TextModel,
-        Gemma4TextScaledWordEmbedding,
-    )
+    from transformers.models.gemma4 import modeling_gemma4 as _g4
+
+    Gemma4RMSNorm = _g4.Gemma4RMSNorm
+    Gemma4TextModel = _g4.Gemma4TextModel
+    Gemma4TextScaledWordEmbedding = _g4.Gemma4TextScaledWordEmbedding
+
+    # These classes were renamed in transformers 5.5 (Gemma4X → Gemma4TextX)
+    # TODO have only transformers 5.5 version of these classes ?
+    Gemma4Attention = getattr(_g4, "Gemma4TextAttention", None) or _g4.Gemma4Attention
+    Gemma4DecoderLayer = getattr(_g4, "Gemma4TextDecoderLayer", None) or _g4.Gemma4DecoderLayer
+    Gemma4MLP = getattr(_g4, "Gemma4TextMLP", None) or _g4.Gemma4MLP
+    Gemma4RotaryEmbedding = getattr(_g4, "Gemma4TextRotaryEmbedding", None) or _g4.Gemma4RotaryEmbedding
     from transformers.models.gemma4.modeling_gemma4 import (
         Gemma4ForConditionalGeneration as HFGemma4ForConditionalGeneration,
     )
@@ -55,7 +58,7 @@ try:
     )
 
     _GEMMA4_HF_AVAILABLE = True
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError, AttributeError):
     _GEMMA4_HF_AVAILABLE = False
     Gemma4Config = _make_missing("Gemma4Config")
     Gemma4TextConfig = _make_missing("Gemma4TextConfig")
