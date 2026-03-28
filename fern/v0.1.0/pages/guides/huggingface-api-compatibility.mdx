@@ -1,0 +1,165 @@
+---
+title: "🤗 Hugging Face Transformers API Compatibility"
+description: ""
+---
+
+NeMo AutoModel is built to work with the 🤗 Hugging Face ecosystem.
+In practice, compatibility comes in two layers:
+
+- **API compatibility**: for many workflows, you can keep your existing `transformers` code and swap in NeMo AutoModel “drop-in” wrappers (`NeMoAutoModel*`, `NeMoAutoTokenizer`) with minimal changes.
+- **Artifact compatibility**: NeMo AutoModel produces **Hugging Face-compatible checkpoints** (config + tokenizer + safetensors) that can be loaded by Hugging Face Transformers and downstream tools (vLLM, SGLang, etc.).
+
+This page summarizes what "HF compatibility" means in NeMo AutoModel, calls out differences you should be aware of, and provides side-by-side examples.
+
+## Transformers Version Compatibility: v4 and v5
+
+### Transformers v4 (Current Default)
+
+NeMo AutoModel currently pins Hugging Face Transformers to the **v4** major line (see `pyproject.toml`, currently `transformers<=4.57.5`).
+
+This means:
+
+- NeMo AutoModel is primarily tested and released against **Transformers v4.x**
+- New model releases on the Hugging Face Hub that require a newer Transformers may require upgrading NeMo AutoModel as well (similar to upgrading `transformers` directly)
+
+### Transformers v5 (Forward-Compatibility and Checkpoint Interoperability)
+
+Transformers **v5** introduces breaking changes across some internal utilities (e.g., cache APIs) and adds/reshapes tokenizer backends for some model families.
+
+NeMo AutoModel addresses this in two complementary ways:
+
+- **Forward-compatibility shims**: NeMo AutoModel includes small compatibility patches to smooth over known API differences across Transformers releases (for example, cache utility method names). The built-in recipes apply these patches automatically.
+- **Backports where needed**: for some model families, NeMo AutoModel may vendor/backport Hugging Face code that originated in the v5 development line so users can run those models while staying on a pinned v4 dependency.
+- **Stable artifact format**: NeMo AutoModel checkpoints are written in Hugging Face-compatible `save_pretrained` layouts (config + tokenizer + safetensors). These artifacts are designed to be loadable by both Transformers **v4** and **v5** (and non-Transformers tools that consume HF-style model repos).
+
+<Note>
+If you are running Transformers v5 in another environment, you can still use NeMo AutoModel-produced consolidated checkpoints with Transformers' standard loading APIs. For details on the checkpoint layouts, see [checkpointing](/checkpointing).
+</Note>
+
+## Drop-In Compatibility and Key Differences
+
+### Drop-In (Same Mental Model as Transformers)
+
+- **Load by model ID or local path**: `from_pretrained(...)`
+- **Standard HF config objects**: `AutoConfig` / `config.json`
+- **Tokenizers**: standard `PreTrainedTokenizerBase` behavior, including `__call__` to create tensors and `decode`/`batch_decode`
+- **Generation**: `model.generate(...)` and the usual generation kwargs
+
+### Differences (Where NeMo AutoModel Adds Value or Has Constraints)
+
+- **Performance features**: NeMo AutoModel can automatically apply optional kernel patches/optimizations (e.g., SDPA selection, Liger kernels, DeepEP, etc.) while keeping the public model API the same.
+- **Distributed training stack**: NeMo AutoModel's recipes/CLI are designed for multi-GPU/multi-node fine-tuning with PyTorch-native distributed features (FSDP2, pipeline parallelism, etc.).
+- **CUDA expectation**: NeMo AutoModel's `NeMoAutoModel*` wrappers are primarily optimized for NVIDIA GPU workflows, and offer support for CPU workflows as well.
+
+<Info>
+`NeMoAutoModelForCausalLM.from_pretrained(...)` currently assumes CUDA is available (it uses `torch.cuda.current_device()` internally). If you need CPU-only inference, use Hugging Face `transformers` directly.
+</Info>
+
+## API Mapping (Transformers and NeMo AutoModel)
+
+### API Name Mapping
+
+| 🤗 Hugging Face (`transformers`) | NeMo AutoModel (`nemo_automodel`) | Status |
+|--------------------------------|----------------------------------|--------|
+| `transformers.AutoModelForCausalLM` | `nemo_automodel.NeMoAutoModelForCausalLM` | ✅ |
+| `transformers.AutoModelForImageTextToText` | `nemo_automodel.NeMoAutoModelForImageTextToText` | ✅ |
+| `transformers.AutoModelForSequenceClassification` | `nemo_automodel.NeMoAutoModelForSequenceClassification` | ✅ |
+| `transformers.AutoModelForTextToWaveform` | `nemo_automodel.NeMoAutoModelForTextToWaveform` | ✅ |
+| `transformers.AutoTokenizer.from_pretrained(...)` | `nemo_automodel.NeMoAutoTokenizer.from_pretrained(...)` | ✅ |
+| `model.generate(...)` | `model.generate(...)` | 🚧 |
+| `model.save_pretrained(path)` | `model.save_pretrained(path, checkpointer=...)` | 🚧 |
+
+## Side-by-Side Examples
+
+### Load a Model and Tokenizer (Transformers v4)
+
+**🤗 Hugging Face (`transformers`):**
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model_id = "gpt2"
+
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16,
+)
+```
+
+**NeMo AutoModel (`nemo_automodel`):**
+
+```python
+import torch
+from nemo_automodel import NeMoAutoModelForCausalLM, NeMoAutoTokenizer
+
+model_id = "gpt2"
+
+tokenizer = NeMoAutoTokenizer.from_pretrained(model_id)
+model = NeMoAutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16,
+)
+```
+
+### Text Generation
+
+This snippet assumes you already have a `model` and `tokenizer` (see the loading snippet above).
+
+**🤗 Hugging Face (`transformers`):**
+
+```python
+import torch
+
+prompt = "Write a haiku about GPU kernels."
+inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+with torch.inference_mode():
+    out = model.generate(**inputs, max_new_tokens=64)
+
+print(tokenizer.decode(out[0], skip_special_tokens=True))
+```
+
+**NeMo AutoModel (`nemo_automodel`):**
+
+```python
+import torch
+
+prompt = "Write a haiku about GPU kernels."
+inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+with torch.inference_mode():
+    out = model.generate(**inputs, max_new_tokens=64)
+
+print(tokenizer.decode(out[0], skip_special_tokens=True))
+```
+
+### Tokenizers (Transformers vs NeMo AutoModel)
+
+NeMo AutoModel provides `NeMoAutoTokenizer` as a Transformers-like auto-tokenizer with a small registry for specialized backends (and a safe fallback when no specialization is needed).
+
+**🤗 Hugging Face (`transformers`):**
+
+```python
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
+```
+
+**NeMo AutoModel (`nemo_automodel`):**
+
+```python
+from nemo_automodel import NeMoAutoTokenizer
+
+tok = NeMoAutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
+```
+
+## Checkpoints: Save in NeMo AutoModel, Load Everywhere
+
+NeMo AutoModel training recipes write checkpoints in Hugging Face-compatible layouts, including consolidated safetensors that you can load directly with Transformers:
+
+- See [checkpointing](/checkpointing) for checkpoint formats and example directory layouts.
+- See [model coverage](/../model-coverage/overview) for notes on how model support depends on the pinned Transformers version.
+
+If your goal is: **train/fine-tune in NeMo AutoModel → deploy in the HF ecosystem**, the recommended workflow is to enable consolidated safetensors checkpoints and then load them with the standard HF APIs or downstream inference engines.
