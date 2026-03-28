@@ -408,6 +408,95 @@ def _filter_kwargs_for_init(model_cls, kwargs: dict) -> dict:
     return {k: v for k, v in kwargs.items() if k in allowed}
 
 
+def initialize_custom_model_from_config(model, torch_dtype="auto"):
+    """Materialize and initialize a custom model created via from_config.
+
+    This must be called OUTSIDE the ``no_init_weights() + init_empty_weights()``
+    context so that ``register_parameter`` works normally during weight init.
+
+    Under deferred-init (no_init_weights + init_empty_weights + FSDP2 to_empty),
+    reset_parameters() is suppressed and parameters are left as uninitialized
+    garbage memory. This function provides a two-phase init:
+
+        1. **Global fallback** — unconditionally initializes ALL parameters to
+           safe defaults (normal for weights, zeros for biases, ones for norms).
+           This ensures no garbage memory survives, even for parameters that
+           the architecture-specific init does not cover (e.g. Mamba norm.weight).
+
+        2. **Architecture-specific init** — calls ``model.initialize_weights()``
+           which overwrites the fallback with proper values where needed
+           (e.g. dt_bias inverse-softplus, A_log log-arange, residual rescaling).
+
+    Args:
+        model: Custom model instance (may have meta-device parameters).
+        torch_dtype: Target dtype (used to set default dtype during init).
+    """
+    torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch.bfloat16
+
+    with local_torch_dtype(torch_dtype, type(model).__name__):
+        # 1. Materialize meta tensors onto physical GPU memory
+        has_meta = any(p.is_meta for p in model.parameters())
+        if has_meta:
+            local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+            model.to_empty(device=local_device)
+
+        # 2. Global fallback: unconditionally init ALL params to safe defaults.
+        # This is critical because initialize_weights() only covers a subset of
+        # parameters — anything it misses (e.g. Mamba norm.weight) would remain
+        # as uninitialized garbage from to_empty(), causing NaN on first forward.
+        for name, p in model.named_parameters():
+            if p.is_meta:
+                continue
+            with torch.no_grad():
+                tensor = p.to_local() if hasattr(p, "to_local") else p
+                if "A_log" in name:
+                    tensor.copy_(torch.log(torch.arange(1, tensor.shape[0] + 1, device=tensor.device)))
+                elif "D" in name or "norm" in name.lower():
+                    tensor.fill_(1.0)
+                elif "bias" in name:
+                    tensor.zero_()
+                else:
+                    tensor.normal_(mean=0.0, std=0.02)
+
+        for name, buf in model.named_buffers():
+            if buf.is_meta:
+                continue
+            with torch.no_grad():
+                tensor = buf.to_local() if hasattr(buf, "to_local") else buf
+                if tensor.dtype.is_floating_point or tensor.dtype.is_complex:
+                    tensor.zero_()
+                else:
+                    tensor.fill_(0)
+
+        # 3. Architecture-specific init (overwrites the fallback where appropriate)
+        if hasattr(model, "initialize_weights"):
+            model.initialize_weights()
+        elif hasattr(model, "init_weights"):
+            model.init_weights()
+
+        # Verify no bad values after init
+        nan_params = []
+        inf_params = []
+        meta_params = []
+        for name, p in model.named_parameters():
+            t = p.to_local() if hasattr(p, "to_local") else p
+            if t.device.type == "meta":
+                meta_params.append(name)
+                continue
+            if torch.isnan(t).any():
+                nan_params.append(name)
+            if torch.isinf(t).any():
+                inf_params.append(name)
+        if meta_params:
+            logger.warning(f"[INIT] Still on meta device ({len(meta_params)}): {meta_params[:10]}")
+        if nan_params:
+            logger.warning(f"[INIT] NaN in params: {nan_params}")
+        if inf_params:
+            logger.warning(f"[INIT] Inf in params: {inf_params}")
+        if not nan_params and not inf_params and not meta_params:
+            logger.info("[INIT] All parameters finite after initialization")
+
+
 def resolve_sdpa_method(
     sdpa_method: list | None = None,
     device_mesh=None,
