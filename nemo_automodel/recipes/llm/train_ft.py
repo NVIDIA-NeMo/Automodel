@@ -1285,6 +1285,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
+        # For packed sequences, precompute cu_seqlens from position_ids so flash attention
+        # uses flash_varlen_fn with document isolation instead of standard causal attention.
+        # This prevents cross-document attention within a pack for batch_size > 1
+        # (TransformersKwargs includes cu_seq_lens_q/k so they propagate to flash attn).
+        if "position_ids" in batch and "seq_lens" in batch:
+            from transformers.modeling_flash_attention_utils import prepare_fa_kwargs_from_position_ids
+
+            (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
+                batch["position_ids"]
+            )
+            batch["cu_seq_lens_q"] = cu_seq_lens_q
+            batch["cu_seq_lens_k"] = cu_seq_lens_k
+            batch["max_length_q"] = max_length_q
+            batch["max_length_k"] = max_length_k
+
         if self.pp_enabled:
             with train_ctx(), fp8_ctx:
                 losses = [] if self.pp.info.has_last_stage else None

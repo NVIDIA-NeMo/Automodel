@@ -337,6 +337,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 with self.timers("optimizer", log_level=2):
                     for opt in self.optimizer:
                         opt.step()
+                    if self.lr_scheduler is not None:
+                        for scheduler in self.lr_scheduler:
+                            scheduler.step(1)
                     logger.debug("Optimizer step")
 
             # Synchronize num_label_tokens across DP ranks
