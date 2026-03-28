@@ -37,6 +37,7 @@ model:
   torch_dtype: torch.bfloat16
   use_liger_kernel: false
   attn_implementation: eager
+  trust_remote_code: true
 
 checkpoint:
   enabled: true

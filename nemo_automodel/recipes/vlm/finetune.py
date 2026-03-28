@@ -235,7 +235,14 @@ def build_loss_fn(cfg_loss):
 
 
 def build_dataloader(
-    cfg_ds, cfg_dl, pretrained_model_name_or_path, cfg_processor, device_mesh, seed, local_batch_size
+    cfg_ds,
+    cfg_dl,
+    pretrained_model_name_or_path,
+    cfg_processor,
+    device_mesh,
+    seed,
+    local_batch_size,
+    trust_remote_code=False,
 ) -> tuple[DataLoader, ProcessorMixin]:
     """Build a DataLoader for the VLM dataset.
 
@@ -247,6 +254,7 @@ def build_dataloader(
         device_mesh: Device mesh for distributed training.
         seed: Random seed.
         local_batch_size: Local batch size.
+        trust_remote_code: Whether to trust remote code when loading the processor.
 
     Returns:
         The instantiated DataLoader and processor.
@@ -273,7 +281,11 @@ def build_dataloader(
             # If no processor was instantiated, try AutoProcessor
             if processor is None:
                 try:
-                    processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
+                    processor = AutoProcessor.from_pretrained(
+                        pretrained_model_name_or_path,
+                        trust_remote_code=trust_remote_code,
+                        **processor_kwargs,
+                    )
                 except Exception as e:
                     # Some models do not provide an AutoProcessor
                     processor = None
@@ -617,6 +629,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             device_mesh=self.device_mesh,
             seed=self.cfg.get("seed", 42),
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+            trust_remote_code=self.cfg.get("model.trust_remote_code", False),
         )
 
         # Build validation dataloader if the config provides it
@@ -630,6 +643,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 device_mesh=self.device_mesh,
                 seed=self.cfg.get("seed", 42),
                 local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+                trust_remote_code=self.cfg.get("model.trust_remote_code", False),
             )
 
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
