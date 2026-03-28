@@ -119,9 +119,9 @@ def get_model_config_and_attention(model_type, device):
     if model_type == "qwen3_moe":
         from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-        from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention
-        from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding
         from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding
+        from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention
 
         config = Qwen3MoeConfig(
             vocab_size=256,
@@ -169,12 +169,12 @@ def get_model_config_and_attention(model_type, device):
     elif model_type == "deepseek_v3":
         from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
+        from nemo_automodel.components.models.common import BackendConfig
         from nemo_automodel.components.models.deepseek_v3.layers import MLA
         from nemo_automodel.components.models.deepseek_v3.rope_utils import (
-            precompute_freqs_cis,
             freqs_cis_from_position_ids,
+            precompute_freqs_cis,
         )
-        from nemo_automodel.components.models.common import BackendConfig
 
         config = DeepseekV3Config(
             vocab_size=256,
@@ -312,6 +312,7 @@ def run_test(model_type):
 
     # ===== Test: CP=2 (context parallelism enabled) =====
     from torch.distributed.device_mesh import init_device_mesh
+
     from nemo_automodel.components.moe.parallelizer import apply_cp
 
     cp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))
@@ -429,7 +430,7 @@ def run_test(model_type):
         print(f"Output shape: CP={output_with_cp_full.shape}, Baseline={output_baseline.shape}")
         print(f"Output diff - mean: {output_diff.mean():.6f}, max: {output_diff.max():.6f}, std: {output_diff.std():.6f}")
         print(f"Output relative diff - mean: {(output_diff / (output_baseline.abs() + 1e-8)).mean():.6f}")
-        print(f"\nGradient statistics:")
+        print("\nGradient statistics:")
         print(f"  Baseline - min: {grad_baseline.abs().min():.6f}, max: {grad_baseline.abs().max():.6f}, mean: {grad_baseline.abs().mean():.6f}")
         print(f"  CP       - min: {grad_with_cp_full.abs().min():.6f}, max: {grad_with_cp_full.abs().max():.6f}, mean: {grad_with_cp_full.abs().mean():.6f}")
         print(f"Grad diff - mean: {grad_diff.mean():.6f}, max: {grad_diff.max():.6f}, std: {grad_diff.std():.6f}")
@@ -452,14 +453,14 @@ def run_test(model_type):
         )
 
         if rank == 0:
-            print(f"✓ Test PASSED: Forward outputs and gradients match between CP=1 and CP=2")
+            print("✓ Test PASSED: Forward outputs and gradients match between CP=1 and CP=2")
             print(f"{'='*70}\n")
         return 0
 
     except AssertionError as e:
         if rank == 0:
             print(f"✗ Test FAILED: {e}")
-            print(f"Note: Some numerical differences are expected with bfloat16 precision")
+            print("Note: Some numerical differences are expected with bfloat16 precision")
             print(f"{'='*70}\n")
         return 1
 
