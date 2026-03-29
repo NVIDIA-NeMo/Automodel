@@ -12,10 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Example recipe to finetune Qwen/Qwen3-VL-30B-A3B-Instruct with neat packing.
-# Uses greedy knapsack bin-packing for reduced padding waste.
-# Requires flash_attention_2 and a meta-dataset in ShareGPT format.
-#
 # To run this recipe:
 # torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py \
 #   --config examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_neat_packing.yaml
@@ -40,8 +36,6 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3-VL-30B-A3B-Instruct
   attn_implementation: flash_attention_2
-  # Note: backend.attn is not set here so the model uses attn_implementation
-  # (flash_attention_2) which is required for neat packing.
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     linear: te
@@ -79,7 +73,6 @@ packed_sequence:
   pack_size: 512
   packing_ratio: 0.9
   drop_long_samples: true
-  balance_media_tokens: true
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
