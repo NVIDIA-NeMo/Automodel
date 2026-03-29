@@ -68,26 +68,36 @@ class TestGetUnpadData:
 
 
 class TestPassthroughCreateCausalMask:
-    def test_returns_attention_mask_unchanged(self):
-        mask = torch.ones(2, 8)
+    def test_passthrough_4d_mask(self):
+        """4D masks (already block-causal from sdpa collater) are returned as-is."""
+        mask = torch.ones(2, 1, 8, 8)
         result = _passthrough_create_causal_mask(attention_mask=mask)
         assert result is mask
 
-    def test_accepts_both_input_embeds_variants(self):
-        mask = torch.ones(2, 8)
-        # HF < 5.3 uses input_embeds
-        result = _passthrough_create_causal_mask(
-            config=None, input_embeds=torch.zeros(2, 8, 64), attention_mask=mask
-        )
-        assert result is mask
-        # HF >= 5.3 uses inputs_embeds
-        result = _passthrough_create_causal_mask(
-            config=None, inputs_embeds=torch.zeros(2, 8, 64), attention_mask=mask
-        )
+    def test_passthrough_indexed_packed_mask(self):
+        """Indexed masks with values > 1 (packed sequences) are returned as-is."""
+        mask = torch.tensor([[1, 1, 2, 2, 0]])
+        result = _passthrough_create_causal_mask(attention_mask=mask)
         assert result is mask
 
+    def test_delegates_to_original_for_normal_mask(self):
+        """Normal 2D mask (max<=1) delegates to the original HF create_causal_mask."""
+        from unittest.mock import patch
+
+        mask = torch.tensor([[1, 1, 1, 0, 0]])
+        with patch("transformers.masking_utils.create_causal_mask", return_value="delegated") as mock_cm:
+            result = _passthrough_create_causal_mask(
+                attention_mask=mask,
+                config=None,
+                inputs_embeds=torch.zeros(1, 5, 64),
+                cache_position=torch.arange(5),
+            )
+        assert result == "delegated"
+        mock_cm.assert_called_once()
+
     def test_handles_extra_kwargs(self):
-        mask = torch.ones(2, 8)
+        """Extra kwargs don't break — indexed mask still passes through."""
+        mask = torch.tensor([[1, 1, 2, 2, 0]])
         result = _passthrough_create_causal_mask(
             attention_mask=mask, or_mask_function=None, and_mask_function=None
         )

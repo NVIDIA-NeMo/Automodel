@@ -107,8 +107,31 @@ def _passthrough_create_causal_mask(
     position_ids=None,
     **kwargs,
 ):
-    """Replacement for ``create_causal_mask`` that returns the mask unchanged."""
-    return attention_mask
+    """Replacement for ``create_causal_mask`` that passes through packed masks.
+
+    If the attention mask is already 4D (block-causal from sdpa collater) or
+    contains packed-sequence indices (values > 1), return it unchanged.
+    Otherwise, fall back to the original ``create_causal_mask`` from
+    ``transformers.masking_utils``.
+    """
+    if attention_mask is not None:
+        if attention_mask.ndim == 4:
+            return attention_mask
+        if attention_mask.max() > 1:
+            return attention_mask
+    # Not a packed mask — delegate to the original HF implementation.
+    from transformers.masking_utils import create_causal_mask
+
+    embeds = inputs_embeds if inputs_embeds is not None else input_embeds
+    return create_causal_mask(
+        config=config,
+        input_embeds=embeds,
+        attention_mask=attention_mask,
+        cache_position=cache_position,
+        past_key_values=past_key_values,
+        position_ids=position_ids,
+        **kwargs,
+    )
 
 
 def get_attn_implementation(cfg_model):
