@@ -108,3 +108,6 @@ optimizer:
   eps: 1e-8
   lr: 1e-5
   weight_decay: 0
+
+ci:
+  nodes: 8
