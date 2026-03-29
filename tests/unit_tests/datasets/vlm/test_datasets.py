@@ -21,6 +21,7 @@ import pytest
 from PIL import Image
 
 import nemo_automodel.components.datasets.vlm.datasets as ds
+import nemo_automodel.components.datasets.vlm.utils as vlm_utils
 
 
 @pytest.fixture(autouse=True)
@@ -847,7 +848,7 @@ class TestPreloadMedia:
             ],
         }
 
-        result = ds._preload_media(example)
+        result = vlm_utils._preload_media(example)
         loaded = result["conversation"][0]["content"][0]["image"]
         assert isinstance(loaded, Image.Image)
         assert loaded.mode == "RGB"
@@ -864,7 +865,7 @@ class TestPreloadMedia:
             ],
         }
 
-        result = ds._preload_media(example)
+        result = vlm_utils._preload_media(example)
         loaded = result["conversation"][0]["content"][0]["image"]
         assert isinstance(loaded, Image.Image)
         assert loaded.mode == "RGB"
@@ -913,7 +914,7 @@ class TestPreloadMedia:
             ],
         }
 
-        result = ds._preload_media(example)
+        result = vlm_utils._preload_media(example)
         loaded = result["conversation"][0]["content"][0]["video"]
         assert isinstance(loaded, list)
         assert len(loaded) == 120
@@ -938,7 +939,7 @@ class TestPreloadMedia:
             ],
         }
 
-        result = ds._preload_media(example)
+        result = vlm_utils._preload_media(example)
         loaded = result["conversation"][0]["content"][0]["video"]
         assert isinstance(loaded, list)
         # 5 frames → padded to 6 (even alignment)
@@ -960,13 +961,13 @@ class TestPreloadMedia:
             ],
         }
 
-        result = ds._preload_media(example)
+        result = vlm_utils._preload_media(example)
         assert result["conversation"][0]["content"][0]["text"] == "Hello"
 
     def test_no_conversation_key(self):
         """Example without a 'conversation' key is returned as-is."""
         example = {"other_key": "value"}
-        result = ds._preload_media(example)
+        result = vlm_utils._preload_media(example)
         assert result == {"other_key": "value"}
 
     def test_missing_image_file_raises(self):
@@ -981,7 +982,7 @@ class TestPreloadMedia:
         }
 
         with pytest.raises(FileNotFoundError):
-            ds._preload_media(example)
+            vlm_utils._preload_media(example)
 
 
 # ---------------------------------------------------------------------------
@@ -1025,7 +1026,7 @@ class TestReadVideoFrames:
 
     def test_returns_pil_images(self):
         """Returns a list of PIL RGB Images."""
-        frames = ds._read_video_frames("/fake.mp4")
+        frames = vlm_utils._read_video_frames("/fake.mp4")
         assert isinstance(frames, list)
         assert all(isinstance(f, Image.Image) for f in frames)
         assert all(f.mode == "RGB" for f in frames)
@@ -1035,7 +1036,7 @@ class TestReadVideoFrames:
         processor = type("P", (), {
             "video_processor": type("VP", (), {"fps": None, "max_frames": 8, "min_frames": 4})(),
         })()
-        frames = ds._read_video_frames("/fake.mp4", processor=processor)
+        frames = vlm_utils._read_video_frames("/fake.mp4", processor=processor)
         assert len(frames) == 8
 
     def test_respects_fps_sampling(self):
@@ -1044,12 +1045,12 @@ class TestReadVideoFrames:
         processor = type("P", (), {
             "video_processor": type("VP", (), {"fps": 2, "max_frames": None, "min_frames": 4})(),
         })()
-        frames = ds._read_video_frames("/fake.mp4", processor=processor)
+        frames = vlm_utils._read_video_frames("/fake.mp4", processor=processor)
         assert len(frames) == 8
 
     def test_no_processor_reads_all_frames(self):
         """Without processor, all frames are returned."""
-        frames = ds._read_video_frames("/fake.mp4")
+        frames = vlm_utils._read_video_frames("/fake.mp4")
         assert len(frames) == self._total_frames
 
     def test_fps_with_max_frames_clamp(self):
@@ -1058,7 +1059,7 @@ class TestReadVideoFrames:
         processor = type("P", (), {
             "video_processor": type("VP", (), {"fps": 10, "max_frames": 16, "min_frames": 4})(),
         })()
-        frames = ds._read_video_frames("/fake.mp4", processor=processor)
+        frames = vlm_utils._read_video_frames("/fake.mp4", processor=processor)
         assert len(frames) == 16
 
     def test_explicit_frame_indices(self):
@@ -1069,19 +1070,19 @@ class TestReadVideoFrames:
             })(),
         })()
         indices = [0, 15, 30, 45, 60]
-        frames = ds._read_video_frames("/fake.mp4", processor=processor, frame_indices=indices)
+        frames = vlm_utils._read_video_frames("/fake.mp4", processor=processor, frame_indices=indices)
         # 5 frames → padded to 6 (next even)
         assert len(frames) == 6
 
     def test_frame_indices_clamped_to_valid_range(self):
         """frame_indices beyond total_frames are clamped to the last frame."""
         # total_frames = 120, so index 999 → 119; 3 frames → padded to 4 (even)
-        frames = ds._read_video_frames("/fake.mp4", frame_indices=[0, 10, 999])
+        frames = vlm_utils._read_video_frames("/fake.mp4", frame_indices=[0, 10, 999])
         assert len(frames) == 4
 
     def test_even_frame_indices_not_padded(self):
         """Even number of frame_indices is not padded."""
-        frames = ds._read_video_frames("/fake.mp4", frame_indices=[0, 10, 20, 30])
+        frames = vlm_utils._read_video_frames("/fake.mp4", frame_indices=[0, 10, 20, 30])
         assert len(frames) == 4
 
     def test_temporal_patch_size_alignment(self):
@@ -1092,7 +1093,7 @@ class TestReadVideoFrames:
             })(),
         })()
         # 120 frames, no fps sampling → 120 frames, 120 % 4 == 0, no padding
-        frames = ds._read_video_frames("/fake.mp4", processor=processor)
+        frames = vlm_utils._read_video_frames("/fake.mp4", processor=processor)
         assert len(frames) % 4 == 0
 
     def test_round_up_not_down(self):
@@ -1112,7 +1113,7 @@ class TestReadVideoFrames:
                 "fps": 3, "max_frames": 5, "min_frames": 2, "temporal_patch_size": 4,
             })(),
         })()
-        frames = ds._read_video_frames("/fake.mp4", processor=processor)
+        frames = vlm_utils._read_video_frames("/fake.mp4", processor=processor)
         assert len(frames) == 8  # rounded UP from 5 to 8, not down to 4
 
 
