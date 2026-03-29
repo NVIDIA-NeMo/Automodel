@@ -382,7 +382,7 @@ jobs:
       )
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
-      && ${{ vars.ENABLE_CODECOV == 'true' }}
+      && vars.ENABLE_CODECOV == 'true'
     environment: nemo-ci
     steps:
       - name: Generate fake coverage report
@@ -408,7 +408,7 @@ jobs:
         || success()
       )
       && !cancelled()
-      && ${{ vars.ENABLE_CODECOV == 'true' }}
+      && vars.ENABLE_CODECOV == 'true'
     strategy:
       matrix:
         flag: [unit-test, e2e]
