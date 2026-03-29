@@ -113,7 +113,7 @@ class CombinedQKVAttentionMixin:
         Returns:
             Tuple of (query, key, value) tensors, each [batch, seq_len, ...]
         """
-        if not self._tp_checked:
+        if not self._tp_checked and not torch.compiler.is_compiling():
             _assert_colwise_parallel(self.qkv_proj.weight, "qkv_proj")
             self._tp_checked = True
 

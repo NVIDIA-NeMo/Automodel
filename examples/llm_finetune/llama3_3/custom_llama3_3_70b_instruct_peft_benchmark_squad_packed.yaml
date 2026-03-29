@@ -48,7 +48,7 @@ checkpoint:
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: none
-  tp_size: 2
+  tp_size: 4
   cp_size: 1
   pp_size: 1
 

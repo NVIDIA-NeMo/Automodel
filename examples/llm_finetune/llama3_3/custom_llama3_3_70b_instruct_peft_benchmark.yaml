@@ -13,7 +13,7 @@ benchmark:
 
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 1
+  local_batch_size: 4
   ckpt_every_steps: 50
   val_every_steps: 1000
   max_steps: 10
@@ -50,7 +50,7 @@ distributed:
   dp_size: none
   tp_size: 2
   cp_size: 1
-  pp_size: 1
+  pp_size: 4
 
   sequence_parallel: false
   activation_checkpointing: true

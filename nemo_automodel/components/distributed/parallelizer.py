@@ -159,6 +159,17 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
 
         # TP sharding with enhanced plan generation
         if tp_mesh.size() > 1:
+            # async-TP (_micro_pipeline_tp) overlaps ReduceScatter with compute.
+            # Without SP, row-parallel layers emit AllReduce (not ReduceScatter),
+            # so there is nothing for the micro-pipeline to overlap — force SP on.
+            if enable_async_tensor_parallel and not sequence_parallel:
+                logger.warning(
+                    "enable_async_tensor_parallel=True requires sequence_parallel=True "
+                    "(_micro_pipeline_tp pipelines ReduceScatter; row-parallel AllReduce "
+                    "cannot be pipelined). Forcing sequence_parallel=True."
+                )
+                sequence_parallel = True
+
             # Validate that attention heads are divisible by TP size
             validate_tp_mesh(model, tp_mesh)
 

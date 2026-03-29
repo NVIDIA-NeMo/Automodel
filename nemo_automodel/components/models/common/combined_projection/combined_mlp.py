@@ -78,7 +78,7 @@ class CombinedGateUpMLP(nn.Module):
         Returns:
             Output tensor [batch, seq_len, hidden_size]
         """
-        if not self._tp_checked:
+        if not self._tp_checked and not torch.compiler.is_compiling():
             _assert_colwise_parallel(self.gate_up_proj.weight, "gate_up_proj")
             self._tp_checked = True
 

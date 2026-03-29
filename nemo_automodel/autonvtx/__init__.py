@@ -42,10 +42,18 @@ def _add_nvtx_hooks(model, name, add_backward_hooks=True):
         module._nvtx_skipped = False
         _get_active_ranges().add(name)
         torch.cuda.nvtx.range_push(name)
+        # Also emit record_function so torch.profiler captures module-level timing
+        rf = torch.profiler.record_function(name)
+        rf.__enter__()
+        module._nvtx_rf = rf
 
     def pop_fwd(module, *args, **kwargs):
         if getattr(module, "_nvtx_skipped", False):
             return
+        rf = getattr(module, "_nvtx_rf", None)
+        if rf is not None:
+            rf.__exit__(None, None, None)
+            module._nvtx_rf = None
         torch.cuda.nvtx.range_pop()
         _get_active_ranges().discard(name)
 
