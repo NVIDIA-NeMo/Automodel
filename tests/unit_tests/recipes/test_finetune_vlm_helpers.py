@@ -416,6 +416,10 @@ def test_autoprocessor_exception_handling(caplog):
         cfg_ds = MagicMock()
         cfg_ds.instantiate.return_value = []
         cfg_ds.path_or_dataset = "test/dataset"
+        cfg_ds.get.side_effect = lambda key, default=None: {
+            "pretokenize": False, "packing": None, "max_length": None,
+            "chat_template": None, "preload_media": False,
+        }.get(key, default)
 
         cfg_dl = MagicMock()
         cfg_dl.get.return_value = None  # No custom settings
@@ -502,6 +506,10 @@ def test_autoprocessor_with_processor_kwargs(caplog):
         cfg_ds = MagicMock()
         cfg_ds.instantiate.return_value = []
         cfg_ds.path_or_dataset = "test/dataset"
+        cfg_ds.get.side_effect = lambda key, default=None: {
+            "pretokenize": False, "packing": None, "max_length": None,
+            "chat_template": None, "preload_media": False,
+        }.get(key, default)
 
         cfg_dl = MagicMock()
         cfg_dl.get.return_value = None  # No custom settings

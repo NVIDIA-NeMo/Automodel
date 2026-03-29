@@ -19,7 +19,7 @@ import os
 import random
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import torch.utils.data
 from datasets import load_dataset
@@ -27,6 +27,7 @@ from PIL import Image
 
 from nemo_automodel.components.datasets.vlm.utils import (
     _build_video_metadata,
+    _lmdb_env_cache,
     _preload_media,
     json2token,
 )
@@ -246,10 +247,12 @@ def _convert_sharegpt_to_conversation(
             continue
 
         if role == "assistant":
-            conversation.append({
-                "role": "assistant",
-                "content": [{"type": "text", "text": content_text}],
-            })
+            conversation.append(
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": content_text}],
+                }
+            )
             continue
 
         # Parse user content: split on <image> and <video> placeholders
@@ -361,7 +364,9 @@ def _load_jsonl_for_rank(file_path, sample_ratio, rank, world_size):
                 logger.warning(
                     "Dataset '%s' has only %d samples but world_size=%d — "
                     "this dataset contributes 0 samples to every rank.",
-                    file_path, total, world_size,
+                    file_path,
+                    total,
+                    world_size,
                 )
             results = results[:per_rank]
         return results, total
@@ -397,7 +402,10 @@ def _load_jsonl_for_rank(file_path, sample_ratio, rank, world_size):
             logger.warning(
                 "Dataset '%s' has only %d samples after sampling (ratio=%.2f) "
                 "but world_size=%d — this dataset contributes 0 samples to every rank.",
-                file_path, n_samples, sample_ratio, world_size,
+                file_path,
+                n_samples,
+                sample_ratio,
+                world_size,
             )
         sampled_order = sampled_order[rank * per_rank : (rank + 1) * per_rank]
 
@@ -551,11 +559,7 @@ def _log_dataset_loading_summary(timings, wall_time, total_samples, rank=None):
     for name, t in ranked:
         bar = _bar(t["total"], max_time)
         if has_stats:
-            row_stats = (
-                f"  {t.get('n_images', 0):>8,}"
-                f"  {t.get('n_videos', 0):>8,}"
-                f"  {t.get('n_text_only', 0):>8,}"
-            )
+            row_stats = f"  {t.get('n_images', 0):>8,}  {t.get('n_videos', 0):>8,}  {t.get('n_text_only', 0):>8,}"
         else:
             row_stats = ""
         lines.append(
@@ -570,20 +574,22 @@ def _log_dataset_loading_summary(timings, wall_time, total_samples, rank=None):
         total_images = sum(t.get("n_images", 0) for t in timings.values())
         total_videos = sum(t.get("n_videos", 0) for t in timings.values())
         total_text_only = sum(t.get("n_text_only", 0) for t in timings.values())
-        total_text_tokens = sum(t.get("n_text_tokens", 0) for t in timings.values())
-        total_media_tokens = sum(t.get("n_media_tokens", 0) for t in timings.values())
+        sum(t.get("n_text_tokens", 0) for t in timings.values())
+        sum(t.get("n_media_tokens", 0) for t in timings.values())
         sum_stats = f"  {total_images:>8,}  {total_videos:>8,}  {total_text_only:>8,}"
     else:
         sum_stats = ""
 
-    lines.extend([
-        f"  ├{sep}┤",
-        f"  │  {'Sum (thread)':<{max_name}}  {'':>{BAR_WIDTH}}  {sum_io:>5.1f}s  {sum_cv:>5.1f}s  {sum_t:>5.1f}s  {total_samples:>8,}{sum_stats}  │",
-        f"  │  {'Wall clock':<{max_name}}  {'':>{BAR_WIDTH}}  {'':>6}  {'':>6}  {wall_time:>5.1f}s  {'':>8}{blank_stats}  │",
-        f"  │  {'Parallelism':<{max_name}}  {'':>{BAR_WIDTH}}  {'':>6}  {'':>6}  {sum_t / max(wall_time, 1e-6):>5.1f}x  {'':>8}{blank_stats}  │",
-        f"  └{sep}┘",
-        "",
-    ])
+    lines.extend(
+        [
+            f"  ├{sep}┤",
+            f"  │  {'Sum (thread)':<{max_name}}  {'':>{BAR_WIDTH}}  {sum_io:>5.1f}s  {sum_cv:>5.1f}s  {sum_t:>5.1f}s  {total_samples:>8,}{sum_stats}  │",
+            f"  │  {'Wall clock':<{max_name}}  {'':>{BAR_WIDTH}}  {'':>6}  {'':>6}  {wall_time:>5.1f}s  {'':>8}{blank_stats}  │",
+            f"  │  {'Parallelism':<{max_name}}  {'':>{BAR_WIDTH}}  {'':>6}  {'':>6}  {sum_t / max(wall_time, 1e-6):>5.1f}x  {'':>8}{blank_stats}  │",
+            f"  └{sep}┘",
+            "",
+        ]
+    )
 
     # Per-rank totals are visible in the Sum row of the timing table above.
     # Global aggregation (all_reduce) is performed by the caller after the
@@ -599,6 +605,7 @@ class _ExamplesWithStats(list):
     ``_log_global_dataset_stats``) can read aggregated stats without
     re-scanning all examples.
     """
+
     __slots__ = ("stats",)
 
 
@@ -669,8 +676,7 @@ def make_meta_dataset(
                 world_size = world_size if world_size is not None else dist.get_world_size()
             else:
                 logger.warning(
-                    "shard_data=True but torch.distributed is not initialized. "
-                    "Loading full dataset on this process."
+                    "shard_data=True but torch.distributed is not initialized. Loading full dataset on this process."
                 )
                 shard_data = False
 
@@ -713,7 +719,11 @@ def make_meta_dataset(
             if do_shard:
                 logger.info(
                     "Rank %d/%d: sharded dataset '%s' — %d/%d samples",
-                    rank, world_size, ds_name, len(raw_data), total,
+                    rank,
+                    world_size,
+                    ds_name,
+                    len(raw_data),
+                    total,
                 )
         else:
             # JSON array files or no sharding needed — load everything
@@ -739,12 +749,18 @@ def make_meta_dataset(
                     logger.warning(
                         "Dataset '%s' has only %d samples but world_size=%d — "
                         "this dataset contributes 0 samples to every rank.",
-                        ds_name, total, world_size,
+                        ds_name,
+                        total,
+                        world_size,
                     )
                 raw_data = raw_data[rank::world_size][:per_rank]
                 logger.info(
                     "Rank %d/%d: sharded dataset '%s' — %d/%d samples",
-                    rank, world_size, ds_name, len(raw_data), total,
+                    rank,
+                    world_size,
+                    ds_name,
+                    len(raw_data),
+                    total,
                 )
         t_io = time.monotonic() - t_io_start
 
@@ -767,14 +783,18 @@ def make_meta_dataset(
                 "Dataset '%s': %d/%d examples missing '_text_tokens' — "
                 "falling back to chars//3 estimate. "
                 "Run scripts/precompute_tokens.py to populate this field.",
-                ds_name, n_missing_tt, n_total,
+                ds_name,
+                n_missing_tt,
+                n_total,
             )
         if n_missing_mm > 0:
             logger.warning(
                 "Dataset '%s': %d/%d media-containing examples missing 'mm_inputs_meta' — "
                 "falling back to 500 tokens per media item. "
                 "Run scripts/precompute_tokens.py to populate this field.",
-                ds_name, n_missing_mm, n_total,
+                ds_name,
+                n_missing_mm,
+                n_total,
             )
 
         timing = {"io": t_io, "convert": t_convert, "total": t_total, "n_samples": len(examples), **stats}
@@ -798,8 +818,7 @@ def make_meta_dataset(
         logger.info("Loading %d datasets in parallel with %d workers", len(ordered_names), num_workers)
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             future_map = {
-                ds_name: executor.submit(_load_one_dataset, ds_name, selected[ds_name])
-                for ds_name in ordered_names
+                ds_name: executor.submit(_load_one_dataset, ds_name, selected[ds_name]) for ds_name in ordered_names
             }
             # Collect in sorted key order, not completion order
             for ds_name in ordered_names:
@@ -878,7 +897,9 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                 # preserve_video_metadata=True: store _video_fps and
                 # _frame_indices on each video item so we can fix timestamps.
                 example = _preload_media(
-                    example, self.processor, preserve_video_metadata=True,
+                    example,
+                    self.processor,
+                    preserve_video_metadata=True,
                 )
                 conversation = example["conversation"]
 
@@ -892,14 +913,13 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                     content = message.get("content")
                     if isinstance(content, list):
                         for item in content:
-                            if isinstance(item, dict) and isinstance(
-                                item.get("image"), Image.Image
-                            ):
+                            if isinstance(item, dict) and isinstance(item.get("image"), Image.Image):
                                 item["image"] = item["image"].convert("RGB")
 
                 # Render template text.
                 text = self.processor.apply_chat_template(
-                    [conversation], tokenize=False,
+                    [conversation],
+                    tokenize=False,
                 )
                 if isinstance(text, list):
                     text = text[0]
@@ -932,7 +952,9 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                 if self.max_length is not None and seq_len > self.max_length:
                     logger.warning(
                         "Sample %d: %d tokens > max_length %d, replacing.",
-                        idx, seq_len, self.max_length,
+                        idx,
+                        seq_len,
+                        self.max_length,
                     )
                     idx = random.randint(0, len(self.dataset) - 1)
                     continue
@@ -951,9 +973,13 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                 }
 
                 # Copy media tensors (these don't have a sample batch dim)
-                for key in ("pixel_values", "pixel_values_videos",
-                            "image_grid_thw", "video_grid_thw",
-                            "second_per_grid_ts"):
+                for key in (
+                    "pixel_values",
+                    "pixel_values_videos",
+                    "image_grid_thw",
+                    "video_grid_thw",
+                    "second_per_grid_ts",
+                ):
                     if key in result and result[key] is not None:
                         output[key] = result[key]
 
@@ -966,13 +992,14 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
             except Exception as e:
                 logger.warning(
                     "Error processing sample %d (attempt %d/%d): %s",
-                    idx, attempt + 1, self.max_retries, e,
+                    idx,
+                    attempt + 1,
+                    self.max_retries,
+                    e,
                 )
                 idx = random.randint(0, len(self.dataset) - 1)
 
-        raise RuntimeError(
-            f"Failed to load a valid sample after {self.max_retries} retries"
-        )
+        raise RuntimeError(f"Failed to load a valid sample after {self.max_retries} retries")
 
     def robust_collate(self, collate_fn):
         """Wrap *collate_fn* so that on failure the entire batch is re-sampled."""

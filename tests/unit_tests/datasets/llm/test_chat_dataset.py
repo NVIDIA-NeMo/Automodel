@@ -245,3 +245,65 @@ def test_tool_calling_chat_dataset_errors(monkeypatch):
     monkeypatch.setattr(tcd, "_has_chat_template", lambda _tok: False)
     with pytest.raises(ValueError):
         tcd.ChatDataset("ignored", Tok())
+
+
+class TestParquetLoading:
+    """Tests for local Parquet/directory loading in _load_openai_messages.
+
+    Addresses review comment: the Parquet loading branch needs test coverage.
+    """
+
+    def test_load_parquet_directory(self, tmp_path):
+        """Loading a directory containing .parquet files should work."""
+        from datasets import Dataset
+
+        data = [
+            {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]},
+            {"messages": [{"role": "user", "content": "bye"}, {"role": "assistant", "content": "goodbye"}]},
+        ]
+        ds = Dataset.from_list(data)
+        ds.to_parquet(tmp_path / "data.parquet")
+
+        result = tcd._load_openai_messages(str(tmp_path), split="train")
+        assert len(result) == 2
+        assert result[0]["messages"][0]["content"] == "hi"
+
+    def test_load_parquet_with_split_slice(self, tmp_path):
+        """Split slicing like 'train[:1]' should work on local Parquet datasets."""
+        from datasets import Dataset
+
+        data = [
+            {"messages": [{"role": "user", "content": f"msg{i}"}, {"role": "assistant", "content": f"reply{i}"}]}
+            for i in range(5)
+        ]
+        ds = Dataset.from_list(data)
+        ds.to_parquet(tmp_path / "data.parquet")
+
+        result = tcd._load_openai_messages(str(tmp_path), split="train[:2]")
+        assert len(result) == 2
+
+    def test_load_single_parquet_file(self, tmp_path):
+        """Loading a single .parquet file path should work via data_files."""
+        from datasets import Dataset
+
+        data = [
+            {"messages": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}]},
+            {"messages": [{"role": "user", "content": "ping"}, {"role": "assistant", "content": "pong"}]},
+            {"messages": [{"role": "user", "content": "foo"}, {"role": "assistant", "content": "bar"}]},
+        ]
+        ds = Dataset.from_list(data)
+        pq_file = tmp_path / "single.parquet"
+        ds.to_parquet(pq_file)
+
+        result = tcd._load_openai_messages(str(pq_file), split="train")
+        assert len(result) == 3
+        assert result[0]["messages"][0]["content"] == "hello"
+        assert result[2]["messages"][1]["content"] == "bar"
+
+    def test_directory_without_parquet_falls_through(self, tmp_path):
+        """A directory without .parquet files should not be handled by the Parquet path."""
+        (tmp_path / "data.jsonl").write_text('{"messages": [{"role": "user", "content": "hi"}]}\n')
+
+        # Should fall through to JSON/JSONL loading or HF hub path, not the Parquet path
+        result = tcd._load_openai_messages(str(tmp_path / "data.jsonl"), split="train")
+        assert len(result) == 1

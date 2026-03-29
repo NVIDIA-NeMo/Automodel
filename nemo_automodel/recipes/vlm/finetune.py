@@ -305,8 +305,15 @@ def _chunk_vlm_media(
 
 
 def build_dataloader(
-    cfg_ds, cfg_dl, pretrained_model_name_or_path, cfg_processor, device_mesh, seed, local_batch_size,
-    cfg_model=None, cfg_ps=None,
+    cfg_ds,
+    cfg_dl,
+    pretrained_model_name_or_path,
+    cfg_processor,
+    device_mesh,
+    seed,
+    local_batch_size,
+    cfg_model=None,
+    cfg_ps=None,
 ) -> tuple[DataLoader, ProcessorMixin]:
     """Build a DataLoader for the VLM dataset.
 
@@ -405,8 +412,13 @@ def build_dataloader(
                 configure_packing(attn_implementation=_attn_impl)
                 logging.info(f"Configured VLM neat packing for attn_implementation={_attn_impl}")
 
-                collate_fn = lambda examples, _pi=_pad_id, _ml=_collate_max_length, _ai=_attn_impl: neat_packed_vlm_collater(
-                    examples, padding_idx=_pi, max_length=_ml, attn_implementation=_ai,
+                collate_fn = (
+                    lambda examples, _pi=_pad_id, _ml=_collate_max_length, _ai=_attn_impl: neat_packed_vlm_collater(
+                        examples,
+                        padding_idx=_pi,
+                        max_length=_ml,
+                        attn_implementation=_ai,
+                    )
                 )
             else:
                 collate_cfg = cfg_dl.get("collate_fn", None)
@@ -416,11 +428,13 @@ def build_dataloader(
                     collate_fn = lambda examples: pad_collate_fn(examples, processor)
 
             sampler = torch.utils.data.distributed.DistributedSampler(
-                ds, **dist_sampler_kwargs,
+                ds,
+                **dist_sampler_kwargs,
             )
         else:
             sampler = torch.utils.data.distributed.DistributedSampler(
-                ds, **dist_sampler_kwargs,
+                ds,
+                **dist_sampler_kwargs,
             )
             collate_cfg = cfg_dl.get("collate_fn", None)
             if collate_cfg:

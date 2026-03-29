@@ -1,3 +1,17 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 #!/usr/bin/env python3
 """Pre-compute accurate text token counts for all samples in a meta dataset.
 
@@ -42,8 +56,10 @@ def _worker_init(tokenizer_path):
     """Called once per worker process to load the tokenizer."""
     global _worker_tokenizer
     from transformers import AutoTokenizer
+
     _worker_tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_path, trust_remote_code=True,
+        tokenizer_path,
+        trust_remote_code=True,
     )
 
 
@@ -88,8 +104,8 @@ def _process_chunk(args):
 # Per-dataset processing
 # ---------------------------------------------------------------------------
 
-def _process_one_dataset(ds_name, file_path, output_path, columns, tags,
-                         pool, chunk_size=2000):
+
+def _process_one_dataset(ds_name, file_path, output_path, columns, tags, pool, chunk_size=2000):
     """Process one JSONL file using a pre-created worker pool."""
     t0 = time.monotonic()
 
@@ -119,7 +135,11 @@ def _process_one_dataset(ds_name, file_path, output_path, columns, tags,
             elapsed = time.monotonic() - t_tok_start
             logger.info(
                 "[%s] %d/%d (%.1fs, %.0f lines/s)",
-                ds_name, done, n_lines, elapsed, done / max(elapsed, 1e-6),
+                ds_name,
+                done,
+                n_lines,
+                elapsed,
+                done / max(elapsed, 1e-6),
             )
 
     t_tok = time.monotonic() - t_tok_start
@@ -154,6 +174,7 @@ def _process_one_dataset(ds_name, file_path, output_path, columns, tags,
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main():
     mp.set_start_method("fork", force=True)  # COW shared memory
@@ -225,7 +246,11 @@ def main():
         for i, (ds_name, fpath, opath, cols, tgs) in enumerate(tasks):
             logger.info("━━━ [%d/%d] %s ━━━", i + 1, len(tasks), ds_name)
             result = _process_one_dataset(
-                ds_name, fpath, opath, cols, tgs,
+                ds_name,
+                fpath,
+                opath,
+                cols,
+                tgs,
                 pool=pool,
                 chunk_size=args.chunk_size,
             )
@@ -268,13 +293,15 @@ def main():
     if len(results_sorted) > 20:
         lines.append(f"  │  {'... and ' + str(len(results_sorted) - 20) + ' more':<{max_name + BAR_W + 36}}  │")
 
-    lines.extend([
-        f"  ├{'─' * (max_name + BAR_W + 42)}┤",
-        f"  │  {'Total':<{max_name}}  {'':>{BAR_W}}  {'':>6}  {'':>6}  {'':>6}  {total_lines:>9,}  │",
-        f"  │  {'Wall clock':<{max_name}}  {'':>{BAR_W}}  {'':>6}  {t_total:>5.1f}s  {'':>6}  {'':>9}  │",
-        f"  └{'─' * (max_name + BAR_W + 42)}┘",
-        "",
-    ])
+    lines.extend(
+        [
+            f"  ├{'─' * (max_name + BAR_W + 42)}┤",
+            f"  │  {'Total':<{max_name}}  {'':>{BAR_W}}  {'':>6}  {'':>6}  {'':>6}  {total_lines:>9,}  │",
+            f"  │  {'Wall clock':<{max_name}}  {'':>{BAR_W}}  {'':>6}  {t_total:>5.1f}s  {'':>6}  {'':>9}  │",
+            f"  └{'─' * (max_name + BAR_W + 42)}┘",
+            "",
+        ]
+    )
     logger.info("\n".join(lines))
 
 

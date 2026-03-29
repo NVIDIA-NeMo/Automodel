@@ -12,14 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Example recipe for Qwen3.5-4B VLM fine-tuning with neat packing.
-#
-# Neat packing bins variable-length samples into fixed-size sequences using
-# a greedy knapsack algorithm, reducing padding waste and increasing
-# throughput (~3.6x TPS/gpu vs non-packed).
-#
-# Requires flash_attention_2 and transformers >= 4.52 (Qwen3.5 support).
-#
 # torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py \
 #   --config examples/vlm_finetune/qwen3_5/qwen3_5_4b_neat_packing.yaml
 

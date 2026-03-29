@@ -33,19 +33,13 @@ except ImportError:
     HAVE_QWEN_OMNI_UTILS = False
     process_mm_info = MagicMock()
 
-import copy
 import logging
 import random
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from PIL import Image as PILImage
-from transformers.video_processing_utils import BaseVideoProcessor
-from transformers.video_utils import load_video
 
 logger = logging.getLogger(__name__)
-
-from nemo_automodel.components.datasets.vlm.samplers import _smart_resize_image
-from nemo_automodel.components.datasets.vlm.utils import default_stop_tokens
 
 # ---------------------------------------------------------------------------
 # Fake image fallback for FSDP / DeepSpeed Zero3
@@ -60,7 +54,8 @@ from nemo_automodel.components.datasets.vlm.fake_image import (  # noqa: F401
     inject_fake_image_into_conversation,
     mask_fake_vision_tokens_batch,
 )
-
+from nemo_automodel.components.datasets.vlm.samplers import _smart_resize_image
+from nemo_automodel.components.datasets.vlm.utils import default_stop_tokens
 
 # ---------------------------------------------------------------------------
 # Patch BaseVideoProcessor.fetch_videos to use decord (decord2) instead of
@@ -92,17 +87,9 @@ def make_robust_collate(dataset, collate_fn, max_retries=10):
                 return collate_fn(examples)
             except Exception as e:
                 last_error = e
-                logger.warning(
-                    f"Collate failed (attempt {attempt + 1}/{max_retries}): {e}. "
-                    "Re-sampling batch."
-                )
-                examples = [
-                    dataset[random.randint(0, len(dataset) - 1)]
-                    for _ in range(len(examples))
-                ]
-        raise RuntimeError(
-            f"Collate failed after {max_retries} retries. Last error: {last_error}"
-        )
+                logger.warning(f"Collate failed (attempt {attempt + 1}/{max_retries}): {e}. Re-sampling batch.")
+                examples = [dataset[random.randint(0, len(dataset) - 1)] for _ in range(len(examples))]
+        raise RuntimeError(f"Collate failed after {max_retries} retries. Last error: {last_error}")
 
     return wrapper
 
@@ -229,6 +216,7 @@ def build_labels(
 # This avoids the BPE context-sensitivity bugs of the old approach.
 # ---------------------------------------------------------------------------
 
+
 def _get_assistant_marker(tokenizer) -> Optional[List[int]]:
     """Return the token-id sequence that introduces an assistant turn.
 
@@ -261,13 +249,15 @@ def _get_stop_token_id(tokenizer) -> Optional[int]:
 # Processor types whose chat template uses ``<|im_start|>``/``<|im_end|>``
 # markers.  For these we can reliably locate assistant turns by scanning the
 # token ids instead of re-tokenizing (which is sensitive to BPE context).
-_IMSTART_TEMPLATE_PROCESSORS = frozenset({
-    "Qwen2VLProcessor",
-    "Qwen2_5_VLProcessor",
-    "Qwen3VLProcessor",
-    "Qwen3VLMoeProcessor",
-    "Qwen3OmniMoeProcessor",
-})
+_IMSTART_TEMPLATE_PROCESSORS = frozenset(
+    {
+        "Qwen2VLProcessor",
+        "Qwen2_5_VLProcessor",
+        "Qwen3VLProcessor",
+        "Qwen3VLMoeProcessor",
+        "Qwen3OmniMoeProcessor",
+    }
+)
 
 
 def build_labels_from_template(
@@ -777,7 +767,8 @@ def kimi_k25_vl_collate_fn(
         if max_length is not None and input_ids.shape[0] > max_length:
             logger.warning(
                 "Dropping expanded sample with %d tokens (max_length=%d).",
-                input_ids.shape[0], max_length,
+                input_ids.shape[0],
+                max_length,
             )
             continue
 
@@ -972,7 +963,9 @@ def _extract_image_config(processor):
     # fall back to ip.size dict with both Qwen-style and HF-style keys.
     size = getattr(ip, "size", {}) or {}
     min_pixels = getattr(ip, "min_pixels", None) or size.get("min_pixels") or size.get("shortest_edge") or 56 * 56
-    max_pixels = getattr(ip, "max_pixels", None) or size.get("max_pixels") or size.get("longest_edge") or 14 * 14 * 4 * 1280
+    max_pixels = (
+        getattr(ip, "max_pixels", None) or size.get("max_pixels") or size.get("longest_edge") or 14 * 14 * 4 * 1280
+    )
     return {
         "patch_size": patch_size,
         "merge_size": merge_size,
@@ -1016,16 +1009,15 @@ def _estimate_media_tokens(conversation, processor):
                 continue
 
             resized_h, resized_w = _smart_resize_image(
-                height, width,
+                height,
+                width,
                 factor=image_cfg["factor"],
                 min_pixels=image_cfg["min_pixels"],
                 max_pixels=image_cfg["max_pixels"],
             )
             merge_length = image_cfg["merge_size"] ** 2
             image_seq_len = (
-                (resized_h // image_cfg["patch_size"])
-                * (resized_w // image_cfg["patch_size"])
-                // merge_length
+                (resized_h // image_cfg["patch_size"]) * (resized_w // image_cfg["patch_size"]) // merge_length
             )
             extra += image_seq_len - 1  # -1: placeholder already counted in base tokenization
 
@@ -1055,7 +1047,8 @@ def _drop_overlong_samples(conversations, processor, max_length):
             if total > max_length:
                 logger.warning(
                     "Dropping sample with estimated %d tokens (max_length=%d).",
-                    total, max_length,
+                    total,
+                    max_length,
                 )
                 continue
         except Exception:
@@ -1181,15 +1174,9 @@ def pad_collate_fn(
         pad_len = pad_to - ids.shape[0]
 
         if pad_len > 0:
-            padded_input_ids.append(
-                torch.cat([ids, torch.full((pad_len,), pad_token_id, dtype=ids.dtype)])
-            )
-            padded_attention_mask.append(
-                torch.cat([mask, torch.zeros(pad_len, dtype=mask.dtype)])
-            )
-            padded_labels.append(
-                torch.cat([labs, torch.full((pad_len,), -100, dtype=labs.dtype)])
-            )
+            padded_input_ids.append(torch.cat([ids, torch.full((pad_len,), pad_token_id, dtype=ids.dtype)]))
+            padded_attention_mask.append(torch.cat([mask, torch.zeros(pad_len, dtype=mask.dtype)]))
+            padded_labels.append(torch.cat([labs, torch.full((pad_len,), -100, dtype=labs.dtype)]))
         else:
             padded_input_ids.append(ids[:pad_to])
             padded_attention_mask.append(mask[:pad_to])
@@ -1220,10 +1207,11 @@ def pad_collate_fn(
             batch[key] = torch.cat(tensors, dim=0).to(torch.bfloat16)
 
     # Per-sample image counts from image_grid_thw shapes (before concat)
-    image_grid_per_sample = [ex["image_grid_thw"] for ex in examples if "image_grid_thw" in ex and ex["image_grid_thw"] is not None]
+    image_grid_per_sample = [
+        ex["image_grid_thw"] for ex in examples if "image_grid_thw" in ex and ex["image_grid_thw"] is not None
+    ]
     if image_grid_per_sample:
         # Each tensor is [n_images_in_sample, 3]; build per-sample counts for all samples
-        grid_idx = 0
         image_counts = []
         for ex in examples:
             if "image_grid_thw" in ex and ex["image_grid_thw"] is not None:
@@ -1233,7 +1221,9 @@ def pad_collate_fn(
         batch["n_images_per_sample"] = torch.tensor(image_counts, dtype=torch.long)
 
     # Per-sample video counts from video_grid_thw shapes (before concat)
-    video_grid_per_sample = [ex["video_grid_thw"] for ex in examples if "video_grid_thw" in ex and ex["video_grid_thw"] is not None]
+    video_grid_per_sample = [
+        ex["video_grid_thw"] for ex in examples if "video_grid_thw" in ex and ex["video_grid_thw"] is not None
+    ]
     if video_grid_per_sample:
         video_counts = []
         for ex in examples:
