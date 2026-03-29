@@ -281,14 +281,14 @@ class NemotronV3Mamba2Mixer(nn.Module):
         seq_idx = kwargs.get("seq_idx", None)
         if seq_idx is None and "cu_seqlens" in kwargs:
             cu_seqlens = kwargs["cu_seqlens"]
-            # When CP is active, the mamba kernel receives the global sequence (after
-            # all-to-all gather).  Scale cu_seqlens and total_len accordingly so that
+            # cu_seqlens from the THD batch is GLOBAL (pre-TE-partitioning).
+            # When CP is active, the mamba kernel receives the global sequence
+            # (after all-to-all gather).  Scale total_len by cp_size so that
             # seq_idx has the correct global length.
             cp_size = self.cp.cp_size if self.cp is not None else 1
-            cu_seqlens_global = cu_seqlens * cp_size
             total_len = (hidden_states.shape[1] if hidden_states.dim() == 3 else hidden_states.shape[0]) * cp_size
             positions = torch.arange(total_len, device=hidden_states.device)
-            seq_idx = (torch.searchsorted(cu_seqlens_global[1:], positions)).unsqueeze(0).to(torch.int32)
+            seq_idx = (torch.searchsorted(cu_seqlens[1:], positions)).unsqueeze(0).to(torch.int32)
 
         # --- Path A: Training (no cache) → fused kernel ---
         if not use_cache:

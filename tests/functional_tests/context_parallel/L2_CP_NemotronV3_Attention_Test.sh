@@ -19,4 +19,4 @@ export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
 torchrun --nproc_per_node=2 --nnodes=1 \
-    tests/functional_tests/context_parallel/run_nemotron_v3_attention_cp.py
+    tests/functional_tests/context_parallel/run_attention_cp.py --model_type nemotron_v3

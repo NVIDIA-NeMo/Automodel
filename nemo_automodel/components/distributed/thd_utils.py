@@ -127,7 +127,9 @@ def process_input_for_thd(
         # Pass cu_seqlens_padded here since CP doesn't support padding between sequences correctly, the labels or loss mask will ensure that loss is computed correctly.
         "cu_seqlens": cu_seqlens_padded,
         "labels": labels_thd,
-        "padding_mask": (input_ids_thd == padding_token_id),
+        "padding_mask": (input_ids_thd == padding_token_id)
+        if padding_token_id is not None
+        else torch.zeros_like(input_ids_thd, dtype=torch.bool),
     }
 
     # Preserve qkv_format and other non-tensor keys from the original batch

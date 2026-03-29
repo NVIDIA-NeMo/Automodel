@@ -18,12 +18,26 @@
 This script validates that attention layers produce identical forward outputs
 and gradients when using different context parallel sizes with packed sequences.
 
+Supported model types: qwen3_moe, deepseek_v3, nemotron_v3
+
+Supported configs:
+  bshd_te   - 3D BSHD input, TE p2p CP, DualChunkSwap
+  thd_te    - 2D THD input, TE p2p CP (qwen3/deepseek use make_cp_batch_for_te;
+              nemotron_v3 uses DualChunkSwap)
+  bshd_sdpa - 3D BSHD input, DTensor context_parallel(), SDPA backend
+
 Usage:
     torchrun --nproc_per_node=2 tests/functional_tests/context_parallel/run_attention_cp.py \
         --model_type qwen3_moe
 
     torchrun --nproc_per_node=2 tests/functional_tests/context_parallel/run_attention_cp.py \
         --model_type deepseek_v3
+
+    torchrun --nproc_per_node=2 tests/functional_tests/context_parallel/run_attention_cp.py \
+        --model_type nemotron_v3
+
+    torchrun --nproc_per_node=2 tests/functional_tests/context_parallel/run_attention_cp.py \
+        --model_type nemotron_v3 --configs bshd_te thd_te
 """
 
 import argparse
@@ -32,6 +46,20 @@ import sys
 
 import torch
 import torch.distributed as dist
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def dual_chunk_swap_unsplit(chunks_per_rank, cp_size, seq_dim=1):
+    """Reconstruct full sequence from DualChunkSwap-ordered rank outputs."""
+    all_chunks = [None] * (2 * cp_size)
+    for rank_idx, rank_output in enumerate(chunks_per_rank):
+        c0, c1 = torch.chunk(rank_output, 2, dim=seq_dim)
+        all_chunks[rank_idx] = c0
+        all_chunks[2 * cp_size - rank_idx - 1] = c1
+    return torch.cat(all_chunks, dim=seq_dim)
 
 
 def is_distributed():
@@ -60,6 +88,75 @@ def init_distributed():
             dist.init_process_group(backend="nccl")
             torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
+
+def _compare_results(
+    config_name,
+    model_name,
+    rank,
+    output_cp_full,
+    output_baseline,
+    grad_cp_full,
+    grad_baseline,
+    param_grad_cp,
+    param_grad_baseline,
+    param_name,
+    output_atol,
+    output_rtol,
+    grad_atol,
+    grad_rtol,
+    param_atol,
+    param_rtol,
+):
+    """Compare CP vs baseline results and return 0 on pass, 1 on fail."""
+    if rank == 0:
+        output_diff = (output_cp_full - output_baseline).abs()
+        grad_diff = (grad_cp_full - grad_baseline).abs()
+        param_diff = (param_grad_cp - param_grad_baseline).abs()
+
+        print(f"\n{'=' * 70}")
+        print(f"Config: {config_name} - {model_name}")
+        print(f"{'=' * 70}")
+        print(f"Output shape: CP={output_cp_full.shape}, Baseline={output_baseline.shape}")
+        print(f"Output diff - mean: {output_diff.mean():.6f}, max: {output_diff.max():.6f}")
+        print(f"Grad diff - mean: {grad_diff.mean():.6f}, max: {grad_diff.max():.6f}")
+        print(f"{param_name} grad diff - mean: {param_diff.mean():.6f}, max: {param_diff.max():.6f}")
+
+    try:
+        torch.testing.assert_close(
+            output_cp_full,
+            output_baseline,
+            rtol=output_rtol,
+            atol=output_atol,
+            msg=f"[{config_name}][Rank {rank}] Forward outputs differ",
+        )
+        torch.testing.assert_close(
+            grad_cp_full,
+            grad_baseline,
+            rtol=grad_rtol,
+            atol=grad_atol,
+            msg=f"[{config_name}][Rank {rank}] Input gradients differ",
+        )
+        torch.testing.assert_close(
+            param_grad_cp,
+            param_grad_baseline,
+            rtol=param_rtol,
+            atol=param_atol,
+            msg=f"[{config_name}][Rank {rank}] {param_name} grad differs",
+        )
+        if rank == 0:
+            print("  PASSED")
+            print(f"{'=' * 70}")
+        return 0
+    except AssertionError as e:
+        if rank == 0:
+            print(f"  FAILED: {e}")
+            print(f"{'=' * 70}")
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# Packed-sequence batch creation (used by qwen3_moe / deepseek_v3 thd_te)
+# ---------------------------------------------------------------------------
 
 def create_packed_sequence_batch(batch_size, seq_lens_per_batch, device, padding_token_id=0):
     """
@@ -114,12 +211,22 @@ def create_packed_sequence_batch(batch_size, seq_lens_per_batch, device, padding
     }
 
 
+# ---------------------------------------------------------------------------
+# Model factory
+# ---------------------------------------------------------------------------
+
 def get_model_config_and_attention(model_type, device):
-    """Get model configuration and attention layer based on model type."""
+    """Get model configuration and attention layer based on model type.
+
+    For qwen3_moe / deepseek_v3: returns (config, attn_no_cp, attn_with_cp, get_freqs_cis).
+    For nemotron_v3: returns (config, None, None, None) because attention pairs
+    are created per-config with different BackendConfig instances.
+    """
     if model_type == "qwen3_moe":
         from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
         from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel.components.models.common.utils import get_rope_config
         from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding
         from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention
 
@@ -152,9 +259,10 @@ def get_model_config_and_attention(model_type, device):
             enable_hf_state_dict_adapter=False,
         )
 
+        rope_theta, _, _ = get_rope_config(config)
         rope = RotaryEmbedding(
             head_dim=config.head_dim,
-            base=config.rope_theta,
+            base=rope_theta,
             dtype=torch.float32,
         )
 
@@ -163,13 +271,14 @@ def get_model_config_and_attention(model_type, device):
 
         from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
 
-        def get_freqs_cis(position_ids, qkv_format):
-            return position_ids_to_freqs_cis(rope, position_ids, qkv_format)
+        def get_freqs_cis(position_ids, qkv_format, cp_size=1):
+            return position_ids_to_freqs_cis(rope, position_ids, qkv_format, cp_size=cp_size)
 
     elif model_type == "deepseek_v3":
         from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
         from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel.components.models.common.utils import get_rope_config
         from nemo_automodel.components.models.deepseek_v3.layers import MLA
         from nemo_automodel.components.models.deepseek_v3.rope_utils import (
             freqs_cis_from_position_ids,
@@ -203,18 +312,33 @@ def get_model_config_and_attention(model_type, device):
         )
 
         # Precompute RoPE frequencies
+        rope_theta, _, _ = get_rope_config(config)
         rope_freqs = precompute_freqs_cis(
             qk_rope_head_dim=config.qk_rope_head_dim,
             max_seq_len=config.max_position_embeddings,
-            rope_theta=config.rope_theta,
+            rope_theta=rope_theta,
             rope_scaling=getattr(config, "rope_scaling", None),
         ).to(device)
 
         attn_no_cp = MLA(config, backend).to(device).to(torch.bfloat16)
         attn_with_cp = MLA(config, backend).to(device).to(torch.bfloat16)
 
-        def get_freqs_cis(position_ids, qkv_format):
-            return freqs_cis_from_position_ids(position_ids, rope_freqs)
+        def get_freqs_cis(position_ids, qkv_format, cp_size=1):
+            return freqs_cis_from_position_ids(position_ids, rope_freqs, qkv_format=qkv_format, for_fused_rope=True, cp_size=cp_size)
+
+    elif model_type == "nemotron_v3":
+
+        class MockNemotronV3AttentionConfig:
+            def __init__(self):
+                self.num_attention_heads = 8
+                self.num_key_value_heads = 4
+                self.head_dim = 32
+                self.hidden_size = 256
+                self.attention_bias = False
+                self.attention_dropout = 0.0
+
+        config = MockNemotronV3AttentionConfig()
+        return config, None, None, None
 
     else:
         raise ValueError(f"Unknown model type: {model_type}")
@@ -222,11 +346,143 @@ def get_model_config_and_attention(model_type, device):
     return config, attn_no_cp, attn_with_cp, get_freqs_cis
 
 
-def run_test(model_type):
-    """Run the CP validation test for the specified model type."""
-    world_size = get_world_size()
-    rank = get_rank()
+# ---------------------------------------------------------------------------
+# NemotronV3 attention pair creation
+# ---------------------------------------------------------------------------
 
+def _create_nemotron_v3_attn_pair(config, backend, device):
+    """Create a pair of identical NemotronV3Attention modules with synced weights."""
+    from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Attention
+
+    attn_baseline = NemotronV3Attention(config, backend).to(device).to(torch.bfloat16)
+    attn_cp = NemotronV3Attention(config, backend).to(device).to(torch.bfloat16)
+    attn_baseline.train()
+    attn_cp.train()
+    attn_cp.load_state_dict(attn_baseline.state_dict())
+
+    for p_base, p_cp in zip(attn_baseline.parameters(), attn_cp.parameters()):
+        dist.broadcast(p_base.data, src=0)
+        dist.broadcast(p_cp.data, src=0)
+
+    return attn_baseline, attn_cp
+
+
+# ---------------------------------------------------------------------------
+# Config: bshd_te
+# ---------------------------------------------------------------------------
+
+def run_bshd_te(model_type, config, rank, world_size, device,
+                attn_no_cp=None, attn_with_cp=None, get_freqs_cis=None):
+    """3D BSHD input with TE p2p CP and DualChunkSwap.
+
+    Only supported for nemotron_v3 (qwen3_moe / deepseek_v3 do not use this config).
+    """
+    if model_type != "nemotron_v3":
+        raise ValueError(f"bshd_te config is only supported for nemotron_v3, got {model_type}")
+
+    from nemo_automodel.components.models.common import BackendConfig
+
+    backend = BackendConfig(linear="torch", attn="te")
+    attn_baseline, attn_cp = _create_nemotron_v3_attn_pair(config, backend, device)
+
+    batch_size, seq_len = 2, 128
+    torch.manual_seed(42)
+    x_full = torch.randn(batch_size, seq_len, config.hidden_size, device=device, dtype=torch.bfloat16)
+    dist.broadcast(x_full, src=0)
+
+    # Baseline: CP=1
+    x_no_cp = x_full.detach().clone().requires_grad_(True)
+    output_baseline = attn_baseline(x_no_cp)
+    output_baseline.sum().backward()
+    out_base = output_baseline.detach().clone()
+    grad_base = x_no_cp.grad.detach().clone()
+    param_grad_base = attn_baseline.q_proj.weight.grad.detach().clone()
+    dist.barrier()
+
+    # CP=2
+    from torch.distributed.device_mesh import init_device_mesh
+    from transformer_engine.pytorch.attention import DotProductAttention
+
+    cp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))
+    cp_group = cp_mesh["cp"].get_group()
+
+    assert isinstance(attn_cp.attn_module, DotProductAttention)
+    attn_cp.attn_module.set_context_parallel_group(
+        cp_group,
+        torch.distributed.get_process_group_ranks(cp_group),
+        torch.cuda.Stream(),
+        cp_comm_type="p2p",
+    )
+
+    import transformer_engine.pytorch  # noqa: F401
+    import transformer_engine_torch as tex
+
+    cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+    indices = tex.thd_get_partitioned_indices(cu_seqlens, seq_len, world_size, rank)
+    x_local = x_full[:, indices, :].detach().clone().requires_grad_(True)
+    local_seq = x_local.shape[1]
+
+    output_cp = attn_cp(x_local)
+    output_cp.sum().backward()
+
+    output_gathered = [
+        torch.zeros(batch_size, local_seq, config.hidden_size, device=device, dtype=torch.bfloat16)
+        for _ in range(world_size)
+    ]
+    grad_gathered = [
+        torch.zeros(batch_size, local_seq, config.hidden_size, device=device, dtype=torch.bfloat16)
+        for _ in range(world_size)
+    ]
+    dist.all_gather(output_gathered, output_cp.contiguous())
+    dist.all_gather(grad_gathered, x_local.grad.contiguous())
+
+    out_cp_full = dual_chunk_swap_unsplit(output_gathered, cp_size=world_size, seq_dim=1)
+    grad_cp_full = dual_chunk_swap_unsplit(grad_gathered, cp_size=world_size, seq_dim=1)
+
+    param_grad_cp = attn_cp.q_proj.weight.grad.detach().clone()
+    dist.all_reduce(param_grad_cp, op=dist.ReduceOp.SUM)
+
+    return _compare_results(
+        "bshd_te",
+        model_type,
+        rank,
+        out_cp_full,
+        out_base,
+        grad_cp_full,
+        grad_base,
+        param_grad_cp,
+        param_grad_base,
+        "q_proj.weight",
+        output_atol=1e-2,
+        output_rtol=1e-2,
+        grad_atol=5e-2,
+        grad_rtol=1e-2,
+        param_atol=5e-2,
+        param_rtol=5e-2,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Config: thd_te
+# ---------------------------------------------------------------------------
+
+def run_thd_te(model_type, config, rank, world_size, device,
+               attn_no_cp=None, attn_with_cp=None, get_freqs_cis=None):
+    """THD input with TE p2p CP.
+
+    For qwen3_moe / deepseek_v3: uses make_cp_batch_for_te + apply_cp flow.
+    For nemotron_v3: uses set_context_parallel_group + DualChunkSwap flow.
+    """
+    if model_type == "nemotron_v3":
+        return _run_thd_te_nemotron_v3(config, rank, world_size, device)
+    else:
+        return _run_thd_te_qwen_deepseek(model_type, config, rank, world_size, device,
+                                         attn_no_cp, attn_with_cp, get_freqs_cis)
+
+
+def _run_thd_te_qwen_deepseek(model_type, config, rank, world_size, device,
+                               attn_no_cp, attn_with_cp, get_freqs_cis):
+    """THD test flow for qwen3_moe / deepseek_v3 (preserves original run_test behavior)."""
     try:
         import transformer_engine.pytorch  # This creates transformer_engine_torch module
         import transformer_engine_torch as tex
@@ -234,20 +490,6 @@ def run_test(model_type):
         if rank == 0:
             print("ERROR: transformer_engine is required but not installed", file=sys.stderr)
         return 1
-
-    if world_size != 2:
-        if rank == 0:
-            print(f"ERROR: This test requires exactly 2 GPUs, got {world_size}", file=sys.stderr)
-        return 1
-
-    device = torch.device(f"cuda:{rank}")
-
-    # Set seeds for reproducibility
-    torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
-
-    # Get model configuration and attention layers
-    config, attn_no_cp, attn_with_cp, get_freqs_cis = get_model_config_and_attention(model_type, device)
 
     # Set to eval mode to avoid dropout
     attn_no_cp.eval()
@@ -308,6 +550,21 @@ def run_test(model_type):
     output_baseline = output_no_cp.detach().clone()
     grad_baseline = x_no_cp.grad.detach().clone()
 
+    # Get a param grad for comparison
+    param_name = "q_proj.weight"
+    param_grad_baseline = None
+    for name, p in attn_no_cp.named_parameters():
+        if name == param_name:
+            param_grad_baseline = p.grad.detach().clone()
+            break
+    if param_grad_baseline is None:
+        # Fallback: use first parameter with grad
+        for name, p in attn_no_cp.named_parameters():
+            if p.grad is not None:
+                param_name = name
+                param_grad_baseline = p.grad.detach().clone()
+                break
+
     dist.barrier()
 
     # ===== Test: CP=2 (context parallelism enabled) =====
@@ -322,6 +579,7 @@ def run_test(model_type):
         def __init__(self, attn_layer):
             super().__init__()
             self.self_attn = attn_layer
+            self.mlp = None
 
     class DummyModel(torch.nn.Module):
         def __init__(self, attn_layer):
@@ -370,7 +628,9 @@ def run_test(model_type):
         end_idx = start_idx + total_tokens_with_cp
         x_with_cp = x_full[start_idx:end_idx].clone().detach().requires_grad_(True)
 
-    freqs_cis_with_cp = get_freqs_cis(batch_with_cp["position_ids"], qkv_format="thd")
+    cp_size = batch_with_cp.get("cp_size", 1)
+    cp_rank = batch_with_cp.get("cp_rank", 0)
+    freqs_cis_with_cp = get_freqs_cis(batch_with_cp["position_ids"], qkv_format="thd", cp_size=cp_size)
 
     # Compute max_seqlen from cu_seqlens if not present
     if "max_seqlen" not in batch_with_cp:
@@ -387,6 +647,8 @@ def run_test(model_type):
         cu_seqlens=batch_with_cp["cu_seqlens"],
         max_seqlen=max_seqlen_with_cp,
         qkv_format=batch_with_cp.get("qkv_format", "thd"),
+        cp_size=cp_size,
+        cp_rank=cp_rank,
     )
 
     loss_with_cp = output_with_cp.sum()
@@ -419,50 +681,227 @@ def run_test(model_type):
     output_with_cp_full[indices_concat] = output_with_cp_concat
     grad_with_cp_full[indices_concat] = grad_with_cp_concat
 
-    # Compare outputs and gradients
-    if rank == 0:
-        output_diff = (output_with_cp_full - output_baseline).abs()
-        grad_diff = (grad_with_cp_full - grad_baseline).abs()
+    # Get param grad for CP run (all-reduce across CP ranks since each rank
+    # only computes gradients for its local sequence shard)
+    param_grad_cp = None
+    for name, p in attn_with_cp.named_parameters():
+        if name == param_name:
+            param_grad_cp = p.grad.detach().clone()
+            break
+    if param_grad_cp is None:
+        for name, p in attn_with_cp.named_parameters():
+            if p.grad is not None:
+                param_name = name
+                param_grad_cp = p.grad.detach().clone()
+                break
+    if param_grad_cp is not None:
+        dist.all_reduce(param_grad_cp, op=dist.ReduceOp.SUM)
 
-        print(f"\n{'='*70}")
-        print(f"Context Parallelism Validation Test - {model_type.upper()}")
-        print(f"{'='*70}")
-        print(f"Output shape: CP={output_with_cp_full.shape}, Baseline={output_baseline.shape}")
-        print(f"Output diff - mean: {output_diff.mean():.6f}, max: {output_diff.max():.6f}, std: {output_diff.std():.6f}")
-        print(f"Output relative diff - mean: {(output_diff / (output_baseline.abs() + 1e-8)).mean():.6f}")
-        print("\nGradient statistics:")
-        print(f"  Baseline - min: {grad_baseline.abs().min():.6f}, max: {grad_baseline.abs().max():.6f}, mean: {grad_baseline.abs().mean():.6f}")
-        print(f"  CP       - min: {grad_with_cp_full.abs().min():.6f}, max: {grad_with_cp_full.abs().max():.6f}, mean: {grad_with_cp_full.abs().mean():.6f}")
-        print(f"Grad diff - mean: {grad_diff.mean():.6f}, max: {grad_diff.max():.6f}, std: {grad_diff.std():.6f}")
+    return _compare_results(
+        "thd_te",
+        model_type,
+        rank,
+        output_with_cp_full,
+        output_baseline,
+        grad_with_cp_full,
+        grad_baseline,
+        param_grad_cp,
+        param_grad_baseline,
+        param_name,
+        output_atol=0.01,
+        output_rtol=1e-2,
+        grad_atol=0.05,
+        grad_rtol=2e-2,
+        param_atol=0.05,
+        param_rtol=2e-2,
+    )
 
-    try:
-        torch.testing.assert_close(
-            output_with_cp_full,
-            output_baseline,
-            rtol=1e-2,
-            atol=0.01,
-            msg=f"[Rank {rank}] Forward outputs differ between CP=1 and CP=2",
-        )
 
-        torch.testing.assert_close(
-            grad_with_cp_full,
-            grad_baseline,
-            rtol=2e-2,
-            atol=0.05,
-            msg=f"[Rank {rank}] Gradients differ between CP=1 and CP=2",
-        )
+def _run_thd_te_nemotron_v3(config, rank, world_size, device):
+    """THD test flow for nemotron_v3 (DualChunkSwap + set_context_parallel_group)."""
+    from nemo_automodel.components.models.common import BackendConfig
 
-        if rank == 0:
-            print("✓ Test PASSED: Forward outputs and gradients match between CP=1 and CP=2")
-            print(f"{'='*70}\n")
-        return 0
+    backend = BackendConfig(linear="torch", attn="te")
+    attn_baseline, attn_cp = _create_nemotron_v3_attn_pair(config, backend, device)
 
-    except AssertionError as e:
-        if rank == 0:
-            print(f"✗ Test FAILED: {e}")
-            print("Note: Some numerical differences are expected with bfloat16 precision")
-            print(f"{'='*70}\n")
-        return 1
+    batch_size, seq_len = 1, 128
+    torch.manual_seed(42)
+    x_full = torch.randn(batch_size, seq_len, config.hidden_size, device=device, dtype=torch.bfloat16)
+    dist.broadcast(x_full, src=0)
+
+    # Baseline: run in 3D BSHD (batch=1) so the TE attention path is identical
+    # to CP aside from the CP gather/scatter.
+    x_no_cp = x_full.detach().clone().requires_grad_(True)  # [1, T, H]
+    output_baseline = attn_baseline(x_no_cp)
+    output_baseline.sum().backward()
+    out_base = output_baseline.detach().clone()
+    grad_base = x_no_cp.grad.detach().clone()
+    param_grad_base = attn_baseline.q_proj.weight.grad.detach().clone()
+    dist.barrier()
+
+    # CP=2
+    from torch.distributed.device_mesh import init_device_mesh
+    from transformer_engine.pytorch.attention import DotProductAttention
+
+    cp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))
+    cp_group = cp_mesh["cp"].get_group()
+
+    assert isinstance(attn_cp.attn_module, DotProductAttention)
+    attn_cp.attn_module.set_context_parallel_group(
+        cp_group,
+        torch.distributed.get_process_group_ranks(cp_group),
+        torch.cuda.Stream(),
+        cp_comm_type="p2p",
+    )
+
+    import transformer_engine.pytorch  # noqa: F401
+    import transformer_engine_torch as tex
+
+    cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+    indices = tex.thd_get_partitioned_indices(cu_seqlens, seq_len, world_size, rank)
+    x_local = x_full[:, indices, :].detach().clone().requires_grad_(True)  # [1, T/cp, H]
+    local_len = x_local.shape[1]
+
+    output_cp = attn_cp(x_local)
+    output_cp.sum().backward()
+
+    # Gather 3D outputs (seq_dim=1 for BSHD)
+    output_gathered = [
+        torch.zeros(batch_size, local_len, config.hidden_size, device=device, dtype=torch.bfloat16)
+        for _ in range(world_size)
+    ]
+    grad_gathered = [
+        torch.zeros(batch_size, local_len, config.hidden_size, device=device, dtype=torch.bfloat16)
+        for _ in range(world_size)
+    ]
+    dist.all_gather(output_gathered, output_cp.contiguous())
+    dist.all_gather(grad_gathered, x_local.grad.contiguous())
+
+    out_cp_full = dual_chunk_swap_unsplit(output_gathered, cp_size=world_size, seq_dim=1)
+    grad_cp_full = dual_chunk_swap_unsplit(grad_gathered, cp_size=world_size, seq_dim=1)
+
+    param_grad_cp = attn_cp.q_proj.weight.grad.detach().clone()
+    dist.all_reduce(param_grad_cp, op=dist.ReduceOp.SUM)
+
+    return _compare_results(
+        "thd_te",
+        "nemotron_v3",
+        rank,
+        out_cp_full,
+        out_base,
+        grad_cp_full,
+        grad_base,
+        param_grad_cp,
+        param_grad_base,
+        "q_proj.weight",
+        output_atol=1e-2,
+        output_rtol=1e-2,
+        grad_atol=5e-2,
+        grad_rtol=1e-2,
+        param_atol=5e-2,
+        param_rtol=5e-2,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Config: bshd_sdpa
+# ---------------------------------------------------------------------------
+
+def run_bshd_sdpa(model_type, config, rank, world_size, device,
+                  attn_no_cp=None, attn_with_cp=None, get_freqs_cis=None):
+    """3D BSHD input with DTensor context_parallel() and SDPA backend.
+
+    Only supported for nemotron_v3 (qwen3_moe / deepseek_v3 do not use this config).
+    """
+    if model_type != "nemotron_v3":
+        raise ValueError(f"bshd_sdpa config is only supported for nemotron_v3, got {model_type}")
+
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor.experimental import context_parallel
+    from torch.distributed.tensor.experimental._attention import context_parallel_unshard, set_rotate_method
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    from nemo_automodel.components.models.common import BackendConfig
+
+    backend = BackendConfig(linear="torch", attn="sdpa")
+    attn_baseline, attn_cp = _create_nemotron_v3_attn_pair(config, backend, device)
+
+    batch_size, seq_len = 2, 128
+    torch.manual_seed(42)
+    x_full = torch.randn(batch_size, seq_len, config.hidden_size, device=device, dtype=torch.bfloat16)
+    dist.broadcast(x_full, src=0)
+
+    # Baseline
+    x_no_cp = x_full.detach().clone().requires_grad_(True)
+    output_baseline = attn_baseline(x_no_cp)
+    output_baseline.sum().backward()
+    out_base = output_baseline.detach().clone()
+    grad_base = x_no_cp.grad.detach().clone()
+    param_grad_base = attn_baseline.q_proj.weight.grad.detach().clone()
+    dist.barrier()
+
+    # CP=2 with SDPA + context_parallel
+    cp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))
+    set_rotate_method("allgather")
+
+    # context_parallel() shards the full-sequence buffer itself, so pass the
+    # complete tensor (not a pre-sharded chunk).  It also cannot handle buffers
+    # that require grad, so enable grad only after entering the context.
+    x_cp = x_full.detach().clone()
+
+    cp_ctx = context_parallel(
+        cp_mesh,
+        buffers=[x_cp],
+        buffer_seq_dims=[1],
+        no_restore_buffers={x_cp},
+    )
+    with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
+        with cp_ctx:
+            x_cp.requires_grad_(True)
+            output_cp = attn_cp(x_cp)
+            output_cp.sum().backward()
+
+    # After context_parallel, x_cp and output_cp hold the local shard.
+    # Use context_parallel_unshard to reconstruct the full sequence with
+    # correct token ordering (undoes the head-tail load-balancing).
+    out_cp_full, grad_cp_full = context_parallel_unshard(
+        cp_mesh,
+        [output_cp.detach(), x_cp.grad],
+        seq_dims=[1, 1],
+    )
+
+    param_grad_cp = attn_cp.q_proj.weight.grad.detach().clone()
+    dist.all_reduce(param_grad_cp, op=dist.ReduceOp.SUM)
+
+    return _compare_results(
+        "bshd_sdpa",
+        "nemotron_v3",
+        rank,
+        out_cp_full,
+        out_base,
+        grad_cp_full,
+        grad_base,
+        param_grad_cp,
+        param_grad_base,
+        "q_proj.weight",
+        output_atol=1e-2,
+        output_rtol=1e-2,
+        grad_atol=5e-2,
+        grad_rtol=2e-2,
+        param_atol=5e-2,
+        param_rtol=5e-2,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+CONFIG_RUNNERS = {
+    "bshd_te": run_bshd_te,
+    "thd_te": run_thd_te,
+    "bshd_sdpa": run_bshd_sdpa,
+}
 
 
 def main():
@@ -471,22 +910,83 @@ def main():
         "--model_type",
         type=str,
         required=True,
-        choices=["qwen3_moe", "deepseek_v3"],
+        choices=["qwen3_moe", "deepseek_v3", "nemotron_v3"],
         help="Model type to test",
     )
+    parser.add_argument(
+        "--configs",
+        nargs="+",
+        default=None,
+        choices=["bshd_te", "thd_te", "bshd_sdpa"],
+        help="Which configs to run. Defaults: nemotron_v3 -> all three; others -> thd_te only.",
+    )
     args = parser.parse_args()
+
+    # Default configs per model type
+    if args.configs is None:
+        if args.model_type == "nemotron_v3":
+            args.configs = ["bshd_te", "thd_te", "bshd_sdpa"]
+        else:
+            args.configs = ["thd_te"]
 
     # Initialize distributed
     init_distributed()
 
-    # Run test
-    exit_code = run_test(args.model_type)
+    world_size = get_world_size()
+    rank = get_rank()
+
+    if world_size != 2:
+        if rank == 0:
+            print(f"ERROR: This test requires exactly 2 GPUs, got {world_size}", file=sys.stderr)
+        sys.exit(1)
+
+    device = torch.device(f"cuda:{rank}")
+
+    # Set seeds for reproducibility
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+
+    # Get model configuration and attention layers
+    config, attn_no_cp, attn_with_cp, get_freqs_cis = get_model_config_and_attention(
+        args.model_type, device
+    )
+
+    # Run selected configs and collect results
+    results = {}
+    for config_name in args.configs:
+        dist.barrier()
+        runner = CONFIG_RUNNERS[config_name]
+        try:
+            results[config_name] = runner(
+                args.model_type, config, rank, world_size, device,
+                attn_no_cp=attn_no_cp,
+                attn_with_cp=attn_with_cp,
+                get_freqs_cis=get_freqs_cis,
+            )
+        except Exception as e:
+            if rank == 0:
+                import traceback
+
+                print(f"  {config_name}: ERROR - {e}")
+                traceback.print_exc()
+            results[config_name] = 1
+
+    # Print summary table
+    if rank == 0:
+        print(f"\n{'=' * 70}")
+        print(f"Summary - {args.model_type} CP Tests")
+        print(f"{'=' * 70}")
+        for name, result in results.items():
+            status = "PASSED" if result == 0 else "FAILED"
+            print(f"  {name}: {status}")
+        print(f"{'=' * 70}\n")
 
     # Cleanup
     if is_distributed():
         dist.barrier()
+        dist.destroy_process_group()
 
-    sys.exit(exit_code)
+    sys.exit(1 if any(r != 0 for r in results.values()) else 0)
 
 
 if __name__ == "__main__":

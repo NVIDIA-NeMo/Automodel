@@ -297,13 +297,13 @@ def run_thd_te(rank, world_size, device, config):
     import transformer_engine.pytorch  # noqa: F401
     import transformer_engine_torch as tex
 
+    # cu_seqlens is GLOBAL (pre-TE-partitioning) — matches the convention in the recipe batch.
     cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
     indices = tex.thd_get_partitioned_indices(cu_seqlens, seq_len, world_size, rank)
     x_local = x_full.squeeze(0)[indices].detach().clone().requires_grad_(True)  # [T/cp, H]
     local_len = x_local.shape[0]
 
-    cu_seqlens_local = torch.tensor([0, local_len], dtype=torch.int32, device=device)
-    output_cp = mixer_cp(x_local, cu_seqlens=cu_seqlens_local)
+    output_cp = mixer_cp(x_local, cu_seqlens=cu_seqlens)
     output_cp.sum().backward()
 
     # Gather 2D outputs (seq_dim=0 for THD)
@@ -394,12 +394,9 @@ def run_thd_te_packed(rank, world_size, device, config):
     x_local = x_full_2d[indices].detach().clone().requires_grad_(True)
     local_len = x_local.shape[0]
 
-    # Build local cu_seqlens: each sequence is halved by CP
-    local_seq_a = seq_len_a // world_size
-    local_seq_b = seq_len_b // world_size
-    cu_seqlens_local = torch.tensor([0, local_seq_a, local_seq_a + local_seq_b], dtype=torch.int32, device=device)
-
-    output_cp = mixer_cp(x_local, cu_seqlens=cu_seqlens_local)
+    # Pass GLOBAL cu_seqlens to mixer — matches the convention in the recipe batch.
+    # MambaContextParallel derives local cu_seqlens internally.
+    output_cp = mixer_cp(x_local, cu_seqlens=cu_seqlens_full)
     output_cp.sum().backward()
 
     # Gather 2D outputs
@@ -412,6 +409,10 @@ def run_thd_te_packed(rank, world_size, device, config):
     dist.all_gather(output_gathered, output_cp.contiguous())
     dist.all_gather(grad_gathered, x_local.grad.contiguous())
 
+    # dual_chunk_swap_unsplit needs LOCAL cu_seqlens (per-rank boundaries).
+    local_seq_a = seq_len_a // world_size
+    local_seq_b = seq_len_b // world_size
+    cu_seqlens_local = torch.tensor([0, local_seq_a, local_seq_a + local_seq_b], dtype=torch.int32, device=device)
     out_cp_full = dual_chunk_swap_unsplit(output_gathered, cp_size=world_size, seq_dim=0, cu_seqlens=cu_seqlens_local)
     grad_cp_full = dual_chunk_swap_unsplit(grad_gathered, cp_size=world_size, seq_dim=0, cu_seqlens=cu_seqlens_local)
 

@@ -396,15 +396,21 @@ class MambaContextParallel:
         # per sequence).  Undo DualChunkSwap so the SSM kernel sees tokens in
         # their true sequential order.
         if cu_seqlens is not None:
+            # cu_seqlens from the batch is GLOBAL (pre-TE-partitioning).
+            # After TE CP sharding each sequence has L/cp_size local tokens,
+            # so derive local cu_seqlens for the deinterleave which operates
+            # on the all-to-all output (cp_size local chunks per sequence).
+            cu_seqlens_local = cu_seqlens // self.cp_size
             # For packed data (multiple sequences), the all-to-all produces a
             # rank-major layout where sequences from different ranks are
             # interleaved.  Deinterleave so each sequence is contiguous
             # before applying the DualChunkSwap undo.
-            result = _deinterleave_packed_seqs(result, cu_seqlens, self.cp_size)
-            cu_seqlens_global = cu_seqlens * self.cp_size
+            result = _deinterleave_packed_seqs(result, cu_seqlens_local, self.cp_size)
+            cu_seqlens_global = cu_seqlens  # already global
         else:
             cu_seqlens_global = None
         result = _undo_attention_load_balancing(result, self.cp_size, cu_seqlens=cu_seqlens_global)
+
         return result
 
     def post_conv_ssm(
@@ -420,14 +426,17 @@ class MambaContextParallel:
         # Redo DualChunkSwap before the inverse all-to-all so that the
         # sequence-parallel layout matches what attention layers expect.
         if cu_seqlens is not None:
-            cu_seqlens_global = cu_seqlens * self.cp_size
+            # cu_seqlens from the batch is GLOBAL (pre-TE-partitioning).
+            cu_seqlens_global = cu_seqlens  # already global
+            cu_seqlens_local = cu_seqlens // self.cp_size
         else:
             cu_seqlens_global = None
+            cu_seqlens_local = None
         output = _redo_attention_load_balancing(output, self.cp_size, cu_seqlens=cu_seqlens_global)
-        if cu_seqlens is not None:
+        if cu_seqlens_local is not None:
             # Reverse the deinterleaving done in pre_conv_ssm so that the
             # inverse all-to-all restores the original per-rank layout.
-            output = _reinterleave_packed_seqs(output, cu_seqlens, self.cp_size)
+            output = _reinterleave_packed_seqs(output, cu_seqlens_local, self.cp_size)
         return _all_to_all_hp2cp(output, self.cp_group, B)
 
     # ------------------------------------------------------------------ #
