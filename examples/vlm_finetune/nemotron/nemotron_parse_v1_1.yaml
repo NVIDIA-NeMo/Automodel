@@ -99,3 +99,6 @@ freeze_config:
 #   project: <your_project_name>  
 #   entity: <your_entity_name>
 #   name: <your_experiment_name>
+
+ci:
+  time: "00:30:00"
