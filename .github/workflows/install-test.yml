@@ -200,7 +200,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: ["ubuntu-latest", "macos-latest"]
+        arch: [${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}, "macos-latest"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
