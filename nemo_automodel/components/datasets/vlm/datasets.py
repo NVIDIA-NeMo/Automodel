@@ -27,6 +27,7 @@ from PIL import Image
 
 from nemo_automodel.components.datasets.vlm.utils import (
     _build_video_metadata,
+    _lmdb_env_cache,
     _preload_media,
     json2token,
 )
