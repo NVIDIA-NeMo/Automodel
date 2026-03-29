@@ -98,7 +98,8 @@ def get_unpad_data(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Te
 
 
 def _passthrough_create_causal_mask(
-    config, input_embeds, attention_mask, cache_position, past_key_values, position_ids, **kwargs
+    config=None, input_embeds=None, inputs_embeds=None, attention_mask=None,
+    cache_position=None, past_key_values=None, position_ids=None, **kwargs
 ):
     """Replacement for ``create_causal_mask`` that returns the mask unchanged."""
     return attention_mask
@@ -122,6 +123,7 @@ _PACKING_PATCH_MODULES = [
     "transformers.models.qwen2.modeling_qwen2",
     "transformers.models.qwen2_5_vl.modeling_qwen2_5_vl",
     "transformers.models.qwen2_vl.modeling_qwen2_vl",
+    "transformers.models.qwen3_5.modeling_qwen3_5",
     "transformers.models.qwen3_vl.modeling_qwen3_vl",
     "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
 ]
