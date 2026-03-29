@@ -80,10 +80,13 @@ def inject_fake_image_into_conversation(conversation):
                 message["content"] = [{"type": "image", "image": _FAKE_IMAGE}]
             return conversation
     # No user message found - prepend one with just the fake image.
-    conversation.insert(0, {
-        "role": "user",
-        "content": [{"type": "image", "image": _FAKE_IMAGE}],
-    })
+    conversation.insert(
+        0,
+        {
+            "role": "user",
+            "content": [{"type": "image", "image": _FAKE_IMAGE}],
+        },
+    )
     return conversation
 
 

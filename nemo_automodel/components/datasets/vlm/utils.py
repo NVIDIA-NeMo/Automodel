@@ -183,7 +183,8 @@ def _preload_media(example, processor=None, preserve_video_metadata=False):
                 if isinstance(vid, str):
                     if preserve_video_metadata:
                         frames, fps, indices = _read_video_frames(
-                            vid, processor,
+                            vid,
+                            processor,
                             frame_indices=item.get("frame_indices"),
                             return_metadata=True,
                         )
@@ -192,7 +193,8 @@ def _preload_media(example, processor=None, preserve_video_metadata=False):
                         item["_frame_indices"] = indices
                     else:
                         item["video"] = _read_video_frames(
-                            vid, processor,
+                            vid,
+                            processor,
                             frame_indices=item.get("frame_indices"),
                         )
     return example
@@ -221,11 +223,13 @@ def _build_video_metadata(conversation):
             indices = item.get("_frame_indices")
             video = item.get("video")
             if fps is not None and indices is not None and video is not None:
-                metadata_list.append(VideoMetadata(
-                    total_num_frames=len(video),
-                    fps=fps,
-                    frames_indices=list(indices),
-                ))
+                metadata_list.append(
+                    VideoMetadata(
+                        total_num_frames=len(video),
+                        fps=fps,
+                        frames_indices=list(indices),
+                    )
+                )
     return metadata_list
 
 
