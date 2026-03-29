@@ -214,7 +214,7 @@ jobs:
           dockerfile-path: "./docker/Dockerfile"
           has-azure-credentials: "true"
           PAT: ${{ secrets.PAT }}
-          repo-name: ${{ vars.CI_CONTAINER_NAME || 'automodel' }}
+          repo-name: ${{ vars.CI_REPO_NAME || 'Automodel' }}
 
   cicd-unit-tests:
     strategy:
