@@ -105,6 +105,13 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.nemotron_v3.model", "NemotronHForCausalLM"),
         ),
         (
+            "NemotronH_Nano_VL_V2",
+            (
+                "nemo_automodel.components.models.nemotron_omni.model",
+                "NemotronOmniForConditionalGeneration",
+            ),
+        ),
+        (
             "NemotronParseForConditionalGeneration",
             ("nemo_automodel.components.models.nemotron_parse.model", "NemotronParseForConditionalGeneration"),
         ),

@@ -1043,11 +1043,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         hidden_states=out.hidden_states[-1]
                         if getattr(out, "hidden_states", None) is not None
                         else None,
-                        num_label_tokens=num_label_tokens,
+                        num_label_tokens=max(num_label_tokens, 1),
                     )
                     total_num_label_tokens += num_label_tokens
 
-                total_loss += local_loss.item() * num_label_tokens
+                if num_label_tokens > 0:
+                    total_loss += local_loss.item() * num_label_tokens
                 total_tokens += num_label_tokens
 
         # Aggregate across ranks if distributed is initialized

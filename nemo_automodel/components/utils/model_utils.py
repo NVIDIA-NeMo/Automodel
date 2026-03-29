@@ -243,7 +243,7 @@ def apply_parameter_freezing(model, freeze_config):
 
     # Freeze audio tower
     if freeze_audio_tower:
-        _freeze_module_by_attribute_and_patterns(model, "audio_tower", ["audio", "audio_encoder", "speech"])
+        _freeze_module_by_attribute_and_patterns(model, "audio_tower", ["audio", "audio_encoder", "speech", "sound"])
 
     # Freeze language model backbone
     if freeze_language_model:

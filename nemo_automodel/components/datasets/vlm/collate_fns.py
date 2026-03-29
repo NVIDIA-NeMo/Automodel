@@ -813,6 +813,205 @@ def neat_packed_vlm_collater(
     return result
 
 
+_nemotron_omni_collate_call_count = 0  # DEBUG: activation dump
+_COLLATE_DUMP_DIR = "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/nemotronomni/activation_dumps"  # DEBUG: activation dump
+
+
+def nemotron_omni_collate_fn(
+    examples: Sequence[Dict[str, Any]],
+    processor,
+    max_length: Optional[int] = None,
+) -> Dict[str, torch.Tensor]:
+    """Collate function for NemotronOmni (NemotronH_Nano_VL_V2) model.
+
+    This model uses InternVL-style image tagging where images are split into
+    dynamic tiles and <image> tokens in the input are replaced with vision
+    embeddings during forward pass.
+
+    The processor (NemotronNanoVLV2Processor) handles:
+    - Image preprocessing (dynamic tiling, normalization)
+    - Token expansion (<image> -> <img> + N*<image> + </img>)
+    - Tokenization
+
+    This collate function:
+    1. Extracts conversations and images from examples
+    2. Applies chat template and processes through the processor
+    3. Builds image_flags tensor (1 for real images, 0 for padding in batch)
+    4. Creates labels masking non-assistant tokens with -100
+
+    Args:
+        examples: List of dataset examples with 'conversation' key
+        processor: NemotronNanoVLV2Processor instance
+        max_length: Optional max sequence length for truncation
+
+    Returns:
+        Dict with input_ids, attention_mask, pixel_values, image_flags, labels
+    """
+    conversations = _ensure_rgb([example["conversation"] for example in examples])
+    tokenizer = getattr(processor, "tokenizer", processor)
+    image_token = getattr(processor, "image_token", "<image>")
+
+    # Collect images and build text prompts
+    all_images: List[Any] = []
+    texts: List[str] = []
+
+    for conversation in conversations:
+        # Extract images and convert multimodal content to text with <image> tokens.
+        # The NemotronOmni chat template does not natively handle {'type': 'image'}
+        # content items, so we replace them with the <image> text token and collect
+        # the PIL images separately for the processor.
+        conv_images = []
+        text_conversation = []
+        for message in conversation:
+            content = message.get("content")
+            if isinstance(content, list):
+                # Multimodal message: flatten image items to <image> token and
+                # concatenate text items.
+                text_parts = []
+                for item in content:
+                    if isinstance(item, dict):
+                        if item.get("type") == "image":
+                            img = item.get("image")
+                            if img is not None:
+                                conv_images.append(img)
+                                text_parts.append(image_token)
+                        elif item.get("type") == "text":
+                            text_parts.append(item.get("text", ""))
+                text_conversation.append({
+                    "role": message["role"],
+                    "content": "".join(text_parts),
+                })
+            else:
+                text_conversation.append(message)
+
+        all_images.append(conv_images)
+
+        # Apply chat template to get text with <image> tokens
+        text = tokenizer.apply_chat_template(text_conversation, tokenize=False)
+        texts.append(text)
+
+    # Process each sample individually to handle variable image counts.
+    # Track per-sample pixel_values so we can trim after truncation.
+    all_input_ids = []
+    all_attention_masks = []
+    sample_pixel_values: Dict[int, torch.Tensor] = {}  # sample_idx -> pixel_values
+
+    for i, (text, images) in enumerate(zip(texts, all_images)):
+        processor_kwargs = {
+            "text": text,
+            "return_tensors": "pt",
+            "padding": False,
+        }
+        if images:
+            processor_kwargs["images"] = images
+
+        batch_i = processor(**processor_kwargs)
+        all_input_ids.append(batch_i["input_ids"][0])
+        all_attention_masks.append(batch_i["attention_mask"][0])
+
+        if "pixel_values" in batch_i and batch_i["pixel_values"] is not None:
+            sample_pixel_values[i] = batch_i["pixel_values"]
+
+    # Determine pad token and target length
+    pad_token_id = getattr(tokenizer, "pad_token_id", None) or 0
+    seq_lengths = [ids.shape[0] for ids in all_input_ids]
+    target_len = max_length if max_length is not None else max(seq_lengths)
+
+    # Pad/truncate sequences
+    padded_input_ids = []
+    padded_attention_masks = []
+    for input_ids, attn_mask in zip(all_input_ids, all_attention_masks):
+        seq_len = input_ids.shape[0]
+        if seq_len < target_len:
+            pad_len = target_len - seq_len
+            input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_token_id, dtype=input_ids.dtype)])
+            attn_mask = torch.cat([attn_mask, torch.zeros(pad_len, dtype=attn_mask.dtype)])
+        elif seq_len > target_len:
+            input_ids = input_ids[:target_len]
+            attn_mask = attn_mask[:target_len]
+        padded_input_ids.append(input_ids)
+        padded_attention_masks.append(attn_mask)
+
+    result = {
+        "input_ids": torch.stack(padded_input_ids),
+        "attention_mask": torch.stack(padded_attention_masks),
+    }
+
+    # After truncation, align pixel_values and <image> tokens per sample.
+    # Each tile generates num_image_token <image> tokens. If truncation removed some
+    # tokens, we: (1) keep only complete tiles, (2) replace leftover partial-tile
+    # <image> tokens with pad_token_id so the counts match exactly.
+    img_context_token_id = 18  # from model config
+    num_image_token = 256  # (force_image_size/patch_size)^2 * downsample_ratio^2 = (512/16)^2 * 0.25
+    adjusted_pixel_values = []
+    for i in range(len(padded_input_ids)):
+        if i in sample_pixel_values:
+            remaining_img_tokens = (padded_input_ids[i] == img_context_token_id).sum().item()
+            surviving_tiles = remaining_img_tokens // num_image_token
+            expected_tokens = surviving_tiles * num_image_token
+            pv = sample_pixel_values[i]
+            if surviving_tiles > 0:
+                adjusted_pixel_values.append(pv[:surviving_tiles])
+            # Replace excess partial-tile <image> tokens with pad
+            if expected_tokens < remaining_img_tokens:
+                ids = padded_input_ids[i]
+                img_positions = (ids == img_context_token_id).nonzero(as_tuple=True)[0]
+                # Keep first expected_tokens, replace the rest
+                excess_positions = img_positions[expected_tokens:]
+                ids[excess_positions] = pad_token_id
+                padded_input_ids[i] = ids
+
+    # Re-stack after potential modifications
+    result["input_ids"] = torch.stack(padded_input_ids)
+
+    if adjusted_pixel_values:
+        pixel_values = torch.cat(adjusted_pixel_values, dim=0)
+        result["pixel_values"] = pixel_values.to(torch.bfloat16)
+
+        # image_flags: 1 for each real image tile, shape [total_tiles, 1]
+        num_tiles = pixel_values.shape[0]
+        result["image_flags"] = torch.ones(num_tiles, 1, dtype=torch.long)
+
+    # Build labels (mask non-assistant tokens with -100)
+    labels = build_labels(
+        result["input_ids"],
+        conversations,
+        processor,
+    )
+    result["labels"] = labels[:, 1:]
+
+    # Shift inputs (remove last token for autoregressive training)
+    input_shape = result["input_ids"].shape
+    for key, value in list(result.items()):
+        if isinstance(value, torch.Tensor) and value.shape == input_shape:
+            result[key] = value[:, :-1]
+
+    # DEBUG: activation dump - save first collated batch on rank 0
+    global _nemotron_omni_collate_call_count  # DEBUG: activation dump
+    import os as _os  # DEBUG: activation dump
+    try:  # DEBUG: activation dump
+        import torch.distributed as _dist  # DEBUG: activation dump
+        _is_rank0 = (not _dist.is_initialized()) or (_dist.get_rank() == 0)  # DEBUG: activation dump
+    except Exception:  # DEBUG: activation dump
+        _is_rank0 = True  # DEBUG: activation dump
+    if _is_rank0 and _nemotron_omni_collate_call_count == 0:  # DEBUG: activation dump
+        collate_dump = {}  # DEBUG: activation dump
+        for k, v in result.items():  # DEBUG: activation dump
+            if isinstance(v, torch.Tensor):  # DEBUG: activation dump
+                collate_dump[k] = v.detach().cpu().float() if v.is_floating_point() else v.detach().cpu()  # DEBUG: activation dump
+            else:  # DEBUG: activation dump
+                collate_dump[k] = v  # DEBUG: activation dump
+        _dump_path = _os.path.join(_COLLATE_DUMP_DIR, "collate_output.pt")  # DEBUG: activation dump
+        torch.save(collate_dump, _dump_path)  # DEBUG: activation dump
+        print(f"[ACTIVATION DUMP] Saved collate_output.pt with keys: {list(collate_dump.keys())}")  # DEBUG: activation dump
+        for k, v in collate_dump.items():  # DEBUG: activation dump
+            if isinstance(v, torch.Tensor):  # DEBUG: activation dump
+                print(f"  {k}: shape={tuple(v.shape)} dtype={v.dtype}")  # DEBUG: activation dump
+    _nemotron_omni_collate_call_count += 1  # DEBUG: activation dump
+
+    return result
+
+
 # Mapping of processor types to their collate functions
 COLLATE_FNS = {
     "Qwen2_5_VLProcessor": qwen2_5_collate_fn,
@@ -820,5 +1019,6 @@ COLLATE_FNS = {
     "KimiVLProcessor": kimi_vl_collate_fn,
     "KimiK25Processor": kimi_k25_vl_collate_fn,
     "NemotronParseProcessor": nemotron_parse_collate_fn,
+    "NemotronNanoVLV2Processor": nemotron_omni_collate_fn,
     "default": default_collate_fn,
 }
