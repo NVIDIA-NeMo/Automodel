@@ -19,5 +19,5 @@ export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
 # Run Qwen3.5 MoE linear attention CP test with 2 GPUs
-torchrun --nproc_per_node=2 --nnodes=1 \
+python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
     tests/functional_tests/context_parallel/run_qwen3_5_moe_linear_attn_cp.py
