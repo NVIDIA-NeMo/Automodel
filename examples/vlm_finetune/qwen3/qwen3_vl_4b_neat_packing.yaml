@@ -12,12 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Example recipe for VLM fine-tuning with neat packing (greedy knapsack).
-#
-# Neat packing bins variable-length samples into fixed-size sequences using
-# a min-heap greedy knapsack algorithm, reducing padding waste.
-# Requires flash_attention_2 and a meta-dataset in ShareGPT format.
-#
 # To run this recipe:
 # torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py \
 #   --config examples/vlm_finetune/qwen3/qwen3_vl_4b_neat_packing.yaml
@@ -76,7 +70,6 @@ packed_sequence:
   pack_size: 8192
   packing_ratio: 0.9
   drop_long_samples: true
-  balance_media_tokens: true
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

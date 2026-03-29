@@ -13,12 +13,6 @@
 # limitations under the License.
 
 
-# Example recipe for LLM fine-tuning with neat packing (greedy knapsack).
-#
-# Neat packing uses a min-heap greedy knapsack algorithm to bin-pack
-# variable-length samples into fixed-size sequences, reducing padding waste.
-# Works with SDPA, flash_attention_2, and eager attention backends.
-#
 # To run this recipe:
 # torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py \
 #   --config examples/llm_finetune/qwen/qwen3_0p6b_hellaswag_neat_packing.yaml
