@@ -234,6 +234,76 @@ def build_loss_fn(cfg_loss):
     return cfg_loss.instantiate()
 
 
+def _chunk_vlm_media(
+    pixel_values: torch.Tensor,
+    image_grid: torch.Tensor,
+    batch_size: int,
+    n_microbatches: int,
+    n_images_per_sample: torch.Tensor | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Split VLM pixel_values and image_grid into PP microbatch chunks.
+
+    Handles three layouts:
+    1. ``[N, C, H, W]`` with ``N == batch_size`` — one full image per sample.
+    2. Flat patches ``[total_patches, D]`` with per-sample image counts from
+       ``n_images_per_sample`` (general case, works for packed sequences too).
+    3. Flat patches with ``n_images == batch_size`` — legacy 1-image-per-sample.
+    """
+    n_images = image_grid.shape[0]
+    pixel_values_chunks: list[torch.Tensor] = []
+    image_grid_chunks: list[torch.Tensor] = []
+
+    if pixel_values.dim() == 4 and pixel_values.shape[0] == batch_size:
+        pixel_values_chunks = list(pixel_values.chunk(n_microbatches, dim=0))
+        image_grid_chunks = list(image_grid.chunk(n_microbatches, dim=0))
+    elif n_images_per_sample is not None:
+        # General case: use per-sample image counts to associate images with
+        # batch items.  Works for packed sequences (multiple images per item).
+        patch_counts = image_grid.prod(dim=1)
+        cumsum_patches = torch.cumsum(patch_counts, dim=0)
+        cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
+
+        samples_per_mb = batch_size // n_microbatches
+        for mb_idx in range(n_microbatches):
+            s_start = mb_idx * samples_per_mb
+            s_end = min(s_start + samples_per_mb, batch_size)
+
+            img_start = 0 if s_start == 0 else cumsum_images[s_start - 1].item()
+            img_end = cumsum_images[s_end - 1].item() if s_end > 0 else 0
+
+            image_grid_chunks.append(image_grid[img_start:img_end])
+
+            patch_start = 0 if img_start == 0 else cumsum_patches[img_start - 1].item()
+            patch_end = cumsum_patches[img_end - 1].item() if img_end > 0 else 0
+            pixel_values_chunks.append(pixel_values[int(patch_start):int(patch_end)])
+    elif n_images == batch_size:
+        # Legacy: exactly 1 image per sample.
+        patch_counts = image_grid.prod(dim=1)
+        cumsum = torch.cumsum(patch_counts, dim=0)
+
+        images_per_mb = batch_size // n_microbatches
+        for mb_idx in range(n_microbatches):
+            img_start = mb_idx * images_per_mb
+            img_end = min(img_start + images_per_mb, n_images)
+
+            image_grid_chunks.append(image_grid[img_start:img_end])
+
+            patch_start = 0 if img_start == 0 else cumsum[img_start - 1].item()
+            patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
+            pixel_values_chunks.append(pixel_values[int(patch_start):int(patch_end)])
+    else:
+        pixel_values_chunks.append(pixel_values)
+        image_grid_chunks.append(image_grid)
+        for _ in range(n_microbatches - 1):
+            pixel_values_chunks.append(pixel_values[:0])
+            image_grid_chunks.append(image_grid[:0])
+        logging.warning(
+            f"VLM chunking: n_images={n_images} != batch_size={batch_size}, giving all images to first microbatch"
+        )
+
+    return pixel_values_chunks, image_grid_chunks
+
+
 def build_dataloader(
     cfg_ds, cfg_dl, pretrained_model_name_or_path, cfg_processor, device_mesh, seed, local_batch_size,
     cfg_model=None, cfg_ps=None,
@@ -820,6 +890,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 image_grid_hws = batch.pop("image_grid_hws", None)
                 image_grid_thw = batch.pop("image_grid_thw", None)
                 image_sizes = batch.pop("image_sizes", None)
+                n_images_per_sample = batch.pop("n_images_per_sample", None)
 
                 image_grid = image_grid_hws if image_grid_hws is not None else image_grid_thw
                 if image_grid is None and image_sizes is not None:
@@ -831,39 +902,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     batch_size = input_ids.shape[0]
                     n_images = image_grid.shape[0]
 
-                    pixel_values_chunks = []
-                    image_grid_chunks = []
-
-                    if pixel_values.dim() == 4 and pixel_values.shape[0] == batch_size:
-                        # pixel_values is [N_images, C, H, W] with one full image per
-                        # batch sample. Simply split along dim 0 to distribute across microbatches.
-                        pixel_values_chunks = list(pixel_values.chunk(n_microbatches, dim=0))
-                        image_grid_chunks = list(image_grid.chunk(n_microbatches, dim=0))
-                    elif n_images == batch_size:
-                        # Qwen/Kimi-style: pixel_values is 2D/3D flat patches [total_patches, hidden_dim].
-                        # Use cumsum-based slicing to split variable-length patch sequences.
-                        patch_counts = image_grid.prod(dim=1)
-                        cumsum = torch.cumsum(patch_counts, dim=0)
-
-                        images_per_mb = batch_size // n_microbatches
-                        for mb_idx in range(n_microbatches):
-                            img_start = mb_idx * images_per_mb
-                            img_end = min(img_start + images_per_mb, n_images)
-
-                            image_grid_chunks.append(image_grid[img_start:img_end])
-
-                            patch_start = 0 if img_start == 0 else cumsum[img_start - 1].item()
-                            patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
-                            pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
-                    else:
-                        pixel_values_chunks.append(pixel_values)
-                        image_grid_chunks.append(image_grid)
-                        for _ in range(n_microbatches - 1):
-                            pixel_values_chunks.append(pixel_values[:0])
-                            image_grid_chunks.append(image_grid[:0])
-                        logging.warning(
-                            f"VLM chunking: n_images={n_images} != batch_size={batch_size}, giving all images to first microbatch"
-                        )
+                    pixel_values_chunks, image_grid_chunks = _chunk_vlm_media(
+                        pixel_values, image_grid, batch_size, n_microbatches,
+                        n_images_per_sample=n_images_per_sample,
+                    )
 
                     # Store pre-chunked tensors on model for forward to use
                     stage0_model._vlm_pixel_values_chunks = pixel_values_chunks
