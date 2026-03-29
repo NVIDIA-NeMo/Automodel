@@ -2152,3 +2152,105 @@ def test_pad_collate_fn_no_per_sample_counts_without_media(collate_mod, fake_qwe
     # No image_grid_thw or video_grid_thw → no per-sample count keys
     assert "n_images_per_sample" not in batch
     assert "n_videos_per_sample" not in batch
+
+
+# ---------------------------------------------------------------------------
+# make_robust_collate
+# ---------------------------------------------------------------------------
+
+
+class TestMakeRobustCollate:
+    def test_success_on_first_try(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import make_robust_collate
+
+        dataset = [{"x": 0}, {"x": 1}, {"x": 2}]
+        collate_fn = lambda batch: {"result": sum(d["x"] for d in batch)}
+        wrapped = make_robust_collate(dataset, collate_fn, max_retries=3)
+        result = wrapped([{"x": 10}, {"x": 20}])
+        assert result == {"result": 30}
+
+    def test_retries_on_failure(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import make_robust_collate
+
+        call_count = 0
+
+        def flaky_collate(batch):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise ValueError("flaky error")
+            return {"ok": True}
+
+        dataset = [{"x": i} for i in range(10)]
+        wrapped = make_robust_collate(dataset, flaky_collate, max_retries=5)
+        result = wrapped([{"x": 0}])
+        assert result == {"ok": True}
+        assert call_count == 3
+
+    def test_raises_after_max_retries(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import make_robust_collate
+
+        def always_fails(batch):
+            raise ValueError("always fails")
+
+        dataset = [{"x": i} for i in range(10)]
+        wrapped = make_robust_collate(dataset, always_fails, max_retries=2)
+        with pytest.raises(RuntimeError, match="Collate failed after 2 retries"):
+            wrapped([{"x": 0}])
+
+
+# ---------------------------------------------------------------------------
+# neat_packed_vlm_collater — attn_implementation variants
+# ---------------------------------------------------------------------------
+
+
+class TestNeatPackedVlmCollaterAttnImpl:
+    def _make_packed_sample(self, seq_len=16, n_images=1):
+        """Create a minimal packed sample dict."""
+        input_ids = torch.randint(100, 30000, (seq_len,))
+        labels = torch.randint(100, 30000, (seq_len,))
+        # Indexed attention mask: all tokens belong to sequence 1
+        attention_mask = torch.ones(seq_len, dtype=torch.long)
+        position_ids = torch.arange(seq_len)
+        sample = {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        }
+        if n_images > 0:
+            sample["pixel_values"] = torch.randn(n_images, 3, 56, 56)
+            sample["image_grid_thw"] = torch.tensor([[1, 2, 2]] * n_images)
+        return sample
+
+    def test_flash_attention_2_returns_2d_mask(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+        batch = [self._make_packed_sample(16, 0), self._make_packed_sample(12, 0)]
+        result = neat_packed_vlm_collater(batch, attn_implementation="flash_attention_2")
+        # Flash attention keeps the 2D indexed mask
+        assert result["attention_mask"].ndim == 2
+
+    def test_sdpa_returns_4d_mask(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+        batch = [self._make_packed_sample(16, 0), self._make_packed_sample(12, 0)]
+        result = neat_packed_vlm_collater(batch, attn_implementation="sdpa")
+        # SDPA produces 4D block-causal mask
+        assert result["attention_mask"].ndim == 4
+
+    def test_fixed_max_length_pads_to_max(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+        batch = [self._make_packed_sample(10, 0)]
+        result = neat_packed_vlm_collater(batch, max_length=32, attn_implementation="flash_attention_2")
+        assert result["input_ids"].shape[1] == 32
+
+    def test_concatenates_pixel_values(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+        s1 = self._make_packed_sample(16, n_images=2)
+        s2 = self._make_packed_sample(12, n_images=1)
+        result = neat_packed_vlm_collater([s1, s2], attn_implementation="flash_attention_2")
+        assert result["pixel_values"].shape[0] == 3  # 2 + 1
+        assert result["image_grid_thw"].shape[0] == 3
