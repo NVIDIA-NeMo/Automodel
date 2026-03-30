@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 import wandb
 
+from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.training.rng import ScopedRNG
@@ -129,6 +130,11 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
             all_logits = []
             all_labels = []
 
+            model = self.model_parts[0]
+            autocast_ctx = (
+                torch.amp.autocast("cuda", dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext()
+            )
+
             with torch.no_grad():
                 for batch in val_dataloader:
                     batch = {
@@ -137,11 +143,7 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
                     }
                     labels = batch.pop("labels")
 
-                    model = self.model_parts[0]
-                    train_ctx = (
-                        torch.amp.autocast("cuda", dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext()
-                    )
-                    with train_ctx:
+                    with autocast_ctx:
                         outputs = model(**batch, return_dict=True)
                         logits = outputs.logits.view(-1, self.val_n_passages)
                         loss = F.cross_entropy(logits, labels)
@@ -185,3 +187,14 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
                 epoch=self.step_scheduler.epoch,
                 metrics=metrics,
             )
+
+
+def main(default_config_path="examples/retrieval/cross_encoder/llama3_2_1b.yaml"):
+    cfg = parse_args_and_load_config(default_config_path)
+    recipe = TrainCrossEncoderRecipe(cfg)
+    recipe.setup()
+    recipe.run_train_validation_loop()
+
+
+if __name__ == "__main__":
+    main()
