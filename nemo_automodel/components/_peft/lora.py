@@ -225,6 +225,8 @@ class LinearLoRA(nn.Linear):
             Tensor: Output tensor of shape (batch_size, out_features).
         """
         # pylint: disable=C0115,C0116
+        # Cast input to match weight dtype to avoid dtype mismatch (e.g. float32 input with bfloat16 weights)
+        x = x.to(self.weight.dtype)
         # If LinearLoRA is used to monkey-patch a nn.Linear module, we want to use nn.Linear's
         # forward in the case where it uses quantized weights. We store a reference to nn.Linear's
         # forward in `super_fwd` attribute. If the attribute does not exist we do the usual linear.
