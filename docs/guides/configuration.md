@@ -106,23 +106,18 @@ Printing a **leaf value** (for example, `print(cfg.dataset.delta_storage_options
 :::
 
 
-## Configure Slurm (`automodel` CLI)
+## Configure Slurm
 
-The `slurm:` section in your YAML is minimal — it only tells the CLI where
-your sbatch script is:
+SLURM jobs are submitted with `sbatch` directly — no YAML section needed.
+Copy the reference script, edit `CONFIG` and cluster settings, then submit:
 
-```yaml
-slurm:
-  script: my_cluster.sub
+```bash
+cp slurm.sub my_cluster.sub
+vim my_cluster.sub
+sbatch my_cluster.sub
 ```
 
 All cluster-specific configuration (SBATCH directives, container image, mounts,
 secrets, environment variables) lives in your sbatch script.  See
 [Run on a Cluster](../launcher/slurm.md) for full examples.
-
-:::{note}
-`job_dir` is used by the CLI on the submit host to create the local log
-directory and write `job_config.yaml`. If you set `job_dir` to a placeholder
-like `${SLURM_JOB_DIR}`, the CLI will treat it literally.
-:::
 

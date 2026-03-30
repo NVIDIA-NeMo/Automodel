@@ -47,12 +47,11 @@ Configs without this key will produce an error with guidance on which target to 
 
 ## Launcher Configuration Moved to YAML
 
-Multi-node launch settings (SLURM, Kubernetes, NeMo-Run) are now configured
+Multi-node launch settings (Kubernetes, NeMo-Run) are now configured
 entirely within the YAML config file rather than through CLI arguments.
 
 | Launcher | YAML section |
 |---|---|
-| SLURM | `slurm:` |
 | Kubernetes | `k8s:` |
 | NeMo-Run | `nemo_run:` |
 
@@ -60,44 +59,20 @@ If none of these sections are present the job runs locally (interactive mode).
 
 ## SLURM: Script-Based Submission
 
-The built-in SLURM template and all related YAML fields (`nodes`,
-`ntasks_per_node`, `container_image`, `partition`, `account`, `time`,
-`extra_mounts`, `hf_home`, `hf_token`, `wandb_key`, `gpus_per_node`,
-`master_port`, `env_vars`, `job_name`) have been removed.
-
-SLURM now requires a `script` field pointing to your sbatch script:
-
-```yaml
-slurm:
-  script: my_cluster.sub
-```
-
-All cluster-specific configuration (SBATCH directives, container runtime,
-mounts, secrets, NCCL tuning) lives in the sbatch script. Copy the reference
-template to get started:
+The `slurm:` YAML section and all related fields have been removed.  SLURM
+jobs are now submitted with `sbatch` directly, using a self-contained sbatch
+script.  Copy the reference template and adapt it to your cluster:
 
 ```bash
 cp slurm.sub my_cluster.sub
+# Edit CONFIG, #SBATCH directives, container, mounts, etc.
+sbatch my_cluster.sub
 ```
 
-The CLI generates a `torchrun` command and exports it as `$AUTOMODEL_COMMAND`
-for your script to use. The command uses SLURM environment variables
-(`$SLURM_NNODES`, `$SLURM_GPUS_PER_NODE`) so it stays in sync with your
-`#SBATCH` directives.
-
-The legacy `custom_script` field is still accepted as an alias for `script`.
-
-Exported environment variables:
-
-| Variable | Description |
-|---|---|
-| `AUTOMODEL_COMMAND` | Full torchrun invocation |
-| `AUTOMODEL_CONFIG` | Absolute path to `job_config.yaml` |
-| `AUTOMODEL_JOB_DIR` | Job artifacts directory |
-| `AUTOMODEL_REPO_ROOT` | Path to AutoModel source |
-
-`AUTOMODEL_NNODES` and `AUTOMODEL_NPROC_PER_NODE` have been removed — use
-`$SLURM_NNODES` and `$SLURM_GPUS_PER_NODE` directly in your script.
+The script runs `torchrun -m nemo_automodel.cli.app` on each node, which
+detects the distributed environment and executes the recipe in-process.
+All cluster-specific configuration lives in the sbatch script where you can
+see and edit it directly.
 
 ## Lightweight CLI-Only Install
 

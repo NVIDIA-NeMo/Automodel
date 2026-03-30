@@ -36,8 +36,9 @@ forms are accepted::
     recipe:
       _target_: nemo_automodel.recipes.llm.train_ft.Trai...  # Hydra-style
 
-Launcher selection is automatic based on the presence of ``slurm:``,
-``skypilot:``, or ``nemo_run:`` sections in the YAML.
+For SLURM clusters, use ``sbatch slurm.sub`` directly (see the reference
+script at the repo root).  Add a ``skypilot:`` or ``nemo_run:`` section
+in the YAML for those launchers.
 
 When launched via ``torchrun``, the CLI detects the existing distributed
 environment and runs the recipe in-process on each worker instead of
@@ -78,7 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Number of workers per node for local/interactive jobs. "
-            "Ignored when a slurm/skypilot/nemo_run section is present."
+            "Ignored when a skypilot/nemo_run section is present."
         ),
     )
     return parser
@@ -87,7 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     """CLI for running recipes with NeMo-AutoModel.
 
-    Supports interactive (local), SLURM, SkyPilot, and NeMo-Run launchers.
+    Supports interactive (local), SkyPilot, and NeMo-Run launchers.
+    For SLURM, use ``sbatch slurm.sub`` directly.
 
     Returns:
         int: Job's exit code.
@@ -123,13 +125,7 @@ def main():
         sys.exit(1)
     logger.info("Recipe: %s", recipe_target)
 
-    if slurm_config := config.pop("slurm", None):
-        logger.info("Launching job via SLURM")
-        from nemo_automodel.components.launcher.slurm.launcher import SlurmLauncher
-
-        return SlurmLauncher().launch(config, config_path, recipe_target, slurm_config, extra)
-
-    elif skypilot_config := config.pop("skypilot", None):
+    if skypilot_config := config.pop("skypilot", None):
         logger.info("Launching job via SkyPilot")
         from nemo_automodel.components.launcher.skypilot.launcher import SkyPilotLauncher
 

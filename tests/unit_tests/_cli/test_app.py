@@ -61,29 +61,6 @@ def recipe_yaml(tmp_path):
 
 
 @pytest.fixture
-def slurm_yaml(tmp_path):
-    """YAML with recipe + slurm section."""
-    cfg = tmp_path / "slurm.yaml"
-    cfg.write_text(
-        yaml.dump(
-            {
-                "recipe": {
-                    "_target_": "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction",
-                },
-                "step_scheduler": {"num_epochs": 1},
-                "slurm": {
-                    "job_name": "test_job",
-                    "nodes": 1,
-                    "ntasks_per_node": 8,
-                    "job_dir": str(tmp_path / "slurm_jobs"),
-                },
-            }
-        )
-    )
-    return cfg
-
-
-@pytest.fixture
 def nemo_run_yaml(tmp_path):
     """YAML with recipe + nemo_run section."""
     cfg = tmp_path / "nemo_run.yaml"
@@ -259,27 +236,6 @@ def test_main_dispatches_to_interactive(monkeypatch, recipe_yaml):
     result = module.main()
     assert result == 0
     assert "TrainFinetuneRecipeForNextTokenPrediction" in launched["recipe_target"]
-
-
-def test_main_dispatches_to_slurm(monkeypatch, slurm_yaml):
-    """slurm: section -> SlurmLauncher."""
-    monkeypatch.setattr("sys.argv", ["automodel", str(slurm_yaml)])
-
-    launched = {}
-
-    class FakeSlurmLauncher:
-        def launch(self, config, config_path, recipe_target, launcher_config, extra):
-            launched["launcher_config"] = launcher_config
-            launched["recipe_target"] = recipe_target
-            return 0
-
-    monkeypatch.setattr(
-        "nemo_automodel.components.launcher.slurm.launcher.SlurmLauncher",
-        FakeSlurmLauncher,
-    )
-    result = module.main()
-    assert result == 0
-    assert launched["launcher_config"]["job_name"] == "test_job"
 
 
 def test_main_dispatches_to_nemo_run(monkeypatch, nemo_run_yaml):

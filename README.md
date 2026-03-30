@@ -211,23 +211,15 @@ automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node
 ```
 
 ### LLM SFT Multi Node
-To launch on a SLURM cluster, copy the reference sbatch script and adapt it to your cluster, then add a `slurm:` section to your YAML config:
+To launch on a SLURM cluster, copy the reference sbatch script and adapt it to your cluster:
 ```sh
 cp slurm.sub my_cluster.sub
-# Edit my_cluster.sub — change #SBATCH directives, container, mounts, etc.
-```
-```yaml
-# Inside your YAML config:
-slurm:
-  script: my_cluster.sub
-```
-```sh
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+# Edit my_cluster.sub — change CONFIG, #SBATCH directives, container, mounts, etc.
+sbatch my_cluster.sub
 ```
 
-The CLI generates the `torchrun` command from your config and makes it available to your script as `$AUTOMODEL_COMMAND`.
 All cluster-specific settings (nodes, GPUs, partition, container, mounts) live in your sbatch script.
-Kubernetes (`k8s:`) and NeMo-Run (`nemo_run:`) sections are also supported -- see our
+NeMo-Run (`nemo_run:`) sections are also supported -- see our
 [cluster guide](https://docs.nvidia.com/nemo/automodel/latest/launcher/cluster.html) for details.
 
 ## LLM Parameter-Efficient Fine-Tuning (PEFT)
@@ -245,7 +237,7 @@ automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml \
 ```
 
 > [!NOTE]
-> Launching a multi-node PEFT example requires only adding a `slurm:` (or `k8s:` / `nemo_run:`) section to your config, similarly to the SFT case.
+> Launching a multi-node PEFT example uses the same `sbatch slurm.sub` workflow as the SFT case above.
 
 
 ## VLM Supervised Fine-Tuning (SFT)

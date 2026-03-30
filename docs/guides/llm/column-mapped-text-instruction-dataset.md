@@ -213,42 +213,20 @@ The following section lists important requirements and caveats for correct usage
 
 For distributed training on Slurm clusters, add a `slurm` section to your YAML configuration. This section configures the Slurm batch job parameters and automatically generates the appropriate `#SBATCH` directives.
 
-### Basic Slurm Configuration
+### Slurm Configuration
 
-Add the following section to your YAML configuration:
-
-```yaml
-# Your existing model, dataset, training config...
-step_scheduler:
-  grad_acc_steps: 4
-  num_epochs: 1
-
-model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
-
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
-  path_or_dataset_id: Muennighoff/natural-instructions
-  column_mapping:
-    context: definition
-    question: inputs
-    answer: targets
-
-# Add Slurm configuration — point to your sbatch script
-slurm:
-  script: my_cluster.sub
-```
-
-All cluster-specific settings (nodes, GPUs, partition, container, mounts, secrets)
-live in your sbatch script. Copy the reference template to get started:
+SLURM jobs are submitted with `sbatch` directly — no YAML section needed.
+Copy the reference script, set the `CONFIG` variable to your YAML, and submit:
 
 ```sh
 cp slurm.sub my_cluster.sub
-# Edit my_cluster.sub — change #SBATCH directives, container, mounts, etc.
+# Edit my_cluster.sub — change CONFIG, #SBATCH directives, container, mounts, etc.
+sbatch my_cluster.sub
 ```
 
-See the [cluster guide](../../launcher/slurm.md) for full examples (Pyxis, bare-metal, Apptainer).
+All cluster-specific settings (nodes, GPUs, partition, container, mounts, secrets)
+live in your sbatch script. See the [cluster guide](../../launcher/slurm.md) for
+full examples (Pyxis, bare-metal, Apptainer).
 
 ### Multi-Node Slurm Configuration
 
@@ -263,12 +241,6 @@ When using multiple nodes with Hugging Face datasets:
 3. **Mounts**: Add shared directories as container mounts in your sbatch script
 
 Configure all of this in your sbatch script (`my_cluster.sub`), not in the YAML.
-The YAML stays minimal:
-
-```yaml
-slurm:
-  script: my_cluster.sub
-```
 
 
 ---
