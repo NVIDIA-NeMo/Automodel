@@ -43,6 +43,7 @@ from nemo_automodel.components.checkpoint._backports.filesystem import Serializa
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _HuggingFaceStorageReader,
     _HuggingFaceStorageWriter,
+    _maybe_rename_index_for_diffusers,
     get_fqn_to_file_index_mapping,
 )
 from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon, PeftAddon
@@ -303,10 +304,7 @@ class Checkpointer:
             )
             if self.config.diffusers_compatible:
                 if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                    src = os.path.join(consolidated_dir, "model.safetensors.index.json")
-                    dst = os.path.join(consolidated_dir, "diffusion_pytorch_model.safetensors.index.json")
-                    if os.path.exists(src):
-                        os.rename(src, dst)
+                    _maybe_rename_index_for_diffusers(consolidated_dir)
 
     @torch.no_grad()
     def save_optimizer(
@@ -822,6 +820,7 @@ class Checkpointer:
                 consolidated_output_path=consolidated_output_path if not consolidate_on_all_ranks else None,
                 fqn_to_index_mapping=fqn_to_index_mapping,
                 staging_dir=self.config.staging_dir,
+                diffusers_compatible=self.config.diffusers_compatible,
             )
 
     def _get_storage_reader(
