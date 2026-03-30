@@ -39,7 +39,7 @@ def test_retrieval_dataset_inline_embedding_testdata_smoke():
     ds = rdi.make_retrieval_dataset(
         data_dir_list=str(data_file),
         data_type="train",
-        train_n_passages=2,  # 1 positive + 1 negative
+        n_passages=2,  # 1 positive + 1 negative
         do_shuffle=False,
         max_train_samples=1,
     )

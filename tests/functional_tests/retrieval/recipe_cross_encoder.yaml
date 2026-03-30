@@ -12,24 +12,18 @@ step_scheduler:
   ckpt_every_steps: 50
   val_every_steps: 16
   num_epochs: 1
-  max_steps: 4
+  max_steps: 32
 
 model:
-  _target_: nemo_automodel._transformers.auto_model.NeMoAutoModelBiEncoder.from_pretrained
+  _target_: nemo_automodel._transformers.auto_model.NeMoAutoModelCrossEncoder.from_pretrained
   pretrained_model_name_or_path: /home/TestData/automodel/llama-nemotron-embed-1b-v2/
   trust_remote_code: true
+  num_labels: 1
+  temperature: 1.0
   pooling: avg
-  l2_normalize: true
   use_liger_kernel: false
   use_sdpa_patching: false
   torch_dtype: bfloat16
-
-peft:
-  _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: true
-  dim: 8
-  alpha: 32
-  use_triton: false
 
 tokenizer:
   _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
@@ -40,7 +34,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   dataset:
     _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset
-    model_type: bi_encoder
+    model_type: cross_encoder
     data_dir_list:
     - /home/TestData/automodel/embedding_testdata/training.jsonl
     data_type: train
@@ -48,12 +42,9 @@ dataloader:
     seed: 42
     do_shuffle: true
   collate_fn:
-    _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
-    q_max_len: 1024
-    p_max_len: 1024
-    query_prefix: ""
-    passage_prefix: ""
-    padding: longest
+    _target_: nemo_automodel.components.datasets.llm.CrossEncoderCollator
+    rerank_max_length: 512
+    prompt_template: "question:{query} \n \n passage:{passage}"
     pad_to_multiple_of: 8
   shuffle: false
   num_workers: 0
@@ -76,9 +67,9 @@ lr_scheduler:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /workspace/output/bi_encoder_ckpt_restore_peft/checkpoints
+  checkpoint_dir: /workspace/output/cross_encoder_inline/checkpoints
   model_save_format: safetensors
-  save_consolidated: false
+  save_consolidated: true
 
 distributed:
   strategy: fsdp2
