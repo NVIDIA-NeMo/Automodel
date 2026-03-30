@@ -558,6 +558,10 @@ class Checkpointer:
             model_type = getattr(getattr(model, "config", None), "model_type", None)
             model_key_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
             key_mapping = get_combined_key_mapping(model_type, model_key_mapping)
+            # NemotronH remote code (trust_remote_code) uses backbone.* params matching checkpoint keys
+            # skip backbone.*→model.* conversion to avoid key mismatch
+            if model_type == "nemotron_h" and hasattr(model, "backbone"):
+                key_mapping = None
             self.load_model(
                 model,
                 model_path=model_name
