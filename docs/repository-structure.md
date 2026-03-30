@@ -108,7 +108,7 @@ More recipe examples are available under the [`examples/`](https://github.com/NV
 ### CLI Directory (`cli/`)
 The `automodel` (or `am`) CLI application simplifies job execution across different environments, from
 single-GPU interactive sessions to batch multi-node runs. It supports interactive (local), SLURM,
-Kubernetes (Kubeflow PyTorchJob), and NeMo-Run launchers. The CLI lives at the repository root in the
+SkyPilot, and NeMo-Run launchers. The CLI lives at the repository root in the
 `cli/` package, separate from the core `nemo_automodel` library.
 
 

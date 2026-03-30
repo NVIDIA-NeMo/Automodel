@@ -36,8 +36,8 @@ forms are accepted::
     recipe:
       _target_: nemo_automodel.recipes.llm.train_ft.Trai...  # Hydra-style
 
-Launcher selection is automatic based on the presence of ``slurm:``, ``k8s:``,
-or ``nemo_run:`` sections in the YAML.
+Launcher selection is automatic based on the presence of ``slurm:``,
+``skypilot:``, or ``nemo_run:`` sections in the YAML.
 
 When launched via ``torchrun``, the CLI detects the existing distributed
 environment and runs the recipe in-process on each worker instead of
@@ -78,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Number of workers per node for local/interactive jobs. "
-            "Ignored when a slurm/k8s/nemo_run section is present."
+            "Ignored when a slurm/skypilot/nemo_run section is present."
         ),
     )
     return parser
@@ -87,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     """CLI for running recipes with NeMo-AutoModel.
 
-    Supports interactive (local), SLURM, Kubernetes, and NeMo-Run launchers.
+    Supports interactive (local), SLURM, SkyPilot, and NeMo-Run launchers.
 
     Returns:
         int: Job's exit code.
@@ -129,11 +129,11 @@ def main():
 
         return SlurmLauncher().launch(config, config_path, recipe_target, slurm_config, extra)
 
-    elif k8s_config := config.pop("k8s", None):
-        logger.info("Launching job via Kubernetes (PyTorchJob)")
-        from nemo_automodel.components.launcher.k8s.launcher import K8sLauncher
+    elif skypilot_config := config.pop("skypilot", None):
+        logger.info("Launching job via SkyPilot")
+        from nemo_automodel.components.launcher.skypilot.launcher import SkyPilotLauncher
 
-        return K8sLauncher().launch(config, config_path, recipe_target, k8s_config, extra)
+        return SkyPilotLauncher().launch(config, config_path, recipe_target, skypilot_config, extra)
 
     elif nemo_run_config := config.pop("nemo_run", None):
         logger.info("Launching job via NeMo-Run")

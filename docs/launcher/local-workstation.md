@@ -73,7 +73,7 @@ automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node
 
 If you don't specify `--nproc-per-node`, it will use all available GPUs on your system.
 
-Looking for Slurm, Kubernetes, or NeMo-Run? See [Run on a Cluster](./slurm.md).
+Looking for Slurm or cloud training? See [Slurm](./slurm.md) or [SkyPilot](./skypilot.md).
 
 ## Run with uv (Development Mode)
 

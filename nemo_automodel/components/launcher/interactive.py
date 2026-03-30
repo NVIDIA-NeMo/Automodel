@@ -61,8 +61,8 @@ _INSTALL_MSG = (
     "To run jobs locally, install the full package:\n"
     "  pip install nemo_automodel          # CPU/basic\n"
     "  pip install nemo_automodel[all]     # with CUDA & all extras\n\n"
-    "For remote job submission from a login node (SLURM, k8s, NeMo-Run),\n"
-    "add a slurm:, k8s:, or nemo_run: section to your YAML config instead.\n\n"
+    "For remote job submission from a login node (SLURM, SkyPilot, NeMo-Run),\n"
+    "add a slurm:, skypilot:, or nemo_run: section to your YAML config instead.\n\n"
     "See: https://github.com/NVIDIA/NeMo-Automodel#readme"
 )
 

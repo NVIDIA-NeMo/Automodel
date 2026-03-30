@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 
 class Launcher(ABC):
-    """Base class for all job launchers (interactive, SLURM, k8s, nemo-run)."""
+    """Base class for all job launchers (interactive, SLURM, SkyPilot, nemo-run)."""
 
     @abstractmethod
     def launch(

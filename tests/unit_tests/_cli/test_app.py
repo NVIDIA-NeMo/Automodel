@@ -84,28 +84,6 @@ def slurm_yaml(tmp_path):
 
 
 @pytest.fixture
-def k8s_yaml(tmp_path):
-    """YAML with recipe + k8s section."""
-    cfg = tmp_path / "k8s.yaml"
-    cfg.write_text(
-        yaml.dump(
-            {
-                "recipe": {
-                    "_target_": "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction",
-                },
-                "step_scheduler": {"num_epochs": 1},
-                "k8s": {
-                    "num_nodes": 2,
-                    "gpus_per_node": 8,
-                    "image": "nvcr.io/nvidia/nemo-automodel:latest",
-                },
-            }
-        )
-    )
-    return cfg
-
-
-@pytest.fixture
 def nemo_run_yaml(tmp_path):
     """YAML with recipe + nemo_run section."""
     cfg = tmp_path / "nemo_run.yaml"
@@ -302,26 +280,6 @@ def test_main_dispatches_to_slurm(monkeypatch, slurm_yaml):
     result = module.main()
     assert result == 0
     assert launched["launcher_config"]["job_name"] == "test_job"
-
-
-def test_main_dispatches_to_k8s(monkeypatch, k8s_yaml):
-    """k8s: section -> K8sLauncher."""
-    monkeypatch.setattr("sys.argv", ["automodel", str(k8s_yaml)])
-
-    launched = {}
-
-    class FakeK8sLauncher:
-        def launch(self, config, config_path, recipe_target, launcher_config, extra):
-            launched["launcher_config"] = launcher_config
-            return 0
-
-    monkeypatch.setattr(
-        "nemo_automodel.components.launcher.k8s.launcher.K8sLauncher",
-        FakeK8sLauncher,
-    )
-    result = module.main()
-    assert result == 0
-    assert launched["launcher_config"]["num_nodes"] == 2
 
 
 def test_main_dispatches_to_nemo_run(monkeypatch, nemo_run_yaml):
