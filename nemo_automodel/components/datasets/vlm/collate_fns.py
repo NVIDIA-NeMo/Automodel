@@ -582,7 +582,8 @@ def kimi_vl_collate_fn(
 
     # Drop overlong samples before processing
     if max_length is not None:
-        conversations = _drop_overlong_samples(conversations, processor, max_length)
+        conversations, kept = _drop_overlong_samples(conversations, processor, max_length)
+        examples = [examples[i] for i in kept]
 
     texts = [
         processor.apply_chat_template(conversation, add_generation_prompt=False, tokenize=False)
@@ -715,7 +716,7 @@ def kimi_k25_vl_collate_fn(
 
     # Pre-filter to avoid expensive processing of obviously overlong samples
     if max_length is not None:
-        conversations = _drop_overlong_samples(conversations, processor, max_length)
+        conversations, _kept = _drop_overlong_samples(conversations, processor, max_length)
 
     # Get media token ID
     media_token_id = getattr(processor, "media_placeholder_token_id", None)
@@ -1027,16 +1028,19 @@ def _estimate_media_tokens(conversation, processor):
 def _drop_overlong_samples(conversations, processor, max_length):
     """Drop conversations whose estimated token count exceeds *max_length*.
 
-    Returns the filtered list.  Raises ``ValueError`` when every sample in
-    the batch is dropped (caught by ``robust_collate`` which re-samples).
+    Returns ``(filtered_conversations, kept_indices)`` where *kept_indices*
+    are the original positions that survived filtering.  Raises ``ValueError``
+    when every sample in the batch is dropped (caught by ``robust_collate``
+    which re-samples).
     """
     if max_length is None:
-        return conversations
+        return conversations, list(range(len(conversations)))
 
     tokenizer = getattr(processor, "tokenizer", processor)
     filtered = []
+    kept_indices = []
 
-    for conv in conversations:
+    for i, conv in enumerate(conversations):
         try:
             text = processor.apply_chat_template([conv], tokenize=False)
             if isinstance(text, list):
@@ -1054,6 +1058,7 @@ def _drop_overlong_samples(conversations, processor, max_length):
         except Exception:
             pass  # estimation failed → keep the sample
         filtered.append(conv)
+        kept_indices.append(i)
 
     if not filtered:
         raise ValueError(
@@ -1061,7 +1066,7 @@ def _drop_overlong_samples(conversations, processor, max_length):
             "Consider increasing max_length or filtering your dataset."
         )
 
-    return filtered
+    return filtered, kept_indices
 
 
 def default_collate_fn(
@@ -1077,7 +1082,8 @@ def default_collate_fn(
 
     # Drop overlong samples before processing
     if max_length is not None:
-        conversations = _drop_overlong_samples(conversations, processor, max_length)
+        conversations, kept = _drop_overlong_samples(conversations, processor, max_length)
+        examples = [examples[i] for i in kept]
 
     processor_kwargs = {
         "tokenize": True,
