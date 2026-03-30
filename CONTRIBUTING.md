@@ -82,13 +82,11 @@ export AUTOMODEL_INSTALL=all #(cuda, moe, vlm, ...)
 export BASE_IMAGE=pytorch #(cuda, pytorch)
 
 # Dependency install options [True, False]
-export INSTALL_DEEPEP=True
 export INSTALL_TE=True
 
 docker build -f docker/Dockerfile \
     --build-arg AUTOMODEL_INSTALL=$AUTOMODEL_INSTALL \
     --build-arg BASE_IMAGE=$BASE_IMAGE \
-    --build-arg INSTALL_DEEPEP=$INSTALL_DEEPEP \
     --build-arg INSTALL_MAMBA=$INSTALL_MAMBA \
     -t automodel --target=automodel_final .
 ```
