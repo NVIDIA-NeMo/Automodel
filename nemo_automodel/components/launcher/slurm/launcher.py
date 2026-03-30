@@ -111,7 +111,7 @@ class SlurmLauncher(Launcher):
             "--nnodes=${SLURM_NNODES:-1}",
             "--rdzv_backend=c10d",
             "--rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT}",
-            script_path,
+                "See docs/launcher/slurm.md for examples."
             "-c",
             job_conf_path,
         ]
