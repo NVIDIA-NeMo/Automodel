@@ -8,7 +8,7 @@ MoE 16B (3B active) model based on DeepSeek V3 architecture. 64 routed experts, 
 
 | Config | Optimizer | lr | Notes |
 |--------|-----------|---:|-------|
-| `moonlight_16b_ep8_flashoptim.yaml` | FlashAdamW | 1e-5 | 24-bit master weights, `fp32_upcast: false` |
+| `moonlight_16b_ep8_flashoptim.yaml` | FlashAdamW | 1e-5 | 32-bit master weights, `fp32_upcast: true` |
 | `moonlight_16b_ep8_te_fusedadam.yaml` | TE FusedAdam | 1e-5 | FP32 master weights, BF16 moments, `fp32_upcast: true` |
 
 All configs use `chat_template.jinja`, `seq_length: 2048`, `betas: [0.9, 0.95]`, `ep_size: 8`, `rms_norm: te`, TE attn+linear backends, `enable_fsdp_optimizations: true`, `gate_bias_update_factor: 0.0001`, `moe_metrics: brief`.
@@ -20,7 +20,7 @@ All configs use `chat_template.jinja`, `seq_length: 2048`, `betas: [0.9, 0.95]`,
 - `first_k_dense_replace: 1` — only layer 0 is dense, layers 1-26 are MoE.
 - `n_group: 1`, `topk_group: 1` — no expert grouping (unlike DeepSeek V3 which uses grouped routing).
 - `local_batch_size: 4` for both optimizers. Dataset must be pre-filtered to `seq_length=2048` to avoid OOM from variable-length batching with the large vocabulary (163840).
-- `fp32_upcast: false` is needed for FlashAdamW to fit in memory at bs=4. TE FusedAdam uses `fp32_upcast: true`.
+- Both optimizers use `fp32_upcast: true` for FP32 loss upcasting.
 
 ## Data Pre-filtering
 
@@ -74,14 +74,14 @@ bash examples/convergence/tulu3/eval/run_eval.sh \
 |-------|-------------:|-------------:|------------:|-----------:|
 | Moonlight-16B-A3B (pretrained) | 0.148 | 0.179 | 0.278 | 0.312 |
 | TE FusedAdam FP32+BF16, gate=1e-4 | 0.381 | 0.473 | 0.534 | 0.607 |
-| FlashAdamW 24-bit | 0.412 | 0.501 | 0.559 | 0.634 |
+| FlashAdamW 32-bit, fp32_upcast | 0.412 | 0.501 | 0.559 | 0.634 |
 
 ### Training Loss
 
 | Config | Step 0 | Step 999 | Val Loss | TPS/gpu |
 |--------|-------:|---------:|---------:|--------:|
 | TE FusedAdam FP32+BF16, gate=1e-4 | 0.875 | 0.570 | 0.655 | ~5000 |
-| FlashAdamW 24-bit | 0.875 | 0.570 | 0.657 | ~5200 |
+| FlashAdamW 32-bit, fp32_upcast | 0.875 | 0.570 | 0.657 | ~5200 |
 
 ### Training Curves
 
@@ -96,7 +96,7 @@ MoE load balancing is healthy: zero dead experts, diversity ~0.89 (1.0=uniform),
 ### W&B Runs
 
 - [TE FusedAdam FP32+BF16](https://wandb.ai/Nemo-automodel/tulu3-convergence/runs/7tzoam21)
-- [FlashAdamW 24-bit](https://wandb.ai/Nemo-automodel/tulu3-convergence/runs/tas9gsxc)
+- [FlashAdamW 32-bit, fp32_upcast](https://wandb.ai/Nemo-automodel/tulu3-convergence/runs/tas9gsxc)
 
 ### Inference Quality
 
@@ -104,17 +104,8 @@ MoE load balancing is healthy: zero dead experts, diversity ~0.89 (1.0=uniform),
 |-------|----------:|--------------:|------------:|------:|
 | Moonlight-16B-A3B (pretrained) | 22.2% | 73.4% | 0% | 0% |
 | TE FusedAdam FP32+BF16, gate=1e-4 | 22.7% | 47.1% | 0% | 0% |
-| FlashAdamW 24-bit | 22.2% | 19.2% | 0% | 0% |
+| FlashAdamW 32-bit, fp32_upcast | 22.2% | 19.2% | 0% | 0% |
 
-### Key Takeaways
-
-- SFT significantly improves instruction following: prompt_strict 0.148 → 0.412 (+179%), inst_strict 0.278 → 0.559 (+101%).
-- **FlashAdamW 24-bit is the best configuration** — highest IFEval scores (prompt_strict=0.412, inst_loose=0.634) and dramatically lower abrupt ending rate (19.2% vs 47-62%).
-- The 24-bit master weights provide a good precision/memory trade-off that translates to significantly improved generation quality.
-- Death loop rate (~20-22%) remains consistent across all runs — needs further investigation (lower lr, more steps, or thinking-aware template).
-- Dataset pre-filtering is required — variable-length batching can hit sequences that cause memory spikes with the large vocabulary.
-- `rms_norm: te` and `enable_fsdp_optimizations: true` from the benchmark config are needed for reasonable memory usage.
-- The TikToken tokenizer requires a patch for `{% generation %}` tag support (slow tokenizer fallback) and to prevent spurious BOS/EOS insertion.
 
 ## Checklist
 

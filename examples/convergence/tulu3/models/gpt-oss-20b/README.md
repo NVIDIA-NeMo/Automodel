@@ -86,14 +86,6 @@ All evals use recommended sampling: `temp=1.0, top_p=1.0`.
 - [FlashAdamW 32-bit](https://wandb.ai/Nemo-automodel/tulu3-convergence/runs/qmf6eiu3)
 - [TE FusedAdam FP32+BF16](https://wandb.ai/Nemo-automodel/tulu3-convergence/runs/gfc28sms)
 
-### Key Takeaways
-
-- SFT significantly improves instruction following: prompt_strict 0.303 → 0.484 (+60%), inst_strict 0.440 → 0.622 (+41%).
-- Abrupt ending reduced by 69%: 39.4% → 12.2%.
-- FlashAdamW slightly outperforms TE FusedAdam on IFEval (prompt_strict 0.484 vs 0.468).
-- `{% generation %}` tags improve results vs no-tag training (prompt_strict 0.484 vs 0.444 without tags).
-- `router_aux_loss_coef` must be overridden from 0.9 to 1e-5 for SFT. The pretrain value causes loss divergence.
-- The aux_loss softmax fix (PR #1559) is critical — without it, raw logits cause aux_loss to diverge to -80 within 80 steps.
 
 ## Checklist
 

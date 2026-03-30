@@ -67,7 +67,7 @@ autocast:
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
-  fp32_upcast: false
+  fp32_upcast: true
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
@@ -110,7 +110,7 @@ optimizer:
   betas: [0.9, 0.95]
   eps: 1e-8
   weight_decay: 0
-  master_weight_bits: 24
+  master_weight_bits: 32
   compress_state_dict: false
 
 moe_metrics:
