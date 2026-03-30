@@ -94,7 +94,9 @@ RUN cd DeepEP && \
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 pip install --no-build-isolation . && \
     apt-get purge -y libnvidia-ml-dev && \
     apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* && \
+    rm -rf /opt/deepep.patch && \
+    cd / && rm -rf DeepEP rdma-core
 
 # Install Bitsandbytes
 ARG INSTALL_BITSANDBYTES=True
