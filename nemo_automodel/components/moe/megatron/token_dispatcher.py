@@ -75,7 +75,7 @@ class _DispatchManager(ABC):
         pass
 
     @abstractmethod
-    def get_dispached_metadata(self) -> torch.Tensor:
+    def get_dispatched_metadata(self) -> torch.Tensor:
         """Get the metadata of the dispatched hidden_states."""
         pass
 
@@ -226,7 +226,7 @@ class _DeepepManager(_DispatchManager):
         multihot_probs[row_indices, valid_indices] = probs[mask]
         return multihot_routing_map.bool(), multihot_probs
 
-    def get_dispached_metadata(self) -> torch.Tensor:
+    def get_dispatched_metadata(self) -> torch.Tensor:
         return self.dispatched_indices, self.dispatched_probs
 
     def get_number_of_tokens_per_expert(self) -> torch.Tensor:
@@ -394,8 +394,8 @@ class _HybridEPManager(_DispatchManager):
     def dispatch(
         self,
         hidden_states: torch.Tensor,
-        async_finish: bool = True,
-        allocate_on_comm_stream: bool = True,
+        async_finish: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
+        allocate_on_comm_stream: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
     ) -> torch.Tensor:
         # Reset num_permuted_tokens to None to avoid reusing cached state from a prior dispatch.
         # This can happen in non-reentrant activation checkpointing mode.
@@ -422,8 +422,8 @@ class _HybridEPManager(_DispatchManager):
     def combine(
         self,
         hidden_states: torch.Tensor,
-        async_finish: bool = True,
-        allocate_on_comm_stream: bool = True,
+        async_finish: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
+        allocate_on_comm_stream: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
     ) -> torch.Tensor:
         hidden_states = hybrid_ep_combine(
             x=hidden_states,
@@ -435,7 +435,7 @@ class _HybridEPManager(_DispatchManager):
         self.num_permuted_tokens = None
         return hidden_states
 
-    def get_dispached_metadata(self) -> torch.Tensor:
+    def get_dispatched_metadata(self) -> torch.Tensor:
         return None, self.dispatched_probs
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
