@@ -216,9 +216,9 @@ def load_checkpoint_into_pipeline(pipe, cfg):
         )
 
     logger.info("Loading consolidated safetensors checkpoint from %s", consolidated_dir)
-    pipe.transformer = pipe.transformer.__class__.from_pretrained(
-        str(consolidated_dir), torch_dtype=torch_dtype
-    ).to("cuda")
+    pipe.transformer = pipe.transformer.__class__.from_pretrained(str(consolidated_dir), torch_dtype=torch_dtype).to(
+        "cuda"
+    )
     logger.info("Loaded consolidated safetensors checkpoint")
 
 
