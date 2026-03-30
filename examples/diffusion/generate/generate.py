@@ -186,10 +186,13 @@ def _build_parallel_scheme(scheme_cfg, dist_info):
 def load_checkpoint_into_pipeline(pipe, cfg):
     """Load a training checkpoint into the pipeline's transformer.
 
-    Supports three checkpoint formats:
-    - EMA shadow weights (ema_shadow.pt)
-    - Consolidated model weights (consolidated_model.bin)
-    - Sharded FSDP/DCP checkpoints (model/*.distcp)
+    Expects a consolidated HF safetensors checkpoint produced by training
+    with model_save_format: safetensors, save_consolidated: true, and
+    diffusers_compatible: true. The checkpoint directory should contain
+    model/consolidated/ with diffusion_pytorch_model.safetensors.index.json
+    and the corresponding safetensors files.
+
+    Uses the standard diffusers from_pretrained() API for loading.
 
     Args:
         pipe: The diffusion pipeline with a `.transformer` attribute.
@@ -206,77 +209,18 @@ def load_checkpoint_into_pipeline(pipe, cfg):
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
 
-    ema_path = checkpoint_dir / "ema_shadow.pt"
-    consolidated_path = checkpoint_dir / "consolidated_model.bin"
-    sharded_dir = checkpoint_dir / "model"
-
-    if ema_path.exists():
-        logger.info("Loading EMA checkpoint from %s", ema_path)
-        ema_state = torch.load(ema_path, map_location="cuda", weights_only=True)
-        pipe.transformer.load_state_dict(ema_state, strict=True)
-        logger.info("Loaded EMA checkpoint")
-    elif consolidated_path.exists():
-        logger.info("Loading consolidated checkpoint from %s", consolidated_path)
-        state_dict = torch.load(consolidated_path, map_location="cuda", weights_only=True)
-        if "model_state_dict" in state_dict:
-            state_dict = state_dict["model_state_dict"]
-        pipe.transformer.load_state_dict(state_dict, strict=True)
-        logger.info("Loaded consolidated checkpoint")
-    elif sharded_dir.is_dir() and any(name.endswith(".distcp") for name in os.listdir(sharded_dir)):
-        logger.info("Loading sharded FSDP checkpoint from %s", sharded_dir)
-        pipe.transformer = _load_sharded_fsdp_checkpoint(pipe.transformer, str(sharded_dir), torch_dtype)
-        pipe.transformer.to("cuda", dtype=torch_dtype)
-        logger.info("Loaded sharded FSDP checkpoint")
-    else:
-        logger.warning("No recognized checkpoint format found in %s, using base model weights", checkpoint_dir)
-
-
-def _load_sharded_fsdp_checkpoint(transformer, sharded_dir, torch_dtype=torch.bfloat16):
-    """Load sharded FSDP/DCP checkpoint into a transformer module.
-
-    Creates a temporary gloo process group for single-GPU loading if
-    torch.distributed is not already initialized.
-
-    Args:
-        transformer: The transformer nn.Module to load weights into.
-        sharded_dir: Path to the directory containing .distcp shard files.
-        torch_dtype: The dtype to cast the transformer to before loading.
-
-    Returns:
-        The unwrapped transformer module with loaded checkpoint weights.
-    """
-    from torch.distributed.checkpoint import FileSystemReader
-    from torch.distributed.checkpoint import load as dist_load
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-    from torch.distributed.fsdp import StateDictType
-    from torch.distributed.fsdp.api import ShardedStateDictConfig
-
-    init_dist = False
-    if not dist.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("MASTER_PORT", "29500")
-        dist.init_process_group(backend="gloo", rank=0, world_size=1)
-        init_dist = True
-
-    try:
-        transformer.to(device="cuda", dtype=torch_dtype)
-        fsdp_transformer = FSDP(transformer, use_orig_params=True)
-
-        FSDP.set_state_dict_type(
-            fsdp_transformer,
-            StateDictType.SHARDED_STATE_DICT,
-            state_dict_config=ShardedStateDictConfig(offload_to_cpu=True),
+    consolidated_dir = checkpoint_dir / "model" / "consolidated"
+    if not consolidated_dir.is_dir():
+        raise FileNotFoundError(
+            f"No consolidated checkpoint directory found at {consolidated_dir}. "
+            "Ensure training used save_consolidated: true."
         )
 
-        model_state = fsdp_transformer.state_dict()
-        dist_load(state_dict=model_state, storage_reader=FileSystemReader(sharded_dir))
-        fsdp_transformer.load_state_dict(model_state)
-
-        # Unwrap back to the original module for inference
-        return fsdp_transformer.module
-    finally:
-        if init_dist:
-            dist.destroy_process_group()
+    logger.info("Loading consolidated safetensors checkpoint from %s", consolidated_dir)
+    pipe.transformer = pipe.transformer.__class__.from_pretrained(
+        str(consolidated_dir), torch_dtype=torch_dtype
+    ).to("cuda")
+    logger.info("Loaded consolidated safetensors checkpoint")
 
 
 def apply_optimizations(pipe, cfg):

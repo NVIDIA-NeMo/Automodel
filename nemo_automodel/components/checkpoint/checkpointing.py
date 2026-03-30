@@ -138,6 +138,8 @@ class CheckpointingConfig:
     # If provided, temp files will be created here instead of system temp. Useful when system temp has limited space.
     v4_compatible: bool = False  # If True, save the original pretrained config.json (with quantization_config removed)
     # instead of the in-memory v5 config.  Useful when downstream consumers (e.g. vLLM) expect a v4-format config.
+    diffusers_compatible: bool = False  # If True, use diffusers-compatible index filename
+    # (diffusion_pytorch_model.safetensors.index.json) so checkpoints are loadable via diffusers from_pretrained().
 
     def __post_init__(self):
         """
@@ -299,6 +301,12 @@ class Checkpointer:
                 use_staging=self.config.staging_dir is not None,
                 staging_dir=self.config.staging_dir,
             )
+            if self.config.diffusers_compatible:
+                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                    src = os.path.join(consolidated_dir, "model.safetensors.index.json")
+                    dst = os.path.join(consolidated_dir, "diffusion_pytorch_model.safetensors.index.json")
+                    if os.path.exists(src):
+                        os.rename(src, dst)
 
     @torch.no_grad()
     def save_optimizer(
