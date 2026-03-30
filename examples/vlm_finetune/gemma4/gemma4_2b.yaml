@@ -34,7 +34,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /workspace/eevee-4-e2b-it_vv7
+  pretrained_model_name_or_path: /workspace/eevee-4-e2b-it_vv9
   torch_dtype: torch.bfloat16
   use_liger_kernel: true
   use_sdpa_patching: false
@@ -43,9 +43,9 @@ model:
   text_config:
     use_cache: true
 
-# Use default image processor, until the gemma4 transformers bug with FastImageProcessor is fixed.
-processor:
-  use_fast: false
+# Use fast image processor, gemma4 transformers bug with FastImageProcessor is fixed.
+# processor:
+#   use_fast: false
 
 checkpoint:
   enabled: true
@@ -98,5 +98,5 @@ freeze_config:
 
 # wandb:
 #   project: eevee-4
-#   name: eevee4-e2b-it_vv7_2epochs
+#   name: eevee4-e2b-it_vv9_trans5.5
 #   dir: vlm_checkpoints/gemma4_2b_it/
