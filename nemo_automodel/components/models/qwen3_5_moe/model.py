@@ -181,39 +181,24 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
             else:
                 raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
 
-        # VL path: encode vision features and scatter into text embeddings
-        # inline, then fall through to the language_model call below.
-        # We avoid super().forward() because HF's scatter logic expects
-        # single-sample input_ids, which breaks with packed sequences.
+        # If we have pixel values and a vision encoder, go through the full HF
+        # VL forward (vision encoding + multimodal scatter + text).
         if pixel_values is not None and self.visual is not None:
-            image_outputs = self.get_image_features(pixel_values, image_grid_thw, return_dict=True)
-            image_embeds = image_outputs.pooler_output
-            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _ = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds,
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
-
-        if pixel_values_videos is not None and self.visual is not None:
-            video_outputs = self.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True)
-            video_embeds = video_outputs.pooler_output
-            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds,
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
-
-        if position_ids is None:
-            position_ids = self.compute_3d_position_ids(
-                input_ids=input_ids,
+            return super().forward(
+                input_ids=None,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
+                cache_position=cache_position,
+                **kwargs,
             )
 
-        # Call the NeMo backend language model directly.
+        # Text-only path: call the NeMo backend language model directly.
         outputs = self.language_model(
             input_ids=None,
             inputs_embeds=inputs_embeds,
