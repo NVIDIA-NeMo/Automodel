@@ -83,9 +83,12 @@ ENV RDMA_CORE_HOME=/opt/rdma-core/build
 RUN apt-get update && \
     apt-get install -y --no-install-recommends libnvidia-ml-dev
 COPY docker/common/deepep.patch /opt/deepep.patch
+ARG DEEPEP_COMMIT=7febc6e25660af0f54d95dd781ecdcd62265ecca
 RUN git clone -b hybrid-ep https://github.com/deepseek-ai/DeepEP.git
 ENV HYBRID_EP_MULTINODE=1
 RUN cd DeepEP && \
+    git fetch origin $DEEPEP_COMMIT && \
+    git checkout FETCH_HEAD && \
     patch -p1 < /opt/deepep.patch && \
     pip install --no-cache-dir nvidia-nvshmem-cu13==3.4.5 && \
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 pip install --no-build-isolation . && \
