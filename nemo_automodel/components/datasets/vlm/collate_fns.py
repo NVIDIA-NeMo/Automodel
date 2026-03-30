@@ -813,8 +813,6 @@ def neat_packed_vlm_collater(
     return result
 
 
-_nemotron_omni_collate_call_count = 0  # DEBUG: activation dump
-_COLLATE_DUMP_DIR = "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/nemotronomni/activation_dumps"  # DEBUG: activation dump
 
 
 def nemotron_omni_collate_fn(
@@ -985,29 +983,6 @@ def nemotron_omni_collate_fn(
     for key, value in list(result.items()):
         if isinstance(value, torch.Tensor) and value.shape == input_shape:
             result[key] = value[:, :-1]
-
-    # DEBUG: activation dump - save first collated batch on rank 0
-    global _nemotron_omni_collate_call_count  # DEBUG: activation dump
-    import os as _os  # DEBUG: activation dump
-    try:  # DEBUG: activation dump
-        import torch.distributed as _dist  # DEBUG: activation dump
-        _is_rank0 = (not _dist.is_initialized()) or (_dist.get_rank() == 0)  # DEBUG: activation dump
-    except Exception:  # DEBUG: activation dump
-        _is_rank0 = True  # DEBUG: activation dump
-    if _is_rank0 and _nemotron_omni_collate_call_count == 0:  # DEBUG: activation dump
-        collate_dump = {}  # DEBUG: activation dump
-        for k, v in result.items():  # DEBUG: activation dump
-            if isinstance(v, torch.Tensor):  # DEBUG: activation dump
-                collate_dump[k] = v.detach().cpu().float() if v.is_floating_point() else v.detach().cpu()  # DEBUG: activation dump
-            else:  # DEBUG: activation dump
-                collate_dump[k] = v  # DEBUG: activation dump
-        _dump_path = _os.path.join(_COLLATE_DUMP_DIR, "collate_output.pt")  # DEBUG: activation dump
-        torch.save(collate_dump, _dump_path)  # DEBUG: activation dump
-        print(f"[ACTIVATION DUMP] Saved collate_output.pt with keys: {list(collate_dump.keys())}")  # DEBUG: activation dump
-        for k, v in collate_dump.items():  # DEBUG: activation dump
-            if isinstance(v, torch.Tensor):  # DEBUG: activation dump
-                print(f"  {k}: shape={tuple(v.shape)} dtype={v.dtype}")  # DEBUG: activation dump
-    _nemotron_omni_collate_call_count += 1  # DEBUG: activation dump
 
     return result
 
