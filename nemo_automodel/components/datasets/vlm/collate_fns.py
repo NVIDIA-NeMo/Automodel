@@ -662,7 +662,7 @@ def default_collate_fn(
             invoked right after ``apply_chat_template`` and before
             ``build_labels``.  Used by model-specific collate wrappers
             (e.g. Gemma4 thinking-channel injection) to transform the
-            tokenized batch without duplicating the rest of the pipeline.
+            tokenized batch and the prefix tokens without duplicating the rest of the pipeline.
     """
     if not HAVE_QWEN_VL_UTILS:
         raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
@@ -699,9 +699,10 @@ def default_collate_fn(
     batch["labels"] = labels[:, 1:]
 
     input_shape = batch["input_ids"].shape
-    for key in batch:
-        if batch[key].shape == input_shape and key != "labels":
-            batch[key] = batch[key][:, :-1]
+    for key in list(batch.keys()):
+        v = batch[key]
+        if isinstance(v, torch.Tensor) and v.shape == input_shape and key != "labels":
+            batch[key] = v[:, :-1]
     return batch
 
 
@@ -845,8 +846,10 @@ def _inject_thinking_prefix_tokens(
     as -100 in labels) lets the model see its expected pattern and brings
     initial loss down to ~3.
 
-    Only modifies ``input_ids``, ``attention_mask``, and ``token_type_ids``
-    (if present).  Other tensors (e.g. ``pixel_values``) are untouched.
+    Modifies ``input_ids``, ``attention_mask``, and ``mm_token_type_ids``
+    (if present).  Additionally, any other 2-D integer tensor whose second
+    dimension matches ``input_ids`` is extended with zeros so that sequence
+    lengths stay consistent (this ismore of future-proofing)
     """
     marker_ids = tokenizer.encode(_GEMMA4_MODEL_TURN, add_special_tokens=False)
     prefix_ids = tokenizer.encode(_GEMMA4_THINKING_PREFIX, add_special_tokens=False)
@@ -861,11 +864,13 @@ def _inject_thinking_prefix_tokens(
     pad_id = getattr(tokenizer, "pad_token_id", 0) or 0
 
     seq_keys = ["input_ids", "attention_mask"]
-    if "token_type_ids" in batch:
-        seq_keys.append("token_type_ids")
+    fill_defaults: Dict[str, int] = {"input_ids": pad_id, "attention_mask": 0}
+    inject_defaults: Dict[str, Any] = {"input_ids": prefix_t, "attention_mask": 1}
 
-    fill_defaults = {"input_ids": pad_id, "attention_mask": 0, "token_type_ids": 0}
-    inject_defaults = {"input_ids": prefix_t, "attention_mask": 1, "token_type_ids": 0}
+    if "mm_token_type_ids" in batch:
+        seq_keys.append("mm_token_type_ids")
+        fill_defaults["mm_token_type_ids"] = 0
+        inject_defaults["mm_token_type_ids"] = 0
 
     B = batch["input_ids"].size(0)
     new_seqs: Dict[str, List[torch.Tensor]] = {k: [] for k in seq_keys}
@@ -906,7 +911,9 @@ def _inject_thinking_prefix_tokens(
     max_new_len = max(s.size(0) for s in new_seqs["input_ids"])
     for k in seq_keys:
         fill = fill_defaults[k]
-        padded = torch.full((B, max_new_len), fill, dtype=batch[k].dtype, device=batch[k].device)
+        padded = torch.full(
+            (B, max_new_len), fill, dtype=batch[k].dtype, device=batch[k].device
+        )
         for i, t in enumerate(new_seqs[k]):
             L = t.size(0)
             padded[i, :L] = t[:L]

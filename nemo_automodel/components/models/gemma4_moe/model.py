@@ -480,10 +480,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         inputs_embeds: torch.Tensor | None = None,
         cache_position: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
-        token_type_ids: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
         **kwargs: Any,
     ):
-        # Newer transformers requires cache_position (can't be None); generate if not provided (uses the standard default that HF uses).
         if cache_position is None and input_ids is not None:
             seq_len = input_ids.shape[-1]
             cache_position = torch.arange(seq_len, device=input_ids.device)
@@ -498,7 +497,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,
                 pixel_values=pixel_values,
-                token_type_ids=token_type_ids,
+                mm_token_type_ids=mm_token_type_ids,
                 **kwargs,
             )
 
@@ -511,8 +510,8 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             image_features = self.model.get_image_features(pixel_values, return_dict=True).pooler_output
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
 
-            if token_type_ids is not None:
-                special_image_mask = token_type_ids == 1
+            if mm_token_type_ids is not None:
+                special_image_mask = mm_token_type_ids == 1
             elif input_ids is not None:
                 special_image_mask = input_ids == self.config.image_token_id
             else:

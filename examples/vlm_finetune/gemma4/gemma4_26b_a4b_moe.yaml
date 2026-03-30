@@ -51,10 +51,6 @@ model:
   # 26B-A4B does not use kv_shared layers (only used in 2B, 4B), hence use_cache: false.
     use_cache: false
 
-# Use default image processor, until the gemma4 transformers bug with FastImageProcessor is fixed.
-processor:
-  use_fast: false
-
 checkpoint:
   enabled: true
   checkpoint_dir: vlm_checkpoints/gemma4_26b_a4b_moe/

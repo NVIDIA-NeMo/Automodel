@@ -43,10 +43,6 @@ model:
   text_config:
     use_cache: true
 
-# Use fast image processor, gemma4 transformers bug with FastImageProcessor is fixed.
-# processor:
-#   use_fast: false
-
 checkpoint:
   enabled: true
   checkpoint_dir: vlm_checkpoints/gemma4_2b_it/
