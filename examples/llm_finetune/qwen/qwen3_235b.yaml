@@ -1,0 +1,90 @@
+step_scheduler:
+  global_batch_size: 128
+  local_batch_size: 16
+  ckpt_every_steps: 100
+  val_every_steps: 100
+  num_epochs: 1
+  max_steps: 5
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+parallelizer:
+  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
+  activation_checkpointing: true
+  reshard_after_forward: false
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /adasif/models/models--Qwen--Qwen3-235B-A22B/snapshots/8efa61729e24bd65b1d152b5ab5409052aa80e65
+  # backend:
+  #   _target_: nemo_automodel.components.moe.utils.BackendConfig
+  #   attn: te
+  #   linear: te
+  #   rms_norm: te
+  #   enable_deepep: false
+  #   fake_balanced_gate: true
+  #   enable_hf_state_dict_adapter: true
+  #   enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /adasif/checkpoints/qwen3_moe_235b
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  tp_size: 1
+  cp_size: 1
+  pp_size: 4
+  dp_replicate_size: 1
+  ep_size: 8
+  sequence_parallel: false
+
+autopipeline:
+  _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
+  pp_schedule: interleaved1f1b
+  pp_microbatch_size: 1
+  round_virtual_stages_to_pp_multiple: up
+  scale_grads_in_schedule: false
+  patch_inner_model: false
+  patch_causal_lm_model: false
+  layers_per_stage: 2
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+
+# validation_dataset:
+#   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+#   path_or_dataset: rowan/hellaswag
+#   split: validation
+#   num_samples_limit: 64
+
+# validation_dataloader:
+#   _target_: torchdata.stateful_dataloader.StatefulDataLoader
+#   collate_fn: nemo_automodel.components.datasets.utils.default_collater
+#   batch_size: 8
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 1.0e-4
+  weight_decay: 0.0
+  # min_lr: 1.0e-5
