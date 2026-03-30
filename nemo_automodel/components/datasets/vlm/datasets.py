@@ -574,8 +574,6 @@ def _log_dataset_loading_summary(timings, wall_time, total_samples, rank=None):
         total_images = sum(t.get("n_images", 0) for t in timings.values())
         total_videos = sum(t.get("n_videos", 0) for t in timings.values())
         total_text_only = sum(t.get("n_text_only", 0) for t in timings.values())
-        total_text_tokens = sum(t.get("n_text_tokens", 0) for t in timings.values())
-        total_media_tokens = sum(t.get("n_media_tokens", 0) for t in timings.values())
         sum_stats = f"  {total_images:>8,}  {total_videos:>8,}  {total_text_only:>8,}"
     else:
         sum_stats = ""
