@@ -13,9 +13,7 @@
 # limitations under the License.
 import math
 from typing import Any, Dict, List
-from unittest.mock import MagicMock
 
-import pytest
 import torch
 
 import nemo_automodel.components.datasets.llm.retrieval_collator as rc
@@ -73,13 +71,13 @@ class FakeTokenizer:
         }
 
 
-def _make_cross_encoder_batch(num_examples: int = 2) -> List[Dict[str, Any]]:
+def _make_cross_encoder_batch(num_examples: int = 2, num_labels: int = None) -> List[Dict[str, Any]]:
     batch = []
     for i in range(num_examples):
-        batch.append({
-            "question": f"what is item {i}",
-            "doc_text": f"document about item {i}",
-        })
+        item = {"question": f"what is item {i}", "doc_text": f"document about item {i}"}
+        if num_labels is not None:
+            item["num_labels"] = num_labels
+        batch.append(item)
     return batch
 
 
@@ -110,3 +108,43 @@ def test_cross_encoder_custom_prompt_template():
         "Q: what is item 0 P: document about item 0",
         "Q: what is item 1 P: document about item 1",
     ]
+
+
+def test_cross_encoder_collator_output_keys_and_shapes():
+    tok = FakeTokenizer()
+    collator = rc.CrossEncoderCollator(rerank_max_length=512, tokenizer=tok, padding=True)
+    batch = _make_cross_encoder_batch(num_examples=3)
+    output = collator(batch)
+
+    assert "input_ids" in output
+    assert "attention_mask" in output
+    assert output["input_ids"].shape[0] == 3
+    assert output["attention_mask"].shape == output["input_ids"].shape
+    assert output["input_ids"].dtype == torch.long
+    assert "labels" not in output
+
+
+def test_cross_encoder_collator_labels_from_num_labels():
+    tok = FakeTokenizer()
+    collator = rc.CrossEncoderCollator(rerank_max_length=512, tokenizer=tok, padding=True)
+    batch = _make_cross_encoder_batch(num_examples=2, num_labels=4)
+    output = collator(batch)
+
+    assert "labels" in output
+    assert output["labels"].shape == (4,)
+    assert output["labels"].dtype == torch.long
+    assert torch.all(output["labels"] == 0)
+
+
+def test_cross_encoder_collator_pad_to_multiple_of():
+    tok = FakeTokenizer()
+    collator = rc.CrossEncoderCollator(
+        rerank_max_length=512, tokenizer=tok, padding=True, pad_to_multiple_of=8
+    )
+    batch = [
+        {"question": "short", "doc_text": "short"},
+        {"question": "this is a much longer query text about many things", "doc_text": "document"},
+    ]
+    output = collator(batch)
+
+    assert output["input_ids"].shape[1] % 8 == 0

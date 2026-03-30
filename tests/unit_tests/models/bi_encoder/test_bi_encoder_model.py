@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
 
 import nemo_automodel._transformers.auto_model as am
 from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel
@@ -81,7 +80,8 @@ def test_from_pretrained_happy_path(monkeypatch):
     assert last_kwargs["some_other_kwarg"] == "x"
 
 
-def test_from_pretrained_retries_without_liger(monkeypatch):
+def _assert_retries_without_liger(monkeypatch, build_model_cls, auto_model_cls):
+    """Verify that when liger patching fails, from_pretrained retries without it."""
     calls = {"build": 0, "liger": 0, "sdpa": 0}
 
     def fake_build(**kwargs):
@@ -96,26 +96,21 @@ def test_from_pretrained_retries_without_liger(monkeypatch):
         calls["sdpa"] += 1
         return model
 
-    def fake_apply_infrastructure(model, **kwargs):
-        return model
-
     _apply_common_mocks(monkeypatch)
-    monkeypatch.setattr(BiEncoderModel, "build", staticmethod(fake_build))
+    monkeypatch.setattr(build_model_cls, "build", staticmethod(fake_build))
     monkeypatch.setattr(am, "_patch_liger_kernel", fake_liger)
     monkeypatch.setattr(am, "_patch_attention", fake_sdpa)
-    monkeypatch.setattr(am, "apply_model_infrastructure", fake_apply_infrastructure)
+    monkeypatch.setattr(am, "apply_model_infrastructure", lambda model, **kwargs: model)
 
-    model = am.NeMoAutoModelBiEncoder.from_pretrained("x", use_liger_kernel=True, use_sdpa_patching=True)
+    model = auto_model_cls.from_pretrained("x", use_liger_kernel=True, use_sdpa_patching=True)
     assert isinstance(model, DummyModel)
-    # First attempt calls liger once, then retries without it (so only 1 liger call)
     assert calls["liger"] == 1
-    # Build called twice (initial + retry)
     assert calls["build"] == 2
-    # SDPA patch applied on retry
     assert calls["sdpa"] == 1
 
 
-def test_from_pretrained_retries_without_sdpa(monkeypatch):
+def _assert_retries_without_sdpa(monkeypatch, build_model_cls, auto_model_cls):
+    """Verify that when SDPA patching fails, from_pretrained retries without it."""
     calls = {"build": 0, "liger": 0, "sdpa": 0}
 
     def fake_build(**kwargs):
@@ -130,24 +125,25 @@ def test_from_pretrained_retries_without_sdpa(monkeypatch):
         calls["sdpa"] += 1
         raise Exception("sdpa failed")
 
-    def fake_apply_infrastructure(model, **kwargs):
-        return model
-
     _apply_common_mocks(monkeypatch)
-    monkeypatch.setattr(BiEncoderModel, "build", staticmethod(fake_build))
+    monkeypatch.setattr(build_model_cls, "build", staticmethod(fake_build))
     monkeypatch.setattr(am, "_patch_liger_kernel", fake_liger)
     monkeypatch.setattr(am, "_patch_attention", fake_sdpa)
-    monkeypatch.setattr(am, "apply_model_infrastructure", fake_apply_infrastructure)
+    monkeypatch.setattr(am, "apply_model_infrastructure", lambda model, **kwargs: model)
 
-    model = am.NeMoAutoModelBiEncoder.from_pretrained("x", use_liger_kernel=True, use_sdpa_patching=True)
+    model = auto_model_cls.from_pretrained("x", use_liger_kernel=True, use_sdpa_patching=True)
     assert isinstance(model, DummyModel)
-    # SDPA attempted once then retried without it (no second SDPA call)
     assert calls["sdpa"] == 1
-    # Build twice (initial + retry)
     assert calls["build"] == 2
-    # Liger called only on the first attempt of each build; second attempt still calls liger
-    # but since use_liger_kernel remains True for this path, ensure it was called twice.
     assert calls["liger"] == 2
+
+
+def test_from_pretrained_retries_without_liger(monkeypatch):
+    _assert_retries_without_liger(monkeypatch, BiEncoderModel, am.NeMoAutoModelBiEncoder)
+
+
+def test_from_pretrained_retries_without_sdpa(monkeypatch):
+    _assert_retries_without_sdpa(monkeypatch, BiEncoderModel, am.NeMoAutoModelBiEncoder)
 
 
 def test_cross_encoder_from_pretrained(monkeypatch):
@@ -176,3 +172,11 @@ def test_cross_encoder_from_pretrained(monkeypatch):
     assert "pooling" not in last_kwargs
     assert "l2_normalize" not in last_kwargs
     assert last_kwargs["model_name_or_path"] == "mock-model"
+
+
+def test_cross_encoder_retries_without_liger(monkeypatch):
+    _assert_retries_without_liger(monkeypatch, CrossEncoderModel, am.NeMoAutoModelCrossEncoder)
+
+
+def test_cross_encoder_retries_without_sdpa(monkeypatch):
+    _assert_retries_without_sdpa(monkeypatch, CrossEncoderModel, am.NeMoAutoModelCrossEncoder)

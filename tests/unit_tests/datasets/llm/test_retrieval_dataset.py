@@ -1210,3 +1210,44 @@ def test_eval_negative_size_defaults_from_n_passages(tmp_path, monkeypatch):
     ex = ds_eval[0]
     # 1 positive + 4 negatives = 5 docs total
     assert len(ex["doc_text"]) == 5
+
+
+from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import flatten_bi_encoder_to_cross_encoder
+
+
+def test_flatten_bi_encoder_to_cross_encoder_basic():
+    data = {
+        "question": ["Q1", "Q2"],
+        "doc_text": [["pos1", "neg1"], ["pos2", "neg2"]],
+        "doc_image": [["", ""], ["", ""]],
+    }
+    result = flatten_bi_encoder_to_cross_encoder(data)
+    assert result["question"] == ["Q1", "Q1", "Q2", "Q2"]
+    assert result["doc_text"] == ["pos1", "neg1", "pos2", "neg2"]
+    assert result["doc_image"] == ["", "", "", ""]
+    assert result["num_labels"] == [2, 2, 2, 2]
+
+
+def test_flatten_bi_encoder_to_cross_encoder_asymmetric():
+    data = {
+        "question": ["Q1"],
+        "doc_text": [["pos", "neg1", "neg2"]],
+        "doc_image": [["", "", ""]],
+    }
+    result = flatten_bi_encoder_to_cross_encoder(data)
+    assert result["question"] == ["Q1", "Q1", "Q1"]
+    assert result["doc_text"] == ["pos", "neg1", "neg2"]
+    assert result["num_labels"] == [1, 1, 1]  # num_labels = len(questions) = 1
+
+
+def test_flatten_bi_encoder_to_cross_encoder_single_doc():
+    data = {
+        "question": ["Q1"],
+        "doc_text": [["only_doc"]],
+        "doc_image": [["img1"]],
+    }
+    result = flatten_bi_encoder_to_cross_encoder(data)
+    assert result["question"] == ["Q1"]
+    assert result["doc_text"] == ["only_doc"]
+    assert result["doc_image"] == ["img1"]
+    assert result["num_labels"] == [1]
