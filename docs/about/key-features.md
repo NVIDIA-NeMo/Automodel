@@ -100,7 +100,7 @@ FP8 training via torchao for reduced memory and higher throughput on supported m
 :::
 
 :::{grid-item-card} {octicon}`server;1.5em;sd-mr-1` Multi-Node with SLURM
-Add a `slurm:` section to any YAML config and launch with the `automodel` CLI. See the [Cluster guide](../launcher/cluster.md).
+Add a `slurm:` section to any YAML config and launch with the `automodel` CLI. See the [Cluster guide](../launcher/slurm.md).
 :::
 
 ::::
@@ -170,7 +170,7 @@ automodel config.yaml
 automodel config.yaml  # CLI detects slurm: section and submits to Slurm
 ```
 
-See the [Local Workstation](../launcher/local-workstation.md) and [Cluster](../launcher/cluster.md) guides.
+See the [Local Workstation](../launcher/local-workstation.md) and [Cluster](../launcher/slurm.md) guides.
 
 ---
 

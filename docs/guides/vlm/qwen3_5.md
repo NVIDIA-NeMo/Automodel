@@ -26,11 +26,11 @@ For a full walkthrough of how MedPix-VQA is preprocessed and integrated into NeM
 
 We provide a ready-to-use recipe at [`examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml). This recipe is configured to run on 32 x 8 H100 nodes.
 
-NeMo Automodel supports several ways to launch training—via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/cluster.md) guide.
+NeMo Automodel supports several ways to launch training—via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md) guide.
 
 ### Standalone Slurm Script
 
-We also provide a standalone Slurm script example for Qwen3.5. Before running it, ensure your cluster environment is configured following the [Standalone Slurm Script (Advanced)](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/cluster.md#standalone-slurm-script-advanced) guide. Then submit the job with the following command:
+We also provide a standalone Slurm script example for Qwen3.5. Before running it, ensure your cluster environment is configured following the [Standalone Slurm Script (Advanced)](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md#standalone-slurm-script-advanced) guide. Then submit the job with the following command:
 
 ```bash
 export TRANSFORMERS_OFFLINE=1

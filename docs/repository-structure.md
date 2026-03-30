@@ -116,4 +116,4 @@ Kubernetes (Kubeflow PyTorchJob), and NeMo-Run launchers. The CLI lives at the r
 
 Learn how to train models with NeMo AutoModel on:
 - **Your local workstation**: See [`docs/launcher/local-workstation.md`](launcher/local-workstation.md).
-- **A cluster**: See [`docs/launcher/cluster.md`](launcher/cluster.md).
+- **A cluster**: See [`docs/launcher/slurm.md`](launcher/slurm.md).

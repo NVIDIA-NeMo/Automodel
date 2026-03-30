@@ -118,7 +118,7 @@ slurm:
 
 All cluster-specific configuration (SBATCH directives, container image, mounts,
 secrets, environment variables) lives in your sbatch script.  See
-[Run on a Cluster](../launcher/cluster.md) for full examples.
+[Run on a Cluster](../launcher/slurm.md) for full examples.
 
 :::{note}
 `job_dir` is used by the CLI on the submit host to create the local log

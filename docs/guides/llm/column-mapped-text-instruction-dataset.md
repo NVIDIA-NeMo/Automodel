@@ -248,7 +248,7 @@ cp slurm.sub my_cluster.sub
 # Edit my_cluster.sub — change #SBATCH directives, container, mounts, etc.
 ```
 
-See the [cluster guide](../launcher/cluster.md) for full examples (Pyxis, bare-metal, Apptainer).
+See the [cluster guide](../../launcher/slurm.md) for full examples (Pyxis, bare-metal, Apptainer).
 
 ### Multi-Node Slurm Configuration
 

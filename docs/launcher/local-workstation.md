@@ -1,8 +1,7 @@
-# Run AutoModel on Your Local Workstation
+# Run on Your Local Workstation
 
-NeMo AutoModel supports training and fine-tuning jobs on configurations ranging from single-GPU workstations to multi-node, multi-GPU clusters.
-Use this guide for local, single-node workflows. For setup details, refer to our [Installation Guide](../guides/installation.md).
-For executing distributed multi-node jobs, please refer to our [Run on a Cluster](./cluster.md) guide.
+Use this guide for local, single-node workflows on a workstation or an interactive Slurm allocation. For setup details, refer to our [Installation Guide](../guides/installation.md).
+For batch multi-node jobs, see the [Slurm](./slurm.md) or [SkyPilot](./skypilot.md) guides.
 
 NeMo AutoModel uses recipes to run end-to-end workflows. If you're new to recipes, see the [Repository Structure](../repository-structure.md) guide.
 
@@ -25,7 +24,7 @@ NeMo AutoModel uses recipes to run end-to-end workflows. If you're new to recipe
 
 ## Run with AutoModel CLI (Single Node)
 
-The AutoModel CLI is the preferred method for most users. It offers a unified interface to launch training scaling from a local workstation (this guide) to large clusters (see our [cluster guide](./cluster.md)).
+The AutoModel CLI is the preferred method for most users. It offers a unified interface to launch training scaling from a local workstation (this guide) to large clusters (see our [cluster guide](./slurm.md)).
 
 ### Basic Usage
 
@@ -74,7 +73,7 @@ automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node
 
 If you don't specify `--nproc-per-node`, it will use all available GPUs on your system.
 
-Looking for Slurm, Kubernetes, or NeMo-Run? See [Run on a Cluster](./cluster.md).
+Looking for Slurm, Kubernetes, or NeMo-Run? See [Run on a Cluster](./slurm.md).
 
 ## Run with uv (Development Mode)
 
@@ -157,4 +156,4 @@ For example, if you want to fine-tune `Qwen/Qwen3-0.6B` instead of `meta-llama/L
 - You're working in environments where uv is not available
 - You're integrating with existing PyTorch workflows
 
-All approaches use the same configuration files and provide the same training capabilities on a single node. For multi-node training, see [Run on a Cluster](./cluster.md).
+All approaches use the same configuration files and provide the same training capabilities on a single node. For multi-node training, see [Run on a Cluster](./slurm.md).

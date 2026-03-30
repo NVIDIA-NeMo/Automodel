@@ -116,13 +116,13 @@ YAML-driven recipes with CLI overrides.
 :::
 
 :::{grid-item-card} {octicon}`device-desktop;1.5em;sd-mr-1` Local Workstation
-:link: launcher/local-workstation
+:link: launcher/interactive
 :link-type: doc
 Run on a single GPU or multi-GPU with torchrun.
 :::
 
 :::{grid-item-card} {octicon}`server;1.5em;sd-mr-1` Cluster (SLURM)
-:link: launcher/cluster
+:link: launcher/slurm
 :link-type: doc
 Multi-node training with SLURM and the `automodel` CLI.
 :::
@@ -221,8 +221,6 @@ about/key-features.md
 guides/installation.md
 guides/configuration.md
 guides/huggingface-api-compatibility.md
-launcher/local-workstation.md
-launcher/cluster.md
 repository-structure.md
 ::::
 
@@ -283,6 +281,9 @@ guides/diffusion/dataset.md
 :hidden:
 :caption: Job Launchers
 
+launcher/overview.md
+launcher/local-workstation.md
+launcher/slurm.md
 launcher/skypilot.md
 ::::
 
