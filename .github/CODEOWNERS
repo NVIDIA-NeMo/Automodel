@@ -10,4 +10,4 @@ examples @akoumpa @HuiyingLi @adil-a @hemildesai @ZhiyuLi-Nvidia @pthombre
 README.md @akoumpa @HuiyingLi @snowmanwwg
 
 nemo_automodel/components/datasets/llm/ @akoumpa @adil-a @HuiyingLi @hemildesai @NVIDIA-NeMo/automodel_retriever_maintainers
-biencoder/ @akoumpa @adil-a @HuiyingLi @hemildesai @NVIDIA-NeMo/automodel_retriever_maintainers
+encoder/ @akoumpa @adil-a @HuiyingLi @hemildesai @NVIDIA-NeMo/automodel_retriever_maintainers

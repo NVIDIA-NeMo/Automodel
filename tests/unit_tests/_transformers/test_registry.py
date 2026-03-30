@@ -291,7 +291,7 @@ def test_all_model_folders_registered_in_auto_map():
     models_root = pathlib.Path(__file__).resolve().parents[3] / "nemo_automodel" / "components" / "models"
 
     # Collect the set of module paths referenced by the auto_map
-    registered_module_paths = {module_path for module_path, _ in MODEL_ARCH_MAPPING.values()}
+    registered_module_paths = {v[0] for v in MODEL_ARCH_MAPPING.values()}
 
     missing = []
     for model_dir in sorted(models_root.iterdir()):

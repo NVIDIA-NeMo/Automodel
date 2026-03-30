@@ -12,16 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Llama Bidirectional model for embedding and retrieval tasks."""
+import shutil
 
-from nemo_automodel.components.models.llama_bidirectional.model import (
-    LlamaBidirectionalConfig,
-    LlamaBidirectionalForSequenceClassification,
-    LlamaBidirectionalModel,
-)
+from tests.utils.test_utils import run_test_script
 
-__all__ = [
-    "LlamaBidirectionalModel",
-    "LlamaBidirectionalConfig",
-    "LlamaBidirectionalForSequenceClassification",
-]
+TEST_FOLDER = "retrieval"
+CROSS_ENCODER_FINETUNE_FILENAME = "L2_Cross_Encoder_Finetune.sh"
+
+
+class TestCrossEncoderFinetune:
+    def test_cross_encoder_finetune(self):
+        try:
+            run_test_script(TEST_FOLDER, CROSS_ENCODER_FINETUNE_FILENAME)
+        finally:
+            shutil.rmtree("/workspace/output/cross_encoder_inline/", ignore_errors=True)

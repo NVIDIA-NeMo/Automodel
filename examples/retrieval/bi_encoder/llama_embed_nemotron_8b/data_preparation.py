@@ -16,10 +16,10 @@ Data preparation script for embed-nemotron-dataset-v1 datasets.
 Downloads and restores datasets from HuggingFace repositories.
 
 Usage:
-    python examples/biencoder/llama_embed_nemotron_8b/data_preparation.py --download-path path/to/dataset
+    python examples/retrieval/bi_encoder/llama_embed_nemotron_8b/data_preparation.py --download-path path/to/dataset
 
 Example:
-    python examples/biencoder/llama_embed_nemotron_8b/data_preparation.py \
+    python examples/retrieval/bi_encoder/llama_embed_nemotron_8b/data_preparation.py \
         --download-path ./embed_nemotron_dataset_v1
 """
 

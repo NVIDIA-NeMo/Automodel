@@ -11,17 +11,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Llama Bidirectional model for embedding and retrieval tasks."""
-
-from nemo_automodel.components.models.llama_bidirectional.model import (
-    LlamaBidirectionalConfig,
-    LlamaBidirectionalForSequenceClassification,
-    LlamaBidirectionalModel,
-)
-
-__all__ = [
-    "LlamaBidirectionalModel",
-    "LlamaBidirectionalConfig",
-    "LlamaBidirectionalForSequenceClassification",
-]

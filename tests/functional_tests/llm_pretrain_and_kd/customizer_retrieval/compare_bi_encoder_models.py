@@ -22,10 +22,10 @@ import numpy as np
 import torch
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.datasets.llm import retrieval_dataset_inline as rdi
-from nemo_automodel.components.datasets.llm import RetrievalBiencoderCollator
+from nemo_automodel.components.datasets.llm import BiEncoderCollator
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel._transformers.auto_model import NeMoAutoModelBiencoder
-from nemo_automodel.recipes.biencoder.train_biencoder import contrastive_scores_and_labels
+from nemo_automodel._transformers.auto_model import NeMoAutoModelBiEncoder
+from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
 
 
 def _resolve_latest_checkpoint_dir(ckpt_root: Path) -> Path:
@@ -64,7 +64,7 @@ def _iter_batches(ds, batch_size: int, max_samples: int):
 def _compute_pos_neg_diffs(
     *,
     model,
-    collator: RetrievalBiencoderCollator,
+    collator: BiEncoderCollator,
     ds,
     device: torch.device,
     batch_size: int,
@@ -87,8 +87,8 @@ def _compute_pos_neg_diffs(
         passage = {k[len(d_prefix) :]: v for k, v in batch.items() if k.startswith(d_prefix)}
 
         with autocast_ctx:
-            q_reps = model.encode(query, encoder="query")
-            p_reps = model.encode(passage, encoder="passage")
+            q_reps = model.encode(query)
+            p_reps = model.encode(passage)
 
             # 2 passages per query: 1 positive + 1 negative
             n_passages = 2
@@ -136,7 +136,7 @@ def load_finetuned_model(model, ft_model_dir: Path):
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare baseline vs fine-tuned biencoder models (pos-neg separation)."
+        description="Compare baseline vs fine-tuned bi-encoder models (pos-neg separation)."
     )
     parser.add_argument("base_model_path", type=str, help="Path to base/pretrained HF model")
     parser.add_argument("checkpoint_root", type=str, help="Path to fine-tuned model directory")
@@ -187,11 +187,9 @@ def main() -> int:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
 
-    # Load all data first (max_train_samples=None -> no cap inside the dataset loader).
     ds = rdi.make_retrieval_dataset(
         data_dir_list=str(dataset_path),
         data_type="eval",
-        train_n_passages=2,
         eval_negative_size=1,
         do_shuffle=False,
         max_train_samples=args.max_samples,
@@ -200,7 +198,7 @@ def main() -> int:
     # max_samples for the batching iterator: use all rows unless capped via CLI.
     max_samples = args.max_samples if args.max_samples is not None else len(ds)
 
-    collator = RetrievalBiencoderCollator(
+    collator = BiEncoderCollator(
         tokenizer=tokenizer,
         q_max_len=max_length,
         p_max_len=max_length,
@@ -214,9 +212,8 @@ def main() -> int:
     model_dtype = torch.bfloat16
 
     # Build a single model instance, compute baseline diffs, then load finetuned weights and recompute.
-    model = NeMoAutoModelBiencoder.from_pretrained(
+    model = NeMoAutoModelBiEncoder.from_pretrained(
         pretrained_model_name_or_path=base_model_path,
-        share_encoder=True,
         pooling="avg",
         l2_normalize=True,
         use_liger_kernel=False,

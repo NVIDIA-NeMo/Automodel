@@ -17,9 +17,9 @@
 # so no model architecture config is needed here.
 #
 # Usage:
-# torchrun --nproc_per_node=8 ./examples/biencoder/mine_hard_negatives.py \
-#     --config examples/biencoder/mining_config.yaml \
-#     --mining.model_name_or_path /path/to/biencoder/checkpoint \
+# torchrun --nproc_per_node=8 ./examples/retrieval/data_utils/mine_hard_negatives.py \
+#     --config examples/retrieval/data_utils/mining_config.yaml \
+#     --mining.model_name_or_path /path/to/encoder/checkpoint \
 #     --mining.train_qa_file_path /path/to/input.json \
 #     --mining.train_file_output_path /path/to/output.json
 
@@ -30,13 +30,13 @@ dist_env:
 
 # Mining parameters - can be overridden via command line
 # Required parameters (must be provided via command line or here):
-#   mining.model_name_or_path: Path to biencoder checkpoint
+#   mining.model_name_or_path: Path to encoder checkpoint
 #   mining.train_qa_file_path: Input QA file
 #   mining.train_file_output_path: Output file with mined negatives
 
 mining:
   # Model path - REQUIRED (override via --mining.model_name_or_path)
-  # model_name_or_path: /path/to/biencoder/checkpoint
+  # model_name_or_path: /path/to/encoder/checkpoint
   
   # Tokenizer path - defaults to model_name_or_path if not specified
   # tokenizer_name_or_path: /path/to/tokenizer

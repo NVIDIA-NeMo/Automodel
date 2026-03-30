@@ -32,6 +32,13 @@ def _next_values():
     )
 
 
+def test_init_all_rng_seed_zero():
+    """``seed=0`` is a valid non-negative integer and must not raise."""
+    init_all_rng(0)
+    # Just verify we can draw from each backend without error
+    _next_values()
+
+
 def test_init_all_rng_reproducibility():
     """
     Calling ``init_all_rng`` twice with the same seed must reproduce
