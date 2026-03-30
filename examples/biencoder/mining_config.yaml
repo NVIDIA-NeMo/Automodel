@@ -54,6 +54,7 @@ mining:
   # Examples:
   #   - Automodel models: Leave commented (uses Automodel defaults)
   #   - nvidia/llama-embed-nemotron-8b: add_bos_token: true, add_eos_token: false
+  #   - nvidia/llama-nemotron-embed-1b-v2: commonly add_bos_token: true, add_eos_token: false
   #   - Custom external model: Check training config and set accordingly
   #
   # add_bos_token: true
