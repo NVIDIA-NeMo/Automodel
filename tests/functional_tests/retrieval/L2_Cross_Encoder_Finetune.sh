@@ -15,11 +15,9 @@
 
 set -exo pipefail
 
-COVERAGE_ARGS="--data-file=/workspace/.coverage --source=/workspace/ --parallel-mode"
-
 # Run the cross-encoder recipe with 2 GPUs (FSDP2).
 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 \
-    -m coverage run ${COVERAGE_ARGS} \
+    -m coverage run \
     -m nemo_automodel.recipes.retrieval.train_cross_encoder \
     --config \
     tests/functional_tests/retrieval/recipe_cross_encoder.yaml \
@@ -28,7 +26,7 @@ python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 \
     --dataloader.dataset.data_dir_list $TEST_DATA_DIR/embedding_testdata/training.jsonl
 
 # Compare baseline vs finetuned cross-encoder checkpoint.
-python3 -m coverage run ${COVERAGE_ARGS} \
+python3 -m coverage run \
     tests/functional_tests/retrieval/compare_cross_encoder_models.py \
     $TEST_DATA_DIR/llama-nemotron-embed-1b-v2 \
     /workspace/output/cross_encoder_inline/checkpoints/epoch_0_step_31/ \
