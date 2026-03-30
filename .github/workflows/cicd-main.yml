@@ -48,9 +48,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.10"
       - name: Set up UV
@@ -79,9 +79,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.10"
       - name: Set up UV
@@ -108,9 +108,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.10"
       - name: Set up UV
@@ -203,7 +203,7 @@ jobs:
     environment: nemo-ci
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: main
         uses: ./.github/actions/build-container
         with:
@@ -241,7 +241,7 @@ jobs:
       && !cancelled()
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: main
         uses: ./.github/actions/test-template
         with:
@@ -303,6 +303,11 @@ jobs:
             timeout: 20
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          - test-name: L2_Context_Parallel
+            test-folder: context_parallel
+            timeout: 20
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
     needs: [pre-flight, cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
@@ -316,7 +321,7 @@ jobs:
       && !cancelled()
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: main
         uses: ./.github/actions/test-template
         with:
@@ -349,7 +354,7 @@ jobs:
     permissions: write-all
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Get workflow result
         id: result
@@ -384,7 +389,7 @@ jobs:
     environment: nemo-ci
     steps:
       - name: Generate fake coverage report
-        uses: actions/github-script@v6
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.PAT }}
           script: |
@@ -411,10 +416,10 @@ jobs:
         flag: [unit-test, e2e]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Download coverage reports of current branch
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: coverage-${{ matrix.flag }}-*
 
@@ -440,7 +445,7 @@ jobs:
           flags: ${{ matrix.flag }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: coverage-${{ matrix.flag }}-aggregated
           path: |

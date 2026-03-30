@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
@@ -103,6 +104,45 @@ def _load_openai_messages(
 
         return dataset
 
+    # Handle local directories and Parquet files via load_dataset.
+    # This covers pre-filtered cached datasets saved as Parquet.
+    if isinstance(path_or_dataset_id, str):
+        p = Path(path_or_dataset_id)
+        is_parquet_file = p.is_file() and p.suffix.lower() == ".parquet"
+        is_dataset_dir = p.is_dir() and any(p.glob("*.parquet"))
+
+        if is_parquet_file or is_dataset_dir:
+            logging.getLogger(__name__).info("Loading local dataset from %s via load_dataset", path_or_dataset_id)
+            base_split = split
+            sl = None
+            if split is not None:
+                match = _SPLIT_SLICE_RE.match(split)
+                if match:
+                    base_split = match.group(1)
+                    start = int(match.group(2)) if match.group(2) else None
+                    end = int(match.group(3)) if match.group(3) else None
+                    sl = slice(start, end)
+
+            load_path = str(p.parent) if is_parquet_file else str(p)
+            # Cached Parquet datasets (from prefilter_dataset.py) are saved as a single
+            # split. Default to "train" when split is unspecified or was stripped to
+            # extract a slice (e.g. "train[:128]" → base_split="train", sl=slice(None,128)).
+            dataset = load_dataset(
+                load_path,
+                name=name,
+                split=base_split or "train",
+                data_files=p.name if is_parquet_file else None,
+                verification_mode=VerificationMode.NO_CHECKS,
+            )
+
+            if shuffle_seed is not None:
+                dataset = dataset.shuffle(seed=shuffle_seed)
+            if sl is not None:
+                indices = range(*sl.indices(len(dataset)))
+                dataset = dataset.select(indices)
+            return dataset
+
+    # Fall back to manual JSON/JSONL parsing for local files.
     files = list(_as_iter(path_or_dataset_id))
     if not files:
         raise RuntimeError("No data files provided")

@@ -76,7 +76,11 @@ class ConsolidatedHFAddon:
 
                 _maybe_strip_quantization_config(model_part)
                 with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
-                    f.write(model_part.config.to_json_string())
+                    if hasattr(model_part.config, "to_json_string"):
+                        f.write(model_part.config.to_json_string())
+                    else:
+                        # Diffusers models use FrozenDict for config instead of PretrainedConfig
+                        json.dump(dict(model_part.config), f, indent=2, default=str)
 
             # save the generation_config.json file
             if getattr(model_part, "generation_config", None) is not None:

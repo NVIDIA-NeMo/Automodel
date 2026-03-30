@@ -1,0 +1,22 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+configs:
+  - deepseek_v32/deepseek_v32_hellaswag_pp.yaml
+  - gemma/functiongemma_xlam.yaml
+  - glm/glm_4.7_te_deepep.yaml
+  - minimax_m2/minimax_m2.1_hellaswag_pp.yaml
+  - nemotron/nemotron_nano_v3_hellaswag.yaml
+  - nemotron/nemotron_nano_v3_hellaswag_peft.yaml
+  - stepfun/step_3.5_flash_hellaswag_pp.yaml
