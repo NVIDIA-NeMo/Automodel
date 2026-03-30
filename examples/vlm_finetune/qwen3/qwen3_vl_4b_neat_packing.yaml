@@ -22,6 +22,7 @@ step_scheduler:
   local_batch_size: 1
   ckpt_every_steps: 50
   val_every_steps: 50
+  max_steps: 100
   num_epochs: 3
 
 dist_env:
@@ -81,6 +82,17 @@ optimizer:
   lr: 1e-5
   weight_decay: 0.01
   betas: [0.9, 0.95]
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: validation
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
 
 freeze_config:
   freeze_embeddings: true
