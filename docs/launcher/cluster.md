@@ -50,15 +50,27 @@ For interactive testing on a Slurm node (without the `slurm:` YAML section):
 
 ## Submit a Batch Job with Slurm
 
-For distributed training on Slurm clusters, add a `slurm` section to your YAML configuration:
+SLURM clusters vary widely: some use Pyxis containers, others use
+Singularity/Apptainer, and many run bare-metal with environment modules.
+Instead of trying to cover all variations in code, AutoModel provides a
+reference sbatch script that you copy and adapt to your cluster.
+
+### Getting Started
+
+1. Copy the reference script:
+
+```bash
+cp slurm.sub my_cluster.sub
+```
+
+2. Edit `my_cluster.sub` — change `#SBATCH` directives (account, partition,
+   nodes, time), container runtime, mounts, and secrets for your cluster.
+
+3. Add a `slurm:` section to your YAML config:
 
 ```yaml
 recipe:
   _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
-
-step_scheduler:
-  grad_acc_steps: 4
-  num_epochs: 1
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
@@ -69,44 +81,171 @@ dataset:
   dataset_name: rajpurkar/squad
   split: train
 
-# Add Slurm configuration
 slurm:
-  job_name: llm-finetune
-  nodes: 1
-  ntasks_per_node: 8
-  time: 00:30:00
-  account: your_account
-  partition: gpu
-  container_image: nvcr.io/nvidia/nemo-automodel:latest
-  gpus_per_node: 8
-  extra_mounts:
-    - /lustre:/lustre
-  hf_home: /path/to/your/HF_HOME
-  # env_vars:
-  #   ENV_VAR: value
-  # job_dir: /path/to/slurm/jobs
+  script: my_cluster.sub
 ```
 
-Then submit the job:
+4. Submit the job:
+
 ```bash
-automodel your_config_with_slurm.yaml
+automodel your_config.yaml
 ```
 
-The CLI will automatically submit the job to Slurm and handle the distributed setup. The above example launches one node with eight workers per node using torchrun (`--nproc-per-node=8`).
+The CLI generates the `torchrun` command from your recipe config and makes it
+available to your script as `$AUTOMODEL_COMMAND`.  All cluster-specific
+configuration (SBATCH directives, container runtime, mounts, NCCL tuning,
+secrets) lives in your sbatch script where you can see and edit it directly.
 
 
-### Launch a Batch Job on Slurm with Modified Code
+### How It Works
 
-If the command is executed from within a Git repository accessible to Slurm workers, the generated SBATCH script will prioritize the repository source over the AutoModel installation inside the container image.
+When you run `automodel config.yaml` with a `slurm:` section, the CLI:
 
-For example:
+1. Writes `job_config.yaml` (the recipe config) to a timestamped job directory
+2. Generates the `torchrun` command from your recipe config
+3. Copies your script into the job directory for reproducibility
+4. Exports `AUTOMODEL_*` environment variables
+5. Runs `sbatch` on your script
+
+Your script receives these environment variables:
+
+| Variable | Description |
+|---|---|
+| `AUTOMODEL_COMMAND` | Full torchrun invocation (ready to `eval` or pass to `srun`) |
+| `AUTOMODEL_CONFIG` | Absolute path to `job_config.yaml` |
+| `AUTOMODEL_JOB_DIR` | Directory where job artifacts are stored |
+| `AUTOMODEL_REPO_ROOT` | Path to the AutoModel source repo |
+
+The generated `AUTOMODEL_COMMAND` uses SLURM environment variables for node
+count and GPUs per node, so it stays in sync with your `#SBATCH` directives:
+
+```
+PYTHONPATH=/opt/Automodel:$PYTHONPATH torchrun \
+    --nproc_per_node=${SLURM_GPUS_PER_NODE:-8} \
+    --nnodes=${SLURM_NNODES:-1} \
+    --rdzv_backend=c10d --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
+    nemo_automodel/recipes/llm/train_ft.py -c /path/to/job_config.yaml
+```
+
+
+### YAML Options
+
+The `slurm:` section supports these fields:
+
+| Field | Required | Description |
+|---|---|---|
+| `script` | **yes** | Path to your sbatch script |
+| `job_dir` | no | Directory for job artifacts (default: `./slurm_jobs`) |
+| `repo_root` | no | Path to AutoModel source (auto-detected from cwd, falls back to `/opt/Automodel`) |
+| `nsys_enabled` | no | Prepend `nsys profile` to the torchrun command (default: `false`) |
+
+Everything else (nodes, GPUs, time, partition, container image, mounts,
+secrets, NCCL tuning) belongs in your sbatch script.
+
+
+### Examples
+
+**Pyxis container (NVIDIA clusters):**
+
+```bash
+#!/bin/bash
+#SBATCH -A my_account
+#SBATCH -p batch
+#SBATCH -t 01:00:00
+#SBATCH -N 8
+#SBATCH --gpus-per-node=8
+#SBATCH --ntasks-per-node=1
+#SBATCH -J automodel-finetune
+#SBATCH --output=slurm_jobs/%x_%j.out
+#SBATCH --error=slurm_jobs/%x_%j.err
+#SBATCH --dependency=singleton
+
+echo "Running on hosts: $(echo $(scontrol show hostname))"
+
+CONT=/lustre/fsw/images/automodel.sqsh
+CONT_NAME=automodel-training
+CONT_MOUNT="\
+/home/$USER/Automodel:/opt/Automodel,\
+/home/$USER/.cache/huggingface:/root/.cache/huggingface"
+
+export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
+export MASTER_PORT=13742
+export NUM_GPUS=${SLURM_GPUS_PER_NODE:-8}
+export WORLD_SIZE=$(($NUM_GPUS * $SLURM_NNODES))
+export WANDB_API_KEY=${WANDB_API_KEY}
+export HF_TOKEN=${HF_TOKEN}
+
+srun \
+    --container-name="${CONT_NAME}" \
+    --container-image="${CONT}" \
+    --container-mounts="${CONT_MOUNT}" \
+    --container-entrypoint \
+    --no-container-mount-home \
+    --export=ALL \
+    bash -c "cd /opt/Automodel && ${AUTOMODEL_COMMAND}"
+```
+
+**Bare-metal (no container):**
+
+```bash
+#!/bin/bash
+#SBATCH -A my_account
+#SBATCH -p gpu
+#SBATCH -N 2
+#SBATCH --gpus-per-node=8
+#SBATCH --time=01:00:00
+
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=13742
+
+module load cuda/12.8
+source /opt/venvs/automodel/bin/activate
+
+srun bash -c "$AUTOMODEL_COMMAND"
+```
+
+**Apptainer / Singularity:**
+
+```bash
+#!/bin/bash
+#SBATCH -A my_account
+#SBATCH -p gpu
+#SBATCH -N 2
+#SBATCH --gpus-per-node=8
+#SBATCH --time=01:00:00
+
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=13742
+
+srun apptainer exec --nv /shared/images/automodel.sif \
+    bash -c "$AUTOMODEL_COMMAND"
+```
+
+To use any of these scripts:
+
+```yaml
+slurm:
+  script: my_cluster.sub
+```
+
+```bash
+automodel my_config.yaml
+```
+
+If you prefer to write the torchrun command yourself (skipping the CLI's
+command generation), just replace `${AUTOMODEL_COMMAND}` with a hardcoded
+command in your script.
+
+
+### Launch with Modified Code
+
+If the command is executed from within a Git repository accessible to Slurm workers, `AUTOMODEL_COMMAND` will use the repository source over the AutoModel installation inside the container image.
+
 ```bash
 git clone git@github.com:NVIDIA-NeMo/Automodel.git automodel_test_repo
 cd automodel_test_repo/
 automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
-
-This will launch the job using the source code in the `automodel_test_repo` directory instead of the version bundled in the Docker image.
 
 ## Submit a Job with Kubernetes
 
@@ -204,176 +343,6 @@ pip install nemo-run
 | `local` | Run on the current machine (like interactive mode, but through NeMo-Run's API) |
 | `slurm` | Submit to a Slurm cluster via NeMo-Run's SlurmExecutor |
 | `k8s` | Submit to Kubernetes via NeMo-Run's K8sExecutor |
-
-## Use Your Own Slurm Script
-
-SLURM clusters vary widely in configuration: some use Pyxis containers, others use
-Singularity/Apptainer, and many run bare-metal with environment modules. The built-in
-template targets Pyxis-based NVIDIA clusters, but you can override it with any sbatch
-script by setting the `custom_script` field:
-
-```yaml
-slurm:
-  custom_script: slurm.sub   # your script
-  nodes: 2
-  ntasks_per_node: 8
-```
-
-When `custom_script` is set the CLI still:
-
-1. Writes `job_config.yaml` (recipe config) to the job directory
-2. Generates the torchrun command
-3. Copies your script into the job directory for reproducibility
-
-But instead of rendering its built-in template, it submits **your** script via
-`sbatch` and exports the following environment variables for your script to use:
-
-| Variable | Description |
-|---|---|
-| `AUTOMODEL_COMMAND` | Full torchrun invocation (ready to `eval` or pass to `srun`) |
-| `AUTOMODEL_CONFIG` | Absolute path to `job_config.yaml` |
-| `AUTOMODEL_JOB_DIR` | Directory where job artifacts are stored |
-| `AUTOMODEL_NNODES` | Number of nodes |
-| `AUTOMODEL_NPROC_PER_NODE` | Workers (GPUs) per node |
-| `AUTOMODEL_REPO_ROOT` | Path to the AutoModel source repo |
-
-### Getting Started
-
-A reference script is provided at
-[`slurm.sub`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/slurm.sub).
-Copy it, adapt the `#SBATCH` directives and launch block for your cluster, then
-point to your copy:
-
-```bash
-cp slurm.sub my_cluster.sub
-# edit my_cluster.sub - change partition, account, container runtime, etc.
-automodel my_config.yaml   # with slurm.custom_script: my_cluster.sub
-```
-
-### Examples
-
-**Pyxis container (NVIDIA clusters):**
-
-A complete, realistic example using Pyxis (the default container runtime on
-NVIDIA Slurm clusters).  `$AUTOMODEL_COMMAND` is the torchrun invocation
-generated by the CLI — your script just needs to `cd` into the repo and
-`eval` or pass it to `bash -c`:
-
-```bash
-#!/bin/bash
-#SBATCH -A my_account
-#SBATCH -p batch
-#SBATCH -t 01:00:00
-#SBATCH -N 8
-#SBATCH --gpus-per-node=8
-#SBATCH --ntasks-per-node=1
-#SBATCH -J automodel-finetune
-#SBATCH --output=slurm_jobs/%x_%j.out
-#SBATCH --error=slurm_jobs/%x_%j.err
-#SBATCH --dependency=singleton
-
-echo "Running on hosts: $(echo $(scontrol show hostname))"
-
-CONT=/lustre/fsw/images/automodel.sqsh
-CONT_NAME=automodel-training
-CONT_MOUNT="\
-/home/$USER/Automodel:/opt/Automodel,\
-/home/$USER/.cache/huggingface:/root/.cache/huggingface"
-
-export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
-export MASTER_PORT=13742
-export NUM_GPUS=${SLURM_GPUS_PER_NODE:-8}
-export WORLD_SIZE=$(($NUM_GPUS * $SLURM_NNODES))
-export WANDB_API_KEY=${WANDB_API_KEY}
-export HF_TOKEN=${HF_TOKEN}
-
-srun \
-    --container-name="${CONT_NAME}" \
-    --container-image="${CONT}" \
-    --container-mounts="${CONT_MOUNT}" \
-    --container-entrypoint \
-    --no-container-mount-home \
-    --export=ALL \
-    bash -c "cd /opt/Automodel && ${AUTOMODEL_COMMAND}"
-```
-
-To use this script, set `custom_script` in your YAML and run:
-
-```yaml
-slurm:
-  custom_script: my_cluster.sub
-  nodes: 8
-  ntasks_per_node: 8
-```
-
-```bash
-automodel my_config.yaml
-```
-
-The CLI generates the torchrun command from your config and injects it as
-`$AUTOMODEL_COMMAND`.  For the config above this expands to something like:
-
-```
-PYTHONPATH=/opt/Automodel:$PYTHONPATH torchrun \
-    --nproc_per_node=8 --nnodes=8 \
-    --rdzv_backend=c10d --rdzv_endpoint=${MASTER_ADDR}:13742 \
-    nemo_automodel/recipes/llm/train_ft.py -c /path/to/job_config.yaml
-```
-
-If you prefer to write the torchrun command yourself (skipping the CLI
-entirely), just replace `${AUTOMODEL_COMMAND}` with a hardcoded command:
-
-```bash
-    bash -c "cd /opt/Automodel && torchrun \
-        --nproc_per_node=8 --nnodes=8 \
-        --rdzv_backend=c10d --rdzv_endpoint=\${MASTER_ADDR}:13742 \
-        nemo_automodel/recipes/llm/benchmark.py \
-        --config examples/benchmark/configs/your_config.yaml"
-```
-
-**Bare-metal (no container):**
-
-```bash
-#!/bin/bash
-#SBATCH -A my_account
-#SBATCH -p gpu
-#SBATCH -N 2
-#SBATCH --gpus-per-node=8
-#SBATCH --time=01:00:00
-
-export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-export MASTER_PORT=13742
-
-module load cuda/12.8
-source /opt/venvs/automodel/bin/activate
-
-srun bash -c "$AUTOMODEL_COMMAND"
-```
-
-**Apptainer / Singularity:**
-
-```bash
-#!/bin/bash
-#SBATCH -A my_account
-#SBATCH -p gpu
-#SBATCH -N 2
-#SBATCH --gpus-per-node=8
-#SBATCH --time=01:00:00
-
-export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-export MASTER_PORT=13742
-
-srun apptainer exec --nv /shared/images/automodel.sif \
-    bash -c "$AUTOMODEL_COMMAND"
-```
-
-### Built-in Template Reference
-
-If you do **not** set `custom_script`, the CLI auto-generates an sbatch script using
-its built-in template (see
-[`nemo_automodel/components/launcher/slurm/template.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/launcher/slurm/template.py)).
-This template is designed for Pyxis-based NVIDIA clusters and may not work
-on other environments without modification.
 
 ## Customize Configuration Settings
 

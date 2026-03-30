@@ -108,22 +108,21 @@ Printing a **leaf value** (for example, `print(cfg.dataset.delta_storage_options
 
 ## Configure Slurm (`automodel` CLI)
 
-The `automodel` CLI loads YAML using `yaml.safe_load()` and then extracts the `slurm:` section.
-Since the `slurm:` dict is not wrapped into a `ConfigNode`, **env placeholders are passed through as-is**. This lets you defer expansion to job runtime (and avoids embedding secrets into generated scripts).
-
-Example:
+The `slurm:` section in your YAML is minimal — it only tells the CLI where
+your sbatch script is:
 
 ```yaml
 slurm:
-  hf_home: ${HF_HOME}        # passed through to the template as-is
-  hf_token: ${HF_TOKEN}      # also passed through (recommended for secrets)
-  env_vars:
-    WANDB_API_KEY: ${WANDB_API_KEY}
+  script: my_cluster.sub
 ```
 
+All cluster-specific configuration (SBATCH directives, container image, mounts,
+secrets, environment variables) lives in your sbatch script.  See
+[Run on a Cluster](../launcher/cluster.md) for full examples.
+
 :::{note}
-- `job_dir` is used by the CLI on the submit host to create the local log directory and write the sbatch script/config. If you set `job_dir` to a placeholder like `${SLURM_JOB_DIR}`, the CLI will treat it literally.
-- Some values are rendered into `#SBATCH` directives (which are **not** shell-expanded). Prefer env placeholders for runtime `export ...` lines (`hf_token`, `env_vars`, etc.), not for SBATCH fields.
-- The `slurm:` section is passed through to a **bash script**. Use bash-compatible syntax (`$VAR` / `${VAR}`) there. Python-only forms like `${oc.env:VAR}` (and dotted names like `${foo.bar}`) are not valid bash parameter expansions and can fail at runtime.
+`job_dir` is used by the CLI on the submit host to create the local log
+directory and write `job_config.yaml`. If you set `job_dir` to a placeholder
+like `${SLURM_JOB_DIR}`, the CLI will treat it literally.
 :::
 

@@ -211,27 +211,22 @@ automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node
 ```
 
 ### LLM SFT Multi Node
-To launch on a SLURM cluster, add a `slurm:` section to your YAML config and run the same CLI command:
+To launch on a SLURM cluster, copy the reference sbatch script and adapt it to your cluster, then add a `slurm:` section to your YAML config:
+```sh
+cp slurm.sub my_cluster.sub
+# Edit my_cluster.sub — change #SBATCH directives, container, mounts, etc.
+```
 ```yaml
 # Inside your YAML config:
 slurm:
-  job_name: llm-finetune
-  nodes: 2
-  ntasks_per_node: 8
-  time: 00:30:00
-  account: your_account
-  partition: gpu
-  container_image: nvcr.io/nvidia/nemo-automodel:25.11.00
-  gpus_per_node: 8
-  extra_mounts:
-    - /lustre:/lustre
-  hf_home: /path/to/your/HF_HOME
+  script: my_cluster.sub
 ```
 ```sh
 automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
-The CLI automatically detects the `slurm:` section, generates an SBATCH script, and submits the job.
+The CLI generates the `torchrun` command from your config and makes it available to your script as `$AUTOMODEL_COMMAND`.
+All cluster-specific settings (nodes, GPUs, partition, container, mounts) live in your sbatch script.
 Kubernetes (`k8s:`) and NeMo-Run (`nemo_run:`) sections are also supported -- see our
 [cluster guide](https://docs.nvidia.com/nemo/automodel/latest/launcher/cluster.html) for details.
 

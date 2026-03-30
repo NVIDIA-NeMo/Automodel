@@ -23,7 +23,7 @@ from nemo_automodel.components.launcher.slurm.launcher import (
     _get_automodel_repo_root,
     _recipe_module_path,
 )
-from nemo_automodel.components.launcher.slurm.utils import submit_custom_slurm_job
+from nemo_automodel.components.launcher.slurm.utils import submit_slurm_job
 
 
 # ---------------------------------------------------------------------------
@@ -64,14 +64,10 @@ def test_recipe_module_path_short():
 # SlurmLauncher.launch
 # ---------------------------------------------------------------------------
 @pytest.fixture
-def base_slurm_config():
-    return {
-        "nodes": 1,
-        "ntasks_per_node": 8,
-        "container_image": "nvcr.io/test:latest",
-        "partition": "batch",
-        "time": "01:00:00",
-    }
+def slurm_script(tmp_path):
+    script = tmp_path / "my_cluster.sub"
+    script.write_text('#!/bin/bash\nsrun bash -c "$AUTOMODEL_COMMAND"\n')
+    return script
 
 
 @pytest.fixture
@@ -92,35 +88,33 @@ def _mock_submit(return_code=0):
     )
 
 
-def _mock_slurm_config():
-    return mock.patch(
-        "nemo_automodel.components.launcher.slurm.config.SlurmConfig",
-        side_effect=lambda **kwargs: mock.MagicMock(**kwargs),
-    )
-
-
 class TestSlurmLauncherLaunch:
-    def test_basic_launch(self, tmp_path, base_slurm_config, recipe_config):
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
-        with _mock_submit(0) as mock_sub, _mock_slurm_config():
-            launcher = SlurmLauncher()
-            rc = launcher.launch(
+    def test_basic_launch(self, tmp_path, slurm_script, recipe_config):
+        slurm_config = {
+            "script": str(slurm_script),
+            "job_dir": str(tmp_path / "slurm_jobs"),
+        }
+        with _mock_submit(0) as mock_sub:
+            rc = SlurmLauncher().launch(
                 config=recipe_config,
                 config_path=Path("/tmp/config.yaml"),
                 recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
+                launcher_config=slurm_config,
             )
         assert rc == 0
         mock_sub.assert_called_once()
 
-    def test_writes_config_yaml(self, tmp_path, base_slurm_config, recipe_config):
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
-        with _mock_submit(0), _mock_slurm_config():
+    def test_writes_config_yaml(self, tmp_path, slurm_script, recipe_config):
+        slurm_config = {
+            "script": str(slurm_script),
+            "job_dir": str(tmp_path / "slurm_jobs"),
+        }
+        with _mock_submit(0):
             SlurmLauncher().launch(
                 config=recipe_config,
                 config_path=Path("/tmp/config.yaml"),
                 recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
+                launcher_config=slurm_config,
             )
         timestamp_dirs = [d for d in (tmp_path / "slurm_jobs").iterdir() if d.is_dir() and d.name.isdigit()]
         assert len(timestamp_dirs) == 1
@@ -129,38 +123,121 @@ class TestSlurmLauncherLaunch:
         loaded = yaml.safe_load(cfg_file.read_text())
         assert loaded["trainer"]["max_steps"] == 100
 
-    def test_empty_job_name_defaults(self, tmp_path, base_slurm_config, recipe_config):
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
-        base_slurm_config["job_name"] = ""
-        with _mock_submit(0), _mock_slurm_config() as mock_cfg:
+    def test_copies_script_to_job_dir(self, tmp_path, slurm_script, recipe_config):
+        slurm_config = {
+            "script": str(slurm_script),
+            "job_dir": str(tmp_path / "slurm_jobs"),
+        }
+        with _mock_submit(0) as mock_sub:
             SlurmLauncher().launch(
                 config=recipe_config,
                 config_path=Path("/tmp/config.yaml"),
                 recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
+                launcher_config=slurm_config,
             )
-        call_kwargs = mock_cfg.call_args.kwargs
-        assert call_kwargs.get("job_name") == "automodel_job"
+        submitted_path = mock_sub.call_args.args[0]
+        assert "my_cluster.sub" in submitted_path
+        assert "slurm_jobs" in submitted_path
 
-    def test_repo_root_from_config(self, tmp_path, base_slurm_config, recipe_config):
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
-        base_slurm_config["repo_root"] = "/custom/repo"
-        with _mock_submit(0), _mock_slurm_config() as mock_cfg:
+    def test_exports_env_vars(self, tmp_path, slurm_script, recipe_config):
+        slurm_config = {
+            "script": str(slurm_script),
+            "job_dir": str(tmp_path / "slurm_jobs"),
+        }
+        with _mock_submit(0) as mock_sub:
             SlurmLauncher().launch(
                 config=recipe_config,
                 config_path=Path("/tmp/config.yaml"),
                 recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
+                launcher_config=slurm_config,
             )
-        call_kwargs = mock_cfg.call_args.kwargs
-        assert call_kwargs.get("chdir") == "/custom/repo"
-        assert "repo_root" not in call_kwargs
+        _, env_vars, _ = mock_sub.call_args.args
+        assert "AUTOMODEL_COMMAND" in env_vars
+        assert "AUTOMODEL_CONFIG" in env_vars
+        assert "AUTOMODEL_JOB_DIR" in env_vars
+        assert "AUTOMODEL_REPO_ROOT" in env_vars
 
-    def test_repo_root_detected_from_cwd(self, tmp_path, base_slurm_config, recipe_config):
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
+    def test_command_uses_slurm_env_vars(self, tmp_path, slurm_script, recipe_config):
+        slurm_config = {
+            "script": str(slurm_script),
+            "job_dir": str(tmp_path / "slurm_jobs"),
+        }
+        with _mock_submit(0) as mock_sub:
+            SlurmLauncher().launch(
+                config=recipe_config,
+                config_path=Path("/tmp/config.yaml"),
+                recipe_target=RECIPE_TARGET,
+                launcher_config=slurm_config,
+            )
+        _, env_vars, _ = mock_sub.call_args.args
+        cmd = env_vars["AUTOMODEL_COMMAND"]
+        assert "${SLURM_GPUS_PER_NODE:-8}" in cmd
+        assert "${SLURM_NNODES:-1}" in cmd
+        assert "${MASTER_ADDR}:${MASTER_PORT}" in cmd
+
+    def test_script_required(self, tmp_path, recipe_config):
+        slurm_config = {"job_dir": str(tmp_path / "slurm_jobs")}
+        with pytest.raises(ValueError, match="slurm.script is required"):
+            SlurmLauncher().launch(
+                config=recipe_config,
+                config_path=Path("/tmp/config.yaml"),
+                recipe_target=RECIPE_TARGET,
+                launcher_config=slurm_config,
+            )
+
+    def test_script_not_found(self, tmp_path, recipe_config):
+        slurm_config = {
+            "script": "/nonexistent/path.sub",
+            "job_dir": str(tmp_path / "slurm_jobs"),
+        }
+        with pytest.raises(FileNotFoundError, match="SLURM script not found"):
+            SlurmLauncher().launch(
+                config=recipe_config,
+                config_path=Path("/tmp/config.yaml"),
+                recipe_target=RECIPE_TARGET,
+                launcher_config=slurm_config,
+            )
+
+    def test_legacy_custom_script_field(self, tmp_path, slurm_script, recipe_config):
+        """Backward compat: ``custom_script`` still works."""
+        slurm_config = {
+            "custom_script": str(slurm_script),
+            "job_dir": str(tmp_path / "slurm_jobs"),
+        }
+        with _mock_submit(0) as mock_sub:
+            rc = SlurmLauncher().launch(
+                config=recipe_config,
+                config_path=Path("/tmp/config.yaml"),
+                recipe_target=RECIPE_TARGET,
+                launcher_config=slurm_config,
+            )
+        assert rc == 0
+        mock_sub.assert_called_once()
+
+    def test_repo_root_from_config(self, tmp_path, slurm_script, recipe_config):
+        slurm_config = {
+            "script": str(slurm_script),
+            "job_dir": str(tmp_path / "slurm_jobs"),
+            "repo_root": "/custom/repo",
+        }
+        with _mock_submit(0) as mock_sub:
+            SlurmLauncher().launch(
+                config=recipe_config,
+                config_path=Path("/tmp/config.yaml"),
+                recipe_target=RECIPE_TARGET,
+                launcher_config=slurm_config,
+            )
+        _, env_vars, _ = mock_sub.call_args.args
+        assert env_vars["AUTOMODEL_REPO_ROOT"] == "/custom/repo"
+        assert "PYTHONPATH=/custom/repo" in env_vars["AUTOMODEL_COMMAND"]
+
+    def test_repo_root_detected_from_cwd(self, tmp_path, slurm_script, recipe_config):
+        slurm_config = {
+            "script": str(slurm_script),
+            "job_dir": str(tmp_path / "slurm_jobs"),
+        }
         with (
-            _mock_submit(0),
-            _mock_slurm_config() as mock_cfg,
+            _mock_submit(0) as mock_sub,
             mock.patch(
                 "nemo_automodel.components.launcher.slurm.launcher._get_automodel_repo_root",
                 return_value=Path("/detected/root"),
@@ -170,16 +247,18 @@ class TestSlurmLauncherLaunch:
                 config=recipe_config,
                 config_path=Path("/tmp/config.yaml"),
                 recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
+                launcher_config=slurm_config,
             )
-        call_kwargs = mock_cfg.call_args.kwargs
-        assert call_kwargs.get("chdir") == "/detected/root"
+        _, env_vars, _ = mock_sub.call_args.args
+        assert env_vars["AUTOMODEL_REPO_ROOT"] == "/detected/root"
 
-    def test_repo_root_fallback(self, tmp_path, base_slurm_config, recipe_config):
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
+    def test_repo_root_fallback(self, tmp_path, slurm_script, recipe_config):
+        slurm_config = {
+            "script": str(slurm_script),
+            "job_dir": str(tmp_path / "slurm_jobs"),
+        }
         with (
-            _mock_submit(0),
-            _mock_slurm_config() as mock_cfg,
+            _mock_submit(0) as mock_sub,
             mock.patch(
                 "nemo_automodel.components.launcher.slurm.launcher._get_automodel_repo_root",
                 return_value=None,
@@ -189,238 +268,77 @@ class TestSlurmLauncherLaunch:
                 config=recipe_config,
                 config_path=Path("/tmp/config.yaml"),
                 recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
-            )
-        call_kwargs = mock_cfg.call_args.kwargs
-        assert call_kwargs.get("chdir") == "/opt/Automodel"
-
-    def test_nsys_enabled(self, tmp_path, base_slurm_config, recipe_config):
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
-        base_slurm_config["nsys_enabled"] = True
-        with _mock_submit(0), _mock_slurm_config() as mock_cfg:
-            SlurmLauncher().launch(
-                config=recipe_config,
-                config_path=Path("/tmp/config.yaml"),
-                recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
-            )
-        call_kwargs = mock_cfg.call_args.kwargs
-        assert "nsys profile" in call_kwargs["command"]
-        assert "--capture-range=cudaProfilerApi" in call_kwargs["command"]
-
-    def test_nsys_disabled(self, tmp_path, base_slurm_config, recipe_config):
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
-        base_slurm_config["nsys_enabled"] = False
-        with _mock_submit(0), _mock_slurm_config() as mock_cfg:
-            SlurmLauncher().launch(
-                config=recipe_config,
-                config_path=Path("/tmp/config.yaml"),
-                recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
-            )
-        call_kwargs = mock_cfg.call_args.kwargs
-        assert "nsys profile" not in call_kwargs["command"]
-
-    def test_extra_args_forwarded(self, tmp_path, base_slurm_config, recipe_config):
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
-        with _mock_submit(0), _mock_slurm_config() as mock_cfg:
-            SlurmLauncher().launch(
-                config=recipe_config,
-                config_path=Path("/tmp/config.yaml"),
-                recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
-                extra_args=["--lr=0.001", "--warmup=100"],
-            )
-        call_kwargs = mock_cfg.call_args.kwargs
-        assert "--lr=0.001" in call_kwargs["command"]
-        assert "--warmup=100" in call_kwargs["command"]
-
-    def test_hf_home_created(self, tmp_path, base_slurm_config, recipe_config):
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
-        with _mock_submit(0), _mock_slurm_config():
-            SlurmLauncher().launch(
-                config=recipe_config,
-                config_path=Path("/tmp/config.yaml"),
-                recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
-            )
-        hf_home = tmp_path / "slurm_jobs" / ".hf_home"
-        assert hf_home.exists()
-
-    def test_hf_home_from_config(self, tmp_path, base_slurm_config, recipe_config):
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
-        hf_dir = tmp_path / "custom_hf"
-        hf_dir.mkdir()
-        base_slurm_config["hf_home"] = str(hf_dir)
-        with _mock_submit(0), _mock_slurm_config() as mock_cfg:
-            SlurmLauncher().launch(
-                config=recipe_config,
-                config_path=Path("/tmp/config.yaml"),
-                recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
-            )
-        call_kwargs = mock_cfg.call_args.kwargs
-        assert call_kwargs["hf_home"] == str(hf_dir)
-
-    def test_extra_mounts_with_existing_repo(self, tmp_path, base_slurm_config, recipe_config):
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
-        repo = tmp_path / "my_repo"
-        repo.mkdir()
-        base_slurm_config["repo_root"] = str(repo)
-        with _mock_submit(0), _mock_slurm_config() as mock_cfg:
-            SlurmLauncher().launch(
-                config=recipe_config,
-                config_path=Path("/tmp/config.yaml"),
-                recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
-            )
-        call_kwargs = mock_cfg.call_args.kwargs
-        assert len(call_kwargs["extra_mounts"]) == 1
-
-    def test_submit_returns_nonzero(self, tmp_path, base_slurm_config, recipe_config):
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
-        with _mock_submit(1), _mock_slurm_config():
-            rc = SlurmLauncher().launch(
-                config=recipe_config,
-                config_path=Path("/tmp/config.yaml"),
-                recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
-            )
-        assert rc == 1
-
-
-# ---------------------------------------------------------------------------
-# Custom SLURM script support
-# ---------------------------------------------------------------------------
-def _mock_custom_submit(return_code=0):
-    return mock.patch(
-        "nemo_automodel.components.launcher.slurm.utils.submit_custom_slurm_job",
-        return_value=return_code,
-    )
-
-
-class TestSlurmLauncherCustomScript:
-    def test_custom_script_basic(self, tmp_path, base_slurm_config, recipe_config):
-        script = tmp_path / "my_cluster.sub"
-        script.write_text('#!/bin/bash\nsrun bash -c "$AUTOMODEL_COMMAND"\n')
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
-        base_slurm_config["custom_script"] = str(script)
-
-        with _mock_custom_submit(0) as mock_sub:
-            rc = SlurmLauncher().launch(
-                config=recipe_config,
-                config_path=Path("/tmp/config.yaml"),
-                recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
-            )
-        assert rc == 0
-        mock_sub.assert_called_once()
-
-    def test_custom_script_exports_env_vars(self, tmp_path, base_slurm_config, recipe_config):
-        script = tmp_path / "my_cluster.sub"
-        script.write_text("#!/bin/bash\necho ok\n")
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
-        base_slurm_config["custom_script"] = str(script)
-
-        with _mock_custom_submit(0) as mock_sub:
-            SlurmLauncher().launch(
-                config=recipe_config,
-                config_path=Path("/tmp/config.yaml"),
-                recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
+                launcher_config=slurm_config,
             )
         _, env_vars, _ = mock_sub.call_args.args
-        assert "AUTOMODEL_COMMAND" in env_vars
-        assert "AUTOMODEL_CONFIG" in env_vars
-        assert "AUTOMODEL_JOB_DIR" in env_vars
-        assert "AUTOMODEL_NNODES" in env_vars
-        assert "AUTOMODEL_NPROC_PER_NODE" in env_vars
-        assert "AUTOMODEL_REPO_ROOT" in env_vars
+        assert env_vars["AUTOMODEL_REPO_ROOT"] == "/opt/Automodel"
 
-    def test_custom_script_copies_to_job_dir(self, tmp_path, base_slurm_config, recipe_config):
-        script = tmp_path / "my_cluster.sub"
-        script.write_text("#!/bin/bash\necho custom\n")
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
-        base_slurm_config["custom_script"] = str(script)
-
-        with _mock_custom_submit(0) as mock_sub:
+    def test_nsys_enabled(self, tmp_path, slurm_script, recipe_config):
+        slurm_config = {
+            "script": str(slurm_script),
+            "job_dir": str(tmp_path / "slurm_jobs"),
+            "nsys_enabled": True,
+        }
+        with _mock_submit(0) as mock_sub:
             SlurmLauncher().launch(
                 config=recipe_config,
                 config_path=Path("/tmp/config.yaml"),
                 recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
+                launcher_config=slurm_config,
             )
-        submitted_path = mock_sub.call_args.args[0]
-        assert "my_cluster.sub" in submitted_path
-        assert "slurm_jobs" in submitted_path
+        _, env_vars, _ = mock_sub.call_args.args
+        assert "nsys profile" in env_vars["AUTOMODEL_COMMAND"]
+        assert "--capture-range=cudaProfilerApi" in env_vars["AUTOMODEL_COMMAND"]
 
-    def test_custom_script_still_writes_config(self, tmp_path, base_slurm_config, recipe_config):
-        script = tmp_path / "my_cluster.sub"
-        script.write_text("#!/bin/bash\necho ok\n")
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
-        base_slurm_config["custom_script"] = str(script)
-
-        with _mock_custom_submit(0):
+    def test_nsys_disabled(self, tmp_path, slurm_script, recipe_config):
+        slurm_config = {
+            "script": str(slurm_script),
+            "job_dir": str(tmp_path / "slurm_jobs"),
+            "nsys_enabled": False,
+        }
+        with _mock_submit(0) as mock_sub:
             SlurmLauncher().launch(
                 config=recipe_config,
                 config_path=Path("/tmp/config.yaml"),
                 recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
+                launcher_config=slurm_config,
             )
-        timestamp_dirs = [d for d in (tmp_path / "slurm_jobs").iterdir() if d.is_dir() and d.name.isdigit()]
-        assert len(timestamp_dirs) == 1
-        cfg_file = timestamp_dirs[0] / "job_config.yaml"
-        assert cfg_file.exists()
+        _, env_vars, _ = mock_sub.call_args.args
+        assert "nsys profile" not in env_vars["AUTOMODEL_COMMAND"]
 
-    def test_custom_script_not_found(self, tmp_path, base_slurm_config, recipe_config):
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
-        base_slurm_config["custom_script"] = "/nonexistent/path.sub"
-
-        with pytest.raises(FileNotFoundError, match="Custom SLURM script not found"):
+    def test_extra_args_forwarded(self, tmp_path, slurm_script, recipe_config):
+        slurm_config = {
+            "script": str(slurm_script),
+            "job_dir": str(tmp_path / "slurm_jobs"),
+        }
+        with _mock_submit(0) as mock_sub:
             SlurmLauncher().launch(
                 config=recipe_config,
                 config_path=Path("/tmp/config.yaml"),
                 recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
+                launcher_config=slurm_config,
+                extra_args=["--lr=0.001", "--warmup=100"],
             )
+        _, env_vars, _ = mock_sub.call_args.args
+        assert "--lr=0.001" in env_vars["AUTOMODEL_COMMAND"]
+        assert "--warmup=100" in env_vars["AUTOMODEL_COMMAND"]
 
-    def test_custom_script_bypasses_builtin_template(self, tmp_path, base_slurm_config, recipe_config):
-        """When custom_script is set, submit_slurm_job (built-in path) must not be called."""
-        script = tmp_path / "my_cluster.sub"
-        script.write_text("#!/bin/bash\necho ok\n")
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
-        base_slurm_config["custom_script"] = str(script)
-
-        with (
-            _mock_submit(0) as mock_builtin,
-            _mock_custom_submit(0) as mock_custom,
-        ):
-            SlurmLauncher().launch(
-                config=recipe_config,
-                config_path=Path("/tmp/config.yaml"),
-                recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
-            )
-        mock_builtin.assert_not_called()
-        mock_custom.assert_called_once()
-
-    def test_custom_script_returns_nonzero(self, tmp_path, base_slurm_config, recipe_config):
-        script = tmp_path / "bad_script.sub"
-        script.write_text("#!/bin/bash\nexit 1\n")
-        base_slurm_config["job_dir"] = str(tmp_path / "slurm_jobs")
-        base_slurm_config["custom_script"] = str(script)
-
-        with _mock_custom_submit(1):
+    def test_submit_returns_nonzero(self, tmp_path, slurm_script, recipe_config):
+        slurm_config = {
+            "script": str(slurm_script),
+            "job_dir": str(tmp_path / "slurm_jobs"),
+        }
+        with _mock_submit(1):
             rc = SlurmLauncher().launch(
                 config=recipe_config,
                 config_path=Path("/tmp/config.yaml"),
                 recipe_target=RECIPE_TARGET,
-                launcher_config=base_slurm_config,
+                launcher_config=slurm_config,
             )
         assert rc == 1
 
 
-class TestSubmitCustomSlurmJob:
+class TestSubmitSlurmJob:
     def test_submits_with_env(self, tmp_path):
         script = tmp_path / "test.sbatch"
         script.write_text("#!/bin/bash\necho ok\n")
@@ -432,7 +350,7 @@ class TestSubmitCustomSlurmJob:
             mock_proc.returncode = 0
             mock_popen.return_value = mock_proc
 
-            rc = submit_custom_slurm_job(
+            rc = submit_slurm_job(
                 str(script),
                 {"AUTOMODEL_COMMAND": "torchrun foo.py", "AUTOMODEL_CONFIG": "/tmp/cfg.yaml"},
                 job_dir,
@@ -455,6 +373,6 @@ class TestSubmitCustomSlurmJob:
             mock_proc.returncode = 1
             mock_popen.return_value = mock_proc
 
-            rc = submit_custom_slurm_job(str(script), {}, job_dir)
+            rc = submit_slurm_job(str(script), {}, job_dir)
 
         assert rc == 1

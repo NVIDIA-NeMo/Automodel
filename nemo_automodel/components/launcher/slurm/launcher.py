@@ -41,7 +41,13 @@ def _recipe_module_path(recipe_target: str, repo_root: str) -> str:
 
 
 class SlurmLauncher(Launcher):
-    """Submit a recipe job to a SLURM cluster."""
+    """Submit a recipe job to a SLURM cluster using a user-provided sbatch script.
+
+    The ``slurm:`` YAML section requires a ``script`` field pointing to an
+    sbatch script.  The CLI generates the torchrun command, writes the recipe
+    config, and exports ``AUTOMODEL_*`` environment variables for the script
+    to use.  See ``slurm.sub`` at the repo root for a reference template.
+    """
 
     def _resolve_job_dir(self, slurm_config: Dict[str, Any]) -> str:
         job_dir = os.path.join(
@@ -73,16 +79,16 @@ class SlurmLauncher(Launcher):
 
     def _build_command(
         self,
-        slurm_config: Dict[str, Any],
         recipe_target: str,
         repo_root: str,
         job_dir: str,
         job_conf_path: str,
+        nsys_enabled: bool = False,
         extra_args: Optional[List[str]] = None,
     ) -> str:
         script_path = _recipe_module_path(recipe_target, repo_root)
 
-        if slurm_config.get("nsys_enabled", False):
+        if nsys_enabled:
             profile_cmd = (
                 f"nsys profile -s none "
                 f"--trace=cuda,cudnn,nvtx "
@@ -100,14 +106,14 @@ class SlurmLauncher(Launcher):
 
         command_parts = [
             f"PYTHONPATH={repo_root}:$PYTHONPATH",
-            f"uv sync --inexact --frozen $(cat /opt/uv_args.txt) && {profile_cmd}uv run --no-sync torchrun ",
-            f"--nproc_per_node={slurm_config['ntasks_per_node']} ",
-            f"--nnodes={slurm_config['nodes']} ",
-            "--rdzv_backend=c10d ",
+            f"{profile_cmd}torchrun",
+            "--nproc_per_node=${SLURM_GPUS_PER_NODE:-8}",
+            "--nnodes=${SLURM_NNODES:-1}",
+            "--rdzv_backend=c10d",
             "--rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT}",
             script_path,
             "-c",
-            f"{job_conf_path}",
+            job_conf_path,
         ]
         if extra_args:
             command_parts.extend(extra_args)
@@ -121,11 +127,26 @@ class SlurmLauncher(Launcher):
         launcher_config: Dict[str, Any],
         extra_args: Optional[List[str]] = None,
     ) -> int:
-        from nemo_automodel.components.launcher.slurm.config import SlurmConfig, VolumeMapping
-        from nemo_automodel.components.launcher.slurm.utils import submit_custom_slurm_job, submit_slurm_job
+        from nemo_automodel.components.launcher.slurm.utils import submit_slurm_job
 
         slurm_config = dict(launcher_config)
-        custom_script = slurm_config.pop("custom_script", None)
+
+        # script is required (accept both "script" and legacy "custom_script")
+        script = slurm_config.pop("script", None) or slurm_config.pop("custom_script", None)
+        if script is None:
+            raise ValueError(
+                "slurm.script is required. Provide a path to your sbatch script.\n"
+                "Copy the reference template to get started:\n"
+                "  cp slurm.sub my_cluster.sub\n"
+                "Then add to your YAML:\n"
+                "  slurm:\n"
+                "    script: my_cluster.sub\n"
+                "See docs/launcher/cluster.md for examples."
+            )
+
+        script_path = Path(script).resolve()
+        if not script_path.is_file():
+            raise FileNotFoundError(f"SLURM script not found: {script_path}")
 
         job_dir = self._resolve_job_dir(slurm_config)
 
@@ -134,43 +155,26 @@ class SlurmLauncher(Launcher):
             yaml.dump(config, fp, default_flow_style=False, sort_keys=False)
         logger.info("Logging Slurm job in: %s", job_dir)
 
-        if "hf_home" not in slurm_config:
-            slurm_config["hf_home"] = str(Path(job_dir).parent / ".hf_home")
-            os.makedirs(slurm_config["hf_home"], exist_ok=True)
-        logger.info("Using HF_HOME= `%s`", slurm_config["hf_home"])
-
         repo_root = self._resolve_repo_root(slurm_config)
 
-        if slurm_config.get("job_name", "") == "":
-            slurm_config["job_name"] = "automodel_job"
-
-        command = self._build_command(slurm_config, recipe_target, repo_root, job_dir, job_conf_path, extra_args)
-
-        if custom_script:
-            custom_script_path = Path(custom_script).resolve()
-            if not custom_script_path.is_file():
-                raise FileNotFoundError(f"Custom SLURM script not found: {custom_script_path}")
-
-            copied_script = Path(job_dir) / custom_script_path.name
-            shutil.copy2(custom_script_path, copied_script)
-
-            env_vars = {
-                "AUTOMODEL_COMMAND": command,
-                "AUTOMODEL_CONFIG": job_conf_path,
-                "AUTOMODEL_JOB_DIR": job_dir,
-                "AUTOMODEL_NNODES": str(slurm_config.get("nodes", 1)),
-                "AUTOMODEL_NPROC_PER_NODE": str(slurm_config.get("ntasks_per_node", 8)),
-                "AUTOMODEL_REPO_ROOT": repo_root,
-            }
-            logger.info("Using custom SLURM script: %s", custom_script_path)
-            return submit_custom_slurm_job(str(copied_script), env_vars, job_dir)
-
-        if "extra_mounts" not in slurm_config:
-            slurm_config["extra_mounts"] = []
-        if Path(repo_root).exists():
-            slurm_config["extra_mounts"].append(VolumeMapping(Path(repo_root), Path(repo_root)))
-
-        return submit_slurm_job(
-            SlurmConfig(**slurm_config, command=command, chdir=repo_root),
+        command = self._build_command(
+            recipe_target,
+            repo_root,
             job_dir,
+            job_conf_path,
+            nsys_enabled=slurm_config.pop("nsys_enabled", False),
+            extra_args=extra_args,
         )
+
+        # Copy script to job dir for reproducibility
+        copied_script = Path(job_dir) / script_path.name
+        shutil.copy2(script_path, copied_script)
+
+        env_vars = {
+            "AUTOMODEL_COMMAND": command,
+            "AUTOMODEL_CONFIG": job_conf_path,
+            "AUTOMODEL_JOB_DIR": job_dir,
+            "AUTOMODEL_REPO_ROOT": repo_root,
+        }
+        logger.info("Using SLURM script: %s", script_path)
+        return submit_slurm_job(str(copied_script), env_vars, job_dir)

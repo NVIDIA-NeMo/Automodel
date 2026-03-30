@@ -17,24 +17,20 @@
 # NeMo AutoModel — Reference SLURM submission script
 # =============================================================================
 #
-# This is a reference sbatch script for use with AutoModel's custom_script
-# feature.  Copy this file, adapt it to your cluster, and point to it from
-# your YAML config:
+# This is a reference sbatch script for launching AutoModel training jobs on
+# SLURM clusters.  Copy this file, adapt it to your cluster, and point to it
+# from your YAML config:
 #
 #   slurm:
-#     custom_script: /path/to/your/copy.sub
-#     nodes: 8
-#     ntasks_per_node: 8
+#     script: /path/to/your/copy.sub
 #
 # When you run `automodel config.yaml`, the CLI exports these env vars before
 # calling sbatch on your script:
 #
-#   AUTOMODEL_COMMAND          – Full torchrun invocation (ready to eval)
-#   AUTOMODEL_CONFIG           – Absolute path to job_config.yaml
-#   AUTOMODEL_JOB_DIR          – Directory where job artifacts are stored
-#   AUTOMODEL_NNODES           – Number of nodes
-#   AUTOMODEL_NPROC_PER_NODE   – Workers (GPUs) per node
-#   AUTOMODEL_REPO_ROOT        – Path to the AutoModel source repo
+#   AUTOMODEL_COMMAND   – Full torchrun invocation (ready to eval)
+#   AUTOMODEL_CONFIG    – Absolute path to job_config.yaml
+#   AUTOMODEL_JOB_DIR   – Directory where job artifacts are stored
+#   AUTOMODEL_REPO_ROOT – Path to the AutoModel source repo
 #
 # Your script can use $AUTOMODEL_COMMAND directly, or ignore it entirely and
 # build your own torchrun invocation.
@@ -47,7 +43,7 @@
 # 4. (Optional) Replace the srun command with your own launch logic.
 #    The last line uses $AUTOMODEL_COMMAND which the CLI populates for you,
 #    but you can hardcode a torchrun command instead if you prefer.
-# 5. Reference it from YAML:  slurm: { custom_script: my_cluster.sub, ... }
+# 5. Reference it from YAML:  slurm: { script: my_cluster.sub }
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -98,18 +94,12 @@ export HF_TOKEN=${HF_TOKEN:-}
 # full torchrun invocation like:
 #
 #   PYTHONPATH=/opt/Automodel:$PYTHONPATH \
-#   torchrun --nproc_per_node=8 --nnodes=8 \
-#            --rdzv_backend=c10d --rdzv_endpoint=${MASTER_ADDR}:13742 \
+#   torchrun --nproc_per_node=${SLURM_GPUS_PER_NODE:-8} \
+#            --nnodes=${SLURM_NNODES:-1} \
+#            --rdzv_backend=c10d --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
 #            nemo_automodel/recipes/llm/train_ft.py -c /path/to/job_config.yaml
 #
 # If you prefer to write the torchrun command yourself, replace the last line.
-# For example, to hardcode a benchmark run:
-#
-#   bash -c "cd /opt/Automodel/ && torchrun \
-#       --nproc_per_node=8 --nnodes=8 \
-#       --rdzv_backend=c10d --rdzv_endpoint=\${MASTER_ADDR}:13742 \
-#       nemo_automodel/recipes/llm/benchmark.py \
-#       --config examples/benchmark/configs/your_config.yaml"
 
 srun \
     --container-name="${CONT_NAME}" \
