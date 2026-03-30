@@ -116,7 +116,7 @@ YAML-driven recipes with CLI overrides.
 :::
 
 :::{grid-item-card} {octicon}`device-desktop;1.5em;sd-mr-1` Local Workstation
-:link: launcher/interactive
+:link: launcher/local-workstation
 :link-type: doc
 Run on a single GPU or multi-GPU with torchrun.
 :::
