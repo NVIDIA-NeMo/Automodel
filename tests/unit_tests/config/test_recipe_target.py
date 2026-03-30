@@ -27,6 +27,7 @@ _EXAMPLES_DIR = _PROJECT_ROOT / "examples"
 _EXCLUDED_PREFIXES = (
     str(_EXAMPLES_DIR / "diffusion"),
     str(_EXAMPLES_DIR / "biencoder" / "mining_config.yaml"),
+    str(_EXAMPLES_DIR / "convergence"),
 )
 
 
