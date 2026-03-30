@@ -497,6 +497,38 @@ See [Gemma-3n](omni/gemma3-3n.md) and [VLM dataset](vlm/dataset.md) for end-to-e
 
 ---
 
+## Diffusion Datasets
+
+Diffusion models don't train directly on raw images or videos. Instead, the data is first encoded into a compact numerical representation called a latent — this is what the model actually learns from. Text captions are similarly converted into text embeddings that the model uses as conditioning.
+
+This encoding is done once during preprocessing, and the results are saved as cache files (.meta). Training then reads these cache files directly, which is significantly faster than re-encoding on every step.
+
+The built-in preprocessing tool ([`tools/diffusion/preprocessing_multiprocess.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/diffusion/preprocessing_multiprocess.py)) handles this conversion. It uses a VAE (Variational Autoencoder) to encode visual data and a text encoder for captions, grouping outputs into resolution-bucketed directories compatible with the multiresolution dataloader.
+
+### Dataloader Builders
+
+- **Video (T2V)**: `nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader` — for Wan 2.1 and HunyuanVideo
+- **Image (T2I)**: `nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader` — for FLUX.1-dev
+
+### Example YAML (Video Dataloader)
+
+```yaml
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
+    cache_dir: /path/to/processed_meta
+    model_type: wan
+    base_resolution: [512, 512]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+    num_workers: 0
+```
+
+See the [Diffusion Dataset Preparation](diffusion/dataset.md) guide for full preprocessing instructions and configuration details.
+
+---
+
 ## Bring Your Own Dataset
 You can integrate custom datasets with zero code changes to NeMo Automodel by using `_target_` in YAML. There are three approaches:
 
