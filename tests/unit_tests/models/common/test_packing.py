@@ -80,15 +80,23 @@ class TestPassthroughCreateCausalMask:
         result = _passthrough_create_causal_mask(attention_mask=mask)
         assert result is mask
 
-    def test_delegates_to_original_for_normal_mask(self):
-        """Normal 2D mask (max<=1) delegates to the original HF create_causal_mask."""
+    def test_fa2_passthrough_for_normal_mask(self):
+        """FA2 config with normal 2D mask still passes through (FA2 handles masking)."""
+        config = SimpleNamespace(_attn_implementation="flash_attention_2")
+        mask = torch.tensor([[1, 1, 1, 0, 0]])
+        result = _passthrough_create_causal_mask(config=config, attention_mask=mask)
+        assert result is mask
+
+    def test_delegates_to_original_for_non_fa2(self):
+        """Non-FA2 config with normal 2D mask delegates to HF create_causal_mask."""
         from unittest.mock import patch
 
+        config = SimpleNamespace(_attn_implementation="sdpa")
         mask = torch.tensor([[1, 1, 1, 0, 0]])
         with patch("transformers.masking_utils.create_causal_mask", return_value="delegated") as mock_cm:
             result = _passthrough_create_causal_mask(
                 attention_mask=mask,
-                config=None,
+                config=config,
                 inputs_embeds=torch.zeros(1, 5, 64),
                 cache_position=torch.arange(5),
             )
