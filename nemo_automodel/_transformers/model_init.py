@@ -190,6 +190,11 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
     trust_remote_code = kwargs.pop("trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path))
     hf_config = kwargs.get("config", None)
     if hf_config is None:
+        # Filter out nested dict kwargs before passing to AutoConfig.from_pretrained.
+        # Nested dicts (e.g. text_config={"key": val}) would replace entire sub-configs
+        # with incomplete dicts, losing all other fields. These nested overrides are
+        # instead handled by _consume_config_overrides which deep-merges them.
+        nested_kwargs = {k: kwargs.pop(k) for k in list(kwargs) if isinstance(kwargs[k], dict)}  # noqa: F841
         try:
             hf_config = AutoConfig.from_pretrained(
                 pretrained_model_name_or_path,
@@ -384,7 +389,17 @@ def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str
             continue
         # Otherwise, if it looks like a config field, apply it to config.
         if k in config_keys:
-            setattr(config, k, kwargs.pop(k))
+            val = kwargs.pop(k)
+            # Deep-merge dict overrides into existing sub-config objects (e.g.
+            # text_config={"router_aux_loss_coef": 0}) instead of replacing the
+            # entire sub-config, which would lose all other fields.
+            if isinstance(val, dict):
+                existing = getattr(config, k, None)
+                if existing is not None and hasattr(existing, "to_dict"):
+                    for sub_k, sub_v in val.items():
+                        setattr(existing, sub_k, sub_v)
+                    continue
+            setattr(config, k, val)
 
 
 def _filter_kwargs_for_init(model_cls, kwargs: dict) -> dict:
