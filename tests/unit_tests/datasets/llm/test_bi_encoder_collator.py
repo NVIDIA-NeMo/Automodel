@@ -78,7 +78,7 @@ def test_unpack_doc_values():
 
 
 def test_merge_and_convert_helpers():
-    collator = rc.RetrievalBiencoderCollator(FakeTokenizer())
+    collator = rc.BiEncoderCollator(FakeTokenizer())
     query_batch = {"input_ids": [[10], [20]], "attention_mask": [[1], [1]]}  # batch_size = 2
     # 2 examples * train_n_passages(=2) = 4 document rows
     doc_batch = {"input_ids": [[100], [101], [110], [111]], "attention_mask": [[1], [1], [1], [1]]}
@@ -102,7 +102,7 @@ def _make_batch(num_examples: int = 2, docs_per_example: int = 3) -> List[Dict[s
 
 def test_collator_end_to_end_no_prefix():
     tok = FakeTokenizer()
-    collator = rc.RetrievalBiencoderCollator(tokenizer=tok, q_max_len=16, p_max_len=16, padding=True)
+    collator = rc.BiEncoderCollator(tokenizer=tok, q_max_len=16, p_max_len=16, padding=True)
     batch = _make_batch(num_examples=2, docs_per_example=3)
     out = collator(batch)
     # Expected keys
@@ -119,7 +119,7 @@ def test_collator_end_to_end_no_prefix():
 
 def test_collator_with_prefix_and_pad_multiple():
     tok = FakeTokenizer()
-    collator = rc.RetrievalBiencoderCollator(
+    collator = rc.BiEncoderCollator(
         tokenizer=tok, q_max_len=32, p_max_len=32, query_prefix="Q:", passage_prefix="D:", padding=True, pad_to_multiple_of=4
     )
     # Make varying lengths so padding is exercised and rounded to multiple-of 4
@@ -138,7 +138,7 @@ def test_collator_with_prefix_and_pad_multiple():
 def test_collator_with_dataset_instruction():
     """Test that use_dataset_instruction prepends query/passage instructions from dataset metadata."""
     tok = FakeTokenizer()
-    collator = rc.RetrievalBiencoderCollator(
+    collator = rc.BiEncoderCollator(
         tokenizer=tok,
         q_max_len=64,
         p_max_len=64,
@@ -185,7 +185,7 @@ def test_collator_with_dataset_instruction():
     # than just the question alone
 
     # Create a second batch without instructions to compare
-    collator_no_instruction = rc.RetrievalBiencoderCollator(
+    collator_no_instruction = rc.BiEncoderCollator(
         tokenizer=tok,
         q_max_len=64,
         p_max_len=64,

@@ -12,15 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# To run this recipe:
-#   automodel examples/biencoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml --nproc-per-node 8
-# Adjust --nproc-per-node to the number of GPUs available on your machine.
-
-recipe: TrainBiencoderRecipe
+# To run this recipe, please use the following command:
+# python examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml
+# Or with torchrun for multi-GPU:
+# torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml
 
 seed: 125
 
-train_n_passages: 5
 temperature: 0.02
 
 step_scheduler:
@@ -31,7 +29,7 @@ step_scheduler:
   num_epochs: 1
 
 model:
-  _target_: nemo_automodel.NeMoAutoModelBiencoder.from_pretrained
+  _target_: nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
   pooling: avg
   torch_dtype: bfloat16
@@ -44,6 +42,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   dataset:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
+    model_type: bi_encoder
     data_dir_list:
       - ./embed_nemotron_dataset_v1/EmotionClassification/EmotionClassification.json
       - ./embed_nemotron_dataset_v1/FEVER/FEVER.json
@@ -60,12 +59,12 @@ dataloader:
       - ./embed_nemotron_dataset_v1/SyntheticClassificationData/SyntheticClassificationData.json
       - ./embed_nemotron_dataset_v1/TriviaQA/TriviaQA.json
     data_type: train
-    train_n_passages: 5
+    n_passages: 5
     seed: 125
     do_shuffle: true
     use_dataset_instruction: true
   collate_fn:
-    _target_: nemo_automodel.components.datasets.llm.RetrievalBiencoderCollator
+    _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
     q_max_len: 512
     p_max_len: 512
     query_prefix: ""

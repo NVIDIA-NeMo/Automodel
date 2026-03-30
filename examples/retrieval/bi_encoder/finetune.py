@@ -25,17 +25,17 @@ warnings.warn(
 )
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.biencoder import TrainBiencoderRecipe
+from nemo_automodel.recipes.retrieval import TrainBiEncoderRecipe
 
 
-def main(default_config_path="examples/biencoder/llama3_2_1b_biencoder.yaml"):
-    """Main entry point for the biencoder fine-tuning recipe.
+def main(default_config_path="examples/retrieval/bi_encoder/llama3_2_1b.yaml"):
+    """Main entry point for the bi-encoder fine-tuning recipe.
 
     .. deprecated::
         Use ``automodel <config.yaml>`` instead.
     """
     cfg = parse_args_and_load_config(default_config_path)
-    recipe = TrainBiencoderRecipe(cfg)
+    recipe = TrainBiEncoderRecipe(cfg)
     recipe.setup()
     recipe.run_train_validation_loop()
 
