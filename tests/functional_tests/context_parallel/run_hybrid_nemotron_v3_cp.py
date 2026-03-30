@@ -209,7 +209,7 @@ def _compare_results(
         print(f"{'=' * 70}")
         print(f"Output shape: CP={output_cp_full.shape}, Baseline={output_baseline.shape}")
         print(f"Output diff - mean: {output_diff.mean().item():.6f}, max: {output_diff.max().item():.6f}")
-        print(f"Embed grad diff - mean: {grad_diff.mean().item():.6f}, max: {grad_diff.max().item():.6f}")
+        print(f"Param grad diff - mean: {grad_diff.mean().item():.6f}, max: {grad_diff.max().item():.6f}")
 
     try:
         torch.testing.assert_close(
@@ -224,7 +224,7 @@ def _compare_results(
             grad_baseline,
             rtol=grad_rtol,
             atol=grad_atol,
-            msg=f"[{config_name}][Rank {rank}] embed_tokens.weight.grad differs",
+            msg=f"[{config_name}][Rank {rank}] Parameter gradients differ",
         )
         if rank == 0:
             print("  PASSED")
@@ -482,7 +482,7 @@ def run_bshd_sdpa(rank, world_size, device, config):
     output_baseline = model_baseline(input_ids=input_ids_full)
     output_baseline.sum().backward()
     out_base = output_baseline.detach().clone()
-    embed_grad_base = model_baseline.embed_tokens.weight.grad.detach().clone()
+    param_grad_base = model_baseline.layers["0"].mixer.q_proj.weight.grad.detach().clone()
     dist.barrier()
 
     # CP=2 with SDPA + context_parallel
@@ -530,17 +530,18 @@ def run_bshd_sdpa(rank, world_size, device, config):
         seq_dims=[1],
     )
 
-    # Embedding was not in the backward graph (we used detach + inputs_embeds),
-    # so compare output only and use matching zeros for the grad comparison.
-    embed_grad_zeros = torch.zeros_like(embed_grad_base)
+    # Embedding is not in the backward graph (detached for context_parallel),
+    # so validate gradients using q_proj.weight which IS in the graph.
+    param_grad_cp = model_cp.layers["0"].mixer.q_proj.weight.grad.detach().clone()
+    dist.all_reduce(param_grad_cp, op=dist.ReduceOp.SUM, group=cp_group)
 
     return _compare_results(
         "bshd_sdpa",
         rank,
         out_cp_full,
         out_base,
-        embed_grad_zeros,
-        embed_grad_zeros,
+        param_grad_cp,
+        param_grad_base,
         output_atol=5e-2,
         output_rtol=1e-2,
         grad_atol=1e-1,

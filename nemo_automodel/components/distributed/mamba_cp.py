@@ -481,13 +481,18 @@ class MambaContextParallel:
         """Repeat group states for CP ranks when n_groups < cp_size.
 
         ``[B, L, n_groups * d_state]`` -> ``[B, L, n_groups * repeat * d_state]``
+        Also supports THD 2D input ``[T, n_groups * d_state]``.
         """
-        return (
+        is_2d = state.dim() == 2
+        if is_2d:
+            state = state.unsqueeze(0)
+        result = (
             state.reshape(*state.shape[:-1], self.n_groups, self.d_state)
             .unsqueeze(-2)
             .expand(-1, -1, -1, self.group_repeat_count, -1)
             .reshape(*state.shape[:-1], self.n_groups * self.group_repeat_count * self.d_state)
         )
+        return result.squeeze(0) if is_2d else result
 
     def _slice_vector_param(self, param: torch.Tensor) -> torch.Tensor:
         """Slice a per-head vector parameter for the current CP rank."""
