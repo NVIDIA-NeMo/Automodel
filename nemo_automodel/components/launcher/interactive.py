@@ -40,8 +40,8 @@ def _get_repo_root() -> Path:
 def resolve_recipe_cls(target_str: str):
     """Import and return the recipe class from a dotted path.
 
-    Example *target_str*:
-    ``nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction``
+    "  pip install nemo-automodel          # CPU/basic\n"
+    "  pip install nemo-automodel[all]     # with CUDA & all extras\n\n"
     """
     module_path, cls_name = target_str.rsplit(".", 1)
     module = importlib.import_module(module_path)
