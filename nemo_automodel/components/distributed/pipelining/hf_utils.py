@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import traceback
 import types
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
@@ -106,27 +107,49 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         if causal_mask_mapping is None:
             # If causal_mask_mapping is missing, fall back to on-the-fly computation.
             # This is not recommended for compilation, as it introduces runtime overhead.
-            logger.warning(
-                "causal_mask_mapping not provided; computing it here. "
-                "This is slow and not recommended for compilation. "
-                "Precompute causal_mask_mapping in the data pipeline for best performance."
+            #
+            # DEBUG: log why we're in the fallback path.  This should NOT happen after
+            # the collate_fn fix — if you see this log, causal_mask_mapping was dropped
+            # somewhere between collate and this forward call.
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            print(
+                f"[DEBUG rank={rank}] causal_mask_mapping not provided; computing it here. "
+                f"inputs_embeds.shape={inputs_embeds.shape if inputs_embeds is not None else None}  "
+                f"attention_mask={attention_mask.shape if isinstance(attention_mask, torch.Tensor) else attention_mask}  "
+                f"_attn_implementation={getattr(getattr(self, 'config', None), '_attn_implementation', 'N/A')}\n"
+                f"Call stack:\n{''.join(traceback.format_stack(limit=12))}",
+                flush=True,
             )
             if not isinstance((causal_mask_mapping := attention_mask), dict):
-                from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
-
-                # Note: input_embeds is only used for shape and dtype, not values
-                # We could use a dummy tensor here, but inputs_embeds is already available
-                mask_kwargs = {
-                    "config": self.config,
-                    "input_embeds": inputs_embeds,
-                    "attention_mask": attention_mask,
-                    "cache_position": cache_position,
-                    "past_key_values": None,  # Training-only: no KV cache
-                    "position_ids": position_ids,
-                }
-                causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
+                # Skip create_causal_mask entirely: for standard (non-packed) causal
+                # training, passing None lets FA2 use its native is_causal=True fast
+                # path with zero mask-materialization overhead.
+                causal_mask_mapping = {"full_attention": None}
                 if hasattr(self, "has_sliding_layers") and self.has_sliding_layers:
-                    causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+                    from transformers.masking_utils import create_sliding_window_causal_mask
+                    mask_kwargs = {
+                        "config": self.config,
+                        "input_embeds": inputs_embeds,
+                        "attention_mask": attention_mask,
+                        "cache_position": cache_position,
+                        "past_key_values": None,
+                        "position_ids": None,
+                    }
+                    # causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+        else:
+            # DEBUG: log that causal_mask_mapping was received correctly (log only first call to avoid spam)
+            if not getattr(pipeline_forward, "_mask_logged", False):
+                import torch.distributed as dist
+                rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+                fa_mask = causal_mask_mapping.get("full_attention")
+                print(
+                    f"[DEBUG rank={rank}] causal_mask_mapping received OK: keys={list(causal_mask_mapping.keys())}  "
+                    f"full_attention type={type(fa_mask)}  "
+                    f"value={fa_mask.shape if isinstance(fa_mask, torch.Tensor) else fa_mask}",
+                    flush=True,
+                )
+                pipeline_forward._mask_logged = True
 
         hidden_states = inputs_embeds
 
@@ -139,12 +162,27 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         if hasattr(self, "layers") and self.layers is not None:
             # Works for dict-like or list-like containers
             layer_iter = self.layers.values() if hasattr(self.layers, "values") else self.layers
+            _layer_dbg_done = getattr(pipeline_forward, "_layer_mask_logged", False)
             for decoder_layer in layer_iter:
                 layer_attention_mask = causal_mask_mapping.get("full_attention")
                 if hasattr(decoder_layer, "attention_type"):
                     layer_attention_mask = causal_mask_mapping.get(
                         getattr(decoder_layer, "attention_type"), causal_mask_mapping.get("full_attention")
                     )
+
+                # DEBUG: confirm mask is None (full causal) at every decoder layer call.
+                if not _layer_dbg_done:
+                    import torch.distributed as dist
+                    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+                    print(
+                        f"[DEBUG layer mask rank={rank}] layer={type(decoder_layer).__name__}  "
+                        f"attention_mask={type(layer_attention_mask).__name__}  "
+                        f"value={layer_attention_mask.shape if isinstance(layer_attention_mask, torch.Tensor) else layer_attention_mask}  "
+                        f"<-- should be None for full-causal FA2 (no mask materialization)",
+                        flush=True,
+                    )
+                    pipeline_forward._layer_mask_logged = True
+                    _layer_dbg_done = True
 
                 hidden_states = decoder_layer(
                     hidden_states,
@@ -196,6 +234,20 @@ def create_pipeline_forward_causal_lm() -> Callable:
         )
 
         if hasattr(self, "model") and self.model is not None:
+            # DEBUG: log what kwargs (specifically causal_mask_mapping) reach the causal-LM wrapper
+            if not getattr(pipeline_forward_causal_lm, "_clm_logged", False):
+                import torch.distributed as dist
+                rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+                cmm = kwargs.get("causal_mask_mapping", "NOT_IN_KWARGS")
+                print(
+                    f"[DEBUG rank={rank}] pipeline_forward_causal_lm: "
+                    f"input_ids.shape={input_ids.shape if isinstance(input_ids, torch.Tensor) else type(input_ids).__name__}  "
+                    f"causal_mask_mapping in kwargs={'causal_mask_mapping' in kwargs}  "
+                    f"value={({k: (type(v).__name__, v.shape if isinstance(v, torch.Tensor) else v) for k, v in cmm.items()} if isinstance(cmm, dict) else cmm)}",
+                    flush=True,
+                )
+                pipeline_forward_causal_lm._clm_logged = True
+
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -232,12 +284,115 @@ def create_pipeline_forward_causal_lm() -> Callable:
     return pipeline_forward_causal_lm
 
 
+def _patch_is_packed_sequence_for_pp_training() -> None:
+    """Eliminate CPU-GPU sync in flash attention during PP training.
+
+    transformers._is_packed_sequence() returns a GPU bool scalar when batch_size==1,
+    which causes Python's `if` to call aten::is_nonzero — a CPU-GPU sync — once per
+    attention layer per microbatch forward pass.  With PP+gradient-checkpointing this
+    fires ~2560 times per iteration, costing ~36 s/iter on 70B.
+
+    For standard (non-packed) PP training sequences are never packed, so returning the
+    Python False immediately is both correct and avoids the sync.  Do NOT apply this
+    patch when using packed-sequence training (multiple sequences concatenated into one
+    tensor with position_ids that reset to 0 mid-sequence).
+    """
+    try:
+        import transformers.modeling_flash_attention_utils as _fa_utils
+
+        if getattr(_fa_utils, "_is_packed_sequence_patched_for_pp", False):
+            return  # already patched
+
+        def _is_packed_sequence_no_sync(position_ids, batch_size):
+            # Non-packed training: position_ids is always a simple arange — never packed.
+            return False
+
+        _fa_utils._is_packed_sequence = _is_packed_sequence_no_sync
+
+        # Patch _flash_attention_forward to add one-time debug confirming:
+        #   1) is_causal=True (full causal path — no recompile)
+        #   2) attention_mask=None (no mask materialization)
+        #   3) which branch is taken (standard causal else-branch expected)
+        #
+        # Must patch BOTH the source module AND the already-imported name in modeling_llama,
+        # because modeling_llama imports _flash_attention_forward by reference at import time.
+        # FSDP2 wrapping prevents class-level method patches from firing, so this is the
+        # only reliable interception point.
+        try:
+            _orig_fa_fwd = _fa_utils._flash_attention_forward
+
+            _fa_call_count = [0]
+
+            def _flash_attention_forward_debug(*args, _orig=_orig_fa_fwd, _count=_fa_call_count, **kwargs):
+                import torch.distributed as dist
+                rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+
+                attn_mask = kwargs.get("attention_mask", args[3] if len(args) > 3 else "N/A")
+                is_causal = kwargs.get("is_causal", args[5] if len(args) > 5 else "N/A")
+                position_ids = kwargs.get("position_ids", args[7] if len(args) > 7 else None)
+                cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
+                cu_seq_lens_k = kwargs.get("cu_seq_lens_k")
+
+                has_mask = attn_mask is not None and attn_mask != "N/A"
+                has_varlen = cu_seq_lens_q is not None and cu_seq_lens_k is not None
+                has_packed = _fa_utils._is_packed_sequence(position_ids, batch_size=args[0].size(0)) if position_ids is not None else False
+
+                if has_mask:
+                    branch = "BRANCH1-UNPAD (slow: _upad_input + flash_varlen_fn + pad_fn)"
+                elif has_varlen or has_packed:
+                    branch = "BRANCH2-VARLEN (packed/varlen: flash_varlen_fn)"
+                else:
+                    branch = "BRANCH3-FAST (optimal: flash_fn with is_causal)"
+
+                _count[0] += 1
+                if _count[0] <= 5 or _count[0] % 1000 == 0:
+                    print(
+                        f"[FA2 rank={rank} call#{_count[0]}] {branch}  "
+                        f"attn_mask={'None' if not has_mask else type(attn_mask).__name__ + str(attn_mask.shape)}  "
+                        f"is_causal={is_causal}  "
+                        f"position_ids={'None' if position_ids is None else type(position_ids).__name__ + str(position_ids.shape)}  "
+                        f"is_packed={has_packed}  cu_seq_lens={has_varlen}",
+                        flush=True,
+                    )
+                return _orig(*args, **kwargs)
+
+            # Patch source module
+            _fa_utils._flash_attention_forward = _flash_attention_forward_debug
+
+            # Patch every module that imported _flash_attention_forward by reference
+            # at import time, so the wrapper fires regardless of the code path.
+            _patch_targets = [
+                "transformers.models.llama.modeling_llama",
+                "transformers.integrations.flash_attention",
+            ]
+            for _mod_name in _patch_targets:
+                try:
+                    import importlib
+                    _mod = importlib.import_module(_mod_name)
+                    if hasattr(_mod, "_flash_attention_forward"):
+                        _mod._flash_attention_forward = _flash_attention_forward_debug
+                except Exception as _e2:
+                    print(f"[PP] {_mod_name} FA2 patch failed: {_e2}", flush=True)
+
+        except Exception as _e:
+            print(f"[PP] _flash_attention_forward debug patch failed: {_e}", flush=True)
+        _fa_utils._is_packed_sequence_patched_for_pp = True
+        print(
+            "[PP] Patched transformers._is_packed_sequence to avoid CPU-GPU sync during training.",
+            flush=True,
+        )
+    except (ImportError, AttributeError):
+        pass
+
+
 def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm_model: bool = True) -> None:
     """Patch a HF model/module to produce pipeline-compatible forward.
 
     - If model has .model (e.g., LlamaForCausalLM), patch inner and outer.
     - Else, patch the module itself.
     """
+    _patch_is_packed_sequence_for_pp_training()
+
     if hasattr(model, "model"):
         if patch_inner_model and getattr(model, "model", None) is not None:
             model.model.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), model.model)

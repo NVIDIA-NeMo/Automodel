@@ -4,11 +4,11 @@ seed: 42
 
 # NEW: Add benchmark section
 benchmark:
-  warmup_steps: 5
+  warmup_steps: 2
   peak_tflops: 989  # H100: 989, A100: 312
-  nsys_start: -1    # Set to step number to profile (e.g., 10)
-  nsys_end: -1      # Set to end step (e.g., 15)
-  nsys_ranks: []    # e.g., [0] to profile rank 0
+  nsys_start: 6    # Set to step number to profile (e.g., 10)
+  nsys_end: 7      # Set to end step (e.g., 15)
+  nsys_ranks: [0]    # e.g., [0] to profile rank 0
   num_nodes: 1
 
 step_scheduler:
@@ -16,7 +16,7 @@ step_scheduler:
   local_batch_size: 4
   ckpt_every_steps: 50
   val_every_steps: 1000
-  max_steps: 10
+  max_steps: 4
 
 dist_env:
   backend: nccl
@@ -37,7 +37,7 @@ peft:
   match_all_linear: True
   dim: 16
   alpha: 32
-  use_triton: True
+  use_triton: False
 
 checkpoint:
   enabled: false
@@ -91,3 +91,5 @@ optimizer:
 lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6 
+
+nvtx: true

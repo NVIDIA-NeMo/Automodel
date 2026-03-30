@@ -158,19 +158,27 @@ def create_causal_mask_mapping(
     if position_ids is None:
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
 
-    # Prepare mask creation kwargs
+    # Prepare mask creation kwargs.
+    # Do NOT pass position_ids here: transformers>=5 uses it only to detect packed-sequence format via
+    # find_packed_sequence_indices(). For standard (non-packed) training this always returns a non-None
+    # packed_sequence_mask, forcing allow_is_causal_skip=False and materializing a full [B,1,S,S] bool
+    # mask every batch. That prevents SDPA from using the is_causal=True fast path (Flash Attention) and
+    # triggers aten::_local_scalar_dense via vmap inside sdpa_mask_recent_torch.
+    # Omitting position_ids is safe: create_causal_mask does not use it for anything other than packed-seq
+    # detection. cache_position carries all the positional info needed for the mask shape.
+    cache_position = torch.arange(seq_len, device=device)
     mask_kwargs = {
         "config": model_config,
         "input_embeds": torch.empty((batch_size, seq_len), device=device),
         "attention_mask": attention_mask,
-        "cache_position": position_ids[0],  # Use first row (all rows identical for non-padded data)
+        "cache_position": cache_position,
         "past_key_values": None,  # Training only
-        "position_ids": position_ids,
+        "position_ids": None,
     }
 
     # Create causal masks
     causal_mask_mapping = {
-        "full_attention": create_causal_mask(**mask_kwargs),
+        "full_attention": None,
     }
 
     # Add sliding window mask if model uses it

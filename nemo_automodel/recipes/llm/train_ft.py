@@ -1266,10 +1266,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
-        # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
+        # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping).
+        # Preserve None values in nested dicts: causal_mask_mapping uses {"full_attention": None}
+        # to signal "use is_causal=True (Flash Attention)" — stripping None would convert it to
+        # an empty dict that gets filtered out before reaching schedule.step(), causing every
+        # pipeline stage to re-run create_causal_mask() in its fallback path.
         batch = {
             k: (
-                {dk: dv.to(self.dist_env.device, non_blocking=True) for dk, dv in v.items() if dv is not None}
+                {
+                    dk: (dv.to(self.dist_env.device, non_blocking=True) if isinstance(dv, torch.Tensor) else dv)
+                    for dk, dv in v.items()
+                }
                 if isinstance(v, dict)
                 else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
             )
@@ -1315,6 +1322,20 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 batch_filtered = {
                     k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
                 }
+
+                # DEBUG: print what's in batch_filtered so we can confirm causal_mask_mapping survives
+                if not getattr(self, "_batch_filtered_logged", False):
+                    _dbg_info = {
+                        k: (
+                            f"dict(keys={list(v.keys())}, values={[(dk, type(dv).__name__, dv.shape if hasattr(dv,'shape') else dv) for dk,dv in v.items()]})"
+                            if isinstance(v, dict)
+                            else f"{type(v).__name__}({v.shape if hasattr(v,'shape') else v})"
+                        )
+                        for k, v in batch_filtered.items()
+                    }
+                    print(f"[DEBUG PP] batch_filtered keys/shapes: {_dbg_info}", flush=True)
+                    print(f"[DEBUG PP] batch keys before filter: {[(k, type(v).__name__) for k, v in batch.items()]}", flush=True)
+                    self._batch_filtered_logged = True
 
                 if is_train:
                     # Use step for training (forward + backward)
