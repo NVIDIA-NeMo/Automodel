@@ -43,14 +43,10 @@ def _has_optimized_tp_plan(model_cls: type) -> bool:
     """Check if *model_cls* has an entry in ``PARALLELIZE_FUNCTIONS``."""
     from nemo_automodel.components.distributed.optimized_tp_plans import (
         PARALLELIZE_FUNCTIONS,
+        _get_class_qualname,
     )
 
-    def get_name(x):
-        if isinstance(x, str):
-            return x
-        return x.__name__
-
-    return model_cls in PARALLELIZE_FUNCTIONS or model_cls.__name__ in set(map(get_name, PARALLELIZE_FUNCTIONS))
+    return _get_class_qualname(model_cls) in PARALLELIZE_FUNCTIONS
 
 
 def _is_moe(model_cls: type) -> bool:
@@ -378,10 +374,14 @@ def attach_capabilities_and_validate(model: "nn.Module", mesh: "MeshContext") ->
     Safe to call more than once -- subsequent calls are no-ops.
     """
     if "supports" not in type(model).__dict__:
-        model.__class__ = type(
-            model.__class__.__name__,
-            (model.__class__,),
+        orig_cls = model.__class__
+        new_cls = type(
+            orig_cls.__name__,
+            (orig_cls,),
             _build_class_dict(),
         )
+        new_cls.__module__ = orig_cls.__module__
+        new_cls.__qualname__ = orig_cls.__qualname__
+        model.__class__ = new_cls
     validate_for_mesh(model, mesh)
     return model

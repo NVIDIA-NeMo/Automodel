@@ -121,3 +121,8 @@ optimizer:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_name>
 #   save_dir: <your_wandb_save_dir>
+
+ci:
+  nodes: 32
+  time: "01:00:00"
+  local_batch_size: 4

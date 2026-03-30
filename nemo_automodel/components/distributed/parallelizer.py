@@ -791,12 +791,6 @@ def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None
     config = getattr(model, "config", None)
     if config is None or not hasattr(config, "num_attention_heads"):
         return
-    model_arch = None
-    if hasattr(config, "architectures") and config.architectures:
-        try:
-            model_arch = config.architectures[0]
-        except Exception:
-            model_arch = None
     inner = getattr(model, "model", model)
     layers = getattr(inner, "layers", None)
     if layers is None and hasattr(model, "language_model"):
@@ -816,13 +810,9 @@ def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None
     if hasattr(config, "num_key_value_heads") and config.num_key_value_heads is not None:
         local_num_key_value_heads = config.num_key_value_heads // tp_size
 
-    is_decilm_nemotron_nas = model_arch == "DeciLMForCausalLM" and getattr(config, "model_type", None) == "nemotron-nas"
-    if not is_decilm_nemotron_nas:
-        config.num_attention_heads = local_num_attention_heads
-        if local_num_key_value_heads is not None:
-            config.num_key_value_heads = local_num_key_value_heads
-
-    for layer in layers:
+    # PP converts ModuleList → ModuleDict; iterating a ModuleDict yields keys, not modules.
+    layer_iter = layers.values() if isinstance(layers, nn.ModuleDict) else layers
+    for layer in layer_iter:
         if hasattr(layer, "self_attn"):
             attn = layer.self_attn
             if hasattr(attn, "num_heads"):

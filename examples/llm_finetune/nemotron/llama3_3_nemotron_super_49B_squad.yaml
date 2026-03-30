@@ -14,16 +14,17 @@
 
 
 # To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/llama3_3_nemotron_super_49B_squad_tp2_peft.yaml
+# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/llama3_3_nemotron_super_49B_squad.yaml
+# This recipe is validated on 2 8xH100 nodes.
 
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 8
-  local_batch_size: 1
-  ckpt_every_steps: 1000
-  val_every_steps: 1000  # will run every x number of gradient steps
+  global_batch_size: 16
+  local_batch_size: 2
+  ckpt_every_steps: 100
+  val_every_steps: 100  # will run every x number of gradient steps
   max_steps: 100
 
 dist_env:
@@ -39,6 +40,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: nvidia/Llama-3_3-Nemotron-Super-49B-v1_5
   trust_remote_code: true
+  attn_implementation: flash_attention_2
 
 # torch.compile configuration
 compile:
@@ -51,9 +53,14 @@ compile:
 distributed:
   strategy: fsdp2
   dp_size: none
-  tp_size: 1
+  tp_size: 4
   cp_size: 1
-
+  ep_size: 1
+  pipeline:
+    pp_microbatch_size: 1
+    pp_schedule: interleaved1f1b
+    scale_grads_in_schedule: false
+  pp_size: 2
   sequence_parallel: false
 
 checkpoint:
@@ -69,6 +76,9 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: train
+  seq_length: 1024
+  padding: max_length
+  truncation: true
 
 packed_sequence:
   packed_sequence_size: 0
@@ -77,16 +87,22 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
   shuffle: True
+  drop_last: True
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: validation
   limit_dataset_samples: 64
+  seq_length: 1024
+  padding: max_length
+  truncation: true
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: True
+  drop_last: True
 
 optimizer:
   _target_: torch.optim.Adam
@@ -98,3 +114,6 @@ optimizer:
 lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
+
+ci:
+  nodes: 2

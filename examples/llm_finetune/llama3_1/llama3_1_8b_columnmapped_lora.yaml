@@ -85,10 +85,10 @@ dataloader:
 #     question: inputs
 #     answer: targets
 
-dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: false
+# validation_dataloader:
+#   _target_: torchdata.stateful_dataloader.StatefulDataLoader
+#   collate_fn: nemo_automodel.components.datasets.utils.default_collater
+#   shuffle: false
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -103,3 +103,6 @@ optimizer:
 #   entity: <your_wandb_entity>
 #   name: llama3_1_8b_squad_qlora
 #   save_dir: <your_wandb_save_dir> 
+
+ci:
+  time: "00:15:00"

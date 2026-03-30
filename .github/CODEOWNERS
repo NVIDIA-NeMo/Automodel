@@ -4,9 +4,9 @@ docker/ @nvidia-nemo/automation
 pyproject.toml @nvidia-nemo/automation
 uv.lock @nvidia-nemo/automation
 
-docs @akoumpa @jgerh @adil-a @HuiyingLi @hemildesai
-nemo_automodel @akoumpa @HuiyingLi @adil-a @hemildesai @ZhiyuLi-Nvidia
-examples @akoumpa @HuiyingLi @adil-a @hemildesai @ZhiyuLi-Nvidia
+docs @akoumpa @jgerh @adil-a @HuiyingLi @hemildesai @pthombre
+nemo_automodel @akoumpa @HuiyingLi @adil-a @hemildesai @ZhiyuLi-Nvidia @pthombre
+examples @akoumpa @HuiyingLi @adil-a @hemildesai @ZhiyuLi-Nvidia @pthombre
 README.md @akoumpa @HuiyingLi @snowmanwwg
 
 nemo_automodel/components/datasets/llm/ @akoumpa @adil-a @HuiyingLi @hemildesai @NVIDIA-NeMo/automodel_retriever_maintainers

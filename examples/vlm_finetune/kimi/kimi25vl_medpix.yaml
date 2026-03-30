@@ -123,3 +123,7 @@ freeze_config:
 #   project: <your_project_name>
 #   entity: <your_entity_name>
 #   name: <your_exp_name>
+
+ci:
+  nodes: 32
+  time: "00:30:00"

@@ -135,3 +135,7 @@ optimizer:
   weight_decay: 0.0
 
 
+
+ci:
+  local_batch_size: 2
+  time: "00:30:00"

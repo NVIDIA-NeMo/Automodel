@@ -106,3 +106,7 @@ optimizer:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
+
+ci:
+  node_multiplier: true
+  time: "00:15:00"

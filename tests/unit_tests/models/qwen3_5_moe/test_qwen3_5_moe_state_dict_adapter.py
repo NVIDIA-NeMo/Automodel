@@ -137,8 +137,7 @@ class TestApplyKeyMapping:
 
     def test_multiple_layers(self, adapter):
         state_dict = {
-            f"model.language_model.layers.{i}.mlp.shared_expert.gate_proj.weight": torch.randn(64, 32)
-            for i in range(3)
+            f"model.language_model.layers.{i}.mlp.shared_expert.gate_proj.weight": torch.randn(64, 32) for i in range(3)
         }
 
         out = adapter._apply_key_mapping(state_dict, adapter.hf_to_internal_map)
@@ -206,104 +205,56 @@ class TestToHF:
         assert "model.language_model.layers.0.self_attn.q_proj.weight" in out
         assert out["model.language_model.layers.0.self_attn.q_proj.weight"] is tensor
 
-    def test_aggregates_with_device_mesh_non_dtensor(self, adapter, monkeypatch):
-        local_experts = torch.tensor(
-            [
-                [[1.0, 2.0], [3.0, 4.0]],
-                [[5.0, 6.0], [7.0, 8.0]],
-            ],
-            dtype=adapter.dtype,
-        )  # shape: [2, 2, 2]
-
-        monkeypatch.setattr(
-            "nemo_automodel.components.moe.state_dict_utils.get_expert_range_for_rank_from_mesh",
-            lambda mesh, n_experts: (1, 3),
-        )
-        monkeypatch.setattr("torch.distributed.is_initialized", lambda: False)
-
-        device_mesh = Mock()
-        device_mesh.mesh_dim_names = ["ep"]
+    def test_transposes_expert_tensors(self, adapter):
+        """to_hf should transpose expert tensors (NeMo→HF layout) without any comms."""
+        gate_up = torch.randn(4, 64, 128, dtype=torch.float16)
+        down = torch.randn(4, 64, 64, dtype=torch.float16)
 
         state_dict = {
-            "model.language_model.layers.0.mlp.experts.gate_and_up_projs": local_experts,
+            "model.language_model.layers.0.mlp.experts.gate_and_up_projs": gate_up,
+            "model.language_model.layers.0.mlp.experts.down_projs": down,
         }
 
-        out = adapter.to_hf(state_dict, device_mesh=device_mesh)
+        out = adapter.to_hf(state_dict)
+
         gate_key = "model.language_model.layers.0.mlp.experts.gate_up_proj"
-        global_gate = out[gate_key]
-
-        assert global_gate.shape == (adapter.moe_config.n_routed_experts, 2, 2)
-        # Experts 1 and 2 should be populated (transposed from local_experts); others zero
-        torch.testing.assert_close(global_gate[1:3], local_experts.transpose(1, 2))
-        assert torch.all(global_gate[0] == 0)
-        assert torch.all(global_gate[3] == 0)
-
-    def test_aggregates_dtensor_path_uses_split_helper(self, adapter, monkeypatch):
-        local_slice = torch.tensor([[9.0, 10.0]], dtype=adapter.dtype)
-
-        monkeypatch.setattr(
-            "nemo_automodel.components.moe.state_dict_utils.is_dtensor", lambda tensor: True
-        )
-        monkeypatch.setattr(
-            "nemo_automodel.components.moe.state_dict_utils.split_experts_weights_dtensor_aware",
-            lambda weight, n_experts: ([local_slice], [2]),
-        )
-        monkeypatch.setattr("torch.distributed.is_initialized", lambda: False)
-
-        device_mesh = Mock()
-        device_mesh.mesh_dim_names = ["ep"]
-
-        state_dict = {
-            "model.language_model.layers.0.mlp.experts.down_projs": torch.empty(1, 1, 2),
-        }
-
-        out = adapter.to_hf(state_dict, device_mesh=device_mesh)
         down_key = "model.language_model.layers.0.mlp.experts.down_proj"
-        global_down = out[down_key]
 
-        assert global_down.shape[0] == adapter.moe_config.n_routed_experts
-        # The global tensor is transposed(1,2) after gathering, so local_slice [1,2] becomes [2,1]
-        torch.testing.assert_close(global_down[2], local_slice.T)
+        # Tensors should be transposed(1, 2)
+        torch.testing.assert_close(out[gate_key], gate_up.transpose(1, 2))
+        torch.testing.assert_close(out[down_key], down.transpose(1, 2))
 
-    def test_all_gather_path_populates_global_tensor(self, adapter, monkeypatch):
-        local_experts = torch.tensor(
-            [
-                [[1.0]],
-                [[2.0]],
-            ],
-            dtype=adapter.dtype,
-        )  # shape: [2, 1, 1]
+    def test_round_trip_preserves_values(self, adapter):
+        """HF → native → HF must produce identical tensors."""
+        gate_up_hf = torch.randn(4, 128, 64)
+        down_hf = torch.randn(4, 64, 64)
+        attn = torch.randn(64, 64)
+        shared = torch.randn(64, 32)
 
-        device_mesh = Mock()
-        device_mesh.mesh_dim_names = ["ep"]
-        device_mesh.get_group = lambda dim: "ep_group" if dim == 0 else None
+        hf_state = {
+            "model.language_model.layers.0.mlp.experts.gate_up_proj": gate_up_hf,
+            "model.language_model.layers.0.mlp.experts.down_proj": down_hf,
+            "model.language_model.layers.0.self_attn.q_proj.weight": attn,
+            "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight": shared,
+        }
 
-        monkeypatch.setattr(
-            "nemo_automodel.components.moe.state_dict_utils.get_expert_range_for_rank_from_mesh",
-            lambda mesh, n_experts: (0, 2),
-        )
-        monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
-        monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
+        native = adapter.from_hf(dict(hf_state))
+        roundtrip = adapter.to_hf(native)
 
-        def fake_all_gather_object(gathered, payload, group=None):
-            gathered[0] = payload
-            other_weights = [torch.tensor([[3.0]], dtype=adapter.dtype), torch.tensor([[4.0]], dtype=adapter.dtype)]
-            gathered[1] = ([2, 3], other_weights)
+        for key in hf_state:
+            torch.testing.assert_close(roundtrip[key], hf_state[key])
 
-        monkeypatch.setattr("torch.distributed.all_gather_object", fake_all_gather_object)
+    def test_exclude_regex_filters_expert_key(self, adapter):
+        """exclude_key_regex should filter expert keys after rename."""
+        state_dict = {
+            "model.language_model.layers.0.mlp.experts.gate_and_up_projs": torch.randn(4, 64, 128),
+            "model.language_model.layers.0.mlp.experts.down_projs": torch.randn(4, 64, 64),
+        }
 
-        state_dict = {"model.language_model.layers.0.mlp.experts.gate_and_up_projs": local_experts}
-        out = adapter.to_hf(state_dict, device_mesh=device_mesh)
+        out = adapter.to_hf(state_dict, exclude_key_regex=r".*gate_up_proj$")
 
-        gate_key = "model.language_model.layers.0.mlp.experts.gate_up_proj"
-        global_gate = out[gate_key]
-
-        assert global_gate.shape == (adapter.moe_config.n_routed_experts, 1, 1)
-        # After transpose(1,2) and gather, all experts should be populated
-        torch.testing.assert_close(global_gate[0], torch.tensor([[1.0]], dtype=adapter.dtype))
-        torch.testing.assert_close(global_gate[1], torch.tensor([[2.0]], dtype=adapter.dtype))
-        torch.testing.assert_close(global_gate[2], torch.tensor([[3.0]], dtype=adapter.dtype))
-        torch.testing.assert_close(global_gate[3], torch.tensor([[4.0]], dtype=adapter.dtype))
+        assert "model.language_model.layers.0.mlp.experts.gate_up_proj" not in out
+        assert "model.language_model.layers.0.mlp.experts.down_proj" in out
 
 
 # ---------------------------------------------------------------------------
@@ -365,13 +316,130 @@ class TestFromHF:
         assert "model.language_model.layers.0.mlp.shared_experts.gate_proj.weight" in out
         assert "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight" not in out
 
-    def test_raises_when_no_expert_keys(self, adapter):
+    def test_dtensor_passthrough(self, adapter, monkeypatch):
+        """DCP path: DTensor values should be renamed + transposed, no slicing."""
+
+        class FakeDTensor(torch.Tensor):
+            """Minimal DTensor stand-in."""
+
+            _is_fake_dtensor = True
+
+            @staticmethod
+            def __new__(cls, data):
+                return torch.Tensor._make_subclass(cls, data)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.state_dict_utils.is_dtensor",
+            lambda t: getattr(t, "_is_fake_dtensor", False),
+        )
+
+        gate_up_data = torch.randn(4, 32, 64)
+        down_data = torch.randn(4, 64, 32)
+        gate_up = FakeDTensor(gate_up_data)
+        down = FakeDTensor(down_data)
+
         hf_state = {
-            "model.language_model.layers.0.self_attn.q_proj.weight": torch.randn(64, 64),
+            "model.language_model.layers.0.mlp.experts.gate_up_proj": gate_up,
+            "model.language_model.layers.0.mlp.experts.down_proj": down,
         }
 
-        with pytest.raises(RuntimeError, match="Expected aggregated expert weights"):
-            adapter.from_hf(hf_state)
+        out = adapter.from_hf(hf_state)
+
+        gate_key = "model.language_model.layers.0.mlp.experts.gate_and_up_projs"
+        down_key = "model.language_model.layers.0.mlp.experts.down_projs"
+
+        # Should be transposed(1,2), no EP slicing
+        assert out[gate_key].shape == (4, 64, 32)
+        assert out[down_key].shape == (4, 32, 64)
+        # Verify values are correct transpose
+        torch.testing.assert_close(out[gate_key], gate_up_data.transpose(1, 2))
+        torch.testing.assert_close(out[down_key], down_data.transpose(1, 2))
+
+    def test_dtensor_skips_ep_slicing(self, adapter, monkeypatch):
+        """DCP path with device_mesh: DTensors must NOT be sliced, only renamed + transposed."""
+
+        class FakeDTensor(torch.Tensor):
+            _is_fake_dtensor = True
+
+            @staticmethod
+            def __new__(cls, data):
+                return torch.Tensor._make_subclass(cls, data)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.state_dict_utils.is_dtensor",
+            lambda t: getattr(t, "_is_fake_dtensor", False),
+        )
+        # These should NOT be called for DTensor path
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.state_dict_utils.get_expert_range_for_rank_from_mesh",
+            lambda mesh, n: (0, 2),
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.state_dict_utils.get_submesh",
+            lambda mesh, dims: Mock(get_rank=lambda: 0),
+        )
+        create_dtensor_called = []
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.state_dict_utils.create_dtensor_from_local",
+            lambda t, m, r: create_dtensor_called.append(1) or t,
+        )
+
+        device_mesh = Mock()
+        device_mesh.mesh_dim_names = ["ep"]
+
+        gate_up = FakeDTensor(torch.randn(4, 32, 64))
+        hf_state = {
+            "model.language_model.layers.0.mlp.experts.gate_up_proj": gate_up,
+            "model.language_model.layers.0.mlp.experts.down_proj": FakeDTensor(torch.randn(4, 64, 32)),
+        }
+
+        out = adapter.from_hf(hf_state, device_mesh=device_mesh)
+
+        # DTensor path: no create_dtensor_from_local calls, full shape preserved (not sliced to 2)
+        assert len(create_dtensor_called) == 0
+        assert out["model.language_model.layers.0.mlp.experts.gate_and_up_projs"].shape[0] == 4
+
+    def test_non_prefixed_keys_get_model_prefix(self, adapter):
+        """Non-expert keys without model. prefix should get it added."""
+        hf_state = {
+            "model.language_model.layers.0.mlp.experts.gate_up_proj": torch.randn(4, 64, 128),
+            "model.language_model.layers.0.mlp.experts.down_proj": torch.randn(4, 128, 64),
+            "language_model.layers.0.input_layernorm.weight": torch.randn(64),
+        }
+
+        out = adapter.from_hf(hf_state)
+
+        # The non-prefixed key should get model. prefix since other keys have it
+        assert "model.language_model.layers.0.input_layernorm.weight" in out
+
+    def test_device_mesh_rank_fallback_no_ep_dim(self, adapter, monkeypatch):
+        """When device_mesh has no 'ep' dim, from_hf should use mesh.get_rank()."""
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.state_dict_utils.get_expert_range_for_rank_from_mesh",
+            lambda mesh, n: (0, 4),
+        )
+
+        device_mesh = Mock()
+        device_mesh.mesh_dim_names = ["dp"]  # no "ep"
+        device_mesh.get_rank.return_value = 0
+
+        def fake_create_dtensor(local_tensor, mesh, rank):
+            return local_tensor
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.state_dict_utils.create_dtensor_from_local",
+            fake_create_dtensor,
+        )
+
+        hf_state = {
+            "model.language_model.layers.0.mlp.experts.gate_up_proj": torch.randn(4, 64, 128),
+            "model.language_model.layers.0.mlp.experts.down_proj": torch.randn(4, 128, 64),
+        }
+
+        out = adapter.from_hf(hf_state, device_mesh=device_mesh)
+
+        device_mesh.get_rank.assert_called_once()
+        assert "model.language_model.layers.0.mlp.experts.gate_and_up_projs" in out
 
     def test_skips_scale_inv_keys(self, adapter):
         hf_state = {
@@ -504,85 +572,6 @@ class TestConvertSingleTensorToHf:
 
 
 # ---------------------------------------------------------------------------
-# to_hf  –  ep_shard multi-node scenarios
-# ---------------------------------------------------------------------------
-class TestToHFEpShard:
-    """Tests for to_hf with ep_shard > 1 (multi-node expert FSDP sharding)."""
-
-    def _make_fake_dtensor(self, local_data, full_data):
-        """Create a fake DTensor that records full_tensor() calls."""
-
-        class _FakeDTensor:
-            def __init__(self, local, full):
-                self._local = local
-                self._full = full
-                self.shape = full.shape
-
-            def full_tensor(self):
-                return self._full
-
-            def cpu(self):
-                return _FakeDTensor(self._local.cpu(), self._full.cpu())
-
-            def to(self, dtype):
-                return _FakeDTensor(self._local.to(dtype), self._full.to(dtype))
-
-        return _FakeDTensor(local_data, full_data)
-
-    def test_to_hf_dtensor_full_tensor_is_used(self, adapter, monkeypatch):
-        """full_tensor() must be called so ep_shard dim is all-gathered before all_gather_object."""
-        n_experts = adapter.moe_config.n_routed_experts  # 4
-        # NeMo native: [n_experts, hidden, inter]; HF: [n_experts, inter, hidden]
-        hidden, inter = 4, 8
-        ep_size = 2
-        local_experts = n_experts // ep_size  # 2
-
-        # Full expert weight per expert (native layout): [hidden, inter]
-        full_weights = [torch.randn(hidden, inter, dtype=adapter.dtype) for _ in range(local_experts)]
-        # Local ep_shard shard: [hidden/2, inter]
-        local_weights = [w[: hidden // 2] for w in full_weights]
-
-        fake_split_results = [self._make_fake_dtensor(l, f) for l, f in zip(local_weights, full_weights)]
-
-        monkeypatch.setattr(
-            "nemo_automodel.components.moe.state_dict_utils.is_dtensor", lambda t: True
-        )
-        monkeypatch.setattr(
-            "nemo_automodel.components.moe.state_dict_utils.split_experts_weights_dtensor_aware",
-            lambda weight, n: (fake_split_results, [0, 1]),
-        )
-        monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
-        monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: ep_size)
-
-        device_mesh = Mock()
-        device_mesh.mesh_dim_names = ["ep"]
-        device_mesh.get_group = lambda dim: "ep_group"
-
-        def fake_all_gather_object(gathered, payload, group=None):
-            gathered[0] = payload
-            gathered[1] = ([2, 3], [torch.randn(hidden, inter, dtype=adapter.dtype) for _ in range(2)])
-
-        monkeypatch.setattr("torch.distributed.all_gather_object", fake_all_gather_object)
-
-        dummy = self._make_fake_dtensor(
-            torch.empty(local_experts, hidden // 2, inter),
-            torch.empty(n_experts, hidden, inter),
-        )
-
-        state_dict = {"model.language_model.layers.0.mlp.experts.gate_and_up_projs": dummy}
-        out = adapter.to_hf(state_dict, device_mesh=device_mesh)
-
-        gate_key = "model.language_model.layers.0.mlp.experts.gate_up_proj"
-        global_gate = out[gate_key]
-
-        # to_hf applies transpose(1,2): native [n, hidden, inter] → HF [n, inter, hidden]
-        assert global_gate.shape == (n_experts, inter, hidden)
-        # Experts 0,1 should have full weight (transposed)
-        torch.testing.assert_close(global_gate[0], full_weights[0].T)
-        torch.testing.assert_close(global_gate[1], full_weights[1].T)
-
-
-# ---------------------------------------------------------------------------
 # from_hf  –  ep_shard multi-node scenarios
 # ---------------------------------------------------------------------------
 class TestFromHFEpShard:
@@ -609,9 +598,7 @@ class TestFromHFEpShard:
                 return mock_ep_shard_sub
             return Mock()
 
-        monkeypatch.setattr(
-            "nemo_automodel.components.moe.state_dict_utils.get_submesh", fake_get_submesh
-        )
+        monkeypatch.setattr("nemo_automodel.components.moe.state_dict_utils.get_submesh", fake_get_submesh)
 
         captured_list = []
 
@@ -643,7 +630,9 @@ class TestFromHFEpShard:
         gate_up_hf = torch.arange(n_experts * inter * hidden, dtype=adapter.dtype).reshape(n_experts, inter, hidden)
         hf_state = {
             "model.language_model.layers.0.mlp.experts.gate_up_proj": gate_up_hf,
-            "model.language_model.layers.0.mlp.experts.down_proj": torch.randn(n_experts, hidden, inter, dtype=adapter.dtype),
+            "model.language_model.layers.0.mlp.experts.down_proj": torch.randn(
+                n_experts, hidden, inter, dtype=adapter.dtype
+            ),
         }
 
         adapter.from_hf(hf_state, device_mesh=device_mesh)
@@ -669,7 +658,9 @@ class TestFromHFEpShard:
         gate_up_hf = torch.randn(n_experts, inter, hidden, dtype=adapter.dtype)
         hf_state = {
             "model.language_model.layers.0.mlp.experts.gate_up_proj": gate_up_hf,
-            "model.language_model.layers.0.mlp.experts.down_proj": torch.randn(n_experts, hidden, inter, dtype=adapter.dtype),
+            "model.language_model.layers.0.mlp.experts.down_proj": torch.randn(
+                n_experts, hidden, inter, dtype=adapter.dtype
+            ),
         }
 
         adapter.from_hf(hf_state, device_mesh=device_mesh)

@@ -1027,11 +1027,11 @@ class TestUpdateAttentionHeadCountsForTP:
         assert model.config.num_attention_heads == 64
         assert model.config.num_key_value_heads == 8
 
-    def test_updates_config_and_layer_attrs(self):
+    def test_preserves_config_and_updates_layer_attrs(self):
         model = self._make_model(num_heads=64, num_kv_heads=8, hidden_size=8192)
         _update_attention_head_counts_for_tp(model, tp_size=2)
-        assert model.config.num_attention_heads == 32
-        assert model.config.num_key_value_heads == 4
+        assert model.config.num_attention_heads == 64
+        assert model.config.num_key_value_heads == 8
         assert model.config.head_dim == 128
         for layer in model.model.layers:
             assert layer.self_attn.num_heads == 32

@@ -112,3 +112,8 @@ optimizer:
   eps: 1e-8
   lr: 1e-5
   weight_decay: 0
+
+ci:
+  node_multiplier: true
+  nodes: 16
+  time: "00:30:00"
