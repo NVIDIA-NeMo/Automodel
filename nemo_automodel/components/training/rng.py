@@ -26,7 +26,7 @@ def init_all_rng(seed: int, ranked: bool = False):
         seed (int): Base seed value.
         ranked (bool): Adjust seed by process rank if True.
     """
-    assert isinstance(seed, int) and seed > 0, ("Seed must be a positive integer", seed)
+    assert isinstance(seed, int) and seed >= 0, ("Seed must be a non-negative integer", seed)
     assert isinstance(ranked, bool), "Ranked must be a boolean"
 
     if ranked:
