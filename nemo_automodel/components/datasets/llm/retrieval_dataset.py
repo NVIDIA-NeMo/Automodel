@@ -684,7 +684,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--n_passages", type=int, default=5, help="Number of passages (1 positive + n-1 negatives)")
     parser.add_argument(
-        "--eval_negative_size", type=int, default=None, help="Number of negative documents for evaluation (default: n_passages - 1)"
+        "--eval_negative_size",
+        type=int,
+        default=None,
+        help="Number of negative documents for evaluation (default: n_passages - 1)",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--do_shuffle", action="store_true", help="Whether to shuffle the dataset")

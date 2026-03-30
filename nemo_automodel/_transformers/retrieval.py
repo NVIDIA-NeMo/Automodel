@@ -130,8 +130,7 @@ def build_encoder_backbone(
         arch_name = task_map.get(task)
         if arch_name is None:
             raise ValueError(
-                f"Unsupported task '{task}' for model type '{model_type}'. "
-                f"Available tasks: {', '.join(task_map)}."
+                f"Unsupported task '{task}' for model type '{model_type}'. Available tasks: {', '.join(task_map)}."
             )
 
         if arch_name not in ModelRegistry.model_arch_name_to_cls:
@@ -145,17 +144,12 @@ def build_encoder_backbone(
         )
 
     # Fallback: use HuggingFace Auto classes for model types not in SUPPORTED_BACKBONES
-    logger.info(
-        f"Model type '{model_type}' not in SUPPORTED_BACKBONES; "
-        f"falling back to HuggingFace Auto classes"
-    )
+    logger.info(f"Model type '{model_type}' not in SUPPORTED_BACKBONES; falling back to HuggingFace Auto classes")
     if task == "score":
         return AutoModelForSequenceClassification.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
         )
-    return AutoModel.from_pretrained(
-        model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
-    )
+    return AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
 
 
 def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> None:
@@ -200,7 +194,6 @@ SUPPORTED_BACKBONES = {
     "llama": _LLAMA_TASKS,
     "llama_bidirec": _LLAMA_TASKS,
 }
-
 
 
 def _init_encoder_common(encoder: nn.Module, model: PreTrainedModel) -> None:

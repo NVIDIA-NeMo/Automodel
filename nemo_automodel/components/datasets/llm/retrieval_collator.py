@@ -239,7 +239,9 @@ class BiEncoderCollator:
 
 
 class CrossEncoderCollator(DataCollatorWithPadding):
-    def __init__(self, rerank_max_length: int, *args, prompt_template: str = "question:{query} \n \n passage:{passage}", **kwargs):
+    def __init__(
+        self, rerank_max_length: int, *args, prompt_template: str = "question:{query} \n \n passage:{passage}", **kwargs
+    ):
         self.rerank_max_length = rerank_max_length
         self.prompt_template = prompt_template
         # Call Base with all args and kwargs
