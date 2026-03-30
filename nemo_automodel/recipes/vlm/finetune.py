@@ -372,8 +372,8 @@ def build_dataloader(
             else:
                 processor_type = type(processor).__name__
                 if processor_type not in COLLATE_FNS:
-                    processor_type = "default"
                     logging.warning(f"You are using {processor_type} with default collate function.")
+                    processor_type = "default"
                 collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
 
         if hasattr(ds, "robust_collate"):
