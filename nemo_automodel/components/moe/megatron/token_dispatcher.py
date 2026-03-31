@@ -489,9 +489,6 @@ class TokenDispatcherConfig:
     improve stability especially when the number of experts is large (e.g. finegrained-moe).
     None means no changes for dtype."""
 
-    moe_enable_uccl_ep: bool = False
-    """Whether to use UCCL-EP instead of DeepEP for expert parallelism."""
-
     moe_flex_dispatcher_backend: Literal["deepep", "hybridep", "uccl_ep"] = "deepep"
     """Backend for the flex token dispatcher. Options: 'deepep', 'hybridep', or 'uccl_ep'."""
 
