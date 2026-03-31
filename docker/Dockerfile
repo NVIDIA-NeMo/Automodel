@@ -74,22 +74,29 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     cd ../ && rm -rf TransformerEngine; \
     fi
 
-# Install Deepep
+# Install HybridEP
+## Dependency: RDMA Core
+RUN git clone https://github.com/linux-rdma/rdma-core.git && \
+    cd rdma-core && git checkout tags/v60.0 && sh build.sh
+ENV RDMA_CORE_HOME=/opt/rdma-core/build
+## Use stub of libnvidia-ml-dev during build only
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libnvidia-ml-dev
 COPY docker/common/deepep.patch /opt/deepep.patch
-ARG INSTALL_DEEPEP=False
-ARG DEEPEP_COMMIT=1dddd194c26911c35b4f53a148617dd73de0ffc9
-RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
-    git clone https://github.com/deepseek-ai/DeepEP.git && \
-    cd DeepEP && \
-    git pull && \
+ARG DEEPEP_COMMIT=7febc6e25660af0f54d95dd781ecdcd62265ecca
+RUN git clone -b hybrid-ep https://github.com/deepseek-ai/DeepEP.git
+ENV HYBRID_EP_MULTINODE=1
+RUN cd DeepEP && \
     git fetch origin $DEEPEP_COMMIT && \
     git checkout FETCH_HEAD && \
     patch -p1 < /opt/deepep.patch && \
     pip install --no-cache-dir nvidia-nvshmem-cu13==3.4.5 && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 pip install --no-build-isolation . && \
+    apt-get purge -y libnvidia-ml-dev && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/* && \
     rm -rf /opt/deepep.patch && \
-    rm -rf DeepEP; \
-    fi
+    cd / && rm -rf DeepEP rdma-core
 
 # Install Bitsandbytes
 ARG INSTALL_BITSANDBYTES=True
