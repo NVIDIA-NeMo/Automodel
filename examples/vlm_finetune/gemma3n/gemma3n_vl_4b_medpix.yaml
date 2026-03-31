@@ -37,6 +37,7 @@ model:
   use_liger_kernel: false
   use_sdpa_patching: false # gemma-3n-e4b-it does not work with sdpa patching
   attn_implementation: eager
+  trust_remote_code: true
   text_config:
     use_cache: true
 

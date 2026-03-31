@@ -134,7 +134,7 @@ def _build_collator():
     from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
     from nemo_automodel.components.datasets.llm import BiEncoderCollator
 
-    tokenizer = NeMoAutoTokenizer.from_pretrained(BASE_MODEL_PATH)
+    tokenizer = NeMoAutoTokenizer.from_pretrained(BASE_MODEL_PATH, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
