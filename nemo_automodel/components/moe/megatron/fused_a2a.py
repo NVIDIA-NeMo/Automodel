@@ -660,6 +660,11 @@ if HAVE_UCCL_EP:
         """Perform fused combine using UCCL-EP (Azure-compatible RDMA)."""
         return UCCLFusedCombine.apply(x, group, handle, async_finish, allocate_on_comm_stream)
 
+    def set_uccl_num_sms(num_sms):
+        """Sets the number of SMs to use for UCCL-EP."""
+        UCCLBuffer.set_num_sms(num_sms)
+
 else:
     uccl_fused_dispatch = None
     uccl_fused_combine = None
+    set_uccl_num_sms = None

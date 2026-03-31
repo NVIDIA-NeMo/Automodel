@@ -25,6 +25,7 @@ from .fused_a2a import (
     hybrid_ep_combine,
     hybrid_ep_dispatch,
     set_deepep_num_sms,
+    set_uccl_num_sms,
     uccl_fused_combine,
     uccl_fused_dispatch,
 )
@@ -542,6 +543,8 @@ class MoEFlexTokenDispatcher:
         use_uccl = self.config.moe_enable_uccl_ep
 
         if backend == "uccl_ep" or use_uccl:
+            if set_uccl_num_sms is not None:
+                set_uccl_num_sms(self.config.moe_deepep_num_sms)
             dispatch_fn = uccl_fused_dispatch
             combine_fn = uccl_fused_combine
             manager_kwargs = dict(
