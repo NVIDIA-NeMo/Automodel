@@ -184,3 +184,22 @@ config dicts:
 
 These builders read their parameters from the YAML config. Do not bypass them
 with manual construction unless there is a strong reason.
+
+---
+
+## Available Skills
+
+The `skills/` directory contains focused guides for common tasks. Each skill
+file gives step-by-step instructions an AI agent can follow.
+
+| # | Skill                    | Directory                  | Description                                      |
+|---|--------------------------|----------------------------|--------------------------------------------------|
+| 1 | model-onboarding         | `model-onboarding`         | Onboard a new LLM, VLM, OMNI, MoE, dLLM, text-to-image, text-to-video model family     |
+| 2 | developer-guide          | `developer-guide`          | Environment setup and day-to-day dev workflow     |
+| 3 | recipe-development       | `recipe-development`       | Create and modify training/eval recipes           |
+| 4 | distributed-training     | `distributed-training`     | FSDP2, HSDP, pipeline parallelism, context parallelism |
+| 5 | parity-testing           | `parity-testing`           | Verify numerical correctness against reference implementations |
+| 6 | launcher-config          | `launcher-config`          | Slurm and SkyPilot job submission setup           |
+
+When starting a task, identify which skill applies and read that file for
+domain-specific guidance before writing any code.
