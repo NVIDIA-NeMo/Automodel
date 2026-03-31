@@ -612,9 +612,7 @@ class MoEFlexTokenDispatcher:
                 )
         else:
             raise ValueError(
-                f"Invalid backend: {backend}. "
-                "Please set moe_flex_dispatcher_backend='deepep', "
-                "'hybridep', or 'uccl_ep'"
+                f"Invalid backend: {backend}. Please set moe_flex_dispatcher_backend='deepep', 'hybridep', or 'uccl_ep'"
             )
 
     def _initialize_metadata(self, num_local_tokens: int, probs: torch.Tensor) -> torch.Tensor:

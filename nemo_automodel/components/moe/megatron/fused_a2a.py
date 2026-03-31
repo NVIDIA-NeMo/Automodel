@@ -17,6 +17,8 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+import os
+
 try:
     from deep_ep import Buffer
     from deep_ep.utils import EventHandle, EventOverlap
