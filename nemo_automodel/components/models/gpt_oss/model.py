@@ -193,7 +193,6 @@ class GptOssModel(nn.Module):
 
 
 class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
-
     @classmethod
     def from_config(
         cls,
