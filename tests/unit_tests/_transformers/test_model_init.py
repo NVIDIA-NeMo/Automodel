@@ -57,7 +57,7 @@ class TestConsumeConfigOverridesNestedDict:
         kwargs = {"some_field": {"key": "val"}}
         _consume_config_overrides(config, kwargs)
 
-        config.__setattr__.assert_any_call("some_field", {"key": "val"})
+        assert config.some_field == {"key": "val"}
         assert "some_field" not in kwargs
 
 
