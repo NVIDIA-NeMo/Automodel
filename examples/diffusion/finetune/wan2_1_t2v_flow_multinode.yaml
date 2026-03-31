@@ -70,6 +70,7 @@ fsdp:
 checkpoint:
   enabled: true
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
-  model_save_format: torch_save
-  save_consolidated: false
+  model_save_format: safetensors
+  save_consolidated: true
+  diffusers_compatible: true
   restore_from: null
