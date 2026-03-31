@@ -31,7 +31,7 @@ try:
     from nemo_automodel.components.moe.uccl_ep.buffer import EventOverlap as UCCLEventOverlap
 
     HAVE_UCCL_EP = True
-    UCCLBuffer.set_num_sms(int(os.environ.get("DEEP_EP_SM_NUMS", 20)))
+    UCCLBuffer.set_num_sms(int(os.environ.get("UCCL_EP_SM_NUMS", os.environ.get("DEEP_EP_SM_NUMS", 20))))
 except ImportError:
     HAVE_UCCL_EP = False
 
