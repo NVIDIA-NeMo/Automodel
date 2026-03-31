@@ -1,16 +1,31 @@
-import inspect
-from typing import Any, Optional, Tuple, Union
-import os
-import torch
-import torch.distributed as dist
-from typing import Optional
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import glob
+import inspect
+import json
+import os
 import sys
 import tempfile
-import json
-from pathlib import Path
 import time
+from pathlib import Path
+from typing import Any, Optional, Tuple, Union
+
 import numpy as np
+import torch
+import torch.distributed as dist
 
 try:
     from uccl import ep
@@ -20,9 +35,7 @@ except ImportError:
         import ep  # type: ignore[no-redef]
         from ep import EventHandle  # type: ignore[no-redef]
     except ImportError:
-        raise ImportError(
-            "UCCL-EP is not installed. Install via: bash scripts/setup_uccl_ep.sh --no-efa"
-        )
+        raise ImportError("UCCL-EP is not installed. Install via: bash scripts/setup_uccl_ep.sh --no-efa")
 
 
 def calc_diff(x: torch.Tensor, y: torch.Tensor):
@@ -67,9 +80,7 @@ def init_dist(local_rank: int, num_local_ranks: int):
 
 def init_dist_under_torchrun(local_rank: int, num_local_ranks: int):
     # torchrun already sets RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT
-    dist.init_process_group(
-        backend="nccl", device_id=torch.device(f"cuda:{local_rank}")
-    )
+    dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
 
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device(f"cuda:{local_rank}")
@@ -92,7 +103,6 @@ def _gather_peer_ips(group):
 
 
 def get_peer_ip(rank: int, num_ranks: int, group: dist.ProcessGroup):
-
     if num_ranks == 1:
         # single-process local test: okay to leave blank (or 127.0.0.1)
         peer_ip = ""
@@ -154,11 +164,7 @@ def check_nvlink_connections(group: dist.ProcessGroup):
         pynvml.nvmlInit()
 
         # noinspection PyTypeChecker
-        devices = (
-            os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
-            .strip(",")
-            .split(",")
-        )
+        devices = os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7").strip(",").split(",")
         physical_device_idx = int(devices[torch.cuda.current_device()])
         physical_device_indices = [
             0,
@@ -167,19 +173,15 @@ def check_nvlink_connections(group: dist.ProcessGroup):
 
         # Check whether they are all connected via NVLink
         # Reference: https://github.com/vllm-project/vllm/blob/b8e809a057765c574726a6077fd124db5077ce1f/vllm/platforms/cuda.py#L438
-        handles = [
-            pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_indices
-        ]
+        handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_indices]
         for i, handle in enumerate(handles):
             for j, peer_handle in enumerate(handles):
                 if i >= j:
                     continue
-                status = pynvml.nvmlDeviceGetP2PStatus(
-                    handle, peer_handle, pynvml.NVML_P2P_CAPS_INDEX_NVLINK
+                status = pynvml.nvmlDeviceGetP2PStatus(handle, peer_handle, pynvml.NVML_P2P_CAPS_INDEX_NVLINK)
+                assert status == pynvml.NVML_P2P_STATUS_OK, (
+                    f"GPU {physical_device_indices[i]} and GPU {physical_device_indices[j]} are not connected via NVLink"
                 )
-                assert (
-                    status == pynvml.NVML_P2P_STATUS_OK
-                ), f"GPU {physical_device_indices[i]} and GPU {physical_device_indices[j]} are not connected via NVLink"
 
         # Close NVML
         pynvml.nvmlShutdown()
@@ -261,16 +263,12 @@ def detect_ib_hca():
         return None
 
     # Check for Mellanox devices first
-    ib_devs = [
-        os.path.basename(d) for d in devices if os.path.basename(d).startswith("mlx5")
-    ]
+    ib_devs = [os.path.basename(d) for d in devices if os.path.basename(d).startswith("mlx5")]
     if ib_devs:
         return ib_devs[0]
 
     # Check for Intel RDMA devices (irdma)
-    ib_devs = [
-        os.path.basename(d) for d in devices if os.path.basename(d).startswith("irdma")
-    ]
+    ib_devs = [os.path.basename(d) for d in devices if os.path.basename(d).startswith("irdma")]
     if ib_devs:
         return ib_devs[0]
 
@@ -331,9 +329,7 @@ def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
     # Flush L2 cache with 256 MB data
     torch.cuda.synchronize()
     current_device = torch.cuda.current_device()
-    cache = torch.empty(
-        int(256e6 // 4), dtype=torch.int, device=f"cuda:{current_device}"
-    )
+    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device=f"cuda:{current_device}")
 
     # Warmup
     for _ in range(num_warmups):
@@ -354,9 +350,7 @@ def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
             post_fn()
     torch.cuda.synchronize()
 
-    times = np.array(
-        [s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)]
-    )[1:]
+    times = np.array([s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)])[1:]
     return np.average(times), np.min(times), np.max(times)
 
 
@@ -373,9 +367,7 @@ def bench_kineto(
     suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
     with suppress():
         schedule = torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1)
-        with torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule
-        ) as prof:
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule) as prof:
             for i in range(2):
                 # NOTES: use a large kernel and a barrier to eliminate the unbalanced CPU launch overhead
                 if barrier_comm_profiling:
@@ -407,11 +399,7 @@ def bench_kineto(
     # Parse the profiling table
     assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
     is_tuple = isinstance(kernel_names, tuple)
-    prof_lines = (
-        prof.key_averages()
-        .table(sort_by="cuda_time_total", max_name_column_width=100)
-        .split("\n")
-    )
+    prof_lines = prof.key_averages().table(sort_by="cuda_time_total", max_name_column_width=100).split("\n")
     kernel_names = (kernel_names,) if isinstance(kernel_names, str) else kernel_names
     assert all([isinstance(name, str) for name in kernel_names])
     for name in kernel_names:
@@ -419,10 +407,8 @@ def bench_kineto(
         if count != 1:
             print(f"\n[WARNING] Profiling table for kernel '{name}':")
             print("\n".join(prof_lines))
-            print(
-                f"[WARNING] Kernel '{name}' found {count} times in profiling table (expected 1)"
-            )
-            print(f"[WARNING] Continuing execution despite mismatch...\n")
+            print(f"[WARNING] Kernel '{name}' found {count} times in profiling table (expected 1)")
+            print("[WARNING] Continuing execution despite mismatch...\n")
 
     # Save chrome traces
     if trace_path is not None:
@@ -438,17 +424,13 @@ def bench_kineto(
                 time_str = line.split()[-2]
                 for unit, scale in units.items():
                     if unit in time_str:
-                        kernel_durations.append(
-                            float(time_str.replace(unit, "")) / scale
-                        )
+                        kernel_durations.append(float(time_str.replace(unit, "")) / scale)
                         found = True
                         break
                 break
         # NOTE(MaoZiming): in rare cases it misses certain events.
         if not found:
-            print(
-                f"[WARNING] Kernel '{name}' not found in profiling table, using 0.0 as placeholder"
-            )
+            print(f"[WARNING] Kernel '{name}' not found in profiling table, using 0.0 as placeholder")
             kernel_durations.append(0.0)
 
     # Expand the kernels by periods
@@ -458,11 +440,7 @@ def bench_kineto(
             profile_data = json.loads(Path(tmp.name).read_text())
 
         for i, kernel_name in enumerate(kernel_names):
-            events = [
-                event
-                for event in profile_data["traceEvents"]
-                if f"::{kernel_name}" in event["name"]
-            ]
+            events = [event for event in profile_data["traceEvents"] if f"::{kernel_name}" in event["name"]]
             events = sorted(events, key=lambda event: event["ts"])
             durations = [event["dur"] / 1e6 for event in events]
 
@@ -489,8 +467,7 @@ def bench_kineto(
                 # If we have no complete periods, fall back to returning zeros
                 if dist.get_rank() == 0:
                     print(
-                        f"[WARNING] Kernel '{kernel_name}': No complete periods found. "
-                        f"Returning zeros.",
+                        f"[WARNING] Kernel '{kernel_name}': No complete periods found. Returning zeros.",
                         flush=True,
                     )
                 kernel_durations[i] = [0.0] * num_kernels_per_period
@@ -570,9 +547,7 @@ def initialize_uccl(
         )
         proxies.append(proxy)
 
-    rank2meta = get_cpu_proxies_meta(
-        proxies, rank, scratch_ptr, scratch_nbytes, num_ranks, group
-    )
+    rank2meta = get_cpu_proxies_meta(proxies, rank, scratch_ptr, scratch_nbytes, num_ranks, group)
     peers_meta_list = [rank2meta[r] for r in range(num_ranks)]
 
     if not is_intranode:
@@ -647,14 +622,10 @@ def per_token_cast_to_fp8(x: torch.Tensor):
     m, n = x.shape
     x_view = x.view(m, -1, 128)
     x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-    return (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(
-        m, n
-    ), (x_amax / 448.0).view(m, -1)
+    return (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n), (x_amax / 448.0).view(m, -1)
 
 
-def create_grouped_scores(
-    scores: torch.Tensor, group_idx: torch.Tensor, num_groups: int
-):
+def create_grouped_scores(scores: torch.Tensor, group_idx: torch.Tensor, num_groups: int):
     num_tokens, num_experts = scores.shape
     scores = scores.view(num_tokens, num_groups, -1)
     mask = torch.zeros((num_tokens, num_groups), dtype=torch.bool, device=scores.device)
@@ -675,7 +646,3 @@ def inplace_unique(x: torch.Tensor, num_slots: int):
     x[:, :].fill_(-1)
     valid_len = min(num_slots, x.size(1))
     x[:, :valid_len] = sorted_bin_idx[:, :valid_len]
-
-
-def hash_tensor(t: torch.Tensor):
-    return t.view(torch.int).sum().item()

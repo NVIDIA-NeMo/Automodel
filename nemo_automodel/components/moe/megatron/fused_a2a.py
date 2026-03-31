@@ -583,6 +583,7 @@ class UCCLFusedDispatch(torch.autograd.Function):
             topk_weights=grad_token_probs.float(),
             previous_event=previous_event,
             async_finish=ctx.async_finish,
+            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
         )
         if ctx.async_finish:
             after_event.current_stream_wait()
@@ -603,6 +604,7 @@ class UCCLFusedCombine(torch.autograd.Function):
             handle=handle,
             async_finish=async_finish,
             previous_event=previous_event,
+            allocate_on_comm_stream=allocate_on_comm_stream,
         )
         if async_finish:
             after_event.current_stream_wait()

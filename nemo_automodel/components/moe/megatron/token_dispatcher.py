@@ -147,7 +147,9 @@ class _DeepepManager(_DispatchManager):
 
         if self._fused_dispatch is None:
             raise ImportError(
-                "DeepEP is not installed. Please install DeepEP package from https://github.com/deepseek-ai/deepep."
+                "Neither DeepEP nor UCCL-EP is installed. "
+                "Install DeepEP from https://github.com/deepseek-ai/deepep "
+                "or UCCL-EP via: bash scripts/setup_uccl_ep.sh"
             )
 
     def setup_metadata(self, num_local_tokens: int, probs: torch.Tensor):
