@@ -432,6 +432,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             save_consolidated=checkpoint_cfg.get("save_consolidated"),
             is_peft=False,
             model_state_dict_keys=model_state_dict_keys,
+            diffusers_compatible=checkpoint_cfg.get("diffusers_compatible", False),
         )
         self.restore_from = checkpoint_cfg.get("restore_from", None)
         self.checkpointer = Checkpointer(

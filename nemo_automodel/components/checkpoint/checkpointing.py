@@ -43,6 +43,7 @@ from nemo_automodel.components.checkpoint._backports.filesystem import Serializa
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _HuggingFaceStorageReader,
     _HuggingFaceStorageWriter,
+    _maybe_rename_index_for_diffusers,
     get_fqn_to_file_index_mapping,
 )
 from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon, PeftAddon
@@ -138,6 +139,8 @@ class CheckpointingConfig:
     # If provided, temp files will be created here instead of system temp. Useful when system temp has limited space.
     v4_compatible: bool = False  # If True, save the original pretrained config.json (with quantization_config removed)
     # instead of the in-memory v5 config.  Useful when downstream consumers (e.g. vLLM) expect a v4-format config.
+    diffusers_compatible: bool = False  # If True, use diffusers-compatible index filename
+    # (diffusion_pytorch_model.safetensors.index.json) so checkpoints are loadable via diffusers from_pretrained().
 
     def __post_init__(self):
         """
@@ -299,6 +302,9 @@ class Checkpointer:
                 use_staging=self.config.staging_dir is not None,
                 staging_dir=self.config.staging_dir,
             )
+            if self.config.diffusers_compatible:
+                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                    _maybe_rename_index_for_diffusers(consolidated_dir)
 
     @torch.no_grad()
     def save_optimizer(
@@ -818,6 +824,7 @@ class Checkpointer:
                 consolidated_output_path=consolidated_output_path if not consolidate_on_all_ranks else None,
                 fqn_to_index_mapping=fqn_to_index_mapping,
                 staging_dir=self.config.staging_dir,
+                diffusers_compatible=self.config.diffusers_compatible,
             )
 
     def _get_storage_reader(
