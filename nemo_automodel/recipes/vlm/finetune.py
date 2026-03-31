@@ -64,7 +64,7 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
+from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, filter_forward_kwargs
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -834,6 +834,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 else nullcontext()
             )
             with train_ctx(), sync_ctx:
+                batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)
@@ -1031,6 +1032,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
                 with train_ctx():
+                    batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                         out = self.model_parts[0](logits_to_keep=1, **batch)
                     else:

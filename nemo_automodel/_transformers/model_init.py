@@ -37,6 +37,7 @@ from nemo_automodel._transformers.utils import apply_qwen3_omni_config_patch
 
 apply_qwen3_omni_config_patch()
 
+import nemo_automodel.components.checkpoint.utils as checkpoint_utils
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
@@ -241,6 +242,77 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
             snapshot_download(pretrained_model_name_or_path)
 
 
+def _get_model_tensor(model, name: str):
+    """Return a parameter or buffer by its fully-qualified state-dict key."""
+    try:
+        return model.get_parameter(name)
+    except (AttributeError, ValueError):
+        pass
+    try:
+        return model.get_buffer(name)
+    except (AttributeError, ValueError):
+        return None
+
+
+def _restore_loaded_model_dtype(
+    model, pretrained_model_name_or_path, hf_config, quantization_config, load_kwargs
+) -> None:
+    """Restore each loaded tensor to the exact dtype stored in the checkpoint.
+
+    Some modules allocate parameters in a wider dtype than the checkpoint.
+    HuggingFace then copies the checkpoint tensor into that existing tensor,
+    which upcasts the loaded value. We fix that by re-inspecting checkpoint
+    tensor dtypes per key and restoring each loaded parameter/buffer to the
+    dtype that was actually stored in the file.
+    """
+    if quantization_config is not None or getattr(hf_config, "quantization_config", None) is not None:
+        return
+
+    try:
+        checkpoint_dtypes = checkpoint_utils._get_checkpoint_tensor_dtypes(
+            pretrained_model_name_or_path, hf_config, load_kwargs
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to inspect checkpoint tensor dtypes for %s; leaving loaded dtypes unchanged: %s",
+            pretrained_model_name_or_path,
+            exc,
+        )
+        return
+
+    if not checkpoint_dtypes:
+        return
+
+    restored_dtype_by_tensor_id: dict[int, torch.dtype] = {}
+    restored_count = 0
+    for name, checkpoint_dtype in checkpoint_dtypes.items():
+        tensor = _get_model_tensor(model, name)
+        if tensor is None or tensor.dtype == checkpoint_dtype:
+            continue
+
+        seen_dtype = restored_dtype_by_tensor_id.get(id(tensor))
+        if seen_dtype is not None and seen_dtype != checkpoint_dtype:
+            logger.warning(
+                "Skipping conflicting checkpoint dtypes for aliased tensor %s: %s vs %s",
+                name,
+                seen_dtype,
+                checkpoint_dtype,
+            )
+            continue
+
+        try:
+            tensor.data = tensor.data.to(dtype=checkpoint_dtype)
+        except (RuntimeError, TypeError) as exc:
+            logger.warning("Failed to restore checkpoint dtype for %s to %s: %s", name, checkpoint_dtype, exc)
+            continue
+
+        restored_dtype_by_tensor_id[id(tensor)] = checkpoint_dtype
+        restored_count += 1
+
+    if restored_count > 0:
+        logger.info("Restored checkpoint dtypes for %d tensors from %s", restored_count, pretrained_model_name_or_path)
+
+
 def _init_model(
     cls,
     pretrained_model_name_or_path_or_config,
@@ -276,6 +348,7 @@ def _init_model(
                     attn_implementation=attn_implementation,
                     **kwargs,
                 )
+            _restore_loaded_model_dtype(model, pretrained_model_name_or_path, hf_config, quantization_config, kwargs)
         else:
             model = cls._from_config_parent_class(
                 hf_config,
@@ -327,6 +400,7 @@ def _init_model(
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
+        _restore_loaded_model_dtype(model, pretrained_model_name_or_path, hf_config, quantization_config, kwargs)
     else:
         model = cls._from_config_parent_class(
             hf_config,
