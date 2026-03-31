@@ -1,0 +1,92 @@
+seed: 42
+
+wandb:
+  project: wan-t2v-flow-matching
+  mode: online
+  name: wan2_1_lora_run
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+  # Required when lora.enabled=true — used by inject_lora() to:
+  #   1. Call _wan_pre_inject() which unfuses QKV projections
+  #   2. Select WAN_DEFAULT_TARGET_MODULES
+  model_type: "wan"
+  mode: finetune
+
+# ── LoRA configuration ────────────────────────────────────────────────────────
+# Set enabled: false (or remove this section) for full fine-tune
+lora:
+  enabled: true
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  # null = use WAN_DEFAULT_TARGET_MODULES from lora/config.py:
+  #   to_q, to_k, to_v, to_out.0
+  # Note: unfuse_projections() is called automatically before injection
+  target_modules: null
+
+optim:
+  learning_rate: 5e-6
+  optimizer:
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 0
+  min_lr: 1e-6
+
+# FSDP2 with param_dtype=None when LoRA enabled:
+#   base weights (bf16): sharded, no grad comms
+#   LoRA weights (fp32): sharded, grad allreduced by FSDP2
+fsdp:
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  dp_replicate_size: 1
+  dp_size: 8
+
+flow_matching:
+  adapter_type: "simple"
+  adapter_kwargs: {}
+  timestep_sampling: "uniform"
+  logit_mean: 0.0
+  logit_std: 1.0
+  flow_shift: 3.0
+  mix_uniform_ratio: 0.1
+  sigma_min: 0.0
+  sigma_max: 1.0
+  num_train_timesteps: 1000
+  i2v_prob: 0.3
+  use_loss_weighting: true
+  log_interval: 100
+  summary_log_interval: 10
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  num_epochs: 100
+  log_every: 2
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
+    cache_dir: PATH_TO_YOUR_DATA
+    model_type: wan
+    base_resolution: [512, 512]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+    num_workers: 0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
+  model_save_format: torch_save
+  save_consolidated: false
+  restore_from: null
