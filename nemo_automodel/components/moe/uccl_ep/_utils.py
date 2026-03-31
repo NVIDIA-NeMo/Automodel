@@ -585,6 +585,8 @@ def initialize_uccl(
     #         if rank == 0:
     #             print(f"PeerCopyManager unavailable: {e}", flush=True)
 
+    # Wait for RDMA proxy connections to fully stabilize after start_dual().
+    # Without this, early dispatch/combine calls may hit unready connections.
     time.sleep(3)
     return proxies, workers
 
