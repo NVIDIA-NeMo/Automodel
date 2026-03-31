@@ -31,6 +31,9 @@ class TestCheckpointRobustness:
     def test_checkpoint_robustness_gpt_oss_20b(self):
         run_test_script(TEST_FOLDER, "L2_Checkpoint_Robustness_GPT_OSS_20B.sh")
 
+    def test_checkpoint_robustness_nemotron_nano_v3(self):
+        run_test_script(TEST_FOLDER, "L2_Checkpoint_Robustness_Nemotron_Nano_V3.sh")
+
 
 class TestVLLMDeploy:
     """vLLM deployment tests. Must run after TestCheckpointRobustness (uses their checkpoints)."""
@@ -48,3 +51,10 @@ class TestVLLMDeploy:
         finally:
             shutil.rmtree("/adasif/checkpoints/robustness_gptoss_sft", ignore_errors=True)
             shutil.rmtree("/adasif/checkpoints/robustness_gptoss_peft", ignore_errors=True)
+
+    def test_vllm_deploy_nemotron_nano_v3(self):
+        try:
+            run_test_script(TEST_FOLDER, "L2_vLLM_Deploy_Nemotron_Nano_V3.sh")
+        finally:
+            shutil.rmtree("/adasif/checkpoints/robustness_nano_v3_sft", ignore_errors=True)
+            shutil.rmtree("/adasif/checkpoints/robustness_nano_v3_peft", ignore_errors=True)

@@ -118,10 +118,12 @@ _OVERRIDES = [
     "tokenizer",
     "max_new_tokens",
     "adapter_path",
+    "experts_implementation",
 ]
 
 _BOOLEAN_OVERRIDES = [
     "vllm_smoke_test",
+    "trust_remote_code",
 ]
 
 

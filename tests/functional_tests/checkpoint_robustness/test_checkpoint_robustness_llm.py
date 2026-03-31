@@ -41,7 +41,14 @@ INPUT_IDS = [791, 4996, 14198, 39935, 35308, 927, 279, 16053, 5679]
 
 def _extract_custom_args(argv):
     """Separate test-specific CLI flags from config parser arguments."""
-    custom_keys = {"--kl_threshold", "--hf_kl_threshold", "--cross_tp_size", "--cross_tp_kl_threshold"}
+    custom_keys = {
+        "--kl_threshold",
+        "--hf_kl_threshold",
+        "--cross_tp_size",
+        "--cross_tp_kl_threshold",
+        "--experts_implementation",
+    }
+    boolean_keys = {"--trust_remote_code"}
     custom = {}
     remaining = []
     i = 0
@@ -49,6 +56,9 @@ def _extract_custom_args(argv):
         if argv[i] in custom_keys:
             custom[argv[i].lstrip("-")] = argv[i + 1]
             i += 2
+        elif argv[i] in boolean_keys:
+            custom[argv[i].lstrip("-")] = True
+            i += 1
         else:
             remaining.append(argv[i])
             i += 1
@@ -94,6 +104,8 @@ def test_checkpoint_robustness():
     hf_kl_threshold = float(custom_args.get("hf_kl_threshold", "5e-3"))
     cross_tp_size = int(custom_args.get("cross_tp_size", "0"))
     cross_tp_kl_threshold = float(custom_args.get("cross_tp_kl_threshold", "5e-3"))
+    trust_remote_code = bool(custom_args.get("trust_remote_code", False))
+    experts_implementation = custom_args.get("experts_implementation", None)
 
     # Phase 1: Train and checkpoint
     cfg = parse_args_and_load_config()
@@ -143,18 +155,19 @@ def test_checkpoint_robustness():
     if _rank0():
         from transformers import AutoModelForCausalLM
 
+        hf_kwargs = dict(torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code)
+        if experts_implementation:
+            hf_kwargs["experts_implementation"] = experts_implementation
+            hf_kwargs["trust_remote_code"] = False
+
         if is_peft:
             from peft import PeftModel
 
-            base_model = AutoModelForCausalLM.from_pretrained(
-                original_pretrained_path, torch_dtype=torch.bfloat16
-            ).to(device)
+            base_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs).to(device)
             peft_model = PeftModel.from_pretrained(base_model, str(ckpt_step_dir / "model"))
             hf_logits = _get_logits(peft_model, INPUT_IDS, device)
         else:
-            hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), torch_dtype=torch.bfloat16).to(
-                device
-            )
+            hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs).to(device)
             hf_logits = _get_logits(hf_model, INPUT_IDS, device)
 
         kl_hf = _kl_divergence_from_logits(reference_logits, hf_logits)

@@ -503,6 +503,21 @@ def get_check_model_inputs_decorator():
     Returns:
         Decorator function to validate model inputs.
     """
+    # transformers >= 5.2.0: check_model_inputs was split into two decorators
+    # Check this FIRST because the old import still exists in 5.2+ as a deprecated wrapper
+    # with a different signature.
+    if is_transformers_min_version("5.2.0"):
+        try:
+            from transformers.utils.generic import merge_with_config_defaults
+            from transformers.utils.output_capturing import capture_outputs
+
+            def _combined_decorator(func):
+                return merge_with_config_defaults(capture_outputs(func))
+
+            return _combined_decorator
+        except ImportError:
+            pass
+
     try:
         from transformers.utils.generic import check_model_inputs
 
@@ -512,18 +527,6 @@ def get_check_model_inputs_decorator():
         else:
             # Old API: check_model_inputs is directly a decorator
             return check_model_inputs
-    except ImportError:
-        pass
-
-    # transformers >= 5.2.0: check_model_inputs was split into two decorators
-    try:
-        from transformers.utils.generic import merge_with_config_defaults
-        from transformers.utils.output_capturing import capture_outputs
-
-        def _combined_decorator(func):
-            return merge_with_config_defaults(capture_outputs(func))
-
-        return _combined_decorator
     except ImportError:
         pass
 

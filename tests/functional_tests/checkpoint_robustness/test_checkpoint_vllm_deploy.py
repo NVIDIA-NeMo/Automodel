@@ -33,7 +33,7 @@ PROMPTS = [
 
 def _extract_custom_args(argv):
     custom_keys = {"--model_path", "--tokenizer", "--max_new_tokens", "--adapter_path"}
-    boolean_keys = {"--vllm_smoke_test"}
+    boolean_keys = {"--vllm_smoke_test", "--trust_remote_code"}
     custom = {}
     remaining = []
     i = 0
@@ -64,6 +64,7 @@ def test_vllm_greedy_matches_hf():
     tokenizer_path = _custom_args.get("tokenizer", model_path)
     max_new_tokens = int(_custom_args.get("max_new_tokens", "20"))
     smoke_test = _custom_args.get("vllm_smoke_test", False)
+    trust_remote_code = _custom_args.get("trust_remote_code", False)
 
     from vllm import LLM, SamplingParams
 
@@ -74,13 +75,13 @@ def test_vllm_greedy_matches_hf():
             from vllm.lora.request import LoRARequest
 
             print(f"[vLLM smoke test] Loading model from {model_path} with enable_lora=True")
-            llm = LLM(model=model_path, enable_lora=True, max_lora_rank=64)
+            llm = LLM(model=model_path, enable_lora=True, max_lora_rank=64, trust_remote_code=trust_remote_code)
             lora_request = LoRARequest("adapter", 1, adapter_path)
             sampling_params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
             vllm_results = llm.generate(PROMPTS, sampling_params, lora_request=lora_request)
         else:
             print(f"[vLLM smoke test] Loading model from {model_path}")
-            llm = LLM(model=model_path)
+            llm = LLM(model=model_path, trust_remote_code=trust_remote_code)
             sampling_params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
             vllm_results = llm.generate(PROMPTS, sampling_params)
 
@@ -99,15 +100,19 @@ def test_vllm_greedy_matches_hf():
         from peft import PeftModel
 
         print(f"[HF] Loading base model from {model_path}")
-        base_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16).to(device)
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code
+        ).to(device)
         print(f"[HF] Loading adapter from {adapter_path}")
         hf_model = PeftModel.from_pretrained(base_model, adapter_path, torch_dtype=torch.bfloat16)
     else:
         print(f"[HF] Loading model from {model_path} on {device}")
-        hf_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16).to(device)
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code
+        ).to(device)
 
     hf_model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=trust_remote_code)
 
     hf_outputs = []
     for idx, prompt in enumerate(PROMPTS):
@@ -128,13 +133,13 @@ def test_vllm_greedy_matches_hf():
         from vllm.lora.request import LoRARequest
 
         print(f"[vLLM] Loading base model from {model_path} with enable_lora=True")
-        llm = LLM(model=model_path, enable_lora=True, max_lora_rank=64)
+        llm = LLM(model=model_path, enable_lora=True, max_lora_rank=64, trust_remote_code=trust_remote_code)
         lora_request = LoRARequest("adapter", 1, adapter_path)
         sampling_params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
         vllm_results = llm.generate(PROMPTS, sampling_params, lora_request=lora_request)
     else:
         print(f"[vLLM] Loading model from {model_path}")
-        llm = LLM(model=model_path, model_impl="transformers")
+        llm = LLM(model=model_path, model_impl="transformers", trust_remote_code=trust_remote_code)
         sampling_params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
         vllm_results = llm.generate(PROMPTS, sampling_params)
 
