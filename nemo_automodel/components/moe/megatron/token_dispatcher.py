@@ -463,10 +463,6 @@ class TokenDispatcherConfig:
     moe_enable_deepep: bool = True
     """Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
-    moe_enable_uccl_ep: bool = False
-    """Enable UCCL-EP (libibverbs RC QPs) instead of DeepEP/NVSHMEM for RDMA.
-    Use this on Azure HPC VMs or any environment where GPU→NIC PCIe P2P is blocked."""
-
     moe_permute_fusion: bool = False
     """Fuse token rearrangement ops during token dispatching."""
 
@@ -537,9 +533,8 @@ class MoEFlexTokenDispatcher:
         assert self.tp_size * self.ep_size > 1, "Flex token dispatcher requires TPxEP > 1"
 
         backend = self.config.moe_flex_dispatcher_backend
-        use_uccl = self.config.moe_enable_uccl_ep
 
-        if backend == "uccl_ep" or use_uccl:
+        if backend == "uccl_ep":
             if set_uccl_num_sms is not None:
                 set_uccl_num_sms(self.config.moe_deepep_num_sms)
             dispatch_fn = uccl_fused_dispatch

@@ -17,7 +17,7 @@
 Tests cover:
 - BackendConfig: uccl_ep dispatcher validation and fallback logic
 - MoE layer: dispatcher selection for uccl_ep
-- TokenDispatcherConfig: moe_enable_uccl_ep field
+- TokenDispatcherConfig: moe_flex_dispatcher_backend uccl_ep option
 - _DeepepManager: custom dispatch/combine function injection
 - fused_a2a: get_uccl_buffer caching, UCCL autograd function wiring
 - GroupedExpertsDeepEP / GroupedExpertsTE: _ep_dispatcher propagation
@@ -278,34 +278,30 @@ class TestGroupedExpertsTEDispatcher:
 
 
 # ---------------------------------------------------------------------------
-# TokenDispatcherConfig – moe_enable_uccl_ep field
+# TokenDispatcherConfig – moe_flex_dispatcher_backend field
 # ---------------------------------------------------------------------------
 
 
 class TestTokenDispatcherConfigUcclEp:
-    """Test TokenDispatcherConfig moe_enable_uccl_ep field."""
+    """Test TokenDispatcherConfig moe_flex_dispatcher_backend for uccl_ep."""
 
-    def test_default_uccl_ep_disabled(self):
+    def test_default_backend_deepep(self):
         from nemo_automodel.components.moe.megatron.token_dispatcher import TokenDispatcherConfig
 
         config = TokenDispatcherConfig()
-        assert config.moe_enable_uccl_ep is False
-        assert config.moe_enable_deepep is True
+        assert config.moe_flex_dispatcher_backend == "deepep"
 
-    def test_enable_uccl_ep(self):
+    def test_backend_uccl_ep(self):
         from nemo_automodel.components.moe.megatron.token_dispatcher import TokenDispatcherConfig
 
-        config = TokenDispatcherConfig(moe_enable_uccl_ep=True, moe_enable_deepep=False)
-        assert config.moe_enable_uccl_ep is True
-        assert config.moe_enable_deepep is False
+        config = TokenDispatcherConfig(moe_flex_dispatcher_backend="uccl_ep")
+        assert config.moe_flex_dispatcher_backend == "uccl_ep"
 
-    def test_both_enabled(self):
-        """Both can be set (dispatcher chooses one at runtime)."""
+    def test_backend_hybridep(self):
         from nemo_automodel.components.moe.megatron.token_dispatcher import TokenDispatcherConfig
 
-        config = TokenDispatcherConfig(moe_enable_uccl_ep=True, moe_enable_deepep=True)
-        assert config.moe_enable_uccl_ep is True
-        assert config.moe_enable_deepep is True
+        config = TokenDispatcherConfig(moe_flex_dispatcher_backend="hybridep")
+        assert config.moe_flex_dispatcher_backend == "hybridep"
 
 
 # ---------------------------------------------------------------------------
@@ -478,38 +474,15 @@ class TestMoEFlexTokenDispatcherUcclEp:
         MoEFlexTokenDispatcher.shared_deepep_manager = orig_comm
         MoEFlexTokenDispatcher.shared_uccl_manager = orig_uccl
 
-    def test_uccl_ep_config_assertion_passes(self):
-        """Config with moe_enable_uccl_ep=True should pass the assertion."""
-        from nemo_automodel.components.moe.megatron.token_dispatcher import (
-            MoEFlexTokenDispatcher,
-            TokenDispatcherConfig,
-        )
-
-        config = TokenDispatcherConfig(moe_enable_deepep=False, moe_enable_uccl_ep=True)
-        group = Mock()
-        group.size.return_value = 2
-
-        # We need a custom dispatch_fn to avoid ImportError from deepep check
-        custom_dispatch = Mock()
-        custom_combine = Mock()
-
-        with patch.object(
-            MoEFlexTokenDispatcher,
-            "__init__",
-            wraps=MoEFlexTokenDispatcher.__init__,
-        ):
-            # Directly test the assertion logic
-            assert config.moe_enable_deepep or config.moe_enable_uccl_ep
-
-    def test_neither_enabled_raises(self):
-        """Config with both disabled should fail the assertion."""
+    def test_uccl_ep_backend_config(self):
+        """Config with moe_flex_dispatcher_backend='uccl_ep' should be valid."""
         from nemo_automodel.components.moe.megatron.token_dispatcher import TokenDispatcherConfig
 
-        config = TokenDispatcherConfig(moe_enable_deepep=False, moe_enable_uccl_ep=False)
-        assert not (config.moe_enable_deepep or config.moe_enable_uccl_ep)
+        config = TokenDispatcherConfig(moe_flex_dispatcher_backend="uccl_ep")
+        assert config.moe_flex_dispatcher_backend == "uccl_ep"
 
     def test_uccl_ep_uses_uccl_dispatch_fn(self):
-        """When moe_enable_uccl_ep=True, dispatcher should use uccl_fused_dispatch."""
+        """When backend='uccl_ep', dispatcher should use uccl_fused_dispatch."""
         from nemo_automodel.components.moe.megatron.token_dispatcher import (
             MoEFlexTokenDispatcher,
             TokenDispatcherConfig,
@@ -518,8 +491,7 @@ class TestMoEFlexTokenDispatcherUcclEp:
         from nemo_automodel.components.moe.megatron import fused_a2a
 
         config = TokenDispatcherConfig(
-            moe_enable_deepep=False,
-            moe_enable_uccl_ep=True,
+            moe_flex_dispatcher_backend="uccl_ep",
             num_moe_experts=8,
             moe_router_topk=2,
         )
@@ -527,14 +499,10 @@ class TestMoEFlexTokenDispatcherUcclEp:
         group = Mock()
         group.size.return_value = 2
 
-        # Mock _DeepepManager to capture kwargs
         captured_kwargs = {}
-
-        original_init = _DeepepManager.__init__
 
         def mock_init(self, **kwargs):
             captured_kwargs.update(kwargs)
-            # Set required attributes to prevent AttributeError
             self.group = kwargs.get("group")
             self.router_topk = kwargs.get("router_topk")
             self.capacity_factor = kwargs.get("capacity_factor")
@@ -552,7 +520,7 @@ class TestMoEFlexTokenDispatcherUcclEp:
             self._fused_combine = combine_fn if combine_fn is not None else fused_a2a.fused_combine
 
         with patch.object(_DeepepManager, "__init__", mock_init):
-            dispatcher = MoEFlexTokenDispatcher(
+            MoEFlexTokenDispatcher(
                 num_local_experts=4,
                 local_expert_indices=list(range(4)),
                 config=config,
@@ -563,8 +531,8 @@ class TestMoEFlexTokenDispatcherUcclEp:
         assert captured_kwargs["_dispatch_fn"] is fused_a2a.uccl_fused_dispatch
         assert captured_kwargs["_combine_fn"] is fused_a2a.uccl_fused_combine
 
-    def test_deepep_uses_none_dispatch_fn(self):
-        """When moe_enable_deepep=True (default), _dispatch_fn should be None."""
+    def test_deepep_uses_no_custom_dispatch_fn(self):
+        """When backend='deepep' (default), _dispatch_fn should not be passed."""
         from nemo_automodel.components.moe.megatron.token_dispatcher import (
             MoEFlexTokenDispatcher,
             TokenDispatcherConfig,
@@ -573,8 +541,7 @@ class TestMoEFlexTokenDispatcherUcclEp:
         from nemo_automodel.components.moe.megatron import fused_a2a
 
         config = TokenDispatcherConfig(
-            moe_enable_deepep=True,
-            moe_enable_uccl_ep=False,
+            moe_flex_dispatcher_backend="deepep",
             num_moe_experts=8,
             moe_router_topk=2,
         )
@@ -623,8 +590,7 @@ class TestMoEFlexTokenDispatcherUcclEp:
         from nemo_automodel.components.moe.megatron import fused_a2a
 
         config = TokenDispatcherConfig(
-            moe_enable_deepep=False,
-            moe_enable_uccl_ep=True,
+            moe_flex_dispatcher_backend="uccl_ep",
             num_moe_experts=8,
             moe_router_topk=2,
         )
