@@ -470,12 +470,12 @@ class TestMoEFlexTokenDispatcherUcclEp:
         """Reset shared managers before/after each test."""
         from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher
 
-        orig_comm = MoEFlexTokenDispatcher.shared_comm_manager
+        orig_comm = MoEFlexTokenDispatcher.shared_deepep_manager
         orig_uccl = MoEFlexTokenDispatcher.shared_uccl_manager
-        MoEFlexTokenDispatcher.shared_comm_manager = None
+        MoEFlexTokenDispatcher.shared_deepep_manager = None
         MoEFlexTokenDispatcher.shared_uccl_manager = None
         yield
-        MoEFlexTokenDispatcher.shared_comm_manager = orig_comm
+        MoEFlexTokenDispatcher.shared_deepep_manager = orig_comm
         MoEFlexTokenDispatcher.shared_uccl_manager = orig_uccl
 
     def test_uccl_ep_config_assertion_passes(self):
@@ -610,11 +610,11 @@ class TestMoEFlexTokenDispatcherUcclEp:
                 ep_group=group,
             )
 
-        assert captured_kwargs["_dispatch_fn"] is None
-        assert captured_kwargs["_combine_fn"] is None
+        assert "_dispatch_fn" not in captured_kwargs
+        assert "_combine_fn" not in captured_kwargs
 
     def test_shared_uccl_manager_used_when_sharing(self):
-        """UCCL-EP path should use shared_uccl_manager, not shared_comm_manager."""
+        """UCCL-EP path should use shared_uccl_manager, not shared_deepep_manager."""
         from nemo_automodel.components.moe.megatron.token_dispatcher import (
             MoEFlexTokenDispatcher,
             TokenDispatcherConfig,
@@ -666,5 +666,5 @@ class TestMoEFlexTokenDispatcherUcclEp:
         # Both should share the same uccl manager
         assert d1._comm_manager is d2._comm_manager
         assert MoEFlexTokenDispatcher.shared_uccl_manager is not None
-        # shared_comm_manager should remain None since we used uccl path
-        assert MoEFlexTokenDispatcher.shared_comm_manager is None
+        # shared_deepep_manager should remain None since we used uccl path
+        assert MoEFlexTokenDispatcher.shared_deepep_manager is None
