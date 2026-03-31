@@ -34,7 +34,7 @@ import torch
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.models.common import BackendConfig
 
-HAVE_UCCL_EP = importlib.util.find_spec("uccl") is not None
+HAVE_UCCL_EP = importlib.util.find_spec("uccl") is not None or importlib.util.find_spec("ep") is not None
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 
 
