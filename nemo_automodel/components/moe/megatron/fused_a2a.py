@@ -33,6 +33,7 @@ try:
     from nemo_automodel.components.moe.uccl_ep.buffer import EventOverlap as UCCLEventOverlap
 
     HAVE_UCCL_EP = True
+    # Default from env; overridden by MoEFlexTokenDispatcher.set_uccl_num_sms() at init time
     UCCLBuffer.set_num_sms(int(os.environ.get("UCCL_EP_SM_NUMS", os.environ.get("DEEP_EP_SM_NUMS", 20))))
 except ImportError:
     HAVE_UCCL_EP = False
@@ -614,10 +615,10 @@ class UCCLFusedCombine(torch.autograd.Function):
         ctx.group = group
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
-        return combined_x, after_event
+        return combined_x, None
 
     @staticmethod
-    def backward(ctx, grad_output, previous_event=None):
+    def backward(ctx, grad_output, _grad_event=None):
         previous_event = None
         if ctx.async_finish:
             previous_event = UCCLEventOverlap(UCCLEventHandle())
