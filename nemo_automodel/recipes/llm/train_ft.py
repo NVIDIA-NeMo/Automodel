@@ -85,6 +85,7 @@ from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     _supports_seq_lens,
+    filter_forward_kwargs,
     resolve_trust_remote_code,
 )
 from nemo_automodel.recipes._dist_setup import setup_distributed
@@ -1332,6 +1333,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else nullcontext()
             )
             with train_ctx(), sync_ctx, fp8_ctx:
+                batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)

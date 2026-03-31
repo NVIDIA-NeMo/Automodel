@@ -30,6 +30,16 @@ import torch.nn as nn
 logger = logging.getLogger(__name__)
 
 
+def _get_forward_signature(model: nn.Module) -> inspect.Signature | None:
+    """Best-effort retrieval of ``model.forward`` signature."""
+    if not callable(getattr(model, "forward", None)):
+        return None
+    try:
+        return inspect.signature(model.forward)
+    except (ValueError, TypeError):
+        return None
+
+
 def _supports_logits_to_keep(model: nn.Module) -> bool:
     """
     Check if the model supports logits_to_keep.
@@ -40,10 +50,8 @@ def _supports_logits_to_keep(model: nn.Module) -> bool:
     Returns:
         bool: True if the model supports logits_to_keep, False otherwise.
     """
-    if callable(getattr(model, "forward", None)):
-        return "logits_to_keep" in set(inspect.signature(model.forward).parameters.keys())
-    else:
-        return False
+    sig = _get_forward_signature(model)
+    return sig is not None and "logits_to_keep" in sig.parameters
 
 
 def _supports_seq_lens(model: nn.Module) -> bool:
@@ -56,21 +64,40 @@ def _supports_seq_lens(model: nn.Module) -> bool:
 
     Returns False otherwise (passing seq_lens would cause "unexpected kwarg" error).
     """
-    if not callable(getattr(model, "forward", None)):
+    sig = _get_forward_signature(model)
+    if sig is None:
         return False
-    try:
-        sig = inspect.signature(model.forward)
-        params = sig.parameters
-        # Check for explicit seq_lens parameter
-        if "seq_lens" in params:
+    params = sig.parameters
+    # Check for explicit seq_lens parameter
+    if "seq_lens" in params:
+        return True
+    # Check for **kwargs (VAR_KEYWORD)
+    for param in params.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
             return True
-        # Check for **kwargs (VAR_KEYWORD)
-        for param in params.values():
-            if param.kind == inspect.Parameter.VAR_KEYWORD:
-                return True
-        return False
-    except (ValueError, TypeError):
-        return False
+    return False
+
+
+def filter_forward_kwargs(model: nn.Module, kwargs: dict) -> dict:
+    """Drop kwargs that ``model.forward`` does not accept.
+
+    If the model exposes ``**kwargs`` or its signature cannot be inspected, the
+    input kwargs are returned unchanged. The original dict is never mutated.
+    """
+    sig = _get_forward_signature(model)
+    if sig is None:
+        return dict(kwargs)
+
+    params = sig.parameters
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+        return dict(kwargs)
+
+    allowed = set(params.keys())
+    filtered = {key: value for key, value in kwargs.items() if key in allowed}
+    dropped = sorted(set(kwargs) - set(filtered))
+    if dropped:
+        logger.debug("Dropping unsupported forward kwargs for %s: %s", type(model).__name__, dropped)
+    return filtered
 
 
 def _get_logical_numel(param) -> int:

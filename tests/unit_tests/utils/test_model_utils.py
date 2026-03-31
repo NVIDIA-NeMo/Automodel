@@ -385,3 +385,37 @@ def test_non_phi4mm_use_cache_unchanged():
 
     model_utils.apply_parameter_freezing(m, {"freeze_vision_tower": False})
     assert m.config.use_cache is True
+
+
+class TestFilterForwardKwargs:
+    def test_drops_unsupported_kwargs(self):
+        class Model(nn.Module):
+            def forward(self, input_ids, attention_mask=None):
+                return input_ids
+
+        model = Model()
+        batch = {
+            "input_ids": torch.ones(2, 3, dtype=torch.long),
+            "attention_mask": torch.ones(2, 3, dtype=torch.long),
+            "padding_mask": torch.zeros(2, 3, dtype=torch.bool),
+        }
+
+        filtered = model_utils.filter_forward_kwargs(model, batch)
+
+        assert set(filtered.keys()) == {"input_ids", "attention_mask"}
+        assert "padding_mask" in batch  # original dict is unchanged
+
+    def test_keeps_kwargs_when_forward_accepts_var_keyword(self):
+        class Model(nn.Module):
+            def forward(self, input_ids, **kwargs):
+                return input_ids, kwargs
+
+        model = Model()
+        batch = {
+            "input_ids": torch.ones(2, 3, dtype=torch.long),
+            "padding_mask": torch.zeros(2, 3, dtype=torch.bool),
+        }
+
+        filtered = model_utils.filter_forward_kwargs(model, batch)
+
+        assert filtered == batch

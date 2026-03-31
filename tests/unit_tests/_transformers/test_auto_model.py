@@ -38,6 +38,7 @@ from nemo_automodel._transformers.model_init import (
     _patched_get_init_context,
     no_hf_meta_device,
 )
+from nemo_automodel.components.checkpoint.utils import _get_checkpoint_tensor_dtypes
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
 
@@ -490,6 +491,21 @@ class TestConsumeConfigOverrides:
         assert "explicit_param" in kwargs
 
 
+class TestGetCheckpointTensorDtypes:
+    def test_uses_provided_state_dict_dtypes(self):
+        state_dict = {
+            "linear.weight": torch.empty(2, 2, dtype=torch.bfloat16),
+            "norm.weight": torch.empty(2, dtype=torch.float32),
+        }
+
+        result = _get_checkpoint_tensor_dtypes("ignored", object(), {"state_dict": state_dict})
+
+        assert result == {
+            "linear.weight": torch.bfloat16,
+            "norm.weight": torch.float32,
+        }
+
+
 class TestFilterKwargsForInit:
     """Test cases for _filter_kwargs_for_init function."""
 
@@ -654,6 +670,51 @@ class TestModelMappingKeyErrorFallback:
         # Fallback: type(model) = FakeModel
         mock_wrap.assert_called_once_with(FakeModel)
 
+    def test_force_hf_pretrained_restores_checkpoint_dtype_per_tensor(self):
+        """force_hf pretrained path should restore each tensor dtype from the checkpoint."""
+
+        class FakeConfig:
+            name_or_path = "test-model"
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(2, 2, bias=False)
+                self.norm = torch.nn.LayerNorm(2)
+
+        fake_config = FakeConfig()
+        fake_model = FakeModel().to(torch.float32)
+
+        cls = self._make_cls({})
+        cls._from_pretrained_parent_class = MagicMock(return_value=fake_model)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch(
+                "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+                return_value={
+                    "linear.weight": torch.bfloat16,
+                    "norm.weight": torch.float32,
+                },
+            ),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
+        ):
+            mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
+            is_custom, model = _init_model(
+                cls,
+                "test-model",
+                attn_implementation="eager",
+                torch_dtype="auto",
+                quantization_config=None,
+                force_hf=True,
+            )
+
+        assert is_custom is False
+        assert cls._from_pretrained_parent_class.call_args.kwargs["torch_dtype"] == "auto"
+        assert fake_model.linear.weight.dtype == torch.bfloat16
+        assert fake_model.norm.weight.dtype == torch.float32
+        mock_wrap.assert_called_once_with(FakeModel)
+
     def test_fallback_path_known_config_type(self):
         """Fallback (non-force_hf, no custom model) path: _model_mapping succeeds."""
 
@@ -686,6 +747,50 @@ class TestModelMappingKeyErrorFallback:
             )
 
         assert is_custom is False
+        mock_wrap.assert_called_once_with(FakeModel)
+
+    def test_fallback_pretrained_restores_tied_weight_checkpoint_dtype(self):
+        """Fallback pretrained path should preserve tied-weight checkpoint dtypes."""
+
+        class FakeConfig:
+            name_or_path = "test-model"
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = torch.nn.Embedding(4, 3)
+                self.lm_head = torch.nn.Linear(3, 4, bias=False)
+                self.lm_head.weight = self.embed_tokens.weight
+
+        fake_config = FakeConfig()
+        fake_model = FakeModel().to(torch.float32)
+
+        cls = self._make_cls({})
+        cls._from_pretrained_parent_class = MagicMock(return_value=fake_model)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch(
+                "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+                return_value={"lm_head.weight": torch.bfloat16},
+            ),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
+        ):
+            mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
+            is_custom, model = _init_model(
+                cls,
+                "test-model",
+                attn_implementation="eager",
+                torch_dtype=torch.bfloat16,
+                quantization_config=None,
+                force_hf=False,
+            )
+
+        assert is_custom is False
+        assert cls._from_pretrained_parent_class.call_args.kwargs["torch_dtype"] == torch.bfloat16
+        assert fake_model.lm_head.weight is fake_model.embed_tokens.weight
+        assert fake_model.lm_head.weight.dtype == torch.bfloat16
+        assert fake_model.embed_tokens.weight.dtype == torch.bfloat16
         mock_wrap.assert_called_once_with(FakeModel)
 
     def test_fallback_path_skips_incompatible_shared_arch_custom_model(self):
