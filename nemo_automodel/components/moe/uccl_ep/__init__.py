@@ -21,8 +21,7 @@ it compatible with environments where GPU-to-NIC PCIe P2P is unavailable
 (e.g., Azure HPC VMs with Mellanox InfiniBand).
 
 Usage:
-    Set dispatcher: uccl_ep in the model backend config, or set
-    AUTOMODEL_EP_BACKEND=uccl_ep environment variable.
+    Set dispatcher: uccl_ep in the model backend config.
 """
 
 from nemo_automodel.components.moe.uccl_ep.buffer import UCCLBuffer
