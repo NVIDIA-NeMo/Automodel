@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -19,7 +20,21 @@ import torch
 import torch.nn as nn
 from transformers.modeling_utils import _get_resolved_checkpoint_files, load_state_dict
 
-from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code
+
+def resolve_trust_remote_code(pretrained_model_name_or_path):
+    """
+    Whitelist NVIDIA models to allow remote code execution.
+
+    Args:
+        pretrained_model_name_or_path (str): The name or path of the pretrained model.
+
+    Returns:
+        bool: True if the model should be loaded with trust_remote_code, False otherwise.
+    """
+    if not pretrained_model_name_or_path:
+        return False
+    # pretrained_model_name_or_path can be something like nvidia/NVIDIA-Nemotron-Nano-9B-v2
+    return not os.path.isdir(pretrained_model_name_or_path) and pretrained_model_name_or_path.startswith("nvidia/")
 
 
 def is_tied_word_embeddings(model: nn.Module) -> bool:
