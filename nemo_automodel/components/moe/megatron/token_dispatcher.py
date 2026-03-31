@@ -25,6 +25,8 @@ from .fused_a2a import (
     hybrid_ep_combine,
     hybrid_ep_dispatch,
     set_deepep_num_sms,
+    uccl_fused_combine,
+    uccl_fused_dispatch,
 )
 from .fused_indices_converter import (
     fused_indices_to_multihot,
@@ -122,6 +124,8 @@ class _DeepepManager(_DispatchManager):
         num_local_experts: Optional[int] = None,
         router_dtype: Optional[str] = None,
         moe_router_expert_pad_multiple: Optional[int] = None,
+        _dispatch_fn=None,
+        _combine_fn=None,
     ):
         self.group = group
         self.router_topk = router_topk
@@ -138,7 +142,10 @@ class _DeepepManager(_DispatchManager):
         # Handle used for combine operation
         self.handle = None
 
-        if fused_dispatch is None:
+        self._fused_dispatch = _dispatch_fn if _dispatch_fn is not None else fused_dispatch
+        self._fused_combine = _combine_fn if _combine_fn is not None else fused_combine
+
+        if self._fused_dispatch is None:
             raise ImportError(
                 "DeepEP is not installed. Please install DeepEP package from https://github.com/deepseek-ai/deepep."
             )
@@ -177,7 +184,7 @@ class _DeepepManager(_DispatchManager):
             dispatched_probs,
             num_tokens_per_expert,
             handle,
-        ) = fused_dispatch(
+        ) = self._fused_dispatch(
             hidden_states,
             self.token_indices,
             self.token_probs,
@@ -244,7 +251,7 @@ class _DeepepManager(_DispatchManager):
         """
         Reverse process using fused kernel to unpermute and perform all-to-all in single step
         """
-        hidden_states, _ = fused_combine(
+        hidden_states, _ = self._fused_combine(
             hidden_states,
             self.group,
             self.handle,
@@ -453,6 +460,10 @@ class TokenDispatcherConfig:
     moe_enable_deepep: bool = True
     """Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
+    moe_enable_uccl_ep: bool = False
+    """Enable UCCL-EP (libibverbs RC QPs) instead of DeepEP/NVSHMEM for RDMA.
+    Use this on Azure HPC VMs or any environment where GPU→NIC PCIe P2P is blocked."""
+
     moe_permute_fusion: bool = False
     """Fuse token rearrangement ops during token dispatching."""
 
@@ -475,8 +486,11 @@ class TokenDispatcherConfig:
     improve stability especially when the number of experts is large (e.g. finegrained-moe).
     None means no changes for dtype."""
 
-    moe_flex_dispatcher_backend: Literal["deepep", "hybridep"] = "deepep"
-    """Backend for the flex token dispatcher. Options: 'deepep' or 'hybridep'."""
+    moe_enable_uccl_ep: bool = False
+    """Whether to use UCCL-EP instead of DeepEP for expert parallelism."""
+
+    moe_flex_dispatcher_backend: Literal["deepep", "hybridep", "uccl_ep"] = "deepep"
+    """Backend for the flex token dispatcher. Options: 'deepep', 'hybridep', or 'uccl_ep'."""
 
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP backend."""
@@ -487,11 +501,12 @@ class TokenDispatcherConfig:
 
 class MoEFlexTokenDispatcher:
     """
-    Flex token dispatcher supporting both DeepEP and HybridEP backends.
+    Flex token dispatcher supporting DeepEP, HybridEP, and UCCL-EP backends.
     """
 
     shared_deepep_manager: _DeepepManager = None
     shared_hybridep_manager: _HybridEPManager = None
+    shared_uccl_manager: _DeepepManager = None
 
     def __init__(
         self,
@@ -522,8 +537,30 @@ class MoEFlexTokenDispatcher:
         assert self.tp_size * self.ep_size > 1, "Flex token dispatcher requires TPxEP > 1"
 
         backend = self.config.moe_flex_dispatcher_backend
+        use_uccl = self.config.moe_enable_uccl_ep
 
-        if backend == "deepep":
+        if backend == "uccl_ep" or use_uccl:
+            dispatch_fn = uccl_fused_dispatch
+            combine_fn = uccl_fused_combine
+            manager_kwargs = dict(
+                group=ep_group,
+                router_topk=self.tp_size * self.config.moe_router_topk,
+                permute_fusion=self.config.moe_permute_fusion,
+                capacity_factor=self.config.moe_expert_capacity_factor,
+                num_experts=self.tp_size * self.config.num_moe_experts,
+                num_local_experts=self.num_local_experts,
+                router_dtype=self.config.moe_router_dtype,
+                moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
+                _dispatch_fn=dispatch_fn,
+                _combine_fn=combine_fn,
+            )
+            if SHARING_DEEPEP_MANAGER:
+                if MoEFlexTokenDispatcher.shared_uccl_manager is None:
+                    MoEFlexTokenDispatcher.shared_uccl_manager = _DeepepManager(**manager_kwargs)
+                self._comm_manager = MoEFlexTokenDispatcher.shared_uccl_manager
+            else:
+                self._comm_manager = _DeepepManager(**manager_kwargs)
+        elif backend == "deepep":
             if set_deepep_num_sms is not None:
                 set_deepep_num_sms(self.config.moe_deepep_num_sms)
             if SHARING_DEEPEP_MANAGER:
@@ -574,8 +611,8 @@ class MoEFlexTokenDispatcher:
         else:
             raise ValueError(
                 f"Invalid backend: {backend}. "
-                "Please set moe_flex_dispatcher_backend='deepep' or "
-                "moe_flex_dispatcher_backend='hybridep'"
+                "Please set moe_flex_dispatcher_backend='deepep', "
+                "'hybridep', or 'uccl_ep'"
             )
 
     def _initialize_metadata(self, num_local_tokens: int, probs: torch.Tensor) -> torch.Tensor:

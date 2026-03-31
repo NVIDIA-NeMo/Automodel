@@ -25,10 +25,21 @@ try:
 except ImportError:
     HAVE_DEEP_EP = False
 
+try:
+    from nemo_automodel.components.moe.uccl_ep import UCCLBuffer
+    from nemo_automodel.components.moe.uccl_ep.buffer import EventHandle as UCCLEventHandle
+    from nemo_automodel.components.moe.uccl_ep.buffer import EventOverlap as UCCLEventOverlap
+
+    HAVE_UCCL_EP = True
+    UCCLBuffer.set_num_sms(int(os.environ.get("DEEP_EP_SM_NUMS", 20)))
+except ImportError:
+    HAVE_UCCL_EP = False
+
 import torch
 
 _buffer = None
 _nvshmem_available = None
+_uccl_buffer = None
 
 
 def _is_nvshmem_available() -> bool:
@@ -482,3 +493,166 @@ if HAVE_HYBRIDEP:
 else:
     hybrid_ep_dispatch = None
     hybrid_ep_combine = None
+
+
+def get_uccl_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
+    """Get or create a UCCL-EP buffer for all-to-all communication."""
+    global _uccl_buffer
+    num_nvl_bytes, num_rdma_bytes = 0, 0
+    for config in (
+        UCCLBuffer.get_dispatch_config(group.size()),
+        UCCLBuffer.get_combine_config(group.size()),
+    ):
+        num_nvl_bytes = max(config.get_nvl_buffer_size_hint(hidden_bytes, group.size()), num_nvl_bytes)
+        num_rdma_bytes = max(config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes)
+
+    if (
+        _uccl_buffer is None
+        or _uccl_buffer.group != group
+        or _uccl_buffer.num_nvl_bytes < num_nvl_bytes
+        or _uccl_buffer.num_rdma_bytes < num_rdma_bytes
+    ):
+        _uccl_buffer = UCCLBuffer(group, num_nvl_bytes, num_rdma_bytes)
+    return _uccl_buffer
+
+
+class UCCLFusedDispatch(torch.autograd.Function):
+    """Fused dispatch using UCCL-EP instead of DeepEP/NVSHMEM."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        group,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
+        previous_event = None
+        if async_finish:
+            previous_event = UCCLEventOverlap(UCCLEventHandle())
+        buffer = get_uccl_buffer(group, get_hidden_bytes(x))
+        (
+            num_tokens_per_rank,
+            num_tokens_per_rdma_rank,
+            num_tokens_per_expert,
+            is_token_in_rank,
+            layout_event,
+        ) = buffer.get_dispatch_layout(
+            token_indices,
+            num_experts,
+            previous_event=previous_event,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        recv_x, recv_token_indices, recv_token_probs, handle, after_event = buffer.dispatch(
+            x,
+            num_tokens_per_rank=num_tokens_per_rank,
+            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+            is_token_in_rank=is_token_in_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
+            previous_event=layout_event,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        if async_finish:
+            after_event.current_stream_wait()
+        ctx.handle = handle
+        ctx.group = group
+        ctx.async_finish = async_finish
+        ctx.allocate_on_comm_stream = allocate_on_comm_stream
+        num_recv_tokens_per_expert_list = recv_token_probs.sum(dim=0).int().tolist()
+        tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
+        return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_token_indices, grad_token_probs, grad_tokens_per_expert, grad_handle):
+        buffer = get_uccl_buffer(ctx.group, get_hidden_bytes(grad_output))
+        handle = ctx.handle
+        previous_event = None
+        if ctx.async_finish:
+            previous_event = UCCLEventOverlap(UCCLEventHandle())
+        grad_x, grad_token_probs, after_event = buffer.combine(
+            grad_output.contiguous(),
+            handle,
+            topk_weights=grad_token_probs.float(),
+            previous_event=previous_event,
+            async_finish=ctx.async_finish,
+        )
+        if ctx.async_finish:
+            after_event.current_stream_wait()
+        return grad_x, None, grad_token_probs, None, None, None, None
+
+
+class UCCLFusedCombine(torch.autograd.Function):
+    """Fused combine using UCCL-EP instead of DeepEP/NVSHMEM."""
+
+    @staticmethod
+    def forward(ctx, x, group, handle, async_finish=False, allocate_on_comm_stream=False):
+        previous_event = None
+        if async_finish:
+            previous_event = UCCLEventOverlap(UCCLEventHandle())
+        buffer = get_uccl_buffer(group, get_hidden_bytes(x))
+        combined_x, _, after_event = buffer.combine(
+            x,
+            handle=handle,
+            async_finish=async_finish,
+            previous_event=previous_event,
+        )
+        if async_finish:
+            after_event.current_stream_wait()
+        ctx.handle = handle
+        ctx.group = group
+        ctx.async_finish = async_finish
+        ctx.allocate_on_comm_stream = allocate_on_comm_stream
+        return combined_x, after_event
+
+    @staticmethod
+    def backward(ctx, grad_output, previous_event=None):
+        previous_event = None
+        if ctx.async_finish:
+            previous_event = UCCLEventOverlap(UCCLEventHandle())
+        buffer = get_uccl_buffer(ctx.group, get_hidden_bytes(grad_output))
+        grad_x, _, _, _, _, after_event = buffer.dispatch(
+            grad_output.contiguous(),
+            handle=ctx.handle,
+            previous_event=previous_event,
+            async_finish=ctx.async_finish,
+            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+        )
+        if ctx.async_finish:
+            after_event.current_stream_wait()
+        return grad_x, None, None, None, None
+
+
+if HAVE_UCCL_EP:
+
+    def uccl_fused_dispatch(
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        group,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
+        """Perform fused dispatch using UCCL-EP (Azure-compatible RDMA)."""
+        return UCCLFusedDispatch.apply(
+            x.contiguous(),
+            token_indices,
+            token_probs,
+            num_experts,
+            group,
+            async_finish,
+            allocate_on_comm_stream,
+        )
+
+    def uccl_fused_combine(x, group, handle, async_finish=False, allocate_on_comm_stream=False):
+        """Perform fused combine using UCCL-EP (Azure-compatible RDMA)."""
+        return UCCLFusedCombine.apply(x, group, handle, async_finish, allocate_on_comm_stream)
+
+else:
+    uccl_fused_dispatch = None
+    uccl_fused_combine = None

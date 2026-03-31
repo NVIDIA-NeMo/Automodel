@@ -594,6 +594,7 @@ class GroupedExpertsDeepEP(nn.Module):
 
         self.config = config
         self.use_torch_mm = backend is not None and backend.experts == "torch_mm"
+        self._ep_dispatcher = backend.dispatcher if backend is not None else "deepep"
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
         self.dispatcher_backend = dispatcher_backend
@@ -620,11 +621,13 @@ class GroupedExpertsDeepEP(nn.Module):
         self.ep_size = ep_mesh.size()
         self.ep_rank = ep_mesh.get_local_rank()
 
+        use_uccl = self._ep_dispatcher == "uccl_ep"
         config = TokenDispatcherConfig(
             moe_router_topk=self.config.n_activated_experts,
             num_moe_experts=self.config.n_routed_experts,
             moe_permute_fusion=True,
             moe_enable_deepep=True,
+            moe_enable_uccl_ep=use_uccl,
             moe_flex_dispatcher_backend=self.dispatcher_backend,
             moe_deepep_num_sms=self.dispatcher_num_sms,
             moe_hybridep_num_sms=self.dispatcher_num_sms,
@@ -794,6 +797,7 @@ class GroupedExpertsTE(nn.Module):
         super().__init__()
 
         self.config = config
+        self._ep_dispatcher = backend.dispatcher if backend is not None else "deepep"
         self.num_local_experts = config.n_routed_experts
         self.expert_bias = config.expert_bias
         self.dim = config.dim
@@ -1101,11 +1105,13 @@ class GroupedExpertsTE(nn.Module):
             device="meta",
         )
 
+        use_uccl = self._ep_dispatcher == "uccl_ep"
         token_dispatcher_config = TokenDispatcherConfig(
             moe_router_topk=self.config.n_activated_experts,
             num_moe_experts=self.config.n_routed_experts,
             moe_permute_fusion=True,
             moe_enable_deepep=True,
+            moe_enable_uccl_ep=use_uccl,
             moe_flex_dispatcher_backend=self.dispatcher_backend,
             moe_deepep_num_sms=self.dispatcher_num_sms,
             moe_hybridep_num_sms=self.dispatcher_num_sms,
