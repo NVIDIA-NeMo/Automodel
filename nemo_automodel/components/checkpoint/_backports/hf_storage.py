@@ -18,6 +18,7 @@
 
 import dataclasses
 import json
+import os
 import queue
 import re
 from typing import Any, Optional
@@ -63,6 +64,21 @@ from nemo_automodel.components.checkpoint._backports.hf_utils import (
 
 __all__ = ["_HuggingFaceStorageWriter", "_HuggingFaceStorageReader"]
 
+_DIFFUSERS_INDEX_FN = "diffusion_pytorch_model.safetensors.index.json"
+
+
+def _maybe_rename_index_for_diffusers(consolidated_dir: str) -> None:
+    """Rename the consolidated index file to the diffusers-expected name.
+
+    If ``model.safetensors.index.json`` exists in *consolidated_dir*, rename it
+    to ``diffusion_pytorch_model.safetensors.index.json`` so that the checkpoint
+    is loadable via ``diffusers`` ``from_pretrained()``.
+    """
+    src = os.path.join(consolidated_dir, _metadata_fn)
+    dst = os.path.join(consolidated_dir, _DIFFUSERS_INDEX_FN)
+    if os.path.exists(src):
+        os.rename(src, dst)
+
 
 class _HuggingFaceStorageWriter(FsspecWriter):
     """
@@ -81,6 +97,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         consolidated_output_path: Optional[str] = None,
         num_threads_consolidation: Optional[int] = None,
         staging_dir: Optional[str] = None,
+        diffusers_compatible: bool = False,
     ) -> None:
         """
         Initialize the huggingface writer pointing to path.
@@ -101,6 +118,8 @@ class _HuggingFaceStorageWriter(FsspecWriter):
             num_threads_consolidation: Number of threads to use for parallel processing of saving data to output files. If not provided, the default value is the number of output files.
             staging_dir: Optional directory for staging files during consolidation. If provided,
                         temp files will be created here instead of system temp.
+            diffusers_compatible: If True, rename the index file to diffusion_pytorch_model.safetensors.index.json
+                        so checkpoints are loadable via diffusers from_pretrained().
         """
         if token is not None:
             super().__init__(
@@ -117,6 +136,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         self._save_sharded = save_sharded
         self._consolidated_output_path = consolidated_output_path
         self._staging_dir = staging_dir
+        self._diffusers_compatible = diffusers_compatible
 
         if num_threads_consolidation:
             self._num_threads_consolidation = num_threads_consolidation
@@ -175,7 +195,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
             return
         if self._save_sharded:
             # Use staging for single-rank consolidation path
-            return consolidate_safetensors_files(
+            consolidate_safetensors_files(
                 input_dir=self.path,
                 output_dir=self._consolidated_output_path,
                 num_threads=self._num_threads_consolidation,
@@ -183,6 +203,9 @@ class _HuggingFaceStorageWriter(FsspecWriter):
                 use_staging=True,
                 staging_dir=self._staging_dir,
             )
+            if self._diffusers_compatible:
+                _maybe_rename_index_for_diffusers(self._consolidated_output_path)
+            return
 
         metadata_to_write = {}
         storage_md = {}

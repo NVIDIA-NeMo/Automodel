@@ -12,14 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+from nemo_automodel.components.checkpoint._backports.hf_storage import _DIFFUSERS_INDEX_FN
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
+    CheckpointingConfig,
     _equally_divide_layers,
     _is_custom_model,
     _model_has_dtensors,
@@ -657,3 +661,90 @@ class TestLmHeadWeightTying:
             model.tie_weights()
 
         assert not model.tie_weights_called
+
+
+# =============================================================================
+# Tests for Checkpointer.save_model — diffusers_compatible rename (all-ranks path)
+# =============================================================================
+
+
+class TestCheckpointerSaveModelDiffusersRename:
+    """Tests that save_model() renames the index on the all-ranks consolidation path."""
+
+    def _make_checkpointer(self, tmp_path, diffusers_compatible):
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path),
+            model_save_format="safetensors",
+            model_cache_dir=str(tmp_path / "cache"),
+            model_repo_id="test/model",
+            save_consolidated=True,
+            is_peft=False,
+            diffusers_compatible=diffusers_compatible,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+        # Mock internals to isolate the consolidation + rename logic
+        checkpointer._should_write_consolidated_safetensors = MagicMock(return_value=True)
+        checkpointer._should_write_hf_metadata = MagicMock(return_value=True)
+        checkpointer._maybe_build_consolidated_index = MagicMock(return_value={"w": 1})
+        checkpointer._get_storage_writer = MagicMock(return_value=MagicMock())
+        checkpointer._do_save = MagicMock(return_value=None)
+        checkpointer._addons = []
+        return checkpointer
+
+    @patch("nemo_automodel.components.checkpoint.checkpointing.consolidate_safetensors_files_on_every_rank")
+    @patch("nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf", side_effect=lambda *a, **kw: a[1])
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_save_model_renames_index_on_all_ranks_path(
+        self, mock_dist_init, mock_adapt, mock_consolidate, tmp_path
+    ):
+        weights_path = tmp_path / "step_100"
+        consolidated_dir = weights_path / "model" / "consolidated"
+
+        def _fake_consolidate(**kwargs):
+            os.makedirs(kwargs["output_dir"], exist_ok=True)
+            index_path = os.path.join(kwargs["output_dir"], "model.safetensors.index.json")
+            with open(index_path, "w") as f:
+                json.dump({"weight_map": {}}, f)
+
+        mock_consolidate.side_effect = _fake_consolidate
+
+        checkpointer = self._make_checkpointer(tmp_path, diffusers_compatible=True)
+
+        model = MagicMock()
+        model.state_dict.return_value = {"w": MagicMock()}
+
+        checkpointer.save_model(model, str(weights_path))
+
+        mock_consolidate.assert_called_once()
+        assert not (consolidated_dir / "model.safetensors.index.json").exists()
+        assert (consolidated_dir / _DIFFUSERS_INDEX_FN).exists()
+
+    @patch("nemo_automodel.components.checkpoint.checkpointing.consolidate_safetensors_files_on_every_rank")
+    @patch("nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf", side_effect=lambda *a, **kw: a[1])
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_save_model_preserves_index_when_not_diffusers_compatible(
+        self, mock_dist_init, mock_adapt, mock_consolidate, tmp_path
+    ):
+        weights_path = tmp_path / "step_100"
+        consolidated_dir = weights_path / "model" / "consolidated"
+
+        def _fake_consolidate(**kwargs):
+            os.makedirs(kwargs["output_dir"], exist_ok=True)
+            index_path = os.path.join(kwargs["output_dir"], "model.safetensors.index.json")
+            with open(index_path, "w") as f:
+                json.dump({"weight_map": {}}, f)
+
+        mock_consolidate.side_effect = _fake_consolidate
+
+        checkpointer = self._make_checkpointer(tmp_path, diffusers_compatible=False)
+
+        model = MagicMock()
+        model.state_dict.return_value = {"w": MagicMock()}
+
+        checkpointer.save_model(model, str(weights_path))
+
+        assert (consolidated_dir / "model.safetensors.index.json").exists()
+        assert not (consolidated_dir / _DIFFUSERS_INDEX_FN).exists()
