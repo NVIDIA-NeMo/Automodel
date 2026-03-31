@@ -37,6 +37,7 @@ from nemo_automodel._transformers.utils import apply_qwen3_omni_config_patch
 
 apply_qwen3_omni_config_patch()
 
+import nemo_automodel.components.checkpoint.utils as checkpoint_utils
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
@@ -190,6 +191,11 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
     trust_remote_code = kwargs.pop("trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path))
     hf_config = kwargs.get("config", None)
     if hf_config is None:
+        # Filter out nested dict kwargs before passing to AutoConfig.from_pretrained.
+        # Nested dicts (e.g. text_config={"key": val}) would replace entire sub-configs
+        # with incomplete dicts, losing all other fields. These nested overrides are
+        # instead handled by _consume_config_overrides which deep-merges them.
+        nested_kwargs = {k: kwargs.pop(k) for k in list(kwargs) if isinstance(kwargs[k], dict)}  # noqa: F841
         try:
             hf_config = AutoConfig.from_pretrained(
                 pretrained_model_name_or_path,
@@ -236,6 +242,77 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
             snapshot_download(pretrained_model_name_or_path)
 
 
+def _get_model_tensor(model, name: str):
+    """Return a parameter or buffer by its fully-qualified state-dict key."""
+    try:
+        return model.get_parameter(name)
+    except (AttributeError, ValueError):
+        pass
+    try:
+        return model.get_buffer(name)
+    except (AttributeError, ValueError):
+        return None
+
+
+def _restore_loaded_model_dtype(
+    model, pretrained_model_name_or_path, hf_config, quantization_config, load_kwargs
+) -> None:
+    """Restore each loaded tensor to the exact dtype stored in the checkpoint.
+
+    Some modules allocate parameters in a wider dtype than the checkpoint.
+    HuggingFace then copies the checkpoint tensor into that existing tensor,
+    which upcasts the loaded value. We fix that by re-inspecting checkpoint
+    tensor dtypes per key and restoring each loaded parameter/buffer to the
+    dtype that was actually stored in the file.
+    """
+    if quantization_config is not None or getattr(hf_config, "quantization_config", None) is not None:
+        return
+
+    try:
+        checkpoint_dtypes = checkpoint_utils._get_checkpoint_tensor_dtypes(
+            pretrained_model_name_or_path, hf_config, load_kwargs
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to inspect checkpoint tensor dtypes for %s; leaving loaded dtypes unchanged: %s",
+            pretrained_model_name_or_path,
+            exc,
+        )
+        return
+
+    if not checkpoint_dtypes:
+        return
+
+    restored_dtype_by_tensor_id: dict[int, torch.dtype] = {}
+    restored_count = 0
+    for name, checkpoint_dtype in checkpoint_dtypes.items():
+        tensor = _get_model_tensor(model, name)
+        if tensor is None or tensor.dtype == checkpoint_dtype:
+            continue
+
+        seen_dtype = restored_dtype_by_tensor_id.get(id(tensor))
+        if seen_dtype is not None and seen_dtype != checkpoint_dtype:
+            logger.warning(
+                "Skipping conflicting checkpoint dtypes for aliased tensor %s: %s vs %s",
+                name,
+                seen_dtype,
+                checkpoint_dtype,
+            )
+            continue
+
+        try:
+            tensor.data = tensor.data.to(dtype=checkpoint_dtype)
+        except (RuntimeError, TypeError) as exc:
+            logger.warning("Failed to restore checkpoint dtype for %s to %s: %s", name, checkpoint_dtype, exc)
+            continue
+
+        restored_dtype_by_tensor_id[id(tensor)] = checkpoint_dtype
+        restored_count += 1
+
+    if restored_count > 0:
+        logger.info("Restored checkpoint dtypes for %d tensors from %s", restored_count, pretrained_model_name_or_path)
+
+
 def _init_model(
     cls,
     pretrained_model_name_or_path_or_config,
@@ -256,6 +333,7 @@ def _init_model(
     pretrained_model_name_or_path = (
         pretrained_model_name_or_path_or_config if is_pretrained_init else getattr(hf_config, "name_or_path")
     )
+    architectures = get_architectures(hf_config)
 
     # 1. if force_hf is True, use HF model class wrapped with mixin
     if force_hf:
@@ -270,6 +348,7 @@ def _init_model(
                     attn_implementation=attn_implementation,
                     **kwargs,
                 )
+            _restore_loaded_model_dtype(model, pretrained_model_name_or_path, hf_config, quantization_config, kwargs)
         else:
             model = cls._from_config_parent_class(
                 hf_config,
@@ -279,15 +358,16 @@ def _init_model(
                 **kwargs,
             )
         # Get HF model class and wrap with mixin
+        hf_model_cls = type(model)
         try:
-            hf_model_cls = cls._model_mapping[type(hf_config)]
+            if len(architectures) > 0 and architectures[0] != "NemotronHForCausalLM":
+                hf_model_cls = cls._model_mapping[type(hf_config)]
         except KeyError:
-            hf_model_cls = type(model)
+            pass  # fallback to use the model class from the model object
         model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
         return False, model
 
     # 2. If we have a custom model implementation available, we prioritize that over HF
-    architectures = get_architectures(hf_config)
     model_cls = _resolve_custom_model_cls_for_config(hf_config)
     if model_cls is not None:
         # if we are able to init the custom model, we will now download the model weights on local rank 0
@@ -308,7 +388,6 @@ def _init_model(
             return True, model_cls(hf_config, *model_args, **kwargs)
 
     # 3. fallback to HF model class wrapped with mixin
-
     model = None
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
@@ -321,6 +400,7 @@ def _init_model(
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
+        _restore_loaded_model_dtype(model, pretrained_model_name_or_path, hf_config, quantization_config, kwargs)
     else:
         model = cls._from_config_parent_class(
             hf_config,
@@ -330,10 +410,13 @@ def _init_model(
             **kwargs,
         )
 
+    # Get HF model class and wrap with mixin
+    hf_model_cls = type(model)
     try:
-        hf_model_cls = cls._model_mapping[type(hf_config)]
+        if len(architectures) > 0 and architectures[0] != "NemotronHForCausalLM":
+            hf_model_cls = cls._model_mapping[type(hf_config)]
     except KeyError:
-        hf_model_cls = type(model)
+        pass  # fallback to use the model class from the model object
     model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
     return False, model
 
@@ -384,7 +467,17 @@ def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str
             continue
         # Otherwise, if it looks like a config field, apply it to config.
         if k in config_keys:
-            setattr(config, k, kwargs.pop(k))
+            val = kwargs.pop(k)
+            # Deep-merge dict overrides into existing sub-config objects (e.g.
+            # text_config={"router_aux_loss_coef": 0}) instead of replacing the
+            # entire sub-config, which would lose all other fields.
+            if isinstance(val, dict):
+                existing = getattr(config, k, None)
+                if existing is not None and hasattr(existing, "to_dict"):
+                    for sub_k, sub_v in val.items():
+                        setattr(existing, sub_k, sub_v)
+                    continue
+            setattr(config, k, val)
 
 
 def _filter_kwargs_for_init(model_cls, kwargs: dict) -> dict:
