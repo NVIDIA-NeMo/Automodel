@@ -28,6 +28,10 @@ except ImportError:
     HAVE_DEEP_EP = False
 
 try:
+    import importlib.util
+
+    if importlib.util.find_spec("uccl") is None and importlib.util.find_spec("ep") is None:
+        raise ImportError("Neither uccl nor ep package is installed")
     from nemo_automodel.components.moe.uccl_ep import UCCLBuffer
     from nemo_automodel.components.moe.uccl_ep.buffer import EventHandle as UCCLEventHandle
     from nemo_automodel.components.moe.uccl_ep.buffer import EventOverlap as UCCLEventOverlap
