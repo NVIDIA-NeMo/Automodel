@@ -67,6 +67,7 @@ from nemo_automodel.components.training.utils import (
     prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
 )
+from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _get_num_thd_chunks,
@@ -393,15 +394,17 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 ScopedModuleOffloading(self.teacher_model, enabled=self._offload_teacher_model),
                 torch.no_grad(),
             ):
-                teacher_logits = self.teacher_model(**batch)
+                teacher_batch = filter_forward_kwargs(self.teacher_model, batch)
+                teacher_logits = self.teacher_model(**teacher_batch)
                 teacher_logits = getattr(teacher_logits, "logits", teacher_logits).detach().clone()
 
             # Student forward.
+            student_batch = filter_forward_kwargs(model, batch)
             student_keep_last = isinstance(self.loss_fn, FusedLinearCrossEntropy)
             if student_keep_last:
-                student_out = model(logits_to_keep=1, **batch)
+                student_out = model(logits_to_keep=1, **student_batch)
             else:
-                student_out = model(**batch)
+                student_out = model(**student_batch)
 
             student_logits = getattr(student_out, "logits", student_out)  # shape (B, S, V)
 
