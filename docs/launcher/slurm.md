@@ -21,7 +21,7 @@ For interactive testing on a Slurm node:
     ```
   - Single node, multiple GPUs
     ```bash
-    automodel your_config.yaml --nproc-per-node 8
+    automodel --nproc-per-node 8 your_config.yaml
     ```
 
 ## Submit a Batch Job with Slurm
@@ -101,7 +101,7 @@ srun \
     bash -c "\
         cd /opt/Automodel && \
         torchrun \
-            --nproc_per_node=\${SLURM_GPUS_PER_NODE:-8} \
+            --nproc-per-node=\${SLURM_GPUS_PER_NODE:-8} \
             --nnodes=\${SLURM_NNODES:-1} \
             --rdzv_backend=c10d \
             --rdzv_endpoint=\${MASTER_ADDR}:\${MASTER_PORT} \
@@ -128,7 +128,7 @@ source /opt/venvs/automodel/bin/activate
 
 srun bash -c "\
     torchrun \
-        --nproc_per_node=\${SLURM_GPUS_PER_NODE:-8} \
+        --nproc-per-node=\${SLURM_GPUS_PER_NODE:-8} \
         --nnodes=\${SLURM_NNODES:-1} \
         --rdzv_backend=c10d \
         --rdzv_endpoint=\${MASTER_ADDR}:\${MASTER_PORT} \
@@ -153,7 +153,7 @@ export MASTER_PORT=13742
 srun apptainer exec --nv /shared/images/automodel.sif \
     bash -c "\
         torchrun \
-            --nproc_per_node=\${SLURM_GPUS_PER_NODE:-8} \
+            --nproc-per-node=\${SLURM_GPUS_PER_NODE:-8} \
             --nnodes=\${SLURM_NNODES:-1} \
             --rdzv_backend=c10d \
             --rdzv_endpoint=\${MASTER_ADDR}:\${MASTER_PORT} \

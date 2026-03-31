@@ -141,7 +141,7 @@ trainer:
 Launch training with your QAT-enabled configuration:
 
 ```bash
-automodel your_qat_config.yaml --nproc-per-node=8
+automodel --nproc-per-node=8 your_qat_config.yaml
 ```
 
 ### 3. Monitor Training

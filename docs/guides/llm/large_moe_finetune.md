@@ -113,7 +113,7 @@ export HF_HOME=your/path/to/hf_cache
 export HF_DATASETS_OFFLINE=1
 export WANDB_API_KEY=your_wandb_key
 
-torchrun --nproc_per_node=8 \
+torchrun --nproc-per-node=8 \
          --nnodes=8 \
          --rdzv_backend=c10d \
          --rdzv_endpoint=${MASTER_ADDR}:${PORT} \

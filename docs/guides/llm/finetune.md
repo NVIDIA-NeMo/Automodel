@@ -163,8 +163,9 @@ step_scheduler:
 
 ## Fine-Tune the Model
 
-You can run the recipe using the AutoModel CLI.
+You can run the recipe using the AutoModel CLI or directly with `torchrun` (advanced).
 
+```bash
 automodel --nproc-per-node=8 sft_guide.yaml
 ```
 

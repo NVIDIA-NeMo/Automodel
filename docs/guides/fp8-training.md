@@ -115,12 +115,12 @@ Check out our [examples directory](https://github.com/NVIDIA-NeMo/Automodel/tree
 To run any of these FP8 training recipes, use the following command:
 
 ```bash
-automodel <path-to-config.yaml> --nproc-per-node=8
+automodel --nproc-per-node=8 <path-to-config.yaml>
 ```
 
 For example, to train Llama 3.1 8B with FP8:
 ```bash
-automodel examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml --nproc-per-node=8
+automodel --nproc-per-node=8 examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml
 ```
 
 

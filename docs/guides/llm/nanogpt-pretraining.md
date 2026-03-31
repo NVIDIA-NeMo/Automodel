@@ -419,7 +419,7 @@ torchrun --standalone --nproc-per-node 8 \
 automodel examples/llm_pretrain/nanogpt_pretrain.yaml
 
 # multi-GPU (8 GPUs)
-automodel examples/llm_pretrain/nanogpt_pretrain.yaml --nproc-per-node 8
+automodel --nproc-per-node 8 examples/llm_pretrain/nanogpt_pretrain.yaml
 ```
 :::{tip}
 Adjust the `distributed` section in the YAML config to change between DDP, FSDP2, etc.

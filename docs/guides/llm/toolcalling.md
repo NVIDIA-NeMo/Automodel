@@ -92,8 +92,7 @@ Use the ready-made config at [`examples/llm_finetune/gemma/functiongemma_xlam.ya
 With the config in place, launch training (8 GPUs shown; adjust `--nproc-per-node` as needed):
 
 ```bash
-automodel examples/llm_finetune/gemma/functiongemma_xlam.yaml \
-  --nproc-per-node=8
+automodel --nproc-per-node=8 examples/llm_finetune/gemma/functiongemma_xlam.yaml
 ```
 
 You should be able to see a training loss curve similar to the one shown below:

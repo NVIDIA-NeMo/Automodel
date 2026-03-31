@@ -104,8 +104,7 @@ Single GPU utilization of ~95% during model training.
 To utilize all four GPUs available on this `g6e.12xlarge` instance, add `--nproc-per-node=4` to the same command:
 
 ```bash
-!automodel llama3_2_1b_squad.yaml \
-    --nproc-per-node=4 \
+!automodel --nproc-per-node=4 llama3_2_1b_squad.yaml \
     --step_scheduler.max_steps 20 \
     --checkpoint.checkpoint_dir /Volumes/<catalog_name>/<schema_name>/<volume_name>/checkpoints_multi/ \
     --checkpoint.staging_dir /local_disk0/checkpoints_multi/ \
@@ -216,8 +215,7 @@ Run training with MLflow tracking enabled using the same commands as before. The
 
 **Multi-GPU:**
 ```bash
-!automodel llama3_2_1b_squad.yaml \
-    --nproc-per-node=4 \
+!automodel --nproc-per-node=4 llama3_2_1b_squad.yaml \
     --step_scheduler.max_steps 20 \
     --checkpoint.checkpoint_dir /Volumes/<catalog_name>/<schema_name>/<volume_name>/checkpoints/
 ```

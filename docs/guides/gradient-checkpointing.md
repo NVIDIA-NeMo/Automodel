@@ -74,8 +74,7 @@ Run your training script and inspect the peak memory:
 ```bash
 
 # If running on 8x GPUs
-automodel examples/llm_finetune/llama3_2/llama_3_2_1b_my_finetune.yaml \
-  --nproc-per-node=8
+automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama_3_2_1b_my_finetune.yaml
 
 # If running on 1x GPU
 automodel examples/llm_finetune/llama3_2/llama_3_2_1b_my_finetune.yaml

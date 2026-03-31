@@ -58,8 +58,7 @@ To ensure seamless integration with the Hugging Face ecosystem, NeMo Automodel s
 
 The following command runs the LLM fine-tuning recipe on two GPUs and saves the resulting checkpoint in the Safetensors format:
 ```bash
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
-    --nproc-per-node=2 \
+automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --step_scheduler.ckpt_every_steps 20 \
     --checkpoint.model_save_format safetensors \
     --checkpoint.save_consolidated True
@@ -145,7 +144,7 @@ Because the PEFT state is so lightweight, sharded checkpointing adds unnecessary
 
 To fine-tune a model using PEFT and save a Hugging Face–ready checkpoint:
 ```bash
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml --nproc-per-node=2 --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors
+automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors
 ```
 
 After training, you'll get a compact, consolidated Safetensors checkpoint that can be loaded directly with Hugging Face tools:
@@ -202,8 +201,7 @@ NeMo Automodel also offers native PyTorch DCP checkpointing support (`.distcp` e
 
 As a simple example, we can run the following command to launch the training recipe on two GPUs.
 ```bash
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml\
-    --nproc-per-node=2 \
+automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --step_scheduler.ckpt_every_steps 20 \
     --checkpoint.model_save_format torch_save
 
@@ -234,8 +232,7 @@ checkpoints/
 
 If you rerun the script, NeMo Automodel automatically detects and restores the most recent checkpoint.
 ```bash
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
-    --nproc-per-node=2 \
+automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --step_scheduler.ckpt_every_steps 20 \
     --checkpoint.model_save_format torch_save
 

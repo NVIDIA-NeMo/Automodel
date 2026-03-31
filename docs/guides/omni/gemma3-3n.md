@@ -152,8 +152,7 @@ automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml
 * **Multi-GPU**
 
 ```bash
-automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml \
-    --nproc-per-node=2
+automodel --nproc-per-node=2 examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml
 ```
 
 #### Run Gemma 3n Fine-Tuning
@@ -167,8 +166,7 @@ automodel examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml
 * **Multi-GPU**
 
 ```bash
-automodel examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml \
-    --nproc-per-node=2
+automodel --nproc-per-node=2 examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml
 ```
 
 #### Override Configuration Parameters

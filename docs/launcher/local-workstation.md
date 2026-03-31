@@ -30,19 +30,10 @@ The AutoModel CLI is the preferred method for most users. It offers a unified in
 
 The CLI follows this format:
 ```bash
-automodel <config.yaml> [--nproc-per-node N] [--key.subkey=override ...]
+automodel [--nproc-per-node N] <config.yaml> [--key.subkey=override ...]
 ```
 
-A short alias `am` is also available:
-```bash
-am <config.yaml> [--nproc-per-node N]
-```
-
-Both commands also work with `uv run` for reproducible environments:
-```bash
-uv run automodel <config.yaml> [--nproc-per-node N]
-uv run am <config.yaml> [--nproc-per-node N]
-```
+A short alias `am` is also available. Both commands also work with `uv run` (e.g., `uv run automodel <config.yaml>`).
 
 Where:
 - `<config.yaml>`: Path to your YAML configuration file (must contain a `recipe._target_` key)
@@ -68,7 +59,7 @@ For interactive single-node jobs, the CLI automatically detects the number of av
 uses `torchrun` for multi-GPU training. You can manually specify the number of GPUs using the `--nproc-per-node` option:
 
 ```bash
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node 2
+automodel --nproc-per-node 2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 If you don't specify `--nproc-per-node`, it will use all available GPUs on your system.

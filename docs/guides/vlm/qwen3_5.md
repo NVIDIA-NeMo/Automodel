@@ -30,7 +30,7 @@ NeMo Automodel supports several ways to launch training—via the Automodel CLI 
 
 ### Standalone Slurm Script
 
-We also provide a standalone Slurm script example for Qwen3.5. Before running it, ensure your cluster environment is configured following the [Standalone Slurm Script (Advanced)](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md#standalone-slurm-script-advanced) guide. Then submit the job with the following command:
+We also provide a standalone Slurm script example for Qwen3.5. Before running it, ensure your cluster environment is configured following the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md) guide. Then submit the job with the following command:
 
 ```bash
 export TRANSFORMERS_OFFLINE=1

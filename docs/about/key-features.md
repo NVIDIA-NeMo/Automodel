@@ -135,8 +135,7 @@ dataset:
 Override any field from the CLI:
 
 ```bash
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
-  --nproc-per-node=8 \
+automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
   --step_scheduler.local_batch_size 16
 ```
 
@@ -166,8 +165,8 @@ The CLI simplifies job launch across environments:
 # Single-node interactive
 automodel config.yaml
 
-# Multi-node SLURM batch (add a slurm: section to the YAML)
-automodel config.yaml  # CLI detects slurm: section and submits to Slurm
+# Multi-node SLURM batch
+sbatch my_cluster.sub  # copy slurm.sub, edit CONFIG & SBATCH directives, then submit
 ```
 
 See the [Local Workstation](../launcher/local-workstation.md) and [Cluster](../launcher/slurm.md) guides.
