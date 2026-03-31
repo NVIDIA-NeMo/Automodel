@@ -119,11 +119,17 @@ _OVERRIDES = [
     "max_new_tokens",
     "adapter_path",
     "experts_implementation",
+    "tokenizer_name",
+    "max_vram_gb",
+    "max_cpu_gb",
 ]
 
 _BOOLEAN_OVERRIDES = [
     "vllm_smoke_test",
     "trust_remote_code",
+    "check_fused_qkv_keys",
+    "check_phantom_keys",
+    "check_resume",
 ]
 
 

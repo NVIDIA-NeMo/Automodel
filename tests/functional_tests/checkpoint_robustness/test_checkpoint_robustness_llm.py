@@ -17,10 +17,14 @@
 Launch: torchrun --nproc-per-node=<N> -m pytest <this_file> -c <config.yaml>
     [--kl_threshold <float>] [--hf_kl_threshold <float>]
     [--cross_tp_size <int>] [--cross_tp_kl_threshold <float>]
+    [--tokenizer_name <str>]
+    [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
+    [--max_vram_gb <float>] [--max_cpu_gb <float>]
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -36,7 +40,8 @@ from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenP
 datasets.disable_caching()
 
 # Llama token IDs for "The quick brown fox jumps over the lazy dog"
-INPUT_IDS = [791, 4996, 14198, 39935, 35308, 927, 279, 16053, 5679]
+_DEFAULT_INPUT_IDS = [791, 4996, 14198, 39935, 35308, 927, 279, 16053, 5679]
+_DEFAULT_PROMPT = "The quick brown fox jumps over the lazy dog"
 
 
 def _extract_custom_args(argv):
@@ -47,8 +52,11 @@ def _extract_custom_args(argv):
         "--cross_tp_size",
         "--cross_tp_kl_threshold",
         "--experts_implementation",
+        "--tokenizer_name",
+        "--max_vram_gb",
+        "--max_cpu_gb",
     }
-    boolean_keys = {"--trust_remote_code"}
+    boolean_keys = {"--trust_remote_code", "--check_fused_qkv_keys", "--check_phantom_keys", "--check_resume"}
     custom = {}
     remaining = []
     i = 0
@@ -63,6 +71,24 @@ def _extract_custom_args(argv):
             remaining.append(argv[i])
             i += 1
     return custom, remaining
+
+
+def _get_input_ids(tokenizer_name: str | None) -> list[int]:
+    """Return input IDs for the test prompt, using dynamic tokenization if tokenizer_name is set."""
+    if tokenizer_name is None:
+        return _DEFAULT_INPUT_IDS
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+    return tokenizer.encode(_DEFAULT_PROMPT, add_special_tokens=False)
+
+
+def _rss_gb() -> float:
+    """Current RSS in GB from /proc/self/statm."""
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    with open("/proc/self/statm") as f:
+        rss_pages = int(f.read().split()[1])
+    return rss_pages * page_size / 1024**3
 
 
 def _kl_divergence_from_logits(reference_logits: torch.Tensor, candidate_logits: torch.Tensor) -> torch.Tensor:
@@ -106,16 +132,39 @@ def test_checkpoint_robustness():
     cross_tp_kl_threshold = float(custom_args.get("cross_tp_kl_threshold", "5e-3"))
     trust_remote_code = bool(custom_args.get("trust_remote_code", False))
     experts_implementation = custom_args.get("experts_implementation", None)
+    tokenizer_name = custom_args.get("tokenizer_name", None)
+    max_vram_gb = float(custom_args.get("max_vram_gb", "0"))
+    max_cpu_gb = float(custom_args.get("max_cpu_gb", "0"))
+    check_fused_qkv_keys = bool(custom_args.get("check_fused_qkv_keys", False))
+    check_phantom_keys = bool(custom_args.get("check_phantom_keys", False))
+    check_resume = bool(custom_args.get("check_resume", False))
+
+    input_ids = _get_input_ids(tokenizer_name)
 
     # Phase 1: Train and checkpoint
+    torch.cuda.reset_peak_memory_stats()
     cfg = parse_args_and_load_config()
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
 
+    # Memory tracking after training
+    peak_vram_gb = torch.cuda.max_memory_allocated() / 1024**3
+    peak_cpu_gb = _rss_gb()
+    if _rank0():
+        print(f"\n[Memory] Peak VRAM: {peak_vram_gb:.2f} GB, Peak CPU RSS: {peak_cpu_gb:.2f} GB")
+    if max_vram_gb > 0:
+        assert peak_vram_gb <= max_vram_gb, (
+            f"Peak VRAM {peak_vram_gb:.2f} GB exceeds threshold {max_vram_gb:.2f} GB"
+        )
+    if max_cpu_gb > 0:
+        assert peak_cpu_gb <= max_cpu_gb, (
+            f"Peak CPU RSS {peak_cpu_gb:.2f} GB exceeds threshold {max_cpu_gb:.2f} GB"
+        )
+
     # Phase 2: Capture reference logits before teardown
     device = next(trainer.model_parts[0].parameters()).device
-    reference_logits = _get_logits(trainer.model_parts[0], INPUT_IDS, device)
+    reference_logits = _get_logits(trainer.model_parts[0], input_ids, device)
 
     # Phase 3: Reload automodel from consolidated checkpoint
     checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
@@ -130,6 +179,20 @@ def test_checkpoint_robustness():
     del trainer
     torch.cuda.empty_cache()
 
+    # Phantom key check: scan consolidated safetensors for leaked quantization keys
+    if check_phantom_keys and _rank0():
+        from safetensors import safe_open
+
+        assert consolidated_dir.exists(), f"Phantom key check: {consolidated_dir} does not exist"
+        sf_files = sorted(consolidated_dir.glob("*.safetensors"))
+        assert len(sf_files) > 0, f"Phantom key check: no .safetensors files in {consolidated_dir}"
+        for sf_path in sf_files:
+            with safe_open(str(sf_path), framework="pt") as f:
+                for key in f.keys():
+                    assert "_blocks" not in key, f"Phantom mxfp4 key leaked: {key} in {sf_path.name}"
+                    assert "_scales" not in key, f"Phantom mxfp4 key leaked: {key} in {sf_path.name}"
+        print(f"[Phantom keys] Scanned {len(sf_files)} files, no _blocks/_scales keys ✓")
+
     cfg = parse_args_and_load_config()
     if not is_peft:
         cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
@@ -137,7 +200,7 @@ def test_checkpoint_robustness():
     restored_trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     restored_trainer.setup()
 
-    restored_logits = _get_logits(restored_trainer.model_parts[0], INPUT_IDS, device)
+    restored_logits = _get_logits(restored_trainer.model_parts[0], input_ids, device)
 
     kl_restored = _kl_divergence_from_logits(reference_logits, restored_logits)
     max_kl_restored = kl_restored.max().item()
@@ -165,10 +228,28 @@ def test_checkpoint_robustness():
 
             base_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs).to(device)
             peft_model = PeftModel.from_pretrained(base_model, str(ckpt_step_dir / "model"))
-            hf_logits = _get_logits(peft_model, INPUT_IDS, device)
+            hf_logits = _get_logits(peft_model, input_ids, device)
+
+            # PEFT fused QKV key verification
+            if check_fused_qkv_keys:
+                from safetensors import safe_open
+
+                adapter_path = ckpt_step_dir / "model" / "adapter_model.safetensors"
+                assert adapter_path.exists(), f"adapter_model.safetensors not found at {adapter_path}"
+                with safe_open(str(adapter_path), framework="pt") as f:
+                    adapter_keys = list(f.keys())
+                combined_keys = [k for k in adapter_keys if "qkv_proj" in k or "gate_up_proj" in k]
+                assert len(combined_keys) == 0, (
+                    f"Fused QKV check failed: adapter_model.safetensors contains combined projection keys: "
+                    f"{combined_keys}"
+                )
+                print(f"[Fused QKV] No combined projection keys in adapter ({len(adapter_keys)} keys checked) ✓")
+
+            del peft_model, base_model
         else:
             hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs).to(device)
-            hf_logits = _get_logits(hf_model, INPUT_IDS, device)
+            hf_logits = _get_logits(hf_model, input_ids, device)
+            del hf_model
 
         kl_hf = _kl_divergence_from_logits(reference_logits, hf_logits)
         max_kl_hf = kl_hf.max().item()
@@ -190,7 +271,7 @@ def test_checkpoint_robustness():
         cross_tp_trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
         cross_tp_trainer.setup()
 
-        cross_tp_logits = _get_logits(cross_tp_trainer.model_parts[0], INPUT_IDS, device)
+        cross_tp_logits = _get_logits(cross_tp_trainer.model_parts[0], input_ids, device)
 
         kl_cross_tp = _kl_divergence_from_logits(reference_logits, cross_tp_logits)
         max_kl_cross_tp = kl_cross_tp.max().item()
@@ -205,5 +286,86 @@ def test_checkpoint_robustness():
         )
 
         del cross_tp_trainer
+        torch.cuda.empty_cache()
+        _barrier()
+
+    # Phase 6 (optional): Training resumption — verify loss continuity
+    # Phase 1 trained for max_steps (e.g. 5) and checkpointed. We now train a fresh baseline
+    # for max_steps+3 (no checkpoint save), then resume from the checkpoint and train to
+    # max_steps+3. For SFT, losses should match to ~4 decimal places.
+    if check_resume:
+        import json
+        import shutil
+        import tempfile
+
+        # Baseline: fresh continuous run for max_steps+3, saving losses to a temp dir
+        baseline_dir = tempfile.mkdtemp(prefix="resume_baseline_")
+        cfg = parse_args_and_load_config()
+        original_max_steps = cfg.step_scheduler.max_steps
+        resume_max_steps = original_max_steps + 3
+        cfg.step_scheduler.max_steps = resume_max_steps
+        cfg.checkpoint.checkpoint_dir = baseline_dir
+        cfg.checkpoint.enabled = False
+        baseline_trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+        baseline_trainer.setup()
+        baseline_trainer.run_train_validation_loop()
+
+        baseline_losses = {}
+        baseline_jsonl = Path(baseline_dir) / "training.jsonl"
+        if _rank0() and baseline_jsonl.exists():
+            with open(baseline_jsonl) as f:
+                for line in f:
+                    entry = json.loads(line)
+                    if entry["step"] >= original_max_steps:
+                        baseline_losses[entry["step"]] = entry["loss"]
+
+        del baseline_trainer
+        torch.cuda.empty_cache()
+        shutil.rmtree(baseline_dir, ignore_errors=True)
+
+        # Resume: reload from Phase 1 checkpoint and train to resume_max_steps
+        cfg = parse_args_and_load_config()
+        cfg.checkpoint.restore_from = str(ckpt_step_dir)
+        cfg.step_scheduler.max_steps = resume_max_steps
+        resume_trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+        resume_trainer.setup()
+        resume_trainer.run_train_validation_loop()
+
+        # Compare losses at the overlapping steps
+        resume_jsonl = checkpoint_dir / "training.jsonl"
+        if _rank0():
+            assert baseline_losses, "Phase 6: baseline_losses is empty — no steps to compare"
+            assert resume_jsonl.exists(), f"Phase 6: {resume_jsonl} not found"
+
+            resume_losses = {}
+            with open(resume_jsonl) as f:
+                for line in f:
+                    entry = json.loads(line)
+                    if entry["step"] in baseline_losses:
+                        resume_losses[entry["step"]] = entry["loss"]
+
+            matched_steps = 0
+            for step in sorted(baseline_losses):
+                if step in resume_losses:
+                    matched_steps += 1
+                    bl = baseline_losses[step]
+                    rl = resume_losses[step]
+                    diff = abs(bl - rl)
+                    print(
+                        f"[Phase 6] Step {step}: baseline_loss={bl:.6f}, resume_loss={rl:.6f}, diff={diff:.6e}"
+                    )
+                    if not is_peft:
+                        assert diff < 5e-3, (
+                            f"SFT loss mismatch after resume at step {step}: "
+                            f"baseline={bl:.6f}, resume={rl:.6f}, diff={diff:.6e}"
+                        )
+
+            assert matched_steps > 0, (
+                f"Phase 6: no overlapping steps found between baseline ({sorted(baseline_losses.keys())}) "
+                f"and resume ({sorted(resume_losses.keys())})"
+            )
+            print(f"[Phase 6] Training resumption verified ({matched_steps} steps compared) ✓")
+
+        del resume_trainer
         torch.cuda.empty_cache()
         _barrier()

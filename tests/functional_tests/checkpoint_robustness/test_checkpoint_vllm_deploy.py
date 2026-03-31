@@ -153,8 +153,11 @@ def test_vllm_greedy_matches_hf():
     for i, prompt in enumerate(PROMPTS):
         hf_tokens = hf_outputs[i]
         vllm_tokens = vllm_outputs[i]
-        min_len = min(len(hf_tokens), len(vllm_tokens))
-        assert hf_tokens[:min_len] == vllm_tokens[:min_len], (
+        assert len(hf_tokens) == len(vllm_tokens), (
+            f"Length mismatch for prompt {i}: HF generated {len(hf_tokens)} tokens, "
+            f"vLLM generated {len(vllm_tokens)} tokens"
+        )
+        assert hf_tokens == vllm_tokens, (
             f"Token mismatch for prompt {i}: {prompt!r}\nHF:   {hf_tokens[:20]}...\nvLLM: {vllm_tokens[:20]}..."
         )
-        print(f"Prompt {i}: PASS ({min_len} tokens match)")
+        print(f"Prompt {i}: PASS ({len(hf_tokens)} tokens match)")

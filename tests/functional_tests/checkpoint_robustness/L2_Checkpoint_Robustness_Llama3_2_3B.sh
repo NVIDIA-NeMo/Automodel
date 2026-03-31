@@ -41,7 +41,9 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --distributed.sequence_parallel false \
     --hf_kl_threshold 5e-3 \
     --cross_tp_size 2 \
-    --cross_tp_kl_threshold 5e-3
+    --cross_tp_kl_threshold 5e-3 \
+    --tokenizer_name meta-llama/Llama-3.2-3B-Instruct \
+    --check_resume
 
 # Step 2: PEFT checkpoint robustness
 python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
@@ -61,4 +63,7 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --distributed.tp_size 1 \
     --distributed.cp_size 1 \
     --distributed.sequence_parallel false \
-    --hf_kl_threshold 5e-3
+    --hf_kl_threshold 5e-3 \
+    --tokenizer_name meta-llama/Llama-3.2-3B-Instruct \
+    --check_fused_qkv_keys \
+    --check_resume

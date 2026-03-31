@@ -43,7 +43,11 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --distributed.sequence_parallel false \
     --hf_kl_threshold 7e-2 \
     --experts_implementation grouped_mm \
-    --trust_remote_code
+    --trust_remote_code \
+    --tokenizer_name nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    # TODO: --check_resume disabled for MoE — DeepEP expert routing is non-deterministic,
+    # causing ~1e-1 loss diff between fresh and resumed runs. Needs --resume_loss_threshold flag.
+    # --check_resume
 
 # Step 2: PEFT checkpoint robustness
 python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
@@ -67,4 +71,7 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --distributed.sequence_parallel false \
     --hf_kl_threshold 1e-1 \
     --experts_implementation grouped_mm \
-    --trust_remote_code
+    --trust_remote_code \
+    --tokenizer_name nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    # TODO: --check_resume disabled for MoE (see SFT comment above)
+    # --check_resume

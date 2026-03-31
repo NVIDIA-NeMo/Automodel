@@ -41,7 +41,12 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --distributed.ep_size 8 \
     --distributed.cp_size 1 \
     --distributed.sequence_parallel false \
-    --hf_kl_threshold 5e-2
+    --hf_kl_threshold 5e-2 \
+    --tokenizer_name openai/gpt-oss-20b \
+    --check_phantom_keys
+    # TODO: --check_resume disabled for MoE — DeepEP expert routing is non-deterministic,
+    # causing ~3e-2 loss diff between fresh and resumed runs. Needs --resume_loss_threshold flag.
+    # --check_resume
 
 # Step 2: PEFT checkpoint robustness
 python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
@@ -63,4 +68,7 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --distributed.ep_size 8 \
     --distributed.cp_size 1 \
     --distributed.sequence_parallel false \
-    --hf_kl_threshold 5e-2
+    --hf_kl_threshold 5e-2 \
+    --tokenizer_name openai/gpt-oss-20b
+    # TODO: --check_resume disabled for MoE (see SFT comment above)
+    # --check_resume
