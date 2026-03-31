@@ -28,7 +28,9 @@ except ImportError:
         import ep  # type: ignore[no-redef]
         from ep import Config, EventHandle  # type: ignore[no-redef]
     except ImportError:
-        raise ImportError("UCCL-EP is not installed. Install via: bash scripts/setup_uccl_ep.sh --no-efa")
+        ep = None
+        Config = None
+        EventHandle = None
 
 from nemo_automodel.components.moe.uccl_ep._utils import (
     EventOverlap,

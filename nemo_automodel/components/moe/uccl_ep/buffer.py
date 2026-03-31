@@ -31,6 +31,7 @@ except ImportError:
     try:
         from ep import Config, EventHandle  # type: ignore[no-redef]  # noqa: F401
     except ImportError:
+
         class EventHandle:  # noqa: D101
             pass
 

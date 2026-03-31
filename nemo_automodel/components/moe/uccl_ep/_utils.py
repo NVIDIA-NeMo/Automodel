@@ -35,7 +35,8 @@ except ImportError:
         import ep  # type: ignore[no-redef]
         from ep import EventHandle  # type: ignore[no-redef]
     except ImportError:
-        raise ImportError("UCCL-EP is not installed. Install via: bash scripts/setup_uccl_ep.sh --no-efa")
+        ep = None
+        EventHandle = None
 
 
 def calc_diff(x: torch.Tensor, y: torch.Tensor):
