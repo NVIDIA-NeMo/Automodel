@@ -509,7 +509,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
         # Handle vision tokens
         if pixel_values is not None:
-            image_features = self.model.get_image_features(pixel_values, image_position_ids=image_position_ids, return_dict=True).pooler_output
+            image_features = self.model.get_image_features(
+                pixel_values, image_position_ids=image_position_ids, return_dict=True
+            ).pooler_output
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
 
             if mm_token_type_ids is not None:
