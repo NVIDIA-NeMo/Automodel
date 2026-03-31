@@ -296,6 +296,8 @@ omit = [
     "nemo_automodel/components/datasets/llm/delta_lake_dataset.py",
     # Weird file suddenly appearing in coverage
     "_remote_module_non_scriptable",
+    # deleted file; may still appear in coverage data from cache
+    "nemo_automodel/_transformers/retrieval.py",
 ]
 
 [tool.ruff]
