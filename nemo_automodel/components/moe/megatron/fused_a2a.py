@@ -547,15 +547,19 @@ class UCCLFusedDispatch(torch.autograd.Function):
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
-        recv_x, recv_token_indices, recv_token_probs, handle, after_event = buffer.dispatch(
-            x,
-            num_tokens_per_rank=num_tokens_per_rank,
-            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-            is_token_in_rank=is_token_in_rank,
-            num_tokens_per_expert=num_tokens_per_expert,
-            previous_event=layout_event,
-            async_finish=async_finish,
-            allocate_on_comm_stream=allocate_on_comm_stream,
+        recv_x, recv_token_indices, recv_token_probs, num_recv_tokens_per_expert_list, handle, after_event = (
+            buffer.dispatch(
+                x,
+                topk_idx=token_indices,
+                topk_weights=token_probs,
+                num_tokens_per_rank=num_tokens_per_rank,
+                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+                is_token_in_rank=is_token_in_rank,
+                num_tokens_per_expert=num_tokens_per_expert,
+                previous_event=layout_event,
+                async_finish=async_finish,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+            )
         )
         if async_finish:
             after_event.current_stream_wait()
@@ -563,7 +567,6 @@ class UCCLFusedDispatch(torch.autograd.Function):
         ctx.group = group
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
-        num_recv_tokens_per_expert_list = recv_token_probs.sum(dim=0).int().tolist()
         tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
         return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
 
