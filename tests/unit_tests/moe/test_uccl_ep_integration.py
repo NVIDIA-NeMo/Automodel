@@ -20,7 +20,6 @@ Tests cover:
 - TokenDispatcherConfig: moe_flex_dispatcher_backend uccl_ep option
 - _DeepepManager: custom dispatch/combine function injection
 - fused_a2a: get_uccl_buffer caching, UCCL autograd function wiring
-- GroupedExpertsDeepEP / GroupedExpertsTE: _ep_dispatcher propagation
 """
 
 import importlib.util
@@ -184,97 +183,6 @@ class TestMoELayerUcclEpDispatcher:
             moe = MoE(moe_config, backend_config)
 
         assert isinstance(moe.experts, GroupedExpertsDeepEP)
-
-
-# ---------------------------------------------------------------------------
-# GroupedExpertsDeepEP – _ep_dispatcher propagation
-# ---------------------------------------------------------------------------
-
-
-class TestGroupedExpertsDeepEPDispatcher:
-    """Test that GroupedExpertsDeepEP stores _ep_dispatcher from backend."""
-
-    def test_ep_dispatcher_deepep(self):
-        """_ep_dispatcher should be 'deepep' when backend.dispatcher='deepep'."""
-        from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP
-
-        backend = BackendConfig(experts="gmm", dispatcher="deepep")
-        config = MoEConfig(
-            n_routed_experts=8, n_shared_experts=0, n_activated_experts=2,
-            n_expert_groups=1, n_limited_groups=1, train_gate=False,
-            gate_bias_update_factor=0.0, aux_loss_coeff=0.0,
-            score_func="softmax", route_scale=1.0,
-            dim=128, inter_dim=256, moe_inter_dim=256, norm_topk_prob=False,
-        )
-        experts = GroupedExpertsDeepEP(config, backend=backend)
-        assert experts._ep_dispatcher == "deepep"
-
-    def test_ep_dispatcher_uccl_ep(self):
-        """_ep_dispatcher should be 'uccl_ep' when backend.dispatcher='uccl_ep'."""
-        from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP
-
-        backend = BackendConfig(experts="gmm", dispatcher="uccl_ep")
-        config = MoEConfig(
-            n_routed_experts=8, n_shared_experts=0, n_activated_experts=2,
-            n_expert_groups=1, n_limited_groups=1, train_gate=False,
-            gate_bias_update_factor=0.0, aux_loss_coeff=0.0,
-            score_func="softmax", route_scale=1.0,
-            dim=128, inter_dim=256, moe_inter_dim=256, norm_topk_prob=False,
-        )
-        experts = GroupedExpertsDeepEP(config, backend=backend)
-        assert experts._ep_dispatcher == "uccl_ep"
-
-    def test_ep_dispatcher_default_without_backend(self):
-        """_ep_dispatcher defaults to 'deepep' when backend is None."""
-        from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP
-
-        config = MoEConfig(
-            n_routed_experts=8, n_shared_experts=0, n_activated_experts=2,
-            n_expert_groups=1, n_limited_groups=1, train_gate=False,
-            gate_bias_update_factor=0.0, aux_loss_coeff=0.0,
-            score_func="softmax", route_scale=1.0,
-            dim=128, inter_dim=256, moe_inter_dim=256, norm_topk_prob=False,
-        )
-        experts = GroupedExpertsDeepEP(config, backend=None)
-        assert experts._ep_dispatcher == "deepep"
-
-
-# ---------------------------------------------------------------------------
-# GroupedExpertsTE – _ep_dispatcher propagation
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(not HAVE_TE, reason="TransformerEngine not installed")
-class TestGroupedExpertsTEDispatcher:
-    """Test that GroupedExpertsTE stores _ep_dispatcher from backend."""
-
-    def test_ep_dispatcher_deepep(self):
-        from nemo_automodel.components.moe.experts import GroupedExpertsTE
-
-        backend = BackendConfig(experts="te", dispatcher="deepep")
-        config = MoEConfig(
-            n_routed_experts=8, n_shared_experts=0, n_activated_experts=2,
-            n_expert_groups=1, n_limited_groups=1, train_gate=False,
-            gate_bias_update_factor=0.0, aux_loss_coeff=0.0,
-            score_func="softmax", route_scale=1.0,
-            dim=128, inter_dim=256, moe_inter_dim=256, norm_topk_prob=False,
-        )
-        experts = GroupedExpertsTE(config, backend=backend)
-        assert experts._ep_dispatcher == "deepep"
-
-    def test_ep_dispatcher_uccl_ep(self):
-        from nemo_automodel.components.moe.experts import GroupedExpertsTE
-
-        backend = BackendConfig(experts="te", dispatcher="uccl_ep")
-        config = MoEConfig(
-            n_routed_experts=8, n_shared_experts=0, n_activated_experts=2,
-            n_expert_groups=1, n_limited_groups=1, train_gate=False,
-            gate_bias_update_factor=0.0, aux_loss_coeff=0.0,
-            score_func="softmax", route_scale=1.0,
-            dim=128, inter_dim=256, moe_inter_dim=256, norm_topk_prob=False,
-        )
-        experts = GroupedExpertsTE(config, backend=backend)
-        assert experts._ep_dispatcher == "uccl_ep"
 
 
 # ---------------------------------------------------------------------------

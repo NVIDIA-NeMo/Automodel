@@ -594,7 +594,6 @@ class GroupedExpertsDeepEP(nn.Module):
 
         self.config = config
         self.use_torch_mm = backend is not None and backend.experts == "torch_mm"
-        self._ep_dispatcher = backend.dispatcher if backend is not None else "deepep"
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
         self.dispatcher_backend = dispatcher_backend
@@ -795,7 +794,6 @@ class GroupedExpertsTE(nn.Module):
         super().__init__()
 
         self.config = config
-        self._ep_dispatcher = backend.dispatcher if backend is not None else "deepep"
         self.num_local_experts = config.n_routed_experts
         self.expert_bias = config.expert_bias
         self.dim = config.dim
