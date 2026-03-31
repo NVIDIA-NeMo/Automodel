@@ -1,0 +1,98 @@
+seed: 42
+
+wandb:
+  project: flux-finetuning
+  mode: online
+  name: flux_lora_run
+
+dist_env:
+  backend: "nccl"
+  init_method: "env://"
+
+model:
+  pretrained_model_name_or_path: "black-forest-labs/FLUX.1-dev"
+  # Required when lora.enabled=true — used by inject_lora() to select
+  # target modules and pre-inject hook
+  model_type: "flux"
+  mode: "finetune"
+  cache_dir: null
+  attention_backend: "flash"
+
+# ── LoRA configuration ────────────────────────────────────────────────────────
+# Set enabled: false (or remove this section) for full fine-tune
+lora:
+  enabled: true
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  # null = use FLUX_DEFAULT_TARGET_MODULES from lora/config.py:
+  #   attn.to_q/k/v/out, attn.add_q/k/v_proj, attn.to_add_out,
+  #   ff.net.0.proj, ff.net.2, ff_context.net.0.proj, ff_context.net.2
+  target_modules: null
+
+optim:
+  learning_rate: 2e-5
+  optimizer:
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 100
+  min_lr: 1e-6
+
+# FSDP2 with param_dtype=None when LoRA enabled:
+#   base weights (bf16): sharded, no grad comms
+#   LoRA weights (fp32): sharded, grad allreduced by FSDP2
+fsdp:
+  dp_size: 8
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  activation_checkpointing: false
+  cpu_offload: false
+
+flow_matching:
+  adapter_type: "flux"
+  adapter_kwargs:
+    guidance_scale: 1
+    use_guidance_embeds: false
+  timestep_sampling: "logit_normal"
+  logit_mean: 0.0
+  logit_std: 1.0
+  flow_shift: 1.0
+  mix_uniform_ratio: 0.0
+  sigma_min: 0.0
+  sigma_max: 1.0
+  num_train_timesteps: 1000
+  i2v_prob: 0.0
+  use_loss_weighting: false
+  log_interval: 100
+  summary_log_interval: 10
+
+step_scheduler:
+  num_epochs: 5000
+  local_batch_size: 1
+  global_batch_size: 8
+  ckpt_every_steps: 500
+  log_every: 1
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader
+    cache_dir: PATH_TO_YOUR_DATA
+    train_text_encoder: false
+    num_workers: 0
+    base_resolution: [512, 512]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
+  # LoRA saves adapter_model.safetensors + adapter_config.json
+  # (ignores model_save_format — PEFT format always used for LoRA)
+  model_save_format: torch_save
+  save_consolidated: false
+  restore_from: null
