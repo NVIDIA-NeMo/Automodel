@@ -41,8 +41,8 @@ from transformers import (  # noqa: E402
     AutoModelForImageTextToText,
     AutoModelForMultimodalLM,
     AutoModelForSequenceClassification,
-    AutoModelForTokenClassification,
     AutoModelForTextToWaveform,
+    AutoModelForTokenClassification,
     PreTrainedModel,
 )
 from transformers.initialization import no_init_weights  # noqa: E402
