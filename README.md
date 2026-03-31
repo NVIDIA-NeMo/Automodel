@@ -21,6 +21,7 @@
 </div>
 
 ## 📣 News and Discussions
+- [03/30/2026]NeMo AutoModel ships with agent-friendly skills in [skills/](https://github.com/NVIDIA-NeMo/Automodel/blob/main/skills/) to help with common development tasks across the repo. We welcome PRs that improve existing skills or add new ones.
 - [03/16/2026][Mistral Small 4](https://huggingface.co/mistralai/Mistral-Small-4-119B-2603) We support fine-tuning for Mistral4 119B! Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml).
 - [03/11/2026][Nemotron Super v3](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16) We support fine-tuning for `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16`. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml).
 - [03/11/2026][GLM-5](https://huggingface.co/zai-org/GLM-5) We now support finetuning `zai-org/GLM-5`. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml).
