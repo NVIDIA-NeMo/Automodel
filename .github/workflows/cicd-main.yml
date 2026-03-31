@@ -46,7 +46,7 @@ jobs:
       NVIDIA_MANAGEMENT_ORG_PAT: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
 
   linting:
-    runs-on: linux-amd64-cpu16
+    runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -77,7 +77,7 @@ jobs:
           uv run --active ruff format --check --verbose .
 
   import_linting:
-    runs-on: linux-amd64-cpu16
+    runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -106,7 +106,7 @@ jobs:
           uv run lint-imports --debug --verbose --no-cache
 
   type_checking:
-    runs-on: linux-amd64-cpu16
+    runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -214,7 +214,7 @@ jobs:
           dockerfile-path: "./docker/Dockerfile"
           has-azure-credentials: "true"
           PAT: ${{ secrets.PAT }}
-          repo-name: "Internal-Automodel"
+          repo-name: ${{ vars.CI_REPO_NAME || 'Automodel' }}
 
   cicd-unit-tests:
     strategy:
@@ -255,7 +255,7 @@ jobs:
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
-          container-image: ${{ env.container-registry }}/internal-automodel:${{ github.sha }}
+          container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
           runner: ${{ matrix.runner }}
 
   cicd-e2e-tests:
@@ -330,7 +330,7 @@ jobs:
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ matrix.test-data-path }}
-          container-image: ${{ env.container-registry }}/internal-automodel:${{ github.sha }}
+          container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
           runner: ${{ matrix.runner }}
 
   Nemo_CICD_Test:
@@ -372,78 +372,80 @@ jobs:
               exit 1
           fi
 
-  # Coverage_Fake:
-  #   runs-on: ubuntu-latest
-  #   needs: [Nemo_CICD_Test, pre-flight]
-  #   if: |
-  #     (
-  #       needs.pre-flight.outputs.docs_only == 'true'
-  #       || needs.pre-flight.outputs.is_deployment_workflow == 'true'
-  #     )
-  #     && needs.pre-flight.outputs.is_ci_workload == 'false'
-  #     && !cancelled()
-  #   environment: nemo-ci
-  #   steps:
-  #     - name: Generate fake coverage report
-  #       uses: actions/github-script@v8
-  #       with:
-  #         github-token: ${{ secrets.PAT }}
-  #         script: |
-  #           await github.rest.repos.createCommitStatus({
-  #             owner: context.repo.owner,
-  #             repo: context.repo.repo,
-  #             sha: context.sha,
-  #             state: 'success',
-  #             description: 'No code changes - coverage check skipped',
-  #             context: 'codecov/patch'
-  #           });
+  Coverage_Fake:
+    runs-on: ubuntu-latest
+    needs: [Nemo_CICD_Test, pre-flight]
+    if: |
+      (
+        needs.pre-flight.outputs.docs_only == 'true'
+        || needs.pre-flight.outputs.is_deployment_workflow == 'true'
+      )
+      && needs.pre-flight.outputs.is_ci_workload == 'false'
+      && !cancelled()
+      && vars.ENABLE_CODECOV == 'true'
+    environment: nemo-ci
+    steps:
+      - name: Generate fake coverage report
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: 'success',
+              description: 'No code changes - coverage check skipped',
+              context: 'codecov/patch'
+            });
 
-  # Coverage:
-  #   runs-on: ubuntu-latest
-  #   needs: [pre-flight, Nemo_CICD_Test]
-  #   if: |
-  #     (
-  #       (needs.pre-flight.outputs.is_ci_workload == 'true' && !failure())
-  #       || success()
-  #     )
-  #     && !cancelled()
-  #   strategy:
-  #     matrix:
-  #       flag: [unit-test, e2e]
-  #   steps:
-  #     - name: Checkout
-  #       uses: actions/checkout@v6
+  Coverage:
+    runs-on: ubuntu-latest
+    needs: [pre-flight, Nemo_CICD_Test]
+    if: |
+      (
+        (needs.pre-flight.outputs.is_ci_workload == 'true' && !failure())
+        || success()
+      )
+      && !cancelled()
+      && vars.ENABLE_CODECOV == 'true'
+    strategy:
+      matrix:
+        flag: [unit-test, e2e]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
 
-  #     - name: Download coverage reports of current branch
-  #       uses: actions/download-artifact@v7
-  #       with:
-  #         pattern: coverage-${{ matrix.flag }}-*
+      - name: Download coverage reports of current branch
+        uses: actions/download-artifact@v7
+        with:
+          pattern: coverage-${{ matrix.flag }}-*
 
-  #     - name: Get total coverage of current branch
-  #       shell: bash -x -e -u -o pipefail {0}
-  #       if: always()
-  #       run: |
-  #         pip install coverage[toml]
+      - name: Get total coverage of current branch
+        shell: bash -x -e -u -o pipefail {0}
+        if: always()
+        run: |
+          pip install coverage[toml]
 
-  #         ls -al .
-  #         ls -al coverage-*/
-  #         coverage combine --keep $(ls coverage-*/.coverage)
-  #         coverage report -i
-  #         coverage xml
-  #         rm -rf coverage-*
-  #         ls -al
+          ls -al .
+          ls -al coverage-*/
+          coverage combine --keep $(ls coverage-*/.coverage)
+          coverage report -i
+          coverage xml
+          rm -rf coverage-*
+          ls -al
 
-  #     - name: Upload coverage reports to Codecov
-  #       uses: codecov/codecov-action@v5
-  #       with:
-  #         token: ${{ secrets.CODECOV_TOKEN }}
-  #         verbose: true
-  #         flags: ${{ matrix.flag }}
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          verbose: true
+          flags: ${{ matrix.flag }}
 
-  #     - name: Upload artifacts
-  #       uses: actions/upload-artifact@v6
-  #       with:
-  #         name: coverage-${{ matrix.flag }}-aggregated
-  #         path: |
-  #           .coverage
-  #         include-hidden-files: true
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: coverage-${{ matrix.flag }}-aggregated
+          path: |
+            .coverage
+          include-hidden-files: true
