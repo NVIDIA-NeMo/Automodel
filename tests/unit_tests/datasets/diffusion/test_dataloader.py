@@ -29,6 +29,7 @@ from typing import Dict, List
 
 import pytest
 import torch
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_automodel.components.datasets.diffusion.collate_fns import (
     _build_multiresolution_dataloader_core,
@@ -40,7 +41,6 @@ from nemo_automodel.components.datasets.diffusion.sampler import (
 from nemo_automodel.components.datasets.diffusion.text_to_image_dataset import (
     TextToImageDataset,
 )
-
 
 # ============================================================================
 # Fixtures and Helpers
@@ -431,6 +431,236 @@ class TestSequentialBucketSamplerCPU:
             if "bucket_key" in info:
                 assert "resolution" in info
                 assert "batch_size" in info
+
+    def test_state_dict_returns_expected_keys(self, simple_dataset):
+        """Test state_dict returns epoch and batches_yielded."""
+        sampler = SequentialBucketSampler(
+            simple_dataset,
+            base_batch_size=4,
+            num_replicas=1,
+            rank=0,
+        )
+
+        state = sampler.state_dict()
+
+        assert "epoch" in state
+        assert "batches_yielded" in state
+        assert state["epoch"] == 0
+        assert state["batches_yielded"] == 0
+
+    def test_state_dict_tracks_batches_yielded(self, simple_dataset):
+        """Test batches_yielded increments during iteration."""
+        sampler = SequentialBucketSampler(
+            simple_dataset,
+            base_batch_size=4,
+            num_replicas=1,
+            rank=0,
+        )
+
+        all_batches = list(sampler)
+        state = sampler.state_dict()
+
+        assert state["batches_yielded"] == len(all_batches)
+
+    def test_state_dict_tracks_partial_iteration(self, large_dataset):
+        """Test state_dict after partial iteration reflects correct count."""
+        sampler = SequentialBucketSampler(
+            large_dataset,
+            base_batch_size=8,
+            num_replicas=1,
+            rank=0,
+        )
+
+        stop_after = 3
+        for i, _ in enumerate(sampler):
+            if i + 1 >= stop_after:
+                break
+
+        state = sampler.state_dict()
+        assert state["batches_yielded"] == stop_after
+
+    def test_state_dict_reflects_epoch(self, simple_dataset):
+        """Test state_dict returns the current epoch."""
+        sampler = SequentialBucketSampler(
+            simple_dataset,
+            base_batch_size=4,
+            num_replicas=1,
+            rank=0,
+        )
+
+        sampler.set_epoch(7)
+        list(sampler)
+        state = sampler.state_dict()
+
+        assert state["epoch"] == 7
+
+    def test_load_state_dict_restores_epoch(self, simple_dataset):
+        """Test load_state_dict restores the epoch."""
+        sampler = SequentialBucketSampler(
+            simple_dataset,
+            base_batch_size=4,
+            num_replicas=1,
+            rank=0,
+        )
+
+        sampler.load_state_dict({"epoch": 5, "batches_yielded": 0})
+        assert sampler.epoch == 5
+
+    def test_resume_produces_correct_batches(self, large_dataset):
+        """Test that partial iteration + resumed iteration == full iteration.
+
+        This is the core correctness test for mid-epoch checkpointing:
+        1. Run a full epoch and record all batches.
+        2. Run a fresh sampler, stop partway, save state_dict.
+        3. Create a new sampler, load_state_dict, iterate to completion.
+        4. Assert concat(first_half, second_half) == full_epoch.
+        """
+        seed = 42
+        batch_size = 8
+
+        # Full epoch reference
+        full_sampler = SequentialBucketSampler(
+            large_dataset,
+            base_batch_size=batch_size,
+            num_replicas=1,
+            rank=0,
+            seed=seed,
+        )
+        full_sampler.set_epoch(0)
+        full_batches = list(full_sampler)
+        assert len(full_batches) > 4, "Need enough batches to split meaningfully"
+
+        # Partial iteration: stop at midpoint
+        midpoint = len(full_batches) // 2
+        partial_sampler = SequentialBucketSampler(
+            large_dataset,
+            base_batch_size=batch_size,
+            num_replicas=1,
+            rank=0,
+            seed=seed,
+        )
+        partial_sampler.set_epoch(0)
+        first_half = []
+        for i, batch in enumerate(partial_sampler):
+            first_half.append(batch)
+            if i + 1 >= midpoint:
+                break
+
+        state = partial_sampler.state_dict()
+        assert state["batches_yielded"] == midpoint
+
+        # Resume from checkpoint
+        resume_sampler = SequentialBucketSampler(
+            large_dataset,
+            base_batch_size=batch_size,
+            num_replicas=1,
+            rank=0,
+            seed=seed,
+        )
+        resume_sampler.load_state_dict(state)
+        second_half = list(resume_sampler)
+
+        # Concatenation should equal the full epoch
+        resumed_all = first_half + second_half
+        assert len(resumed_all) == len(full_batches)
+        for i, (expected, actual) in enumerate(zip(full_batches, resumed_all)):
+            assert expected == actual, f"Batch {i} differs after resume"
+
+    def test_resume_at_every_position(self, simple_dataset):
+        """Test resuming from every possible position produces correct results."""
+        seed = 123
+        batch_size = 4
+
+        full_sampler = SequentialBucketSampler(
+            simple_dataset,
+            base_batch_size=batch_size,
+            num_replicas=1,
+            rank=0,
+            seed=seed,
+        )
+        full_sampler.set_epoch(0)
+        full_batches = list(full_sampler)
+
+        # Try resuming from every position
+        for resume_point in range(len(full_batches)):
+            resume_sampler = SequentialBucketSampler(
+                simple_dataset,
+                base_batch_size=batch_size,
+                num_replicas=1,
+                rank=0,
+                seed=seed,
+            )
+            resume_sampler.load_state_dict({"epoch": 0, "batches_yielded": resume_point})
+            remaining = list(resume_sampler)
+
+            assert remaining == full_batches[resume_point:]
+
+    def test_resume_with_distributed(self, large_dataset):
+        """Test resume works correctly in simulated multi-rank setup."""
+        seed = 42
+        world_size = 2
+
+        for rank in range(world_size):
+            full_sampler = SequentialBucketSampler(
+                large_dataset,
+                base_batch_size=8,
+                num_replicas=world_size,
+                rank=rank,
+                seed=seed,
+            )
+            full_sampler.set_epoch(0)
+            full_batches = list(full_sampler)
+
+            midpoint = len(full_batches) // 2
+
+            # Partial run
+            partial_sampler = SequentialBucketSampler(
+                large_dataset,
+                base_batch_size=8,
+                num_replicas=world_size,
+                rank=rank,
+                seed=seed,
+            )
+            partial_sampler.set_epoch(0)
+            first_half = []
+            for i, batch in enumerate(partial_sampler):
+                first_half.append(batch)
+                if i + 1 >= midpoint:
+                    break
+
+            state = partial_sampler.state_dict()
+
+            # Resume
+            resume_sampler = SequentialBucketSampler(
+                large_dataset,
+                base_batch_size=8,
+                num_replicas=world_size,
+                rank=rank,
+                seed=seed,
+            )
+            resume_sampler.load_state_dict(state)
+            second_half = list(resume_sampler)
+
+            assert first_half + second_half == full_batches, f"Resume failed for rank {rank}"
+
+    def test_batches_yielded_resets_each_iteration(self, simple_dataset):
+        """Test _batches_yielded resets to 0 at the start of each __iter__."""
+        sampler = SequentialBucketSampler(
+            simple_dataset,
+            base_batch_size=4,
+            num_replicas=1,
+            rank=0,
+        )
+
+        # First iteration
+        list(sampler)
+        count1 = sampler.state_dict()["batches_yielded"]
+        assert count1 > 0
+
+        # Second iteration should reset and produce the same count
+        list(sampler)
+        count2 = sampler.state_dict()["batches_yielded"]
+        assert count2 == count1
 
 
 class TestSequentialBucketSamplerDistributedCPU:
@@ -1007,3 +1237,112 @@ class TestDataloaderIntegration:
         # Combined should cover more of the dataset
         combined = all_indices0 | all_indices1
         assert len(combined) > len(all_indices0)
+
+    def test_dataloader_returns_stateful_type(self, simple_dataset):
+        """Test _build_multiresolution_dataloader_core returns StatefulDataLoader."""
+        dataloader, _ = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
+            dataset=simple_dataset,
+            batch_size=4,
+            dp_rank=0,
+            dp_world_size=1,
+            num_workers=0,
+        )
+
+        assert isinstance(dataloader, StatefulDataLoader)
+
+    def test_stateful_dataloader_state_dict(self, simple_dataset):
+        """Test StatefulDataLoader.state_dict() includes sampler state."""
+        dataloader, sampler = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
+            dataset=simple_dataset,
+            batch_size=4,
+            dp_rank=0,
+            dp_world_size=1,
+            num_workers=0,
+            pin_memory=False,
+        )
+
+        # Iterate partway
+        it = iter(dataloader)
+        next(it)
+        next(it)
+
+        dl_state = dataloader.state_dict()
+
+        # The StatefulDataLoader should have captured state
+        assert isinstance(dl_state, dict)
+        assert len(dl_state) > 0
+
+    def test_stateful_dataloader_save_load_resume(self, large_dataset):
+        """Test full save/load/resume cycle through StatefulDataLoader.
+
+        Verifies that calling state_dict() on the dataloader and then
+        load_state_dict() on a fresh dataloader produces the correct
+        remaining batches.
+        """
+        batch_size = 8
+
+        # Full epoch reference
+        full_dl, full_sampler = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
+            dataset=large_dataset,
+            batch_size=batch_size,
+            dp_rank=0,
+            dp_world_size=1,
+            num_workers=0,
+            pin_memory=False,
+        )
+        full_sampler.set_epoch(0)
+
+        full_latents = []
+        for batch in full_dl:
+            full_latents.append(batch["latent"])
+
+        total_batches = len(full_latents)
+        assert total_batches > 4
+
+        # Partial iteration + checkpoint
+        partial_dl, partial_sampler = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
+            dataset=large_dataset,
+            batch_size=batch_size,
+            dp_rank=0,
+            dp_world_size=1,
+            num_workers=0,
+            pin_memory=False,
+        )
+        partial_sampler.set_epoch(0)
+
+        midpoint = total_batches // 2
+        first_latents = []
+        for i, batch in enumerate(partial_dl):
+            first_latents.append(batch["latent"])
+            if i + 1 >= midpoint:
+                break
+
+        dl_state = partial_dl.state_dict()
+
+        # Resume from checkpoint
+        resume_dl, resume_sampler = _build_multiresolution_dataloader_core(
+            collate_fn=collate_fn_production,
+            dataset=large_dataset,
+            batch_size=batch_size,
+            dp_rank=0,
+            dp_world_size=1,
+            num_workers=0,
+            pin_memory=False,
+        )
+        resume_sampler.set_epoch(0)
+        resume_dl.load_state_dict(dl_state)
+
+        second_latents = []
+        for batch in resume_dl:
+            second_latents.append(batch["latent"])
+
+        # first_half + second_half should cover the full epoch
+        all_latents = first_latents + second_latents
+        assert len(all_latents) == total_batches
+
+        for i, (expected, actual) in enumerate(zip(full_latents, all_latents)):
+            assert torch.equal(expected, actual), f"Batch {i} latents differ after resume"

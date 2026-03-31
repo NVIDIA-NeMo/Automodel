@@ -77,6 +77,8 @@ class SequentialBucketSampler(Sampler[List[int]]):
         self.dynamic_batch_size = dynamic_batch_size
         self.seed = seed
         self.epoch = 0
+        self._batches_yielded = 0
+        self._batches_to_skip = 0
 
         # Handle Distributed Training (DDP)
         if num_replicas is None:
@@ -143,6 +145,18 @@ class SequentialBucketSampler(Sampler[List[int]]):
         """Crucial for reproducibility and different shuffles per epoch."""
         self.epoch = epoch
 
+    def state_dict(self) -> Dict:
+        """Return sampler state for mid-epoch checkpointing."""
+        return {
+            "epoch": self.epoch,
+            "batches_yielded": self._batches_yielded,
+        }
+
+    def load_state_dict(self, state_dict: Dict) -> None:
+        """Restore sampler state; the next __iter__ will skip already-yielded batches."""
+        self.epoch = state_dict["epoch"]
+        self._batches_to_skip = state_dict["batches_yielded"]
+
     def __iter__(self) -> Iterator[List[int]]:
         # Deterministic generator - SAME seed across all ranks
         g = torch.Generator()
@@ -153,6 +167,10 @@ class SequentialBucketSampler(Sampler[List[int]]):
         if self.shuffle_buckets:
             perm = torch.randperm(len(current_bucket_keys), generator=g).tolist()
             current_bucket_keys = [current_bucket_keys[i] for i in perm]
+
+        self._batches_yielded = 0
+        batches_to_skip = self._batches_to_skip
+        self._batches_to_skip = 0
 
         # 2. Iterate Buckets
         for key in current_bucket_keys:
@@ -190,6 +208,11 @@ class SequentialBucketSampler(Sampler[List[int]]):
                 if not batch:
                     continue
 
+                if batches_to_skip > 0:
+                    batches_to_skip -= 1
+                    continue
+
+                self._batches_yielded += 1
                 yield batch
 
     def __len__(self) -> int:

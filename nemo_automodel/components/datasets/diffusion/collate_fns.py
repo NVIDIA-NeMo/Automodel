@@ -24,7 +24,7 @@ import logging
 from typing import Callable, Dict, List, Tuple
 
 import torch
-from torch.utils.data import DataLoader
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 from .sampler import SequentialBucketSampler
 from .text_to_image_dataset import TextToImageDataset
@@ -139,7 +139,7 @@ def _build_multiresolution_dataloader_core(
     num_workers: int = 4,
     pin_memory: bool = True,
     prefetch_factor: int = 2,
-) -> Tuple[DataLoader, SequentialBucketSampler]:
+) -> Tuple[StatefulDataLoader, SequentialBucketSampler]:
     """Internal helper: create sampler + DataLoader from dataset and collate fn."""
     sampler = SequentialBucketSampler(
         dataset,
@@ -153,7 +153,7 @@ def _build_multiresolution_dataloader_core(
         rank=dp_rank,
     )
 
-    dataloader = DataLoader(
+    dataloader = StatefulDataLoader(
         dataset,
         batch_sampler=sampler,
         collate_fn=collate_fn,
@@ -182,7 +182,7 @@ def build_text_to_image_multiresolution_dataloader(
     num_workers: int = 4,
     pin_memory: bool = True,
     prefetch_factor: int = 2,
-) -> Tuple[DataLoader, SequentialBucketSampler]:
+) -> Tuple[StatefulDataLoader, SequentialBucketSampler]:
     """
     Build a text-to-image multiresolution dataloader for TrainDiffusionRecipe.
 
@@ -286,7 +286,7 @@ def build_video_multiresolution_dataloader(
     num_workers: int = 2,
     pin_memory: bool = True,
     prefetch_factor: int = 2,
-) -> Tuple[DataLoader, SequentialBucketSampler]:
+) -> Tuple[StatefulDataLoader, SequentialBucketSampler]:
     """
     Build a multiresolution video dataloader for TrainDiffusionRecipe.
 
