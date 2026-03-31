@@ -34,7 +34,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /workspace/eevee-4-26b-a4b-it_vv5
+  pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/evee/eevee-4-26b-a4b-it_vv7
   torch_dtype: torch.bfloat16
   trust_remote_code: true
   backend:
