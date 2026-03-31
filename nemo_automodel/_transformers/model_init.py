@@ -261,6 +261,7 @@ def _init_model(
     pretrained_model_name_or_path = (
         pretrained_model_name_or_path_or_config if is_pretrained_init else getattr(hf_config, "name_or_path")
     )
+    architectures = get_architectures(hf_config)
 
     # 1. if force_hf is True, use HF model class wrapped with mixin
     if force_hf:
@@ -284,15 +285,16 @@ def _init_model(
                 **kwargs,
             )
         # Get HF model class and wrap with mixin
+        hf_model_cls = type(model)
         try:
-            hf_model_cls = cls._model_mapping[type(hf_config)]
+            if len(architectures) > 0 and architectures[0] != "NemotronHForCausalLM":
+                hf_model_cls = cls._model_mapping[type(hf_config)]
         except KeyError:
-            hf_model_cls = type(model)
+            pass  # fallback to use the model class from the model object
         model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
         return False, model
 
     # 2. If we have a custom model implementation available, we prioritize that over HF
-    architectures = get_architectures(hf_config)
     model_cls = _resolve_custom_model_cls_for_config(hf_config)
     if model_cls is not None:
         # if we are able to init the custom model, we will now download the model weights on local rank 0
@@ -313,7 +315,6 @@ def _init_model(
             return True, model_cls(hf_config, *model_args, **kwargs)
 
     # 3. fallback to HF model class wrapped with mixin
-
     model = None
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
@@ -335,10 +336,13 @@ def _init_model(
             **kwargs,
         )
 
+    # Get HF model class and wrap with mixin
+    hf_model_cls = type(model)
     try:
-        hf_model_cls = cls._model_mapping[type(hf_config)]
+        if len(architectures) > 0 and architectures[0] != "NemotronHForCausalLM":
+            hf_model_cls = cls._model_mapping[type(hf_config)]
     except KeyError:
-        hf_model_cls = type(model)
+        pass  # fallback to use the model class from the model object
     model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
     return False, model
 

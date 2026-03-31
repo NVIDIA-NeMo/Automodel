@@ -25,12 +25,13 @@ module in a new directory (e.g., qwen2_bidirectional/) with its own ModelClass e
 from typing import List, Optional, Tuple, Union
 
 import torch
+import torch.nn as nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_bidirectional_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.models.llama.configuration_llama import LlamaConfig
-from transformers.models.llama.modeling_llama import LlamaForSequenceClassification, LlamaModel
+from transformers.models.llama.modeling_llama import LlamaModel, LlamaPreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
@@ -52,7 +53,7 @@ class LlamaBidirectionalConfig(LlamaConfig):
     and pooling configurations.
     """
 
-    model_type = "LlamaBidirectionalModel"
+    model_type = "llama_bidirec"
 
     def __init__(
         self,
@@ -82,7 +83,7 @@ class LlamaBidirectionalModel(LlamaModel):
     and retrieval tasks where bidirectional context is beneficial.
 
     The model is auto-discovered by ModelRegistry via the ModelClass export,
-    enabling it to be loaded via NeMoAutoModelBiencoder.from_pretrained().
+    enabling it to be loaded via NeMoAutoModelBiEncoder.from_pretrained().
     """
 
     config_class = LlamaBidirectionalConfig
@@ -178,7 +179,7 @@ def _pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_t
     return emb
 
 
-class LlamaBidirectionalForSequenceClassification(LlamaForSequenceClassification):
+class LlamaBidirectionalForSequenceClassification(LlamaPreTrainedModel):
     """
     Llama Bidirectional Model with a sequence classification/regression head.
 
@@ -190,8 +191,10 @@ class LlamaBidirectionalForSequenceClassification(LlamaForSequenceClassification
 
     def __init__(self, config):
         super().__init__(config)
-        del self.model
+        self.num_labels = config.num_labels
+        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
         self.model = LlamaBidirectionalModel(config)
+        # Initialize weights and apply final processing
         self.post_init()
 
     def forward(
@@ -206,6 +209,7 @@ class LlamaBidirectionalForSequenceClassification(LlamaForSequenceClassification
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -219,8 +223,12 @@ class LlamaBidirectionalForSequenceClassification(LlamaForSequenceClassification
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            **kwargs,
         )
         hidden_states = transformer_outputs[0]
+
+        if attention_mask is None:
+            raise ValueError("attention_mask is required for pooling")
 
         pooled_hidden_states = _pool(
             last_hidden_states=hidden_states,
@@ -270,6 +278,27 @@ class LlamaBidirectionalForSequenceClassification(LlamaForSequenceClassification
 
 # Export for ModelRegistry auto-discovery
 ModelClass = [LlamaBidirectionalModel, LlamaBidirectionalForSequenceClassification]
+
+
+def _register_with_hf_auto_classes():
+    """Register bidirectional models with HuggingFace Auto classes.
+
+    This is needed so that AutoModel.from_config(LlamaBidirectionalConfig)
+    works inside LlamaForSequenceClassification.__init__.
+    """
+    from transformers import AutoConfig, AutoModel
+
+    try:
+        AutoConfig.register(LlamaBidirectionalConfig.model_type, LlamaBidirectionalConfig)
+    except ValueError:
+        pass  # Already registered
+    try:
+        AutoModel.register(LlamaBidirectionalConfig, LlamaBidirectionalModel)
+    except ValueError:
+        pass  # Already registered
+
+
+_register_with_hf_auto_classes()
 
 __all__ = [
     "LlamaBidirectionalModel",
