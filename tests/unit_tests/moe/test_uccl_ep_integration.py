@@ -668,5 +668,3 @@ class TestMoEFlexTokenDispatcherUcclEp:
         assert MoEFlexTokenDispatcher.shared_uccl_manager is not None
         # shared_comm_manager should remain None since we used uccl path
         assert MoEFlexTokenDispatcher.shared_comm_manager is None
-
-
