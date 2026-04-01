@@ -16,6 +16,12 @@
 
 
 
+# To run this recipe:
+#   automodel examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: FinetuneRecipeForVLM
+
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1
