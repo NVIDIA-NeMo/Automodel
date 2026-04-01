@@ -1,5 +1,11 @@
 # GLUE MRPC with RoBERTa-large + LoRA
 
+# To run this recipe:
+#   automodel examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForSequenceClassification
+
 step_scheduler:
   global_batch_size: 32
   local_batch_size: 32

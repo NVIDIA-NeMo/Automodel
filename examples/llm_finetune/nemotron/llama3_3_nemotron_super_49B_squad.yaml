@@ -18,6 +18,8 @@
 # This recipe is validated on 2 8xH100 nodes.
 
 
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 16
   local_batch_size: 2

@@ -16,8 +16,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
-from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
 from nemo_automodel.recipes.llm.train_seq_cls import TrainFinetuneRecipeForSequenceClassification
+from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 

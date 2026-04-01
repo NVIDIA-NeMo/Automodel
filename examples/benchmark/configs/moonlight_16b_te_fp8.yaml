@@ -14,6 +14,8 @@
 
 # Benchmarking config for Moonlight 16B with FP8 grouped GEMM
 
+recipe: BenchmarkingRecipeForNextTokenPrediction
+
 seed: 1234
 
 benchmark:

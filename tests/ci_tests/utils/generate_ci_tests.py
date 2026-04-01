@@ -17,9 +17,10 @@
 import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any, Dict
+
 from ruamel.yaml import YAML
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString as DQ
-from typing import Any, Dict
 
 yaml = YAML()
 yaml.default_flow_style = False

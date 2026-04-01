@@ -31,19 +31,19 @@ IDs collide.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 import torch
 from datasets import Dataset
-from pathlib import Path
-import os
 
-from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 import nemo_automodel.components.datasets.llm.squad as squad_module
+from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.datasets.llm.formatting_utils import (
     _get_right_trailing_pad_mask,
 )
 from nemo_automodel.components.datasets.utils import default_collater
-
 
 #  Helpers
 

@@ -95,7 +95,7 @@ distributed:
 
 ## Launch Training
 
-NeMo Automodel supports several ways to launch training—via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/cluster.md) guide.
+NeMo Automodel supports several ways to launch training—via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md) guide.
 
 ### Automodel CLI
 
@@ -113,7 +113,7 @@ export HF_HOME=your/path/to/hf_cache
 export HF_DATASETS_OFFLINE=1
 export WANDB_API_KEY=your_wandb_key
 
-torchrun --nproc_per_node=8 \
+torchrun --nproc-per-node=8 \
          --nnodes=8 \
          --rdzv_backend=c10d \
          --rdzv_endpoint=${MASTER_ADDR}:${PORT} \

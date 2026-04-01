@@ -92,8 +92,7 @@ Use the ready-made config at [`examples/llm_finetune/gemma/functiongemma_xlam.ya
 With the config in place, launch training (8 GPUs shown; adjust `--nproc-per-node` as needed):
 
 ```bash
-torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py \
-  --config examples/llm_finetune/gemma/functiongemma_xlam.yaml
+automodel --nproc-per-node=8 examples/llm_finetune/gemma/functiongemma_xlam.yaml
 ```
 
 You should be able to see a training loss curve similar to the one shown below:
@@ -115,8 +114,7 @@ peft:
 ```
 Then fine-tune with the same recipe. Adjust the number of GPUs as needed.
 ```bash
-torchrun --nproc-per-node=1 examples/llm_finetune/finetune.py \
-  --config examples/llm_finetune/gemma/functiongemma_xlam.yaml
+automodel examples/llm_finetune/gemma/functiongemma_xlam.yaml
 ```
 
 <p align="center">

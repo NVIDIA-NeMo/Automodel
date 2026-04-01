@@ -1,6 +1,6 @@
 # Run on Any Cloud with SkyPilot
 
-In this guide, you will learn how to launch NeMo AutoModel training jobs on any major cloud provider (AWS, GCP, Azure, Lambda, Kubernetes) using [SkyPilot](https://skypilot.readthedocs.io). For on-premises cluster usage, see [Run on a Cluster (Slurm)](./cluster.md). For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.md).
+In this guide, you will learn how to launch NeMo AutoModel training jobs on any major cloud provider (AWS, GCP, Azure, Lambda, Kubernetes) using [SkyPilot](https://skypilot.readthedocs.io). For on-premises cluster usage, see [Run on a Cluster (Slurm)](./slurm.md). For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.md).
 
 SkyPilot is an open-source framework that abstracts cloud infrastructure so you can train on whichever cloud is cheapest or most available at launch time — including automatic spot-instance handling for significant cost savings.
 

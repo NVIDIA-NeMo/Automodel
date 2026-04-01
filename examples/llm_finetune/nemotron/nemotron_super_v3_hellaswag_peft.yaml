@@ -19,6 +19,8 @@
 # This recipe requires 8x80GB of GPU memory.
 
 
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   num_epochs: 1
   global_batch_size: 256

@@ -100,7 +100,7 @@ FP8 training via torchao for reduced memory and higher throughput on supported m
 :::
 
 :::{grid-item-card} {octicon}`server;1.5em;sd-mr-1` Multi-Node with SLURM
-Add a `slurm:` section to any YAML config and launch with the `automodel` CLI. See the [Cluster guide](../launcher/cluster.md).
+Add a `slurm:` section to any YAML config and launch with the `automodel` CLI. See the [Cluster guide](../launcher/slurm.md).
 :::
 
 ::::
@@ -119,6 +119,9 @@ Recipes are executable Python scripts paired with YAML configuration files. Each
 4. **Checkpoint** using Distributed Checkpoint (DCP) with SafeTensors output
 
 ```yaml
+recipe:
+  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
+
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
@@ -132,8 +135,7 @@ dataset:
 Override any field from the CLI:
 
 ```bash
-uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py \
-  --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
   --step_scheduler.local_batch_size 16
 ```
 
@@ -161,13 +163,13 @@ The CLI simplifies job launch across environments:
 
 ```bash
 # Single-node interactive
-automodel finetune llm -c config.yaml
+automodel config.yaml
 
 # Multi-node SLURM batch
-automodel finetune llm -c config.yaml  # with slurm: section in YAML
+sbatch my_cluster.sub  # copy slurm.sub, edit CONFIG & SBATCH directives, then submit
 ```
 
-See the [Local Workstation](../launcher/local-workstation.md) and [Cluster](../launcher/cluster.md) guides.
+See the [Local Workstation](../launcher/local-workstation.md) and [Cluster](../launcher/slurm.md) guides.
 
 ---
 
