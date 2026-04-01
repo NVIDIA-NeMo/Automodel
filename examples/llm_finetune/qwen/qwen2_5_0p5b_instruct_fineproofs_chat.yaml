@@ -20,6 +20,7 @@
 # torchrun --nproc-per-node=1 recipes/llm_finetune/finetune.py \
 #   --config examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml
 
+recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 16
