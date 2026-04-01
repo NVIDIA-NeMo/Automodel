@@ -255,8 +255,8 @@ def _remap_system_role(conversation):
     return remapped
 
 
-def _try_convert_tiktoken_to_fast(tokenizer):
-    """Convert a TikToken-based tokenizer to a fast (Rust-backed) tokenizer.
+def _try_convert_tiktoken_to_native(tokenizer):
+    """Convert a TikToken-based tokenizer to a native HF tokenizer.
 
     This enables char_to_token() for {% generation %} mask computation
     without needing the heuristic fallback in _apply_chat_template_safe.
@@ -318,7 +318,7 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
 
         # Convert TikToken-based tokenizers to fast (Rust-backed) tokenizers so that
         # char_to_token() works natively for {% generation %} mask computation.
-        tokenizer = _try_convert_tiktoken_to_fast(tokenizer)
+        tokenizer = _try_convert_tiktoken_to_native(tokenizer)
 
         # Transformers >=5.0.0 defaults special_tokens_pattern to "cls_sep", which inserts
         # cls_token_id / sep_token_id into input_ids via build_inputs_with_special_tokens.
@@ -361,98 +361,20 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
     def apply_chat_template(self, conversation, *args, **kwargs):
         has_system = any(isinstance(m, dict) and m.get("role") == "system" for m in conversation)
         if not has_system:
-            return self._apply_chat_template_safe(conversation, *args, **kwargs)
+            return super().apply_chat_template(conversation, *args, **kwargs)
 
         system_msgs = [m for m in conversation if isinstance(m, dict) and m.get("role") == "system"]
         if len(system_msgs) > 1:
             raise ValueError("System role appeared in multiple messages. Only a single system message is supported.")
 
         try:
-            return self._apply_chat_template_safe(conversation, *args, **kwargs)
+            return super().apply_chat_template(conversation, *args, **kwargs)
         except TemplateError as e:
             if "System role not supported" not in str(e):
                 raise
             logger.debug("Chat template does not support system role; merging into first user message.")
             remapped = _remap_system_role(conversation)
-            return self._apply_chat_template_safe(remapped, *args, **kwargs)
-
-    def _apply_chat_template_safe(self, conversation, *args, **kwargs):
-        """Wrap apply_chat_template with a fallback for TikToken tokenizers.
-
-        HF's apply_chat_template uses char_to_token() for generation masks,
-        which is only available on native HF tokenizers. For TikToken-based
-        tokenizers we compute the mask by matching decoded tokens against
-        the rendered text to build a character-to-token mapping.
-        """
-        try:
-            return super().apply_chat_template(conversation, *args, **kwargs)
-        except ValueError as e:
-            if "char_to_token() is not available" not in str(e):
-                raise
-
-        # TikToken tokenizer path.
-        from transformers.tokenization_utils_base import render_jinja_template
-
-        return_assistant_tokens_mask = kwargs.get("return_assistant_tokens_mask", False)
-        return_dict = kwargs.get("return_dict", False)
-        tokenize = kwargs.get("tokenize", True)
-
-        if not return_assistant_tokens_mask or not tokenize or not return_dict:
-            kwargs["return_assistant_tokens_mask"] = False
-            return super().apply_chat_template(conversation, *args, **kwargs)
-
-        # 1. Render template to get text + generation char ranges.
-        chat_template = kwargs.get("chat_template") or self.chat_template
-        tools = kwargs.get("tools")
-        documents = kwargs.get("documents")
-        add_generation_prompt = kwargs.get("add_generation_prompt", False)
-        continue_final_message = kwargs.get("continue_final_message", False)
-
-        template_kwargs = {**self.special_tokens_map}
-        rendered_chat, generation_indices = render_jinja_template(
-            conversations=[conversation],
-            tools=tools,
-            documents=documents,
-            chat_template=chat_template,
-            return_assistant_tokens_mask=True,
-            continue_final_message=continue_final_message,
-            add_generation_prompt=add_generation_prompt,
-            **template_kwargs,
-        )
-        rendered_text = rendered_chat[0]
-        gen_ranges = generation_indices[0]
-
-        # 2. Tokenize without the mask (avoids char_to_token).
-        kwargs_no_mask = dict(kwargs)
-        kwargs_no_mask["return_assistant_tokens_mask"] = False
-        out = super().apply_chat_template(conversation, *args, **kwargs_no_mask)
-
-        # 3. Build char-to-token map by matching decoded tokens against the text.
-        input_ids = out["input_ids"]
-        token_char_start = []
-        pos = 0
-        for tid in input_ids:
-            decoded = self.decode([tid])
-            match_pos = rendered_text.find(decoded, pos)
-            # Allow a small gap (up to 10 chars) between the expected and actual
-            # position to tolerate whitespace normalization or special-token
-            # markers inserted by the chat template but absent from decoded tokens.
-            if match_pos != -1 and match_pos - pos < len(decoded) + 10:
-                token_char_start.append(match_pos)
-                pos = match_pos + len(decoded)
-            else:
-                # Inserted token (BOS/EOS) not in rendered text.
-                token_char_start.append(pos)
-
-        # 4. Build the mask from generation ranges.
-        mask = [0] * len(input_ids)
-        for start_char, end_char in gen_ranges:
-            for i, cs in enumerate(token_char_start):
-                if cs >= start_char and cs < end_char:
-                    mask[i] = 1
-
-        out["assistant_masks"] = mask
-        return out
+            return super().apply_chat_template(remapped, *args, **kwargs)
 
     def __call__(self, *args, **kwargs):
         tokenized = super().__call__(*args, **kwargs)
