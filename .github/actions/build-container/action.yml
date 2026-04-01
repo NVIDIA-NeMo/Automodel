@@ -64,12 +64,12 @@ runs:
         echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
 
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         ref: ${{ steps.sha.outputs.main }}
 
     - name: Setup python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: 3.12
 
@@ -143,7 +143,6 @@ runs:
         context: .
         build-args: |
           BASE_IMAGE=pytorch
-          INSTALL_DEEPEP=True
         cache-from: |
           type=registry,ref=${{ env.container-registry }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
           type=registry,ref=${{ env.container-registry }}/${{ env.REPO_LOWER }}:main-buildcache,mode=max
