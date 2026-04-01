@@ -24,9 +24,7 @@ from typing import Callable
 
 import torch
 import torch.nn as nn
-from diffusers.training_utils import cast_training_params
 from peft import LoraConfig
-from peft import PeftAdapterMixin
 
 from .config import MODEL_DEFAULT_TARGET_MODULES
 
@@ -107,11 +105,10 @@ def inject_lora(
                       Avoids fragile transformer.peft_config dict access.
     """
     # ── Guard ────────────────────────────────────────────────────────────────
-    if not isinstance(transformer, PeftAdapterMixin):
+    if not isinstance(transformer, nn.Module):
         raise TypeError(
-            f"{type(transformer).__name__} does not inherit PeftAdapterMixin. "
-            f"LoRA injection requires PeftAdapterMixin. "
-            f"Check your diffusers version for {model_type} support."
+            f"{type(transformer).__name__} is not an nn.Module. "
+            f"LoRA injection via get_peft_model requires an nn.Module."
         )
 
     # ── Pre-inject hook ───────────────────────────────────────────────────────
@@ -141,14 +138,35 @@ def inject_lora(
         target_modules=target_modules,
     )
 
-    # ── Inject via PeftAdapterMixin.add_adapter() ─────────────────────────────
-    # Internally calls inject_adapter_in_model() which walks the module tree
-    # and replaces each target nn.Linear with peft.tuners.lora.Linear:
+    # ── Inject via diffusers PeftAdapterMixin.add_adapter() ─────────────────
+    # add_adapter() calls peft's inject_adapter_in_model() to replace each
+    # target nn.Linear with peft.tuners.lora.Linear IN-PLACE, then calls
+    # set_adapter() to activate the adapter so lora_A/lora_B are included
+    # in the forward pass. Both steps are required — inject alone leaves
+    # active_adapter unset and LoRA contributes nothing to the output.
     #   peft.tuners.lora.Linear:
     #     .base_layer            → original nn.Linear
     #     .lora_A["default"]     → nn.Linear(in, rank, bias=False)
     #     .lora_B["default"]     → nn.Linear(rank, out, bias=False)
     transformer.add_adapter(peft_config)
+
+    # ── Verify adapter activation ─────────────────────────────────────────────
+    # active_adapters must be ["default"] for the LoRA forward path to run.
+    # If set_adapter() failed (e.g. isinstance check on wrong BaseTunerLayer),
+    # active_adapters = [] and lora_B never receives gradient → stays at zero.
+    from peft.tuners.tuners_utils import BaseTunerLayer
+    _lora_layers = [(n, m) for n, m in transformer.named_modules() if isinstance(m, BaseTunerLayer)]
+    if _lora_layers:
+        _name, _layer = _lora_layers[0]
+        logger.info(f"[LoRA] Sample layer '{_name}': active_adapters={_layer.active_adapters}")
+        if not _layer.active_adapters:
+            logger.warning("[LoRA] active_adapters is EMPTY — calling set_adapter directly via peft")
+            for _, m in transformer.named_modules():
+                if isinstance(m, BaseTunerLayer):
+                    m.set_adapter("default")
+            logger.info(f"[LoRA] After fix: active_adapters={_lora_layers[0][1].active_adapters}")
+    else:
+        logger.warning("[LoRA] No BaseTunerLayer modules found — injection may have failed!")
 
     # ── Freeze base weights ───────────────────────────────────────────────────
     # Base layer weights must be frozen so FSDP2 skips gradient allreduce.
@@ -157,13 +175,16 @@ def inject_lora(
         if "lora_" not in name:
             param.requires_grad = False
 
-    # ── Cast LoRA params to fp32 ──────────────────────────────────────────────
-    # diffusers utility — only touches requires_grad=True params.
-    # Ensures LoRA weights stay fp32 for training stability even when
-    # FSDP2 MixedPrecisionPolicy has param_dtype=None (our config).
-    # Verified from train_dreambooth_flux.py:
-    #   cast_training_params([transformer], dtype=torch.float32)
-    cast_training_params([transformer], dtype=torch.float32)
+    # ── Cast LoRA params to bf16 ──────────────────────────────────────────────
+    # Cast to bf16 (not fp32) so all parameters in the FSDP2 unit share the
+    # same dtype as the base weights. Mixed fp32-lora + bf16-base in the same
+    # FSDP unit causes gradient reduce-scatter to malfunction — lora_B receives
+    # no effective gradient update despite active_adapters being correct.
+    # Imported lazily to avoid pulling in diffusers.models (→ flash_attn) at
+    # module load time, which crashes when flash_attn is not built for the
+    # current PyTorch/CUDA version.
+    from diffusers.training_utils import cast_training_params
+    cast_training_params([transformer], dtype=torch.bfloat16)
 
     # ── Collect lora_params BEFORE FSDP2 ─────────────────────────────────────
     # FSDP2 uses use_orig_params=True by default — it shards the .data of
@@ -177,6 +198,7 @@ def inject_lora(
     # ── Logging ───────────────────────────────────────────────────────────────
     total_params = sum(p.numel() for p in transformer.parameters())
     lora_param_count = sum(p.numel() for p in lora_params)
+    injected_layer_names = [n for n, _ in _lora_layers]
     logger.info(
         f"[LoRA] Injected into {model_type}: "
         f"{lora_param_count:,} trainable / {total_params:,} total "
@@ -187,5 +209,8 @@ def inject_lora(
         f"dropout={lora_cfg.dropout}"
     )
     logger.info(f"[LoRA] target_modules={target_modules}")
+    logger.info(f"[LoRA] Injected {len(injected_layer_names)} layers:")
+    for layer_name in injected_layer_names:
+        logger.info(f"[LoRA]   {layer_name}")
 
     return lora_params, peft_config

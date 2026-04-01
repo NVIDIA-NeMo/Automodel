@@ -30,6 +30,7 @@ Identical for Flux, Wan, and Hunyuan — no model_type needed.
 
 import logging
 import os
+import re
 
 import torch
 import torch.distributed as dist
@@ -66,6 +67,17 @@ def gather_lora_state_dict(
         Dict of LoRA-only weights (lora_A, lora_B for each target module).
     """
     if is_fsdp and dist.is_initialized():
+        # Diagnose: check raw local shard norms before gathering
+        _b_norms = []
+        for n, p in transformer.named_parameters():
+            if "lora_B" in n:
+                try:
+                    _b_norms.append(p.data.to_local().float().norm().item())
+                except Exception:
+                    _b_norms.append(p.data.float().norm().item())
+        if _b_norms:
+            logger.info(f"[LoRA] lora_B local shard norms (first 3): {_b_norms[:3]}")
+
         # get_model_state_dict — returns Dict[str, Tensor] only.
         # Do NOT use get_state_dict() which returns Tuple[model_sd, optim_sd].
         # full_state_dict=True: all-gathers DTensor shards → full tensors on each rank
@@ -77,13 +89,22 @@ def gather_lora_state_dict(
                 cpu_offload=True,
             ),
         )
-        # Pass gathered dict — PEFT filters to lora_A/lora_B keys only
-        # Matches Flux2 trainer pattern:
-        #   get_peft_model_state_dict(transformer, state_dict=state_dict)
-        lora_sd = get_peft_model_state_dict(
-            transformer,
-            state_dict=full_sd,
-        )
+        # Manually extract LoRA keys from the gathered state dict.
+        # get_peft_model_state_dict(state_dict=full_sd) in peft 0.18+ does not
+        # correctly read from the provided dict for FSDP2 models — it falls back
+        # to current sharded DTensor values which resolve to zeros.
+        # Strip adapter name component: "lora_A.default.weight" → "lora_A.weight"
+        lora_sd = {}
+        for k, v in full_sd.items():
+            if "lora_A" not in k and "lora_B" not in k:
+                continue
+            new_key = re.sub(r'(\.lora_[AB])\.[^.]+\.', r'\1.', k)
+            lora_sd[new_key] = v
+
+        # Diagnose: check gathered norms
+        _gathered_b = [(k, v.float().norm().item()) for k, v in lora_sd.items() if "lora_B" in k]
+        if _gathered_b:
+            logger.info(f"[LoRA] lora_B gathered norms (first 3): {_gathered_b[:3]}")
     else:
         # Non-FSDP: params are plain tensors, extract directly
         lora_sd = get_peft_model_state_dict(transformer)
@@ -157,25 +178,12 @@ def load_lora_weights_for_inference(
     """
     Load LoRA weights onto a fresh (base) transformer for inference.
 
-    Uses PeftAdapterMixin.load_adapter() which handles the complete
-    sequence internally:
-        1. Reads adapter_config.json → reconstructs LoraConfig
-        2. Calls add_adapter() to create lora_A/lora_B module structure
-        3. Loads adapter_model.safetensors
-        4. Handles "base_model.model." key prefix mapping
-        5. Fills lora_A/lora_B weights correctly
+    Tries load_adapter() (newer diffusers) first, falls back to manual
+    add_adapter() + safetensors load for older diffusers that lack load_adapter.
 
-    This is preferred over the manual sequence:
-        add_adapter() + load_file() + set_peft_model_state_dict()
-    because set_peft_model_state_dict() has a key prefix mismatch when
-    called on a PeftAdapterMixin model (keys saved with "base_model.model."
-    prefix but model parameters don't have that prefix on a fresh load).
-    load_adapter() resolves this internally.
-
-    After loading, LoRA scale is applied via attention_kwargs at call time:
-        pipe(..., attention_kwargs={"scale": lora_alpha / rank})
-    All three transformers have @apply_lora_scale("attention_kwargs") on
-    their forward() — verified for Flux, Wan (document 5), Hunyuan (document 31).
+    The manual path strips the "base_model.model." prefix that get_peft_model_state_dict
+    adds when saving, then uses load_state_dict(strict=False) to update only
+    the lora_A/lora_B keys without touching base weights.
 
     Args:
         transformer:  pipe.transformer — the raw transformer module.
@@ -184,17 +192,46 @@ def load_lora_weights_for_inference(
         adapter_name: Name to register the adapter under.
         device:       Device to load weights onto.
     """
-    # PeftAdapterMixin.load_adapter() handles the full sequence correctly
-    transformer.load_adapter(
-        lora_path,
-        adapter_name=adapter_name,
-        torch_device=device,
-    )
+    if hasattr(transformer, "load_adapter"):
+        transformer.load_adapter(
+            lora_path,
+            adapter_name=adapter_name,
+            torch_device=device,
+        )
+        if hasattr(transformer, "set_adapter"):
+            transformer.set_adapter(adapter_name)
+    else:
+        # Older diffusers: load_adapter() not available — manual sequence
+        from peft import LoraConfig
+        from safetensors.torch import load_file
 
-    # Activate the loaded adapter
-    # set_adapter() ensures this adapter's weights are used in forward()
-    transformer.set_adapter(adapter_name)
+        from peft.tuners.lora import LoraModel as PeftLoraModel
+        peft_config = LoraConfig.from_pretrained(lora_path)
+        PeftLoraModel(transformer, {"default": peft_config}, "default")  # injects lora.Linear in-place
 
-    logger.info(
-        f"[LoRA] Loaded adapter '{adapter_name}' from {lora_path}"
-    )
+        weights_path = os.path.join(lora_path, "adapter_model.safetensors")
+        state_dict = load_file(weights_path, device=device)
+
+        # Strip "base_model.model." prefix added by get_peft_model_state_dict
+        prefix = "base_model.model."
+        state_dict = {
+            k[len(prefix):] if k.startswith(prefix) else k: v
+            for k, v in state_dict.items()
+        }
+
+        # Re-insert adapter name stripped by get_peft_model_state_dict on save:
+        # "lora_A.weight" → "lora_A.default.weight"
+        state_dict = {
+            k.replace("lora_A.weight", f"lora_A.{adapter_name}.weight")
+             .replace("lora_B.weight", f"lora_B.{adapter_name}.weight"): v
+            for k, v in state_dict.items()
+        }
+
+        incompatible = transformer.load_state_dict(state_dict, strict=False)
+        if incompatible.unexpected_keys:
+            logger.warning("[LoRA] Unexpected keys (first 5): %s", incompatible.unexpected_keys[:5])
+        missing_lora = [k for k in incompatible.missing_keys if "lora_" in k]
+        if missing_lora:
+            logger.warning("[LoRA] Missing lora keys (first 5): %s", missing_lora[:5])
+
+    logger.info(f"[LoRA] Loaded adapter '{adapter_name}' from {lora_path}")
