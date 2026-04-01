@@ -46,7 +46,9 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --hf_kl_threshold 7e-2 \
     --experts_implementation grouped_mm \
     --trust_remote_code \
-    --tokenizer_name nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    --tokenizer_name nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
+    --max_vram_gb 35 \
+    --max_cpu_gb 34
     # TODO: --check_resume disabled for MoE — DeepEP expert routing is non-deterministic,
     # causing ~1e-1 loss diff between fresh and resumed runs. Needs --resume_loss_threshold flag.
     # --check_resume
@@ -76,6 +78,8 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --hf_kl_threshold 1e-1 \
     --experts_implementation grouped_mm \
     --trust_remote_code \
-    --tokenizer_name nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    --tokenizer_name nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
+    --max_vram_gb 15 \
+    --max_cpu_gb 4
     # TODO: --check_resume disabled for MoE (see SFT comment above)
     # --check_resume

@@ -45,6 +45,8 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --cross_tp_size 2 \
     --cross_tp_kl_threshold 5e-3 \
     --tokenizer_name meta-llama/Llama-3.2-3B-Instruct \
+    --max_vram_gb 5 \
+    --max_cpu_gb 6 \
     --check_resume
 
 # Step 2: PEFT checkpoint robustness
@@ -69,5 +71,7 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --distributed.sequence_parallel false \
     --hf_kl_threshold 5e-3 \
     --tokenizer_name meta-llama/Llama-3.2-3B-Instruct \
+    --max_vram_gb 5 \
+    --max_cpu_gb 4 \
     --check_fused_qkv_keys \
     --check_resume

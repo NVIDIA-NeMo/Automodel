@@ -45,6 +45,8 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --distributed.sequence_parallel false \
     --hf_kl_threshold 5e-2 \
     --tokenizer_name openai/gpt-oss-20b \
+    --max_vram_gb 24 \
+    --max_cpu_gb 17 \
     --check_phantom_keys
     # TODO: --check_resume disabled for MoE — DeepEP expert routing is non-deterministic,
     # causing ~3e-2 loss diff between fresh and resumed runs. Needs --resume_loss_threshold flag.
@@ -73,6 +75,8 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --distributed.cp_size 1 \
     --distributed.sequence_parallel false \
     --hf_kl_threshold 5e-2 \
-    --tokenizer_name openai/gpt-oss-20b
+    --tokenizer_name openai/gpt-oss-20b \
+    --max_vram_gb 12 \
+    --max_cpu_gb 4
     # TODO: --check_resume disabled for MoE (see SFT comment above)
     # --check_resume
