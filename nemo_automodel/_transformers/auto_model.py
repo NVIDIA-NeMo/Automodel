@@ -756,9 +756,9 @@ class NeMoAutoModelForTokenClassification(_BaseNeMoAutoModelClass, AutoModelForT
 
     Examples:
     --------
-    >>> model = NeMoAutoModelForTokenClassification.from_pretrained(\"dbmdz/bert-large-cased-finetuned-conll03-english\") # try Liger
+    >>> model = NeMoAutoModelForTokenClassification.from_pretrained("dbmdz/bert-large-cased-finetuned-conll03-english") # try Liger
     >>> model = NeMoAutoModelForTokenClassification.from_pretrained(
-    ...     \"dbmdz/bert-large-cased-finetuned-conll03-english\", use_liger_kernel=False)   # skip Liger
+    ...     "dbmdz/bert-large-cased-finetuned-conll03-english", use_liger_kernel=False)   # skip Liger
     """
 
     pass
