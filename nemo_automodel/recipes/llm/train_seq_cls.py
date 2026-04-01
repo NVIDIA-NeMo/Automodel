@@ -30,6 +30,7 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
+from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import (
@@ -230,6 +231,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()
             }
             labels = batch.pop("labels")
+            batch = filter_forward_kwargs(model, batch)
             out = model(**batch)
             logits = getattr(out, "logits", out)
             loss = self.loss_fn(logits, labels.view(-1))
@@ -333,6 +335,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()
             }
             labels = batch.pop("labels")
+            batch = filter_forward_kwargs(model, batch)
             out = model(**batch)
             logits = getattr(out, "logits", out)
             loss = self.loss_fn(logits, labels.view(-1))
