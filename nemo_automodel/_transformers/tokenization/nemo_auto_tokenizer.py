@@ -259,7 +259,7 @@ def _try_convert_tiktoken_to_native(tokenizer):
     """Convert a TikToken-based tokenizer to a native HF tokenizer.
 
     This enables char_to_token() for {% generation %} mask computation
-    without needing the heuristic fallback in _apply_chat_template_safe.
+    without needing a heuristic fallback for char_to_token().
     Returns the original tokenizer unchanged if conversion is not applicable.
     """
     if getattr(tokenizer, "is_fast", True):
