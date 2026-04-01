@@ -193,8 +193,6 @@ class GptOssModel(nn.Module):
 
 
 class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
-    _keep_in_fp32_modules = ["post_attention_layernorm", "input_layernorm", "norm"]
-
     @classmethod
     def from_config(
         cls,

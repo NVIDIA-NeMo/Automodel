@@ -8,7 +8,7 @@ NeMo AutoModel LLM APIs can be easily extended to support VLM tasks. While most 
 
 ## Run VLMs with NeMo AutoModel
 
-To run VLMs with NeMo AutoModel, use NeMo container version [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) or later. If the model you want to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest NeMo AutoModel using:
+To run VLMs with NeMo AutoModel, use NeMo container version [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) or later. If the model you want to finetune requires a newer version of Transformers, you may need to upgrade to the latest NeMo AutoModel using:
 
 ```bash
 
@@ -35,7 +35,9 @@ NeMo AutoModel supports [AutoModelForImageTextToText](https://huggingface.co/doc
 | Qwen3-Omni-30BA3B                  | MedPix-VQA                   | Supported  | Supported  | [qwen3_omni_moe_30b_te_deepep.yaml](../../examples/vlm_finetune/qwen3/qwen3_omni_moe_30b_te_deepep.yaml) |
 | InternVL3.5-4B                     | MedPix-VQA                   | Supported  | Supported  | [internvl_3_5_4b.yaml](../../examples/vlm_finetune/internvl/internvl_3_5_4b.yaml) |
 | Ministral3-{3B,8B,14B}             | MedPix-VQA                   | Supported  | Supported  | [ministral3_3b_medpix.yaml](../../examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml), [ministral3_8b_medpix.yaml](../../examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml), [ministral3_14b_medpix.yaml](../../examples/vlm_finetune/mistral/ministral3_14b_medpix.yaml) |
-| Qwen3.5-MoE                       | MedPix-VQA                   | Supported  | Supported  | [qwen3_5_moe_medpix.yaml](../../examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml) |
+| Qwen3.5-MoE                       | MedPix-VQA                   | Supported  | Supported  | [qwen3_5_moe_medpix.yaml](../../examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml), [qwen3_5_35b.yaml](../../examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml) |
+| Qwen3.5-{4B,9B}                   | MedPix-VQA                   | Supported  | Supported  | [qwen3_5_4b.yaml](../../examples/vlm_finetune/qwen3_5/qwen3_5_4b.yaml), [qwen3_5_9b.yaml](../../examples/vlm_finetune/qwen3_5/qwen3_5_9b.yaml) |
+| Mistral-Small-4-119B               | MedPix-VQA                   | Supported  | Supported  | [mistral4_medpix.yaml](../../examples/vlm_finetune/mistral4/mistral4_medpix.yaml) |
 | Phi-4-multimodal-instruct          | commonvoice_17_tr_fixed      | Supported  | Supported  | [phi4_mm_cv17.yaml](../../examples/vlm_finetune/phi4/phi4_mm_cv17.yaml) |
 
 For detailed instructions on fine-tuning these models using both SFT and PEFT approaches, please refer to the [Gemma 3 and Gemma 3n Fine-Tuning Guide](../guides/omni/gemma3-3n.md). The guide covers dataset preparation, configuration, and running both full fine-tuning and LoRA-based parameter efficient fine-tuning.
