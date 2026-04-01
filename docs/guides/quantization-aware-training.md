@@ -141,7 +141,7 @@ trainer:
 Launch training with your QAT-enabled configuration:
 
 ```bash
-uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config your_qat_config.yaml
+automodel --nproc-per-node=8 your_qat_config.yaml
 ```
 
 ### 3. Monitor Training

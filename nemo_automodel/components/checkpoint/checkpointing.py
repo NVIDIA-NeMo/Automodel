@@ -43,6 +43,7 @@ from nemo_automodel.components.checkpoint._backports.filesystem import Serializa
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _HuggingFaceStorageReader,
     _HuggingFaceStorageWriter,
+    _maybe_rename_index_for_diffusers,
     get_fqn_to_file_index_mapping,
 )
 from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon, PeftAddon
@@ -138,6 +139,8 @@ class CheckpointingConfig:
     # If provided, temp files will be created here instead of system temp. Useful when system temp has limited space.
     v4_compatible: bool = False  # If True, save the original pretrained config.json (with quantization_config removed)
     # instead of the in-memory v5 config.  Useful when downstream consumers (e.g. vLLM) expect a v4-format config.
+    diffusers_compatible: bool = False  # If True, use diffusers-compatible index filename
+    # (diffusion_pytorch_model.safetensors.index.json) so checkpoints are loadable via diffusers from_pretrained().
 
     def __post_init__(self):
         """
@@ -299,6 +302,9 @@ class Checkpointer:
                 use_staging=self.config.staging_dir is not None,
                 staging_dir=self.config.staging_dir,
             )
+            if self.config.diffusers_compatible:
+                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                    _maybe_rename_index_for_diffusers(consolidated_dir)
 
     @torch.no_grad()
     def save_optimizer(
@@ -495,9 +501,10 @@ class Checkpointer:
         # We need to set them to False and call initialize_weights to re-initialize the weights.
 
         # Some models cannot call initialize_weights when sharded with DTensors:
-        # - Gemma3ForConditionalGeneration / Gemma3ForCausalLM: _init_weights() calls
-        #   init.zeros_(module.weight[module.padding_idx]) on the embedding layer, which
-        #   triggers DTensor redistribute and fails with sharded (TP) embeddings.
+        # - Gemma3ForConditionalGeneration / Gemma3ForCausalLM / Phi3ForCausalLM:
+        #   _init_weights() calls init.zeros_(module.weight[module.padding_idx]) on the
+        #   embedding layer, which triggers DTensor redistribute and fails with sharded
+        #   (TP) embeddings.
         # - NemotronHForCausalLM: the HF remote code's _init_weights uses dt_bias.copy_()
         #   which fails with DTensors. This applies to:
         #   - v2 (non-MoE, no n_routed_experts): always uses HF remote code.
@@ -515,7 +522,7 @@ class Checkpointer:
             and hasattr(model, "backbone")  # is HF remote code
         )
         skip_initialize_weights = (
-            model_class in ["Gemma3ForConditionalGeneration", "Gemma3ForCausalLM"]
+            model_class in ["Gemma3ForConditionalGeneration", "Gemma3ForCausalLM", "Phi3ForCausalLM"]
             or is_nemotron_v2
             or is_nemotron_v3_hf
         )
@@ -558,6 +565,10 @@ class Checkpointer:
             model_type = getattr(getattr(model, "config", None), "model_type", None)
             model_key_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
             key_mapping = get_combined_key_mapping(model_type, model_key_mapping)
+            # NemotronH remote code (trust_remote_code) uses backbone.* params matching checkpoint keys
+            # skip backbone.*→model.* conversion to avoid key mismatch
+            if model_type == "nemotron_h" and hasattr(model, "backbone"):
+                key_mapping = None
             self.load_model(
                 model,
                 model_path=model_name
@@ -780,7 +791,7 @@ class Checkpointer:
 
         # Add any missing keys from the model_state_dict
         # These will go to the same file as the last file (or file 1 for single-file models)
-        # Use default of 1 when mapping is empty (e.g., biencoder models with different key prefixes)
+        # Use default of 1 when mapping is empty (e.g., encoder models with different key prefixes)
         default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
 
         # add any additional keys that are not in the base checkpoint
@@ -814,6 +825,7 @@ class Checkpointer:
                 consolidated_output_path=consolidated_output_path if not consolidate_on_all_ranks else None,
                 fqn_to_index_mapping=fqn_to_index_mapping,
                 staging_dir=self.config.staging_dir,
+                diffusers_compatible=self.config.diffusers_compatible,
             )
 
     def _get_storage_reader(

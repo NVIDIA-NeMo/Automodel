@@ -24,9 +24,11 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
-# Static mapping: architecture name → (module_path, class_name).
+# Static mapping: architecture name → (module_path, class_name[, tags]).
 # Analogous to HuggingFace transformers' MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.
 # Models are loaded lazily on first access rather than imported at startup.
+# Optional third element is a set of tags (e.g. {"retrieval"}) used by
+# downstream code to classify model archs without importing them.
 MODEL_ARCH_MAPPING = OrderedDict(
     [
         (
@@ -74,11 +76,12 @@ MODEL_ARCH_MAPPING = OrderedDict(
             (
                 "nemo_automodel.components.models.llama_bidirectional.model",
                 "LlamaBidirectionalForSequenceClassification",
+                {"retrieval"},
             ),
         ),
         (
             "LlamaBidirectionalModel",
-            ("nemo_automodel.components.models.llama_bidirectional.model", "LlamaBidirectionalModel"),
+            ("nemo_automodel.components.models.llama_bidirectional.model", "LlamaBidirectionalModel", {"retrieval"}),
         ),
         (
             "LlamaForCausalLM",
@@ -186,8 +189,15 @@ class _LazyArchMapping:
     can be added at runtime via ``register``.
     """
 
-    def __init__(self, auto_map: Union[OrderedDict, Dict[str, Tuple[str, str]], None] = None):
-        self._auto_map: Dict[str, Tuple[str, str]] = OrderedDict(auto_map or {})
+    def __init__(self, auto_map: Union[OrderedDict, Dict[str, tuple], None] = None):
+        # Entries may be (module_path, class_name) or (module_path, class_name, tags).
+        # Strip the optional tags and store them separately.
+        self._auto_map: Dict[str, Tuple[str, str]] = OrderedDict()
+        self._tags: Dict[str, set] = {}
+        for key, value in (auto_map or {}).items():
+            self._auto_map[key] = (value[0], value[1])
+            if len(value) > 2:
+                self._tags[key] = value[2]
         self._loaded: Dict[str, Type[nn.Module]] = {}
         self._extra: Dict[str, Type[nn.Module]] = {}
         self._modules: Dict[str, object] = {}
@@ -231,6 +241,14 @@ class _LazyArchMapping:
             raise ValueError(f"Duplicated model implementation for {key}")
         self._extra[key] = value
 
+    def has_tag(self, key: str, tag: str) -> bool:
+        """Return ``True`` if *key* was registered with *tag*."""
+        return tag in self._tags.get(key, set())
+
+    def keys_with_tag(self, tag: str) -> set:
+        """Return all architecture names that have *tag*."""
+        return {k for k, tags in self._tags.items() if tag in tags}
+
     def keys(self):
         return set(self._auto_map.keys()) | set(self._extra.keys())
 
@@ -244,10 +262,12 @@ class _LazyArchMapping:
 @dataclass
 class _ModelRegistry:
     model_arch_name_to_cls: _LazyArchMapping = field(default=None)
+    _retrieval_archs: set = field(default_factory=set)
 
     def __post_init__(self):
         if self.model_arch_name_to_cls is None:
             self.model_arch_name_to_cls = _LazyArchMapping(MODEL_ARCH_MAPPING)
+        self._retrieval_archs = self.model_arch_name_to_cls.keys_with_tag("retrieval")
 
     @property
     def supported_models(self):
@@ -259,6 +279,14 @@ class _ModelRegistry:
     def has_custom_model(self, arch_name: str) -> bool:
         """Return ``True`` if *arch_name* has a custom (non-HF) implementation."""
         return arch_name in self.model_arch_name_to_cls
+
+    def has_retrieval_model(self, arch_name: str) -> bool:
+        """Return ``True`` if *arch_name* is a registered retrieval/encoder architecture."""
+        return arch_name in self._retrieval_archs
+
+    def register_retrieval(self, arch_name: str) -> None:
+        """Mark *arch_name* as a retrieval/encoder architecture."""
+        self._retrieval_archs.add(arch_name)
 
     def resolve_custom_model_cls(self, architecture: str, config) -> Union[Type[nn.Module], None]:
         """Return the custom model class if it exists and supports *config*, else ``None``.

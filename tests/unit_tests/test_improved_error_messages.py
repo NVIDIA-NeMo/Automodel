@@ -23,9 +23,11 @@ Covers three scenarios:
 
 import importlib
 import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 
 # ============================================================================
 # 1. Import-time error for missing model submodules
@@ -246,6 +248,78 @@ class TestGetHfConfigUnrecognizedModelType:
             result = get_hf_config("ignored", attn_implementation="eager", config=sentinel_config)
             mock_from_pretrained.assert_not_called()
             assert result is sentinel_config
+
+
+class TestCheckpointDtypeRestoration:
+    def test_checkpoint_tensor_dtypes_come_from_provided_state_dict(self):
+        from nemo_automodel.components.checkpoint.utils import _get_checkpoint_tensor_dtypes
+
+        state_dict = {
+            "linear.weight": torch.empty(2, 2, dtype=torch.bfloat16),
+            "norm.weight": torch.empty(2, dtype=torch.float32),
+        }
+
+        result = _get_checkpoint_tensor_dtypes("ignored", object(), {"state_dict": state_dict})
+
+        assert result == {
+            "linear.weight": torch.bfloat16,
+            "norm.weight": torch.float32,
+        }
+
+    def test_restore_loaded_model_dtype_uses_checkpoint_dtype_per_tensor(self):
+        from nemo_automodel._transformers.model_init import _restore_loaded_model_dtype
+
+        class DummyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(2, 2, bias=False)
+                self.norm = torch.nn.LayerNorm(2, elementwise_affine=True)
+
+        model = DummyModel().to(torch.float32)
+        with patch(
+            "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+            return_value={
+                "linear.weight": torch.bfloat16,
+                "norm.weight": torch.float32,
+            },
+        ):
+            _restore_loaded_model_dtype(
+                model,
+                "fake/model",
+                SimpleNamespace(),
+                quantization_config=None,
+                load_kwargs={},
+            )
+
+        assert model.linear.weight.dtype == torch.bfloat16
+        assert model.norm.weight.dtype == torch.float32
+
+    def test_restore_loaded_model_dtype_preserves_tied_weights(self):
+        from nemo_automodel._transformers.model_init import _restore_loaded_model_dtype
+
+        class DummyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = torch.nn.Embedding(4, 3)
+                self.lm_head = torch.nn.Linear(3, 4, bias=False)
+                self.lm_head.weight = self.embed_tokens.weight
+
+        model = DummyModel().to(torch.float32)
+        with patch(
+            "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+            return_value={"lm_head.weight": torch.bfloat16},
+        ):
+            _restore_loaded_model_dtype(
+                model,
+                "fake/model",
+                SimpleNamespace(),
+                quantization_config=None,
+                load_kwargs={},
+            )
+
+        assert model.lm_head.weight is model.embed_tokens.weight
+        assert model.lm_head.weight.dtype == torch.bfloat16
+        assert model.embed_tokens.weight.dtype == torch.bfloat16
 
 
 class TestFromConfigUnrecognizedModelType:

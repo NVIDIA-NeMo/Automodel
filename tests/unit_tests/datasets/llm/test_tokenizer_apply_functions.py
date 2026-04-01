@@ -30,11 +30,11 @@ import pytest
 
 from nemo_automodel.components.datasets.llm.formatting_utils import (
     _add_pad_token,
-    _pad_to_seq_length,
     _package_tokenized_example,
+    _pad_to_seq_length,
     _warned_add_pad_token,
-    format_prompt_completion,
     format_chat_template,
+    format_prompt_completion,
 )
 
 
