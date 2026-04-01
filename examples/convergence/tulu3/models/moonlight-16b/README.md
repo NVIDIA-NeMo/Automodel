@@ -16,7 +16,7 @@ All configs use `chat_template.jinja`, `seq_length: 2048`, `betas: [0.9, 0.95]`,
 **Important notes:**
 - Moonlight uses a custom TikToken-based tokenizer with special tokens `<|im_system|>`, `<|im_user|>`, `<|im_assistant|>`, `<|im_middle|>`, `<|im_end|>` — different from Qwen's `<|im_start|>/<|im_end|>` pattern.
 - The chat template (`chat_template.jinja`) uses `{% generation %}` tags to supervise only the assistant response content + `<|im_end|>`.
-- The TikToken tokenizer is handled natively: `_apply_chat_template_safe` provides a `char_to_token` fallback for `{% generation %}` mask computation, and `hasattr` guards prevent spurious BOS/EOS insertion.
+- The TikToken tokenizer is automatically converted to a native HF tokenizer at load time via `_try_convert_tiktoken_to_native`, enabling native `char_to_token()` support for `{% generation %}` mask computation.
 - `first_k_dense_replace: 1` — only layer 0 is dense, layers 1-26 are MoE.
 - `n_group: 1`, `topk_group: 1` — no expert grouping (unlike DeepSeek V3 which uses grouped routing).
 - `local_batch_size: 4` for both optimizers. Dataset must be pre-filtered to `seq_length=2048` to avoid OOM from variable-length batching with the large vocabulary (163840).
