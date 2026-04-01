@@ -77,8 +77,8 @@ def configure_torch_dynamo(cache_size_limit: int = 256, capture_scalar_outputs: 
     try:
         import torch._dynamo as dynamo
 
-        # Set cache size limit
-        dynamo.config.cache_size_limit = cache_size_limit
+        # Set cache size limit (never lower an already-higher value)
+        dynamo.config.cache_size_limit = max(dynamo.config.cache_size_limit, cache_size_limit)
         logger.debug(f"Set torch._dynamo cache_size_limit to {cache_size_limit}")
 
         # Configure scalar output capture if requested
@@ -249,7 +249,10 @@ def build_compile_config(cfg: Optional[Dict[str, Any]]) -> CompileConfig:
 # Apply Flash Attention fix when module is imported (dynamo config happens per-compilation)
 _FLASH_ATTENTION_FIX_APPLIED = apply_flash_attention_compile_fix()
 
-# Bump dynamo cache limit unconditionally so that per-method @torch.compile decorators
-# (e.g. Float32RMSNorm) don't hit FailOnRecompileLimitHit from varying guard states
-# (ndim, autocast, grad mode combinations). The default limit of 8 is too low.
-configure_torch_dynamo(cache_size_limit=64)
+# Set a reasonable dynamo cache limit at import time so that per-method @torch.compile
+# decorators (e.g. Float32RMSNorm) don't hit FailOnRecompileLimitHit from varying guard
+# states (ndim, autocast, grad mode combinations). The PyTorch default of 8 is too low.
+# When full model compile is enabled, configure_torch_dynamo is called again with the
+# user-configured value (default 256) via compile_model(), and the max() in
+# configure_torch_dynamo ensures the limit is never lowered.
+configure_torch_dynamo(cache_size_limit=256)
