@@ -481,8 +481,10 @@ class Checkpointer:
         # We need to set them to False and call initialize_weights to re-initialize the weights.
 
         # Some models cannot call initialize_weights when sharded with DTensors:
-        # - Gemma3ForConditionalGeneration: requires setting a row to zeros in the embedding matrix,
-        #   which is not supported for DTensors in the pinned torch version.
+        # - Gemma3ForConditionalGeneration / Gemma3ForCausalLM / Phi3ForCausalLM:
+        #   _init_weights() calls init.zeros_(module.weight[module.padding_idx]) on the
+        #   embedding layer, which triggers DTensor redistribute and fails with sharded
+        #   (TP) embeddings.
         # - NemotronHForCausalLM: the HF remote code's _init_weights uses dt_bias.copy_()
         #   which fails with DTensors. Note: v3 (MoE) has n_routed_experts and uses our custom
         #   implementation which handles this correctly.
@@ -491,7 +493,10 @@ class Checkpointer:
         except Exception:
             model_class = ""
         is_nemotron_v2 = model_class == "NemotronHForCausalLM" and not getattr(model.config, "n_routed_experts", None)
-        skip_initialize_weights = is_nemotron_v2
+        skip_initialize_weights = (
+            model_class in ["Gemma3ForConditionalGeneration", "Gemma3ForCausalLM", "Phi3ForCausalLM"]
+            or is_nemotron_v2
+        )
         if not skip_initialize_weights:
             for _, module in model.named_modules():
                 if hasattr(module, "_is_hf_initialized"):
