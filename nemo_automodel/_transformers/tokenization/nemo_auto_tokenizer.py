@@ -316,28 +316,28 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
     def apply_chat_template(self, conversation, *args, **kwargs):
         has_system = any(isinstance(m, dict) and m.get("role") == "system" for m in conversation)
         if not has_system:
-            return self._apply_chat_template_with_slow_fallback(conversation, *args, **kwargs)
+            return self._apply_chat_template_safe(conversation, *args, **kwargs)
 
         system_msgs = [m for m in conversation if isinstance(m, dict) and m.get("role") == "system"]
         if len(system_msgs) > 1:
             raise ValueError("System role appeared in multiple messages. Only a single system message is supported.")
 
         try:
-            return self._apply_chat_template_with_slow_fallback(conversation, *args, **kwargs)
+            return self._apply_chat_template_safe(conversation, *args, **kwargs)
         except TemplateError as e:
             if "System role not supported" not in str(e):
                 raise
             logger.debug("Chat template does not support system role; merging into first user message.")
             remapped = _remap_system_role(conversation)
-            return self._apply_chat_template_with_slow_fallback(remapped, *args, **kwargs)
+            return self._apply_chat_template_safe(remapped, *args, **kwargs)
 
-    def _apply_chat_template_with_slow_fallback(self, conversation, *args, **kwargs):
-        """Wrap apply_chat_template with a fallback for slow (Python) tokenizers.
+    def _apply_chat_template_safe(self, conversation, *args, **kwargs):
+        """Wrap apply_chat_template with a fallback for TikToken tokenizers.
 
         HF's apply_chat_template uses char_to_token() for generation masks,
-        which only works with fast (Rust) tokenizers. For slow tokenizers
-        (e.g. TikToken), we compute the mask by matching decoded tokens
-        against the rendered text to build a character-to-token mapping.
+        which is only available on native HF tokenizers. For TikToken-based
+        tokenizers we compute the mask by matching decoded tokens against
+        the rendered text to build a character-to-token mapping.
         """
         try:
             return super().apply_chat_template(conversation, *args, **kwargs)
@@ -345,7 +345,7 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
             if "char_to_token() is not available" not in str(e):
                 raise
 
-        # Slow tokenizer path.
+        # TikToken tokenizer path.
         from transformers.tokenization_utils_base import render_jinja_template
 
         return_assistant_tokens_mask = kwargs.get("return_assistant_tokens_mask", False)

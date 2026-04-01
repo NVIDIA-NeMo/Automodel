@@ -798,16 +798,16 @@ class TestTikTokenLikeTokenizerGuards:
             assert enc == [5, 6]
 
 
-class TestSlowTokenizerFallback:
-    """Tests for _apply_chat_template_with_slow_fallback — the fallback path
-    that handles slow (Python) tokenizers where char_to_token() is unavailable."""
+class TestApplyChatTemplateSafeFallback:
+    """Tests for _apply_chat_template_safe — the fallback path
+    that handles TikToken tokenizers where char_to_token() is unavailable."""
 
-    def _make_slow_tokenizer(self):
+    def _make_tiktoken_tokenizer(self):
         """Create a wrapped tokenizer that raises ValueError('char_to_token()
         is not available') when apply_chat_template is called with
         return_assistant_tokens_mask=True."""
 
-        class _SlowTokenizerStub(_StubHFTokenizer):
+        class _TikTokenStub(_StubHFTokenizer):
             bos_token = "<s>"
             eos_token = "</s>"
             chat_template = "dummy"
@@ -823,12 +823,12 @@ class TestSlowTokenizerFallback:
             def decode(self, token_ids, **kwargs):
                 return "".join(self._vocab.get(t, "?") for t in token_ids)
 
-        return _SlowTokenizerStub()
+        return _TikTokenStub()
 
     def test_fallback_triggers_on_char_to_token_error(self):
         """When the fast path raises 'char_to_token() is not available',
-        the slow fallback path should produce assistant_masks."""
-        stub = self._make_slow_tokenizer()
+        the TikToken fallback path should produce assistant_masks."""
+        stub = self._make_tiktoken_tokenizer()
         with (
             patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
@@ -868,7 +868,7 @@ class TestSlowTokenizerFallback:
     def test_fallback_disabled_when_mask_not_requested(self):
         """When return_assistant_tokens_mask=False, the fast path should be
         used even if char_to_token() is unavailable."""
-        stub = self._make_slow_tokenizer()
+        stub = self._make_tiktoken_tokenizer()
         with (
             patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
@@ -958,9 +958,9 @@ class TestSlowTokenizerFallback:
         assert result["assistant_masks"] == [1, 1, 1]
 
     def test_fallback_skips_when_tokenize_false(self):
-        """When tokenize=False the slow fallback should disable the mask and
+        """When tokenize=False the fallback should disable the mask and
         delegate to the base class."""
-        stub = self._make_slow_tokenizer()
+        stub = self._make_tiktoken_tokenizer()
 
         # Override to return a string when tokenize=False
         original_apply = stub.apply_chat_template
