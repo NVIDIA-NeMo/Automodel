@@ -117,3 +117,4 @@ wandb:
 
 ci:
   nodes: 4
+  time: "00:30:00"
