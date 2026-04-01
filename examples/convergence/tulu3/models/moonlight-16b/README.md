@@ -111,8 +111,8 @@ MoE load balancing is healthy: zero dead experts, diversity ~0.89 (1.0=uniform),
 
 - [x] Baselines established (pretrained model eval)
 - [x] Truncation rates checked, data pre-filtered and cached (4.2% removed)
-- [ ] Data validation passes (5/5 assertions)
-- [ ] Model verification passes (cosine sim > 0.99 vs HF)
+- [x] Data validation passes (5/5 assertions)
+- [x] Model verification passes (cosine sim > 0.99 vs HF)
 - [x] Training converges (loss decreasing, no NaN)
 - [x] SFT eval results (FlashAdamW + TE FusedAdam)
 - [x] Inference quality analysis (all 4 failure modes vs baseline)

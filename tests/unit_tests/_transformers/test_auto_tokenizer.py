@@ -49,6 +49,28 @@ class _StubHFTokenizer:
         return [5, 6]
 
 
+class _TikTokenLikeTokenizer:
+    """Stub that mimics a TikToken tokenizer without add_bos/eos_token attributes."""
+
+    def __init__(self, bos_id=101, eos_id=102):
+        self.bos_token_id = bos_id
+        self.eos_token_id = eos_id
+        self.bos_token = "<s>"
+        self.eos_token = "</s>"
+        # Deliberately does NOT have add_bos_token / add_eos_token
+
+    def __call__(self, *args, **kwargs):
+        return BatchEncoding(
+            {
+                "input_ids": [[5, 6]],
+                "attention_mask": [[1, 1]],
+            }
+        )
+
+    def encode(self, *args, **kwargs):
+        return [5, 6]
+
+
 class _StubConfig:
     model_type = "stub"
 
@@ -714,3 +736,252 @@ class TestSavePretrainedPreservesSpecialTokens:
 
         assert tok._original_tokenizer_config == src_config
         assert tok._original_tokenizer_class == "PreTrainedTokenizerFast"
+
+
+class TestTikTokenLikeTokenizerGuards:
+    """Tests for the hasattr guards that prevent forcing add_bos/eos_token
+    on tokenizers (like TikToken) that don't natively declare them."""
+
+    def test_from_pretrained_skips_bos_eos_when_not_declared(self):
+        """When a tokenizer lacks add_bos_token / add_eos_token attributes,
+        from_pretrained should not create them."""
+        stub = _TikTokenLikeTokenizer()
+        assert not hasattr(stub, "add_bos_token")
+        assert not hasattr(stub, "add_eos_token")
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
+            patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
+        ):
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            assert not hasattr(tok, "add_bos_token")
+            assert not hasattr(tok, "add_eos_token")
+
+    def test_from_pretrained_still_sets_bos_eos_when_declared(self):
+        """When a tokenizer declares add_bos_token / add_eos_token,
+        from_pretrained should set them as usual."""
+        stub = _StubHFTokenizer()
+        stub.bos_token = "<s>"
+        stub.eos_token = "</s>"
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
+            patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
+        ):
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            assert tok.add_bos_token is True
+            assert tok.add_eos_token is True
+
+    def test_call_no_bos_eos_when_attributes_missing(self):
+        """__call__ should not add BOS/EOS when add_bos_token / add_eos_token
+        attributes are absent (getattr defaults to False)."""
+        stub = _TikTokenLikeTokenizer()
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
+            patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
+        ):
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            out = tok(["x"])
+            assert isinstance(out, BatchEncoding)
+            # Should NOT have BOS/EOS prepended/appended
+            assert out["input_ids"] == [[5, 6]]
+            assert out["attention_mask"] == [[1, 1]]
+
+    def test_encode_no_bos_eos_when_attributes_missing(self):
+        """encode() should not add BOS/EOS when add_bos_token / add_eos_token
+        attributes are absent (getattr defaults to False)."""
+        stub = _TikTokenLikeTokenizer()
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
+            patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
+        ):
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            enc = tok.encode("x")
+            assert enc == [5, 6]
+
+
+class TestSlowTokenizerFallback:
+    """Tests for _apply_chat_template_with_slow_fallback — the fallback path
+    that handles slow (Python) tokenizers where char_to_token() is unavailable."""
+
+    def _make_slow_tokenizer(self):
+        """Create a wrapped tokenizer that raises ValueError('char_to_token()
+        is not available') when apply_chat_template is called with
+        return_assistant_tokens_mask=True."""
+
+        class _SlowTokenizerStub(_StubHFTokenizer):
+            bos_token = "<s>"
+            eos_token = "</s>"
+            chat_template = "dummy"
+            special_tokens_map = {}
+            _vocab = {10: "Hello", 11: " world", 12: "!"}
+
+            def apply_chat_template(self, conversation, *args, **kwargs):
+                if kwargs.get("return_assistant_tokens_mask", False):
+                    raise ValueError("char_to_token() is not available when a non-fast tokenizer is used")
+                # Without mask: return a dict with input_ids
+                return BatchEncoding({"input_ids": [10, 11, 12]})
+
+            def decode(self, token_ids, **kwargs):
+                return "".join(self._vocab.get(t, "?") for t in token_ids)
+
+        return _SlowTokenizerStub()
+
+    def test_fallback_triggers_on_char_to_token_error(self):
+        """When the fast path raises 'char_to_token() is not available',
+        the slow fallback path should produce assistant_masks."""
+        stub = self._make_slow_tokenizer()
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
+            patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
+        ):
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+
+        rendered_text = "Hello world!"
+        gen_ranges = [(6, 12)]  # " world!" is the assistant part
+
+        with patch(
+            "transformers.tokenization_utils_base.render_jinja_template",
+            return_value=([rendered_text], [gen_ranges]),
+        ):
+            result = tok.apply_chat_template(
+                [{"role": "user", "content": "Hi"}],
+                return_assistant_tokens_mask=True,
+                return_dict=True,
+                tokenize=True,
+            )
+
+        assert "assistant_masks" in result
+        assert result["input_ids"] == [10, 11, 12]
+        # "Hello" starts at 0 (not in range 6-12) -> 0
+        # " world" starts at 5 (not >= 6) -> 0
+        # Wait, let me think about this more carefully.
+        # Token 10 = "Hello" -> find("Hello", 0) = 0, pos becomes 5
+        # Token 11 = " world" -> find(" world", 5) = 5, pos becomes 11
+        # Token 12 = "!" -> find("!", 11) = 11, pos becomes 12
+        # token_char_start = [0, 5, 11]
+        # gen_ranges = [(6, 12)]
+        # Token 0: cs=0, 0 >= 6? No -> 0
+        # Token 1: cs=5, 5 >= 6? No -> 0
+        # Token 2: cs=11, 11 >= 6 and 11 < 12? Yes -> 1
+        # mask = [0, 0, 1]
+        assert result["assistant_masks"] == [0, 0, 1]
+
+    def test_fallback_disabled_when_mask_not_requested(self):
+        """When return_assistant_tokens_mask=False, the fast path should be
+        used even if char_to_token() is unavailable."""
+        stub = self._make_slow_tokenizer()
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
+            patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
+        ):
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+
+        result = tok.apply_chat_template(
+            [{"role": "user", "content": "Hi"}],
+            return_assistant_tokens_mask=False,
+            return_dict=True,
+            tokenize=True,
+        )
+        assert isinstance(result, BatchEncoding)
+        assert result["input_ids"] == [10, 11, 12]
+        assert "assistant_masks" not in result
+
+    def test_fallback_reraises_unrelated_valueerror(self):
+        """ValueError messages not about char_to_token() should propagate."""
+
+        class _BadTokenizer(_StubHFTokenizer):
+            bos_token = "<s>"
+            eos_token = "</s>"
+
+            def apply_chat_template(self, conversation, *args, **kwargs):
+                raise ValueError("completely unrelated error")
+
+        stub = _BadTokenizer()
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
+            patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
+        ):
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+
+        with pytest.raises(ValueError, match="completely unrelated error"):
+            tok.apply_chat_template(
+                [{"role": "user", "content": "Hi"}],
+                return_assistant_tokens_mask=True,
+                return_dict=True,
+                tokenize=True,
+            )
+
+    def test_fallback_handles_inserted_special_tokens(self):
+        """Tokens not found in the rendered text (e.g. BOS) should get
+        the current position as their char start."""
+
+        class _TokenizerWithBos(_StubHFTokenizer):
+            bos_token = "<s>"
+            eos_token = "</s>"
+            chat_template = "dummy"
+            special_tokens_map = {}
+            _vocab = {1: "<s>", 10: "Hi", 11: " there"}
+
+            def apply_chat_template(self, conversation, *args, **kwargs):
+                if kwargs.get("return_assistant_tokens_mask", False):
+                    raise ValueError("char_to_token() is not available")
+                return BatchEncoding({"input_ids": [1, 10, 11]})
+
+            def decode(self, token_ids, **kwargs):
+                return "".join(self._vocab.get(t, "?") for t in token_ids)
+
+        stub = _TokenizerWithBos()
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
+            patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
+        ):
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+
+        # Rendered text does NOT contain "<s>" — it's an inserted BOS
+        rendered_text = "Hi there"
+        gen_ranges = [(0, 8)]  # entire text is assistant
+
+        with patch(
+            "transformers.tokenization_utils_base.render_jinja_template",
+            return_value=([rendered_text], [gen_ranges]),
+        ):
+            result = tok.apply_chat_template(
+                [{"role": "user", "content": "Hi"}],
+                return_assistant_tokens_mask=True,
+                return_dict=True,
+                tokenize=True,
+            )
+
+        assert result["input_ids"] == [1, 10, 11]
+        # BOS token "<s>" is not in rendered text "Hi there" → char_start = 0, within [0,8) → 1
+        # "Hi" found at 0, pos becomes 2, char_start = 0, within [0,8) → 1
+        # " there" found at 2, pos becomes 8, char_start = 2, within [0,8) → 1
+        assert result["assistant_masks"] == [1, 1, 1]
+
+    def test_fallback_skips_when_tokenize_false(self):
+        """When tokenize=False the slow fallback should disable the mask and
+        delegate to the base class."""
+        stub = self._make_slow_tokenizer()
+
+        # Override to return a string when tokenize=False
+        original_apply = stub.apply_chat_template
+
+        def _apply(conversation, *args, **kwargs):
+            if not kwargs.get("tokenize", True):
+                return "rendered text"
+            return original_apply(conversation, *args, **kwargs)
+
+        stub.apply_chat_template = _apply
+
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
+            patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
+        ):
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+
+        result = tok.apply_chat_template(
+            [{"role": "user", "content": "Hi"}],
+            return_assistant_tokens_mask=True,
+            return_dict=True,
+            tokenize=False,
+        )
+        assert result == "rendered text"

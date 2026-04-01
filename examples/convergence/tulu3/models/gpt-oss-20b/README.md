@@ -91,7 +91,7 @@ All evals use recommended sampling: `temp=1.0, top_p=1.0`.
 
 - [x] Baselines established (base model eval + inference quality)
 - [x] Truncation rates checked, data pre-filtered and cached (4.2% removed)
-- [ ] Data validation passes (5/5 assertions)
+- [x] Data validation passes (5/5 assertions)
 - [x] Model verification passes (cosine sim > 0.99 vs HF)
 - [x] Training converges (loss decreasing, no NaN)
 - [x] SFT eval results (FlashAdamW + TE FusedAdam)
