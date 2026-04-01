@@ -43,6 +43,8 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --distributed.sequence_parallel false \
     --hf_kl_threshold 5e-3 \
     --tokenizer_name mistralai/Ministral-3-3B-Instruct-2512 \
+    --cross_tp_size 2 \
+    --cross_tp_kl_threshold 5e-3 \
     --check_resume
 
 # Step 2: PEFT checkpoint robustness

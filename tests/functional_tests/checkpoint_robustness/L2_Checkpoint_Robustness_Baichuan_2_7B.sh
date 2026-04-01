@@ -44,6 +44,8 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --hf_kl_threshold 5e-3 \
     --trust_remote_code \
     --tokenizer_name baichuan-inc/Baichuan2-7B-Chat \
+    --cross_tp_size 2 \
+    --cross_tp_kl_threshold 5e-3 \
     --check_resume
 
 # Step 2: PEFT checkpoint robustness

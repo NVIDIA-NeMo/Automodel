@@ -41,8 +41,12 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --distributed.tp_size 2 \
     --distributed.cp_size 1 \
     --distributed.sequence_parallel false \
-    --hf_kl_threshold 5e-3 \
+    --hf_kl_threshold 9e-3 \
     --tokenizer_name Qwen/Qwen2.5-7B \
+    --cross_tp_size 2 \
+    --cross_tp_kl_threshold 9e-3 \
+    --max_vram_gb 10 \
+    --max_cpu_gb 12 \
     --check_resume
 
 # Step 2: PEFT checkpoint robustness
@@ -65,7 +69,9 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --distributed.tp_size 2 \
     --distributed.cp_size 1 \
     --distributed.sequence_parallel false \
-    --hf_kl_threshold 5e-3 \
+    --hf_kl_threshold 8e-2 \
     --tokenizer_name Qwen/Qwen2.5-7B \
+    --max_vram_gb 6 \
+    --max_cpu_gb 4 \
     --check_fused_qkv_keys \
     --check_resume

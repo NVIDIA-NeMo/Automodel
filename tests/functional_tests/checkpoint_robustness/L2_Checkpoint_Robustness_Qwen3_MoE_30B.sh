@@ -43,9 +43,11 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --distributed.ep_size 8 \
     --distributed.cp_size 1 \
     --distributed.sequence_parallel false \
-    --hf_kl_threshold 7e-2 \
+    --hf_kl_threshold 1e-4 \
     --trust_remote_code \
-    --tokenizer_name Qwen/Qwen3-30B-A3B
+    --tokenizer_name Qwen/Qwen3-30B-A3B \
+    --max_vram_gb 34 \
+    --max_cpu_gb 26
     # TODO: --check_resume disabled for MoE — DeepEP expert routing is non-deterministic,
     # causing loss diff between fresh and resumed runs. Needs --resume_loss_threshold flag.
     # --check_resume

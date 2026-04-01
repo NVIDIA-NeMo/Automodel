@@ -369,3 +369,7 @@ def test_checkpoint_robustness():
         del resume_trainer
         torch.cuda.empty_cache()
         _barrier()
+
+
+if __name__ == "__main__":
+    test_checkpoint_robustness()
