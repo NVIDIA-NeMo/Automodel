@@ -31,6 +31,8 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --step_scheduler.local_batch_size 2 \
     --step_scheduler.ckpt_every_steps 5 \
     --step_scheduler.val_every_steps 5 \
+    --dataset.limit_dataset_samples 500 \
+    --validation_dataset.limit_dataset_samples 500 \
     --checkpoint.enabled true \
     --checkpoint.checkpoint_dir "$SFT_CKPT_DIR" \
     --checkpoint.model_save_format safetensors \
@@ -54,6 +56,8 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --step_scheduler.local_batch_size 2 \
     --step_scheduler.ckpt_every_steps 5 \
     --step_scheduler.val_every_steps 5 \
+    --dataset.limit_dataset_samples 500 \
+    --validation_dataset.limit_dataset_samples 500 \
     --checkpoint.enabled true \
     --checkpoint.checkpoint_dir "$PEFT_CKPT_DIR" \
     --checkpoint.save_consolidated true \

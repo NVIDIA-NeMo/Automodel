@@ -83,6 +83,7 @@ _OVERRIDES = [
     "distributed.activation_checkpointing",
     "dataset._target_",
     "dataset.path_or_dataset",
+    "dataset.num_samples_limit",
     "validation_dataset.path_or_dataset",
     "validation_dataset.split",
     "validation_dataset.num_samples_limit",

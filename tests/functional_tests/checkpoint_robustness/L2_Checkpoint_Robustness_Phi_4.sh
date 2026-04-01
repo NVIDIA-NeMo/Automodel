@@ -31,17 +31,21 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --step_scheduler.local_batch_size 2 \
     --step_scheduler.ckpt_every_steps 5 \
     --step_scheduler.val_every_steps 5 \
+    --dataset.limit_dataset_samples 500 \
+    --validation_dataset.limit_dataset_samples 500 \
     --checkpoint.enabled true \
     --checkpoint.checkpoint_dir "$SFT_CKPT_DIR" \
     --checkpoint.model_save_format safetensors \
     --checkpoint.save_consolidated true \
     --distributed.dp_size none \
-    --distributed.tp_size 2 \
+    --distributed.tp_size 1 \
     --distributed.cp_size 1 \
     --distributed.sequence_parallel false \
-    --hf_kl_threshold 5e-3 \
+    --hf_kl_threshold 1.2e-3 \
     --trust_remote_code \
     --tokenizer_name microsoft/phi-4 \
+    --max_vram_gb 19 \
+    --max_cpu_gb 15 \
     --check_resume
 
 # Step 2: PEFT checkpoint robustness
@@ -54,15 +58,19 @@ python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 \
     --step_scheduler.local_batch_size 2 \
     --step_scheduler.ckpt_every_steps 5 \
     --step_scheduler.val_every_steps 5 \
+    --dataset.limit_dataset_samples 500 \
+    --validation_dataset.limit_dataset_samples 500 \
     --checkpoint.enabled true \
     --checkpoint.checkpoint_dir "$PEFT_CKPT_DIR" \
     --checkpoint.save_consolidated true \
     --peft.use_triton false \
     --distributed.dp_size none \
-    --distributed.tp_size 2 \
+    --distributed.tp_size 1 \
     --distributed.cp_size 1 \
     --distributed.sequence_parallel false \
-    --hf_kl_threshold 5e-3 \
+    --hf_kl_threshold 1e-3 \
     --trust_remote_code \
     --tokenizer_name microsoft/phi-4 \
+    --max_vram_gb 11 \
+    --max_cpu_gb 3 \
     --check_resume
