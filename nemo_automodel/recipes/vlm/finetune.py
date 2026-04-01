@@ -235,7 +235,15 @@ def build_loss_fn(cfg_loss):
 
 
 def build_dataloader(
-    cfg_ds, cfg_dl, pretrained_model_name_or_path, cfg_processor, device_mesh, seed, local_batch_size
+    cfg_ds,
+    cfg_dl,
+    pretrained_model_name_or_path,
+    cfg_processor,
+    device_mesh,
+    seed,
+    local_batch_size,
+    cfg_model=None,
+    cfg_ps=None,
 ) -> tuple[DataLoader, ProcessorMixin]:
     """Build a DataLoader for the VLM dataset.
 
@@ -247,6 +255,9 @@ def build_dataloader(
         device_mesh: Device mesh for distributed training.
         seed: Random seed.
         local_batch_size: Local batch size.
+        cfg_model: Model configuration (used to detect attention backend).
+        cfg_ps: Packed sequence configuration (top-level ``packed_sequence:`` section).
+            When provided, takes precedence over ``dataset.packing``.
 
     Returns:
         The instantiated DataLoader and processor.
@@ -287,19 +298,86 @@ def build_dataloader(
 
             ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
 
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            ds,
-            **dist_sampler_kwargs,
-        )
-        collate_cfg = cfg_dl.get("collate_fn", None)
-        if collate_cfg:
-            collate_fn = lambda examples: collate_cfg.instantiate(examples=examples, processor=processor)
+        # Resolve packing config: top-level packed_sequence (LLM-style) takes
+        # precedence over legacy dataset.packing (backward compat).
+        if cfg_ps is not None:
+            _ps_enabled = getattr(cfg_ps, "pack_size", 0) > 0
+            packing_cfg = cfg_ps if _ps_enabled else None
+            pretokenize = getattr(cfg_ps, "pretokenize", _ps_enabled)
+            max_length = getattr(cfg_ps, "max_length", None)
         else:
-            processor_type = type(processor).__name__
-            if processor_type not in COLLATE_FNS:
-                processor_type = "default"
-                logging.warning(f"You are using {processor_type} with default collate function.")
-            collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
+            _legacy = cfg_ds.get("packing", None)
+            _ps_enabled = _legacy is not None and _legacy.get("enabled", False)
+            packing_cfg = _legacy if _ps_enabled else None
+            pretokenize = cfg_ds.get("pretokenize", False)
+            max_length = cfg_ds.get("max_length", None)
+
+        if pretokenize:
+            from nemo_automodel.components.datasets.vlm.collate_fns import pad_collate_fn
+            from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
+
+            ds_raw = ds
+            ds = PreTokenizedDatasetWrapper(ds_raw, processor, max_length=max_length)
+
+            if packing_cfg:
+                from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+                from nemo_automodel.components.datasets.vlm.neat_packing_vlm import neat_pack_dataset_vlm
+                from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+
+                ds = neat_pack_dataset_vlm(
+                    ds,
+                    pack_size=packing_cfg.get("pack_size", max_length),
+                    padding_idx=getattr(processor.tokenizer, "pad_token_id", 0) or 0,
+                    drop_long_samples=packing_cfg.get("drop_long_samples", False),
+                    max_packs=packing_cfg.get("max_packs", None),
+                    ds_raw=ds_raw,
+                    packing_ratio=packing_cfg.get("packing_ratio", 1.0),
+                    processor=processor,
+                    balance_media_tokens=packing_cfg.get("balance_media_tokens", True),
+                )
+                _pad_id = getattr(processor.tokenizer, "pad_token_id", 0) or 0
+                _collate_max_length = packing_cfg.get("collate_max_length", None)
+                _attn_impl = get_attn_implementation(cfg_model)
+
+                configure_packing(attn_implementation=_attn_impl)
+                logging.info(f"Configured VLM neat packing for attn_implementation={_attn_impl}")
+
+                collate_fn = (
+                    lambda examples, _pi=_pad_id, _ml=_collate_max_length, _ai=_attn_impl: neat_packed_vlm_collater(
+                        examples,
+                        padding_idx=_pi,
+                        max_length=_ml,
+                        attn_implementation=_ai,
+                    )
+                )
+            else:
+                collate_cfg = cfg_dl.get("collate_fn", None)
+                if collate_cfg:
+                    collate_fn = lambda examples: collate_cfg.instantiate(examples=examples, processor=processor)
+                else:
+                    collate_fn = lambda examples: pad_collate_fn(examples, processor)
+
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                ds,
+                **dist_sampler_kwargs,
+            )
+        else:
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                ds,
+                **dist_sampler_kwargs,
+            )
+            collate_cfg = cfg_dl.get("collate_fn", None)
+            if collate_cfg:
+                collate_fn = lambda examples: collate_cfg.instantiate(examples=examples, processor=processor)
+            else:
+                processor_type = type(processor).__name__
+                if processor_type not in COLLATE_FNS:
+                    logging.warning(f"You are using {processor_type} with default collate function.")
+                    processor_type = "default"
+                collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
+
+        if hasattr(ds, "robust_collate"):
+            collate_fn = ds.robust_collate(collate_fn)
 
         return cfg_dl.instantiate(
             dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=local_batch_size
@@ -617,6 +695,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             device_mesh=self.device_mesh,
             seed=self.cfg.get("seed", 42),
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+            cfg_model=self.cfg.model,
+            cfg_ps=self.cfg.get("packed_sequence", None),
         )
 
         # Build validation dataloader if the config provides it
