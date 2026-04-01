@@ -278,6 +278,7 @@ class ChatDataset(Dataset):
         start_of_turn_token: Optional[str] = None,
         chat_template: Optional[str] = None,
         shuffle_seed: Optional[int] = None,
+        mask_reasoning_content: bool = False,
     ) -> None:
         if tokenizer is None:
             raise ValueError("Tokenizer is required")
@@ -294,6 +295,7 @@ class ChatDataset(Dataset):
         self.padding = padding
         self.truncation = truncation
         self.start_of_turn_token = start_of_turn_token
+        self.mask_reasoning_content = mask_reasoning_content
 
         self.dataset = _load_openai_messages(path_or_dataset_id, split=split, name=name, shuffle_seed=shuffle_seed)
 
@@ -325,5 +327,6 @@ class ChatDataset(Dataset):
             padding=self.padding,
             truncation=self.truncation,
             tools=tools,
+            mask_reasoning_content=self.mask_reasoning_content,
         )
         return sample

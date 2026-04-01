@@ -133,6 +133,53 @@ class _StubTokenizerChat(_StubTokenizerPlain):  # noqa: D401
         return super().__call__(text, add_special_tokens=add_special_tokens)
 
 
+class _StubTokenizerChatWithReasoning(_StubTokenizerPlain):  # noqa: D401
+    """Chat-template tokenizer with generation blocks and explicit reasoning output."""
+
+    chat_template = "<dummy reasoning_content {% generation %} template>"
+    _start_of_turn_token_id = 99
+
+    def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
+        ids: List[int] = [self._start_of_turn_token_id]
+        assistant_mask: List[int] = [0]
+
+        for msg in messages:
+            role_token = self._id_for_token(f"<{msg['role']}>")
+            ids.append(role_token)
+            is_assistant = msg["role"] == "assistant"
+            assistant_mask.append(1 if is_assistant else 0)
+
+            if msg["role"] != "assistant":
+                for tok in msg["content"].split():
+                    ids.append(self._id_for_token(tok))
+                    assistant_mask.append(0)
+                continue
+
+            reasoning = msg.get("reasoning_content", "")
+            if reasoning:
+                ids.append(self._id_for_token("<think>"))
+                assistant_mask.append(1)
+                for tok in reasoning.split():
+                    ids.append(self._id_for_token(tok))
+                    assistant_mask.append(1)
+                ids.append(self._id_for_token("</think>"))
+                assistant_mask.append(1)
+
+            for tok in msg["content"].split():
+                ids.append(self._id_for_token(tok))
+                assistant_mask.append(1)
+
+        ids.append(self.eos_token_id)
+        assistant_mask.append(1 if any(msg["role"] == "assistant" for msg in messages) else 0)
+
+        if kwargs.get("return_dict", False):
+            result = {"input_ids": ids}
+            if kwargs.get("return_assistant_tokens_mask", False):
+                result["assistant_masks"] = assistant_mask
+            return result
+        return ids
+
+
 def testformat_prompt_completion_answer_only_mask():
     tok = _StubTokenizerPlain()
     context = "Context"
@@ -229,6 +276,43 @@ def test_apply_tokenizer_chat_template_full_loss_mask():
     assert set(out) == {"input_ids", "labels", "attention_mask"}
     assert len(out["input_ids"]) == len(out["labels"]) == len(out["attention_mask"])
     assert all(v == 1 for v in out["attention_mask"])
+
+
+def test_apply_chat_template_can_mask_reasoning_content_generation_kwd():
+    tok = _StubTokenizerChatWithReasoning()
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "reasoning_content": "think step", "content": "final answer"},
+    ]
+
+    unmasked = format_chat_template(
+        tok,
+        formatted_text=[m.copy() for m in messages],
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        mask_reasoning_content=False,
+    )
+    masked = format_chat_template(
+        tok,
+        formatted_text=[m.copy() for m in messages],
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        mask_reasoning_content=True,
+    )
+
+    think_id = tok._id_for_token("think")
+    step_id = tok._id_for_token("step")
+    final_id = tok._id_for_token("final")
+    answer_id = tok._id_for_token("answer")
+
+    assert think_id in masked["input_ids"] and step_id in masked["input_ids"]
+    assert masked["labels"][masked["input_ids"].index(think_id)] == -100
+    assert masked["labels"][masked["input_ids"].index(step_id)] == -100
+    assert masked["labels"][masked["input_ids"].index(final_id)] != -100
+    assert masked["labels"][masked["input_ids"].index(answer_id)] != -100
+    assert sum(1 for value in masked["labels"] if value != -100) < sum(
+        1 for value in unmasked["labels"] if value != -100
+    )
 
 
 class _StubTokenizerChatNoGen:
@@ -380,6 +464,57 @@ def test_apply_chat_template_warns_when_reasoning_content_is_unused(caplog):
         )
 
     assert "reasoning_content" in caplog.text
+
+
+class _StubTokenizerChatNoGenWithReasoning(_StubTokenizerChatNoGen):
+    """Non-generation tokenizer that renders reasoning_content before assistant content."""
+
+    chat_template = "<dummy reasoning_content template>"
+
+    def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
+        ids: List[int] = [self._start_of_turn_token_id]
+        for msg in messages:
+            ids.append(self._id_for_token(f"<{msg['role']}>"))
+            if msg["role"] == "assistant":
+                reasoning = msg.get("reasoning_content", "")
+                if reasoning:
+                    ids.append(self._id_for_token("<think>"))
+                    ids.extend(self._id_for_token(tok) for tok in reasoning.split())
+                    ids.append(self._id_for_token("</think>"))
+                ids.extend(self._id_for_token(tok) for tok in str(msg["content"]).split())
+            else:
+                ids.extend(self._id_for_token(tok) for tok in str(msg["content"]).split())
+        ids.append(self.eos_token_id)
+        if kwargs.get("return_dict", False):
+            return {"input_ids": ids}
+        return ids
+
+
+def test_apply_chat_template_can_mask_reasoning_content_without_generation_kwd():
+    tok = _StubTokenizerChatNoGenWithReasoning()
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "reasoning_content": "think step", "content": "final answer"},
+    ]
+
+    masked = format_chat_template(
+        tok,
+        formatted_text=[m.copy() for m in messages],
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        answer_only_loss_mask=True,
+        mask_reasoning_content=True,
+    )
+
+    think_id = tok._id_for_token("think")
+    step_id = tok._id_for_token("step")
+    final_id = tok._id_for_token("final")
+    answer_id = tok._id_for_token("answer")
+
+    assert masked["labels"][masked["input_ids"].index(think_id)] == -100
+    assert masked["labels"][masked["input_ids"].index(step_id)] == -100
+    assert masked["labels"][masked["input_ids"].index(final_id)] != -100
+    assert masked["labels"][masked["input_ids"].index(answer_id)] != -100
 
 
 # pad_token_id == eos_token_id overlap tests

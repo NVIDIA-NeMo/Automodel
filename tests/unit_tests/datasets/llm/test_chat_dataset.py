@@ -269,7 +269,14 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
 
     monkeypatch.setattr(tcd, "_load_openai_messages", lambda *a, **k: dataset_rows)
 
-    ds = tcd.ChatDataset("ignored", tok, seq_length=16, start_of_turn_token="<|sot|>", chat_template="OVERRIDE")
+    ds = tcd.ChatDataset(
+        "ignored",
+        tok,
+        seq_length=16,
+        start_of_turn_token="<|sot|>",
+        chat_template="OVERRIDE",
+        mask_reasoning_content=True,
+    )
 
     # init effects
     assert ds.pad_token_id == 3  # from _add_pad_token
@@ -283,6 +290,7 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
     # Verify calls captured the tools argument behavior
     assert calls[0]["kwargs"]["tools"] == dataset_rows[0]["tools"]
     assert calls[1]["kwargs"]["tools"] is None
+    assert calls[0]["kwargs"]["mask_reasoning_content"] is True
 
     # Bad row: messages not a list → ValueError
     monkeypatch.setattr(tcd, "_load_openai_messages", lambda *a, **k: [{"messages": "oops"}])

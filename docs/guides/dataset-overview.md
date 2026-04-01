@@ -107,6 +107,7 @@ See the detailed guide, [Column-Mapped Text Instruction Dataset](llm/column-mapp
   - `truncation`: truncation strategy ("do_not_truncate", "longest_first", etc.)
   - `start_of_turn_token`: token marking assistant response start (for answer-only loss)
   - `chat_template`: optional override for tokenizer's chat template
+  - `mask_reasoning_content`: optionally exclude rendered `reasoning_content` tokens from loss
 :::{note}
 - Requires a tokenizer with chat template support
 - Supports both single-turn and multi-turn tool calling
@@ -116,6 +117,7 @@ See the detailed guide, [Column-Mapped Text Instruction Dataset](llm/column-mapp
 - Tool responses use the `tool` role and must include `tool_call_id`
 - If your dataset contains `reasoning_content`, your chat template must render it explicitly or it will be dropped
 - For multi-turn tool-calling datasets, prefer chat templates that use `{% generation %}` blocks so assistant-turn loss masking is exact
+- Set `mask_reasoning_content: true` if you want to train on the final assistant answer while excluding rendered reasoning traces from loss
 :::
 - Example YAML:
 ```yaml
@@ -128,6 +130,7 @@ dataset:
     pretrained_model_name_or_path: google/functiongemma-270m-it
   seq_length: 2048
   start_of_turn_token: "<start_of_turn>"
+  mask_reasoning_content: false
 ```
   - Expected data format (OpenAI messages format):
 ```json

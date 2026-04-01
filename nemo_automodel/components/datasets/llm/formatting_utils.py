@@ -16,7 +16,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
 
@@ -79,9 +79,31 @@ def _tokenized_chat_length(
     return len(tokenized_chat.get("input_ids", []))
 
 
+def _tokenize_chat(
+    tokenizer: "PreTrainedTokenizer",
+    messages: List[Dict[str, Any]],
+    *,
+    tools: Optional[List[Dict]] = None,
+    truncation: Union[str, bool] = "do_not_truncate",
+    seq_length: Optional[int] = None,
+) -> List[int]:
+    """Tokenize chat messages without padding and return input ids."""
+    tokenized_chat = tokenizer.apply_chat_template(
+        messages,
+        tools=tools,
+        tokenize=True,
+        return_dict=True,
+        return_assistant_tokens_mask=False,
+        padding=False,
+        truncation=truncation,
+        max_length=seq_length,
+    )
+    return tokenized_chat.get("input_ids", [])
+
+
 def _build_multiturn_assistant_mask(
     tokenizer: "PreTrainedTokenizer",
-    formatted_text: List[Dict[str, str]],
+    formatted_text: List[Dict[str, Any]],
     input_ids: List[int],
     *,
     tools: Optional[List[Dict]] = None,
@@ -118,6 +140,95 @@ def _build_multiturn_assistant_mask(
         raise AssertionError("At least one assistant message is required when answer_only_loss_mask=True")
 
     return assistant_mask
+
+
+def _masked_reasoning_message(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of a message with reasoning_content removed."""
+    masked = dict(message)
+    masked["reasoning_content"] = ""
+    return masked
+
+
+def _find_reasoning_span(full_segment: List[int], masked_segment: List[int]) -> Optional[tuple[int, int]]:
+    """Locate the contiguous token span attributable to reasoning content."""
+    prefix_len = 0
+    while (
+        prefix_len < min(len(full_segment), len(masked_segment))
+        and full_segment[prefix_len] == masked_segment[prefix_len]
+    ):
+        prefix_len += 1
+
+    suffix_len = 0
+    max_suffix = min(len(full_segment) - prefix_len, len(masked_segment) - prefix_len)
+    while suffix_len < max_suffix and full_segment[-(suffix_len + 1)] == masked_segment[-(suffix_len + 1)]:
+        suffix_len += 1
+
+    reasoning_start = prefix_len
+    reasoning_end = len(full_segment) - suffix_len
+    if reasoning_end <= reasoning_start:
+        return None
+
+    return reasoning_start, reasoning_end
+
+
+def _build_reasoning_mask(
+    tokenizer: "PreTrainedTokenizer",
+    formatted_text: List[Dict[str, Any]],
+    input_ids: List[int],
+    *,
+    tools: Optional[List[Dict]] = None,
+    truncation: Union[str, bool] = "do_not_truncate",
+    seq_length: Optional[int] = None,
+) -> List[int]:
+    """Build a token mask for reasoning_content spans inside assistant turns."""
+    reasoning_mask = [0] * len(input_ids)
+
+    for idx, message in enumerate(formatted_text):
+        if message.get("role") != "assistant" or not message.get("reasoning_content"):
+            continue
+
+        prefix_ids = _tokenize_chat(
+            tokenizer,
+            formatted_text[:idx],
+            tools=tools,
+            truncation=truncation,
+            seq_length=seq_length,
+        )
+        full_ids = _tokenize_chat(
+            tokenizer,
+            formatted_text[: idx + 1],
+            tools=tools,
+            truncation=truncation,
+            seq_length=seq_length,
+        )
+        masked_ids = _tokenize_chat(
+            tokenizer,
+            formatted_text[:idx] + [_masked_reasoning_message(message)],
+            tools=tools,
+            truncation=truncation,
+            seq_length=seq_length,
+        )
+
+        start = len(prefix_ids)
+        full_segment = full_ids[start:]
+        masked_segment = masked_ids[start:]
+        span = _find_reasoning_span(full_segment, masked_segment)
+        if span is None:
+            logger.warning(
+                "Could not isolate reasoning_content tokens for assistant message %s. "
+                "Leave `mask_reasoning_content=False` or ensure the chat template renders "
+                "reasoning_content in a distinct block.",
+                idx,
+            )
+            continue
+
+        reasoning_start, reasoning_end = span
+        for pos in range(
+            min(start + reasoning_start, len(reasoning_mask)), min(start + reasoning_end, len(reasoning_mask))
+        ):
+            reasoning_mask[pos] = 1
+
+    return reasoning_mask
 
 
 @torch.no_grad()
@@ -363,7 +474,7 @@ def format_prompt_completion(
 
 def format_chat_template(
     tokenizer: "PreTrainedTokenizer",
-    formatted_text: List[Dict[str, str]],
+    formatted_text: List[Dict[str, Any]],
     eos_token_id: int,
     pad_token_id: int,
     seq_length: Optional[int] = None,
@@ -371,6 +482,7 @@ def format_chat_template(
     truncation: Union[str, bool] = "do_not_truncate",
     tools: Optional[List[Dict]] = None,
     answer_only_loss_mask: bool = True,
+    mask_reasoning_content: bool = False,
 ) -> Dict[str, List[int]]:
     """
     Format a chat template style example.
@@ -383,6 +495,7 @@ def format_chat_template(
         seq_length: Optional sequence length for padding.
         tools: Optional list of tool definitions for function calling.
         answer_only_loss_mask: Whether to compute the loss mask only on the answer tokens.
+        mask_reasoning_content: Whether to exclude rendered reasoning_content tokens from loss.
 
     Returns:
         A dictionary with the formatted example.
@@ -436,6 +549,17 @@ def format_chat_template(
         for i in range(min(len(mask), len(tokenizer_attn_mask))):
             if not tokenizer_attn_mask[i]:
                 mask[i] = 0
+
+    if mask_reasoning_content and has_reasoning_content:
+        reasoning_mask = _build_reasoning_mask(
+            tokenizer,
+            formatted_text,
+            input_ids,
+            tools=tools,
+            truncation=truncation,
+            seq_length=seq_length,
+        )
+        mask = [assistant if not reasoning else 0 for assistant, reasoning in zip(mask, reasoning_mask)]
 
     return _package_tokenized_example(
         tokenizer=tokenizer,
