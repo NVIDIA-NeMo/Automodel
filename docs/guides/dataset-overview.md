@@ -110,9 +110,12 @@ See the detailed guide, [Column-Mapped Text Instruction Dataset](llm/column-mapp
 :::{note}
 - Requires a tokenizer with chat template support
 - Supports both single-turn and multi-turn tool calling
+- Assistant messages may also include `reasoning_content` for structured reasoning traces
 - Tool definitions are provided in a `tools` field at the conversation level
 - Tool calls appear in assistant messages through the `tool_calls` field
-- Tool responses use the `tool` role
+- Tool responses use the `tool` role and must include `tool_call_id`
+- If your dataset contains `reasoning_content`, your chat template must render it explicitly or it will be dropped
+- For multi-turn tool-calling datasets, prefer chat templates that use `{% generation %}` blocks so assistant-turn loss masking is exact
 :::
 - Example YAML:
 ```yaml
@@ -131,11 +134,16 @@ dataset:
 {
   "messages": [
     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+    },
+    {
       "role": "user",
-      "content": "What's the weather in Seattle?"
+      "content": "What's the weather in Seattle and should I bring an umbrella?"
     },
     {
       "role": "assistant",
+      "reasoning_content": "The user wants weather info and advice. I should call get_weather first, then decide whether an umbrella is needed.",
       "content": "",
       "tool_calls": [
         {
@@ -151,11 +159,12 @@ dataset:
     {
       "role": "tool",
       "tool_call_id": "call_1",
-      "content": "{\"temperature\": 65, \"condition\": \"cloudy\"}"
+      "content": "{\"temperature\": 55, \"condition\": \"rain\", \"precipitation_chance\": 0.85}"
     },
     {
       "role": "assistant",
-      "content": "It's 65°F and cloudy in Seattle."
+      "reasoning_content": "It is raining with a high precipitation chance, so I should recommend bringing an umbrella.",
+      "content": "It's currently 55 degrees F and raining in Seattle with an 85% chance of continued precipitation. Yes, definitely bring an umbrella."
     }
   ],
   "tools": [
@@ -175,6 +184,17 @@ dataset:
     }
   ]
 }
+```
+  - Template requirement example for `reasoning_content`:
+```jinja
+{%- if message.reasoning_content %}
+{% generation %}
+{{ "<think>\n" + message.reasoning_content + "\n</think>\n" }}
+{% endgeneration %}
+{%- endif %}
+{% generation %}
+{{ message.content }}
+{% endgeneration %}
 ```
   - For single-turn tool calling (one tool call per conversation), omit the tool response and final assistant message:
 ```json

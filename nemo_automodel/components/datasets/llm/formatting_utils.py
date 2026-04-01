@@ -57,6 +57,69 @@ if TYPE_CHECKING:
 GENERATION_REGEX = re.compile(r"\{%-?\s+generation\s+-?%\}")
 
 
+def _tokenized_chat_length(
+    tokenizer: "PreTrainedTokenizer",
+    messages: List[Dict[str, str]],
+    *,
+    tools: Optional[List[Dict]] = None,
+    truncation: Union[str, bool] = "do_not_truncate",
+    seq_length: Optional[int] = None,
+) -> int:
+    """Return the tokenized chat length for a message prefix without padding."""
+    tokenized_chat = tokenizer.apply_chat_template(
+        messages,
+        tools=tools,
+        tokenize=True,
+        return_dict=True,
+        return_assistant_tokens_mask=False,
+        padding=False,
+        truncation=truncation,
+        max_length=seq_length,
+    )
+    return len(tokenized_chat.get("input_ids", []))
+
+
+def _build_multiturn_assistant_mask(
+    tokenizer: "PreTrainedTokenizer",
+    formatted_text: List[Dict[str, str]],
+    input_ids: List[int],
+    *,
+    tools: Optional[List[Dict]] = None,
+    truncation: Union[str, bool] = "do_not_truncate",
+    seq_length: Optional[int] = None,
+) -> List[int]:
+    """Build a fallback loss mask that supervises every assistant turn."""
+    assistant_mask = [0] * len(input_ids)
+    found_assistant = False
+
+    for idx, message in enumerate(formatted_text):
+        if message["role"] != "assistant":
+            continue
+
+        found_assistant = True
+        start = _tokenized_chat_length(
+            tokenizer,
+            formatted_text[:idx],
+            tools=tools,
+            truncation=truncation,
+            seq_length=seq_length,
+        )
+        end = _tokenized_chat_length(
+            tokenizer,
+            formatted_text[: idx + 1],
+            tools=tools,
+            truncation=truncation,
+            seq_length=seq_length,
+        )
+        for pos in range(min(start, len(assistant_mask)), min(end, len(assistant_mask))):
+            assistant_mask[pos] = 1
+
+    if not found_assistant:
+        raise AssertionError("At least one assistant message is required when answer_only_loss_mask=True")
+
+    return assistant_mask
+
+
 @torch.no_grad()
 def _get_right_trailing_pad_mask(
     sequence: torch.Tensor,
@@ -329,6 +392,16 @@ def format_chat_template(
         raise ValueError("Tokenizer lacks a usable chat template (chat_template/apply_chat_template)")
 
     template_has_generation_kwd = GENERATION_REGEX.search(tokenizer.chat_template) is not None
+    template_mentions_reasoning_content = "reasoning_content" in tokenizer.chat_template
+    has_reasoning_content = any(
+        message.get("role") == "assistant" and bool(message.get("reasoning_content")) for message in formatted_text
+    )
+
+    if has_reasoning_content and not template_mentions_reasoning_content:
+        logger.warning(
+            "Assistant messages include `reasoning_content`, but the active chat template does not reference "
+            "`reasoning_content`. Those reasoning traces may be dropped from training data."
+        )
 
     tokenized_chat = tokenizer.apply_chat_template(
         formatted_text,
@@ -345,22 +418,14 @@ def format_chat_template(
     if template_has_generation_kwd:
         mask = tokenized_chat["assistant_masks"]
     elif not template_has_generation_kwd and answer_only_loss_mask:
-        # Tokenize prompt-only without padding to get its real length,
-        # then derive the mask from the length difference.
-        answer_text = formatted_text.pop()
-        assert answer_text["role"] == "assistant", "The last message in the formatted_text must be an assistant message"
-        tokenized_prompt = tokenizer.apply_chat_template(
+        mask = _build_multiturn_assistant_mask(
+            tokenizer,
             formatted_text,
+            input_ids,
             tools=tools,
-            tokenize=True,
-            return_dict=True,
-            return_assistant_tokens_mask=template_has_generation_kwd,
-            padding=False,
             truncation=truncation,
-            max_length=seq_length,
+            seq_length=seq_length,
         )
-        len_prompt_ids = len(tokenized_prompt.get("input_ids", []))
-        mask = [0] * len_prompt_ids + [1] * (len(input_ids) - len_prompt_ids)
     else:
         mask = [1] * len(input_ids)
 
