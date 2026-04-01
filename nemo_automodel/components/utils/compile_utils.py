@@ -248,3 +248,8 @@ def build_compile_config(cfg: Optional[Dict[str, Any]]) -> CompileConfig:
 
 # Apply Flash Attention fix when module is imported (dynamo config happens per-compilation)
 _FLASH_ATTENTION_FIX_APPLIED = apply_flash_attention_compile_fix()
+
+# Bump dynamo cache limit unconditionally so that per-method @torch.compile decorators
+# (e.g. Float32RMSNorm) don't hit FailOnRecompileLimitHit from varying guard states
+# (ndim, autocast, grad mode combinations). The default limit of 8 is too low.
+configure_torch_dynamo(cache_size_limit=64)
