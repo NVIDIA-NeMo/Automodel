@@ -395,12 +395,17 @@ def run_inference(pipe, cfg, is_rank0):
     if extra_kwargs is not None:
         pipe_kwargs.update(extra_kwargs.to_dict())
 
-    # LoRA scale: passed as attention_kwargs so @apply_lora_scale on each
-    # transformer's forward() applies the correct contribution weight.
+    # LoRA scale: passed as attention_kwargs (newer diffusers) or
+    # cross_attention_kwargs (older diffusers) so the transformer forward()
+    # applies the correct contribution weight.
     lora_weights = getattr(cfg.model, "lora_weights", None)
     if lora_weights:
         lora_scale = getattr(cfg.model, "lora_scale", 1.0)
-        pipe_kwargs["attention_kwargs"] = {"scale": lora_scale}
+        call_sig = inspect.signature(pipe.__call__)
+        if "attention_kwargs" in call_sig.parameters:
+            pipe_kwargs["attention_kwargs"] = {"scale": lora_scale}
+        elif "cross_attention_kwargs" in call_sig.parameters:
+            pipe_kwargs["cross_attention_kwargs"] = {"scale": lora_scale}
 
     seed = getattr(cfg, "seed", 42)
     torch.manual_seed(seed)
