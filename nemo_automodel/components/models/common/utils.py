@@ -149,8 +149,8 @@ class BackendConfig:
             "te" uses TE GroupedLinear, "gmm" uses grouped_gemm.ops.gmm,
             "torch_mm" uses torch._grouped_mm.
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
-            "deepep" uses DeepEP/NVSHMEM for token dispatch,
-            "uccl_ep" uses UCCL-EP (libibverbs RC QPs, Azure-compatible).
+            "deepep" uses DeepEP for token dispatch,
+            "uccl_ep" uses UCCL-EP for token dispatch across heterogeneous GPUs and NICs.
         enable_deepep: Deprecated. Use dispatcher="deepep" and experts="gmm" instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
             that assigns tokens to experts without learned routing weights.

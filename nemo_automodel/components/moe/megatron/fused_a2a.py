@@ -524,7 +524,7 @@ def get_uccl_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
 
 
 class UCCLFusedDispatch(torch.autograd.Function):
-    """Fused dispatch using UCCL-EP instead of DeepEP/NVSHMEM."""
+    """Fused dispatch using UCCL-EP instead of DeepEP."""
 
     @staticmethod
     def forward(
@@ -598,7 +598,7 @@ class UCCLFusedDispatch(torch.autograd.Function):
 
 
 class UCCLFusedCombine(torch.autograd.Function):
-    """Fused combine using UCCL-EP instead of DeepEP/NVSHMEM."""
+    """Fused combine using UCCL-EP instead of DeepEP."""
 
     @staticmethod
     def forward(ctx, x, group, handle, async_finish=False, allocate_on_comm_stream=False):
@@ -650,7 +650,7 @@ if HAVE_UCCL_EP:
         async_finish=False,
         allocate_on_comm_stream=False,
     ):
-        """Perform fused dispatch using UCCL-EP (Azure-compatible RDMA)."""
+        """Perform fused dispatch using UCCL-EP."""
         return UCCLFusedDispatch.apply(
             x.contiguous(),
             token_indices,
@@ -662,7 +662,7 @@ if HAVE_UCCL_EP:
         )
 
     def uccl_fused_combine(x, group, handle, async_finish=False, allocate_on_comm_stream=False):
-        """Perform fused combine using UCCL-EP (Azure-compatible RDMA)."""
+        """Perform fused combine using UCCL-EP."""
         return UCCLFusedCombine.apply(x, group, handle, async_finish, allocate_on_comm_stream)
 
     def set_uccl_num_sms(num_sms):

@@ -23,15 +23,15 @@ Tests cover:
 """
 
 import importlib.util
+import os
 import warnings
-from dataclasses import dataclass
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
-from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.moe.config import MoEConfig
 
 HAVE_UCCL_EP = importlib.util.find_spec("uccl") is not None or importlib.util.find_spec("ep") is not None
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
@@ -222,8 +222,8 @@ class TestDeepepManagerCustomFns:
 
     def test_default_uses_fused_dispatch(self):
         """Without custom fns, manager uses module-level fused_dispatch/fused_combine."""
-        from nemo_automodel.components.moe.megatron.token_dispatcher import _DeepepManager
         from nemo_automodel.components.moe.megatron import fused_a2a
+        from nemo_automodel.components.moe.megatron.token_dispatcher import _DeepepManager
 
         group = Mock()
         group.size.return_value = 2
@@ -257,8 +257,8 @@ class TestDeepepManagerCustomFns:
 
     def test_custom_dispatch_fn_none_falls_back(self):
         """Passing None explicitly for _dispatch_fn falls back to module-level."""
-        from nemo_automodel.components.moe.megatron.token_dispatcher import _DeepepManager
         from nemo_automodel.components.moe.megatron import fused_a2a
+        from nemo_automodel.components.moe.megatron.token_dispatcher import _DeepepManager
 
         group = Mock()
         group.size.return_value = 2
@@ -327,8 +327,8 @@ class TestGetUcclBufferCaching:
 
     @pytest.mark.skipif(not HAVE_UCCL_EP, reason="UCCL-EP not installed")
     def test_buffer_created_on_first_call(self):
-        from nemo_automodel.components.moe.megatron.fused_a2a import get_uccl_buffer
         from nemo_automodel.components.moe.megatron import fused_a2a
+        from nemo_automodel.components.moe.megatron.fused_a2a import get_uccl_buffer
 
         group = Mock()
         group.size.return_value = 2
@@ -376,11 +376,16 @@ class TestMoEFlexTokenDispatcherUcclEp:
 
         orig_comm = MoEFlexTokenDispatcher.shared_deepep_manager
         orig_uccl = MoEFlexTokenDispatcher.shared_uccl_manager
+        orig_hybrid = getattr(MoEFlexTokenDispatcher, "shared_hybridep_manager", None)
         MoEFlexTokenDispatcher.shared_deepep_manager = None
         MoEFlexTokenDispatcher.shared_uccl_manager = None
+        if hasattr(MoEFlexTokenDispatcher, "shared_hybridep_manager"):
+            MoEFlexTokenDispatcher.shared_hybridep_manager = None
         yield
         MoEFlexTokenDispatcher.shared_deepep_manager = orig_comm
         MoEFlexTokenDispatcher.shared_uccl_manager = orig_uccl
+        if hasattr(MoEFlexTokenDispatcher, "shared_hybridep_manager"):
+            MoEFlexTokenDispatcher.shared_hybridep_manager = orig_hybrid
 
     def test_uccl_ep_backend_config(self):
         """Config with moe_flex_dispatcher_backend='uccl_ep' should be valid."""
@@ -391,12 +396,12 @@ class TestMoEFlexTokenDispatcherUcclEp:
 
     def test_uccl_ep_uses_uccl_dispatch_fn(self):
         """When backend='uccl_ep', dispatcher should use uccl_fused_dispatch."""
+        from nemo_automodel.components.moe.megatron import fused_a2a
         from nemo_automodel.components.moe.megatron.token_dispatcher import (
             MoEFlexTokenDispatcher,
             TokenDispatcherConfig,
             _DeepepManager,
         )
-        from nemo_automodel.components.moe.megatron import fused_a2a
 
         config = TokenDispatcherConfig(
             moe_flex_dispatcher_backend="uccl_ep",
@@ -441,12 +446,12 @@ class TestMoEFlexTokenDispatcherUcclEp:
 
     def test_deepep_uses_no_custom_dispatch_fn(self):
         """When backend='deepep' (default), _dispatch_fn should not be passed."""
+        from nemo_automodel.components.moe.megatron import fused_a2a
         from nemo_automodel.components.moe.megatron.token_dispatcher import (
             MoEFlexTokenDispatcher,
             TokenDispatcherConfig,
             _DeepepManager,
         )
-        from nemo_automodel.components.moe.megatron import fused_a2a
 
         config = TokenDispatcherConfig(
             moe_flex_dispatcher_backend="deepep",
@@ -490,12 +495,12 @@ class TestMoEFlexTokenDispatcherUcclEp:
 
     def test_shared_uccl_manager_used_when_sharing(self):
         """UCCL-EP path should use shared_uccl_manager, not shared_deepep_manager."""
+        from nemo_automodel.components.moe.megatron import fused_a2a
         from nemo_automodel.components.moe.megatron.token_dispatcher import (
             MoEFlexTokenDispatcher,
             TokenDispatcherConfig,
             _DeepepManager,
         )
-        from nemo_automodel.components.moe.megatron import fused_a2a
 
         config = TokenDispatcherConfig(
             moe_flex_dispatcher_backend="uccl_ep",
@@ -542,3 +547,149 @@ class TestMoEFlexTokenDispatcherUcclEp:
         assert MoEFlexTokenDispatcher.shared_uccl_manager is not None
         # shared_deepep_manager should remain None since we used uccl path
         assert MoEFlexTokenDispatcher.shared_deepep_manager is None
+
+
+# ---------------------------------------------------------------------------
+# uccl_ep/__init__.py – module import and exports
+# ---------------------------------------------------------------------------
+
+
+class TestUcclEpModuleInit:
+    """Test uccl_ep package __init__.py imports and exports."""
+
+    def test_uccl_buffer_importable(self):
+        """UCCLBuffer should be importable from the uccl_ep package."""
+        from nemo_automodel.components.moe.uccl_ep import UCCLBuffer
+
+        assert UCCLBuffer is not None
+
+    def test_all_exports(self):
+        """__all__ should contain UCCLBuffer."""
+        import nemo_automodel.components.moe.uccl_ep as uccl_ep_pkg
+
+        assert "UCCLBuffer" in uccl_ep_pkg.__all__
+
+
+# ---------------------------------------------------------------------------
+# uccl_ep/buffer.py – UCCLBuffer intranode auto-detection
+# ---------------------------------------------------------------------------
+
+
+class TestUCCLBufferIntranodeDetection:
+    """Test UCCLBuffer auto-detects intranode mode and zeroes RDMA bytes."""
+
+    def test_intranode_when_group_fits_on_node(self):
+        """When group.size() <= LOCAL_WORLD_SIZE, should set is_intranode=True and num_rdma_bytes=0."""
+        from nemo_automodel.components.moe.uccl_ep.buffer import Buffer, UCCLBuffer
+
+        group = Mock()
+        group.size.return_value = 4
+
+        captured_kwargs = {}
+
+        def mock_buffer_init(self, **kwargs):
+            captured_kwargs.update(kwargs)
+
+        with patch.object(Buffer, "__init__", mock_buffer_init), patch.dict(
+            "os.environ", {"LOCAL_WORLD_SIZE": "8"}
+        ):
+            UCCLBuffer(group, num_nvl_bytes=1024, num_rdma_bytes=2048)
+
+        assert captured_kwargs["is_intranode"] is True
+        assert captured_kwargs["num_rdma_bytes"] == 0
+        assert captured_kwargs["num_nvl_bytes"] == 1024
+
+    def test_not_intranode_when_group_exceeds_node(self):
+        """When group.size() > LOCAL_WORLD_SIZE, should preserve original is_intranode and num_rdma_bytes."""
+        from nemo_automodel.components.moe.uccl_ep.buffer import Buffer, UCCLBuffer
+
+        group = Mock()
+        group.size.return_value = 16
+
+        captured_kwargs = {}
+
+        def mock_buffer_init(self, **kwargs):
+            captured_kwargs.update(kwargs)
+
+        with patch.object(Buffer, "__init__", mock_buffer_init), patch.dict(
+            "os.environ", {"LOCAL_WORLD_SIZE": "8"}
+        ):
+            UCCLBuffer(group, num_nvl_bytes=1024, num_rdma_bytes=2048)
+
+        assert captured_kwargs["is_intranode"] is False
+        assert captured_kwargs["num_rdma_bytes"] == 2048
+
+    def test_intranode_falls_back_to_cuda_device_count(self):
+        """When LOCAL_WORLD_SIZE is not set, should use torch.cuda.device_count()."""
+        from nemo_automodel.components.moe.uccl_ep.buffer import Buffer, UCCLBuffer
+
+        group = Mock()
+        group.size.return_value = 2
+
+        captured_kwargs = {}
+
+        def mock_buffer_init(self, **kwargs):
+            captured_kwargs.update(kwargs)
+
+        env = {k: v for k, v in os.environ.items() if k != "LOCAL_WORLD_SIZE"}
+        with patch.object(Buffer, "__init__", mock_buffer_init), patch.dict(
+            "os.environ", env, clear=True
+        ), patch("torch.cuda.device_count", return_value=4):
+            UCCLBuffer(group, num_nvl_bytes=512, num_rdma_bytes=1024)
+
+        # group.size() (2) <= device_count (4), so intranode
+        assert captured_kwargs["is_intranode"] is True
+        assert captured_kwargs["num_rdma_bytes"] == 0
+
+    def test_passthrough_kwargs_to_buffer(self):
+        """All constructor kwargs should be forwarded to Buffer.__init__."""
+        from nemo_automodel.components.moe.uccl_ep.buffer import Buffer, UCCLBuffer
+
+        group = Mock()
+        group.size.return_value = 16
+
+        captured_kwargs = {}
+
+        def mock_buffer_init(self, **kwargs):
+            captured_kwargs.update(kwargs)
+
+        with patch.object(Buffer, "__init__", mock_buffer_init), patch.dict(
+            "os.environ", {"LOCAL_WORLD_SIZE": "8"}
+        ):
+            UCCLBuffer(
+                group,
+                num_nvl_bytes=1024,
+                num_rdma_bytes=2048,
+                low_latency_mode=True,
+                num_qps_per_rank=32,
+                allow_mnnvl=True,
+                explicitly_destroy=True,
+            )
+
+        assert captured_kwargs["group"] is group
+        assert captured_kwargs["low_latency_mode"] is True
+        assert captured_kwargs["num_qps_per_rank"] == 32
+        assert captured_kwargs["allow_mnnvl"] is True
+        assert captured_kwargs["explicitly_destroy"] is True
+
+
+# ---------------------------------------------------------------------------
+# uccl_ep/buffer.py – EventHandle fallback
+# ---------------------------------------------------------------------------
+
+
+class TestEventHandleFallback:
+    """Test that EventHandle stub is created when uccl.ep is not installed."""
+
+    def test_event_handle_available(self):
+        """EventHandle should be importable from buffer.py (real or stub)."""
+        from nemo_automodel.components.moe.uccl_ep.buffer import EventHandle
+
+        assert EventHandle is not None
+
+    def test_buffer_module_exports(self):
+        """buffer.py __all__ should include Buffer, UCCLBuffer, EventOverlap, EventHandle."""
+        from nemo_automodel.components.moe.uccl_ep import buffer as buf_mod
+
+        for name in ("UCCLBuffer", "Buffer", "EventOverlap", "EventHandle"):
+            assert name in buf_mod.__all__

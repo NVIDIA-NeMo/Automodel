@@ -15,10 +15,13 @@
 
 """UCCL-EP integration for expert parallelism.
 
-UCCL-EP (https://github.com/uccl-project/uccl/tree/main/ep) is a community
-fork of DeepEP that uses libibverbs RC QPs instead of NVSHMEM IBGDA, making
-it compatible with environments where GPU-to-NIC PCIe P2P is unavailable
-(e.g., Azure HPC VMs with Mellanox InfiniBand).
+UCCL-EP (https://github.com/uccl-project/uccl/tree/main/ep) has the same
+interface and functionality as DeepEP, and enables GPU-initiated communication
+for MoE models across heterogeneous GPUs and NICs.
+
+Vendored files (from https://github.com/uccl-project/uccl/tree/main/ep/deep_ep_wrapper):
+    _buffer.py  <- deep_ep_wrapper/deep_ep/buffer.py
+    _utils.py   <- deep_ep_wrapper/deep_ep/utils.py
 
 Usage:
     Set dispatcher: uccl_ep in the model backend config.
