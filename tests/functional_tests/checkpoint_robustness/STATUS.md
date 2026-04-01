@@ -23,7 +23,7 @@ Last updated: 2026-04-01 22:40 UTC
 | 9 | Nemotron Nano V2 9B | TP=2, TP=1 | `'FSDPNemotronHForCausalLM' has no attribute 'model'` | FSDP wrapping issue even with `force_hf: true` | Crashes during setup |
 | 10 | Baichuan 2 7B | TP=2, TP=1 | TP=2: `ColwiseParallel only supports nn.Linear/Embedding`. TP=1: Phase 4 `Cannot copy out of meta tensor` | TP=2: custom layers. TP=1: transformers 5.3 meta tensor bug | Phase 1-3 PASS at TP=1 |
 | 11 | Mistral3 3B | TP=2, TP=1 | `fully_shard doesn't support scalar parameters (weight_scale_inv)` | FP8 quantized model has scalar scale params incompatible with FSDP2. Same error at TP=1 — not TP-related. Needs code fix or model dequant. | Crashes during setup |
-| 13 | Llama-3.3-Super-49B | TP=8, PEFT TP=1 | SFT: OOM at TP=8 (79GB/GPU). PEFT: Phase 3 PASS but Phase 4 OOM (49B HF model doesn't fit on 1 GPU) | 49B model needs 16 GPUs (TP=4 PP=2) for SFT. Phase 4 HF load needs multi-GPU or offloading. | PEFT Phase 1-3 PASS |
+| 13 | Llama-3.3-Super-49B | TP=4 PP=2, TP=8, PP=2 TP=1 | SFT: OOM in all configs on 8 GPUs (TP=4 PP=2 gets through step 0 at 40GB then OOMs step 1). PEFT TP=1: Phase 1-3 PASS, Phase 4 OOM (49B HF on 1 GPU). | Needs 2 nodes (16 GPUs) as YAML specifies (`ci: nodes: 2`). | PEFT Phase 1-3 PASS |
 
 ## vLLM Failures
 
