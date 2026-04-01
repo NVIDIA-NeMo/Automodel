@@ -188,8 +188,16 @@ class LinearLoRA(nn.Linear):
         assert lora_dtype is None or isinstance(lora_dtype, torch.dtype)
         dtype = lora_dtype or obj.weight.dtype
 
-        obj.lora_A = nn.Linear(in_features, dim, bias=False, dtype=dtype, device=device)
-        obj.lora_B = nn.Linear(dim, out_features, bias=False, dtype=dtype, device=device)
+        if HAS_TE and isinstance(obj, transformer_engine.pytorch.Linear):
+            obj.lora_A = transformer_engine.pytorch.Linear(
+                in_features=in_features, out_features=dim, bias=False, device=device, params_dtype=dtype
+            )
+            obj.lora_B = transformer_engine.pytorch.Linear(
+                in_features=dim, out_features=out_features, bias=False, device=device, params_dtype=dtype
+            )
+        else:
+            obj.lora_A = nn.Linear(in_features, dim, bias=False, dtype=dtype, device=device)
+            obj.lora_B = nn.Linear(dim, out_features, bias=False, dtype=dtype, device=device)
         LinearLoRA.init_lora_weights(obj, lora_A_init_method)
         obj.dropout_p = dropout
         assert dropout_position in ["pre", "post"], ("dropout position can only be pre/post", dropout_position)
@@ -411,6 +419,10 @@ def patch_linear_module(
             assert not isinstance(orig_linear, transformer_engine.pytorch.Linear), (
                 "quant_state is not supported with transformer_engine.pytorch.Linear"
             )
+        orig_linear.super_fwd = orig_linear.forward
+    elif HAS_TE and isinstance(orig_linear, transformer_engine.pytorch.Linear):
+        # Delegate base computation to TE's forward so TE kernels (including FP8)
+        # are used instead of falling back to F.linear().
         orig_linear.super_fwd = orig_linear.forward
 
     orig_linear.__class__ = new_cls
