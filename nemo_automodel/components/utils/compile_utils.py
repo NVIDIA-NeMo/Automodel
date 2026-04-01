@@ -79,7 +79,7 @@ def configure_torch_dynamo(cache_size_limit: int = 256, capture_scalar_outputs: 
 
         # Set cache size limit (never lower an already-higher value)
         dynamo.config.cache_size_limit = max(dynamo.config.cache_size_limit, cache_size_limit)
-        logger.debug(f"Set torch._dynamo cache_size_limit to {cache_size_limit}")
+        logger.debug(f"Set torch._dynamo cache_size_limit to {dynamo.config.cache_size_limit}")
 
         # Configure scalar output capture if requested
         if capture_scalar_outputs:
