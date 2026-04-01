@@ -13,12 +13,9 @@
 # limitations under the License.
 
 import sys
-from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 import pytest
-import yaml
 
 # Stub out the sky module before importing utils so sky is never required.
 _fake_resources = mock.MagicMock()

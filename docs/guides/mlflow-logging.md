@@ -126,8 +126,7 @@ mlflow:
 ### Run Training
 
 ```bash
-uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py \
-  --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 During training, you'll see MLflow logging messages:
