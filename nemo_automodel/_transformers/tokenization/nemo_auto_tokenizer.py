@@ -255,6 +255,47 @@ def _remap_system_role(conversation):
     return remapped
 
 
+def _try_convert_tiktoken_to_fast(tokenizer):
+    """Convert a TikToken-based tokenizer to a fast (Rust-backed) tokenizer.
+
+    This enables char_to_token() for {% generation %} mask computation
+    without needing the heuristic fallback in _apply_chat_template_safe.
+    Returns the original tokenizer unchanged if conversion is not applicable.
+    """
+    if getattr(tokenizer, "is_fast", True):
+        return tokenizer
+    if not (hasattr(tokenizer, "vocab_file") and hasattr(tokenizer, "special_tokens")):
+        return tokenizer
+
+    try:
+        from transformers.convert_slow_tokenizer import TikTokenConverter
+        from transformers.tokenization_utils_tokenizers import TokenizersBackend
+
+        fast_backend = TikTokenConverter(
+            vocab_file=tokenizer.vocab_file,
+            pattern=getattr(tokenizer, "pat_str", None),
+            extra_special_tokens=tokenizer.special_tokens,
+        ).converted()
+
+        fast = TokenizersBackend(
+            tokenizer_object=fast_backend,
+            bos_token=getattr(tokenizer, "bos_token", None),
+            eos_token=getattr(tokenizer, "eos_token", None),
+            unk_token=getattr(tokenizer, "unk_token", None),
+            pad_token=getattr(tokenizer, "pad_token", None),
+        )
+
+        # Carry over chat template and any other custom attributes.
+        if hasattr(tokenizer, "chat_template"):
+            fast.chat_template = tokenizer.chat_template
+
+        logger.info("Converted TikToken tokenizer to fast backend for char_to_token() support.")
+        return fast
+    except Exception:
+        logger.debug("TikToken-to-fast conversion failed, keeping original tokenizer.", exc_info=True)
+        return tokenizer
+
+
 class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
     """
     A wrapper around HuggingFace's AutoTokenizer that ensures consistent BOS/EOS token handling.
@@ -274,6 +315,10 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
             add_eos_token: Whether to add EOS token (default: True)
         """
         tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+
+        # Convert TikToken-based tokenizers to fast (Rust-backed) tokenizers so that
+        # char_to_token() works natively for {% generation %} mask computation.
+        tokenizer = _try_convert_tiktoken_to_fast(tokenizer)
 
         # Transformers >=5.0.0 defaults special_tokens_pattern to "cls_sep", which inserts
         # cls_token_id / sep_token_id into input_ids via build_inputs_with_special_tokens.
@@ -389,6 +434,9 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
         for tid in input_ids:
             decoded = self.decode([tid])
             match_pos = rendered_text.find(decoded, pos)
+            # Allow a small gap (up to 10 chars) between the expected and actual
+            # position to tolerate whitespace normalization or special-token
+            # markers inserted by the chat template but absent from decoded tokens.
             if match_pos != -1 and match_pos - pos < len(decoded) + 10:
                 token_char_start.append(match_pos)
                 pos = match_pos + len(decoded)

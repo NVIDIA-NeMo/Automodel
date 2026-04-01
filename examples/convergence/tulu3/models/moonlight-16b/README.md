@@ -16,7 +16,7 @@ All configs use `chat_template.jinja`, `seq_length: 2048`, `betas: [0.9, 0.95]`,
 **Important notes:**
 - Moonlight uses a custom TikToken-based tokenizer with special tokens `<|im_system|>`, `<|im_user|>`, `<|im_assistant|>`, `<|im_middle|>`, `<|im_end|>` — different from Qwen's `<|im_start|>/<|im_end|>` pattern.
 - The chat template (`chat_template.jinja`) uses `{% generation %}` tags to supervise only the assistant response content + `<|im_end|>`.
-- A tokenizer patch (`slow_tokenizer_fallback.patch`) is required to handle the TikToken slow tokenizer. It adds a `char_to_token` fallback for `{% generation %}` mask computation, and prevents spurious BOS/EOS insertion. Apply with: `git apply examples/convergence/tulu3/models/moonlight-16b/slow_tokenizer_fallback.patch`
+- The TikToken tokenizer is handled natively: `_apply_chat_template_safe` provides a `char_to_token` fallback for `{% generation %}` mask computation, and `hasattr` guards prevent spurious BOS/EOS insertion.
 - `first_k_dense_replace: 1` — only layer 0 is dense, layers 1-26 are MoE.
 - `n_group: 1`, `topk_group: 1` — no expert grouping (unlike DeepSeek V3 which uses grouped routing).
 - `local_batch_size: 4` for both optimizers. Dataset must be pre-filtered to `seq_length=2048` to avoid OOM from variable-length batching with the large vocabulary (163840).

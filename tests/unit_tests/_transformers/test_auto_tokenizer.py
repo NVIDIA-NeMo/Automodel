@@ -26,6 +26,7 @@ from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
     _read_tokenizer_config,
     _remap_system_role,
     _restore_tokenizer_config,
+    _try_convert_tiktoken_to_fast,
 )
 
 
@@ -985,3 +986,72 @@ class TestApplyChatTemplateSafeFallback:
             tokenize=False,
         )
         assert result == "rendered text"
+
+
+class TestTryConvertTikTokenToFast:
+    """Tests for _try_convert_tiktoken_to_fast."""
+
+    def test_returns_fast_tokenizer_unchanged(self):
+        """Fast tokenizers should be returned as-is."""
+        stub = _StubHFTokenizer()
+        stub.is_fast = True
+        result = _try_convert_tiktoken_to_fast(stub)
+        assert result is stub
+
+    def test_returns_non_tiktoken_slow_tokenizer_unchanged(self):
+        """Slow tokenizers without vocab_file/special_tokens should be returned as-is."""
+        stub = _StubHFTokenizer()
+        stub.is_fast = False
+        result = _try_convert_tiktoken_to_fast(stub)
+        assert result is stub
+
+    def test_returns_original_on_conversion_failure(self):
+        """If TikTokenConverter raises, the original tokenizer should be returned."""
+        stub = _StubHFTokenizer()
+        stub.is_fast = False
+        stub.vocab_file = "/nonexistent/path.model"
+        stub.special_tokens = {"<s>": 0}
+        result = _try_convert_tiktoken_to_fast(stub)
+        assert result is stub
+
+    def test_converts_tiktoken_tokenizer(self):
+        """A tokenizer with vocab_file and special_tokens should be converted to fast."""
+        stub = _StubHFTokenizer()
+        stub.is_fast = False
+        stub.vocab_file = "/fake/path.model"
+        stub.special_tokens = {"<s>": 0, "</s>": 1}
+        stub.pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+"
+        stub.bos_token = "<s>"
+        stub.eos_token = "</s>"
+        stub.chat_template = "dummy template"
+
+        mock_fast_backend = object()
+        mock_fast_tokenizer = _StubHFTokenizer()
+        mock_fast_tokenizer.is_fast = True
+
+        with (
+            patch(
+                "transformers.convert_slow_tokenizer.TikTokenConverter"
+            ) as mock_converter_cls,
+            patch(
+                "transformers.tokenization_utils_tokenizers.TokenizersBackend",
+                return_value=mock_fast_tokenizer,
+            ) as mock_backend_cls,
+        ):
+            mock_converter_cls.return_value.converted.return_value = mock_fast_backend
+            result = _try_convert_tiktoken_to_fast(stub)
+
+        assert result is mock_fast_tokenizer
+        mock_converter_cls.assert_called_once_with(
+            vocab_file="/fake/path.model",
+            pattern=stub.pat_str,
+            extra_special_tokens=stub.special_tokens,
+        )
+        mock_backend_cls.assert_called_once_with(
+            tokenizer_object=mock_fast_backend,
+            bos_token="<s>",
+            eos_token="</s>",
+            unk_token=None,
+            pad_token=None,
+        )
+        assert result.chat_template == "dummy template"
