@@ -1,6 +1,6 @@
-# Dataset Overview: LLM, VLM, and Retrieval Datasets in NeMo Automodel
+# Dataset Overview: LLM, VLM, and Retrieval Datasets in NeMo AutoModel
 
-This page summarizes the datasets supported in NeMo Automodel for LLM, VLM, and retrieval training and shows how to plug in your own datasets using Python functions or the YAML `_target_` mechanism.
+This page summarizes the datasets supported in NeMo AutoModel for LLM, VLM, and retrieval training and shows how to plug in your own datasets using Python functions or the YAML `_target_` mechanism.
 
 - See also: [LLM datasets](llm/dataset.md), [VLM datasets](vlm/dataset.md), and [Retrieval dataset](llm/retrieval-dataset.md) for deeper, task-specific guides.
 
@@ -9,12 +9,7 @@ This page summarizes the datasets supported in NeMo Automodel for LLM, VLM, and 
 
 ## LLM Datasets
 
-NeMo Automodel supports several common patterns for language modeling and instruction tuning.
-
-- **HellaSwag (completion SFT)**
-  - Wrapper: `nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`
-  - Use case: single-turn completion style SFT where a prompt (ctx) is followed by a gold continuation (ending)
-  - Key args: `path_or_dataset`, `split`, `num_samples_limit`
+NeMo AutoModel supports several common patterns for language modeling and instruction tuning.
 ### HellaSwag (Completion SFT)
 - Wrapper: `nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`
 - Use case: single-turn completion-style SFT where a prompt (ctx) is followed by a gold continuation (ending)
@@ -27,12 +22,6 @@ dataset:
   split: train
 ```
 
-- **SQuAD-style Question Answering (QA) (instruction SFT)**
-  - Factory: `nemo_automodel.components.datasets.llm.squad.make_squad_dataset`
-  - Use case: instruction/QA tuning with either prompt+answer formatting or chat-template formatting
-  - Notes:
-    - If the tokenizer has a chat template and you want answer-only loss, you must provide `start_of_turn_token`.
-    - Optional `seq_length` can be used for padding/truncation.
 ### SQuAD-Style Question Answering (QA) (Instruction SFT)
 - Factory: `nemo_automodel.components.datasets.llm.squad.make_squad_dataset`
 - Use case: instruction/QA tuning with either prompt-and-answer formatting or chat-template formatting
@@ -264,11 +253,6 @@ collate_fn:
 ```
 See the detailed guide, [Retrieval dataset](llm/retrieval-dataset.md), for more information.
 
-- **NanoGPT Binary Shards (pretraining)**
-  - Class: `nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset`
-  - Use case: token-level LM pretraining over `.bin` shards produced by NanoGPT-style preprocessors (supports legacy and current formats)
-  - Notes:
-    - Streams contiguous `seq_len` slices, supports optional BOS alignment and `.bos.idx` sidecar files
 ### NanoGPT Binary Shards (Pretraining)
 - Class: `nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset`
 - Use case: token-level LM pretraining over `.bin` shards produced by NanoGPT-style preprocessors (supports legacy and current formats)
@@ -277,15 +261,10 @@ See the detailed guide, [Retrieval dataset](llm/retrieval-dataset.md), for more 
 - Related tool: `tools/nanogpt_data_processor.py`
 :::
 
-- **Megatron (pretraining; interoperable with pre-tokenized Megatron data)**
-  - Class: `nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining`
-  - Use case: large-scale LM pretraining over Megatron-LM formatted tokenized corpora
-  - Interoperability: If your corpus has already been tokenized/indexed for Megatron (i.e., `.bin`/`.idx` pairs), you can point Automodel to those assets directly. No re-tokenization required.
-  - Key args: `paths` (single path, glob, weighted list, or per-split dict), `seq_length`, `tokenizer`, `split`, `index_mapping_dir`, `splits_to_build`
 ### Megatron (Pretraining; Interoperable With Pre-Tokenized Megatron Data)
 - Class: `nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining`
 - Use case: large-scale LM pretraining over Megatron-LM formatted tokenized corpora
-- Interoperability: If your corpus has already been tokenized/indexed for Megatron (i.e., `.bin`/`.idx` pairs), you can point Automodel to those assets directly. No re-tokenization required.
+- Interoperability: If your corpus has already been tokenized/indexed for Megatron (i.e., `.bin`/`.idx` pairs), you can point AutoModel to those assets directly. No re-tokenization required.
 - Key args: `paths` (single path, glob, weighted list, or per-split dict), `seq_length`, `tokenizer`, `split`, `index_mapping_dir`, `splits_to_build`
 - Example YAML:
 ```yaml
@@ -553,7 +532,7 @@ See the [Diffusion Dataset Preparation](diffusion/dataset.md) guide for full pre
 ---
 
 ## Bring Your Own Dataset
-You can integrate custom datasets with zero code changes to NeMo Automodel by using `_target_` in YAML. There are three approaches:
+You can integrate custom datasets with zero code changes to NeMo AutoModel by using `_target_` in YAML. There are three approaches:
 
 ### Point to an Existing Class or Function (Dotted Path)
 - LLM example (class):
@@ -618,7 +597,7 @@ class MyCompletionDataset:
     def get_target(self, examples):
         return examples["my_target_field"]
 ```
-Then reference your class via `_target_` in YAML.
+Then reference your class with `_target_` in YAML.
 
 ### Important Considerations
 - **Chat templates**: If your tokenizer has a chat template and you want answer-only loss, provide the correct `start_of_turn_token` (LLM) or `start_of_response_token` (VLM collate functions).
