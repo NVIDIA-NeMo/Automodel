@@ -24,6 +24,8 @@ step_scheduler:
   max_steps: 100
   num_epochs: 2
 
+recipe: FinetuneRecipeForVLM
+
 dist_env:
   backend: nccl
   timeout_minutes: 10
