@@ -26,6 +26,8 @@
 #     -m nemo_automodel.train \
 #     --config-name qwen3_moe_30b_uccl_ep
 
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 512
   local_batch_size: 32
