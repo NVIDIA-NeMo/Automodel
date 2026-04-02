@@ -100,20 +100,21 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
         expert_buffers: dict[str, dict[str, torch.Tensor]] = defaultdict(dict)
         state_dict: dict[str, Any] = {}
 
-        _EXPERT_KEYS = {"gate_up_proj", "down_proj", "per_expert_scale"}
-
         for key, value in hf_state_dict.items():
             # --- Router keys: router.{proj.weight,scale} -> moe.gate.{proj.weight,scale} ---
-            router_match = re.search(r"(layers\.\d+)\.router\.(proj\.weight|scale)$", key)
+            router_match = re.search(r"(layers\.\d+)\.router\.(proj\.weight|scale|per_expert_scale)$", key)
             if router_match:
                 layer_path = router_match.group(1)
                 router_attr = router_match.group(2)
-                new_key = key.replace(f"{layer_path}.router.{router_attr}", f"{layer_path}.moe.gate.{router_attr}")
-                state_dict[new_key] = value
+                if router_attr == "per_expert_scale":
+                    expert_buffers[layer_path]["per_expert_scale"] = value
+                else:
+                    new_key = key.replace(f"{layer_path}.router.{router_attr}", f"{layer_path}.moe.gate.{router_attr}")
+                    state_dict[new_key] = value
                 continue
 
             # --- Expert weight keys ---
-            expert_match = re.search(r"(layers\.\d+)\.moe\.(gate_up_proj|down_proj|per_expert_scale)$", key)
+            expert_match = re.search(r"(layers\.\d+)\.(?:moe|experts)\.(gate_up_proj|down_proj|per_expert_scale)$", key)
             if expert_match:
                 layer_path = expert_match.group(1)
                 weight_name = expert_match.group(2)
@@ -124,8 +125,9 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
             state_dict[key] = value
 
         # Process collected expert weights per layer
+        _REQUIRED_EXPERT_KEYS = {"gate_up_proj", "down_proj"}
         for layer_path, tensors in expert_buffers.items():
-            missing = _EXPERT_KEYS - tensors.keys()
+            missing = _REQUIRED_EXPERT_KEYS - tensors.keys()
             if missing:
                 raise RuntimeError(
                     f"Incomplete expert weights for {layer_path}: missing {missing}. "
@@ -184,23 +186,23 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
                 hf_state_dict[hf_key] = tensor
                 continue
 
-            # --- Expert: gate_and_up_projs -> gate_up_proj ---
+            # --- Expert: gate_and_up_projs -> experts.gate_up_proj ---
             if ".moe.experts.gate_and_up_projs" in fqn:
                 layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
                 global_tensor = self._gather_expert_tensor(tensor, device_mesh, n_experts)
                 layer_prefix = f"{prefix}language_model.layers.{layer_num}"
                 # Transpose from NeMo [E, hidden, 2*inter] to HF [E, 2*inter, hidden]
-                hf_state_dict[f"{layer_prefix}.moe.gate_up_proj"] = global_tensor.transpose(-2, -1).contiguous()
+                hf_state_dict[f"{layer_prefix}.experts.gate_up_proj"] = global_tensor.transpose(-2, -1).contiguous()
                 continue
 
-            # --- Expert: down_projs -> down_proj + per_expert_scale ---
+            # --- Expert: down_projs -> experts.down_proj + router.per_expert_scale ---
             if ".moe.experts.down_projs" in fqn:
                 layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
                 global_tensor = self._gather_expert_tensor(tensor, device_mesh, n_experts)
                 layer_prefix = f"{prefix}language_model.layers.{layer_num}"
                 # Transpose from NeMo [E, inter, hidden] to HF [E, hidden, inter]
-                hf_state_dict[f"{layer_prefix}.moe.down_proj"] = global_tensor.transpose(-2, -1).contiguous()
-                hf_state_dict[f"{layer_prefix}.moe.per_expert_scale"] = torch.ones(n_experts, dtype=self.dtype)
+                hf_state_dict[f"{layer_prefix}.experts.down_proj"] = global_tensor.transpose(-2, -1).contiguous()
+                hf_state_dict[f"{layer_prefix}.router.per_expert_scale"] = torch.ones(n_experts, dtype=self.dtype)
                 continue
 
             # --- Pass-through ---

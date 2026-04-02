@@ -259,7 +259,7 @@ class Gemma4MoETextModelBackend(nn.Module):
         self.moe_config = moe_config or MoEConfig(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
-            moe_inter_dim=config.expert_intermediate_size,
+            moe_inter_dim=config.expert_intermediate_size or getattr(config, "moe_intermediate_size", None),
             n_routed_experts=config.num_experts,
             n_shared_experts=0,
             n_activated_experts=config.top_k_experts,
@@ -433,6 +433,11 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             cfg_text = config.text_config if hasattr(config, "text_config") else config
             for k, v in text_config.items():
                 setattr(cfg_text, k, v)
+
+        # Compat: checkpoints renamed expert_intermediate_size → moe_intermediate_size.
+        cfg_text = config.text_config if hasattr(config, "text_config") else config
+        if not getattr(cfg_text, "expert_intermediate_size", None) and getattr(cfg_text, "moe_intermediate_size", None):
+            cfg_text.expert_intermediate_size = cfg_text.moe_intermediate_size
 
         # Initialize the HF parent (creates self.model, self.lm_head, vision tower, etc.)
         super().__init__(config)
