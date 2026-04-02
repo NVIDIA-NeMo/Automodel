@@ -101,3 +101,7 @@ optimizer:
 
 ci:
   nodes: 2
+  checkpoint_robustness:
+    hf_kl_threshold: 7e-2
+    tokenizer_name: Qwen/Qwen3-30B-A3B
+    no_check_resume: true

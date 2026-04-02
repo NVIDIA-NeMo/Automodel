@@ -101,6 +101,12 @@ lr_scheduler:
 
 ci:
   time: "00:30:00"
+  checkpoint_robustness:
+    hf_kl_threshold: 5e-3
+    distributed.tp_size: 2
+    cross_tp_size: 2
+    cross_tp_kl_threshold: 5e-3
+    tokenizer_name: baichuan-inc/Baichuan2-7B-Chat
 
 # Uncomment and configure for W&B logging
 # wandb:

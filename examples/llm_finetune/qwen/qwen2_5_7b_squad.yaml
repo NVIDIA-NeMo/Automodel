@@ -102,3 +102,11 @@ optimizer:
 
 ci:
   time: "00:15:00"
+  checkpoint_robustness:
+    hf_kl_threshold: 9e-3
+    distributed.tp_size: 2
+    tokenizer_name: Qwen/Qwen2.5-7B
+    cross_tp_size: 2
+    cross_tp_kl_threshold: 9e-3
+    max_vram_gb: 10
+    max_cpu_gb: 12

@@ -114,6 +114,14 @@ optimizer:
   weight_decay: 0.0
   # min_lr: 1.0e-5
 
+ci:
+  checkpoint_robustness:
+    hf_kl_threshold: 5e-2
+    tokenizer_name: openai/gpt-oss-20b
+    max_vram_gb: 12
+    max_cpu_gb: 4
+    no_check_resume: true
+
 # Uncomment and configure for W&B logging
 # wandb:
 #   project: <your_wandb_project>

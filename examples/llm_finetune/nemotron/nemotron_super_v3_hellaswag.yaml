@@ -94,3 +94,10 @@ lr_scheduler:
 
 ci:
   nodes: 4
+  checkpoint_robustness:
+    hf_kl_threshold: 7e-2
+    experts_implementation: grouped_mm
+    trust_remote_code: true
+    tokenizer_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+    hf_device_map_auto: true
+    no_check_resume: true

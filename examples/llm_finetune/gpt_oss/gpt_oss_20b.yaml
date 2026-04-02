@@ -118,3 +118,10 @@ optimizer:
 
 ci:
   node_multiplier: true
+  checkpoint_robustness:
+    hf_kl_threshold: 5e-2
+    tokenizer_name: openai/gpt-oss-20b
+    check_phantom_keys: true
+    max_vram_gb: 24
+    max_cpu_gb: 17
+    no_check_resume: true

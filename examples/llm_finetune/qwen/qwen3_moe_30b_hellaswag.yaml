@@ -86,3 +86,11 @@ optimizer:
   weight_decay: 0.01
   betas: [0.9, 0.95]
   eps: 1e-8
+
+ci:
+  checkpoint_robustness:
+    hf_kl_threshold: 1e-4
+    tokenizer_name: Qwen/Qwen3-30B-A3B
+    max_vram_gb: 34
+    max_cpu_gb: 26
+    no_check_resume: true

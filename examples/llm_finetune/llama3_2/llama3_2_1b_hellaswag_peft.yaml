@@ -99,6 +99,15 @@ optimizer:
   weight_decay: 0
   # min_lr: 1.0e-5
 
+ci:
+  checkpoint_robustness:
+    hf_kl_threshold: 5e-3
+    model.pretrained_model_name_or_path: meta-llama/Llama-3.2-3B-Instruct
+    tokenizer_name: meta-llama/Llama-3.2-3B-Instruct
+    check_fused_qkv_keys: true
+    max_vram_gb: 5
+    max_cpu_gb: 4
+
 # Uncomment and configure for W&B logging
 # wandb:
 #   project: <your_wandb_project>

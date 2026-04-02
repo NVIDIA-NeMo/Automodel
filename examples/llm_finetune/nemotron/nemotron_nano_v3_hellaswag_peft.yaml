@@ -105,6 +105,17 @@ lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
 
+ci:
+  checkpoint_robustness:
+    hf_kl_threshold: 1e-1
+    experts_implementation: grouped_mm
+    trust_remote_code: true
+    tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    distributed.ep_size: 8
+    max_vram_gb: 15
+    max_cpu_gb: 4
+    no_check_resume: true
+
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
