@@ -80,21 +80,58 @@ class TestAfmoeAttention:
         assert hasattr(attn, "k_norm")
 
     def test_forward_shape(self, tiny_config, backend_config, device):
-        attn = AfmoeAttention(tiny_config, layer_idx=0, backend=backend_config).to(device).to(torch.float32)
+        attn = AfmoeAttention(tiny_config, layer_idx=0, backend=backend_config).to(device)
 
         batch, seq_len = 2, 8
-        x = torch.randn(batch, seq_len, tiny_config.hidden_size, device=device)
+        x = torch.randn(batch, seq_len, tiny_config.hidden_size, device=device, dtype=torch.bfloat16)
         freqs_cis = torch.randn(batch, seq_len, tiny_config.head_dim, device=device)
 
         out = attn(x, freqs_cis=freqs_cis)
         assert out.shape == (batch, seq_len, tiny_config.hidden_size)
 
     def test_global_attention_forward_shape(self, tiny_config, backend_config, device):
-        attn = AfmoeAttention(tiny_config, layer_idx=1, backend=backend_config).to(device).to(torch.float32)
+        attn = AfmoeAttention(tiny_config, layer_idx=1, backend=backend_config).to(device)
 
         batch, seq_len = 2, 8
-        x = torch.randn(batch, seq_len, tiny_config.hidden_size, device=device)
+        x = torch.randn(batch, seq_len, tiny_config.hidden_size, device=device, dtype=torch.bfloat16)
         freqs_cis = torch.randn(batch, seq_len, tiny_config.head_dim, device=device)
 
         out = attn(x, freqs_cis=freqs_cis)
         assert out.shape == (batch, seq_len, tiny_config.hidden_size)
+
+
+class TestAfmoeAttentionParity:
+    def test_rope_conditional_local_vs_global(self, tiny_config, backend_config, device):
+        """Local attention (with RoPE) and global attention (without) must diverge given shared weights."""
+        torch.manual_seed(42)
+        local_attn = AfmoeAttention(tiny_config, layer_idx=0, backend=backend_config).to(device)
+        global_attn = AfmoeAttention(tiny_config, layer_idx=1, backend=backend_config).to(device)
+        global_attn.load_state_dict(local_attn.state_dict())
+
+        batch, seq_len = 2, 8
+        x = torch.randn(batch, seq_len, tiny_config.hidden_size, device=device, dtype=torch.bfloat16)
+        freqs_cis = torch.randn(batch, seq_len, tiny_config.head_dim, device=device)
+
+        with torch.no_grad():
+            local_out = local_attn(x, freqs_cis=freqs_cis)
+            global_out = global_attn(x, freqs_cis=freqs_cis)
+
+        max_diff = (local_out - global_out).abs().max().item()
+        assert max_diff > 0.01, f"RoPE should cause divergence, but max_diff={max_diff}"
+
+    def test_qk_norm_reduces_head_variance(self, tiny_config, backend_config, device):
+        """Per-head QK RMSNorm should equalize magnitudes across heads."""
+        attn = AfmoeAttention(tiny_config, layer_idx=0, backend=backend_config).to(device)
+
+        batch, seq_len = 1, 4
+        q = torch.randn(
+            batch, seq_len, tiny_config.num_attention_heads, tiny_config.head_dim, device=device, dtype=torch.bfloat16
+        )
+        q[:, :, 0, :] *= 10.0  # Make first head 10x larger
+
+        with torch.no_grad():
+            q_normed = attn.q_norm(q)
+
+        pre_var = q.norm(dim=-1).var(dim=-1).mean().item()
+        post_var = q_normed.norm(dim=-1).var(dim=-1).mean().item()
+        assert post_var < pre_var, "QK norm should reduce variance across heads"

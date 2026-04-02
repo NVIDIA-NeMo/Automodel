@@ -20,7 +20,8 @@ import torch
 from nemo_automodel.components.models.afmoe.config import AfmoeConfig
 from nemo_automodel.components.models.afmoe.model import AfmoeForCausalLM, AfmoeModel, Block, _build_moe_config
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.moe.layers import MLP, MoE
+from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.layers import MLP, Gate, MoE
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -195,3 +196,85 @@ class TestBuildMoeConfig:
         assert moe_cfg.route_scale == tiny_config.route_scale
         assert moe_cfg.norm_topk_prob is True
         assert moe_cfg.force_e_score_correction_bias is True
+
+
+class TestDualNormParity:
+    def test_manual_trace_matches_forward(self, tiny_config, backend_config, device):
+        """Manual 4-norm residual trace must be bit-identical to Block.forward()."""
+        torch.manual_seed(42)
+        moe_config = _build_moe_config(tiny_config)
+        block = Block(layer_idx=0, config=tiny_config, moe_config=moe_config, backend=backend_config).to(device)
+        block.eval()
+
+        batch, seq_len = 1, 4
+        x = torch.randn(batch, seq_len, tiny_config.hidden_size, device=device, dtype=torch.bfloat16)
+        freqs_cis = torch.randn(batch, seq_len, tiny_config.head_dim, device=device)
+
+        with torch.no_grad():
+            # Manual trace: attention sublayer
+            residual = x
+            h = block.input_layernorm(x)
+            h = block.self_attn(h, freqs_cis=freqs_cis)
+            h = block.post_attention_layernorm(h)
+            after_attn = residual + h
+
+            # Manual trace: MLP sublayer
+            residual = after_attn
+            h = block.pre_mlp_layernorm(after_attn)
+            h = block._mlp(h, padding_mask=None)
+            h = block.post_mlp_layernorm(h)
+            expected = residual + h
+
+            # Block forward
+            actual = block(x, freqs_cis=freqs_cis)
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+class TestMoeRoutingParity:
+    def test_sigmoid_norm_scale(self, device):
+        """Manual sigmoid -> topk -> normalize -> scale must match Gate.forward()."""
+        torch.manual_seed(42)
+
+        moe_config = MoEConfig(
+            dim=64,
+            inter_dim=128,
+            moe_inter_dim=32,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=False,
+            gate_bias_update_factor=0.0,
+            score_func="sigmoid",
+            route_scale=2.0,
+            aux_loss_coeff=0.0,
+            norm_topk_prob=True,
+            force_e_score_correction_bias=True,
+            dtype=torch.bfloat16,
+        )
+
+        gate = Gate(moe_config).to(device)
+        torch.manual_seed(123)
+        gate.weight.data = torch.randn(4, 64, device=device, dtype=torch.bfloat16)
+
+        x = torch.randn(8, 64, device=device, dtype=torch.bfloat16)  # 8 tokens
+        token_mask = torch.ones(8, dtype=torch.bool, device=device)
+
+        with torch.no_grad():
+            weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        # Manual reference: sigmoid -> bias -> topk -> gather original -> normalize -> scale
+        with torch.no_grad():
+            scores = torch.sigmoid(x @ gate.weight.data.T)  # [8, 4]
+            original_scores = scores.clone()
+            biased = scores + gate.e_score_correction_bias  # zeros, no-op
+            manual_idx = torch.topk(biased, 2, dim=-1)[1]
+            manual_w = original_scores.gather(1, manual_idx)
+            manual_w = manual_w / (manual_w.sum(dim=-1, keepdim=True) + 1e-20)
+            manual_w = manual_w * 2.0
+
+        assert torch.equal(indices, manual_idx), "Expert indices mismatch"
+        torch.testing.assert_close(weights, manual_w, rtol=1e-3, atol=1e-3)
+        assert aux_loss is None

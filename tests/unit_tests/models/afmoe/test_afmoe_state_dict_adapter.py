@@ -82,30 +82,30 @@ def adapter(config, moe_config, backend):
     return AfmoeStateDictAdapter(config, moe_config, backend, dtype=torch.bfloat16)
 
 
-def _make_hf_expert_state_dict(n_layers=2, n_experts=4, hidden=64, moe_inter=32, num_dense=1):
+def _make_hf_expert_state_dict(n_layers=2, n_experts=4, hidden=64, moe_inter=32, num_dense=1, dtype=torch.bfloat16):
     """Create a minimal HF-format state dict with router, experts, and expert_bias."""
     sd = {}
     for layer_idx in range(n_layers):
         prefix = f"model.layers.{layer_idx}"
         if layer_idx >= num_dense:
             # Router gate
-            sd[f"{prefix}.mlp.router.gate.weight"] = torch.randn(n_experts, hidden)
+            sd[f"{prefix}.mlp.router.gate.weight"] = torch.randn(n_experts, hidden, dtype=dtype)
             # Expert bias
             sd[f"{prefix}.mlp.expert_bias"] = torch.zeros(n_experts)
             # Per-expert weights
             for e in range(n_experts):
-                sd[f"{prefix}.mlp.experts.{e}.gate_proj.weight"] = torch.randn(moe_inter, hidden)
-                sd[f"{prefix}.mlp.experts.{e}.up_proj.weight"] = torch.randn(moe_inter, hidden)
-                sd[f"{prefix}.mlp.experts.{e}.down_proj.weight"] = torch.randn(hidden, moe_inter)
+                sd[f"{prefix}.mlp.experts.{e}.gate_proj.weight"] = torch.randn(moe_inter, hidden, dtype=dtype)
+                sd[f"{prefix}.mlp.experts.{e}.up_proj.weight"] = torch.randn(moe_inter, hidden, dtype=dtype)
+                sd[f"{prefix}.mlp.experts.{e}.down_proj.weight"] = torch.randn(hidden, moe_inter, dtype=dtype)
             # Shared expert
-            sd[f"{prefix}.mlp.shared_experts.gate_proj.weight"] = torch.randn(moe_inter, hidden)
-            sd[f"{prefix}.mlp.shared_experts.up_proj.weight"] = torch.randn(moe_inter, hidden)
-            sd[f"{prefix}.mlp.shared_experts.down_proj.weight"] = torch.randn(hidden, moe_inter)
+            sd[f"{prefix}.mlp.shared_experts.gate_proj.weight"] = torch.randn(moe_inter, hidden, dtype=dtype)
+            sd[f"{prefix}.mlp.shared_experts.up_proj.weight"] = torch.randn(moe_inter, hidden, dtype=dtype)
+            sd[f"{prefix}.mlp.shared_experts.down_proj.weight"] = torch.randn(hidden, moe_inter, dtype=dtype)
         else:
             # Dense MLP
-            sd[f"{prefix}.mlp.gate_proj.weight"] = torch.randn(128, hidden)
-            sd[f"{prefix}.mlp.up_proj.weight"] = torch.randn(128, hidden)
-            sd[f"{prefix}.mlp.down_proj.weight"] = torch.randn(hidden, 128)
+            sd[f"{prefix}.mlp.gate_proj.weight"] = torch.randn(128, hidden, dtype=dtype)
+            sd[f"{prefix}.mlp.up_proj.weight"] = torch.randn(128, hidden, dtype=dtype)
+            sd[f"{prefix}.mlp.down_proj.weight"] = torch.randn(hidden, 128, dtype=dtype)
     return sd
 
 
@@ -187,3 +187,20 @@ class TestAfmoeStateDictAdapter:
             assert f"model.layers.1.mlp.experts.{e}.gate_proj.weight" in hf_sd
             assert f"model.layers.1.mlp.experts.{e}.up_proj.weight" in hf_sd
             assert f"model.layers.1.mlp.experts.{e}.down_proj.weight" in hf_sd
+
+    def test_roundtrip_preserves_all_values(self, adapter):
+        """HF -> NeMo -> HF round-trip must preserve exact tensor values."""
+        torch.manual_seed(42)
+        hf_sd = _make_hf_expert_state_dict()
+        originals = {k: v.clone() for k, v in hf_sd.items()}
+
+        nemo_sd = adapter.from_hf(hf_sd)
+        roundtrip_sd = adapter.to_hf(nemo_sd)
+
+        assert set(roundtrip_sd.keys()) == set(originals.keys()), (
+            f"Missing: {set(originals.keys()) - set(roundtrip_sd.keys())}, "
+            f"Extra: {set(roundtrip_sd.keys()) - set(originals.keys())}"
+        )
+        for key in originals:
+            max_diff = (originals[key].float() - roundtrip_sd[key].float()).abs().max().item()
+            assert max_diff == 0.0, f"Round-trip mismatch for {key}: max_diff={max_diff}"
