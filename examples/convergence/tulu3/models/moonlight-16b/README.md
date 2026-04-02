@@ -8,7 +8,7 @@ MoE 16B (3B active) model based on DeepSeek V3 architecture. 64 routed experts, 
 
 | Config | Optimizer | lr | Notes |
 |--------|-----------|---:|-------|
-| `moonlight_16b_ep8_flashoptim.yaml` | FlashAdamW | 1e-5 | 24-bit master weights, `fp32_upcast: false` |
+| `moonlight_16b_ep8_flashoptim.yaml` | FlashAdamW | 1e-5 | 32-bit master weights, `fp32_upcast: true` |
 | `moonlight_16b_ep8_cp2_flashoptim.yaml` | FlashAdamW | 1e-5 | Corrected CP=2 rerun, 32-bit master weights, `fp32_upcast: true` |
 | `moonlight_16b_ep8_te_fusedadam.yaml` | TE FusedAdam | 1e-5 | FP32 master weights, BF16 moments, `fp32_upcast: true` |
 
@@ -21,7 +21,7 @@ All configs use `chat_template.jinja`, `seq_length: 2048`, `betas: [0.9, 0.95]`,
 - `first_k_dense_replace: 1` — only layer 0 is dense, layers 1-26 are MoE.
 - `n_group: 1`, `topk_group: 1` — no expert grouping (unlike DeepSeek V3 which uses grouped routing).
 - `local_batch_size: 4` for both optimizers. Dataset must be pre-filtered to `seq_length=2048` to avoid OOM from variable-length batching with the large vocabulary (163840).
-- The legacy non-CP FlashAdamW config keeps `fp32_upcast: false` for extra memory headroom at `bs=4`. The published CP=2 rerun below uses `master_weight_bits: 32` with `fp32_upcast: true` and fits on 8 H100s.
+- Both optimizers use `fp32_upcast: true` for FP32 loss upcasting.
 
 ## Data Pre-filtering
 
