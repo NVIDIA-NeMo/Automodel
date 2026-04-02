@@ -309,80 +309,30 @@ def _patch_is_packed_sequence_for_pp_training() -> None:
 
         _fa_utils._is_packed_sequence = _is_packed_sequence_no_sync
 
-        # Patch _flash_attention_forward to add one-time debug confirming:
-        #   1) is_causal=True (full causal path — no recompile)
-        #   2) attention_mask=None (no mask materialization)
-        #   3) which branch is taken (standard causal else-branch expected)
-        #
-        # Must patch BOTH the source module AND the already-imported name in modeling_llama,
-        # because modeling_llama imports _flash_attention_forward by reference at import time.
-        # FSDP2 wrapping prevents class-level method patches from firing, so this is the
-        # only reliable interception point.
-        try:
-            _orig_fa_fwd = _fa_utils._flash_attention_forward
+        # Also patch any module that imported _is_packed_sequence by reference at
+        # import time (e.g. "from modeling_flash_attention_utils import _is_packed_sequence").
+        # Module-level attribute replacement only affects code that accesses the function
+        # via the module; locally-imported names need separate patching.
+        _patch_targets = [
+            "transformers.models.llama.modeling_llama",
+            "transformers.integrations.flash_attention",
+            "transformers.modeling_flash_attention_utils",
+        ]
+        patched = ["modeling_flash_attention_utils"]
+        for _mod_name in _patch_targets:
+            try:
+                import importlib
+                _mod = importlib.import_module(_mod_name)
+                if hasattr(_mod, "_is_packed_sequence"):
+                    _mod._is_packed_sequence = _is_packed_sequence_no_sync
+                    patched.append(_mod_name.split(".")[-1])
+            except Exception:
+                pass
 
-            _fa_call_count = [0]
-
-            def _flash_attention_forward_debug(*args, _orig=_orig_fa_fwd, _count=_fa_call_count, **kwargs):
-                import torch.distributed as dist
-                rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-
-                attn_mask = kwargs.get("attention_mask", args[3] if len(args) > 3 else "N/A")
-                is_causal = kwargs.get("is_causal", args[5] if len(args) > 5 else "N/A")
-                position_ids = kwargs.get("position_ids", args[7] if len(args) > 7 else None)
-                cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
-                cu_seq_lens_k = kwargs.get("cu_seq_lens_k")
-
-                has_mask = attn_mask is not None and attn_mask != "N/A"
-                has_varlen = cu_seq_lens_q is not None and cu_seq_lens_k is not None
-                has_packed = _fa_utils._is_packed_sequence(position_ids, batch_size=args[0].size(0)) if position_ids is not None else False
-
-                if has_mask:
-                    branch = "BRANCH1-UNPAD (slow: _upad_input + flash_varlen_fn + pad_fn)"
-                elif has_varlen or has_packed:
-                    branch = "BRANCH2-VARLEN (packed/varlen: flash_varlen_fn)"
-                else:
-                    branch = "BRANCH3-FAST (optimal: flash_fn with is_causal)"
-
-                _count[0] += 1
-                if _count[0] <= 5 or _count[0] % 1000 == 0:
-                    print(
-                        f"[FA2 rank={rank} call#{_count[0]}] {branch}  "
-                        f"attn_mask={'None' if not has_mask else type(attn_mask).__name__ + str(attn_mask.shape)}  "
-                        f"is_causal={is_causal}  "
-                        f"position_ids={'None' if position_ids is None else type(position_ids).__name__ + str(position_ids.shape)}  "
-                        f"is_packed={has_packed}  cu_seq_lens={has_varlen}",
-                        flush=True,
-                    )
-                return _orig(*args, **kwargs)
-
-            # Patch source module
-            _fa_utils._flash_attention_forward = _flash_attention_forward_debug
-
-            # Patch every module that imported _flash_attention_forward by reference
-            # at import time, so the wrapper fires regardless of the code path.
-            _patch_targets = [
-                "transformers.models.llama.modeling_llama",
-                "transformers.integrations.flash_attention",
-            ]
-            for _mod_name in _patch_targets:
-                try:
-                    import importlib
-                    _mod = importlib.import_module(_mod_name)
-                    if hasattr(_mod, "_flash_attention_forward"):
-                        _mod._flash_attention_forward = _flash_attention_forward_debug
-                except Exception as _e2:
-                    print(f"[PP] {_mod_name} FA2 patch failed: {_e2}", flush=True)
-
-        except Exception as _e:
-            print(f"[PP] _flash_attention_forward debug patch failed: {_e}", flush=True)
         _fa_utils._is_packed_sequence_patched_for_pp = True
-        print(
-            "[PP] Patched transformers._is_packed_sequence to avoid CPU-GPU sync during training.",
-            flush=True,
-        )
-    except (ImportError, AttributeError):
-        pass
+        print(f"[PP] Patched _is_packed_sequence → always False in: {patched}", flush=True)
+    except (ImportError, AttributeError) as _e:
+        print(f"[PP] WARNING: _patch_is_packed_sequence_for_pp_training failed: {_e}", flush=True)
 
 
 def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm_model: bool = True) -> None:

@@ -53,6 +53,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         self._bench_nsys_end = bench_cfg.nsys_end
         self._bench_nsys_ranks = bench_cfg.nsys_ranks
         self._bench_json_output_path = getattr(bench_cfg, "json_output_path", None)
+        self._bench_profile_comm = getattr(bench_cfg, "profile_comm", False)
         self._wandb_enabled = cfg.get("wandb", None) is not None
 
         # Infer max_steps from step_scheduler
@@ -86,7 +87,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 logger.info(f"Using batch_size={local_batch_size} from step_scheduler.local_batch_size")
 
         super().__init__(cfg)
-        self.timers = Timers(log_level=2, log_option="minmax")
+        self.timers = Timers(log_level=1, log_option="minmax")  # was: 2 — reduce stream syncs in hot path
 
     def setup(self):
         """Setup the benchmarking environment.
@@ -265,31 +266,25 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Create dataloader iterator
         dataloader_iter = iter(self.dataloader)
 
-        # torch.profiler for async-TP verification (runs on step warmup_steps, all ranks).
-        # Prints a comm vs compute CUDA-time breakdown on rank 0.
-        # NCCL ops with CUDA self-time << their wall time → truly async/overlapped.
-        _prof = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            record_shapes=False,
-            with_stack=False,
-            schedule=torch.profiler.schedule(wait=warmup_steps, warmup=0, active=1, repeat=1),
-            on_trace_ready=None,
-        )
-        _prof.__enter__()
+        # Optional step profiler (set benchmark.profile_comm: true).
+        _step_profiler = None
+        if self._bench_profile_comm:
+            from nemo_automodel.profiling import StepProfiler
+            _step_profiler = StepProfiler(
+                active_step=warmup_steps,
+                rank=rank,
+            )
+            _step_profiler.start()
 
-        # Patch model with autonvtx for detailed module breakdown
-        try:
-            import nemo_automodel.autonvtx as autonvtx
-            for mp in self.model_parts:
-                autonvtx.patch(mp)
-            if rank == 0:
-                logger.info("[autonvtx] Patched model parts for detailed breakdown")
-        except ImportError:
-            if rank == 0:
-                logger.warning("[autonvtx] Could not import autonvtx, module breakdown will be unavailable")
+            try:
+                import nemo_automodel.autonvtx as autonvtx
+                for mp in self.model_parts:
+                    autonvtx.patch(mp)
+                if rank == 0:
+                    logger.info("[autonvtx] Patched model parts for detailed breakdown")
+            except ImportError:
+                if rank == 0:
+                    logger.warning("[autonvtx] Could not import autonvtx, module breakdown will be unavailable")
 
         # Main benchmarking loop
         for i in range(steps):
@@ -340,24 +335,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
                     if ga_step_idx == 0:
                         prepare_after_first_microbatch()
-
-                # Print LoRA grad norms once at iteration 1 (first compiled pass) for correctness check
-                if i == 1 and rank == 0:
-                    lora_grads = {
-                        name: param.grad.norm().item()
-                        for name, param in self.model_parts[0].named_parameters()
-                        if "lora_" in name and param.grad is not None
-                    }
-                    no_grad = [
-                        name for name, param in self.model_parts[0].named_parameters()
-                        if "lora_" in name and param.grad is None
-                    ]
-                    if lora_grads:
-                        sample = list(lora_grads.items())[:4]
-                        logger.info(f"[grad_check] LoRA grad norms (first 4): {sample}")
-                        logger.info(f"[grad_check] Total LoRA params with grad: {len(lora_grads)}, without grad: {len(no_grad)}")
-                    else:
-                        logger.warning(f"[grad_check] NO LoRA grads found! (no_grad params: {len(no_grad)})")
 
                 # Optimizer step
                 with self.timers("optimizer", log_level=2):
@@ -411,59 +388,17 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 torch.cuda.cudart().cudaProfilerStop()
 
             self._maybe_collect_garbage()
-            _prof.step()
+            if _step_profiler is not None:
+                _step_profiler._prof.step()
 
-        _prof.__exit__(None, None, None)
-
-        # Print async-TP comm vs compute breakdown on rank 0 only.
-        # Aggregate from raw events (individual FunctionEvent objects have self_cuda_time_total).
-        if rank == 0:
-            try:
-                from collections import defaultdict
-                comm_keys = ("nccl", "c10d", "all_reduce", "reduce_scatter", "all_gather")
-                # Aggregate per-key CUDA time from raw events
-                key_cuda = defaultdict(float)
-                key_count = defaultdict(int)
-                for e in _prof.events():
-                    cuda_us = getattr(e, "self_cuda_time_total", 0) or 0
-                    key_cuda[e.name] += cuda_us
-                    key_count[e.name] += 1
-
-                comm_rows = [(k, v, key_count[k]) for k, v in key_cuda.items()
-                             if any(ck in k.lower() for ck in comm_keys)]
-                compute_rows = [(k, v, key_count[k]) for k, v in key_cuda.items()
-                                if k.startswith("aten::") and v > 0]
-                module_rows = [(k, v, key_count[k]) for k, v in key_cuda.items()
-                               if ": " in k and v > 0]
-                comm_cuda_us = sum(v for _, v, _ in comm_rows)
-                compute_cuda_us = sum(v for _, v, _ in compute_rows)
-                logger.info("=" * 70)
-                logger.info("[async-TP probe] CUDA self-time breakdown for step %d", warmup_steps)
-                logger.info("  If async TP is working: NCCL CUDA self-time should be near 0 us")
-                logger.info("  (comm runs concurrently with compute, so GPU never idles for it)")
-                logger.info("-" * 70)
-                logger.info("  %-45s  %10s  %8s", "Op", "CUDA us", "calls")
-                for k, v, c in sorted(comm_rows, key=lambda x: -x[1]):
-                    logger.info("  %-45s  %10.1f  %8d", k, v, c)
-                
-                if module_rows:
-                    logger.info("  %-45s  %10s", "--- top modules (autonvtx) ---", "")
-                    for k, v, c in sorted(module_rows, key=lambda x: -x[1])[:15]:
-                        logger.info("  %-45s  %10.1f  %8d", k, v, c)
-
-                logger.info("  %-45s  %10s", "--- top compute (aten) ---", "")
-                for k, v, c in sorted(compute_rows, key=lambda x: -x[1])[:8]:
-                    logger.info("  %-45s  %10.1f  %8d", k, v, c)
-                logger.info("-" * 70)
-                logger.info(
-                    "  NCCL CUDA total: %.1f us   Compute CUDA total: %.1f us   "
-                    "NCCL fraction: %.1f%%",
-                    comm_cuda_us, compute_cuda_us,
-                    100.0 * comm_cuda_us / (compute_cuda_us + 1e-9),
-                )
-                logger.info("=" * 70)
-            except Exception as probe_exc:
-                logger.warning("[async-TP probe] Could not compute CUDA breakdown: %s", probe_exc)
+        if _step_profiler is not None:
+            _step_profiler._step_wall_us = (
+                self.timers._get_global_min_max_time(
+                    ["iteration"], reset=False, barrier=False, normalizer=1.0
+                ).get("iteration", (0, 0))[1] * 1e6
+            ) if "iteration" in self.timers._timers else 0.0
+            _step_profiler.stop()
+            _step_profiler.report()
 
         # Final summary
         self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)

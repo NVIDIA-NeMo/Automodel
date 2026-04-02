@@ -4,19 +4,20 @@ seed: 42
 
 # NEW: Add benchmark section
 benchmark:
-  warmup_steps: 2
+  warmup_steps: 5
   peak_tflops: 989  # H100: 989, A100: 312
-  nsys_start: 6    # Set to step number to profile (e.g., 10)
-  nsys_end: 7      # Set to end step (e.g., 15)
-  nsys_ranks: [0]    # e.g., [0] to profile rank 0
+  nsys_start: 8
+  nsys_end: 9
+  nsys_ranks: [0]
   num_nodes: 1
+  profile_comm: false
 
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 4
+  local_batch_size: 8
   ckpt_every_steps: 50
   val_every_steps: 1000
-  max_steps: 4
+  max_steps: 10
 
 dist_env:
   backend: nccl
@@ -37,7 +38,7 @@ peft:
   match_all_linear: True
   dim: 16
   alpha: 32
-  use_triton: False
+  use_triton: True  # was: False — restore fused Triton LoRA kernels
 
 checkpoint:
   enabled: false
@@ -54,8 +55,8 @@ distributed:
 
   sequence_parallel: false
   activation_checkpointing: true
-  enable_async_tensor_parallel: true
-  enable_fsdp2_prefetch: true
+  enable_async_tensor_parallel: false  # was: true — disable to match baseline (no async-TP in 22.7% run)
+  enable_fsdp2_prefetch: false
   enable_compile: true
 
   pipeline:
@@ -92,4 +93,4 @@ lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6 
 
-nvtx: true
+nvtx: false  # was: true — eliminate NVTX push/pop CPU overhead per kernel launch

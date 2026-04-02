@@ -24,6 +24,12 @@ from transformers.activations import ACT2FN
 
 from nemo_automodel.components.models.common.combined_projection.combined_qkv import _assert_colwise_parallel
 
+try:
+    from flash_attn.ops.activations import swiglu as _flash_swiglu
+    _HAS_FLASH_SWIGLU = True
+except ImportError:
+    _HAS_FLASH_SWIGLU = False
+
 
 class CombinedGateUpMLP(nn.Module):
     """SwiGLU MLP with combined gate_up projection for efficiency.
@@ -87,5 +93,8 @@ class CombinedGateUpMLP(nn.Module):
         gate = gate_up[..., 0]
         up = gate_up[..., 1]
 
-        # SwiGLU: down(act(gate) * up)
+        # SwiGLU: fuse silu(gate)*up into a single kernel when flash_attn is available.
+        # Falls back to separate act_fn(gate)*up for non-SiLU activations or no flash_attn.
+        if _HAS_FLASH_SWIGLU and isinstance(self.act_fn, torch.nn.SiLU):
+            return self.down_proj(_flash_swiglu(gate, up))
         return self.down_proj(self.act_fn(gate) * up)

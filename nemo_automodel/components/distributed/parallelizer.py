@@ -215,16 +215,6 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 if hasattr(layer, "self_attn"):
                     layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
 
-                if hasattr(layer, "input_layernorm"):
-                    layers[i].input_layernorm = checkpoint_wrapper(
-                        layers[i].input_layernorm  # type: ignore
-                    )
-
-                if hasattr(layer, "post_attention_layernorm"):
-                    layers[i].post_attention_layernorm = checkpoint_wrapper(
-                        layers[i].post_attention_layernorm  # type: ignore
-                    )
-
         # Per-layer compile: deferred to after checkpoint loading in apply_model_infrastructure
         # to avoid _orig_mod key prefix mismatch when loading HF checkpoints.
         # Set the flag here so whole-model compile is skipped; actual compile applied later.
@@ -645,8 +635,12 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
         logger.warning("_apply_per_layer_compile: cannot find transformer layers, skipping")
         return
 
+    # PP converts model.model.layers from nn.ModuleList to nn.ModuleDict (str keys).
+    # enumerate(nn.ModuleDict) yields string keys, not modules — use .items() instead.
+    items = module_list.items() if isinstance(module_list, nn.ModuleDict) else enumerate(module_list)
+
     compiled_count = 0
-    for i, layer in enumerate(module_list):
+    for i, layer in items:
         # Unwrap any existing layer-level checkpoint wrapper (e.g. from PP path).
         if isinstance(layer, CheckpointWrapper):
             actual_layer = layer._checkpoint_wrapped_module

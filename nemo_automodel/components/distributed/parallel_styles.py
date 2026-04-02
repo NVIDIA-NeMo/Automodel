@@ -13,6 +13,7 @@
 # limitations under the License.
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributed.tensor import (
     DeviceMesh,
     DTensor,
@@ -63,6 +64,11 @@ class TPLinear(nn.Linear):
     """
 
     def forward(self, x):
+        # bmm is only needed during AOT-autograd tracing to avoid aten.view recursion on
+        # sharded DTensor activations. In eager mode F.linear is safe and avoids the extra
+        # unsqueeze/expand/bmm kernel launches.
+        if not torch.compiler.is_compiling():
+            return F.linear(x, self.weight, self.bias)
         if x.dim() == 3:
             b = x.shape[0]
             out = torch.bmm(x, self.weight.t().unsqueeze(0).expand(b, -1, -1))

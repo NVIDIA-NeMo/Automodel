@@ -263,7 +263,13 @@ class LinearLoRA(nn.Linear):
             bias = self.bias
             if bias is not None and bias.numel() == 0:
                 bias = None
-            res = _dtensor_linear(x, self.weight, bias)
+            # _dtensor_linear (bmm) is only needed during AOT-autograd tracing to avoid
+            # aten.view infinite recursion on Shard(2) DTensor activations. In eager mode
+            # F.linear is safe and avoids the bmm kernel-launch overhead.
+            if torch.compiler.is_compiling():
+                res = _dtensor_linear(x, self.weight, bias)
+            else:
+                res = F.linear(x, self.weight, bias)
 
         if not self.use_dora:
             if self.dropout_position == "pre":
@@ -343,6 +349,14 @@ class TritonLinearLoRA(LinearLoRA):
         Returns:
             torch.Tensor: the output tensor.
         """
+        # LoRATritonFunction.apply does not support DTensor inputs (TP-sharded weights).
+        # When weights are DTensors, fall through to LinearLoRA.forward which handles
+        # DTensors correctly via _dtensor_linear and avoids torch.compile graph breaks.
+        from torch.distributed.tensor import DTensor
+
+        if isinstance(self.lora_A.weight, DTensor) or isinstance(self.lora_B.weight, DTensor):
+            return LinearLoRA.forward(self, x)
+
         # If LinearLoRA is used to monkey-patch a nn.Linear module, we want to use nn.Linear's
         # forward in the case where it uses quantized weights. We store a reference to nn.Linear's
         # forward in `super_fwd` attribute. If the attribute does not exist we do the usual linear.
