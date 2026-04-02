@@ -34,9 +34,10 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/evee/eevee-4-26b-a4b-it_vv7
+  pretrained_model_name_or_path: your/path/to/gemma4_26b_a4b_moe
   torch_dtype: torch.bfloat16
   trust_remote_code: true
+  attn_implementation: sdpa
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
@@ -103,8 +104,8 @@ freeze_config:
   freeze_audio_tower: true
   freeze_language_model: false
 
-#Uncomment and set WANDB_API_KEY env var to enable W&B logging
-# wandb:
-#   project: eevee-4
-#   name: eevee4-26b-a4b-moe-it_vv5_lr2e-5_2epochs
-#   dir: vlm_checkpoints/gemma4_26b_a4b_moe/
+wandb:
+  project: <your-project>
+  entity: <your-entity>
+  name: <your-run-name>
+  dir: vlm_checkpoints/gemma4_2b_it/
