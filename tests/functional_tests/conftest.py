@@ -123,6 +123,7 @@ _OVERRIDES = [
     "tokenizer_name",
     "max_vram_gb",
     "max_cpu_gb",
+    "resume_loss_threshold",
     "cosine_threshold",
     "tokenizer.pretrained_model_name_or_path",
     "tokenizer.trust_remote_code",

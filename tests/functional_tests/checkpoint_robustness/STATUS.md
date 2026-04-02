@@ -1,6 +1,6 @@
 # Checkpoint Robustness Test Status
 
-Last updated: 2026-04-01 09:00 UTC
+Last updated: 2026-04-02 UTC
 
 ## Passing Models (8/15)
 
@@ -10,7 +10,7 @@ Last updated: 2026-04-01 09:00 UTC
 | 2 | GPT-OSS 20B | PASS | PASS | 1 | — | 5e-2 | 5e-2 | — | — | PASS (smoke) | PASS (smoke) | Disabled (MoE) | check_phantom_keys, EP=8 |
 | 3 | Nemotron Nano V3 | PASS | PASS | 1 | — | 7e-2 | 1e-1 | — | — | PASS (smoke) | PASS (smoke) | Disabled (MoE) | experts_implementation, EP=8 |
 | 4 | Gemma 3 270m | PASS | PASS | 1 | — | 3.8e-3 (t=6e-3) | 7.5e-3 (t=8e-3) | 4.47 GB | 0.45 GB | FAIL (vLLM) | — | PASS | 1 KV head, can't TP=2 |
-| 5 | Phi-4 | PASS | PASS | 1 | — | 7.6e-4 (t=1.2e-3) | 6.4e-4 (t=1e-3) | 15.41 GB | 8.62 GB | PASS | PASS | PASS | DTensor bug at TP=2 |
+| 5 | Phi-4 | PASS | PASS | 2 | — | 7.6e-4 (t=1.2e-3) | 6.4e-4 (t=1e-3) | 15.41 GB | 8.62 GB | PASS | PASS | PASS (t=7e-3) | TP=2 DTensor bug fixed on main |
 | 6 | Qwen2.5 7B | PASS | PASS | 2 | TP=2 (KL=0) | 5.9e-3 (t=9e-3) | 5.5e-2 (t=8e-2) | 8.02 GB | 4.49 GB | PASS | FAIL (lm_head LoRA) | PASS | check_fused_qkv_keys ✓, cross-TP ✓ |
 | 7 | Nemotron-Nano-8B-v1 | PASS | PASS | 2 | TP=2 (KL=0) | 4.2e-4 (t=7e-4) | 2.1e-3 (t=5e-3) | 7.73 GB | 4.42 GB | FAIL (token mismatch) | — | Disabled (Mamba) | check_fused_qkv_keys ✓, cross-TP ✓ |
 | 8 | Qwen3-MoE 30B | PASS | **FAIL** | 1 | — | 6.4e-5 (t=1e-4) | — | 28.18 GB | 11.81 GB | NOT RUN | NOT RUN | — | EP=8. SFT KL extremely low. **PEFT Phase 3 KL=0.84 — broken PEFT checkpoint reload, real bug** |
@@ -52,7 +52,7 @@ Last updated: 2026-04-01 09:00 UTC
 - **Mamba hybrid resume non-determinism**: Nano-8B-v1 has 0.62 loss diff on resume. Mamba layers have non-deterministic state.
 - **Mamba hybrid vLLM mismatch**: Nano-8B-v1 greedy tokens differ between HF and vLLM. Should use `--vllm_smoke_test`.
 - **transformers 5.3 compatibility**: Flash 1B (triton_attention.py), Nano V2 (FSDP model attr), Baichuan (meta tensor).
-- **TP=2 failures**: Gemma 3 (1 KV head), Phi-4 (DTensor assertion), Baichuan (custom layers), Mistral3 (FP8 scalars).
+- **TP=2 failures**: Gemma 3 (1 KV head), Baichuan (custom layers), Mistral3 (FP8 scalars). Phi-4 TP=2 fixed on main.
 - **vLLM Gemma 3**: vLLM in `/adasif/vllm-venv/` doesn't support Gemma 3's RoPE config.
 - **vLLM Qwen2.5 PEFT**: `match_all_linear: true` includes `lm_head` as LoRA target which vLLM rejects.
 - **Qwen3-MoE PEFT bug**: Phase 3 KL=0.84 indicates broken PEFT checkpoint save/reload. Needs investigation in Qwen3MoeStateDictAdapter.
@@ -75,7 +75,7 @@ Last updated: 2026-04-01 09:00 UTC
 9. **Super 120B** — EP=32 on 32 GPUs (PEFT EP=8 could run on 1 node)
 
 ### Infrastructure improvements:
-10. **`--resume_loss_threshold`** flag for MoE/Mamba models
+10. **`--resume_loss_threshold`** flag — DONE (added, default 5e-3)
 11. **Memory thresholds** for remaining models (Llama, GPT-OSS, Nano V3 still missing)
 
 ## Commits on branch `adil-a/checkpoint-robustness-test`
@@ -87,3 +87,4 @@ Last updated: 2026-04-01 09:00 UTC
 - `5928505d` — Merge main
 - `39a413ef` — Tighten thresholds, add cross-TP for Qwen2.5/Nano-8B-v1/Baichuan/Mistral3
 - `2f1a5a94` — STATUS update with Super-49B results
+- Phi-4 TP=2: SFT PASS (HF KL=2.7e-4, resume 7e-3), PEFT PASS (9:05). DTensor bug fixed on main after merge.
