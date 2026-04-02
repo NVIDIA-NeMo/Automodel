@@ -2,18 +2,20 @@
 
 Last updated: 2026-04-02 UTC
 
+> **Note:** vLLM deployment tests moved to separate PR.
+
 ## Passing Models (8/15)
 
-| # | Model | SFT | PEFT | TP | Cross-TP | HF KL (SFT) | HF KL (PEFT) | VRAM SFT | VRAM PEFT | vLLM SFT | vLLM PEFT | Resume | Special Flags |
-|---|-------|-----|------|----|----------|-------------|--------------|----------|-----------|----------|-----------|--------|---------------|
-| 1 | Llama 3.2 3B | PASS | PASS | 1 | TP=2 | 5e-3 | 5e-3 | — | — | PASS | PASS | PASS | check_fused_qkv_keys (PEFT) |
-| 2 | GPT-OSS 20B | PASS | PASS | 1 | — | 5e-2 | 5e-2 | — | — | PASS (smoke) | PASS (smoke) | Disabled (MoE) | check_phantom_keys, EP=8 |
-| 3 | Nemotron Nano V3 | PASS | PASS | 1 | — | 7e-2 | 1e-1 | — | — | PASS (smoke) | PASS (smoke) | Disabled (MoE) | experts_implementation, EP=8 |
-| 4 | Gemma 3 270m | PASS | PASS | 1 | — | 3.8e-3 (t=6e-3) | 7.5e-3 (t=8e-3) | 4.47 GB | 0.45 GB | FAIL (vLLM) | — | PASS | 1 KV head, can't TP=2 |
-| 5 | Phi-4 | PASS | PASS | 2 | — | 7.6e-4 (t=1.2e-3) | 6.4e-4 (t=1e-3) | 15.41 GB | 8.62 GB | PASS | PASS | PASS (t=7e-3) | TP=2 DTensor bug fixed on main |
-| 6 | Qwen2.5 7B | PASS | PASS | 2 | TP=2 (KL=0) | 5.9e-3 (t=9e-3) | 5.5e-2 (t=8e-2) | 8.02 GB | 4.49 GB | PASS | FAIL (lm_head LoRA) | PASS | check_fused_qkv_keys ✓, cross-TP ✓ |
-| 7 | Nemotron-Nano-8B-v1 | PASS | PASS | 2 | TP=2 (KL=0) | 4.2e-4 (t=7e-4) | 2.1e-3 (t=5e-3) | 7.73 GB | 4.42 GB | FAIL (token mismatch) | — | Disabled (Mamba) | check_fused_qkv_keys ✓, cross-TP ✓ |
-| 8 | Qwen3-MoE 30B | PASS | **FAIL** | 1 | — | 6.4e-5 (t=1e-4) | — | 28.18 GB | 11.81 GB | NOT RUN | NOT RUN | — | EP=8. SFT KL extremely low. **PEFT Phase 3 KL=0.84 — broken PEFT checkpoint reload, real bug** |
+| # | Model | SFT | PEFT | TP | Cross-TP | HF KL (SFT) | HF KL (PEFT) | VRAM SFT | VRAM PEFT | Resume | Special Flags |
+|---|-------|-----|------|----|----------|-------------|--------------|----------|-----------|--------|---------------|
+| 1 | Llama 3.2 3B | PASS | PASS | 1 | TP=2 | 5e-3 | 5e-3 | — | — | PASS | check_fused_qkv_keys (PEFT) |
+| 2 | GPT-OSS 20B | PASS | PASS | 1 | — | 5e-2 | 5e-2 | — | — | Disabled (MoE) | check_phantom_keys, EP=8 |
+| 3 | Nemotron Nano V3 | PASS | PASS | 1 | — | 7e-2 | 1e-1 | — | — | Disabled (MoE) | experts_implementation, EP=8 |
+| 4 | Gemma 3 270m | PASS | PASS | 1 | — | 3.8e-3 (t=6e-3) | 7.5e-3 (t=8e-3) | 4.47 GB | 0.45 GB | PASS | 1 KV head, can't TP=2 |
+| 5 | Phi-4 | PASS | PASS | 2 | — | 7.6e-4 (t=1.2e-3) | 6.4e-4 (t=1e-3) | 15.41 GB | 8.62 GB | PASS (t=7e-3) | TP=2 DTensor bug fixed on main |
+| 6 | Qwen2.5 7B | PASS | PASS | 2 | TP=2 (KL=0) | 5.9e-3 (t=9e-3) | 5.5e-2 (t=8e-2) | 8.02 GB | 4.49 GB | PASS | check_fused_qkv_keys ✓, cross-TP ✓ |
+| 7 | Nemotron-Nano-8B-v1 | PASS | PASS | 2 | TP=2 (KL=0) | 4.2e-4 (t=7e-4) | 2.1e-3 (t=5e-3) | 7.73 GB | 4.42 GB | Disabled (Mamba) | check_fused_qkv_keys ✓, cross-TP ✓ |
+| 8 | Qwen3-MoE 30B | PASS | **FAIL** | 1 | — | 6.4e-5 (t=1e-4) | — | 28.18 GB | 11.81 GB | — | EP=8. SFT KL extremely low. **PEFT Phase 3 KL=0.84 — broken PEFT checkpoint reload, real bug** |
 
 ## Failing Models (5/15)
 
@@ -35,14 +37,6 @@ Last updated: 2026-04-02 UTC
 | 15 | Super-120B | SFT | 4 (EP=32) | 32 GPUs | PASS | PASS (device_map=auto) | Disabled (MoE) | All phases pass, 9:27 |
 | 15 | Super-120B | PEFT | 2 (EP=16) | 16 GPUs | PASS | FAIL (KL=8.5e-2, t=7e-2) | Disabled (MoE) | Combined QKV in PEFT adapter |
 
-## vLLM Failures
-
-| # | Model | Mode | Error | Root Cause |
-|---|-------|------|-------|------------|
-| 4 | Gemma 3 270m | SFT full | `rope_parameters should have a 'rope_type' key` | vLLM version incompatible with Gemma 3's RoPE config |
-| 6 | Qwen2.5 7B | PEFT full | `expected target modules in {'k_proj',...} but received ['lm_head']` | `match_all_linear: true` includes lm_head which vLLM LoRA doesn't support |
-| 7 | Nemotron-Nano-8B-v1 | SFT full | Token mismatch on prompt 1 | Mamba hybrid layers produce different outputs between HF and vLLM. Should use smoke test mode. |
-
 ## Not Yet Run
 
 (None — all models tested)
@@ -51,12 +45,9 @@ Last updated: 2026-04-02 UTC
 
 - **MoE resume non-determinism**: DeepEP expert routing causes 3e-2 to 1e-1 loss diff. `--check_resume` disabled for MoE models.
 - **Mamba hybrid resume non-determinism**: Nano-8B-v1 has 0.62 loss diff on resume. Mamba layers have non-deterministic state.
-- **Mamba hybrid vLLM mismatch**: Nano-8B-v1 greedy tokens differ between HF and vLLM. Should use `--vllm_smoke_test`.
 - **transformers 5.3 compatibility**: Flash 1B (triton_attention.py), Nano V2 (FSDP model attr), Baichuan (meta tensor).
 - **TP=2 failures**: Gemma 3 (1 KV head), Baichuan (custom layers), Mistral3 (FP8 scalars). Phi-4 TP=2 fixed on main.
 - **Combined QKV Phase 4 failures**: Super-49B and Super-120B PEFT produce combined projection keys (qkv_proj, gate_up_proj) in consolidated/adapter checkpoints. Vanilla HF models expect separate projections. StateDictAdapter conversion needed for Phase 4 to work.
-- **vLLM Gemma 3**: vLLM in `/adasif/vllm-venv/` doesn't support Gemma 3's RoPE config.
-- **vLLM Qwen2.5 PEFT**: `match_all_linear: true` includes `lm_head` as LoRA target which vLLM rejects.
 - **Qwen3-MoE PEFT bug**: Phase 3 KL=0.84 indicates broken PEFT checkpoint save/reload. Needs investigation in Qwen3MoeStateDictAdapter.
 
 ## TODO
@@ -65,8 +56,6 @@ Last updated: 2026-04-02 UTC
 1. **Super-49B Phase 4** — consolidated checkpoint has combined QKV keys. Need StateDictAdapter in Phase 4, or fix save_consolidated to split projections.
 2. **Super-120B PEFT Phase 4** — same combined QKV issue for PEFT adapter weights.
 3. **Qwen3-MoE PEFT bug** — investigate why Phase 3 KL=0.84 (real checkpoint bug)
-4. **vLLM fixes** — Nano-8B-v1 switch to smoke test; Qwen2.5 PEFT exclude lm_head
-
 ### Investigate other failures (may need code fixes):
 5. **Nemotron Flash 1B** — consolidated checkpoint missing triton_attention.py
 6. **Nemotron Nano V2 9B** — FSDP wrapping issue

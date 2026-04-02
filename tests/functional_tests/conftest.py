@@ -115,10 +115,7 @@ _OVERRIDES = [
     "hf_kl_threshold",
     "cross_tp_size",
     "cross_tp_kl_threshold",
-    "model_path",
     "tokenizer",
-    "max_new_tokens",
-    "adapter_path",
     "experts_implementation",
     "tokenizer_name",
     "max_vram_gb",
@@ -132,7 +129,6 @@ _OVERRIDES = [
 ]
 
 _BOOLEAN_OVERRIDES = [
-    "vllm_smoke_test",
     "trust_remote_code",
     "check_fused_qkv_keys",
     "check_phantom_keys",
