@@ -71,6 +71,31 @@ def _extract_custom_args(argv):
         else:
             remaining.append(argv[i])
             i += 1
+
+    # Read ci.checkpoint_robustness from the YAML config as defaults.
+    # CLI args take precedence over YAML values.
+    config_path = None
+    for j, arg in enumerate(remaining):
+        if arg == "--config" and j + 1 < len(remaining):
+            config_path = remaining[j + 1]
+            break
+    if config_path:
+        import yaml
+
+        with open(config_path) as f:
+            raw_cfg = yaml.safe_load(f)
+        ci_robustness = raw_cfg.get("ci", {}).get("checkpoint_robustness") or {}
+        no_check_resume = ci_robustness.pop("no_check_resume", False)
+        for k, v in ci_robustness.items():
+            if k not in custom:
+                if isinstance(v, bool) and v:
+                    custom[k] = True
+                elif not isinstance(v, bool):
+                    custom[k] = str(v)
+        # Enable check_resume by default unless no_check_resume is set
+        if not no_check_resume and "check_resume" not in custom:
+            custom["check_resume"] = True
+
     return custom, remaining
 
 
