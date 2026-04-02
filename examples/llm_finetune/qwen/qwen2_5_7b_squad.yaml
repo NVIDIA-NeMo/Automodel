@@ -110,3 +110,5 @@ ci:
     cross_tp_kl_threshold: 9e-3
     max_vram_gb: 10
     max_cpu_gb: 12
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500

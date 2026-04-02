@@ -107,3 +107,5 @@ ci:
     tokenizer_name: nvidia/Llama-3.1-Nemotron-Nano-8B-v1
     check_fused_qkv_keys: true
     no_check_resume: true
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500
