@@ -106,7 +106,7 @@ Install NeMo AutoModel and launch your first training job.
 :::{grid-item-card} {octicon}`download;1.5em;sd-mr-1` Installation
 :link: guides/installation
 :link-type: doc
-Install via PyPI, Docker, or from source.
+Install via PyPI, Docker, or from source. Use `nemo-automodel[cli]` for lightweight login-node installs.
 :::
 
 :::{grid-item-card} {octicon}`gear;1.5em;sd-mr-1` Configuration
@@ -122,7 +122,7 @@ Run on a single GPU or multi-GPU with torchrun.
 :::
 
 :::{grid-item-card} {octicon}`server;1.5em;sd-mr-1` Cluster (SLURM)
-:link: launcher/cluster
+:link: launcher/slurm
 :link-type: doc
 Multi-node training with SLURM and the `automodel` CLI.
 :::
@@ -221,8 +221,6 @@ about/key-features.md
 guides/installation.md
 guides/configuration.md
 guides/huggingface-api-compatibility.md
-launcher/local-workstation.md
-launcher/cluster.md
 repository-structure.md
 ::::
 
@@ -283,6 +281,9 @@ guides/diffusion/dataset.md
 :hidden:
 :caption: Job Launchers
 
+launcher/overview.md
+launcher/local-workstation.md
+launcher/slurm.md
 launcher/skypilot.md
 ::::
 

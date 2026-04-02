@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from packaging.version import Version
 from typing import Optional
 
 import argparse
 import requests
 import tomllib
+from packaging.version import Version
 
 
 def get_latest_version(package_name: str) -> Optional[str]:
