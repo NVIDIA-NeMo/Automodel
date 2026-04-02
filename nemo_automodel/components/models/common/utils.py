@@ -234,6 +234,15 @@ class BackendConfig:
             )
 
 
+@torch.compile(fullgraph=True, dynamic=True)
+def _float32_rms_norm_fwd(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Compiled fp32 RMSNorm forward — standalone function to minimize dynamo guards."""
+    input_dtype = x.dtype
+    x = x.float()
+    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    return (weight * x).to(input_dtype)
+
+
 class Float32RMSNorm(nn.Module):
     """RMSNorm with explicit fp32 computation for training stability.
 
@@ -250,12 +259,8 @@ class Float32RMSNorm(nn.Module):
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)
 
-    @torch.compile(fullgraph=True, dynamic=True)
     def forward(self, x):
-        input_dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (self.weight * x).to(input_dtype)
+        return _float32_rms_norm_fwd(x, self.weight, self.eps)
 
 
 def initialize_rms_norm_module(

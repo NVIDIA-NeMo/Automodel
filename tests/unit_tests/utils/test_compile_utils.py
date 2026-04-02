@@ -157,6 +157,7 @@ class TestConfigureTorchDynamo:
     def test_configure_dynamo_success(self, mock_dynamo):
         """Test successful dynamo configuration."""
         mock_config = MagicMock()
+        mock_config.cache_size_limit = 8  # simulate PyTorch default
         mock_dynamo.config = mock_config
 
         configure_torch_dynamo(cache_size_limit=512, capture_scalar_outputs=True)
@@ -168,12 +169,24 @@ class TestConfigureTorchDynamo:
     def test_configure_dynamo_without_scalar_outputs(self, mock_dynamo):
         """Test dynamo configuration without scalar outputs."""
         mock_config = MagicMock()
+        mock_config.cache_size_limit = 8
         mock_dynamo.config = mock_config
 
         configure_torch_dynamo(cache_size_limit=256, capture_scalar_outputs=False)
 
         assert mock_config.cache_size_limit == 256
         # When capture_scalar_outputs=False, the attribute is not set at all
+
+    @patch("torch._dynamo")
+    def test_configure_dynamo_never_lowers_limit(self, mock_dynamo):
+        """Test that cache_size_limit is never lowered below the current value."""
+        mock_config = MagicMock()
+        mock_config.cache_size_limit = 512  # already higher
+        mock_dynamo.config = mock_config
+
+        configure_torch_dynamo(cache_size_limit=64)
+
+        assert mock_config.cache_size_limit == 512  # preserved, not lowered
 
     def test_configure_dynamo_import_error(self):
         """Test handling of ImportError when torch._dynamo is not available."""
