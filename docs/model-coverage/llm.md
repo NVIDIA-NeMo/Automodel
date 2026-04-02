@@ -22,6 +22,7 @@ The table below lists the main architectures we test against (FSDP2 combined wit
 
 | Architecture                          | Models                                | Example HF Models                                                                 |
 |---------------------------------------|---------------------------------------|-----------------------------------------------------------------------------------|
+| `AfmoeForCausalLM`                    | Afmoe (Arcee Fusion MoE)              | `arcee-ai/Trinity-Large-Thinking` — example recipe: [trinity_large_thinking_sft.yaml](../../examples/llm_finetune/afmoe/trinity_large_thinking_sft.yaml) |
 | `AquilaForCausalLM`                   | Aquila, Aquila2                       | `BAAI/Aquila-7B`, `BAAI/AquilaChat-7B`, etc.                                      |
 | `BaiChuanForCausalLM`                 | Baichuan2, Baichuan                   | `baichuan-inc/Baichuan2-13B-Chat`, `baichuan-inc/Baichuan-7B`, etc. — example recipes: [baichuan_2_7b_squad.yaml](../../examples/llm_finetune/baichuan/baichuan_2_7b_squad.yaml), [baichuan_2_7b_squad_peft.yaml](../../examples/llm_finetune/baichuan/baichuan_2_7b_squad_peft.yaml) |
 | `BambaForCausalLM`                    | Bamba                                 | `ibm-ai-platform/Bamba-9B`                                                        |
