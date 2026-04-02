@@ -57,7 +57,7 @@ def _extract_custom_args(argv):
         "--max_cpu_gb",
         "--resume_loss_threshold",
     }
-    boolean_keys = {"--trust_remote_code", "--check_fused_qkv_keys", "--check_phantom_keys", "--check_resume"}
+    boolean_keys = {"--trust_remote_code", "--check_fused_qkv_keys", "--check_phantom_keys", "--check_resume", "--hf_device_map_auto"}
     custom = {}
     remaining = []
     i = 0
@@ -140,6 +140,7 @@ def test_checkpoint_robustness():
     check_phantom_keys = bool(custom_args.get("check_phantom_keys", False))
     check_resume = bool(custom_args.get("check_resume", False))
     resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
+    hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
 
     input_ids = _get_input_ids(tokenizer_name)
 
@@ -216,6 +217,7 @@ def test_checkpoint_robustness():
     # Phase 4: Load into vanilla HF (rank 0 only)
     del restored_trainer
     torch.cuda.empty_cache()
+    _barrier()  # ensure all ranks free memory before rank 0 loads HF model
 
     if _rank0():
         from transformers import AutoModelForCausalLM
@@ -224,11 +226,16 @@ def test_checkpoint_robustness():
         if experts_implementation:
             hf_kwargs["experts_implementation"] = experts_implementation
             hf_kwargs["trust_remote_code"] = False
+        if hf_device_map_auto:
+            hf_kwargs["device_map"] = "auto"
 
         if is_peft:
             from peft import PeftModel
 
-            base_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs).to(device)
+            if hf_device_map_auto:
+                base_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
+            else:
+                base_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs).to(device)
             peft_model = PeftModel.from_pretrained(base_model, str(ckpt_step_dir / "model"))
             hf_logits = _get_logits(peft_model, input_ids, device)
 
@@ -249,7 +256,10 @@ def test_checkpoint_robustness():
 
             del peft_model, base_model
         else:
-            hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs).to(device)
+            if hf_device_map_auto:
+                hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
+            else:
+                hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs).to(device)
             hf_logits = _get_logits(hf_model, input_ids, device)
             del hf_model
 

@@ -135,6 +135,7 @@ _BOOLEAN_OVERRIDES = [
     "check_fused_qkv_keys",
     "check_phantom_keys",
     "check_resume",
+    "hf_device_map_auto",
 ]
 
 
