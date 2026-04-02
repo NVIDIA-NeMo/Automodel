@@ -55,6 +55,7 @@ def _extract_custom_args(argv):
         "--tokenizer_name",
         "--max_vram_gb",
         "--max_cpu_gb",
+        "--resume_loss_threshold",
     }
     boolean_keys = {"--trust_remote_code", "--check_fused_qkv_keys", "--check_phantom_keys", "--check_resume"}
     custom = {}
@@ -138,6 +139,7 @@ def test_checkpoint_robustness():
     check_fused_qkv_keys = bool(custom_args.get("check_fused_qkv_keys", False))
     check_phantom_keys = bool(custom_args.get("check_phantom_keys", False))
     check_resume = bool(custom_args.get("check_resume", False))
+    resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
 
     input_ids = _get_input_ids(tokenizer_name)
 
@@ -355,7 +357,7 @@ def test_checkpoint_robustness():
                         f"[Phase 6] Step {step}: baseline_loss={bl:.6f}, resume_loss={rl:.6f}, diff={diff:.6e}"
                     )
                     if not is_peft:
-                        assert diff < 5e-3, (
+                        assert diff < resume_loss_threshold, (
                             f"SFT loss mismatch after resume at step {step}: "
                             f"baseline={bl:.6f}, resume={rl:.6f}, diff={diff:.6e}"
                         )
