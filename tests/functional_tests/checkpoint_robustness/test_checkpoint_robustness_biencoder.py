@@ -36,7 +36,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.biencoder.train_biencoder import TrainBiencoderRecipe
+from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
 
 # Default test sentence for embedding extraction
 _DEFAULT_PROMPT = "The quick brown fox jumps over the lazy dog"
@@ -46,6 +46,7 @@ def _extract_custom_args(argv):
     """Separate test-specific CLI flags from config parser arguments."""
     custom_keys = {
         "--cosine_threshold",
+        "--resume_loss_threshold",
     }
     boolean_keys = {"--check_resume"}
     custom = {}
@@ -79,7 +80,9 @@ def _get_embeddings(model, tokenizer, prompt: str, device) -> torch.Tensor:
     to produce a single embedding vector.
     """
     model.eval()
-    encoded = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=512)
+    # Use underlying HF tokenizer to avoid NeMoAutoTokenizer's _add_token issue with return_tensors="pt"
+    hf_tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
+    encoded = hf_tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=512)
     input_dict = {k: v.to(device) for k, v in encoded.items()}
     with torch.no_grad():
         embeddings = model(input_dict, encoder="query")
@@ -106,13 +109,14 @@ def test_checkpoint_robustness_biencoder():
     sys.argv = [sys.argv[0]] + config_argv
     cosine_threshold = float(custom_args.get("cosine_threshold", "0.999"))
     check_resume = bool(custom_args.get("check_resume", False))
+    resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
 
     # ------------------------------------------------------------------
     # Phase 1: Train biencoder and checkpoint
     # ------------------------------------------------------------------
     torch.cuda.reset_peak_memory_stats()
     cfg = parse_args_and_load_config()
-    trainer = TrainBiencoderRecipe(cfg)
+    trainer = TrainBiEncoderRecipe(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
 
@@ -146,7 +150,7 @@ def test_checkpoint_robustness_biencoder():
     cfg = parse_args_and_load_config()
     cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
     cfg.checkpoint.enabled = False
-    restored_trainer = TrainBiencoderRecipe(cfg)
+    restored_trainer = TrainBiEncoderRecipe(cfg)
     restored_trainer.setup()
 
     restored_embeddings = _get_embeddings(
@@ -180,7 +184,7 @@ def test_checkpoint_robustness_biencoder():
         cfg.step_scheduler.max_steps = resume_max_steps
         cfg.checkpoint.checkpoint_dir = baseline_dir
         cfg.checkpoint.enabled = False
-        baseline_trainer = TrainBiencoderRecipe(cfg)
+        baseline_trainer = TrainBiEncoderRecipe(cfg)
         baseline_trainer.setup()
         baseline_trainer.run_train_validation_loop()
 
@@ -201,7 +205,7 @@ def test_checkpoint_robustness_biencoder():
         cfg = parse_args_and_load_config()
         cfg.checkpoint.restore_from = str(ckpt_step_dir)
         cfg.step_scheduler.max_steps = resume_max_steps
-        resume_trainer = TrainBiencoderRecipe(cfg)
+        resume_trainer = TrainBiEncoderRecipe(cfg)
         resume_trainer.setup()
         resume_trainer.run_train_validation_loop()
 
@@ -229,7 +233,7 @@ def test_checkpoint_robustness_biencoder():
                         f"[Phase 4] Step {step}: baseline_loss={bl:.6f}, "
                         f"resume_loss={rl:.6f}, diff={diff:.6e}"
                     )
-                    assert diff < 5e-3, (
+                    assert diff < resume_loss_threshold, (
                         f"Contrastive loss mismatch after resume at step {step}: "
                         f"baseline={bl:.6f}, resume={rl:.6f}, diff={diff:.6e}"
                     )

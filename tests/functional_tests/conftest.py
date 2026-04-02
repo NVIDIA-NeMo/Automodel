@@ -125,6 +125,8 @@ _OVERRIDES = [
     "max_cpu_gb",
     "resume_loss_threshold",
     "cosine_threshold",
+    "dataloader.dataset.data_dir_list",
+    "tokenizer._target_",
     "tokenizer.pretrained_model_name_or_path",
     "tokenizer.trust_remote_code",
 ]

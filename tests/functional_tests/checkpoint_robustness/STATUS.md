@@ -25,12 +25,15 @@ Last updated: 2026-04-02 UTC
 | 12 | Mistral3 3B | TP=2, TP=1 | `fully_shard doesn't support scalar parameters (weight_scale_inv)` | FP8 quantized model has scalar scale params incompatible with FSDP2. Same error at both TP sizes. | Crashes during setup |
 | 8* | Qwen3-MoE PEFT | TP=1 EP=8 | Phase 3 KL=0.84 (should be 0) | **Real bug**: PEFT checkpoint reload is broken for Qwen3-MoE. SFT works fine. | Phase 1-2 PASS |
 
-## Deferred — Multi-Node (2/15)
+## Multi-Node Results (tested 2026-04-02)
 
-| # | Model | Config | Why |
-|---|-------|--------|-----|
-| 13 | Llama-3.3-Super-49B | TP=4 PP=2 (2 nodes, 16 GPUs) | OOM on 8 GPUs in all configs. PEFT Phase 1-3 passed at TP=1 but Phase 4 OOMs (49B HF on 1 GPU). |
-| 15 | Nemotron Super 120B | EP=32 (4 nodes, 32 GPUs) | SFT needs 4 nodes. PEFT (EP=8) could fit 1 node but not tested yet. |
+| # | Model | Mode | Nodes | Config | Phases 1-3 | Phase 4 (HF) | Resume | Notes |
+|---|-------|------|-------|--------|-----------|--------------|--------|-------|
+| 13 | Super-49B | SFT | 2 (TP=4) | 16 GPUs | PASS | FAIL (KL=10.6) | Not reached | Combined QKV keys in consolidated ckpt — vanilla HF can't load |
+| 13 | Super-49B | PEFT | 1 (TP=2) | 8 GPUs | PASS | FAIL (KL=10.5) | Not reached | Same combined QKV issue in PEFT adapter |
+| 14 | Embed-1B-v2 | SFT | 1 | 8 GPUs | PASS (cosine=1.0) | N/A | PASS (t=2e-2) | Biencoder test, all phases pass |
+| 15 | Super-120B | SFT | 4 (EP=32) | 32 GPUs | PASS | PASS (device_map=auto) | Disabled (MoE) | All phases pass, 9:27 |
+| 15 | Super-120B | PEFT | 2 (EP=16) | 16 GPUs | PASS | FAIL (KL=8.5e-2, t=7e-2) | Disabled (MoE) | Combined QKV in PEFT adapter |
 
 ## vLLM Failures
 
@@ -40,11 +43,9 @@ Last updated: 2026-04-02 UTC
 | 6 | Qwen2.5 7B | PEFT full | `expected target modules in {'k_proj',...} but received ['lm_head']` | `match_all_linear: true` includes lm_head which vLLM LoRA doesn't support |
 | 7 | Nemotron-Nano-8B-v1 | SFT full | Token mismatch on prompt 1 | Mamba hybrid layers produce different outputs between HF and vLLM. Should use smoke test mode. |
 
-## Not Yet Run (1/15)
+## Not Yet Run
 
-| # | Model | Notes |
-|---|-------|-------|
-| 14 | Embed-1B-v2 | Biencoder, separate test file (test_checkpoint_robustness_biencoder.py), no vLLM |
+(None — all models tested)
 
 ## Known Issues
 
@@ -53,26 +54,24 @@ Last updated: 2026-04-02 UTC
 - **Mamba hybrid vLLM mismatch**: Nano-8B-v1 greedy tokens differ between HF and vLLM. Should use `--vllm_smoke_test`.
 - **transformers 5.3 compatibility**: Flash 1B (triton_attention.py), Nano V2 (FSDP model attr), Baichuan (meta tensor).
 - **TP=2 failures**: Gemma 3 (1 KV head), Baichuan (custom layers), Mistral3 (FP8 scalars). Phi-4 TP=2 fixed on main.
+- **Combined QKV Phase 4 failures**: Super-49B and Super-120B PEFT produce combined projection keys (qkv_proj, gate_up_proj) in consolidated/adapter checkpoints. Vanilla HF models expect separate projections. StateDictAdapter conversion needed for Phase 4 to work.
 - **vLLM Gemma 3**: vLLM in `/adasif/vllm-venv/` doesn't support Gemma 3's RoPE config.
 - **vLLM Qwen2.5 PEFT**: `match_all_linear: true` includes `lm_head` as LoRA target which vLLM rejects.
 - **Qwen3-MoE PEFT bug**: Phase 3 KL=0.84 indicates broken PEFT checkpoint save/reload. Needs investigation in Qwen3MoeStateDictAdapter.
 
 ## TODO
 
-### Runnable on this machine:
-1. **Embed-1B-v2** — biencoder test, last remaining model
-2. **Qwen3-MoE PEFT bug** — investigate why Phase 3 KL=0.84 (real checkpoint bug)
-3. **vLLM fixes** — Nano-8B-v1 switch to smoke test; Qwen2.5 PEFT exclude lm_head
+### Investigate failures:
+1. **Super-49B Phase 4** — consolidated checkpoint has combined QKV keys. Need StateDictAdapter in Phase 4, or fix save_consolidated to split projections.
+2. **Super-120B PEFT Phase 4** — same combined QKV issue for PEFT adapter weights.
+3. **Qwen3-MoE PEFT bug** — investigate why Phase 3 KL=0.84 (real checkpoint bug)
+4. **vLLM fixes** — Nano-8B-v1 switch to smoke test; Qwen2.5 PEFT exclude lm_head
 
-### Investigate failures (may need code fixes):
-4. **Nemotron Flash 1B** — consolidated checkpoint missing triton_attention.py
-5. **Nemotron Nano V2 9B** — FSDP wrapping issue
-6. **Baichuan 2 7B** — meta tensor in Phase 4 HF loading
-7. **Mistral3 3B** — FP8 scalar params vs FSDP2
-
-### Multi-node (need 2+ nodes):
-8. **Super-49B SFT** — TP=4 PP=2 on 16 GPUs
-9. **Super 120B** — EP=32 on 32 GPUs (PEFT EP=8 could run on 1 node)
+### Investigate other failures (may need code fixes):
+5. **Nemotron Flash 1B** — consolidated checkpoint missing triton_attention.py
+6. **Nemotron Nano V2 9B** — FSDP wrapping issue
+7. **Baichuan 2 7B** — meta tensor in Phase 4 HF loading
+8. **Mistral3 3B** — FP8 scalar params vs FSDP2
 
 ### Infrastructure improvements:
 10. **`--resume_loss_threshold`** flag — DONE (added, default 5e-3)
@@ -88,3 +87,6 @@ Last updated: 2026-04-02 UTC
 - `39a413ef` — Tighten thresholds, add cross-TP for Qwen2.5/Nano-8B-v1/Baichuan/Mistral3
 - `2f1a5a94` — STATUS update with Super-49B results
 - Phi-4 TP=2: SFT PASS (HF KL=2.7e-4, resume 7e-3), PEFT PASS (9:05). DTensor bug fixed on main after merge.
+- Multi-node tests (2026-04-02): Super-120B SFT PASS (4 nodes EP=32, device_map=auto). Super-49B SFT Phase 1-3 PASS (2 nodes TP=4), Phase 4 FAIL (combined QKV). Embed-1B-v2 PASS (cosine=1.0, resume t=2e-2).
+- Added `--hf_device_map_auto` flag for Phase 4 large model loading across all GPUs.
+- Added `--resume_loss_threshold` to biencoder test. Fixed biencoder import path and tokenizer compatibility.
