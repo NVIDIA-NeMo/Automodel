@@ -84,6 +84,7 @@ from nemo_automodel.components.utils.compile_utils import (
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
+    _supports_padding_mask,
     _supports_seq_lens,
     filter_forward_kwargs,
     resolve_trust_remote_code,
@@ -588,6 +589,18 @@ def build_dataloader(
             else:
                 dl_kwargs["collate_fn"] = cfg_dl.collate_fn
             assert callable(dl_kwargs["collate_fn"]), "collate_fn must be callable"
+
+        if "collate_fn" in dl_kwargs and model is not None and not _supports_padding_mask(model):
+            base_collate_fn = dl_kwargs["collate_fn"]
+
+            def maybe_strip_padding_mask(batch, base_fn=base_collate_fn):
+                collated_batch = base_fn(batch)
+                if isinstance(collated_batch, dict) and "padding_mask" in collated_batch:
+                    collated_batch = dict(collated_batch)
+                    collated_batch.pop("padding_mask", None)
+                return collated_batch
+
+            dl_kwargs["collate_fn"] = maybe_strip_padding_mask
 
         # Chain with mask precomputation if PP is enabled
         if pp_enabled:
