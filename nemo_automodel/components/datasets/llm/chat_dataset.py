@@ -52,6 +52,19 @@ def _as_iter(val: Union[str, Sequence[str]]) -> Iterator[str]:
 _SPLIT_SLICE_RE = re.compile(r"^(\w+)\[(\d*):(\d*)\]$")
 
 
+def _parse_split_slice(split: Optional[str]):
+    """Parse a split string like ``"train[1024:]"`` into ``(base_split, slice | None)``."""
+    if split is None:
+        return split, None
+    match = _SPLIT_SLICE_RE.match(split)
+    if not match:
+        return split, None
+    base = match.group(1)
+    start = int(match.group(2)) if match.group(2) else None
+    end = int(match.group(3)) if match.group(3) else None
+    return base, slice(start, end)
+
+
 def _load_openai_messages(
     path_or_dataset_id: Union[str, Sequence[str]],
     split: Optional[str] = None,
@@ -77,16 +90,7 @@ def _load_openai_messages(
             Set to ``None`` to disable shuffling.
     """
     if isinstance(path_or_dataset_id, str) and _is_hf_repo_id(path_or_dataset_id):
-        # Parse split string: "train[1024:]" -> base="train", slice(1024, None)
-        base_split = split
-        sl = None
-        if split is not None:
-            match = _SPLIT_SLICE_RE.match(split)
-            if match:
-                base_split = match.group(1)
-                start = int(match.group(2)) if match.group(2) else None
-                end = int(match.group(3)) if match.group(3) else None
-                sl = slice(start, end)
+        base_split, sl = _parse_split_slice(split)
 
         dataset = load_dataset(
             path_or_dataset_id,
@@ -113,15 +117,7 @@ def _load_openai_messages(
 
         if is_parquet_file or is_dataset_dir:
             logging.getLogger(__name__).info("Loading local dataset from %s via load_dataset", path_or_dataset_id)
-            base_split = split
-            sl = None
-            if split is not None:
-                match = _SPLIT_SLICE_RE.match(split)
-                if match:
-                    base_split = match.group(1)
-                    start = int(match.group(2)) if match.group(2) else None
-                    end = int(match.group(3)) if match.group(3) else None
-                    sl = slice(start, end)
+            base_split, sl = _parse_split_slice(split)
 
             load_path = str(p.parent) if is_parquet_file else str(p)
             # Cached Parquet datasets (from prefilter_dataset.py) are saved as a single

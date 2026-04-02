@@ -56,10 +56,6 @@ distributed:
     patch_causal_lm_model: false
     layers_per_stage: 2
 
-autocast:
-  enabled: true
-  dtype: bfloat16
-
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
