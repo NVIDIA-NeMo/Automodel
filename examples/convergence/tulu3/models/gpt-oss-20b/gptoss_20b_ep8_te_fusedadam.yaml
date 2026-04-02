@@ -1,9 +1,9 @@
-# Qwen3 MoE 30B SFT on Tulu-3 with EP=8, TE FusedAdam, FSDP on 8 GPUs.
+# GPT-OSS 20B SFT on Tulu-3 with EP=8, TE FusedAdam, FSDP on 8 GPUs.
 # Uses ChatDataset with default collater.
 
 step_scheduler:
   global_batch_size: 128
-  local_batch_size: 2
+  local_batch_size: 4
   ckpt_every_steps: 1000
   gc_every_steps: 10
   max_steps: 1000
@@ -20,20 +20,24 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B-Base
+  pretrained_model_name_or_path: openai/gpt-oss-20b
+  trust_remote_code: true
+  router_aux_loss_coef: 0.00001
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
-    rms_norm: torch_fp32
+    rms_norm: te
+    rope_fusion: false
     experts: torch_mm
     dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
 
 checkpoint:
   enabled: true
-  checkpoint_dir: checkpoints_convergence/qwen3_moe_30b_te_fusedadam/
+  checkpoint_dir: checkpoints_convergence/gptoss_20b_te_fusedadam/
   model_save_format: safetensors
   save_consolidated: true
 
@@ -45,7 +49,7 @@ distributed:
   ep_size: 8
 
   sequence_parallel: false
-  activation_checkpointing: true
+  activation_checkpointing: false
 
   pipeline:
     pp_schedule: interleaved1f1b
@@ -58,6 +62,7 @@ distributed:
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: true
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
@@ -67,7 +72,7 @@ dataset:
   seq_length: 2048
   padding: do_not_pad
   shuffle_seed: 42
-  chat_template: examples/convergence/tulu3/models/qwen3-moe-30b/chat_template.jinja
+  chat_template: examples/convergence/tulu3/models/gpt-oss-20b/chat_template.jinja
 
 packed_sequence:
   packed_sequence_size: 0
@@ -86,7 +91,7 @@ validation_dataset:
   seq_length: 2048
   padding: do_not_pad
   shuffle_seed: 42
-  chat_template: examples/convergence/tulu3/models/qwen3-moe-30b/chat_template.jinja
+  chat_template: examples/convergence/tulu3/models/gpt-oss-20b/chat_template.jinja
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -104,3 +109,7 @@ optimizer:
   store_param_remainders: true
   exp_avg_dtype: torch.bfloat16
   exp_avg_sq_dtype: torch.bfloat16
+
+moe_metrics:
+  enabled: true
+  mode: brief

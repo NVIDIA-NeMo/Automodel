@@ -1,9 +1,10 @@
-# Qwen3 MoE 30B SFT on Tulu-3 with EP=8, TE FusedAdam, FSDP on 8 GPUs.
+# Moonlight 16B (3B active) SFT on Tulu-3 with EP=8, FSDP on 8 GPUs.
 # Uses ChatDataset with default collater.
+# Backend settings aligned with examples/benchmark/configs/moonlight_16b_te_deepep.yaml
 
 step_scheduler:
   global_batch_size: 128
-  local_batch_size: 2
+  local_batch_size: 4
   ckpt_every_steps: 1000
   gc_every_steps: 10
   max_steps: 1000
@@ -20,20 +21,23 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B-Base
+  pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
+  trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
-    rms_norm: torch_fp32
+    rms_norm: te
+    rope_fusion: false
     experts: torch_mm
     dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
 
 checkpoint:
   enabled: true
-  checkpoint_dir: checkpoints_convergence/qwen3_moe_30b_te_fusedadam/
+  checkpoint_dir: checkpoints_convergence/moonlight_16b_flashoptim/
   model_save_format: safetensors
   save_consolidated: true
 
@@ -56,8 +60,10 @@ distributed:
     patch_causal_lm_model: false
     layers_per_stage: 2
 
+
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: true
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
@@ -67,7 +73,7 @@ dataset:
   seq_length: 2048
   padding: do_not_pad
   shuffle_seed: 42
-  chat_template: examples/convergence/tulu3/models/qwen3-moe-30b/chat_template.jinja
+  chat_template: examples/convergence/tulu3/models/moonlight-16b/chat_template.jinja
 
 packed_sequence:
   packed_sequence_size: 0
@@ -86,7 +92,7 @@ validation_dataset:
   seq_length: 2048
   padding: do_not_pad
   shuffle_seed: 42
-  chat_template: examples/convergence/tulu3/models/qwen3-moe-30b/chat_template.jinja
+  chat_template: examples/convergence/tulu3/models/moonlight-16b/chat_template.jinja
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -95,12 +101,14 @@ validation_dataloader:
     pad_seq_len_divisible: 8
 
 optimizer:
-  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  _target_: flashoptim.FlashAdamW
+  lr: 1.0e-5
   betas: [0.9, 0.95]
   eps: 1e-8
-  lr: 1.0e-5
   weight_decay: 0
-  master_weights: true
-  store_param_remainders: true
-  exp_avg_dtype: torch.bfloat16
-  exp_avg_sq_dtype: torch.bfloat16
+  master_weight_bits: 32
+  compress_state_dict: false
+
+moe_metrics:
+  enabled: true
+  mode: brief
