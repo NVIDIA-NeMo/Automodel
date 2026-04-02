@@ -98,4 +98,3 @@ wandb:
   project: <your-project>
   entity: <your-entity>
   name: <your-run-name>
-  dir: vlm_checkpoints/gemma4_2b_it/
