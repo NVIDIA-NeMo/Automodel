@@ -16,6 +16,8 @@
 # Requires 8 GPUs (FSDP2 + EP=8, 16 experts per GPU)
 # torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe.yaml
 
+recipe: FinetuneRecipeForVLM
+
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1

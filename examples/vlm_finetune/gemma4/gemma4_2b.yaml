@@ -16,6 +16,8 @@
 # Run command:
 # torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_2b.yaml
 
+recipe: FinetuneRecipeForVLM
+
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1
