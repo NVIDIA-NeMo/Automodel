@@ -399,13 +399,9 @@ def split_model_into_stages(
         )
         # Create a set of modules to keep
         modules_to_keep = set(module_names)
+        modules_sorted = sorted(modules_to_keep, key=lambda x: x.split('.')[-1])
         logger.info(
-            f"PP Rank {pp_rank}: Stage {stage_idx}: Keeping modules: {
-                sorted(modules_to_keep, key=lambda x: x.split('.')[-1])
-  modules_sorted = sorted(modules_to_keep, key=lambda x: x.split('.')[-1])
-  logger.info(
-      f"PP Rank {pp_rank}: Stage {stage_idx}: Keeping modules: {modules_sorted}"
-  )
+            f"PP Rank {pp_rank}: Stage {stage_idx}: Keeping modules: {modules_sorted}"
         )
 
         # Helper function to handle nested module removal
