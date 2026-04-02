@@ -460,9 +460,19 @@ class NeMoAutoDiffusionPipeline:
                         _ensure_params_trainable(module, module_name=name)
 
         # Apply parallelization (FSDP2 or DDP)
-        # For LoRA: base weights (bf16, no grad) + LoRA weights (fp32, grad) both sharded.
-        # FSDP2 skips gradient allreduce for requires_grad=False params automatically.
+        # LoRA: all params are trainable when fully_shard() runs so FSDP2 sets
+        # up gradient reduction for lora_A/lora_B correctly. Freeze happens below.
         created_managers = _apply_parallelization(pipe, parallel_scheme)
+
+        # Freeze base weights AFTER FSDP2 wrapping — mirrors the LLM pattern in
+        # nemo_automodel/_transformers/infrastructure.py lines 513-518.
+        # FSDP2 must see all params as trainable during fully_shard(); freezing
+        # before wrapping causes gradient reduction to malfunction for LoRA params.
+        if lora_cfg is not None and lora_cfg.enabled:
+            for name, param in pipe.transformer.named_parameters():
+                if "lora_" not in name and param.requires_grad:
+                    param.requires_grad_(False)
+            logger.info("[LoRA] Froze base weights after FSDP2 wrapping")
 
         return pipe, created_managers
 

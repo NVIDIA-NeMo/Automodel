@@ -168,14 +168,12 @@ def inject_lora(
     else:
         logger.warning("[LoRA] No BaseTunerLayer modules found — injection may have failed!")
 
-    # ── Freeze base weights ───────────────────────────────────────────────────
-    # Base layer weights must be frozen so FSDP2 skips gradient allreduce.
-    # Any param without "lora_" in its name is part of the original model.
-    for name, param in transformer.named_parameters():
-        if "lora_" not in name:
-            param.requires_grad = False
-
     # ── Cast LoRA params to bf16 ──────────────────────────────────────────────
+    # NOTE: Base weights are NOT frozen here — freeze must happen AFTER FSDP2
+    # wrapping. FSDP2 must see all params as trainable when fully_shard() runs
+    # so it sets up gradient reduction for LoRA params correctly.
+    # See: nemo_automodel/_transformers/infrastructure.py lines 513-518.
+    # The freeze is applied in auto_diffusion_pipeline.py after _apply_parallelization().
     # Cast to bf16 (not fp32) so all parameters in the FSDP2 unit share the
     # same dtype as the base weights. Mixed fp32-lora + bf16-base in the same
     # FSDP unit causes gradient reduce-scatter to malfunction — lora_B receives
