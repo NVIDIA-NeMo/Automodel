@@ -163,12 +163,12 @@ def test_default_collater_shapes() -> None:
     ]
 
     collated = sftp.default_collater(raw_batch)
-    # Keys preserved (padding_mask is added by the collater)
-    assert set(collated) == {"input_ids", "attention_mask", "labels", "loss_mask", "padding_mask"}
+    # Keys are preserved without synthesizing extra model kwargs.
+    assert set(collated) == {"input_ids", "attention_mask", "labels", "loss_mask"}
 
     # Batch dimension added
     assert collated["input_ids"].shape[0] == 2
-    # Same seq length for all tensor keys (excluding padding_mask which is bool)
+    # Same seq length for all tensor keys
     lens = {v.shape[1] for v in collated.values()}
     assert len(lens) == 1
     lens.pop()
@@ -183,20 +183,6 @@ def test_default_collater_shapes() -> None:
     assert torch.equal(collated["input_ids"], input_ids)
     assert torch.equal(collated["labels"], labels)
     assert torch.equal(collated["loss_mask"], loss_mask)
-
-    # padding_mask should be True where input_ids == pad_token (0)
-    expected_padding_mask = torch.tensor([[False, False], [False, True]])
-    assert torch.equal(collated["padding_mask"], expected_padding_mask)
-    # (torch.Tensor([[1,1,2],[1,2,3]]) == torch.Tensor([[1,1,2],[1,2,3]])).all().item()
-    # assert collated["input_ids"][1, 1:].eq(0).all(), collated
-    # assert collated["attention_mask"][1, 1:].eq(0).all()
-    # assert collated["labels"][1, 1:].eq(-100).all()
-    # # `loss_mask` mirrors labels but with 0/1 instead of ids
-    # assert collated["loss_mask"][1, 1:].eq(0).all()
-
-    # # Sanity on dtype
-    # for tensor in collated.values():
-    #     assert tensor.dtype == torch.long
 
 
 def test_tokenize_function_strips_special_tokens(dummy_tokenizer: DummyTokenizer) -> None:

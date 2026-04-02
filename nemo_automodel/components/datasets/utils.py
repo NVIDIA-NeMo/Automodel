@@ -243,14 +243,7 @@ def default_collater(batch, pad_seq_len_divisible=None):
     }
 
     # convert to tensors
-    result = {k: batchify(torch.LongTensor(v)) for k, v in ans.items()}
-
-    # Add padding_mask similar to cp_utils.py
-    if "input_ids" in result:
-        input_ids_pad_token = get_pad_token_from_key("input_ids", pad_token_ids) or 0
-        result["padding_mask"] = (result["input_ids"] == input_ids_pad_token).bool()
-
-    return result
+    return {k: batchify(torch.LongTensor(v)) for k, v in ans.items()}
 
 
 def packed_sequence_thd_collater(batch):
@@ -390,7 +383,7 @@ def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tens
         position is **allowed** to attend.
     """
     # attention_mask: [B, S]
-    B, S = attention_mask.shape
+    _, S = attention_mask.shape
 
     # same_doc[b, i, j] = True iff positions i and j belong to the same sub-sequence
     mask_q = attention_mask.unsqueeze(2)  # [B, S, 1]
