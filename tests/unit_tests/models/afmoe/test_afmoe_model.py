@@ -208,7 +208,10 @@ class TestDualNormParity:
 
         batch, seq_len = 1, 4
         x = torch.randn(batch, seq_len, tiny_config.hidden_size, device=device, dtype=torch.bfloat16)
-        freqs_cis = torch.randn(batch, seq_len, tiny_config.head_dim, device=device)
+        if backend_config.rope_fusion:
+            freqs_cis = torch.randn(seq_len, 1, 1, tiny_config.head_dim, device=device)
+        else:
+            freqs_cis = torch.randn(batch, seq_len, tiny_config.head_dim, device=device)
 
         with torch.no_grad():
             # Manual trace: attention sublayer
