@@ -192,10 +192,15 @@ def build_model_and_optimizer(
         transformer_module.set_attention_backend(attention_backend)
 
     if lora_enabled:
-        # Pre-FSDP2 refs stored by inject_lora() via pipe._lora_params.
-        # Valid after FSDP2 wrapping because FSDP2 preserves original
-        # Parameter objects (use_orig_params=True default).
-        trainable_params = pipe._lora_params.get("transformer", [])
+        # Collect lora_params AFTER FSDP2 wrapping from the live wrapped module.
+        # Pre-FSDP2 refs (pipe._lora_params) are stale after fully_shard() —
+        # FSDP2 replaces parameter storage, so AdamW with stale refs never commits
+        # updates to the actual sharded parameters. Mirrors the LLM pattern in
+        # nemo_automodel/recipes/llm/train_ft.py line 313.
+        trainable_params = [
+            p for n, p in transformer_module.named_parameters()
+            if "lora_" in n and p.requires_grad
+        ]
         if not trainable_params:
             raise RuntimeError(
                 "lora_cfg.enabled=True but no LoRA params found. "
@@ -683,6 +688,17 @@ class TrainDiffusionRecipe(BaseRecipe):
 
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.clip_grad_max_norm)
                 grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm
+
+                # ── LoRA gradient diagnostic (step 1 only) ───────────────────
+                if global_step == 1 and self.lora_cfg and self.lora_cfg.enabled:
+                    for n, p in self.model.named_parameters():
+                        if "lora_B" in n:
+                            try:
+                                grad_val = p.grad.to_local().float().norm().item() if p.grad is not None else None
+                            except Exception:
+                                grad_val = p.grad.float().norm().item() if p.grad is not None else None
+                            logging.info(f"[GRAD CHECK] {n}: grad_norm={grad_val}, param_norm={p.data.float().norm().item():.6f}")
+                            break
 
                 self.optimizer.step()
                 if self.lr_scheduler is not None:
