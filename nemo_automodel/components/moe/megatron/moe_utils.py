@@ -231,6 +231,87 @@ def weighted_swiglu_back(g, y, weights):
     return input_grad.to(input_dtype), weights_grad.to(w_dtype)
 
 
+@torch.compile
+def geglu(y):
+    """GEGLU activation function.
+    Splits the input in half along the last dimension and applies:
+        GEGLU(y) = GELU_tanh(y_gate) * y_up
+
+    Used by Gemma4 MoE expert layers (hidden_activation="gelu_pytorch_tanh").
+    """
+    y_1, y_2 = torch.chunk(y, 2, -1)
+    return F.gelu(y_1, approximate="tanh") * y_2
+
+
+@torch.compile
+def weighted_geglu(y, weights):
+    dtype = y.dtype
+    res = geglu(y) * weights
+    return res.to(dtype)
+
+
+@torch.compile
+def geglu_back(g, y):
+    y_1, y_2 = torch.chunk(y, 2, -1)
+    # d/dx gelu_tanh(x) ≈ 0.5*(1+tanh(k)) + 0.5*x*(1-tanh(k)^2)*dk/dx
+    # where k = sqrt(2/pi)*(x + 0.044715*x^3)
+    # Use autograd-friendly form via F.gelu for the gate gradient.
+    gelu_y1 = F.gelu(y_1, approximate="tanh")
+    # Numerical gradient of tanh-approximated GELU
+    SQRT_2_OVER_PI = 0.7978845608028654
+    COEFF = 0.044715
+    inner = SQRT_2_OVER_PI * (y_1 + COEFF * y_1.pow(3))
+    tanh_inner = torch.tanh(inner)
+    dtanh = 1.0 - tanh_inner.pow(2)
+    dinner = SQRT_2_OVER_PI * (1.0 + 3.0 * COEFF * y_1.pow(2))
+    gelu_grad = 0.5 * (1.0 + tanh_inner) + 0.5 * y_1 * dtanh * dinner
+    return torch.cat(
+        (
+            g * gelu_grad * y_2,
+            g * gelu_y1,
+        ),
+        -1,
+    )
+
+
+@torch.compile
+def weighted_geglu_back(g, y, weights):
+    input_dtype = y.dtype
+    w_dtype = weights.dtype
+    input_grad = geglu_back(g * weights, y)
+    weights_grad = geglu(y) * g.to(w_dtype)
+    weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
+    return input_grad.to(input_dtype), weights_grad.to(w_dtype)
+
+
+class WeightedGEGLUFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, weights, fp8_input_store):
+        input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+        ctx.save_for_backward(input_for_backward, weights)
+        ctx.ori_input_dtype = input.dtype
+        ctx.fp8_input_store = fp8_input_store
+        return weighted_geglu(input, weights)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, weights = ctx.saved_tensors
+        input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
+        tmp, wgrad = weighted_geglu_back(grad_output, input, weights)
+        return tmp, wgrad, None
+
+
+def weighted_bias_geglu_impl(input, weights, fp8_input_store=False):
+    """Token-wise-weighted bias GEGLU fusion (tanh-approximated GELU gating)."""
+    ori_shape = input.shape
+    if len(ori_shape) > 1:
+        input = input.view(-1, ori_shape[-1])
+
+    output = WeightedGEGLUFunction.apply(input, weights, fp8_input_store)
+
+    return output if len(ori_shape) <= 2 else output.view(ori_shape[0], ori_shape[1], -1)
+
+
 class WeightedSwiGLUFunction(torch.autograd.Function):
     @staticmethod
     # bias is an optional argument

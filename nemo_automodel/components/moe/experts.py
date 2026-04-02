@@ -33,6 +33,7 @@ except ImportError:
 
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.megatron.moe_utils import (
+    weighted_bias_geglu_impl,
     weighted_bias_swiglu_impl,
 )
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher, TokenDispatcherConfig
@@ -92,7 +93,7 @@ def is_gated_activation(activation: str) -> bool:
     Non-gated activations (ReLU²) only use up_proj, requiring up_projs tensor
     with shape [n_experts, dim, inter_dim] - 50% memory savings.
     """
-    return activation in ("swiglu", "quick_geglu")
+    return activation in ("swiglu", "quick_geglu", "geglu")
 
 
 def _permute_tokens_for_grouped_mm(
@@ -550,6 +551,8 @@ def get_expert_activation_for_deepep(config: MoEConfig):
             alpha=config.activation_alpha,
             linear_offset=1.0,
         )
+    elif config.expert_activation == "geglu":
+        return weighted_bias_geglu_impl
     elif config.expert_activation == "relu2":
         return relu2_deepep
     else:
