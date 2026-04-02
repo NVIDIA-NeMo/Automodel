@@ -1252,6 +1252,46 @@ def test_apply_ac_raises_when_num_experts_not_available(monkeypatch):
         P.apply_ac(model)
 
 
+def test_apply_ac_derives_num_experts_from_num_local_experts(monkeypatch):
+    """Test that apply_ac derives num_experts from config.num_local_experts (Mixtral/GPT-OSS style)."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    captured_num_experts = None
+
+    def fake_create_selective_checkpoint_contexts(policy_cb):
+        nonlocal captured_num_experts
+        torch_stub = sys.modules["torch"]
+        for ne in [32, 64, 128]:
+            rhs = type("Mat", (), {"shape": (256, ne)})()
+            result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs)
+            if result == P.CheckpointPolicy.MUST_SAVE:
+                captured_num_experts = ne
+        return "CTX"
+
+    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+        if context_fn is not None:
+            context_fn()
+        return block
+
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
+
+    class ConfigWithNumLocalExperts:
+        hidden_size = 256
+        num_local_experts = 32
+
+    class ModelWithNumLocalExperts:
+        def __init__(self):
+            self.config = ConfigWithNumLocalExperts()
+            self.layers = LayerContainer([DummyBlock()])
+
+    model = ModelWithNumLocalExperts()
+
+    P.apply_ac(model, ignore_router=True)
+
+    assert captured_num_experts == 32
+
+
 def test_apply_ac_accepts_explicit_hidden_size_and_num_experts(monkeypatch):
     """Test that apply_ac accepts explicit hidden_size and num_experts parameters."""
     P = _import_parallelizer_with_stubs(monkeypatch)
@@ -2045,8 +2085,6 @@ def test_apply_cp_linear_attention_warns_when_no_cp_aware_module(monkeypatch):
     model = DummyModel([block])
 
     cp_mesh = MagicMock()
-
-    import logging
 
     with patch.object(P.logger, "warning") as mock_warn:
         P.apply_cp(model, cp_mesh)

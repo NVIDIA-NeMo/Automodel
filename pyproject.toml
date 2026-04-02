@@ -138,6 +138,9 @@ vlm = [
     "timm<=1.0.22",
     "torchcodec; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
 ]
+cli = [
+    "pyyaml",
+]
 all = [
     "nemo_automodel[cuda]",
     "nemo_automodel[delta-databricks]",
@@ -152,7 +155,8 @@ Repository = "https://github.com/NVIDIA/NeMo-Automodel"
 Download = "https://github.com/NVIDIA/NeMo-Automodel/releases"
 
 [project.scripts]
-automodel = "nemo_automodel._cli.app:main"
+automodel = "nemo_automodel.cli.app:main"
+am = "nemo_automodel.cli.app:main"
 
 [dependency-groups]
 build = ["setuptools", "torch<=2.10.0", "packaging", "psutil"]
@@ -288,6 +292,9 @@ omit = [
     "nemo_automodel/components/_peft/lora_kernel.py",
     "nemo_automodel/components/loss/triton/te_cross_entropy.py",
     "nemo_automodel/components/moe/megatron/*.py",
+    # Vendored from https://github.com/uccl-project/uccl/tree/main/ep/deep_ep_wrapper
+    "nemo_automodel/components/moe/uccl_ep/_buffer.py",
+    "nemo_automodel/components/moe/uccl_ep/_utils.py",
     "config.py",
     "config-3.py",
     # transformer v5 backports
