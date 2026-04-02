@@ -101,3 +101,5 @@ ci:
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
     hf_device_map_auto: true
     no_check_resume: true
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500

@@ -94,3 +94,5 @@ ci:
     max_vram_gb: 34
     max_cpu_gb: 26
     no_check_resume: true
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500

@@ -115,6 +115,8 @@ ci:
     max_vram_gb: 15
     max_cpu_gb: 4
     no_check_resume: true
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500
 
 # wandb:
 #   project: <your_wandb_project>

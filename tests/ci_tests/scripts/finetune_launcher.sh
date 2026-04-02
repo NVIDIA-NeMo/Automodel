@@ -80,9 +80,7 @@ if [[ "$HAS_ROBUSTNESS" == "yes" ]]; then
     --step_scheduler.global_batch_size 16 \
     --step_scheduler.local_batch_size 2 \
     --dataset.limit_dataset_samples 500 \
-    --dataset.num_samples_limit 500 \
-    --validation_dataset.limit_dataset_samples 500 \
-    --validation_dataset.num_samples_limit 500"
+    --validation_dataset.limit_dataset_samples 500"
 
   if [[ "${CONFIG_PATH}" == *peft* ]] || [[ "${CONFIG_PATH}" == *lora* ]]; then
     ROBUSTNESS_COMMON="${ROBUSTNESS_COMMON} --peft.use_triton false"
