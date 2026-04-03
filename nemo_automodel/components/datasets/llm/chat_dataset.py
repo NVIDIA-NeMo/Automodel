@@ -175,17 +175,79 @@ def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     - Keeps tool_calling fields if present (e.g., tool calls in assistant messages, tool role messages).
     - If content is a list of parts, only keep text parts.
     """
+
+    def _normalize_content(value: Any) -> str:
+        if isinstance(value, list):
+            return " ".join(part["text"] for part in value if isinstance(part, dict) and "text" in part)
+        if value is None:
+            return ""
+        return str(value)
+
+    def _normalize_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
+        if not isinstance(tool_calls, list):
+            raise ValueError("assistant message `tool_calls` must be a list")
+
+        normalized_tool_calls: List[Dict[str, Any]] = []
+        for idx, tool_call in enumerate(tool_calls):
+            if not isinstance(tool_call, dict):
+                raise ValueError(f"assistant message `tool_calls[{idx}]` must be a dict")
+
+            tool_call_id = tool_call.get("id")
+            if not isinstance(tool_call_id, str) or not tool_call_id:
+                raise ValueError(f"assistant message `tool_calls[{idx}].id` must be a non-empty string")
+
+            tool_call_type = tool_call.get("type")
+            if not isinstance(tool_call_type, str) or not tool_call_type:
+                raise ValueError(f"assistant message `tool_calls[{idx}].type` must be a non-empty string")
+
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                raise ValueError(f"assistant message `tool_calls[{idx}].function` must be a dict")
+
+            function_name = function.get("name")
+            if not isinstance(function_name, str) or not function_name:
+                raise ValueError(f"assistant message `tool_calls[{idx}].function.name` must be a non-empty string")
+
+            function_arguments = function.get("arguments")
+            if function_arguments is None:
+                raise ValueError(f"assistant message `tool_calls[{idx}].function.arguments` is required")
+
+            normalized_function = dict(function)
+            if not isinstance(function_arguments, str):
+                normalized_function["arguments"] = json.dumps(function_arguments)
+
+            normalized_tool_call = dict(tool_call)
+            normalized_tool_call["function"] = normalized_function
+            normalized_tool_calls.append(normalized_tool_call)
+
+        return normalized_tool_calls
+
     norm: List[Dict[str, Any]] = []
     for m in messages:
         role = m.get("role")
-        content = m.get("content")
         out = dict(m)
-        if isinstance(content, list):
-            out["content"] = " ".join(part["text"] for part in content if isinstance(part, dict) and "text" in part)
-        else:
-            out["content"] = str(content)
         if role not in {"system", "user", "assistant", "tool"}:
             raise ValueError(f"Unsupported role in messages: {role}")
+
+        out["content"] = _normalize_content(m.get("content"))
+
+        if role == "assistant":
+            if "reasoning_content" in m:
+                reasoning_content = m.get("reasoning_content")
+                if reasoning_content is None:
+                    out["reasoning_content"] = ""
+                else:
+                    if not isinstance(reasoning_content, str):
+                        raise ValueError("assistant message `reasoning_content` must be a string when provided")
+                    out["reasoning_content"] = reasoning_content
+            if "tool_calls" in m:
+                out["tool_calls"] = _normalize_tool_calls(m.get("tool_calls"))
+
+        if role == "tool":
+            tool_call_id = m.get("tool_call_id")
+            if not isinstance(tool_call_id, str) or not tool_call_id:
+                raise ValueError("tool message `tool_call_id` must be a non-empty string")
+
         norm.append(out)
     return norm
 
@@ -212,6 +274,7 @@ class ChatDataset(Dataset):
         start_of_turn_token: Optional[str] = None,
         chat_template: Optional[str] = None,
         shuffle_seed: Optional[int] = None,
+        mask_reasoning_content: bool = False,
         unshifted: bool = False,
     ) -> None:
         if tokenizer is None:
@@ -229,6 +292,7 @@ class ChatDataset(Dataset):
         self.padding = padding
         self.truncation = truncation
         self.start_of_turn_token = start_of_turn_token
+        self.mask_reasoning_content = mask_reasoning_content
         self.unshifted = unshifted
 
         self.dataset = _load_openai_messages(path_or_dataset_id, split=split, name=name, shuffle_seed=shuffle_seed)
@@ -261,6 +325,7 @@ class ChatDataset(Dataset):
             padding=self.padding,
             truncation=self.truncation,
             tools=tools,
+            mask_reasoning_content=self.mask_reasoning_content,
             unshifted=self.unshifted,
         )
         return sample
