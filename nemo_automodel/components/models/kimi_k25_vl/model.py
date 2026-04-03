@@ -123,11 +123,7 @@ class KimiK25VLConfig(PretrainedConfig):
 
         # MM Projector config
         self.mm_projector_type = mm_projector_type
-        self.mm_hidden_size = (
-            mm_hidden_size
-            if mm_hidden_size is not None
-            else getattr(vision_config, "hidden_size", None) or vision_config.mm_hidden_size
-        )
+        self.mm_hidden_size = mm_hidden_size if mm_hidden_size is not None else vision_config.hidden_size
         self.projector_hidden_act = projector_hidden_act
         self.projector_ln_eps = projector_ln_eps
 
@@ -452,15 +448,6 @@ class MoonViT3dPretrainedModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        # Patch: fall back to vt_* prefixed attributes if standard ones are missing
-        if not hasattr(config, "hidden_size") or config.hidden_size is None:
-            config.hidden_size = config.mm_hidden_size
-        if not hasattr(config, "num_attention_heads") or config.num_attention_heads is None:
-            config.num_attention_heads = config.vt_num_attention_heads
-        if not hasattr(config, "num_hidden_layers") or config.num_hidden_layers is None:
-            config.num_hidden_layers = config.vt_num_hidden_layers
-        if not hasattr(config, "intermediate_size") or config.intermediate_size is None:
-            config.intermediate_size = config.vt_intermediate_size
         self.merge_kernel_size = config.merge_kernel_size
         self.merge_type = config.merge_type
 
@@ -511,12 +498,11 @@ class KimiK25VLMultiModalProjector(nn.Module):
         vision_config = config.vision_config
         text_config = config.text_config
 
-        mm_hidden_size = getattr(config, "mm_hidden_size", None) or vision_config.mm_hidden_size
+        mm_hidden_size = config.mm_hidden_size
         merge_kernel_size = vision_config.merge_kernel_size
 
         self.hidden_size = mm_hidden_size * merge_kernel_size[0] * merge_kernel_size[1]
-        projector_ln_eps = getattr(config, "projector_ln_eps", None) or vision_config.projector_ln_eps
-        self.pre_norm = nn.LayerNorm(mm_hidden_size, eps=projector_ln_eps)
+        self.pre_norm = nn.LayerNorm(mm_hidden_size, eps=config.projector_ln_eps)
         self.linear_1 = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.act = GELUActivation()
         self.linear_2 = nn.Linear(self.hidden_size, text_config.hidden_size, bias=True)

@@ -184,7 +184,7 @@ def apply_fsdp(
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
             output_dtype=torch.bfloat16,
             cast_forward_inputs=True,
         )
