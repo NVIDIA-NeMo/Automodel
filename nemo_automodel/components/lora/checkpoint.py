@@ -203,9 +203,8 @@ def load_lora_weights_for_inference(
     else:
         # Older diffusers: load_adapter() not available — manual sequence
         from peft import LoraConfig
-        from safetensors.torch import load_file
-
         from peft.tuners.lora import LoraModel as PeftLoraModel
+        from safetensors.torch import load_file
         peft_config = LoraConfig.from_pretrained(lora_path)
         PeftLoraModel(transformer, {"default": peft_config}, "default")  # injects lora.Linear in-place
 
