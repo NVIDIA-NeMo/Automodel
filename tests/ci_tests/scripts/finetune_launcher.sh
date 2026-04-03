@@ -66,7 +66,8 @@ if [[ "${CONFIG_PATH}" == *peft* ]] || [[ "${CONFIG_PATH}" == *lora* ]]; then
   ROBUSTNESS_COMMON="${ROBUSTNESS_COMMON} --peft.use_triton false"
 fi
 
-ROBUSTNESS_CMD="${CMD} -m pytest tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
+ROBUSTNESS_CMD="${CMD} --redirects 3 --log-dir $PIPELINE_DIR/$TEST_NAME/robustness_logs \
+  -m pytest tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
   ${ROBUSTNESS_COMMON}"
 
 # --- Finetune ---
