@@ -90,6 +90,7 @@ class MDLMStrategy(DLLMStrategy):
 
     def prepare_batch(self, batch, noisy_input_ids, noise_mask, clean_input_ids):
         batch["input_ids"] = noisy_input_ids
+        batch.pop("attention_mask", None)  # MDLM models are bidirectional
         return batch
 
 

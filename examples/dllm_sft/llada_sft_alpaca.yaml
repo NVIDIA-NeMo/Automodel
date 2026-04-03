@@ -1,0 +1,96 @@
+# LLaDA-8B-Base SFT on Alpaca — matches reference dllm recipe from README
+#
+# Reference: accelerate launch examples/llada/sft.py \
+#   --dataset_args "tatsu-lab/alpaca" --max_length 1024 \
+#   --num_train_epochs 5 --learning_rate 2e-5 --per_device_train_batch_size 4
+#
+# Run with:
+#   python -m torch.distributed.run --nproc-per-node=8 \
+#       examples/dllm_sft/finetune.py -c examples/dllm_sft/llada_sft_alpaca.yaml
+
+step_scheduler:
+  global_batch_size: 32   # 8 GPUs * 4 per_device = 32 (matches reference)
+  local_batch_size: 4     # grad_accum = 32 / 8 / 4 = 1 (matches dllm baseline)
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  max_steps: null    # run all 5 epochs (~8125 steps), matching reference
+  num_epochs: 5
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+seed: 42
+
+wandb:
+  project: dllm-baseline
+  name: am-llada-alpaca
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: GSAI-ML/LLaDA-8B-Base
+  torch_dtype: float32
+  trust_remote_code: true
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: false
+  mp_policy:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: float32
+  autocast_dtype: bfloat16
+  offload_policy: null
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dllm:
+  mode: mdlm
+  mask_token_id: 126336
+  eps: 0.001
+  supervise_padding: false
+  block_size: null
+  half_life_ratio: null
+  ar_loss_alpha: null
+  pad_block_size: null
+  pad_seq_len_divisible: null
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  lr: 2.0e-5
+  weight_decay: 0.0   # match reference dllm (HF default)
+
+clip_grad_norm:
+  max_norm: 1.0
+
+lr_scheduler:
+  # Match reference dllm: cosine decay with 10% warmup (starting from lr=0)
+  lr_decay_style: cosine
+  init_lr: 0.0
+  min_lr: 0.0
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: /tmp/alpaca_messages.jsonl
+  seq_length: 1024    # matches reference --max_length 1024
+  truncation: true
+  unshifted: true
+  tokenizer:
+    pretrained_model_name_or_path: GSAI-ML/LLaDA-8B-Base
+    trust_remote_code: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  group_by_length: true
