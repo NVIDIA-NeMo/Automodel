@@ -27,7 +27,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python-is-python3 \
     curl \
     git \
-    libopenmpi-dev && \
+    libopenmpi-dev \
+    ffmpeg \
+    libavcodec-dev \
+    libavformat-dev \
+    libavutil-dev && \
     rm -rf /var/lib/apt/lists/*
 
 FROM ${PYTORCH_IMAGE} AS pytorch
@@ -69,8 +73,8 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     git fetch origin $TE_COMMIT && \
     git checkout FETCH_HEAD && \
     git submodule init && git submodule update && \
-    pip install nvidia-mathdx==25.1.1 && \
-    env NVTE_CUDA_ARCHS="80;90;100;120" NVTE_BUILD_THREADS_PER_JOB=8 pip install --no-cache-dir --no-build-isolation -v . && \
+    uv pip install nvidia-mathdx==25.1.1 && \
+    env NVTE_CUDA_ARCHS="80;90;100;120" NVTE_BUILD_THREADS_PER_JOB=8 uv pip install --no-cache-dir --no-build-isolation -v . && \
     cd ../ && rm -rf TransformerEngine; \
     fi
 
@@ -124,7 +128,7 @@ RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
     fi
 
 # Address base image CVE
-RUN pip install "aiohttp>=3.13.3" \
+RUN uv pip install "aiohttp>=3.13.3" \
         "jaraco-context>=6.1.0" \
         "nbconvert>=7.17.0" \
         "pillow>=12.1.1" \

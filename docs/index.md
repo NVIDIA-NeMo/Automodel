@@ -244,6 +244,7 @@ model-coverage/overview.md
 model-coverage/llm.md
 model-coverage/vlm.md
 model-coverage/diffusion.md
+model-coverage/asr.md
 model-coverage/troubleshooting.md
 ::::
 
@@ -277,6 +278,7 @@ guides/llm/column-mapped-text-instruction-dataset.md
 guides/llm/column-mapped-text-instruction-iterable-dataset.md
 guides/vlm/dataset.md
 guides/diffusion/dataset.md
+guides/asr/dataset.md
 ::::
 
 ::::{toctree}
