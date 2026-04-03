@@ -151,7 +151,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi && \
-    uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS && \
+    uv sync --extra $AUTOMODEL_INSTALL --group build --group docs --group linting --group test --group dev $UV_SYNC_ARGS && \
     uv cache prune --ci
 
 COPY . /opt/Automodel

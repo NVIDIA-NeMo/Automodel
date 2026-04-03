@@ -176,6 +176,11 @@ linting = [
     "ty>=0.0.20",
 ]
 test = ["coverage", "pytest", "peft>=0.18.1", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
+deploy-test = [
+    "vllm; sys_platform == 'linux'",
+    "peft>=0.18.1",
+    "pytest",
+]
 # CP for linear attention (fla.ops.cp) requires fla > 0.4.1; pin to main until a release includes it.
 dev = [
     "cut-cross-entropy",
