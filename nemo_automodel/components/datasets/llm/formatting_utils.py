@@ -339,6 +339,7 @@ def _package_tokenized_example(
     seq_length,
     truncation="do_not_truncate",
     padding="do_not_pad",
+    unshifted=False,
 ):
     """
     Package a tokenized example with proper masking and padding.
@@ -352,9 +353,47 @@ def _package_tokenized_example(
         seq_length: Optional sequence length for padding.
         truncation: Optional truncation strategy.
         padding: Optional padding strategy.
+        unshifted: If True, return unshifted format for dLLM training
+            (``input_ids`` at full length with ``loss_mask`` instead of
+            shifted ``input_ids``/``labels``).
     Returns:
         A dictionary with input_ids, labels, and attention_mask.
+        When *unshifted* is True, ``labels`` is replaced by ``loss_mask``.
     """
+    if unshifted:
+        # --- Unshifted dLLM format ---
+        # No shift: input_ids stays at full length, loss_mask = assistant_masks.
+        loss_mask = [int(bool(m)) for m in assistant_masks]
+
+        # Compute content length (skip trailing pad tokens).
+        content_length = len(input_ids)
+        if pad_token_id is not None and content_length > 0:
+            end = content_length
+            while end > 0 and input_ids[end - 1] == pad_token_id:
+                end -= 1
+            if pad_token_id == eos_token_id:
+                content_length = min(end + 1, content_length)
+            else:
+                content_length = end
+        attention_mask = [1] * content_length + [0] * (len(input_ids) - content_length)
+
+        if isinstance(seq_length, int) and padding in ("max_length",):
+            input_ids = _pad_to_seq_length(input_ids, pad_token_id, seq_length)
+            loss_mask = _pad_to_seq_length(loss_mask, 0, seq_length)
+
+        attention_mask += [0] * (len(input_ids) - len(attention_mask))
+        return {
+            "input_ids": input_ids,
+            "loss_mask": loss_mask,
+            "attention_mask": attention_mask,
+            "___PAD_TOKEN_IDS___": {
+                "input_ids": pad_token_id,
+                "loss_mask": 0,
+                "attention_mask": 0,
+            },
+        }
+
+    # --- Standard shifted NTP format ---
     labels = input_ids.copy()
     # Compute content length on the original input_ids (before the next-token
     # shift) so that pre-padded and non-padded inputs produce identical
@@ -414,6 +453,7 @@ def format_prompt_completion(
     padding: Union[str, bool] = "do_not_pad",
     truncation: Union[str, bool] = "do_not_truncate",
     answer_only_loss_mask: bool = True,
+    unshifted: bool = False,
 ) -> Dict[str, List[int]]:
     """
     Format a prompt-completion style example (without chat template).
@@ -469,6 +509,7 @@ def format_prompt_completion(
         seq_length=seq_length,
         truncation=truncation,
         padding=padding,
+        unshifted=unshifted,
     )
 
 
@@ -483,6 +524,7 @@ def format_chat_template(
     tools: Optional[List[Dict]] = None,
     answer_only_loss_mask: bool = True,
     mask_reasoning_content: bool = False,
+    unshifted: bool = False,
 ) -> Dict[str, List[int]]:
     """
     Format a chat template style example.
@@ -570,4 +612,5 @@ def format_chat_template(
         seq_length=seq_length,
         truncation=truncation,
         padding=padding,
+        unshifted=unshifted,
     )

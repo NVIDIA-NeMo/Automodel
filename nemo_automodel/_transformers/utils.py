@@ -47,8 +47,8 @@ def _should_load_before_shard(
     need_checkpoint_load = bool(pretrained_model_name_or_path and load_base_model)
     result = no_pp and no_tp and no_ep and no_peft and need_checkpoint_load
     logger.debug(
-        "[_should_load_before_shard] no_pp={} no_tp={} no_ep={} need_load={} peft={} -> {}".format(
-            no_pp, no_tp, no_ep, need_checkpoint_load, peft_config is not None, result
+        "[_should_load_before_shard] no_pp={} no_tp={} no_ep={} no_peft={} need_load={} -> {}".format(
+            no_pp, no_tp, no_ep, no_peft, need_checkpoint_load, result
         )
     )
     return result
