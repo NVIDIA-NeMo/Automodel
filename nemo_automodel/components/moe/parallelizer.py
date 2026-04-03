@@ -132,7 +132,7 @@ def apply_ac(
         else:
             cfg = getattr(model, "config", None)
             text_cfg = getattr(cfg, "text_config", cfg)
-            for attr in ["num_experts", "moe_num_experts", "n_routed_experts"]:
+            for attr in ["num_experts", "moe_num_experts", "n_routed_experts", "num_local_experts"]:
                 if text_cfg is not None and hasattr(text_cfg, attr):
                     num_experts = getattr(text_cfg, attr)
                     break

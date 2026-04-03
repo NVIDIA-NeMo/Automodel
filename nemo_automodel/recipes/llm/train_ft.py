@@ -85,6 +85,7 @@ from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     _supports_seq_lens,
+    filter_forward_kwargs,
     resolve_trust_remote_code,
 )
 from nemo_automodel.recipes._dist_setup import setup_distributed
@@ -128,9 +129,7 @@ def _uses_te_dot_product_attention(model_or_cfg):
         return any(isinstance(m, DotProductAttention) for m in model_or_cfg.modules())
     # Config fallback for call sites before model is built
     return (
-        hasattr(model_or_cfg, "backend")
-        and hasattr(model_or_cfg.backend, "attn")
-        and model_or_cfg.backend.attn == "te"
+        hasattr(model_or_cfg, "backend") and hasattr(model_or_cfg.backend, "attn") and model_or_cfg.backend.attn == "te"
     )
 
 
@@ -515,6 +514,8 @@ def build_dataloader(
 
             if packing_strategy == "neat":
                 from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
+                from nemo_automodel.components.datasets.utils import neat_packed_collater
+                from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
 
                 ds = neat_pack_dataset(
                     ds,
@@ -524,6 +525,11 @@ def build_dataloader(
                     padding_idx=getattr(tokenizer, "pad_token_id", 0),
                     drop_long_samples=getattr(cfg_ps, "drop_long_samples", False),
                 )
+                _attn_impl = get_attn_implementation(cfg_model)
+                configure_packing(attn_implementation=_attn_impl)
+                # Set collater with attn_implementation so it produces the right mask format
+                cfg_dl.collate_fn = lambda batch, _ai=_attn_impl: neat_packed_collater(batch, attn_implementation=_ai)
+                logger.info(f"Configured neat packing for attn_implementation={_attn_impl}")
             else:
                 # "thd" — existing packing logic
                 ds = pack_dataset(
@@ -1290,7 +1296,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         train_ctx, batch = make_cp_batch_and_ctx(
             self.device_mesh,
             batch,
-            use_te=_uses_te_dot_product_attention(self.model_parts[0]) and _uses_thd_collater(self.cfg.dataloader),
+            use_te=_uses_te_dot_product_attention(
+                self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
+            )
+            and _uses_thd_collater(self.cfg.dataloader),
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
             num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
         )
@@ -1344,6 +1353,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else nullcontext()
             )
             with train_ctx(), sync_ctx, fp8_ctx:
+                batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)

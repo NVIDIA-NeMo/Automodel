@@ -23,6 +23,8 @@
 # TE context parallelism without requiring actual sequence packing.
 
 
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 16
   local_batch_size: 2

@@ -174,9 +174,7 @@ def run_test():
     local_mask = (all_positions % world_size) == rank
     local_positions = all_positions[local_mask]  # [S_local]
 
-    assert local_positions.shape[0] == S_local, (
-        f"Expected {S_local} local positions, got {local_positions.shape[0]}"
-    )
+    assert local_positions.shape[0] == S_local, f"Expected {S_local} local positions, got {local_positions.shape[0]}"
 
     # Shard input according to load-balanced positions
     x_local = x_full[:, local_mask, :].clone().detach().requires_grad_(True)
@@ -209,7 +207,7 @@ def run_test():
     sort_order = torch.argsort(all_pos)
 
     output_cp_cat = torch.cat(output_gathered, dim=1)  # [B, S_global, D]
-    grad_cp_cat = torch.cat(grad_gathered, dim=1)      # [B, S_global, D]
+    grad_cp_cat = torch.cat(grad_gathered, dim=1)  # [B, S_global, D]
 
     # Reorder from interleaved to dense
     output_cp_full = output_cp_cat[:, sort_order, :]

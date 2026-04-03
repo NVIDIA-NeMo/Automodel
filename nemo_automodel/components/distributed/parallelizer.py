@@ -190,21 +190,44 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 except Exception:
                     pass
 
-            for i, layer in enumerate(layers):
-                if hasattr(layer, "mlp"):
-                    layers[i].mlp = checkpoint_wrapper(layer.mlp)
-                if hasattr(layer, "self_attn"):
-                    layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
+            # For HF-native models in transformers >= 5.3.0, GradientCheckpointingLayer.__call__
+            # applies torch.utils.checkpoint at full-layer granularity when gradient_checkpointing=True.
+            # This avoids OOM memory fragmentation from 4 × N_layers CheckpointWrapper sub-module
+            # objects (mlp/self_attn/layernorms) + transformers 5.3.0 output_capturing.py overhead.
+            _use_hf_native_grad_ckpt = False
+            try:
+                from transformers.modeling_layers import (
+                    GradientCheckpointingLayer as _HFGradLayer,
+                )
 
-                if hasattr(layer, "input_layernorm"):
-                    layers[i].input_layernorm = checkpoint_wrapper(
-                        layers[i].input_layernorm  # type: ignore
-                    )
+                _use_hf_native_grad_ckpt = (
+                    bool(layers)
+                    and layers[0].__class__.__module__.startswith("transformers.")
+                    and isinstance(layers[0], _HFGradLayer)
+                    and getattr(model, "supports_gradient_checkpointing", False)
+                    and hasattr(model, "gradient_checkpointing_enable")
+                )
+            except ImportError:
+                pass  # transformers < 5.3.0, fall through to sub-module wrapping
 
-                if hasattr(layer, "post_attention_layernorm"):
-                    layers[i].post_attention_layernorm = checkpoint_wrapper(
-                        layers[i].post_attention_layernorm  # type: ignore
-                    )
+            if _use_hf_native_grad_ckpt:
+                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+            else:
+                for i, layer in enumerate(layers):
+                    if hasattr(layer, "mlp"):
+                        layers[i].mlp = checkpoint_wrapper(layer.mlp)
+                    if hasattr(layer, "self_attn"):
+                        layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
+
+                    if hasattr(layer, "input_layernorm"):
+                        layers[i].input_layernorm = checkpoint_wrapper(
+                            layers[i].input_layernorm  # type: ignore
+                        )
+
+                    if hasattr(layer, "post_attention_layernorm"):
+                        layers[i].post_attention_layernorm = checkpoint_wrapper(
+                            layers[i].post_attention_layernorm  # type: ignore
+                        )
 
         # Set up mixed precision policy
         if not mp_policy:

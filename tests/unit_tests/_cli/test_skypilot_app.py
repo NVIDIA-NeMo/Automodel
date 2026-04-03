@@ -12,114 +12,118 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
-from pathlib import Path
-from types import SimpleNamespace
-from unittest import mock
-
-import pytest
 import yaml
 
-# Stub heavy optional deps before any module under test is imported.
-sys.modules.setdefault("nemo_run", mock.MagicMock())
-sys.modules.setdefault("torch.distributed.run", mock.MagicMock())
-
-import nemo_automodel._cli.app as module
-
+from nemo_automodel.components.launcher.skypilot.launcher import (
+    SkyPilotLauncher,
+    _parse_gpus_per_node,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _write_yaml(path, data):
     with open(path, "w") as f:
         yaml.dump(data, f)
-    return path
+    return str(path)
+
+
+RECIPE_TARGET = "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction"
 
 
 # ---------------------------------------------------------------------------
 # _parse_gpus_per_node
 # ---------------------------------------------------------------------------
 
+
 def test_parse_gpus_per_node_standard():
-    assert module._parse_gpus_per_node("T4:1") == 1
-    assert module._parse_gpus_per_node("A100:8") == 8
-    assert module._parse_gpus_per_node("V100:4") == 4
+    assert _parse_gpus_per_node("T4:1") == 1
+    assert _parse_gpus_per_node("A100:8") == 8
+    assert _parse_gpus_per_node("V100:4") == 4
 
 
 def test_parse_gpus_per_node_no_colon():
-    # Falls back to 1 when format is unexpected.
-    assert module._parse_gpus_per_node("T4") == 1
+    assert _parse_gpus_per_node("T4") == 1
 
 
 def test_parse_gpus_per_node_non_int():
-    assert module._parse_gpus_per_node("T4:bad") == 1
+    assert _parse_gpus_per_node("T4:bad") == 1
 
 
 # ---------------------------------------------------------------------------
-# launch_with_skypilot – command construction
+# SkyPilotLauncher._build_command
 # ---------------------------------------------------------------------------
 
-def _dummy_args(domain="llm", command="finetune"):
-    return SimpleNamespace(domain=domain, command=command)
 
-
-def test_launch_with_skypilot_single_node_command(monkeypatch, tmp_path):
-    captured = {}
-
-    def fake_submit(cfg, job_dir):
-        captured["cfg"] = cfg
-        return 0
-
-    monkeypatch.setattr(
-        "nemo_automodel.components.launcher.skypilot.utils.submit_skypilot_job",
-        fake_submit,
-    )
-
-    job_conf_path = str(tmp_path / "job_config.yaml")
-    _write_yaml(job_conf_path, {"model": "gpt2"})
-
-    skypilot_cfg = {"cloud": "gcp", "accelerators": "T4:4"}
-    module.launch_with_skypilot(
-        _dummy_args(), job_conf_path, str(tmp_path), skypilot_cfg
-    )
-
-    cmd = captured["cfg"].command
+def test_build_command_single_node():
+    launcher = SkyPilotLauncher()
+    cmd = launcher._build_command(RECIPE_TARGET, "/tmp/config.yaml", gpus_per_node=4, num_nodes=1)
+    assert "PYTHONPATH=~/sky_workdir:$PYTHONPATH" in cmd
     assert "torchrun" in cmd
     assert "--nproc_per_node=4" in cmd
-    # No multi-node flags for single node
     assert "SKYPILOT_NUM_NODES" not in cmd
     assert "SKYPILOT_NODE_RANK" not in cmd
 
 
-def test_launch_with_skypilot_multi_node_command(monkeypatch, tmp_path):
-    captured = {}
-
-    def fake_submit(cfg, job_dir):
-        captured["cfg"] = cfg
-        return 0
-
-    monkeypatch.setattr(
-        "nemo_automodel.components.launcher.skypilot.utils.submit_skypilot_job",
-        fake_submit,
-    )
-
-    job_conf_path = str(tmp_path / "job_config.yaml")
-    _write_yaml(job_conf_path, {"model": "llama"})
-
-    skypilot_cfg = {"cloud": "aws", "accelerators": "A100:8", "num_nodes": 2}
-    module.launch_with_skypilot(
-        _dummy_args(), job_conf_path, str(tmp_path), skypilot_cfg
-    )
-
-    cmd = captured["cfg"].command
+def test_build_command_multi_node():
+    launcher = SkyPilotLauncher()
+    cmd = launcher._build_command(RECIPE_TARGET, "/tmp/config.yaml", gpus_per_node=8, num_nodes=2)
     assert "--nnodes=$SKYPILOT_NUM_NODES" in cmd
     assert "--node_rank=$SKYPILOT_NODE_RANK" in cmd
+    assert "--rdzv_backend=c10d" in cmd
     assert "--master_addr=" in cmd
     assert "--nproc_per_node=8" in cmd
 
 
-def test_launch_with_skypilot_explicit_gpus_per_node(monkeypatch, tmp_path):
+def test_build_command_extra_args():
+    launcher = SkyPilotLauncher()
+    cmd = launcher._build_command(
+        RECIPE_TARGET,
+        "/tmp/config.yaml",
+        gpus_per_node=1,
+        num_nodes=1,
+        extra_args=["--my-flag", "val"],
+    )
+    assert "--my-flag" in cmd
+    assert "val" in cmd
+
+
+# ---------------------------------------------------------------------------
+# SkyPilotLauncher.launch
+# ---------------------------------------------------------------------------
+
+
+def test_launch_single_node(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_submit(cfg, job_dir):
+        captured["cfg"] = cfg
+        captured["job_dir"] = job_dir
+        return 0
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.launcher.skypilot.utils.submit_skypilot_job",
+        fake_submit,
+    )
+
+    launcher = SkyPilotLauncher()
+    config = {"model": {"name": "gpt2"}}
+    skypilot_cfg = {
+        "cloud": "gcp",
+        "accelerators": "T4:4",
+        "job_dir": str(tmp_path / "sky_jobs"),
+    }
+
+    result = launcher.launch(config, tmp_path / "cfg.yaml", RECIPE_TARGET, skypilot_cfg)
+    assert result == 0
+    assert "torchrun" in captured["cfg"].command
+    assert "--nproc_per_node=4" in captured["cfg"].command
+    assert "SKYPILOT_NUM_NODES" not in captured["cfg"].command
+
+
+def test_launch_multi_node(monkeypatch, tmp_path):
     captured = {}
 
     def fake_submit(cfg, job_dir):
@@ -131,23 +135,55 @@ def test_launch_with_skypilot_explicit_gpus_per_node(monkeypatch, tmp_path):
         fake_submit,
     )
 
-    job_conf_path = str(tmp_path / "job_config.yaml")
-    _write_yaml(job_conf_path, {})
+    launcher = SkyPilotLauncher()
+    config = {"model": {"name": "llama"}}
+    skypilot_cfg = {
+        "cloud": "aws",
+        "accelerators": "A100:8",
+        "num_nodes": 2,
+        "job_dir": str(tmp_path / "sky_jobs"),
+    }
 
-    # gpus_per_node overrides the value parsed from accelerators
-    skypilot_cfg = {"cloud": "gcp", "accelerators": "T4:1", "gpus_per_node": 2}
-    module.launch_with_skypilot(
-        _dummy_args(), job_conf_path, str(tmp_path), skypilot_cfg
+    launcher.launch(config, tmp_path / "cfg.yaml", RECIPE_TARGET, skypilot_cfg)
+    assert "--nnodes=$SKYPILOT_NUM_NODES" in captured["cfg"].command
+    assert "--node_rank=$SKYPILOT_NODE_RANK" in captured["cfg"].command
+    assert "--nproc_per_node=8" in captured["cfg"].command
+
+
+def test_launch_explicit_gpus_per_node(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_submit(cfg, job_dir):
+        captured["cfg"] = cfg
+        return 0
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.launcher.skypilot.utils.submit_skypilot_job",
+        fake_submit,
     )
 
+    launcher = SkyPilotLauncher()
+    skypilot_cfg = {
+        "cloud": "gcp",
+        "accelerators": "T4:1",
+        "gpus_per_node": 2,
+        "job_dir": str(tmp_path / "sky_jobs"),
+    }
+
+    launcher.launch({}, tmp_path / "cfg.yaml", RECIPE_TARGET, skypilot_cfg)
     assert "--nproc_per_node=2" in captured["cfg"].command
 
 
-def test_launch_with_skypilot_default_job_name(monkeypatch, tmp_path):
-    captured = {}
+def test_launch_strips_skypilot_from_written_config(monkeypatch, tmp_path):
+    written_configs = {}
 
     def fake_submit(cfg, job_dir):
-        captured["cfg"] = cfg
+        # Read back the job_config.yaml that was written
+        import os
+
+        conf_path = os.path.join(job_dir, "job_config.yaml")
+        with open(conf_path) as f:
+            written_configs["data"] = yaml.safe_load(f)
         return 0
 
     monkeypatch.setattr(
@@ -155,108 +191,14 @@ def test_launch_with_skypilot_default_job_name(monkeypatch, tmp_path):
         fake_submit,
     )
 
-    job_conf_path = str(tmp_path / "job_config.yaml")
-    _write_yaml(job_conf_path, {})
+    launcher = SkyPilotLauncher()
+    config = {"model": {"name": "gpt2"}}
+    skypilot_cfg = {
+        "cloud": "gcp",
+        "job_dir": str(tmp_path / "sky_jobs"),
+    }
 
-    skypilot_cfg = {"cloud": "gcp"}
-    module.launch_with_skypilot(
-        _dummy_args(domain="llm", command="finetune"),
-        job_conf_path,
-        str(tmp_path),
-        skypilot_cfg,
-    )
-
-    assert captured["cfg"].job_name == "llm_finetune"
-
-
-def test_launch_with_skypilot_extra_args_appended(monkeypatch, tmp_path):
-    captured = {}
-
-    def fake_submit(cfg, job_dir):
-        captured["cfg"] = cfg
-        return 0
-
-    monkeypatch.setattr(
-        "nemo_automodel.components.launcher.skypilot.utils.submit_skypilot_job",
-        fake_submit,
-    )
-
-    job_conf_path = str(tmp_path / "job_config.yaml")
-    _write_yaml(job_conf_path, {})
-
-    skypilot_cfg = {"cloud": "gcp"}
-    module.launch_with_skypilot(
-        _dummy_args(), job_conf_path, str(tmp_path), skypilot_cfg,
-        extra_args=["--my-flag", "val"],
-    )
-
-    assert "--my-flag val" in captured["cfg"].command
-
-
-# ---------------------------------------------------------------------------
-# main() – skypilot branch
-# ---------------------------------------------------------------------------
-
-def test_main_skypilot_branch(monkeypatch, tmp_path):
-    cfg_file = tmp_path / "cfg.yaml"
-    cfg_file.write_text(
-        f"""
-skypilot:
-  cloud: gcp
-  accelerators: T4:1
-  job_dir: {tmp_path / "skypilot_jobs"}
-model:
-  name: gpt2
-"""
-    )
-
-    captured = {}
-
-    def fake_launch(args, job_conf_path, job_dir, skypilot_config, extra_args=None):
-        captured["skypilot_config"] = dict(skypilot_config)
-        captured["job_dir"] = job_dir
-        # Verify the stripped config (no skypilot key) was written
-        with open(job_conf_path) as f:
-            data = yaml.safe_load(f)
-        assert "skypilot" not in data
-        assert data.get("model", {}).get("name") == "gpt2"
-        return 0
-
-    monkeypatch.setattr(module, "launch_with_skypilot", fake_launch)
-    monkeypatch.setattr(module.time, "time", lambda: 1234567890)
-    monkeypatch.setattr("sys.argv", ["automodel", "finetune", "llm", "-c", str(cfg_file)])
-
-    result = module.main()
-    assert result == 0
-    assert "cloud" in captured["skypilot_config"]
-    assert captured["skypilot_config"]["cloud"] == "gcp"
-    # job_dir should be popped before forwarding
-    assert "job_dir" not in captured["skypilot_config"]
-    assert captured["job_dir"].endswith("1234567890")
-
-
-def test_main_skypilot_preserves_env_var_placeholders(monkeypatch, tmp_path):
-    cfg_file = tmp_path / "cfg.yaml"
-    cfg_file.write_text(
-        f"""
-skypilot:
-  cloud: aws
-  hf_token: ${{HF_TOKEN}}
-model:
-  name: llama
-"""
-    )
-
-    captured = {}
-
-    def fake_launch(args, job_conf_path, job_dir, skypilot_config, extra_args=None):
-        captured["skypilot_config"] = dict(skypilot_config)
-        return 0
-
-    monkeypatch.setattr(module, "launch_with_skypilot", fake_launch)
-    monkeypatch.setattr(module.time, "time", lambda: 9999999999)
-    monkeypatch.setattr("sys.argv", ["automodel", "finetune", "llm", "-c", str(cfg_file)])
-
-    module.main()
-    # env-var placeholders must survive YAML round-trip unchanged
-    assert captured["skypilot_config"]["hf_token"] == "${HF_TOKEN}"
+    launcher.launch(config, tmp_path / "cfg.yaml", RECIPE_TARGET, skypilot_cfg)
+    # The written config should not contain the skypilot section
+    assert "skypilot" not in written_configs["data"]
+    assert written_configs["data"]["model"]["name"] == "gpt2"
