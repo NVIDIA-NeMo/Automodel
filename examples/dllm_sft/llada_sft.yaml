@@ -1,19 +1,24 @@
-# LLaDA-8B-Base SFT on Alpaca — matches reference dllm recipe from README
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
-# Reference: accelerate launch examples/llada/sft.py \
-#   --dataset_args "tatsu-lab/alpaca" --max_length 1024 \
-#   --num_train_epochs 5 --learning_rate 2e-5 --per_device_train_batch_size 4
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-# Run with:
-#   python -m torch.distributed.run --nproc-per-node=8 \
-#       examples/dllm_sft/finetune.py -c examples/dllm_sft/llada_sft_alpaca.yaml
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 
 step_scheduler:
-  global_batch_size: 32   # 8 GPUs * 4 per_device = 32 (matches reference)
-  local_batch_size: 4     # grad_accum = 32 / 8 / 4 = 1 (matches dllm baseline)
+  global_batch_size: 32
+  local_batch_size: 4
   ckpt_every_steps: 500
   val_every_steps: 500
-  max_steps: null    # run all 5 epochs (~8125 steps), matching reference
+  max_steps: null
   num_epochs: 5
 
 dist_env:
@@ -57,25 +62,19 @@ dllm:
   mode: mdlm
   mask_token_id: 126336
   eps: 0.001
-  supervise_padding: false
-  block_size: null
-  half_life_ratio: null
-  ar_loss_alpha: null
-  pad_block_size: null
-  pad_seq_len_divisible: null
+  supervise_padding: true
 
 optimizer:
   _target_: torch.optim.AdamW
   betas: [0.9, 0.999]
   eps: 1.0e-8
   lr: 2.0e-5
-  weight_decay: 0.0   # match reference dllm (HF default)
+  weight_decay: 0.0
 
 clip_grad_norm:
   max_norm: 1.0
 
 lr_scheduler:
-  # Match reference dllm: cosine decay with 10% warmup (starting from lr=0)
   lr_decay_style: cosine
   init_lr: 0.0
   min_lr: 0.0
@@ -83,7 +82,7 @@ lr_scheduler:
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
   path_or_dataset_id: /tmp/alpaca_messages.jsonl
-  seq_length: 1024    # matches reference --max_length 1024
+  seq_length: 1024
   truncation: true
   unshifted: true
   tokenizer:
