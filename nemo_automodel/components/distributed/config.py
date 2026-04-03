@@ -57,7 +57,20 @@ class FSDP2Config:
         sequence_parallel (bool): Enable sequence parallelism in TP plan.
         tp_plan (Optional[dict]): Custom TP plan. If None, auto-selected based on model type.
         mp_policy (Optional[MixedPrecisionPolicy]): MixedPrecisionPolicy for FSDP2.
+            Can be configured from YAML using the ``_target_`` pattern::
+
+                mp_policy:
+                  _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+                  param_dtype: bfloat16
+                  reduce_dtype: float32
+                  output_dtype: float32
+
         offload_policy (Optional[CPUOffloadPolicy]): CPUOffloadPolicy for CPU offloading.
+        autocast_dtype (Optional[torch.dtype]): If set, wraps the forward pass in
+            ``torch.autocast(device_type="cuda", dtype=autocast_dtype)``.  Use with
+            ``output_dtype=float32`` in mp_policy to keep the residual stream in fp32
+            while running matmuls in lower precision.  Set to ``None`` to disable.
+            Can be set from YAML as a string (e.g. ``autocast_dtype: bfloat16``).
         activation_checkpointing (bool): Enable activation checkpointing.
         defer_fsdp_grad_sync (bool): Defer FSDP gradient sync to final micro-batch.
         backend (str): Distributed backend.
@@ -67,6 +80,7 @@ class FSDP2Config:
     tp_plan: Optional[dict] = None
     mp_policy: Optional[MixedPrecisionPolicy] = None
     offload_policy: Optional[CPUOffloadPolicy] = None
+    autocast_dtype: Optional[torch.dtype] = None
     activation_checkpointing: bool = False
     defer_fsdp_grad_sync: bool = True
     backend: str = "nccl"
