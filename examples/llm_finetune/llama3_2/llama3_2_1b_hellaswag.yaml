@@ -90,7 +90,6 @@ optimizer:
   # min_lr: 1.0e-5
 
 ci:
-  time: "00:45:00"
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
     model.pretrained_model_name_or_path: meta-llama/Llama-3.2-3B-Instruct

@@ -109,7 +109,6 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
-  time: "00:45:00"
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
     distributed.tp_size: 2
