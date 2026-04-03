@@ -379,9 +379,7 @@ def _shard_thd_chunk_for_te(
         "cu_seqlens": cu_seqlens_padded.to(torch.int32).contiguous(),
         "max_seqlen": torch.tensor(max_seqlen).to(torch.int32).to(device=cu_seqlens_padded.device),
         "qkv_format": qkv_format,
-        "padding_mask": (batch["input_ids"] == padding_token_id).bool().contiguous()
-        if padding_token_id is not None
-        else torch.zeros_like(batch["input_ids"], dtype=torch.bool).contiguous(),
+        "padding_mask": (batch["input_ids"] == padding_token_id).bool().contiguous(),
         "cp_size": cp_size,
         "cp_rank": cp_rank,
     }
