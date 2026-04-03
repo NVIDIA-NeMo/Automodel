@@ -77,7 +77,7 @@ def test_custom_values():
         container_image="nvcr.io/nvidia/nemo:24.05",
         time="04:00:00",
         mounts=["/data:/data", "/models:/models"],
-        env_vars={"HF_TOKEN": "tok123", "WANDB_KEY": "wb456"},
+        env_vars={"MY_VAR": "value1", "OTHER_VAR": "value2"},  # pragma: allowlist secret
         job_name="pretrain_llama",
         detach=False,
         tail_logs=True,
@@ -90,7 +90,7 @@ def test_custom_values():
     assert cfg.container_image == "nvcr.io/nvidia/nemo:24.05"
     assert cfg.time == "04:00:00"
     assert cfg.mounts == ["/data:/data", "/models:/models"]
-    assert cfg.env_vars == {"HF_TOKEN": "tok123", "WANDB_KEY": "wb456"}
+    assert cfg.env_vars == {"MY_VAR": "value1", "OTHER_VAR": "value2"}
     assert cfg.job_name == "pretrain_llama"
     assert cfg.detach is False
     assert cfg.tail_logs is True
