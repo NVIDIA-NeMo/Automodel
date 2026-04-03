@@ -105,6 +105,10 @@ lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
 
+ci:
+  vllm_deploy: true
+  vllm_smoke_test: true
+
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>

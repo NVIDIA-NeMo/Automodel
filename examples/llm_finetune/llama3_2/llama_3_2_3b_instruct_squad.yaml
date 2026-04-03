@@ -94,9 +94,12 @@ optimizer:
   weight_decay: 0
   # min_lr: 1.0e-5
 
+ci:
+  vllm_deploy: true
+
 # Uncomment and configure for W&B logging
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>

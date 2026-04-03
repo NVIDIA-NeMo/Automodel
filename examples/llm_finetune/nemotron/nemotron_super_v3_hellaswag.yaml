@@ -94,3 +94,5 @@ lr_scheduler:
 
 ci:
   nodes: 4
+  vllm_deploy: true
+  vllm_smoke_test: true

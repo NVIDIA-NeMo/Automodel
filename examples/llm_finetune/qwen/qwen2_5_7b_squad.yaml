@@ -102,3 +102,4 @@ optimizer:
 
 ci:
   time: "00:15:00"
+  vllm_deploy: true

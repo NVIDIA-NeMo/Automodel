@@ -118,6 +118,7 @@ lr_scheduler:
 
 ci:
   time: "00:30:00"
+  vllm_deploy: true
 
 # Uncomment and configure for W&B logging
 # wandb:

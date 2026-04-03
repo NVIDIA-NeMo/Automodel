@@ -114,6 +114,10 @@ optimizer:
   weight_decay: 0.0
   # min_lr: 1.0e-5
 
+ci:
+  vllm_deploy: true
+  vllm_smoke_test: true
+
 # Uncomment and configure for W&B logging
 # wandb:
 #   project: <your_wandb_project>

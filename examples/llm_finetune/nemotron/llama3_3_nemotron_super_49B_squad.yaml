@@ -118,3 +118,4 @@ lr_scheduler:
 ci:
   nodes: 2
   time: "00:30:00"
+  vllm_deploy: true

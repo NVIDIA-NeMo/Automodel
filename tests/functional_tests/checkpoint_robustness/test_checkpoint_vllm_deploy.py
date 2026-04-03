@@ -17,6 +17,19 @@
 Default mode: compare vLLM (model_impl="transformers") against HF token-for-token.
 Smoke test mode (--vllm_smoke_test): verify the model loads into vLLM's native backend
 and produces non-empty output, without HF comparison.
+
+Usage:
+  SFT (config-driven):
+    python -m pytest test_checkpoint_vllm_deploy.py \
+        --mode sft --config_path recipe.yaml --model_path /path/to/checkpoint/model/consolidated/
+
+  PEFT (config-driven):
+    python -m pytest test_checkpoint_vllm_deploy.py \
+        --mode peft --config_path recipe.yaml --adapter_path /path/to/checkpoint/model/
+
+  Legacy (no config):
+    python -m pytest test_checkpoint_vllm_deploy.py \
+        --model_path <hf_name_or_path> --tokenizer <hf_name> --trust_remote_code
 """
 
 import sys
@@ -32,7 +45,10 @@ PROMPTS = [
 
 
 def _extract_custom_args(argv):
-    custom_keys = {"--model_path", "--tokenizer", "--max_new_tokens", "--adapter_path"}
+    custom_keys = {
+        "--model_path", "--tokenizer", "--max_new_tokens",
+        "--adapter_path", "--config_path", "--mode",
+    }
     boolean_keys = {"--vllm_smoke_test", "--trust_remote_code"}
     custom = {}
     remaining = []
@@ -50,6 +66,71 @@ def _extract_custom_args(argv):
     return custom, remaining
 
 
+def _load_recipe_config(config_path):
+    """Load a recipe YAML and return the parsed dict."""
+    import yaml
+
+    with open(config_path) as f:
+        return yaml.safe_load(f)
+
+
+def _resolve_args(custom_args):
+    """Resolve final test arguments from CLI args and optional recipe config.
+
+    Returns a dict with keys: model_path, adapter_path, tokenizer, max_new_tokens,
+    smoke_test, trust_remote_code.
+    """
+    config_path = custom_args.get("config_path")
+    mode = custom_args.get("mode")  # "sft", "peft", or None (legacy)
+    cfg = _load_recipe_config(config_path) if config_path else {}
+
+    model_cfg = cfg.get("model", {})
+    tokenizer_cfg = cfg.get("tokenizer", {})
+    ci_cfg = cfg.get("ci", {})
+
+    # -- model_path and adapter_path --
+    if mode == "peft":
+        # PEFT: base model from config, adapter from --adapter_path
+        model_path = model_cfg["pretrained_model_name_or_path"]
+        adapter_path = custom_args["adapter_path"]
+    elif mode == "sft":
+        # SFT: full model from --model_path
+        model_path = custom_args["model_path"]
+        adapter_path = None
+    else:
+        # Legacy: caller provides everything explicitly
+        model_path = custom_args["model_path"]
+        adapter_path = custom_args.get("adapter_path")
+
+    # -- tokenizer --
+    if "tokenizer" in custom_args:
+        tokenizer = custom_args["tokenizer"]
+    elif tokenizer_cfg.get("pretrained_model_name_or_path"):
+        tokenizer = tokenizer_cfg["pretrained_model_name_or_path"]
+    else:
+        tokenizer = model_path
+
+    # -- flags --
+    trust_remote_code = custom_args.get("trust_remote_code", False)
+    if not trust_remote_code and model_cfg.get("trust_remote_code"):
+        trust_remote_code = True
+
+    smoke_test = custom_args.get("vllm_smoke_test", False)
+    if not smoke_test and ci_cfg.get("vllm_smoke_test"):
+        smoke_test = True
+
+    max_new_tokens = int(custom_args.get("max_new_tokens", "20"))
+
+    return {
+        "model_path": model_path,
+        "adapter_path": adapter_path,
+        "tokenizer": tokenizer,
+        "max_new_tokens": max_new_tokens,
+        "smoke_test": smoke_test,
+        "trust_remote_code": trust_remote_code,
+    }
+
+
 # Extract custom args at module level before pytest processes them.
 _custom_args, _remaining_argv = _extract_custom_args(sys.argv)
 sys.argv = _remaining_argv
@@ -59,12 +140,13 @@ def test_vllm_greedy_matches_hf():
     """Load a checkpoint with HF and vLLM, then verify greedy outputs match token-for-token."""
     pytest.importorskip("vllm")
 
-    model_path = _custom_args["model_path"]
-    adapter_path = _custom_args.get("adapter_path")
-    tokenizer_path = _custom_args.get("tokenizer", model_path)
-    max_new_tokens = int(_custom_args.get("max_new_tokens", "20"))
-    smoke_test = _custom_args.get("vllm_smoke_test", False)
-    trust_remote_code = _custom_args.get("trust_remote_code", False)
+    args = _resolve_args(_custom_args)
+    model_path = args["model_path"]
+    adapter_path = args["adapter_path"]
+    tokenizer_path = args["tokenizer"]
+    max_new_tokens = args["max_new_tokens"]
+    smoke_test = args["smoke_test"]
+    trust_remote_code = args["trust_remote_code"]
 
     from vllm import LLM, SamplingParams
 

@@ -110,3 +110,5 @@ optimizer:
 ci:
   node_multiplier: true
   time: "00:15:00"
+  vllm_deploy: true
+  vllm_smoke_test: true

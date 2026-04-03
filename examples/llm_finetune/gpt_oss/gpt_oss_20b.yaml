@@ -118,3 +118,5 @@ optimizer:
 
 ci:
   node_multiplier: true
+  vllm_deploy: true
+  vllm_smoke_test: true
