@@ -50,43 +50,35 @@ CMD="torchrun --nproc-per-node=${NPROC_PER_NODE} \
 if [ "$EXEC_CMD" = "python" ]; then CMD="python"; fi
 if [ "$EXEC_CMD" = "uv_python" ]; then CMD="uv run python"; fi
 
+# Checkpoint robustness variables
+ROBUSTNESS_COMMON="--config /opt/Automodel/${CONFIG_PATH} \
+  --checkpoint.checkpoint_dir $PIPELINE_DIR/$TEST_NAME/robustness_checkpoint \
+  --checkpoint.enabled true \
+  --checkpoint.model_save_format safetensors \
+  --checkpoint.save_consolidated true \
+  --step_scheduler.max_steps 5 \
+  --step_scheduler.ckpt_every_steps 5 \
+  --step_scheduler.val_every_steps 5 \
+  --step_scheduler.global_batch_size 16 \
+  --step_scheduler.local_batch_size 2"
+
+if [[ "${CONFIG_PATH}" == *peft* ]] || [[ "${CONFIG_PATH}" == *lora* ]]; then
+  ROBUSTNESS_COMMON="${ROBUSTNESS_COMMON} --peft.use_triton false"
+fi
+
+ROBUSTNESS_CMD="${CMD} -m pytest tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
+  ${ROBUSTNESS_COMMON}"
+
+# ============================================
+# Finetune
+# ============================================
 cd /opt/Automodel
 RUN_CMD="${CMD} ${TEST_SCRIPT_PATH} ${CONFIG} ${FINETUNE_ARGS}"
 eval $RUN_CMD
 
-# --- Checkpoint Robustness Test (runs after finetune if configured) ---
-HAS_ROBUSTNESS=$(python3 -c "
-import yaml
-with open('/opt/Automodel/${CONFIG_PATH}') as f:
-    cfg = yaml.safe_load(f)
-if cfg.get('ci', {}).get('checkpoint_robustness'):
-    print('yes')
-" 2>/dev/null)
-
-if [[ "$HAS_ROBUSTNESS" == "yes" ]]; then
-  echo "============================================"
-  echo "[checkpoint_robustness] Running robustness test..."
-  echo "============================================"
-
-  # Common args — model-specific args are read from ci.checkpoint_robustness by the test script
-  ROBUSTNESS_COMMON="--config /opt/Automodel/${CONFIG_PATH} \
-    --checkpoint.checkpoint_dir $PIPELINE_DIR/$TEST_NAME/robustness_checkpoint \
-    --checkpoint.enabled true \
-    --checkpoint.model_save_format safetensors \
-    --checkpoint.save_consolidated true \
-    --step_scheduler.max_steps 5 \
-    --step_scheduler.ckpt_every_steps 5 \
-    --step_scheduler.val_every_steps 5 \
-    --step_scheduler.global_batch_size 16 \
-    --step_scheduler.local_batch_size 2 \
-"
-
-  if [[ "${CONFIG_PATH}" == *peft* ]] || [[ "${CONFIG_PATH}" == *lora* ]]; then
-    ROBUSTNESS_COMMON="${ROBUSTNESS_COMMON} --peft.use_triton false"
-  fi
-
-  ROBUSTNESS_CMD="${CMD} -m pytest tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
-    ${ROBUSTNESS_COMMON}"
-
+# ============================================
+# Checkpoint Robustness
+# ============================================
+if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
   eval $ROBUSTNESS_CMD
 fi

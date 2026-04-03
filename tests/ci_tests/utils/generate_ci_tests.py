@@ -146,6 +146,9 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
             else:
                 job['variables'][ci_var] = value
 
+    has_robustness = 'true' if ci_config.get('checkpoint_robustness') else 'false'
+    job['variables']['HAS_ROBUSTNESS'] = has_robustness
+
     # Check if config has known issue
     known_issue_config_list = config_override.get('known_issue') or []
     if config.stem in known_issue_config_list:
