@@ -1,6 +1,6 @@
 # Moonlight 16B (A3B) — Tulu-3 Convergence
 
-MoE 16B (3B active) model based on DeepSeek V3 architecture. 64 routed experts, 2 shared experts, top-6 routing. 8 GPUs, EP=8, FSDP, 1000 steps on Tulu-3 (pre-filtered to seq_length=2048).
+MoE 16B (3B active) model based on DeepSeek V3 architecture. 64 routed experts, 2 shared experts, top-6 routing. 8 GPUs, EP=8, FSDP baselines plus a corrected CP=2 FP32-upcast rerun on Tulu-3 (pre-filtered to `seq_length=2048`).
 
 **Model:** [moonshotai/Moonlight-16B-A3B](https://huggingface.co/moonshotai/Moonlight-16B-A3B)
 
@@ -9,6 +9,7 @@ MoE 16B (3B active) model based on DeepSeek V3 architecture. 64 routed experts, 
 | Config | Optimizer | lr | Notes |
 |--------|-----------|---:|-------|
 | `moonlight_16b_ep8_flashoptim.yaml` | FlashAdamW | 1e-5 | 32-bit master weights, `fp32_upcast: true` |
+| `moonlight_16b_ep8_cp2_flashoptim.yaml` | FlashAdamW | 1e-5 | Corrected CP=2 rerun, 32-bit master weights, `fp32_upcast: true` |
 | `moonlight_16b_ep8_te_fusedadam.yaml` | TE FusedAdam | 1e-5 | FP32 master weights, BF16 moments, `fp32_upcast: true` |
 
 All configs use `chat_template.jinja`, `seq_length: 2048`, `betas: [0.9, 0.95]`, `ep_size: 8`, `rms_norm: te`, TE attn+linear backends, `enable_fsdp_optimizations: true`, `gate_bias_update_factor: 0.0001`, `moe_metrics: brief`.
@@ -61,10 +62,11 @@ bash examples/convergence/tulu3/eval/run_eval.sh \
     --tokenizer moonshotai/Moonlight-16B-A3B \
     --tasks ifeval \
     --tp-size 1 --dp-size 1 \
-    -- --model_args "pretrained=$CKPT,tokenizer=moonshotai/Moonlight-16B-A3B,tensor_parallel_size=1,dtype=auto,gpu_memory_utilization=0.8,data_parallel_size=1,enable_thinking=False,trust_remote_code=True"
+    --extra-model-args "trust_remote_code=True" \
+    --gen-kwargs "until=<|im_end|>"
 ```
 
-**Note:** `trust_remote_code=True` must be passed via `--model_args` for the TikToken tokenizer.
+**Note:** Moonlight's assistant turns end with `<|im_end|>`, so newer vLLM/lm-eval stacks need `--gen-kwargs "until=<|im_end|>"` for correct stopping. `trust_remote_code=True` is also required for the TikToken tokenizer.
 
 ## Results
 
@@ -75,6 +77,7 @@ bash examples/convergence/tulu3/eval/run_eval.sh \
 | Moonlight-16B-A3B (pretrained) | 0.148 | 0.179 | 0.278 | 0.312 |
 | TE FusedAdam FP32+BF16, gate=1e-4 | 0.381 | 0.473 | 0.534 | 0.607 |
 | FlashAdamW 32-bit, fp32_upcast | 0.412 | 0.501 | 0.559 | 0.634 |
+| FlashAdamW 32-bit, fp32_upcast, CP=2 | **0.573** | **0.599** | **0.668** | **0.697** |
 
 ### Training Loss
 
@@ -82,6 +85,7 @@ bash examples/convergence/tulu3/eval/run_eval.sh \
 |--------|-------:|---------:|---------:|--------:|
 | TE FusedAdam FP32+BF16, gate=1e-4 | 0.875 | 0.570 | 0.655 | ~5000 |
 | FlashAdamW 32-bit, fp32_upcast | 0.875 | 0.570 | 0.657 | ~5200 |
+| FlashAdamW 32-bit, fp32_upcast, CP=2 | 0.875 | 0.570 | 0.656 | ~2900 |
 
 ### Training Curves
 
@@ -105,7 +109,18 @@ MoE load balancing is healthy: zero dead experts, diversity ~0.89 (1.0=uniform),
 | Moonlight-16B-A3B (pretrained) | 22.2% | 73.4% | 0% | 0% |
 | TE FusedAdam FP32+BF16, gate=1e-4 | 22.7% | 47.1% | 0% | 0% |
 | FlashAdamW 32-bit, fp32_upcast | 22.2% | 19.2% | 0% | 0% |
+| FlashAdamW 32-bit, fp32_upcast, CP=2 | **14.2%** | **14.2%** | 0% | 0% |
 
+### Key Takeaways
+
+- SFT significantly improves instruction following: prompt_strict 0.148 → 0.573 (+287%), inst_strict 0.278 → 0.668 (+140%).
+- **FlashAdamW 32-bit with fp32_upcast remains the strongest setup, and the corrected CP=2 rerun is the best published result on the current eval stack**.
+- The combination of FP32 master weights + FP32 loss upcasting continues to translate into better generation quality.
+- Moonlight evals need explicit `<|im_end|>` stopping on newer vLLM/lm-eval stacks; without it, both IFEval and inference-quality numbers are understated.
+- The corrected CP=2 rerun also reduces death loops materially (14.2%) while keeping abrupt endings low (14.2%).
+- Dataset pre-filtering is required — variable-length batching can hit sequences that cause memory spikes with the large vocabulary.
+- `rms_norm: te` and `enable_fsdp_optimizations: true` from the benchmark config are needed for reasonable memory usage.
+- The TikToken tokenizer requires a patch for `{% generation %}` tag support (slow tokenizer fallback) and to prevent spurious BOS/EOS insertion.
 
 ## Checklist
 

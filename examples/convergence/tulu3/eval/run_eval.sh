@@ -28,6 +28,8 @@
 #   --thinking            Enable thinking mode for chat template
 #   --tp-size N           Tensor parallel size (default: 2)
 #   --dp-size N           Data parallel size (default: 4)
+#   --extra-model-args X  Extra CSV appended to --model_args
+#   --gen-kwargs X        Passed through to lm_eval --gen_kwargs
 #
 # Everything after "--" is forwarded to lm_eval verbatim.
 
@@ -37,6 +39,8 @@ LM_EVAL_DIR="${LM_EVAL_DIR:-/opt/lm-evaluation-harness}"
 ENABLE_THINKING="False"
 TP_SIZE=2
 DP_SIZE=4
+EXTRA_MODEL_ARGS=""
+GEN_KWARGS=""
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -48,6 +52,8 @@ while [[ $# -gt 0 ]]; do
     --thinking)     ENABLE_THINKING="True"; shift ;;
     --tp-size)      TP_SIZE="$2";      shift 2 ;;
     --dp-size)      DP_SIZE="$2";      shift 2 ;;
+    --extra-model-args) EXTRA_MODEL_ARGS="$2"; shift 2 ;;
+    --gen-kwargs)   GEN_KWARGS="$2";   shift 2 ;;
     --)             shift; EXTRA_ARGS+=("$@"); break ;;
     *)              echo "Unknown arg: $1"; exit 1 ;;
   esac
@@ -94,12 +100,29 @@ source "$VENV_DIR/bin/activate"
 # ── Run evaluation ──────────────────────────────────────────────────────────
 cd "$LM_EVAL_DIR"
 
-lm_eval --model vllm \
-    --model_args "pretrained=$MODEL_PATH,tokenizer=$TOKENIZER,tensor_parallel_size=$TP_SIZE,dtype=auto,gpu_memory_utilization=0.8,data_parallel_size=$DP_SIZE,enable_thinking=$ENABLE_THINKING" \
-    --tasks "$TASKS" \
-    --batch_size auto \
-    --apply_chat_template \
-    --fewshot_as_multiturn \
-    --log_samples \
-    --output_path "$OUTPUT_PATH" \
-    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+MODEL_ARGS="pretrained=$MODEL_PATH,tokenizer=$TOKENIZER,tensor_parallel_size=$TP_SIZE,dtype=auto,gpu_memory_utilization=0.8,data_parallel_size=$DP_SIZE,enable_thinking=$ENABLE_THINKING"
+if [ -n "$EXTRA_MODEL_ARGS" ]; then
+  MODEL_ARGS="$MODEL_ARGS,$EXTRA_MODEL_ARGS"
+fi
+
+LM_EVAL_CMD=(
+  lm_eval
+  --model vllm
+  --model_args "$MODEL_ARGS"
+  --tasks "$TASKS"
+  --batch_size auto
+  --apply_chat_template
+  --fewshot_as_multiturn
+  --log_samples
+  --output_path "$OUTPUT_PATH"
+)
+
+if [ -n "$GEN_KWARGS" ]; then
+  LM_EVAL_CMD+=(--gen_kwargs "$GEN_KWARGS")
+fi
+
+if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
+  LM_EVAL_CMD+=("${EXTRA_ARGS[@]}")
+fi
+
+"${LM_EVAL_CMD[@]}"
