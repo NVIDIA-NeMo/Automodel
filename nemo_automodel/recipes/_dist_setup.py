@@ -121,7 +121,12 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
 
     strategy_config = strategy_cls(**strategy_kwargs)
 
-    pipeline_config = PipelineConfig(**pipeline_dict) if pipeline_dict is not None else None
+    if pipeline_dict is not None:
+        pipeline_config = PipelineConfig(**pipeline_dict)
+    elif pp_size > 1:
+        pipeline_config = PipelineConfig()
+    else:
+        pipeline_config = None
 
     # Instantiate nested _target_ configs (e.g. mp_policy) before constructing MoEParallelizerConfig
     if moe_dict is not None and "mp_policy" in moe_dict:

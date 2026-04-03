@@ -128,6 +128,13 @@ class TestPipeline:
     def test_pp_enabled_true_when_pp_gt_1(self):
         assert parse_distributed_section({"pp_size": 2})["pp_enabled"] is True
 
+    def test_default_pipeline_config_created_when_pp_gt_1_and_no_pipeline_dict(self):
+        """pp_size > 1 without a pipeline section must still yield a PipelineConfig."""
+        result = parse_distributed_section({"pp_size": 4})
+        assert result["pp_enabled"] is True
+        assert isinstance(result["pipeline_config"], PipelineConfig)
+        assert result["pipeline_config"].pp_schedule == "1f1b"
+
     def test_pp_enabled_false_when_pp_eq_1(self):
         assert parse_distributed_section({"pp_size": 1})["pp_enabled"] is False
 
