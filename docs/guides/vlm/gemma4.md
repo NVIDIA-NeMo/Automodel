@@ -222,7 +222,7 @@ def evaluate_receipts(model, processor, test_dataset, n_samples=20):
 
 # --- Load base model ---
 
-MODEL_PATH = "/path/to/eevee-4-31b-it_vv9"   # or HuggingFace model ID
+MODEL_PATH = "/path/to/gemma-4-31b-it"   # or HuggingFace model ID
 
 processor = AutoProcessor.from_pretrained(MODEL_PATH)
 base_model = NeMoAutoModelForImageTextToText.from_pretrained(
@@ -281,7 +281,7 @@ dist_env:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /path/to/eevee-4-31b-it_vv9
+  pretrained_model_name_or_path: /path/to/gemma-4-31b-it
   torch_dtype: torch.bfloat16
   use_liger_kernel: true
   use_sdpa_patching: false
@@ -419,7 +419,7 @@ from transformers import AutoProcessor, AutoModelForMultimodalLM
 from nemo_automodel.components.datasets.vlm.utils import json2token
 
 # Paths
-BASE_MODEL = "/path/to/eevee-4-31b-it_vv9"
+BASE_MODEL = "/path/to/gemma-4-31b-it"
 CKPT_DIR = "vlm_checkpoints/gemma4_31b_cord_v2"
 best_ckpt = os.path.realpath(os.path.join(CKPT_DIR, "LOWEST_VAL"))
 consolidated = os.path.join(best_ckpt, "model", "consolidated")
