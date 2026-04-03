@@ -434,7 +434,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 batch["_clean_input_ids"] = input_ids.clone()
 
                 # Count tokens for this batch (all-reduce across DP for this batch)
-                num_noise = self._dp_allreduce(torch.tensor(noise_mask.sum().item(), dtype=torch.long)).item()
+                num_noise = self._dp_allreduce(torch.tensor(noise_mask.sum().item(), dtype=torch.long)).item()  # noqa: F841
                 num_supervised = self._dp_allreduce(
                     torch.tensor(loss_mask.sum().item(), dtype=torch.long)
                 ).item()
