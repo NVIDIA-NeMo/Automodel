@@ -1305,7 +1305,9 @@ def mla_moe_flops(config, gbs=1, seq_len=None):
     Handles VL wrappers by extracting text_config if present.
     """
     # Handle VL wrappers with nested text_config
-    cfg = getattr(config, "text_config", config)
+    cfg = config
+    if hasattr(config, "text_config") and not hasattr(config, "num_hidden_layers"):
+        cfg = config.text_config
 
     if seq_len is None:
         seq_len = getattr(cfg, "max_position_embeddings", 2048)

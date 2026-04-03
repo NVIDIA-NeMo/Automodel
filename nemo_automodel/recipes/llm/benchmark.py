@@ -52,7 +52,7 @@ def _infer_vocab_size(model_cfg):
     if config_target is not None and callable(config_target):
         target_name = getattr(config_target, "__qualname__", "")
         if "AutoConfig" not in target_name:
-            model_config = config_target(config_section.pretrained_model_name_or_path)
+            model_config = config_target.from_pretrained(config_section.pretrained_model_name_or_path)
     elif isinstance(config_target, str) and "AutoConfig" not in config_target:
         import importlib
 
