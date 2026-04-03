@@ -69,16 +69,18 @@ fi
 ROBUSTNESS_CMD="${CMD} -m pytest tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
   ${ROBUSTNESS_COMMON}"
 
-# ============================================
-# Finetune
-# ============================================
+# --- Finetune ---
 cd /opt/Automodel
 RUN_CMD="${CMD} ${TEST_SCRIPT_PATH} ${CONFIG} ${FINETUNE_ARGS}"
+echo "============================================"
+echo "[finetune] Running finetune..."
+echo "============================================"
 eval $RUN_CMD
 
-# ============================================
-# Checkpoint Robustness
-# ============================================
+# --- Checkpoint Robustness ---
 if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
+  echo "============================================"
+  echo "[checkpoint_robustness] Running robustness test..."
+  echo "============================================"
   eval $ROBUSTNESS_CMD
 fi
