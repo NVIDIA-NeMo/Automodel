@@ -287,6 +287,7 @@ launcher/overview.md
 launcher/local-workstation.md
 launcher/slurm.md
 launcher/skypilot.md
+launcher/skypilot-kubernetes.md
 ::::
 
 

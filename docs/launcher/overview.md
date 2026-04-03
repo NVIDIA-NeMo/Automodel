@@ -8,7 +8,7 @@ NeMo AutoModel provides several ways to launch training. The right choice depend
 |---|---|---|---|
 | **Local Workstation** | Getting started, debugging, single-node training | 1-8 on one machine | [Local Workstation](./local-workstation.md) |
 | **Slurm** | Multi-node batch jobs on HPC clusters | 8+ across nodes | [Slurm](./slurm.md) |
-| **SkyPilot** | Cloud training (AWS, GCP, Azure) with spot pricing | Any | [SkyPilot](./skypilot.md) |
+| **SkyPilot** | Cloud training or Kubernetes clusters | Any | [SkyPilot](./skypilot.md) |
 
 ### I have 1-2 GPUs on my workstation
 
@@ -39,6 +39,16 @@ automodel config_with_skypilot.yaml
 ```
 
 See the [SkyPilot](./skypilot.md) guide.
+
+### I want to train on Kubernetes with SkyPilot
+
+Use the same `skypilot:` launcher, but set `cloud: kubernetes`. This is a good fit when your team already has a GPU-backed Kubernetes cluster and you want SkyPilot to handle job submission and multi-node orchestration:
+
+```bash
+automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes.yaml
+```
+
+See the [SkyPilot + Kubernetes tutorial](./skypilot-kubernetes.md).
 
 ## All Launchers Use the Same Config
 
