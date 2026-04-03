@@ -14,6 +14,12 @@
 
 # Benchmarking config for Qwen3 VL 235B Te Deepep
 
+# To run this recipe:
+#   automodel examples/benchmark/configs/qwen3_vl_235b_te_deepep.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: BenchmarkingRecipeForNextTokenPrediction
+
 seed: 1234
 
 benchmark:

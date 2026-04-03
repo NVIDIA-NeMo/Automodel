@@ -14,6 +14,12 @@
 
 # Benchmarking config for GLM-4.7 Te Deepep
 
+# To run this recipe:
+#   automodel examples/benchmark/configs/glm_4.7_te_deepep.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: BenchmarkingRecipeForNextTokenPrediction
+
 seed: 1234
 
 benchmark:
