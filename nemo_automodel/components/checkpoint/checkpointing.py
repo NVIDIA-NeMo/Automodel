@@ -534,12 +534,31 @@ class Checkpointer:
                 if hasattr(module, "_is_hf_initialized"):
                     module._is_hf_initialized = False
 
+            # HF's _init_weights calls init.zeros_(weight[padding_idx]) on
+            # nn.Embedding layers.  When the weight is a DTensor (TP-sharded),
+            # the integer index triggers a redistribute that fails.  Temporarily
+            # clear padding_idx so the zeroing is skipped, then restore it and
+            # zero the row via local-tensor ops instead.
+            saved_padding_idx: dict[nn.Embedding, int] = {}
+            for mod in model.modules():
+                if (
+                    isinstance(mod, nn.Embedding)
+                    and getattr(mod, "padding_idx", None) is not None
+                    and type(getattr(mod, "weight", None)).__name__ == "DTensor"
+                ):
+                    saved_padding_idx[mod] = mod.padding_idx
+                    mod.padding_idx = None
+
             if hasattr(model, "initialize_weights"):
                 model.initialize_weights()
             else:
                 logging.warning(
-                    "Warning: Model does not have initialize_weights method. Requires custom initialization to be implemented."
+                    "Warning: Model does not have initialize_weights method."
+                    "Custom initialization is required to be implemented."
                 )
+
+            for mod, idx in saved_padding_idx.items():
+                mod.padding_idx = idx
 
         if peft_init_method is not None:
             _init_peft_adapters(model, peft_init_method)
