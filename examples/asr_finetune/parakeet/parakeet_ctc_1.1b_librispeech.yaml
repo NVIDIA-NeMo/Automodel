@@ -1,0 +1,76 @@
+# Fine-tune Parakeet CTC 1.1B on LibriSpeech
+# Based on nvidia/parakeet-ctc-1.1b model from HuggingFace
+# Larger model with 1.1B parameters for higher accuracy
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 2  # Reduced for larger model
+  ckpt_every_steps: 100
+  val_every_steps: 50
+  max_steps: 1000
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCTC.from_pretrained
+  pretrained_model_name_or_path: nvidia/parakeet-ctc-1.1b
+  torch_dtype: bfloat16
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./asr_checkpoints/parakeet_ctc_1.1b_librispeech
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  dp_size: null
+  tp_size: 1
+  cp_size: 1
+
+distributed_config:
+  _target_: nemo_automodel.components.distributed.config.FSDP2Config
+  sequence_parallel: false
+
+# CTC models compute loss internally during forward pass
+# This loss_fn is used as a placeholder for non-CTC codepaths
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.asr.datasets.make_librispeech_dataset
+  path_or_dataset: librispeech_asr
+  split: train.100
+  streaming: false
+  limit_dataset_samples: 10000
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  pin_memory: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.asr.collate_fns.parakeet_collate_fn
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.asr.datasets.make_librispeech_dataset
+  path_or_dataset: librispeech_asr
+  split: validation
+  streaming: false
+  limit_dataset_samples: 1000
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 2
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.asr.collate_fns.parakeet_collate_fn
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6

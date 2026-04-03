@@ -1,6 +1,6 @@
 # Model Coverage Overview
 
-NeMo AutoModel integrates with Hugging Face `transformers`. Any LLM or VLM that can be instantiated through `transformers` can also be used via NeMo AutoModel, subject to runtime, third-party software dependencies, and feature compatibility.
+NeMo AutoModel integrates with Hugging Face `transformers`. As a result, any LLM, VLM, or ASR model that can be instantiated through `transformers` can also be used via NeMo AutoModel, subject to runtime, third-party software dependencies, and feature compatibility.
 
 ## Supported Hugging Face Auto Classes
 
@@ -8,6 +8,8 @@ NeMo AutoModel integrates with Hugging Face `transformers`. Any LLM or VLM that 
 |------------|------|--------|---------|
 | `AutoModelForCausalLM` | Text Generation (LLM) | Supported | See [LLM model list](llm.md). |
 | `AutoModelForImageTextToText` | Image-Text-to-Text (VLM) | Supported | See [VLM model list](vlm.md). |
+| `AutoModelForCTC` | Speech-to-Text (ASR CTC) | Supported | See [ASR model list](asr.md). |
+| `AutoModelForSpeechSeq2Seq` | Speech-to-Text (ASR) | Supported | See [ASR model list](asr.md). |
 | `AutoModelForSequenceClassification` | Sequence Classification | WIP | Early support; interfaces may change. |
 | Diffusers Pipelines | Diffusion Generation (T2I, T2V) | Supported | See [Diffusion model list](diffusion.md). |
 
