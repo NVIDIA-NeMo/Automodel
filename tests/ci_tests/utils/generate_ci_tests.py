@@ -109,20 +109,11 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
         }
     }
 
-    # Configure test script (finetune or benchmark) and set template
-    test_script = ""
+    # Configure test template
     if 'benchmark' in config.stem:
-        test_script = "benchmark"
-        job['extends'] = f'.llm_{test_script}_test'
+        job['extends'] = '.llm_benchmark_test'
     else:
-        test_script = "finetune"
         job['extends'] = f'.{test_folder}_test'
-
-    # Configure test stage based on test script
-    if 'peft' in config.stem:
-        job['stage'] = f'{test_script}_peft'
-    else:
-        job['stage'] = f'{test_script}_sft'
 
     # Apply resource overrides (time, nodes, etc.) from the recipe's top-level ci: section
     recipe_path = f"{automodel_dir}/{config}"
@@ -146,8 +137,16 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
             else:
                 job['variables'][ci_var] = value
 
-    has_robustness = 'true' if ci_config.get('checkpoint_robustness') else 'false'
-    job['variables']['HAS_ROBUSTNESS'] = has_robustness
+    has_robustness = bool(ci_config.get('checkpoint_robustness'))
+    job['variables']['HAS_ROBUSTNESS'] = str(has_robustness).lower()
+
+    # Configure test stage based on recipe type and robustness config
+    if 'benchmark' in config.stem:
+        job['stage'] = 'benchmark'
+    elif 'peft' in config.stem:
+        job['stage'] = 'peft_ckpt_robustness' if has_robustness else 'peft'
+    else:
+        job['stage'] = 'sft_ckpt_robustness' if has_robustness else 'sft'
 
     # Check if config has known issue
     known_issue_config_list = config_override.get('known_issue') or []

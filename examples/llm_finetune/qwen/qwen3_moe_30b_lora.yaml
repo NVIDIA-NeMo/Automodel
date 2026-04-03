@@ -100,6 +100,7 @@ optimizer:
   eps: 1e-8
 
 ci:
+  time: "00:15:00"
   nodes: 2
   checkpoint_robustness:
     hf_kl_threshold: 7e-2

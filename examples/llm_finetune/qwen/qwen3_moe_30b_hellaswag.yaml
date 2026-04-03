@@ -88,6 +88,7 @@ optimizer:
   eps: 1e-8
 
 ci:
+  time: "00:15:00"
   checkpoint_robustness:
     hf_kl_threshold: 1e-4
     tokenizer_name: Qwen/Qwen3-30B-A3B
