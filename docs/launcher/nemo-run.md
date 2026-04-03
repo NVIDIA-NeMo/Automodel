@@ -96,43 +96,41 @@ EXECUTOR_MAP = {
 
 ## Quickstart
 
-Add a `nemo_run:` section to any existing config YAML, then run the same `automodel` command you already know:
+Any existing AutoModel YAML config can be run via NeMo-Run by adding a `nemo_run:` section at the top. For example, given an existing config that you run locally:
 
 ```bash
-automodel your_config_with_nemo_run.yaml
+automodel examples/llm_finetune/qwen/qwen3_moe_30b_te_packed_sequence.yaml
+```
+
+Add a `nemo_run:` block to submit it to a remote executor instead:
+
+```yaml
+# -- Add this section to any existing config ----------------------------------
+nemo_run:
+  executor: my_slurm             # Name from EXECUTOR_MAP in $NEMORUN_HOME/executors.py
+  container_image: /images/custom.sqsh  # Override executor's default image
+  nodes: 1                       # Override number of nodes
+  devices: 8                     # GPUs per node
+  time: "04:00:00"               # Override time limit
+  job_name: qwen3_moe_finetune   # Experiment and job name
+
+# -- Everything below is your existing training config (unchanged) ------------
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 32
+  # ... rest of your config ...
+```
+
+Then run the same command:
+
+```bash
+automodel your_config.yaml
 ```
 
 The CLI detects the `nemo_run:` key, strips it from the training config, loads the named executor from `$NEMORUN_HOME/executors.py`, and submits the job -- all in one command.
 
 ## Configuration Reference
-
-Below is an annotated example. A ready-to-run copy lives at [`examples/llm_finetune/qwen/qwen3_moe_30b_te_packed_sequence_nemorun.yaml`](../../examples/llm_finetune/qwen/qwen3_moe_30b_te_packed_sequence_nemorun.yaml).
-
-```yaml
-# -- NeMo-Run launcher section ------------------------------------------------
-# Removed before the training config reaches the remote node.
-nemo_run:
-  executor: my_slurm             # Name from EXECUTOR_MAP in $NEMORUN_HOME/executors.py
-  container_image: /images/custom.sqsh  # Override executor's default image
-  nodes: 2                       # Override number of nodes
-  devices: 8                     # GPUs per node
-  time: "04:00:00"               # Override time limit
-  job_name: llama_finetune       # Experiment and job name
-
-# -- Training config (forwarded to the remote node unchanged) ------------------
-recipe: TrainFinetuneRecipeForNextTokenPrediction
-
-step_scheduler:
-  global_batch_size: 64
-  local_batch_size: 8
-  num_epochs: 1
-
-model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
-
-# ... rest of your training config ...
-```
 
 ### All `nemo_run:` Fields
 
