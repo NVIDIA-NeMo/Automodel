@@ -113,8 +113,7 @@ class LengthGroupedSampler(Sampler[int]):
             min_count = count.item()
             if min_count < len(self.sorted_indices):
                 logger.info(
-                    "LengthGroupedSampler: truncating from %d to %d samples "
-                    "to align across ranks.",
+                    "LengthGroupedSampler: truncating from %d to %d samples to align across ranks.",
                     len(self.sorted_indices),
                     min_count,
                 )
@@ -152,7 +151,10 @@ class LengthGroupedSampler(Sampler[int]):
                 elapsed = time.monotonic() - t0
                 logger.info(
                     "  %d/%d samples (%.1fs, %.0f samples/s)",
-                    i + 1, n, elapsed, (i + 1) / max(elapsed, 1e-6),
+                    i + 1,
+                    n,
+                    elapsed,
+                    (i + 1) / max(elapsed, 1e-6),
                 )
 
         logger.info("Length computation done in %.1fs", time.monotonic() - t0)

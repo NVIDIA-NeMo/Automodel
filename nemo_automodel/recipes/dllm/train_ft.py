@@ -280,7 +280,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         """
         # Pre-corrupt all microbatches so we can count noise tokens globally
         # before any forward pass.
-        num_noise_tokens = 0   # diffusion loss denominator (corrupted positions)
+        num_noise_tokens = 0  # diffusion loss denominator (corrupted positions)
         num_supervised_tokens = 0  # total supervised tokens (all loss_mask==1 positions)
 
         for batch in batches:
@@ -435,9 +435,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
 
                 # Count tokens for this batch (all-reduce across DP for this batch)
                 num_noise = self._dp_allreduce(torch.tensor(noise_mask.sum().item(), dtype=torch.long)).item()  # noqa: F841
-                num_supervised = self._dp_allreduce(
-                    torch.tensor(loss_mask.sum().item(), dtype=torch.long)
-                ).item()
+                num_supervised = self._dp_allreduce(torch.tensor(loss_mask.sum().item(), dtype=torch.long)).item()
 
                 loss_buffer = []
                 self._forward_backward_step(
