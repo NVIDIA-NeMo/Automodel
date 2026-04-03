@@ -56,10 +56,9 @@ def _infer_vocab_size(model_cfg):
     elif isinstance(config_target, str) and "AutoConfig" not in config_target:
         import importlib
 
-        module_path, _ = config_target.rsplit(".", 1)
-        parts = module_path.rsplit(".", 1)
-        mod = importlib.import_module(parts[0])
-        config_cls = getattr(mod, parts[1])
+        module_path, class_name = config_target.rsplit(".", 1)
+        mod = importlib.import_module(module_path)
+        config_cls = getattr(mod, class_name)
         model_config = config_cls.from_pretrained(config_section.pretrained_model_name_or_path)
 
     if model_config is None:
