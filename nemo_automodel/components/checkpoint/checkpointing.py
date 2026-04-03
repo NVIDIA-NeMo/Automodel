@@ -520,6 +520,17 @@ class Checkpointer:
             and getattr(model.config, "n_routed_experts", None)  # is Nemotron V3
             and hasattr(model, "backbone")  # is HF remote code
         )
+        # HF's _init_weights calls init.zeros_(weight[padding_idx]) on
+        # nn.Embedding layers.  When the weight is a DTensor (TP-sharded),
+        # the integer index triggers a redistribute that fails.  Temporarily
+        # clear padding_idx so the zeroing is skipped, then restore it and
+        # zero the row via local-tensor ops instead.
+        has_padding_idx = any(
+            isinstance(mod, nn.Embedding)
+            and type(mod.weight).__name__ == "DTensor"
+            and getattr(mod, "padding_idx", None) is not None
+            for mod in model.modules()
+        )
         skip_initialize_weights = (
             model_class
             in [
@@ -528,37 +539,20 @@ class Checkpointer:
             ]
             or is_nemotron_v2
             or is_nemotron_v3_hf
+            or has_padding_idx
         )
         if not skip_initialize_weights:
             for _, module in model.named_modules():
                 if hasattr(module, "_is_hf_initialized"):
                     module._is_hf_initialized = False
 
-            # HF's _init_weights calls init.zeros_(weight[padding_idx]) on
-            # nn.Embedding layers.  When the weight is a DTensor (TP-sharded),
-            # the integer index triggers a redistribute that fails.  Temporarily
-            # clear padding_idx so the zeroing is skipped, then restore it and
-            # zero the row via local-tensor ops instead.
-            saved_padding_idx: dict[nn.Embedding, int] = {}
-            for mod in model.modules():
-                if (
-                    isinstance(mod, nn.Embedding)
-                    and getattr(mod, "padding_idx", None) is not None
-                    and type(getattr(mod, "weight", None)).__name__ == "DTensor"
-                ):
-                    saved_padding_idx[mod] = mod.padding_idx
-                    mod.padding_idx = None
-
             if hasattr(model, "initialize_weights"):
                 model.initialize_weights()
             else:
                 logging.warning(
                     "Warning: Model does not have initialize_weights method."
-                    "Custom initialization is required to be implemented."
+                    " Requires custom initialization to be implemented."
                 )
-
-            for mod, idx in saved_padding_idx.items():
-                mod.padding_idx = idx
 
         if peft_init_method is not None:
             _init_peft_adapters(model, peft_init_method)
@@ -1394,6 +1388,50 @@ def _equally_divide_layers(num_shards: int, keys: list[str]) -> dict[str, int]:
 def _model_has_dtensors(module: nn.Module) -> bool:
     """True if any parameter is a DTensor (model is already sharded)."""
     return any(type(p).__name__ == "DTensor" for p in module.parameters())
+
+
+def _zero_dtensor_embedding_padding_row(embedding: nn.Embedding) -> None:
+    """Zero the ``padding_idx`` row of a TP-sharded embedding weight via local tensor ops.
+
+    When the weight is a DTensor sharded along dim 0 (vocab-parallel), only the
+    rank whose local shard contains the ``padding_idx`` row performs the zeroing.
+    For replicated weights or weights sharded on other dims, every rank zeros
+    the row in its local tensor.
+    """
+    padding_idx = embedding.padding_idx
+    weight = embedding.weight
+    if padding_idx is None:
+        return
+    if type(weight).__name__ != "DTensor":
+        return
+
+    local = weight._local_tensor
+    spec = weight._spec
+
+    for mesh_dim, placement in enumerate(spec.placements):
+        if placement.is_shard() and placement.dim == 0:
+            mesh = spec.mesh
+            tp_size = mesh.size(mesh_dim)
+            rank = mesh.get_local_rank(mesh_dim)
+            vocab_size = weight.shape[0]
+
+            chunk = vocab_size // tp_size
+            rem = vocab_size % tp_size
+            if rank < rem:
+                local_off = rank * (chunk + 1)
+                local_size = chunk + 1
+            else:
+                local_off = rem * (chunk + 1) + (rank - rem) * chunk
+                local_size = chunk
+
+            local_idx = padding_idx - local_off
+            if 0 <= local_idx < local_size:
+                with torch.no_grad():
+                    local[local_idx].zero_()
+            return
+
+    with torch.no_grad():
+        local[padding_idx].zero_()
 
 
 def _is_custom_model(module: nn.Module) -> bool:
