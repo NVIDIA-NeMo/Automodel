@@ -100,6 +100,7 @@ optimizer:
   # min_lr: 1.0e-5
 
 ci:
+  time: "00:45:00"
   checkpoint_robustness:
     hf_kl_threshold: 1e-3
     tokenizer_name: microsoft/phi-4

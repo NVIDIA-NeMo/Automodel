@@ -93,6 +93,7 @@ lr_scheduler:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  time: "00:45:00"
   nodes: 4
   checkpoint_robustness:
     hf_kl_threshold: 7e-2

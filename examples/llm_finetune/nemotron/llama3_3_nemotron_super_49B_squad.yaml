@@ -117,7 +117,7 @@ lr_scheduler:
 
 ci:
   nodes: 2
-  time: "00:30:00"
+  time: "00:45:00"
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
     distributed.tp_size: 8

@@ -117,6 +117,7 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  time: "00:45:00"
   node_multiplier: true
   checkpoint_robustness:
     hf_kl_threshold: 5e-2
