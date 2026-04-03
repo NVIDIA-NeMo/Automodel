@@ -222,6 +222,7 @@ def test_checkpoint_robustness():
         print(f"[Phantom keys] Scanned {len(sf_files)} files, no _blocks/_scales keys ✓")
 
     cfg = parse_args_and_load_config()
+    cfg.model.trust_remote_code = False
     if not is_peft:
         cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
         cfg.checkpoint.enabled = False
