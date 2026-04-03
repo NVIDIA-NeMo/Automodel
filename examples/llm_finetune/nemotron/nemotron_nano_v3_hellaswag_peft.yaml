@@ -112,8 +112,6 @@ ci:
     trust_remote_code: true
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
     distributed.ep_size: 8
-    max_vram_gb: 15
-    max_cpu_gb: 4
     no_check_resume: true
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500

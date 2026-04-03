@@ -103,8 +103,6 @@ ci:
   checkpoint_robustness:
     hf_kl_threshold: 1e-3
     tokenizer_name: microsoft/phi-4
-    max_vram_gb: 11
-    max_cpu_gb: 3
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
 

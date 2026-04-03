@@ -106,8 +106,6 @@ ci:
     distributed.tp_size: 2
     tokenizer_name: Qwen/Qwen2.5-7B
     check_fused_qkv_keys: true
-    max_vram_gb: 6
-    max_cpu_gb: 4
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
 

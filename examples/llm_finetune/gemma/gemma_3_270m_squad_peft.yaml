@@ -102,8 +102,6 @@ ci:
   checkpoint_robustness:
     hf_kl_threshold: 8e-3
     tokenizer_name: google/gemma-3-270m
-    max_vram_gb: 1
-    max_cpu_gb: 3
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
 

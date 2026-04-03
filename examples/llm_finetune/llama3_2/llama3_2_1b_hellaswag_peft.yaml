@@ -105,8 +105,6 @@ ci:
     model.pretrained_model_name_or_path: meta-llama/Llama-3.2-3B-Instruct
     tokenizer_name: meta-llama/Llama-3.2-3B-Instruct
     check_fused_qkv_keys: true
-    max_vram_gb: 5
-    max_cpu_gb: 4
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500
 

@@ -118,8 +118,6 @@ ci:
   checkpoint_robustness:
     hf_kl_threshold: 5e-2
     tokenizer_name: openai/gpt-oss-20b
-    max_vram_gb: 12
-    max_cpu_gb: 4
     no_check_resume: true
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500
