@@ -25,6 +25,18 @@ from transformers.tokenization_utils_base import BatchEncoding
 logger = logging.getLogger(__name__)
 
 
+def _ensure_pad_token_id(tokenizer, model_name: str) -> None:
+    """Default pad_token_id to 0 when the tokenizer does not define one."""
+    if getattr(tokenizer, "pad_token_id", None) is None:
+        tokenizer.pad_token_id = 0
+        logger.warning(
+            "Tokenizer '%s' has pad_token_id=None; defaulting to 0. "
+            "This can cause incorrect MoE auxiliary loss calculations if valid tokens "
+            "share token ID 0. Set pad_token_id explicitly in your tokenizer config to avoid this.",
+            model_name,
+        )
+
+
 _PRESERVED_SPECIAL_TOKEN_KEYS = frozenset(
     {
         "add_bos_token",
@@ -352,6 +364,8 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
         tokenizer._base_class = base_tokenizer_cls
         tokenizer._original_tokenizer_config = _read_tokenizer_config(pretrained_model_name_or_path, **kwargs)
         tokenizer._original_tokenizer_class = (tokenizer._original_tokenizer_config or {}).get("tokenizer_class")
+
+        _ensure_pad_token_id(tokenizer, pretrained_model_name_or_path)
 
         tokenizer._source_dir = _resolve_source_dir(pretrained_model_name_or_path, **kwargs)
 

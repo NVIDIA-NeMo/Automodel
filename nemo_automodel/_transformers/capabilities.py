@@ -178,6 +178,7 @@ class ModelSupports:
         | Model kind       | Attention      | CP?     |
         +------------------+----------------+---------+
         | Custom           | TE             | Yes     |
+        | Custom hybrid    | TE / SDPA      | Yes     |
         | Custom           | FlexAttention  | No      |
         | HF (pure attn)   | SDPA           | Yes     |
         | HF (pure attn)   | no SDPA        | No      |
@@ -185,6 +186,9 @@ class ModelSupports:
         +------------------+----------------+---------+
         """
         if _has_backend(self._model):
+            if _is_hybrid(self._model):
+                backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
+                return backend_attn in ("te", "sdpa")
             return _uses_te_attention(self._model)
         if _is_hybrid(self._model):
             return False
@@ -293,7 +297,16 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
         )
 
     if cp_size > 1 and not supports.supports_cp:
-        if _is_hybrid(model):
+        if _is_hybrid(model) and _has_backend(model):
+            errors.append(
+                f"Context parallelism (cp_size={cp_size}) for hybrid model {arch} "
+                f"requires the TE or SDPA attention backend (backend.attn='te' or 'sdpa').\n"
+                f"Please switch attention backend:\n"
+                f"model:\n"
+                f"  backend:\n"
+                f"    attn: te  # or sdpa"
+            )
+        elif _is_hybrid(model):
             errors.append(
                 f"Context parallelism (cp_size={cp_size}) is not supported for "
                 f"hybrid model {arch} (contains Mamba/SSM layers).\n"
