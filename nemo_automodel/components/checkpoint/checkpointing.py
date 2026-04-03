@@ -1390,50 +1390,6 @@ def _model_has_dtensors(module: nn.Module) -> bool:
     return any(type(p).__name__ == "DTensor" for p in module.parameters())
 
 
-def _zero_dtensor_embedding_padding_row(embedding: nn.Embedding) -> None:
-    """Zero the ``padding_idx`` row of a TP-sharded embedding weight via local tensor ops.
-
-    When the weight is a DTensor sharded along dim 0 (vocab-parallel), only the
-    rank whose local shard contains the ``padding_idx`` row performs the zeroing.
-    For replicated weights or weights sharded on other dims, every rank zeros
-    the row in its local tensor.
-    """
-    padding_idx = embedding.padding_idx
-    weight = embedding.weight
-    if padding_idx is None:
-        return
-    if type(weight).__name__ != "DTensor":
-        return
-
-    local = weight._local_tensor
-    spec = weight._spec
-
-    for mesh_dim, placement in enumerate(spec.placements):
-        if placement.is_shard() and placement.dim == 0:
-            mesh = spec.mesh
-            tp_size = mesh.size(mesh_dim)
-            rank = mesh.get_local_rank(mesh_dim)
-            vocab_size = weight.shape[0]
-
-            chunk = vocab_size // tp_size
-            rem = vocab_size % tp_size
-            if rank < rem:
-                local_off = rank * (chunk + 1)
-                local_size = chunk + 1
-            else:
-                local_off = rem * (chunk + 1) + (rank - rem) * chunk
-                local_size = chunk
-
-            local_idx = padding_idx - local_off
-            if 0 <= local_idx < local_size:
-                with torch.no_grad():
-                    local[local_idx].zero_()
-            return
-
-    with torch.no_grad():
-        local[padding_idx].zero_()
-
-
 def _is_custom_model(module: nn.Module) -> bool:
     """True if the model has a custom implementation in nemo_automodel/components/models/.
 
