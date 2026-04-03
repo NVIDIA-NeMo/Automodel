@@ -1296,7 +1296,9 @@ def _build_moe_layer_pattern(config, layers):
     moe_layer_freq = getattr(config, "moe_layer_freq", 1)
     if isinstance(moe_layer_freq, list):
         return moe_layer_freq
-    return [0] * first_k_dense + [1] * (layers - first_k_dense)
+    return [0] * first_k_dense + [
+        1 if ((i - first_k_dense) % moe_layer_freq == 0) else 0 for i in range(first_k_dense, layers)
+    ]
 
 
 def mla_moe_flops(config, gbs=1, seq_len=None):
