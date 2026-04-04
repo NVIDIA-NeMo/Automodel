@@ -973,7 +973,13 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                     input_ids = input_ids[:ml]
                     labels = labels[:ml]
                     result = {
-                        k: v[:, :ml] if isinstance(v, torch.Tensor) and v.dim() == 2 and v.shape[1] == seq_len else v
+                        k: (
+                            v[:, :ml]
+                            if isinstance(v, torch.Tensor) and v.dim() == 2 and v.shape[1] == seq_len
+                            else v[:ml]
+                            if isinstance(v, torch.Tensor) and v.dim() == 1 and v.shape[0] == seq_len
+                            else v
+                        )
                         for k, v in result.items()
                     }
                     seq_len = ml
