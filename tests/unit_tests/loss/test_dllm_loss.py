@@ -16,7 +16,6 @@
 
 import pytest
 import torch
-
 import torch.nn.functional as F
 
 from nemo_automodel.components.loss.dllm_loss import (
@@ -83,11 +82,56 @@ class TestMDLMCrossEntropyLoss:
         logits, target_ids, noise_mask, p_mask, loss_mask = dummy_inputs
         loss_fn = MDLMCrossEntropyLoss()
         result_unnorm = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask)
-        result_norm = loss_fn(
-            logits, target_ids, noise_mask, p_mask, loss_mask, num_diffusion_tokens=10
-        )
+        result_norm = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask, num_diffusion_tokens=10)
         # Normalized loss should be unnormalized / 10
         assert torch.allclose(result_norm.total_loss, result_unnorm.total_loss / 10, atol=1e-5)
+
+    def test_numerical_correctness_against_reference(self):
+        """Verify loss matches hand-computed reference: sum(CE * mask * 1/p_mask) / N.
+
+        Reference formula (from dllm/core/trainers/mdlm.py):
+            loss = sum_{i in masked} CE_i * (1/t) / sum(maskable)
+        where t = p_mask (the corruption probability).
+        """
+        torch.manual_seed(123)
+        B_test, L_test, V_test = 2, 4, 8
+        logits = torch.randn(B_test, L_test, V_test)
+        target_ids = torch.randint(0, V_test, (B_test, L_test))
+        loss_mask = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]])
+        noise_mask = torch.tensor([[True, False, True, False], [False, True, False, False]])
+        p_mask = torch.tensor([[0.4, 0.4, 0.4, 0.4], [0.6, 0.6, 0.6, 0.6]])
+
+        # Hand-compute reference
+        ce = F.cross_entropy(logits.reshape(-1, V_test), target_ids.reshape(-1), reduction="none").reshape(
+            B_test, L_test
+        )
+        mask = noise_mask & loss_mask.bool()
+        weighted = ce * mask.float() * (1.0 / p_mask)
+        num_supervised = loss_mask.sum().item()
+        expected = weighted.sum() / num_supervised
+
+        loss_fn = MDLMCrossEntropyLoss()
+        result = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask, num_diffusion_tokens=int(num_supervised))
+        assert torch.allclose(result.total_loss, expected, atol=1e-5)
+
+    def test_loss_only_at_corrupted_supervised_positions(self):
+        """Loss should be zero for positions that are corrupted but NOT supervised,
+        and for positions that are supervised but NOT corrupted."""
+        torch.manual_seed(99)
+        logits = torch.randn(1, 6, 16)
+        target_ids = torch.randint(0, 16, (1, 6))
+        # Only position 2 is both corrupted AND supervised
+        loss_mask = torch.tensor([[1, 1, 1, 0, 0, 0]])
+        noise_mask = torch.tensor([[False, False, True, True, False, False]])
+        p_mask = torch.full((1, 6), 0.5)
+
+        loss_fn = MDLMCrossEntropyLoss()
+        result = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask)
+
+        # Compute expected: only position 2 contributes
+        ce = F.cross_entropy(logits.reshape(-1, 16), target_ids.reshape(-1), reduction="none").reshape(1, 6)
+        expected = ce[0, 2] * (1.0 / 0.5)
+        assert torch.allclose(result.total_loss, expected, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -102,9 +146,7 @@ class TestComputePerTokenNLL:
         logits = torch.randn(2, 8, 32)
         targets = torch.randint(0, 32, (2, 8))
         nll = _compute_per_token_nll(logits, targets)
-        ref = F.cross_entropy(
-            logits.reshape(-1, 32), targets.reshape(-1), reduction="none"
-        ).reshape(2, 8)
+        ref = F.cross_entropy(logits.reshape(-1, 32), targets.reshape(-1), reduction="none").reshape(2, 8)
         assert torch.allclose(nll, ref)
 
     def test_output_shape(self):

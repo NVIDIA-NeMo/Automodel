@@ -28,6 +28,7 @@ from nemo_automodel._transformers.auto_model import (
     _get_next_fallback_attn,
     _init_model,
     _patch_attention,
+    _patch_remote_code_compat,
 )
 from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
 from nemo_automodel._transformers.model_init import (
@@ -1186,3 +1187,151 @@ class TestNoHfMetaDevice:
                 assert _get_hf_meta_device_disabled()
             assert _get_hf_meta_device_disabled()
         assert not _get_hf_meta_device_disabled()
+
+
+# =============================================================================
+# Tests for _patch_remote_code_compat
+# =============================================================================
+
+
+class TestPatchRemoteCodeCompat:
+    """Tests for the remote-code compatibility patch."""
+
+    @pytest.fixture(autouse=True)
+    def reset_patch_state(self):
+        """Reset the global patch state and restore original _finalize_model_loading."""
+        from transformers import PreTrainedModel
+
+        import nemo_automodel._transformers.auto_model as mod
+
+        orig_finalize = PreTrainedModel._finalize_model_loading
+        orig_flag = mod._remote_code_compat_applied
+        mod._remote_code_compat_applied = False
+        yield
+        PreTrainedModel._finalize_model_loading = orig_finalize
+        mod._remote_code_compat_applied = orig_flag
+
+    def test_patch_is_idempotent(self):
+        """Calling _patch_remote_code_compat twice should not double-wrap."""
+        from transformers import PreTrainedModel
+
+        _patch_remote_code_compat()
+        first = PreTrainedModel._finalize_model_loading
+        _patch_remote_code_compat()
+        second = PreTrainedModel._finalize_model_loading
+        assert first is second
+
+    def test_sets_all_tied_weights_keys(self):
+        """Patch should set all_tied_weights_keys if missing."""
+        from transformers import PreTrainedModel
+
+        _patch_remote_code_compat()
+
+        # Create a mock model missing the attribute
+        model = MagicMock(spec=[])
+        model.get_expanded_tied_weights_keys = MagicMock(return_value=["some.key"])
+        model.config = MagicMock()
+        model.config.use_cache = False
+
+        # The model class uses base tie_weights (no wrapping needed)
+        model_cls = type(model)
+        model_cls.tie_weights = PreTrainedModel.tie_weights
+
+        load_config = MagicMock()
+        loading_info = MagicMock()
+
+        # The patched finalize will call _orig_finalize which may fail on mock,
+        # but we can check the attribute was set before that point
+        try:
+            PreTrainedModel._finalize_model_loading(model, load_config, loading_info)
+        except Exception:
+            pass
+
+        assert hasattr(model, "all_tied_weights_keys")
+
+    def test_wraps_old_tie_weights_signature(self):
+        """Patch should wrap tie_weights that lacks `missing_keys` param."""
+        from transformers import PreTrainedModel
+
+        _patch_remote_code_compat()
+
+        # Create a real class with an old-style tie_weights (no missing_keys param)
+        class OldModel(PreTrainedModel):
+            config_class = type("DummyConfig", (), {"model_type": "dummy"})
+
+            def __init__(self):
+                # Skip PreTrainedModel.__init__ — we just need the class hierarchy
+                pass
+
+            def tie_weights(self):
+                self.tied = True
+
+        # Simulate what _compat_finalize does: inspect type(model) and wrap tie_weights
+        model = object.__new__(OldModel)
+        model.all_tied_weights_keys = []
+        model.config = types.SimpleNamespace(use_cache=False)
+        model.get_expanded_tied_weights_keys = lambda all_submodels=True: []
+
+        load_config = MagicMock()
+        loading_info = MagicMock()
+
+        try:
+            PreTrainedModel._finalize_model_loading(model, load_config, loading_info)
+        except Exception:
+            pass
+
+        # The wrapper should now accept missing_keys without TypeError
+        try:
+            OldModel.tie_weights(model, missing_keys=["foo"])
+        except TypeError:
+            pytest.fail("Wrapped tie_weights should accept missing_keys kwarg")
+
+    def test_sets_missing_config_defaults(self):
+        """Patch should set use_cache=False if missing from config."""
+        from transformers import PreTrainedModel
+
+        _patch_remote_code_compat()
+
+        model = MagicMock(spec=[])
+        model.get_expanded_tied_weights_keys = MagicMock(return_value=[])
+        model.config = types.SimpleNamespace()  # no use_cache attribute
+
+        model_cls = type(model)
+        model_cls.tie_weights = PreTrainedModel.tie_weights
+
+        load_config = MagicMock()
+        loading_info = MagicMock()
+
+        try:
+            PreTrainedModel._finalize_model_loading(model, load_config, loading_info)
+        except Exception:
+            pass
+
+        assert hasattr(model.config, "use_cache")
+        assert model.config.use_cache is False
+
+    def test_compatible_model_unaffected(self):
+        """A model that already has all required attributes should pass through unchanged."""
+        from transformers import PreTrainedModel
+
+        _patch_remote_code_compat()
+
+        model = MagicMock(spec=[])
+        model.all_tied_weights_keys = ["existing.key"]
+        model.config = MagicMock()
+        model.config.use_cache = True  # already set
+
+        model_cls = type(model)
+        model_cls.tie_weights = PreTrainedModel.tie_weights
+
+        load_config = MagicMock()
+        loading_info = MagicMock()
+
+        try:
+            PreTrainedModel._finalize_model_loading(model, load_config, loading_info)
+        except Exception:
+            pass
+
+        # Existing values should be preserved
+        assert model.all_tied_weights_keys == ["existing.key"]
+        assert model.config.use_cache is True

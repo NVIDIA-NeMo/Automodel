@@ -59,15 +59,12 @@ class DLLMLossOutput(NamedTuple):
 class MDLMCrossEntropyLoss(nn.Module):
     """Cross-entropy loss for MDLM training.
 
-    Computes loss only at positions where ``noise_mask=True``, weighted by
-    ``1/p_mask`` (inverse corruption probability). Loss is normalized by
-    answer length to keep it scale-invariant w.r.t. corruption ratio.
+    Matches the reference dllm framework (``dllm/core/trainers/mdlm.py``):
 
-    Loss computation::
+    .. math::
+        \\text{loss} = \\frac{\\sum_{i \\in \\text{masked}} \\text{CE}_i \\cdot w(t)}{\\sum \\text{maskable}}
 
-        logprobs = log_softmax(logits).gather(target_ids)
-        logprobs_normalized = logprobs / answer_length
-        loss = -sum(logprobs_normalized[noise_mask] / p_mask[noise_mask]) / num_valid_seqs
+    where :math:`w(t) = 1/t` for the ``scheduler`` weight type (linear schedule).
     """
 
     def __init__(self, fp32_upcast: bool = True):
@@ -103,16 +100,13 @@ class MDLMCrossEntropyLoss(nn.Module):
         # Effective mask: corrupted AND supervised positions
         mask = noise_mask & loss_mask.bool()  # [B, L]
 
-        # Normalize by answer length per sequence
-        answer_lengths = loss_mask.sum(dim=-1, keepdim=True).clamp(min=1)  # [B, 1]
-        token_nll_norm = token_nll / answer_lengths
-
-        # Weighted loss: divide by corruption probability at masked positions
+        # Weight by 1/p_mask (= scheduler weight 1/t for linear schedule)
         p_mask_safe = p_mask.clamp(min=1e-8)
-        token_loss = token_nll_norm[mask] / p_mask_safe[mask]
+        weighted_nll = token_nll * mask.float() * (1.0 / p_mask_safe)
 
-        loss = token_loss.sum()
+        loss = weighted_nll.sum()
 
+        # Normalize by total supervised tokens
         if num_diffusion_tokens is not None:
             loss = loss / max(num_diffusion_tokens, 1)
 

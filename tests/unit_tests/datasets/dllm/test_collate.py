@@ -14,9 +14,6 @@
 
 """Tests for DLLMCollator (two-stage block-aligned padding)."""
 
-import pytest
-import torch
-
 from nemo_automodel.components.datasets.dllm.collate import DLLMCollator
 
 
@@ -103,7 +100,6 @@ class TestDLLMCollatorBlockAlign:
         collator = DLLMCollator(block_size=8, pad_token_id=0)
         batch = [_make_sample(5), _make_sample(14)]
         out = collator(batch)
-        L = out["input_ids"].shape[1]
         # For the short sample (len=5, block-aligned=8), positions 8+ are global padding
         assert (out["loss_mask"][0, 8:] == 0).all()
 
@@ -165,3 +161,57 @@ class TestDLLMCollatorMaxSeqLen:
         out = collator(batch)
         # Only first 10 tokens should be copied
         assert out["input_ids"][0, :10].tolist() == list(range(1, 11))
+
+
+# ---------------------------------------------------------------------------
+# supervise_padding
+# ---------------------------------------------------------------------------
+
+
+class TestDLLMCollatorSupervisePadding:
+    def test_global_padding_loss_mask_zero_by_default(self):
+        """Default: global padding has loss_mask=0."""
+        collator = DLLMCollator(pad_token_id=0)
+        batch = [_make_sample(5), _make_sample(10)]
+        out = collator(batch)
+        # Short sample: positions beyond content are global padding
+        assert (out["loss_mask"][0, 5:] == 0).all()
+
+    def test_global_padding_loss_mask_one_when_enabled(self):
+        """With supervise_padding=True, global padding has loss_mask=1."""
+        collator = DLLMCollator(pad_token_id=0, supervise_padding=True)
+        batch = [_make_sample(5), _make_sample(10)]
+        out = collator(batch)
+        # Short sample: global padding positions should now be 1
+        assert (out["loss_mask"][0, 5:] == 1).all()
+
+    def test_content_loss_mask_unaffected(self):
+        """supervise_padding should not change loss_mask for content positions."""
+        collator_off = DLLMCollator(pad_token_id=0, supervise_padding=False)
+        collator_on = DLLMCollator(pad_token_id=0, supervise_padding=True)
+        batch = [_make_sample(8)]
+        out_off = collator_off(batch)
+        out_on = collator_on(batch)
+        # Content region should be identical
+        assert (out_off["loss_mask"][0, :8] == out_on["loss_mask"][0, :8]).all()
+
+    def test_with_block_padding(self):
+        """Block padding always has loss_mask=1; supervise_padding only affects global padding."""
+        collator = DLLMCollator(block_size=8, eos_token_id=2, pad_token_id=0, supervise_padding=True)
+        batch = [_make_sample(5), _make_sample(14)]
+        out = collator(batch)
+        L = out["input_ids"].shape[1]
+        # For short sample (len=5, block-aligned=8):
+        # block padding (5-7): loss_mask=1 (always)
+        assert (out["loss_mask"][0, 5:8] == 1).all()
+        # global padding (8+): loss_mask=1 (because supervise_padding=True)
+        if L > 8:
+            assert (out["loss_mask"][0, 8:] == 1).all()
+
+    def test_no_padding_no_difference(self):
+        """When all samples are the same length, supervise_padding has no effect."""
+        collator = DLLMCollator(pad_token_id=0, supervise_padding=True)
+        batch = [_make_sample(10), _make_sample(10)]
+        out = collator(batch)
+        # No padding needed, all positions are content with loss_mask=1
+        assert (out["loss_mask"] == 1).all()
