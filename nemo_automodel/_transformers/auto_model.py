@@ -25,6 +25,7 @@ Heavy-lifting helpers live in sibling modules:
 """
 
 import gc
+import inspect
 import logging
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, List, Optional, Union
@@ -107,6 +108,58 @@ logger = logging.getLogger(__name__)
 
 _MAX_BUILD_RETRIES = 5
 
+_remote_code_compat_applied = False
+
+
+def _patch_remote_code_compat():
+    """Patch ``_finalize_model_loading`` for remote-code models written against older transformers.
+
+    Remote-code models (``trust_remote_code=True``) may be incompatible with
+    the installed transformers in several ways:
+
+    1. Missing ``all_tied_weights_keys`` -- set in ``post_init()`` which the
+       model may never call.
+    2. Overridden ``tie_weights()`` with an old signature that doesn't accept
+       the ``missing_keys`` kwarg added in newer transformers.
+
+    This one-time patch wraps ``_finalize_model_loading`` to fix these issues
+    on the fly.  For models that are already compatible the guards are no-ops.
+    """
+    global _remote_code_compat_applied
+    if _remote_code_compat_applied:
+        return
+    _orig_finalize = PreTrainedModel._finalize_model_loading
+
+    def _compat_finalize(model, load_config, loading_info):
+        # 1. Ensure all_tied_weights_keys exists
+        if not hasattr(model, "all_tied_weights_keys"):
+            model.all_tied_weights_keys = model.get_expanded_tied_weights_keys(all_submodels=True)
+
+        # 2. Wrap tie_weights if it doesn't accept `missing_keys`
+        model_cls = type(model)
+        if model_cls.tie_weights is not PreTrainedModel.tie_weights:
+            sig = inspect.signature(model_cls.tie_weights)
+            has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if "missing_keys" not in sig.parameters and not has_var_kw:
+                _orig_tie = model_cls.tie_weights
+
+                def _compat_tie(self, **kwargs):
+                    accepted = {k: v for k, v in kwargs.items() if k in sig.parameters}
+                    return _orig_tie(self, **accepted)
+
+                model_cls.tie_weights = _compat_tie
+
+        # 3. Set missing config defaults that older remote code models expect
+        _config_defaults = {"use_cache": False}
+        for attr, default in _config_defaults.items():
+            if not hasattr(model.config, attr):
+                setattr(model.config, attr, default)
+
+        return _orig_finalize(model, load_config, loading_info)
+
+    PreTrainedModel._finalize_model_loading = staticmethod(_compat_finalize)
+    _remote_code_compat_applied = True
+
 
 def _maybe_dequantize_fp8_for_peft(hf_native_quant_cfg, peft_config, pretrained_path):
     """Set ``dequantize=True`` on FP8 quantization configs when PEFT is requested.
@@ -150,6 +203,17 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             cls.__name__ = name[4:]
         try:
             model = super().from_pretrained(*args, **kwargs)
+        except (AttributeError, TypeError) as e:
+            if "all_tied_weights_keys" in str(e) or (isinstance(e, TypeError) and "tie_weights" in str(e)):
+                logger.warning(
+                    "Remote code model incompatible with installed transformers (%s). "
+                    "Applying compatibility patches and retrying.",
+                    e,
+                )
+                _patch_remote_code_compat()
+                model = super().from_pretrained(*args, **kwargs)
+            else:
+                raise
         except OSError:
             if kwargs.get("use_safetensors") is not False:
                 logger.warning(

@@ -58,6 +58,7 @@ class DLLMCollator:
         block_size: Optional[int] = None,
         pad_seq_len_divisible: Optional[int] = None,
         max_seq_len: Optional[int] = None,
+        supervise_padding: bool = False,
     ) -> None:
         self.pad_token_id = pad_token_id
         self.eos_token_id = eos_token_id
@@ -65,6 +66,7 @@ class DLLMCollator:
         self.pad_seq_len_divisible = pad_seq_len_divisible
         self.max_seq_len = max_seq_len
         self.block_pad_token_id = eos_token_id if eos_token_id is not None else pad_token_id
+        self.supervise_padding = supervise_padding
 
     def __call__(self, batch: List[Dict[str, list]]) -> Dict[str, torch.Tensor]:
         for sample in batch:
@@ -80,11 +82,12 @@ class DLLMCollator:
             pad_value=self.pad_token_id,
             block_pad_value=self.block_pad_token_id,
         )
+        loss_mask_pad_value = 1 if self.supervise_padding else 0
         loss_mask = self._pad_and_fill(
             [s["loss_mask"] for s in batch],
             content_lengths,
             target_len,
-            pad_value=0,
+            pad_value=loss_mask_pad_value,
             block_pad_value=1,
         ).float()
         attention_mask = self._pad_and_fill(
