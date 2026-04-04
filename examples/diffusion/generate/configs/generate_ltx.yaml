@@ -1,0 +1,31 @@
+model:
+  pretrained_model_name_or_path: "Lightricks/LTX-Video"
+  checkpoint: null
+
+inference:
+  num_inference_steps: 50
+  guidance_scale: 3.0
+  height: 512
+  width: 512
+  dtype: "bfloat16"
+  max_samples: 10
+  prompts:
+    - "A cat sitting on a windowsill watching the rain"
+  pipeline_kwargs:
+    num_frames: 25
+    negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted"
+    decode_timestep: 0.03
+    decode_noise_scale: 0.025
+
+output:
+  output_dir: "./inference_outputs"
+  fps: 24
+
+distributed: null
+
+vae:
+  enable_slicing: true
+  enable_tiling: true
+  enable_cpu_offload: false
+
+seed: 42

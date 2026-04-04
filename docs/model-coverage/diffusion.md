@@ -15,6 +15,7 @@ NeMo AutoModel integrates with [Hugging Face Diffusers](https://huggingface.co/d
 | Wan 2.1 T2V 1.3B | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | Text-to-Video | 1.3B | FSDP2 | [finetune](../../examples/diffusion/finetune/wan2_1_t2v_flow.yaml), [pretrain](../../examples/diffusion/pretrain/wan2_1_t2v_flow.yaml) |
 | FLUX.1-dev | `black-forest-labs/FLUX.1-dev` | Text-to-Image | 12B | FSDP2 | [finetune](../../examples/diffusion/finetune/flux_t2i_flow.yaml), [pretrain](../../examples/diffusion/pretrain/flux_t2i_flow.yaml) |
 | HunyuanVideo 1.5 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | Text-to-Video | 13B | FSDP2 | [finetune](../../examples/diffusion/finetune/hunyuan_t2v_flow.yaml) |
+| LTX-Video | `Lightricks/LTX-Video` | Text-to-Video | 2B–22B | FSDP2 | [finetune](../../examples/diffusion/finetune/ltx_t2v_flow.yaml) |
 
 ## Supported Workflows
 

@@ -1052,7 +1052,7 @@ Examples:
         "--processor",
         type=str,
         required=True,
-        choices=["wan", "wan2.1", "hunyuan", "hunyuanvideo", "hunyuanvideo-1.5"],
+        choices=["wan", "wan2.1", "hunyuan", "hunyuanvideo", "hunyuanvideo-1.5", "ltx", "ltx-video"],
     )
     video_parser.add_argument("--model_name", type=str, default=None, help="Model name (uses processor default)")
     video_parser.add_argument("--mode", type=str, default="video", choices=["video", "frames"], help="Processing mode")
