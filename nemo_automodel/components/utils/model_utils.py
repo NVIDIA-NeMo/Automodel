@@ -288,8 +288,6 @@ def apply_parameter_freezing(model, freeze_config):
 
 def cast_mixed_dtype_params_to_bf16(model):
     """Cast fp32 parameters and buffers to bf16 for FSDP2 compatibility."""
-    import torch
-
     for p in model.parameters():
         if p.dtype == torch.float32:
             p.data = p.data.to(torch.bfloat16)
@@ -364,7 +362,7 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
     """
     input_ids = input_ids.squeeze(0)
     position_ids = position_ids.squeeze(0)
-    if padding_mask is not None:
+    if isinstance(padding_mask, torch.Tensor):
         padding_mask = padding_mask.squeeze(0)
     for key, value in attn_kwargs.items():
         if isinstance(value, torch.Tensor):
