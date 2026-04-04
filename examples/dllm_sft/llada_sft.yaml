@@ -30,7 +30,7 @@ seed: 42
 
 wandb:
   project: dllm-baseline
-  name: am-llada-alpaca
+  name: am-llada-tulu3_run
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
