@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 MODEL_ARCH_MAPPING = OrderedDict(
     [
         (
+            "AfmoeForCausalLM",
+            ("nemo_automodel.components.models.afmoe.model", "AfmoeForCausalLM"),
+        ),
+        (
             "BaichuanForCausalLM",
             ("nemo_automodel.components.models.baichuan.model", "BaichuanForCausalLM"),
         ),
@@ -154,6 +158,7 @@ MODEL_ARCH_MAPPING = OrderedDict(
 # checkpoint config.json.  Registered eagerly with AutoConfig so that
 # AutoConfig.from_pretrained can resolve them without trust_remote_code.
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
+    "afmoe": ("nemo_automodel.components.models.afmoe.config", "AfmoeConfig"),
     "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
