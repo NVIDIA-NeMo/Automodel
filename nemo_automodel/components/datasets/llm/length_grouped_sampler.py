@@ -32,9 +32,10 @@ Usage::
 
 from __future__ import annotations
 
+import itertools
 import logging
 import time
-from typing import Iterator
+from typing import Any, Dict, Iterator
 
 import torch
 import torch.distributed as dist
@@ -88,6 +89,8 @@ class LengthGroupedSampler(Sampler[int]):
         self.rank = rank
         self.drop_last = drop_last
         self.epoch = 0
+        self.yielded = 0
+        self._next_yielded: int | None = None
 
         # Compute lengths
         self.lengths = self._compute_lengths(dataset)
@@ -108,7 +111,8 @@ class LengthGroupedSampler(Sampler[int]):
 
         # Cross-rank alignment
         if dist.is_initialized() and self.num_replicas > 1:
-            count = torch.tensor(len(self.sorted_indices), dtype=torch.long).cuda()
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            count = torch.tensor(len(self.sorted_indices), dtype=torch.long, device=device)
             dist.all_reduce(count, op=dist.ReduceOp.MIN)
             min_count = count.item()
             if min_count < len(self.sorted_indices):
@@ -164,7 +168,19 @@ class LengthGroupedSampler(Sampler[int]):
         """Set the epoch for deterministic per-epoch shuffling."""
         self.epoch = epoch
 
+    def state_dict(self) -> Dict[str, Any]:
+        return {"yielded": self.yielded, "epoch": self.epoch}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        self._next_yielded = state_dict["yielded"]
+        self.epoch = state_dict["epoch"]
+
     def __iter__(self) -> Iterator[int]:
+        self.yielded = 0
+        if self._next_yielded is not None:
+            self.yielded = self._next_yielded
+            self._next_yielded = None
+
         g = torch.Generator()
         g.manual_seed(self.seed + self.epoch)
 
@@ -176,7 +192,9 @@ class LengthGroupedSampler(Sampler[int]):
         for ci in chunk_perm:
             indices.extend(chunks[ci])
 
-        return iter(indices)
+        for idx in itertools.islice(indices, self.yielded, None):
+            self.yielded += 1
+            yield idx
 
     def __len__(self) -> int:
         return len(self.sorted_indices)
