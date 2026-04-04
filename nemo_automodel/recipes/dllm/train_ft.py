@@ -85,6 +85,12 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
 
         self.dllm_mode = dllm_cfg.get("mode", "mdlm")
         self.dllm_strategy = get_dllm_strategy(self.dllm_mode)
+        if self.dllm_strategy.normalization_mode not in ("supervised", "noise"):
+            raise ValueError(
+                f"Invalid normalization_mode {self.dllm_strategy.normalization_mode!r} "
+                f"from strategy {type(self.dllm_strategy).__name__}. "
+                f"Must be 'supervised' or 'noise'."
+            )
 
         self.dllm_eps = float(dllm_cfg.get("eps", 1e-3))
         self.dllm_block_size = dllm_cfg.get("block_size", None)
@@ -119,7 +125,8 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         logger.info(
             f"dLLM SFT setup: mode={self.dllm_mode}, mask_token_id={self.mask_token_id}, "
             f"eps={self.dllm_eps}, block_size={self.dllm_block_size}, "
-            f"half_life_ratio={self.dllm_half_life_ratio}"
+            f"half_life_ratio={self.dllm_half_life_ratio}, "
+            f"normalization_mode={self.dllm_strategy.normalization_mode}"
         )
 
         # --- Wrap dataloader collate to produce unshifted format ---
@@ -295,6 +302,12 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         num_noise_tokens = self._dp_allreduce(torch.tensor(num_noise_tokens, dtype=torch.long)).item()
         num_supervised_tokens = self._dp_allreduce(torch.tensor(num_supervised_tokens, dtype=torch.long)).item()
 
+        # Select denominator based on strategy (MDLM -> supervised, future models may use noise)
+        if self.dllm_strategy.normalization_mode == "noise":
+            num_diffusion_tokens = num_noise_tokens
+        else:
+            num_diffusion_tokens = num_supervised_tokens
+
         loss_buffer = []
 
         # Count total tokens excluding tail padding
@@ -312,7 +325,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 i,
                 batch,
                 loss_buffer=loss_buffer,
-                num_diffusion_tokens=num_supervised_tokens,
+                num_diffusion_tokens=num_diffusion_tokens,
                 num_batches=num_batches,
             )
 
@@ -329,7 +342,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
-            num_label_tokens=num_supervised_tokens,
+            num_label_tokens=num_diffusion_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
         )
 
@@ -421,7 +434,8 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 mp.eval()
 
             total_weighted_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
-            total_noise_tokens = 0
+            total_norm_tokens = 0
+            use_noise = self.dllm_strategy.normalization_mode == "noise"
 
             for batch in val_dataloader:
                 # Pre-corrupt this val batch (same as training path)
@@ -434,29 +448,30 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 batch["_clean_input_ids"] = input_ids.clone()
 
                 # Count tokens for this batch (all-reduce across DP for this batch)
-                num_noise = self._dp_allreduce(torch.tensor(noise_mask.sum().item(), dtype=torch.long)).item()  # noqa: F841
+                num_noise = self._dp_allreduce(torch.tensor(noise_mask.sum().item(), dtype=torch.long)).item()
                 num_supervised = self._dp_allreduce(torch.tensor(loss_mask.sum().item(), dtype=torch.long)).item()
+                num_norm = num_noise if use_noise else num_supervised
 
                 loss_buffer = []
                 self._forward_backward_step(
                     0,
                     batch,
                     loss_buffer=loss_buffer,
-                    num_diffusion_tokens=num_supervised,
+                    num_diffusion_tokens=num_norm,
                     num_batches=1,
                     is_train=False,
                 )
 
-                # Accumulate: per-token-avg loss * supervised_count
+                # Accumulate: per-token-avg loss * norm_count
                 batch_loss = torch.sum(torch.stack(loss_buffer)).item()
                 batch_loss = self._dp_allreduce(
                     torch.tensor(batch_loss, dtype=torch.float32, device=self.dist_env.device),
                     include_cp=True,
                 ).item()
-                total_weighted_loss += batch_loss * num_supervised
-                total_noise_tokens += num_supervised
+                total_weighted_loss += batch_loss * num_norm
+                total_norm_tokens += num_norm
 
-        val_loss = total_weighted_loss / max(total_noise_tokens, 1e-8)
+        val_loss = total_weighted_loss / max(total_norm_tokens, 1e-8)
         val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
 
         # Clear dLLM loss buffer from validation
@@ -468,7 +483,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             metrics={
                 "val_loss": val_loss,
                 "lr": self.optimizer[0].param_groups[0]["lr"],
-                "num_label_tokens": total_noise_tokens,
+                "num_label_tokens": total_norm_tokens,
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,
             },
         )

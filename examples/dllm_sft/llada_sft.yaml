@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+recipe: DiffusionLMSFTRecipe
 
 step_scheduler:
   global_batch_size: 32
@@ -81,7 +82,9 @@ lr_scheduler:
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
-  path_or_dataset_id: /tmp/alpaca_messages.jsonl
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  shuffle_seed: 42
   seq_length: 1024
   truncation: true
   unshifted: true

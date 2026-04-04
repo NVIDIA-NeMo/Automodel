@@ -21,6 +21,9 @@ model families:
 2. **Corruption** — how tokens are corrupted before the forward pass.
 3. **Batch preparation** — how the batch dict is shaped for the model's
    forward signature.
+4. **Normalization mode** — whether loss is normalised by the total
+   supervised token count (``"supervised"``) or by the actually-corrupted
+   token count (``"noise"``).
 
 To add a new dLLM variant (e.g., LLADA), implement a new
 :class:`DLLMStrategy` subclass and register it in :data:`DLLM_STRATEGIES`.
@@ -45,6 +48,17 @@ from nemo_automodel.components.loss.dllm_loss import (
 
 class DLLMStrategy(ABC):
     """Abstract base for dLLM model strategies."""
+
+    @property
+    def normalization_mode(self) -> str:
+        """Token count used as the loss denominator: ``"supervised"`` or ``"noise"``.
+
+        * ``"supervised"`` — total ``loss_mask == 1`` positions (default).
+        * ``"noise"`` — actually-corrupted positions (``noise_mask == True``).
+
+        Also governs gradient-norm scaling so loss and gradients stay consistent.
+        """
+        return "supervised"
 
     @abstractmethod
     def create_loss_fn(self, dllm_cfg: dict) -> nn.Module:

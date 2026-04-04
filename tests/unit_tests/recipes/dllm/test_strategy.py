@@ -27,7 +27,6 @@ from nemo_automodel.recipes.dllm.strategy import (
     get_dllm_strategy,
 )
 
-
 # ---------------------------------------------------------------------------
 # Strategy registry tests
 # ---------------------------------------------------------------------------
@@ -49,6 +48,13 @@ class TestDLLMStrategyRegistry:
         for name, cls in DLLM_STRATEGIES.items():
             assert issubclass(cls, DLLMStrategy)
 
+    def test_all_strategies_have_valid_normalization_mode(self):
+        for name, cls in DLLM_STRATEGIES.items():
+            s = cls()
+            assert s.normalization_mode in ("supervised", "noise"), (
+                f"Strategy {name} has invalid normalization_mode: {s.normalization_mode}"
+            )
+
 
 # ---------------------------------------------------------------------------
 # MDLMStrategy tests
@@ -60,6 +66,9 @@ class TestMDLMStrategy:
     def strategy(self):
         return MDLMStrategy()
 
+    def test_normalization_mode_default(self, strategy):
+        assert strategy.normalization_mode == "supervised"
+
     def test_create_loss_fn_type(self, strategy):
         loss_fn = strategy.create_loss_fn({})
         assert isinstance(loss_fn, MDLMCrossEntropyLoss)
@@ -70,8 +79,12 @@ class TestMDLMStrategy:
         input_ids = torch.randint(0, 100, (B, L))
         loss_mask = torch.ones(B, L, dtype=torch.long)
         noisy, noise_mask, p_mask = strategy.apply_corruption(
-            input_ids, loss_mask, mask_token_id=999, eps=0.001,
-            block_size=None, half_life_ratio=None,
+            input_ids,
+            loss_mask,
+            mask_token_id=999,
+            eps=0.001,
+            block_size=None,
+            half_life_ratio=None,
         )
         assert noisy.shape == (B, L)
         assert noise_mask.shape == (B, L)
@@ -84,8 +97,12 @@ class TestMDLMStrategy:
         input_ids = torch.randint(0, 100, (B, L))
         loss_mask = torch.ones(B, L, dtype=torch.long)
         _, _, p_mask = strategy.apply_corruption(
-            input_ids, loss_mask, mask_token_id=999, eps=0.001,
-            block_size=None, half_life_ratio=None,
+            input_ids,
+            loss_mask,
+            mask_token_id=999,
+            eps=0.001,
+            block_size=None,
+            half_life_ratio=None,
         )
         # Uniform corruption: p_mask is constant per sequence
         for b in range(B):
@@ -128,8 +145,12 @@ class TestLLaDAIntegration:
         loss_mask = torch.ones(B, L, dtype=torch.long)
 
         noisy, noise_mask, p_mask = strategy.apply_corruption(
-            input_ids, loss_mask, mask_token_id=self.LLADA_MASK_TOKEN_ID,
-            eps=0.001, block_size=None, half_life_ratio=None,
+            input_ids,
+            loss_mask,
+            mask_token_id=self.LLADA_MASK_TOKEN_ID,
+            eps=0.001,
+            block_size=None,
+            half_life_ratio=None,
         )
         # Corrupted positions should have LLaDA's mask token
         assert (noisy[noise_mask] == self.LLADA_MASK_TOKEN_ID).all()
@@ -183,10 +204,48 @@ class TestLLaDAIntegration:
 
         # Simulate recipe-level filtering for LLaDA
         llada_params = {
-            "input_ids", "inputs_embeds", "attention_mask", "attention_bias",
-            "past_key_values", "labels", "use_cache", "output_attentions",
-            "output_hidden_states", "return_dict", "cache_position",
+            "input_ids",
+            "inputs_embeds",
+            "attention_mask",
+            "attention_bias",
+            "past_key_values",
+            "labels",
+            "use_cache",
+            "output_attentions",
+            "output_hidden_states",
+            "return_dict",
+            "cache_position",
         }
         filtered = {k: v for k, v in result.items() if k in llada_params}
         assert "input_lengths" not in filtered
         assert "input_ids" in filtered
+
+
+# ---------------------------------------------------------------------------
+# normalization_mode override tests
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizationModeOverride:
+    """Verify that a strategy subclass can override normalization_mode."""
+
+    def test_custom_noise_mode(self):
+        class NoiseModeStrategy(DLLMStrategy):
+            @property
+            def normalization_mode(self):
+                return "noise"
+
+            def create_loss_fn(self, dllm_cfg):
+                return MDLMCrossEntropyLoss()
+
+            def apply_corruption(self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio):
+                from nemo_automodel.components.datasets.dllm.corruption import corrupt_uniform
+
+                return corrupt_uniform(input_ids, loss_mask, mask_token_id, eps=eps)
+
+            def prepare_batch(self, batch, noisy_input_ids, noise_mask, clean_input_ids):
+                batch["input_ids"] = noisy_input_ids
+                return batch
+
+        s = NoiseModeStrategy()
+        assert s.normalization_mode == "noise"
