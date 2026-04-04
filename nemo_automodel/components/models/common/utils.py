@@ -373,6 +373,9 @@ def _make_lazy_te_patcher():
         def _patched_rmsnorm_forward(self, x):
             if is_tensor_unallocated(x):
                 return torch.empty_like(x)
+            input_dtype = x.dtype
+            if input_dtype != torch.float32:
+                return _original_rmsnorm_forward(self, x.float()).to(input_dtype)
             return _original_rmsnorm_forward(self, x)
 
         def _patched_linear_forward(self, x, is_first_microbatch=None, **kwargs):
