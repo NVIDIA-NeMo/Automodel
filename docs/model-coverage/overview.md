@@ -13,7 +13,7 @@ NeMo AutoModel integrates with Hugging Face `transformers`. Any LLM or VLM that 
 
 ## Release Log
 
-The table below tracks when model support and key features were added across NeMo AutoModel releases. For the full list of tested architectures and example configs, see the [LLM](llm.md) and [VLM](vlm.md) pages.
+The table below tracks when model support and key features were added across NeMo AutoModel releases. For the full list of tested architectures and example configs, see the [LLM](llm/index.md) and [VLM](vlm/index.md) pages.
 
 | Release | Date | New Models | Key Features |
 |---------|------|------------|--------------|
