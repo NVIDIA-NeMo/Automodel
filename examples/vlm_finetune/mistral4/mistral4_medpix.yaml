@@ -15,6 +15,8 @@
 # VLM finetuning config for Mistral 4 (sinistea-small-4-119B) on MedPix
 # Replace /path/to/sinistea-small-4-119b with the path to the Mistral 4 checkpoint
 
+recipe: FinetuneRecipeForVLM
+
 step_scheduler:
   global_batch_size: 256
   local_batch_size: 4
@@ -115,3 +117,4 @@ wandb:
 
 ci:
   nodes: 4
+  time: "00:30:00"

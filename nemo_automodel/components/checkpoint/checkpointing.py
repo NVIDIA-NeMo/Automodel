@@ -521,7 +521,11 @@ class Checkpointer:
             and hasattr(model, "backbone")  # is HF remote code
         )
         skip_initialize_weights = (
-            model_class in ["Gemma3ForConditionalGeneration", "Gemma3ForCausalLM"]
+            model_class
+            in [
+                "Gemma3ForConditionalGeneration",
+                "Gemma3ForCausalLM",
+            ]
             or is_nemotron_v2
             or is_nemotron_v3_hf
         )
