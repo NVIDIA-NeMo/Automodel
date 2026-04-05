@@ -129,20 +129,23 @@ class TestGetSubmesh:
 
     def test_mixed_physical_flattened_uses_unflatten(self, monkeypatch):
         """Mixed physical + flattened tuple constructs submesh via _unflatten from parent."""
+        # Shared group sentinel — validation checks groups match
+        group_sentinel = Mock()
+
         dp_shard_cp_flat = Mock()
         dp_shard_cp_flat.size = Mock(return_value=4)
+        dp_shard_cp_flat.get_group = Mock(return_value=group_sentinel)
 
         # dp_cp is the parent: dp_replicate(2) * dp_shard_cp(4) = dp_cp(8)
         dp_cp_flat = Mock()
         dp_cp_flat.size = Mock(return_value=8)
 
-        # The unflatten result — set up dp_replicate group to match root's
-        group_sentinel = Mock()
+        # The unflatten result — both dims return matching groups
         unflatten_result = Mock()
         unflatten_result.__getitem__ = Mock(return_value=Mock(get_group=Mock(return_value=group_sentinel)))
         dp_cp_flat._unflatten = Mock(return_value=unflatten_result)
 
-        # dp_replicate is physical with size 2, group matches unflatten result
+        # dp_replicate is a mesh dim with size 2
         dp_rep_submesh = Mock()
         dp_rep_submesh.size = Mock(return_value=2)
         dp_rep_submesh.get_group = Mock(return_value=group_sentinel)
@@ -154,10 +157,9 @@ class TestGetSubmesh:
         mesh._get_root_mesh = Mock(return_value=root)
         mesh.__getitem__ = Mock(return_value=dp_rep_submesh)
 
-        # Mock dist.get_process_group_ranks to return consistent ranks
         monkeypatch.setattr(
             "torch.distributed.get_process_group_ranks",
-            lambda g: [0, 4] if g is group_sentinel else [0],
+            lambda g: [0, 4],
         )
 
         result = get_submesh(mesh, ("dp_replicate", "dp_shard_cp"))

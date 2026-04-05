@@ -361,13 +361,11 @@ def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
             result = fm._unflatten(0, sizes, names)
         except (ValueError, RuntimeError):
             continue
-        # Validate: for each requested name that is a root-mesh dim,
-        # the process group must match the root mesh's group for that dim.
+        # Validate: for each requested dim, verify its process group matches
+        # what get_flat_mesh returns (works for both mesh dims and flattened dims).
         valid = True
         for name in names:
-            if name not in mesh_dim_names:
-                continue
-            expected = set(dist.get_process_group_ranks(device_mesh[name].get_group()))
+            expected = set(dist.get_process_group_ranks(get_flat_mesh(device_mesh, name).get_group()))
             actual = set(dist.get_process_group_ranks(result[name].get_group()))
             if expected != actual:
                 valid = False

@@ -192,10 +192,10 @@ def test_function_signature_preserved():
 
 def test_no_runtime_errors_with_different_model_types(mock_device_mesh):
     """Test that both model types can be processed without runtime errors."""
-    with patch("torch.distributed.get_process_group_ranks", return_value=[0]):
-      with patch("nemo_automodel.components.distributed.parallelizer.fully_shard",
-                 side_effect=lambda model, **kwargs: model):
-        with patch("nemo_automodel.components.distributed.parallelizer.parallelize_module"):
+    with patch("torch.distributed.get_process_group_ranks", return_value=[0]), \
+         patch("nemo_automodel.components.distributed.parallelizer.fully_shard",
+               side_effect=lambda model, **kwargs: model), \
+         patch("nemo_automodel.components.distributed.parallelizer.parallelize_module"):
             with patch("nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively"):
                 with patch("nemo_automodel.components.distributed.parallelizer._extract_model_layers",
                           return_value=[]):
