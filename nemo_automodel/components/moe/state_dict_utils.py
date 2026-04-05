@@ -25,11 +25,7 @@ def is_dtensor(tensor: torch.Tensor) -> bool:
     return isinstance(tensor, DTensor)
 
 
-def get_submesh(device_mesh: DeviceMesh, dims: tuple[str, ...]) -> DeviceMesh:
-    from torch.distributed.device_mesh import _mesh_resources
-
-    root_mesh = _mesh_resources.get_root_mesh(device_mesh)
-    return root_mesh[dims]
+from nemo_automodel.components.distributed.mesh_utils import get_submesh  # noqa: F401 (re-export)
 
 
 def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> tuple[torch.Tensor, int, int]:

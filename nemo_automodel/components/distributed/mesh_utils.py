@@ -177,11 +177,11 @@ def _create_fsdp2_device_mesh(
         "since DDP usecase is not supported by FSDP2"
     )
 
-    # Expert parallelism calculations
-    dp_cp_size = dp_size * cp_size
-    assert dp_cp_size % ep_size == 0, f"{dp_cp_size=} must be a multiple of {ep_size=}"
-    if ep_size < dp_cp_size:
-        ep_shard_size = dp_cp_size // ep_size
+    # Expert parallelism: EP spans all non-pp dims (dp, cp, tp)
+    non_pp_size = dp_size * cp_size * tp_size
+    assert non_pp_size % ep_size == 0, f"{non_pp_size=} must be a multiple of {ep_size=}"
+    if ep_size < non_pp_size:
+        ep_shard_size = non_pp_size // ep_size
     else:
         ep_shard_size = 1
 
@@ -226,16 +226,18 @@ def _create_fsdp2_device_mesh(
     # Flatten submeshes
     device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP)
     device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_SHARD_CP)
-    device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_CP)
+    dp_cp_mesh = device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_CP)
 
-    # Create MOE mesh if ep_size > 1
+    # Derive EP mesh by flattening all non-pp dims and unflattening into (ep_shard, ep).
+    # EP spans dp, cp, and tp — the full non-pp rank space.
     moe_mesh = None
     if ep_size > 1:
-        moe_mesh = _create_moe_mesh(
-            pp_size=pp_size,
-            ep_shard_size=ep_shard_size,
-            ep_size=ep_size,
-            backend=backend,
+        non_pp_dims = (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD, MeshAxisName.CP, MeshAxisName.TP)
+        non_pp_mesh = device_mesh[non_pp_dims]._flatten()
+        moe_mesh = non_pp_mesh._unflatten(
+            0,
+            (ep_shard_size, ep_size),
+            (MeshAxisName.EP_SHARD, MeshAxisName.EP),
         )
 
     return device_mesh, moe_mesh
@@ -300,36 +302,48 @@ def _create_megatron_fsdp_device_mesh(
     return device_mesh
 
 
-def _create_moe_mesh(
-    pp_size: int,
-    ep_shard_size: int,
-    ep_size: int,
-    backend: str,
-) -> DeviceMesh:
-    """
-    Create MOE mesh for expert parallelism.
+def get_flat_mesh(device_mesh: "DeviceMesh", name: str) -> "DeviceMesh":
+    """Access a 1D submesh by parallelism name (e.g. ``"dp"``, ``"tp"``, ``"dp_cp"``).
 
-    Mesh shape: (pp_size, ep_shard_size, ep_size)
-    Mesh names: ("pp", "ep_shard", "ep")
+    PyTorch 2.11 deprecates ``root_mesh["name"]`` for dimensions created via
+    ``_flatten()``.  This reads the ``_flatten()`` result directly.
 
     Args:
-        pp_size: Pipeline parallel size.
-        ep_shard_size: Expert shard size (dp_cp_size // ep_size).
-        ep_size: Expert parallel size.
-        backend: Distributed backend ('nccl' or 'gloo').
-
-    Returns:
-        DeviceMesh: The MOE mesh for expert parallelism.
+        device_mesh: Any DeviceMesh (root or submesh).
+        name: Parallelism dimension name.
     """
-    mesh_shape = (pp_size, ep_shard_size, ep_size)
-    mesh_names = (MeshAxisName.PP, MeshAxisName.EP_SHARD, MeshAxisName.EP)
-    for shape, name in zip(mesh_shape, mesh_names):
-        assert isinstance(shape, int), f"Expected {name} to be an int, but got {type(shape)}"
-        assert shape > 0, f"Expected {name} > 0, got {shape}"
+    if name in device_mesh.mesh_dim_names:
+        return device_mesh[name]
+    root = device_mesh._get_root_mesh()
+    if name in root._flatten_mapping:
+        return root._flatten_mapping[name]
+    return device_mesh[name]
 
-    moe_mesh = init_device_mesh(
-        device_type="cuda" if backend == "nccl" else "cpu",
-        mesh_shape=mesh_shape,
-        mesh_dim_names=mesh_names,
-    )
-    return moe_mesh
+
+def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
+    """Access a submesh by parallelism dim names.
+
+    Handles all cases: single dims, multi-dim slices, and combinations that
+    include ``_flatten()``-created dims (e.g. ``("dp_replicate", "dp_shard_cp")``).
+    For the latter, finds the parent ``_flatten()`` result and calls ``_unflatten()``
+    to decompose it into the requested shape.
+
+    Args:
+        device_mesh: Any DeviceMesh (root or submesh).
+        names: Tuple of dimension names.
+    """
+    if len(names) == 1:
+        return get_flat_mesh(device_mesh, names[0])
+    if all(n in device_mesh.mesh_dim_names for n in names):
+        return device_mesh[names]
+
+    # Some dims were created via _flatten(); resolve sizes and unflatten from parent.
+    from math import prod
+
+    sizes = tuple(get_flat_mesh(device_mesh, n).size() for n in names)
+    target = prod(sizes)
+    root = device_mesh._get_root_mesh()
+    for fm in root._flatten_mapping.values():
+        if fm.size() == target:
+            return fm._unflatten(0, sizes, names)
+    return device_mesh[names]

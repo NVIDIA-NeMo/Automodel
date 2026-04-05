@@ -175,11 +175,11 @@ def _create_fsdp2_device_mesh(
         "dp_replicate_size must be less than dp_size since ddp usecase is not supported by FSDP2"
     )
 
-    # Expert parallelism calculations
-    dp_cp_size = dp_size * cp_size
-    assert dp_cp_size % ep_size == 0, f"{dp_cp_size=} must be a multiple of {ep_size=}"
-    if ep_size < dp_cp_size:
-        ep_shard_size = dp_cp_size // ep_size
+    # Expert parallelism: EP spans all non-pp dims (dp, cp, tp)
+    non_pp_size = dp_size * cp_size * tp_size
+    assert non_pp_size % ep_size == 0, f"{non_pp_size=} must be a multiple of {ep_size=}"
+    if ep_size < non_pp_size:
+        ep_shard_size = non_pp_size // ep_size
     else:
         ep_shard_size = 1
 
@@ -218,16 +218,16 @@ def _create_fsdp2_device_mesh(
     # Flatten submeshes
     device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
     device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_cp")
-    device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
+    dp_cp_mesh = device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
 
-    # Create MOE mesh if ep_size > 1
+    # Derive EP mesh by flattening all non-pp dims and unflattening into (ep_shard, ep).
     moe_mesh = None
     if ep_size > 1:
-        moe_mesh = _create_moe_mesh(
-            pp_size=pp_size,
-            ep_shard_size=ep_shard_size,
-            ep_size=ep_size,
-            backend=backend,
+        non_pp_mesh = device_mesh[("dp_replicate", "dp_shard", "cp", "tp")]._flatten()
+        moe_mesh = non_pp_mesh._unflatten(
+            0,
+            (ep_shard_size, ep_size),
+            ("ep_shard", "ep"),
         )
 
     return device_mesh, moe_mesh
@@ -290,38 +290,3 @@ def _create_megatron_fsdp_device_mesh(
         device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
 
     return device_mesh
-
-
-def _create_moe_mesh(
-    pp_size: int,
-    ep_shard_size: int,
-    ep_size: int,
-    backend: str,
-) -> DeviceMesh:
-    """
-    Create MOE mesh for expert parallelism.
-
-    Mesh shape: (pp_size, ep_shard_size, ep_size)
-    Mesh names: ("pp", "ep_shard", "ep")
-
-    Args:
-        pp_size: Pipeline parallel size.
-        ep_shard_size: Expert shard size (dp_cp_size // ep_size).
-        ep_size: Expert parallel size.
-        backend: Distributed backend ('nccl' or 'gloo').
-
-    Returns:
-        DeviceMesh: The MOE mesh for expert parallelism.
-    """
-    mesh_shape = (pp_size, ep_shard_size, ep_size)
-    mesh_names = ("pp", "ep_shard", "ep")
-    for shape, name in zip(mesh_shape, mesh_names):
-        assert isinstance(shape, int), f"Expected {name} to be an int, but got {type(shape)}"
-        assert shape > 0, f"Expected {name} > 0, got {shape}"
-
-    moe_mesh = init_device_mesh(
-        device_type="cuda" if backend == "nccl" else "cpu",
-        mesh_shape=mesh_shape,
-        mesh_dim_names=mesh_names,
-    )
-    return moe_mesh
