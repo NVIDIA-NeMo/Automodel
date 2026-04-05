@@ -32,6 +32,36 @@
 | {download}`flux_t2i_flow.yaml <../../../examples/diffusion/finetune/flux_t2i_flow.yaml>` | Fine-tune — FLUX.1-dev with flow matching |
 | {download}`flux_t2i_flow.yaml <../../../examples/diffusion/pretrain/flux_t2i_flow.yaml>` | Pretrain — FLUX.1-dev with flow matching |
 
+
+## Try with NeMo AutoModel
+
+```bash
+torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/flux_t2i_flow.yaml
+```
+
+:::{dropdown} Run with Docker
+Pull the NeMo AutoModel container and mount a checkpoint directory:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+Then inside the container:
+
+```bash
+torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/flux_t2i_flow.yaml
+```
+:::
+
+See the [Installation Guide](../../../guides/installation.md) and [Diffusion Fine-Tuning Guide](../../../guides/diffusion/finetune.md).
+
 ## Training
 
 See the [Diffusion Training and Fine-Tuning Guide](../../../guides/diffusion/finetune.md) and [Dataset Preparation](../../../guides/diffusion/dataset.md).

@@ -37,6 +37,32 @@
 | {download}`ministral3_8b_medpix.yaml <../../../examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml>` | MedPix-VQA | SFT — Ministral3 8B on MedPix |
 | {download}`ministral3_14b_medpix.yaml <../../../examples/vlm_finetune/mistral/ministral3_14b_medpix.yaml>` | MedPix-VQA | SFT — Ministral3 14B on MedPix |
 
+
+## Try with NeMo AutoModel
+
+```bash
+automodel --nproc-per-node=8 examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml
+```
+
+:::{dropdown} Run with Docker
+Pull the NeMo AutoModel container and mount a checkpoint directory:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+Then inside the container:
+
+```bash
+automodel --nproc-per-node=8 examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml
+```
+:::
+
+See the [Installation Guide](../../../guides/installation.md) and [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
+
 ## Fine-Tuning
 
 See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).

@@ -32,6 +32,32 @@
 | {download}`moonlight_16b_te.yaml <../../../examples/llm_finetune/moonlight/moonlight_16b_te.yaml>` | SFT — Moonlight 16B with Transformer Engine |
 | {download}`moonlight_16b_te_packed_sequence.yaml <../../../examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml>` | SFT — Moonlight 16B with packed sequences |
 
+
+## Try with NeMo AutoModel
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/moonlight/moonlight_16b_te.yaml
+```
+
+:::{dropdown} Run with Docker
+Pull the NeMo AutoModel container and mount a checkpoint directory:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+Then inside the container:
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/moonlight/moonlight_16b_te.yaml
+```
+:::
+
+See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+
 ## Fine-Tuning
 
 See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).

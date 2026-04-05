@@ -36,6 +36,26 @@
 | LLaVA-NeXT-Video 7B | `llava-hf/LLaVA-NeXT-Video-7B-hf` |
 | LLaVA-OneVision 7B | `llava-hf/llava-onevision-qwen2-7b-ov-hf` |
 
+
+## Try with NeMo AutoModel
+
+Install NeMo AutoModel and follow the fine-tuning guide to configure a recipe for this model.
+
+```bash
+pip install nemo-automodel
+```
+
+:::{dropdown} Run with Docker
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+:::
+
+See the [Installation Guide](../../../guides/installation.md) and [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
+
 ## Fine-Tuning
 
 See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).

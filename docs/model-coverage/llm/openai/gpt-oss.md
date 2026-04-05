@@ -34,6 +34,32 @@
 | {download}`gpt_oss_20b.yaml <../../../examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml>` | SFT — GPT-OSS 20B |
 | {download}`gpt_oss_120b.yaml <../../../examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml>` | SFT — GPT-OSS 120B |
 
+
+## Try with NeMo AutoModel
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml
+```
+
+:::{dropdown} Run with Docker
+Pull the NeMo AutoModel container and mount a checkpoint directory:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+Then inside the container:
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml
+```
+:::
+
+See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+
 ## Fine-Tuning
 
 See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).

@@ -39,6 +39,32 @@
 | {download}`gemma3n_vl_4b_medpix.yaml <../../../examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml>` | MedPix-VQA | SFT — Gemma 3n 4B VL on MedPix |
 | {download}`gemma3n_vl_4b_medpix_peft.yaml <../../../examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix_peft.yaml>` | MedPix-VQA | LoRA — Gemma 3n 4B VL on MedPix |
 
+
+## Try with NeMo AutoModel
+
+```bash
+automodel --nproc-per-node=8 examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml
+```
+
+:::{dropdown} Run with Docker
+Pull the NeMo AutoModel container and mount a checkpoint directory:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+Then inside the container:
+
+```bash
+automodel --nproc-per-node=8 examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml
+```
+:::
+
+See the [Installation Guide](../../../guides/installation.md) and [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
+
 ## Fine-Tuning
 
 See the [Gemma 3 & Gemma 3n Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md) for detailed instructions on dataset preparation, configuration, and multi-GPU training.

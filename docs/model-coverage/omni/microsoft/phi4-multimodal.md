@@ -31,6 +31,32 @@
 |---|---|---|
 | {download}`phi4_mm_cv17.yaml <../../../examples/vlm_finetune/phi4/phi4_mm_cv17.yaml>` | CommonVoice 17 | SFT — Phi-4-multimodal on CommonVoice (audio-text) |
 
+
+## Try with NeMo AutoModel
+
+```bash
+automodel --nproc-per-node=8 examples/vlm_finetune/phi4/phi4_mm_cv17.yaml
+```
+
+:::{dropdown} Run with Docker
+Pull the NeMo AutoModel container and mount a checkpoint directory:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+Then inside the container:
+
+```bash
+automodel --nproc-per-node=8 examples/vlm_finetune/phi4/phi4_mm_cv17.yaml
+```
+:::
+
+See the [Installation Guide](../../../guides/installation.md) and [Omni Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
+
 ## Fine-Tuning
 
 See the [VLM / Omni Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).

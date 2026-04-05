@@ -31,6 +31,32 @@ Qwen3.5-VL is Alibaba Cloud's next-generation vision language model series, incl
 | {download}`qwen3_5_moe_medpix.yaml <../../../examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml>` | MedPix-VQA | SFT — Qwen3.5-MoE on MedPix |
 | {download}`qwen3_5_35b.yaml <../../../examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml>` | MedPix-VQA | SFT — Qwen3.5 35B on MedPix |
 
+
+## Try with NeMo AutoModel
+
+```bash
+automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_5/qwen3_5_4b.yaml
+```
+
+:::{dropdown} Run with Docker
+Pull the NeMo AutoModel container and mount a checkpoint directory:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+Then inside the container:
+
+```bash
+automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_5/qwen3_5_4b.yaml
+```
+:::
+
+See the [Installation Guide](../../../guides/installation.md) and [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
+
 ## Fine-Tuning
 
 See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).

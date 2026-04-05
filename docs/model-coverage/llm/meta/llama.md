@@ -45,6 +45,32 @@
 | {download}`llama3_2_1b_squad.yaml <../../../examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml>` | SFT — Llama 3.2 1B on SQuAD |
 | {download}`llama_3_3_70b_instruct_squad.yaml <../../../examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad.yaml>` | SFT — Llama 3.3 70B Instruct on SQuAD |
 
+
+## Try with NeMo AutoModel
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+```
+
+:::{dropdown} Run with Docker
+Pull the NeMo AutoModel container and mount a checkpoint directory:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+Then inside the container:
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+```
+:::
+
+See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+
 ## Fine-Tuning
 
 See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) for full SFT and LoRA instructions.

@@ -37,6 +37,32 @@
 | {download}`qwen2_5_7b_squad.yaml <../../../examples/llm_finetune/qwen/qwen2_5_7b_squad.yaml>` | SFT — Qwen2.5 7B on SQuAD |
 | {download}`qwq_32b_squad_peft.yaml <../../../examples/llm_finetune/qwen/qwq_32b_squad_peft.yaml>` | LoRA — QwQ 32B on SQuAD |
 
+
+## Try with NeMo AutoModel
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen2_5_7b_squad.yaml
+```
+
+:::{dropdown} Run with Docker
+Pull the NeMo AutoModel container and mount a checkpoint directory:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+Then inside the container:
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen2_5_7b_squad.yaml
+```
+:::
+
+See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+
 ## Fine-Tuning
 
 See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) for full SFT and LoRA instructions.

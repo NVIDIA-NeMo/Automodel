@@ -39,6 +39,36 @@
 | {download}`glm_4.7_flash_te_deepep.yaml <../../../examples/llm_finetune/glm/glm_4.7_flash_te_deepep.yaml>` | SFT — GLM-4.7-Flash with TE + DeepEP |
 | {download}`glm_4.7_flash_te_packed_sequence.yaml <../../../examples/llm_finetune/glm/glm_4.7_flash_te_packed_sequence.yaml>` | SFT — GLM-4.7-Flash with packed sequences |
 
+
+## Try with NeMo AutoModel
+
+:::{note}
+This recipe was validated on **8 nodes × 8 GPUs (64 H100s)**. See the [Launcher Guide](../../../launcher/slurm.md) for multi-node setup.
+:::
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/glm/glm_4.5_air_te_deepep.yaml
+```
+
+:::{dropdown} Run with Docker
+Pull the NeMo AutoModel container and mount a checkpoint directory:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+Then inside the container:
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/glm/glm_4.5_air_te_deepep.yaml
+```
+:::
+
+See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+
 ## Fine-Tuning
 
 See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) and the [Large MoE Fine-Tuning Guide](../../../guides/llm/large_moe_finetune.md).
