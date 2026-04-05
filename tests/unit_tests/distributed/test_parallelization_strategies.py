@@ -562,22 +562,11 @@ class TestWanParallelizationStrategy:
     @pytest.fixture
     def mesh_tp1(self):
         mesh = MagicMock()
-        mesh.mesh_dim_names = ("dp_replicate", "dp_shard", "cp", "tp")
         tp_mesh = MagicMock()
         tp_mesh.size.return_value = 1
-        dp_rep_mesh = MagicMock()
-        dp_rep_mesh.size.return_value = 1
-        dp_shard_cp_mesh = MagicMock()
-        dp_shard_cp_mesh.size.return_value = 1
-        dp_cp_mesh = MagicMock()
-        dp_cp_mesh.size.return_value = 1
         dp_mesh = MagicMock()
-        root = MagicMock()
-        root._flatten_mapping = {"dp_shard_cp": dp_shard_cp_mesh, "dp_cp": dp_cp_mesh}
-        mesh._get_root_mesh.return_value = root
         mesh.__getitem__.side_effect = lambda key: {
             "tp": tp_mesh,
-            "dp_replicate": dp_rep_mesh,
             ("dp_replicate", "dp_shard_cp"): dp_mesh,
         }[key]
         return mesh, dp_mesh, tp_mesh
@@ -585,29 +574,23 @@ class TestWanParallelizationStrategy:
     @pytest.fixture
     def mesh_tp2(self):
         mesh = MagicMock()
-        mesh.mesh_dim_names = ("dp_replicate", "dp_shard", "cp", "tp")
         tp_mesh = MagicMock()
         tp_mesh.size.return_value = 2
-        dp_rep_mesh = MagicMock()
-        dp_rep_mesh.size.return_value = 1
-        dp_shard_cp_mesh = MagicMock()
-        dp_shard_cp_mesh.size.return_value = 1
-        dp_cp_mesh = MagicMock()
-        dp_cp_mesh.size.return_value = 1
         dp_mesh = MagicMock()
-        root = MagicMock()
-        root._flatten_mapping = {"dp_shard_cp": dp_shard_cp_mesh, "dp_cp": dp_cp_mesh}
-        mesh._get_root_mesh.return_value = root
         mesh.__getitem__.side_effect = lambda key: {
             "tp": tp_mesh,
-            "dp_replicate": dp_rep_mesh,
             ("dp_replicate", "dp_shard_cp"): dp_mesh,
         }[key]
         return mesh, dp_mesh, tp_mesh
 
-    def _mock_env(self, monkeypatch):
-        # Mock dist.get_process_group_ranks for get_submesh validation
-        monkeypatch.setattr("torch.distributed.get_process_group_ranks", lambda g: [0], raising=False)
+    def _mock_env(self, monkeypatch, dp_mesh_sentinel=None):
+        # Mock get_submesh to return the known dp_mesh sentinel from the fixture,
+        # so we can assert the correct mesh is forwarded to apply_fsdp.
+        if dp_mesh_sentinel is not None:
+            monkeypatch.setattr(
+                "nemo_automodel.components.distributed.parallelizer.get_submesh",
+                lambda mesh, names: dp_mesh_sentinel,
+            )
 
         fully_shard_mock = MagicMock(side_effect=lambda model, **kwargs: model)
         monkeypatch.setattr(
@@ -637,8 +620,8 @@ class TestWanParallelizationStrategy:
         }
 
     def test_no_tp_when_group_size_is_one(self, wan_strategy, wan_model, mesh_tp1, monkeypatch):
-        env = self._mock_env(monkeypatch)
         mesh, dp_mesh, tp_mesh = mesh_tp1
+        env = self._mock_env(monkeypatch, dp_mesh_sentinel=dp_mesh)
 
         result = wan_strategy.parallelize(model=wan_model, device_mesh=mesh)
 
@@ -650,26 +633,26 @@ class TestWanParallelizationStrategy:
         assert result is wan_model
 
     def test_tp_applied_to_condition_blocks_and_proj(self, wan_strategy, wan_model, mesh_tp2, monkeypatch):
-        env = self._mock_env(monkeypatch)
         mesh, dp_mesh, tp_mesh = mesh_tp2
+        env = self._mock_env(monkeypatch, dp_mesh_sentinel=dp_mesh)
 
         result = wan_strategy.parallelize(model=wan_model, device_mesh=mesh)
 
         # parallelize_module should be called for text_embedder, time_embedder, time_proj, each block.ffn, and proj_out
         # There are 2 blocks with ffn → 2 calls + 3 condition embedder + 1 proj_out = 6
         assert env["parallelize_module"].call_count == 6
-        # FSDP applied
+        # FSDP applied with the correct dp_mesh
         from unittest.mock import ANY
 
-        env["apply_fsdp"].assert_called_once_with(wan_model, ANY, ANY, None)
+        env["apply_fsdp"].assert_called_once_with(wan_model, dp_mesh, ANY, None)
         env["fully_shard"].assert_called()
         assert result is wan_model
 
     def test_exceptions_in_tp_paths_are_logged_and_ignored(
         self, wan_strategy, wan_model, mesh_tp2, monkeypatch, caplog
     ):
-        self._mock_env(monkeypatch)
         mesh, dp_mesh, tp_mesh = mesh_tp2
+        self._mock_env(monkeypatch, dp_mesh_sentinel=dp_mesh)
 
         # Make parallelize_module raise once to hit logging branches
         calls = {"count": 0}
@@ -696,17 +679,14 @@ class TestWanParallelizationStrategy:
         assert result is wan_model
 
     def test_custom_mesh_names(self, wan_strategy, wan_model, monkeypatch):
-        env = self._mock_env(monkeypatch)
-
         mesh = MagicMock()
         mesh.mesh_dim_names = ("custom_dp_repl", "custom_dp_shard", "custom_tp")
         tp_mesh = MagicMock()
         tp_mesh.size.return_value = 2
         dp_mesh = MagicMock()
+        env = self._mock_env(monkeypatch, dp_mesh_sentinel=dp_mesh)
         mesh.__getitem__.side_effect = lambda key: {
             "custom_tp": tp_mesh,
-            "custom_dp_repl": MagicMock(size=MagicMock(return_value=1)),
-            "custom_dp_shard": MagicMock(size=MagicMock(return_value=1)),
             ("custom_dp_repl", "custom_dp_shard"): dp_mesh,
         }[key]
 
@@ -721,7 +701,7 @@ class TestWanParallelizationStrategy:
         # Ensure FSDP used the dp_mesh we provided via custom names
         from unittest.mock import ANY
 
-        env["apply_fsdp"].assert_called_once_with(wan_model, ANY, ANY, None)
+        env["apply_fsdp"].assert_called_once_with(wan_model, dp_mesh, ANY, None)
         assert result is wan_model
 
 

@@ -372,8 +372,6 @@ class WanParallelizationStrategy(ParallelizationStrategy):
         tp_mesh_name: str = "tp",
     ) -> nn.Module:
         # Not using custom tp_shard_plan; apply Wan-specific plan
-        from nemo_automodel.components.distributed.mesh_utils import get_submesh
-
         tp_mesh = device_mesh[tp_mesh_name]
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
         dp_mesh = get_submesh(device_mesh, dp_mesh_dim_names)

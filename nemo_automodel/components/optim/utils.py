@@ -137,22 +137,14 @@ def _get_dion_mesh(distributed_mesh: Any) -> Any:
     if not hasattr(distributed_mesh, "ndim") or distributed_mesh.ndim == 1:
         return distributed_mesh
     try:
-        # Use get_flat_mesh for real DeviceMesh objects (avoids PT 2.11 deprecation warning),
-        # fall back to __getitem__ for test fakes or non-DeviceMesh types.
-        if hasattr(distributed_mesh, "mesh_dim_names"):
-            from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
-
-            logger.info(f"[Dion] Extracting dp_shard_cp 1D submesh from distributed_mesh: {distributed_mesh}")
-            submesh = get_flat_mesh(distributed_mesh, "dp_shard_cp")
-        else:
-            logger.info(f"[Dion] Extracting dp_shard_cp 1D submesh from distributed_mesh: {distributed_mesh}")
-            dp_mesh_2d = distributed_mesh[("dp_replicate", "dp_shard_cp")]
-            submesh = dp_mesh_2d["dp_shard_cp"]
+        logger.info(f"[Dion] Extracting dp_shard_cp 1D submesh from distributed_mesh: {distributed_mesh}")
+        dp_mesh_2d = distributed_mesh[("dp_replicate", "dp_shard_cp")]
+        submesh = dp_mesh_2d["dp_shard_cp"]
         if hasattr(submesh, "ndim") and submesh.ndim == 1:
-            logger.info(f"[Dion] Extracted dp_shard_cp 1D submesh: {submesh}")
+            logger.info(f"[Dion] Extracted dp_shard_cp 1D submesh via 2D mesh: {submesh}")
             return submesh
-    except (KeyError, RuntimeError, TypeError, AttributeError) as e:
-        logger.debug(f"[Dion] Could not access dp_shard_cp: {e}")
+    except (KeyError, RuntimeError, TypeError) as e:
+        logger.debug(f"[Dion] Could not access via (dp_replicate, dp_shard_cp): {e}")
     return distributed_mesh
 
 

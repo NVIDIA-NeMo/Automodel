@@ -26,10 +26,8 @@ def is_dtensor(tensor: torch.Tensor) -> bool:
 
 
 def get_submesh(device_mesh: DeviceMesh, dims: tuple[str, ...]) -> DeviceMesh:
-    """Access a submesh by dim names. Delegates to mesh_utils.get_submesh."""
-    from nemo_automodel.components.distributed.mesh_utils import get_submesh as _get_submesh
-
-    return _get_submesh(device_mesh, dims)
+    """Access a submesh by dim names from the given mesh."""
+    return device_mesh[dims]
 
 
 def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> tuple[torch.Tensor, int, int]:
