@@ -1,6 +1,6 @@
 # Gemma 3 VL / Gemma 3n
 
-[Gemma 3 VL](https://ai.google.dev/gemma/docs/gemma3) is Google's multimodal extension of Gemma 3, supporting image-text inputs for tasks like image captioning and visual question answering. Gemma 3n is a next-generation efficiency-focused variant.
+[Gemma 3 VL](https://ai.google.dev/gemma/docs/core) is Google's multimodal extension of Gemma 3, supporting image-text inputs for tasks like image captioning and visual question answering. Gemma 3n is a next-generation efficiency-focused variant.
 
 :::{card}
 | | |

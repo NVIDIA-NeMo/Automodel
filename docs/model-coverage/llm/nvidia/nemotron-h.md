@@ -1,6 +1,6 @@
 # Nemotron-H
 
-[NVIDIA Nemotron-H](https://developer.nvidia.com/blog/nemotron-h-efficient-hybrid-mamba-transformer-models/) is a hybrid Mamba-2 / transformer architecture that interleaves selective state space layers with standard attention layers for improved efficiency on long sequences.
+[NVIDIA Nemotron-H](https://developer.nvidia.com/blog/nemotron-h-reasoning-enabling-throughput-gains-with-no-compromises/) is a hybrid Mamba-2 / transformer architecture that interleaves selective state space layers with standard attention layers for improved efficiency on long sequences.
 
 :::{card}
 | | |

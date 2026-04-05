@@ -1,6 +1,6 @@
 # StableLM
 
-[StableLM](https://stability.ai/stable-lm) is Stability AI's series of open language models, available in base and instruction-tuned variants across multiple sizes.
+[StableLM](https://huggingface.co/stabilityai) is Stability AI's series of open language models, available in base and instruction-tuned variants across multiple sizes.
 
 :::{card}
 | | |
