@@ -65,11 +65,10 @@ class TestGetFlatMesh:
         # Should NOT go through __getitem__
         mesh.__getitem__.assert_not_called()
 
-    def test_unknown_dim_falls_through_to_getitem(self):
+    def test_unknown_dim_raises_key_error(self):
         mesh = self._make_mock_mesh(("dp", "tp"), flatten_mapping={})
-        # "unknown" is not on the mesh or in _flatten_mapping — falls through
-        result = get_flat_mesh(mesh, "unknown")
-        mesh.__getitem__.assert_called_once_with("unknown")
+        with pytest.raises(KeyError, match="unknown"):
+            get_flat_mesh(mesh, "unknown")
 
     def test_flattened_dim_checked_on_root_not_self(self):
         """When mesh is a submesh, flattened dims are looked up on the root."""

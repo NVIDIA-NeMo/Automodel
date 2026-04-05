@@ -317,7 +317,10 @@ def get_flat_mesh(device_mesh: "DeviceMesh", name: str) -> "DeviceMesh":
     root = device_mesh._get_root_mesh()
     if name in root._flatten_mapping:
         return root._flatten_mapping[name]
-    return device_mesh[name]
+    raise KeyError(
+        f"Mesh dim {name!r} not found in mesh_dim_names {device_mesh.mesh_dim_names} "
+        f"or root _flatten_mapping {set(root._flatten_mapping)}"
+    )
 
 
 def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
@@ -371,4 +374,7 @@ def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
                 break
         if valid:
             return result
-    return device_mesh[names]
+    raise KeyError(
+        f"No parent flattened mesh found for dims {names} with target size {target}. "
+        f"Available: {set(root._flatten_mapping)}"
+    )

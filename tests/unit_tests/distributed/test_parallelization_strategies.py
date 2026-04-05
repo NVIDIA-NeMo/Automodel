@@ -328,6 +328,7 @@ class TestDefaultParallelizationStrategy:
         mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh = mock_device_mesh
 
         # Update mesh mock to support custom names
+        mesh.mesh_dim_names = ("custom_dp_replicate", "custom_dp_shard", "custom_tp")
         mesh.__getitem__.side_effect = lambda key: {
             "custom_dp_replicate": dp_replicate_mesh,
             "custom_dp_shard": dp_shard_mesh,
