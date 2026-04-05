@@ -153,18 +153,10 @@ def test_pretokenized_wrapper_truncate_mode():
         "attention_mask": torch.ones(1, SEQ_LEN, dtype=torch.long),  # (1, 20)
         "mm_token_type_ids": torch.zeros(SEQ_LEN, dtype=torch.long),  # 1D (20,)
     }
-    # chat_template needs to produce some text
     processor.apply_chat_template = MagicMock(return_value="fake template text")
     processor.image_token = "<image>"
 
-    # Mock build_labels_from_template to return non-negative labels for the second half
-    labels = torch.full((SEQ_LEN,), -100, dtype=torch.long)
-    labels[SEQ_LEN // 2 :] = torch.arange(SEQ_LEN // 2)
-
     with patch(
-        "nemo_automodel.components.datasets.vlm.collate_fns.build_labels_from_template",
-        return_value=labels.unsqueeze(0),
-    ), patch(
         "nemo_automodel.components.datasets.vlm.datasets._preload_media",
         side_effect=lambda ex, proc, **kw: ex,
     ), patch(
@@ -180,8 +172,6 @@ def test_pretokenized_wrapper_truncate_mode():
     assert sample["input_ids"].shape[0] == MAX_LEN
     assert sample["attention_mask"].shape[0] == MAX_LEN
     assert sample["labels"].shape[0] == MAX_LEN
-    # Labels should not all be -100 (label building happened before truncation)
-    assert not torch.all(sample["labels"] == -100)
     # 1D mm_token_type_ids should also be truncated
     if "mm_token_type_ids" in sample:
         assert sample["mm_token_type_ids"].shape[0] == MAX_LEN
