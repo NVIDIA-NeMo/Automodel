@@ -162,16 +162,16 @@ def test_pretokenized_wrapper_truncate_mode():
     labels[SEQ_LEN // 2 :] = torch.arange(SEQ_LEN // 2)
 
     with patch(
-        "nemo_automodel.components.datasets.vlm.datasets.build_labels_from_template",
+        "nemo_automodel.components.datasets.vlm.collate_fns.build_labels_from_template",
         return_value=labels.unsqueeze(0),
     ), patch(
         "nemo_automodel.components.datasets.vlm.datasets._preload_media",
         side_effect=lambda ex, proc, **kw: ex,
     ), patch(
-        "nemo_automodel.components.datasets.vlm.datasets._conversation_has_media",
+        "nemo_automodel.components.datasets.vlm.fake_image._conversation_has_media",
         return_value=True,
     ), patch(
-        "nemo_automodel.components.datasets.vlm.datasets._extract_media_from_conversations",
+        "nemo_automodel.components.datasets.vlm.collate_fns._extract_media_from_conversations",
         return_value=([], []),
     ):
         wrapper = PreTokenizedDatasetWrapper(mock_ds, processor, max_length=MAX_LEN, truncate=True)
