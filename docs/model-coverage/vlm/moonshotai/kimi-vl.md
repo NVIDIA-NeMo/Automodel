@@ -30,8 +30,8 @@
 
 | Recipe | Dataset | Description |
 |---|---|---|
-| {download}`kimi2vl_cordv2.yaml <../../../examples/vlm_finetune/kimi/kimi2vl_cordv2.yaml>` | cord-v2 | SFT — Kimi-VL on CORD-v2 |
-| {download}`kimi25vl_medpix.yaml <../../../examples/vlm_finetune/kimi/kimi25vl_medpix.yaml>` | MedPix-VQA | SFT — Kimi-K25-VL on MedPix |
+| {download}`kimi2vl_cordv2.yaml <../../../../examples/vlm_finetune/kimi/kimi2vl_cordv2.yaml>` | cord-v2 | SFT — Kimi-VL on CORD-v2 |
+| {download}`kimi25vl_medpix.yaml <../../../../examples/vlm_finetune/kimi/kimi25vl_medpix.yaml>` | MedPix-VQA | SFT — Kimi-K25-VL on MedPix |
 
 
 ## Try with NeMo AutoModel

@@ -32,8 +32,8 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`glm_4_9b_chat_hf_squad.yaml <../../../examples/llm_finetune/glm/glm_4_9b_chat_hf_squad.yaml>` | SFT — GLM-4 9B on SQuAD |
-| {download}`glm_4_9b_chat_hf_hellaswag_fp8.yaml <../../../examples/llm_finetune/glm/glm_4_9b_chat_hf_hellaswag_fp8.yaml>` | SFT — GLM-4 9B on HellaSwag with FP8 |
+| {download}`glm_4_9b_chat_hf_squad.yaml <../../../../examples/llm_finetune/glm/glm_4_9b_chat_hf_squad.yaml>` | SFT — GLM-4 9B on SQuAD |
+| {download}`glm_4_9b_chat_hf_hellaswag_fp8.yaml <../../../../examples/llm_finetune/glm/glm_4_9b_chat_hf_hellaswag_fp8.yaml>` | SFT — GLM-4 9B on HellaSwag with FP8 |
 
 
 ## Try with NeMo AutoModel

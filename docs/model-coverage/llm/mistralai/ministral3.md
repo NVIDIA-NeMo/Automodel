@@ -40,8 +40,8 @@ Both use the `Mistral3ForConditionalGeneration` architecture.
 
 | Recipe | Description |
 |---|---|
-| {download}`devstral2_small_2512_squad.yaml <../../../examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml>` | SFT — Devstral Small 2 24B on SQuAD |
-| {download}`devstral2_small_2512_squad_peft.yaml <../../../examples/llm_finetune/devstral/devstral2_small_2512_squad_peft.yaml>` | LoRA — Devstral Small 2 24B on SQuAD |
+| {download}`devstral2_small_2512_squad.yaml <../../../../examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml>` | SFT — Devstral Small 2 24B on SQuAD |
+| {download}`devstral2_small_2512_squad_peft.yaml <../../../../examples/llm_finetune/devstral/devstral2_small_2512_squad_peft.yaml>` | LoRA — Devstral Small 2 24B on SQuAD |
 
 
 ## Try with NeMo AutoModel

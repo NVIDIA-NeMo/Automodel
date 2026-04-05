@@ -31,8 +31,8 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`qwen3_moe_30b_te_deepep.yaml <../../../examples/llm_finetune/qwen/qwen3_moe_30b_te_deepep.yaml>` | SFT — Qwen3 MoE 30B with TE + DeepEP |
-| {download}`qwen3_moe_30b_lora.yaml <../../../examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml>` | LoRA — Qwen3 MoE 30B |
+| {download}`qwen3_moe_30b_te_deepep.yaml <../../../../examples/llm_finetune/qwen/qwen3_moe_30b_te_deepep.yaml>` | SFT — Qwen3 MoE 30B with TE + DeepEP |
+| {download}`qwen3_moe_30b_lora.yaml <../../../../examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml>` | LoRA — Qwen3 MoE 30B |
 
 
 ## Try with NeMo AutoModel

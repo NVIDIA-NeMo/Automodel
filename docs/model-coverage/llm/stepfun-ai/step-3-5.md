@@ -29,7 +29,7 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`step_3.5_flash_hellaswag_pp.yaml <../../../examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml>` | SFT — Step-3.5-Flash on HellaSwag with pipeline parallelism |
+| {download}`step_3.5_flash_hellaswag_pp.yaml <../../../../examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml>` | SFT — Step-3.5-Flash on HellaSwag with pipeline parallelism |
 
 
 ## Try with NeMo AutoModel

@@ -38,10 +38,10 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`phi_4_squad.yaml <../../../examples/llm_finetune/phi/phi_4_squad.yaml>` | SFT — Phi-4 on SQuAD |
-| {download}`phi_4_squad_peft.yaml <../../../examples/llm_finetune/phi/phi_4_squad_peft.yaml>` | LoRA — Phi-4 on SQuAD |
-| {download}`phi_3_mini_it_squad.yaml <../../../examples/llm_finetune/phi/phi_3_mini_it_squad.yaml>` | SFT — Phi-3-mini Instruct on SQuAD |
-| {download}`phi_3_mini_it_squad_peft.yaml <../../../examples/llm_finetune/phi/phi_3_mini_it_squad_peft.yaml>` | LoRA — Phi-3-mini Instruct on SQuAD |
+| {download}`phi_4_squad.yaml <../../../../examples/llm_finetune/phi/phi_4_squad.yaml>` | SFT — Phi-4 on SQuAD |
+| {download}`phi_4_squad_peft.yaml <../../../../examples/llm_finetune/phi/phi_4_squad_peft.yaml>` | LoRA — Phi-4 on SQuAD |
+| {download}`phi_3_mini_it_squad.yaml <../../../../examples/llm_finetune/phi/phi_3_mini_it_squad.yaml>` | SFT — Phi-3-mini Instruct on SQuAD |
+| {download}`phi_3_mini_it_squad_peft.yaml <../../../../examples/llm_finetune/phi/phi_3_mini_it_squad_peft.yaml>` | LoRA — Phi-3-mini Instruct on SQuAD |
 
 
 ## Try with NeMo AutoModel

@@ -32,8 +32,8 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`baichuan_2_7b_squad.yaml <../../../examples/llm_finetune/baichuan/baichuan_2_7b_squad.yaml>` | SFT — Baichuan2 7B on SQuAD |
-| {download}`baichuan_2_7b_squad_peft.yaml <../../../examples/llm_finetune/baichuan/baichuan_2_7b_squad_peft.yaml>` | LoRA — Baichuan2 7B on SQuAD |
+| {download}`baichuan_2_7b_squad.yaml <../../../../examples/llm_finetune/baichuan/baichuan_2_7b_squad.yaml>` | SFT — Baichuan2 7B on SQuAD |
+| {download}`baichuan_2_7b_squad_peft.yaml <../../../../examples/llm_finetune/baichuan/baichuan_2_7b_squad_peft.yaml>` | LoRA — Baichuan2 7B on SQuAD |
 
 
 ## Try with NeMo AutoModel

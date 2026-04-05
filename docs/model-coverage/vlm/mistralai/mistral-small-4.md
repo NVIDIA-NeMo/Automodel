@@ -29,7 +29,7 @@
 
 | Recipe | Dataset | Description |
 |---|---|---|
-| {download}`mistral4_medpix.yaml <../../../examples/vlm_finetune/mistral4/mistral4_medpix.yaml>` | MedPix-VQA | SFT — Mistral-Small-4 on MedPix |
+| {download}`mistral4_medpix.yaml <../../../../examples/vlm_finetune/mistral4/mistral4_medpix.yaml>` | MedPix-VQA | SFT — Mistral-Small-4 on MedPix |
 
 
 ## Try with NeMo AutoModel

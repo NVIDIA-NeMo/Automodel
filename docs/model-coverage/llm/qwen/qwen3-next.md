@@ -29,7 +29,7 @@ Qwen3-Next is an advanced MoE language model from Alibaba Cloud's Qwen team desi
 
 | Recipe | Description |
 |---|---|
-| {download}`qwen3_next_te_deepep.yaml <../../../examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml>` | SFT — Qwen3-Next with TE + DeepEP |
+| {download}`qwen3_next_te_deepep.yaml <../../../../examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml>` | SFT — Qwen3-Next with TE + DeepEP |
 
 
 ## Try with NeMo AutoModel

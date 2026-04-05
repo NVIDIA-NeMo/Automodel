@@ -29,7 +29,7 @@
 
 | Recipe | Dataset | Description |
 |---|---|---|
-| {download}`nemotron_parse_v1_1.yaml <../../../examples/vlm_finetune/nemotron/nemotron_parse_v1_1.yaml>` | cord-v2 | SFT — Nemotron-Parse on CORD-v2 |
+| {download}`nemotron_parse_v1_1.yaml <../../../../examples/vlm_finetune/nemotron/nemotron_parse_v1_1.yaml>` | cord-v2 | SFT — Nemotron-Parse on CORD-v2 |
 
 
 ## Try with NeMo AutoModel

@@ -31,8 +31,8 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`phi_2_squad.yaml <../../../examples/llm_finetune/phi/phi_2_squad.yaml>` | SFT — Phi-2 on SQuAD |
-| {download}`phi_2_squad_peft.yaml <../../../examples/llm_finetune/phi/phi_2_squad_peft.yaml>` | LoRA — Phi-2 on SQuAD |
+| {download}`phi_2_squad.yaml <../../../../examples/llm_finetune/phi/phi_2_squad.yaml>` | SFT — Phi-2 on SQuAD |
+| {download}`phi_2_squad_peft.yaml <../../../../examples/llm_finetune/phi/phi_2_squad_peft.yaml>` | LoRA — Phi-2 on SQuAD |
 
 
 ## Try with NeMo AutoModel

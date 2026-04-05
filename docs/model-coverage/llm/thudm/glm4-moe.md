@@ -34,10 +34,10 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`glm_4.5_air_te_deepep.yaml <../../../examples/llm_finetune/glm/glm_4.5_air_te_deepep.yaml>` | SFT — GLM-4.5-Air with TE + DeepEP |
-| {download}`glm_4.7_te_deepep.yaml <../../../examples/llm_finetune/glm/glm_4.7_te_deepep.yaml>` | SFT — GLM-4.7 with TE + DeepEP |
-| {download}`glm_4.7_flash_te_deepep.yaml <../../../examples/llm_finetune/glm/glm_4.7_flash_te_deepep.yaml>` | SFT — GLM-4.7-Flash with TE + DeepEP |
-| {download}`glm_4.7_flash_te_packed_sequence.yaml <../../../examples/llm_finetune/glm/glm_4.7_flash_te_packed_sequence.yaml>` | SFT — GLM-4.7-Flash with packed sequences |
+| {download}`glm_4.5_air_te_deepep.yaml <../../../../examples/llm_finetune/glm/glm_4.5_air_te_deepep.yaml>` | SFT — GLM-4.5-Air with TE + DeepEP |
+| {download}`glm_4.7_te_deepep.yaml <../../../../examples/llm_finetune/glm/glm_4.7_te_deepep.yaml>` | SFT — GLM-4.7 with TE + DeepEP |
+| {download}`glm_4.7_flash_te_deepep.yaml <../../../../examples/llm_finetune/glm/glm_4.7_flash_te_deepep.yaml>` | SFT — GLM-4.7-Flash with TE + DeepEP |
+| {download}`glm_4.7_flash_te_packed_sequence.yaml <../../../../examples/llm_finetune/glm/glm_4.7_flash_te_packed_sequence.yaml>` | SFT — GLM-4.7-Flash with packed sequences |
 
 
 ## Try with NeMo AutoModel

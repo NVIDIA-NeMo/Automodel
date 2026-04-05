@@ -33,10 +33,10 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`nemotron_nano_9b_squad.yaml <../../../examples/llm_finetune/nemotron/nemotron_nano_9b_squad.yaml>` | SFT — Nemotron-Nano 9B on SQuAD |
-| {download}`nemotron_nano_9b_squad_peft.yaml <../../../examples/llm_finetune/nemotron/nemotron_nano_9b_squad_peft.yaml>` | LoRA — Nemotron-Nano 9B on SQuAD |
-| {download}`nemotron_nano_v3_hellaswag.yaml <../../../examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml>` | SFT — Nemotron-3-Nano 30B on HellaSwag |
-| {download}`nemotron_nano_v3_hellaswag_peft.yaml <../../../examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag_peft.yaml>` | LoRA — Nemotron-3-Nano 30B on HellaSwag |
+| {download}`nemotron_nano_9b_squad.yaml <../../../../examples/llm_finetune/nemotron/nemotron_nano_9b_squad.yaml>` | SFT — Nemotron-Nano 9B on SQuAD |
+| {download}`nemotron_nano_9b_squad_peft.yaml <../../../../examples/llm_finetune/nemotron/nemotron_nano_9b_squad_peft.yaml>` | LoRA — Nemotron-Nano 9B on SQuAD |
+| {download}`nemotron_nano_v3_hellaswag.yaml <../../../../examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml>` | SFT — Nemotron-3-Nano 30B on HellaSwag |
+| {download}`nemotron_nano_v3_hellaswag_peft.yaml <../../../../examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag_peft.yaml>` | LoRA — Nemotron-3-Nano 30B on HellaSwag |
 
 
 ## Try with NeMo AutoModel

@@ -34,8 +34,8 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`falcon3_7b_instruct_squad.yaml <../../../examples/llm_finetune/falcon/falcon3_7b_instruct_squad.yaml>` | SFT — Falcon3 7B Instruct on SQuAD |
-| {download}`falcon3_7b_instruct_squad_peft.yaml <../../../examples/llm_finetune/falcon/falcon3_7b_instruct_squad_peft.yaml>` | LoRA — Falcon3 7B Instruct on SQuAD |
+| {download}`falcon3_7b_instruct_squad.yaml <../../../../examples/llm_finetune/falcon/falcon3_7b_instruct_squad.yaml>` | SFT — Falcon3 7B Instruct on SQuAD |
+| {download}`falcon3_7b_instruct_squad_peft.yaml <../../../../examples/llm_finetune/falcon/falcon3_7b_instruct_squad_peft.yaml>` | LoRA — Falcon3 7B Instruct on SQuAD |
 
 
 ## Try with NeMo AutoModel

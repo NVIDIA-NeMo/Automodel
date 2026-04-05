@@ -26,10 +26,10 @@ Qwen3.5-VL is Alibaba Cloud's next-generation vision language model series, incl
 
 | Recipe | Dataset | Description |
 |---|---|---|
-| {download}`qwen3_5_4b.yaml <../../../examples/vlm_finetune/qwen3_5/qwen3_5_4b.yaml>` | MedPix-VQA | SFT — Qwen3.5-VL 4B on MedPix |
-| {download}`qwen3_5_9b.yaml <../../../examples/vlm_finetune/qwen3_5/qwen3_5_9b.yaml>` | MedPix-VQA | SFT — Qwen3.5-VL 9B on MedPix |
-| {download}`qwen3_5_moe_medpix.yaml <../../../examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml>` | MedPix-VQA | SFT — Qwen3.5-MoE on MedPix |
-| {download}`qwen3_5_35b.yaml <../../../examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml>` | MedPix-VQA | SFT — Qwen3.5 35B on MedPix |
+| {download}`qwen3_5_4b.yaml <../../../../examples/vlm_finetune/qwen3_5/qwen3_5_4b.yaml>` | MedPix-VQA | SFT — Qwen3.5-VL 4B on MedPix |
+| {download}`qwen3_5_9b.yaml <../../../../examples/vlm_finetune/qwen3_5/qwen3_5_9b.yaml>` | MedPix-VQA | SFT — Qwen3.5-VL 9B on MedPix |
+| {download}`qwen3_5_moe_medpix.yaml <../../../../examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml>` | MedPix-VQA | SFT — Qwen3.5-MoE on MedPix |
+| {download}`qwen3_5_35b.yaml <../../../../examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml>` | MedPix-VQA | SFT — Qwen3.5 35B on MedPix |
 
 
 ## Try with NeMo AutoModel

@@ -31,8 +31,8 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`qwen3_0p6b_hellaswag.yaml <../../../examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml>` | SFT — Qwen3 0.6B on HellaSwag |
-| {download}`qwen3_8b_squad_spark.yaml <../../../examples/llm_finetune/qwen/qwen3_8b_squad_spark.yaml>` | SFT — Qwen3 8B on SQuAD (Spark) |
+| {download}`qwen3_0p6b_hellaswag.yaml <../../../../examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml>` | SFT — Qwen3 0.6B on HellaSwag |
+| {download}`qwen3_8b_squad_spark.yaml <../../../../examples/llm_finetune/qwen/qwen3_8b_squad_spark.yaml>` | SFT — Qwen3 8B on SQuAD (Spark) |
 
 
 ## Try with NeMo AutoModel

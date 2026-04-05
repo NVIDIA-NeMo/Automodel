@@ -33,8 +33,8 @@ This model requires `trust_remote_code: true` in your recipe YAML.
 
 | Recipe | Description |
 |---|---|
-| {download}`nemotron_flash_1b_squad.yaml <../../../examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml>` | SFT — Nemotron-Flash 1B on SQuAD |
-| {download}`nemotron_flash_1b_squad_peft.yaml <../../../examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad_peft.yaml>` | LoRA — Nemotron-Flash 1B on SQuAD |
+| {download}`nemotron_flash_1b_squad.yaml <../../../../examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml>` | SFT — Nemotron-Flash 1B on SQuAD |
+| {download}`nemotron_flash_1b_squad_peft.yaml <../../../../examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad_peft.yaml>` | LoRA — Nemotron-Flash 1B on SQuAD |
 
 
 ## Try with NeMo AutoModel

@@ -30,7 +30,7 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`qwen1_5_moe_a2_7b_qlora.yaml <../../../examples/llm_finetune/qwen/qwen1_5_moe_a2_7b_qlora.yaml>` | QLoRA — Qwen1.5 MoE A2.7B |
+| {download}`qwen1_5_moe_a2_7b_qlora.yaml <../../../../examples/llm_finetune/qwen/qwen1_5_moe_a2_7b_qlora.yaml>` | QLoRA — Qwen1.5 MoE A2.7B |
 
 
 ## Try with NeMo AutoModel

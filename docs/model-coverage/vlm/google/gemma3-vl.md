@@ -32,12 +32,12 @@
 
 | Recipe | Dataset | Description |
 |---|---|---|
-| {download}`gemma3_vl_4b_cord_v2.yaml <../../../examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml>` | cord-v2 | SFT — Gemma 3 4B VL on CORD-v2 |
-| {download}`gemma3_vl_4b_cord_v2_peft.yaml <../../../examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml>` | cord-v2 | LoRA — Gemma 3 4B VL on CORD-v2 |
-| {download}`gemma3_vl_4b_cord_v2_megatron_fsdp.yaml <../../../examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_megatron_fsdp.yaml>` | cord-v2 | SFT — Gemma 3 4B VL with MegatronFSDP |
-| {download}`gemma3_vl_4b_medpix.yaml <../../../examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml>` | MedPix-VQA | SFT — Gemma 3 4B VL on MedPix |
-| {download}`gemma3n_vl_4b_medpix.yaml <../../../examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml>` | MedPix-VQA | SFT — Gemma 3n 4B VL on MedPix |
-| {download}`gemma3n_vl_4b_medpix_peft.yaml <../../../examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix_peft.yaml>` | MedPix-VQA | LoRA — Gemma 3n 4B VL on MedPix |
+| {download}`gemma3_vl_4b_cord_v2.yaml <../../../../examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml>` | cord-v2 | SFT — Gemma 3 4B VL on CORD-v2 |
+| {download}`gemma3_vl_4b_cord_v2_peft.yaml <../../../../examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml>` | cord-v2 | LoRA — Gemma 3 4B VL on CORD-v2 |
+| {download}`gemma3_vl_4b_cord_v2_megatron_fsdp.yaml <../../../../examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_megatron_fsdp.yaml>` | cord-v2 | SFT — Gemma 3 4B VL with MegatronFSDP |
+| {download}`gemma3_vl_4b_medpix.yaml <../../../../examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml>` | MedPix-VQA | SFT — Gemma 3 4B VL on MedPix |
+| {download}`gemma3n_vl_4b_medpix.yaml <../../../../examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml>` | MedPix-VQA | SFT — Gemma 3n 4B VL on MedPix |
+| {download}`gemma3n_vl_4b_medpix_peft.yaml <../../../../examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix_peft.yaml>` | MedPix-VQA | LoRA — Gemma 3n 4B VL on MedPix |
 
 
 ## Try with NeMo AutoModel

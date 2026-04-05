@@ -29,8 +29,8 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`moonlight_16b_te.yaml <../../../examples/llm_finetune/moonlight/moonlight_16b_te.yaml>` | SFT — Moonlight 16B with Transformer Engine |
-| {download}`moonlight_16b_te_packed_sequence.yaml <../../../examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml>` | SFT — Moonlight 16B with packed sequences |
+| {download}`moonlight_16b_te.yaml <../../../../examples/llm_finetune/moonlight/moonlight_16b_te.yaml>` | SFT — Moonlight 16B with Transformer Engine |
+| {download}`moonlight_16b_te_packed_sequence.yaml <../../../../examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml>` | SFT — Moonlight 16B with packed sequences |
 
 
 ## Try with NeMo AutoModel

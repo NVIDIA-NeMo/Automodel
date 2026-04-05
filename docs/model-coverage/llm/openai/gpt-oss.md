@@ -31,8 +31,8 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`gpt_oss_20b.yaml <../../../examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml>` | SFT — GPT-OSS 20B |
-| {download}`gpt_oss_120b.yaml <../../../examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml>` | SFT — GPT-OSS 120B |
+| {download}`gpt_oss_20b.yaml <../../../../examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml>` | SFT — GPT-OSS 20B |
+| {download}`gpt_oss_120b.yaml <../../../../examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml>` | SFT — GPT-OSS 120B |
 
 
 ## Try with NeMo AutoModel

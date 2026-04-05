@@ -29,7 +29,7 @@
 
 | Recipe | Dataset | Description |
 |---|---|---|
-| {download}`qwen3_omni_moe_30b_te_deepep.yaml <../../../examples/vlm_finetune/qwen3/qwen3_omni_moe_30b_te_deepep.yaml>` | MedPix-VQA | SFT — Qwen3-Omni 30B with TE + DeepEP |
+| {download}`qwen3_omni_moe_30b_te_deepep.yaml <../../../../examples/vlm_finetune/qwen3/qwen3_omni_moe_30b_te_deepep.yaml>` | MedPix-VQA | SFT — Qwen3-Omni 30B with TE + DeepEP |
 
 
 ## Try with NeMo AutoModel

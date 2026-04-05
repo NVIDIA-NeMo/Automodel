@@ -33,10 +33,10 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`mistral_7b_squad.yaml <../../../examples/llm_finetune/mistral/mistral_7b_squad.yaml>` | SFT — Mistral 7B on SQuAD |
-| {download}`mistral_7b_squad_peft.yaml <../../../examples/llm_finetune/mistral/mistral_7b_squad_peft.yaml>` | LoRA — Mistral 7B on SQuAD |
-| {download}`mistral_nemo_2407_squad.yaml <../../../examples/llm_finetune/mistral/mistral_nemo_2407_squad.yaml>` | SFT — Mistral Nemo 2407 on SQuAD |
-| {download}`mistral_nemo_2407_squad_peft.yaml <../../../examples/llm_finetune/mistral/mistral_nemo_2407_squad_peft.yaml>` | LoRA — Mistral Nemo 2407 on SQuAD |
+| {download}`mistral_7b_squad.yaml <../../../../examples/llm_finetune/mistral/mistral_7b_squad.yaml>` | SFT — Mistral 7B on SQuAD |
+| {download}`mistral_7b_squad_peft.yaml <../../../../examples/llm_finetune/mistral/mistral_7b_squad_peft.yaml>` | LoRA — Mistral 7B on SQuAD |
+| {download}`mistral_nemo_2407_squad.yaml <../../../../examples/llm_finetune/mistral/mistral_nemo_2407_squad.yaml>` | SFT — Mistral Nemo 2407 on SQuAD |
+| {download}`mistral_nemo_2407_squad_peft.yaml <../../../../examples/llm_finetune/mistral/mistral_nemo_2407_squad_peft.yaml>` | LoRA — Mistral Nemo 2407 on SQuAD |
 
 
 ## Try with NeMo AutoModel
