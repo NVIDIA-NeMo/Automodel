@@ -2,6 +2,15 @@
 
 [StarCoder2](https://huggingface.co/blog/starcoder2) is BigCode's second-generation code language model, available in 3B, 7B, and 15B sizes, trained on 600+ programming languages from The Stack v2.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Code Generation |
+| **Architecture** | `Starcoder2ForCausalLM` |
+| **Parameters** | 3B – 15B |
+| **HF Org** | [bigcode](https://huggingface.co/bigcode) |
+:::
+
 ## Available Models
 
 - **starcoder2-3b**: 3B
@@ -33,4 +42,4 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/bigcode/starcoder2-7b
+- [bigcode/starcoder2-7b](https://huggingface.co/bigcode/starcoder2-7b)

@@ -2,6 +2,15 @@
 
 [OLMo2](https://allenai.org/olmo) is Allen AI's second-generation open language model with improved architecture and training, including RMSNorm and rotary position embeddings.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `OLMo2ForCausalLM` |
+| **Parameters** | 1B – 13B |
+| **HF Org** | [allenai](https://huggingface.co/allenai) |
+:::
+
 ## Available Models
 
 - **OLMo2-0425-1B-Instruct**
@@ -32,4 +41,4 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/allenai/OLMo2-7B-1124
+- [allenai/OLMo2-7B-1124](https://huggingface.co/allenai/OLMo2-7B-1124)

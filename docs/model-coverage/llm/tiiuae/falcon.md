@@ -2,6 +2,15 @@
 
 [Falcon](https://falconllm.tii.ae/) is a series of open language models from the Technology Innovation Institute (TII) in Abu Dhabi, known for being trained on a high-quality curated web corpus (RefinedWeb).
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `FalconForCausalLM` |
+| **Parameters** | 7B – 40B |
+| **HF Org** | [tiiuae](https://huggingface.co/tiiuae) |
+:::
+
 ## Available Models
 
 - **Falcon-40B**, **Falcon-40B-Instruct**
@@ -34,5 +43,5 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/tiiuae/falcon-7b
-- https://huggingface.co/tiiuae/falcon-40b
+- [tiiuae/falcon-7b](https://huggingface.co/tiiuae/falcon-7b)
+- [tiiuae/falcon-40b](https://huggingface.co/tiiuae/falcon-40b)

@@ -2,6 +2,15 @@
 
 [Kimi-VL](https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct) and Kimi-K25-VL are vision language models from Moonshot AI. Kimi-VL-A3B uses a MoE language backbone (3B active parameters) with a vision encoder, supporting image understanding and multimodal reasoning.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Image-Text-to-Text |
+| **Architecture** | `KimiVLForConditionalGeneration` |
+| **Parameters** | ~3B active (MoE) |
+| **HF Org** | [moonshotai](https://huggingface.co/moonshotai) |
+:::
+
 ## Available Models
 
 - **Kimi-VL-A3B-Instruct**
@@ -30,4 +39,4 @@ See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct
+- [moonshotai/Kimi-VL-A3B-Instruct](https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct)

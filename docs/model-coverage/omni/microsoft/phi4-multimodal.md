@@ -2,6 +2,15 @@
 
 [Phi-4-multimodal-instruct](https://huggingface.co/microsoft/Phi-4-multimodal-instruct) is Microsoft's multimodal extension of Phi-4, supporting text, image, and audio inputs — making it suitable for speech, vision, and combined multimodal tasks.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Omnimodal (Text·Image·Audio) |
+| **Architecture** | `Phi4MultimodalForCausalLM` |
+| **Parameters** | 5.6B |
+| **HF Org** | [microsoft](https://huggingface.co/microsoft) |
+:::
+
 ## Available Models
 
 - **Phi-4-multimodal-instruct**: 5.6B
@@ -28,4 +37,4 @@ See the [VLM / Omni Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/microsoft/Phi-4-multimodal-instruct
+- [microsoft/Phi-4-multimodal-instruct](https://huggingface.co/microsoft/Phi-4-multimodal-instruct)

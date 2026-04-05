@@ -2,6 +2,15 @@
 
 Qwen3-Next is an advanced MoE language model from Alibaba Cloud's Qwen team designed for high-throughput inference with large total parameter counts and efficient per-token activation.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation (MoE) |
+| **Architecture** | `Qwen3NextForCausalLM` |
+| **Parameters** | 80B total / 3B active |
+| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
+:::
+
 ## Available Models
 
 - **Qwen3-Next-80B-A3B**: 80B total parameters, 3B activated per token
@@ -28,4 +37,4 @@ See the [Large MoE Fine-Tuning Guide](../../../guides/llm/large_moe_finetune.md)
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct
+- [Qwen/Qwen3-Next-80B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct)

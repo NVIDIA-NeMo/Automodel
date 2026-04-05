@@ -2,6 +2,15 @@
 
 [Wan 2.1](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) is a text-to-video diffusion model from Wan AI, trained with flow matching on a large-scale video dataset. It generates high-quality short video clips from text prompts.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text-to-Video |
+| **Architecture** | DiT (Flow Matching) |
+| **Parameters** | 1.3B |
+| **HF Org** | [Wan-AI](https://huggingface.co/Wan-AI) |
+:::
+
 ## Available Models
 
 - **Wan2.1-T2V-1.3B**: 1.3B parameters
@@ -29,4 +38,4 @@ See the [Diffusion Training and Fine-Tuning Guide](../../../guides/diffusion/fin
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+- [Wan-AI/Wan2.1-T2V-1.3B-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers)

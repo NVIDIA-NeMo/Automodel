@@ -2,6 +2,15 @@
 
 [Mistral AI](https://mistral.ai/) models are efficient transformer decoder models featuring sliding window attention for long context support. Mistral-Nemo is a 12B model developed jointly with NVIDIA.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `MistralForCausalLM` |
+| **Parameters** | 7B – 12B |
+| **HF Org** | [mistralai](https://huggingface.co/mistralai) |
+:::
+
 ## Available Models
 
 - **Mistral-7B**: v0.1, v0.2, v0.3
@@ -35,5 +44,5 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/mistralai/Mistral-7B-v0.1
-- https://huggingface.co/mistralai/Mistral-Nemo-Instruct-2407
+- [mistralai/Mistral-7B-v0.1](https://huggingface.co/mistralai/Mistral-7B-v0.1)
+- [mistralai/Mistral-Nemo-Instruct-2407](https://huggingface.co/mistralai/Mistral-Nemo-Instruct-2407)

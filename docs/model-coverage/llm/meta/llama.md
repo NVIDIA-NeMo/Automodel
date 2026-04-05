@@ -2,6 +2,15 @@
 
 [Meta's Llama](https://www.llama.com/) is a family of open-weight autoregressive language models built on the transformer decoder architecture. Key design choices include pre-normalization with RMSNorm, SwiGLU activations, and Rotary Positional Embeddings (RoPE). Llama 3+ models add Grouped Query Attention (GQA) for memory-efficient inference at larger scales.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `LlamaForCausalLM` |
+| **Parameters** | 1B – 405B |
+| **HF Org** | [meta-llama](https://huggingface.co/meta-llama) |
+:::
+
 ## Available Models
 
 - **Llama 3.2**: 1B, 3B
@@ -42,6 +51,6 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) for full SFT an
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/meta-llama/Meta-Llama-3.1-8B
-- https://huggingface.co/meta-llama/Meta-Llama-3.1-70B
-- https://huggingface.co/meta-llama/Llama-3.2-1B
+- [meta-llama/Meta-Llama-3.1-8B](https://huggingface.co/meta-llama/Meta-Llama-3.1-8B)
+- [meta-llama/Meta-Llama-3.1-70B](https://huggingface.co/meta-llama/Meta-Llama-3.1-70B)
+- [meta-llama/Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B)

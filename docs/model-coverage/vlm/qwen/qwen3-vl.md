@@ -2,6 +2,15 @@
 
 [Qwen3-VL](https://qwenlm.github.io/blog/qwen3/) is Alibaba Cloud's third-generation vision language model series. The MoE variant activates a fraction of parameters per token for efficient large-scale inference.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Image-Text-to-Text |
+| **Architecture** | `Qwen3VLForConditionalGeneration` |
+| **Parameters** | 4B – 235B |
+| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
+:::
+
 ## Available Models
 
 - **Qwen3-VL-8B-Instruct**: 8B
@@ -35,5 +44,5 @@ See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct
-- https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct
+- [Qwen/Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct)
+- [Qwen/Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct)

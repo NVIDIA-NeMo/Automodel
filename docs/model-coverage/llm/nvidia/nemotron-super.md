@@ -2,6 +2,15 @@
 
 [Llama-3.3-Nemotron-Super-49B-v1](https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1) is a NVIDIA model derived from Llama-3.1-70B through Neural Architecture Search (NAS)-based pruning and knowledge distillation, resulting in a 49B model with strong reasoning capabilities. It uses the `DeciLMForCausalLM` architecture.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `DeciLMForCausalLM` |
+| **Parameters** | 49B |
+| **HF Org** | [nvidia](https://huggingface.co/nvidia) |
+:::
+
 ## Available Models
 
 - **Llama-3.3-Nemotron-Super-49B-v1**: 49B parameters
@@ -22,4 +31,4 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1
+- [nvidia/Llama-3_3-Nemotron-Super-49B-v1](https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1)

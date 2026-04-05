@@ -2,6 +2,15 @@
 
 [InternVL](https://github.com/OpenGVLab/InternVL) is a vision language model from Shanghai AI Laboratory (OpenGVLab), combining a large vision encoder with an InternLM language backbone for strong multimodal performance.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Image-Text-to-Text |
+| **Architecture** | `InternVLForConditionalGeneration` |
+| **Parameters** | 4B – 8B |
+| **HF Org** | [OpenGVLab](https://huggingface.co/OpenGVLab) |
+:::
+
 ## Available Models
 
 - **InternVL3.5-4B**
@@ -29,4 +38,4 @@ See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/OpenGVLab/InternVL3-5-4B
+- [OpenGVLab/InternVL3-5-4B](https://huggingface.co/OpenGVLab/InternVL3-5-4B)

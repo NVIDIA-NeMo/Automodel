@@ -2,6 +2,15 @@
 
 Qwen3.5-VL is Alibaba Cloud's next-generation vision language model series, including dense and MoE variants for image and multimodal understanding tasks.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Image-Text-to-Text |
+| **Architecture** | `Qwen3_5VLForConditionalGeneration` |
+| **Parameters** | 4B – 35B+ |
+| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
+:::
+
 ## Available Models
 
 - **Qwen3.5-VL-4B**: 4B dense model
@@ -28,4 +37,4 @@ See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/Qwen
+- [Qwen](https://huggingface.co/Qwen)

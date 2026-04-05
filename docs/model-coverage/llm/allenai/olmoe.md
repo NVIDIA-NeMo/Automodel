@@ -2,6 +2,15 @@
 
 [OLMoE](https://allenai.org/olmo) is Allen AI's open Mixture-of-Experts language model. It activates 1B parameters per token from a 7B total parameter pool.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation (MoE) |
+| **Architecture** | `OLMoEForCausalLM` |
+| **Parameters** | 7B total / 1B active |
+| **HF Org** | [allenai](https://huggingface.co/allenai) |
+:::
+
 ## Available Models
 
 - **OLMoE-1B-7B-0924**: 7B total, 1B activated
@@ -24,4 +33,4 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/allenai/OLMoE-1B-7B-0924
+- [allenai/OLMoE-1B-7B-0924](https://huggingface.co/allenai/OLMoE-1B-7B-0924)

@@ -2,6 +2,15 @@
 
 [Llama 4](https://ai.meta.com/blog/llama-4-multimodal-intelligence/) is Meta's first natively multimodal model family. Llama 4 Scout and Maverick are MoE models supporting interleaved image and text inputs.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Image-Text-to-Text |
+| **Architecture** | `Llama4ForConditionalGeneration` |
+| **Parameters** | 17B active (MoE) |
+| **HF Org** | [meta-llama](https://huggingface.co/meta-llama) |
+:::
+
 ## Available Models
 
 - **Llama-4-Scout-17B-16E-Instruct**: 17B active / 16 experts
@@ -24,5 +33,5 @@ See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct
-- https://huggingface.co/meta-llama/Llama-4-Maverick-17B-128E-Instruct
+- [meta-llama/Llama-4-Scout-17B-16E-Instruct](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct)
+- [meta-llama/Llama-4-Maverick-17B-128E-Instruct](https://huggingface.co/meta-llama/Llama-4-Maverick-17B-128E-Instruct)

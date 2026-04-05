@@ -2,6 +2,15 @@
 
 [Bamba](https://huggingface.co/ibm-ai-platform/Bamba-9B) is a hybrid SSM-attention language model from IBM, combining Mamba-2 selective state space layers with standard transformer attention for efficient long-context processing.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `BambaForCausalLM` |
+| **Parameters** | 9B |
+| **HF Org** | [ibm-ai-platform](https://huggingface.co/ibm-ai-platform) |
+:::
+
 ## Available Models
 
 - **Bamba-9B**: 9B parameters
@@ -22,4 +31,4 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/ibm-ai-platform/Bamba-9B
+- [ibm-ai-platform/Bamba-9B](https://huggingface.co/ibm-ai-platform/Bamba-9B)

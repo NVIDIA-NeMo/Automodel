@@ -2,6 +2,15 @@
 
 IBM Granite MoE models extend the Granite architecture with Mixture-of-Experts layers for more efficient scaling. PowerMoE (IBM Research) also uses this architecture.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation (MoE) |
+| **Architecture** | `GraniteMoeForCausalLM` |
+| **Parameters** | 1B – 3B |
+| **HF Org** | [ibm-granite](https://huggingface.co/ibm-granite) |
+:::
+
 ## Available Models
 
 - **Granite 3.0 1B A400M Base** — 1B total, 400M activated
@@ -28,5 +37,5 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/ibm-granite/granite-3.0-1b-a400m-base
-- https://huggingface.co/ibm/PowerMoE-3b
+- [ibm-granite/granite-3.0-1b-a400m-base](https://huggingface.co/ibm-granite/granite-3.0-1b-a400m-base)
+- [ibm/PowerMoE-3b](https://huggingface.co/ibm/PowerMoE-3b)

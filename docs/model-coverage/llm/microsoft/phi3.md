@@ -2,6 +2,15 @@
 
 [Phi-3](https://azure.microsoft.com/en-us/products/phi) and [Phi-4](https://azure.microsoft.com/en-us/products/phi) are Microsoft's high-capability small language models using a shared transformer decoder architecture (`Phi3ForCausalLM`). Phi-4-mini and Phi-4 achieve strong benchmark results at relatively small parameter counts.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `Phi3ForCausalLM` |
+| **Parameters** | 3.8B – 14B |
+| **HF Org** | [microsoft](https://huggingface.co/microsoft) |
+:::
+
 ## Available Models
 
 - **Phi-4**: 14B
@@ -40,6 +49,6 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/microsoft/Phi-4
-- https://huggingface.co/microsoft/Phi-4-mini-instruct
-- https://huggingface.co/microsoft/Phi-3-mini-4k-instruct
+- [microsoft/Phi-4](https://huggingface.co/microsoft/Phi-4)
+- [microsoft/Phi-4-mini-instruct](https://huggingface.co/microsoft/Phi-4-mini-instruct)
+- [microsoft/Phi-3-mini-4k-instruct](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct)

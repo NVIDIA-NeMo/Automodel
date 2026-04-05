@@ -2,6 +2,15 @@
 
 [Qwen1.5-MoE](https://qwenlm.github.io/) is a Mixture-of-Experts variant from Alibaba Cloud that activates only a fraction of parameters per token, enabling efficient training and inference at scale.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation (MoE) |
+| **Architecture** | `Qwen2MoeForCausalLM` |
+| **Parameters** | 14.3B total / 2.7B active |
+| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
+:::
+
 ## Available Models
 
 - **Qwen1.5-MoE-A2.7B**: 14.3B total parameters, 2.7B activated per token
@@ -29,4 +38,4 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) and the [Large 
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B
+- [Qwen/Qwen1.5-MoE-A2.7B](https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B)

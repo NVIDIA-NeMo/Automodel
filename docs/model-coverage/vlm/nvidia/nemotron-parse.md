@@ -2,6 +2,15 @@
 
 [Nemotron-Parse-v1.1](https://huggingface.co/nvidia/Nemotron-Parse-v1.1) is NVIDIA's document parsing VLM, specializing in extracting structured information from complex documents including tables, forms, and mixed-content PDFs.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Document Parsing |
+| **Architecture** | `NemotronParseForConditionalGeneration` |
+| **Parameters** | varies |
+| **HF Org** | [nvidia](https://huggingface.co/nvidia) |
+:::
+
 ## Available Models
 
 - **Nemotron-Parse-v1.1**
@@ -28,4 +37,4 @@ See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/nvidia/Nemotron-Parse-v1.1
+- [nvidia/Nemotron-Parse-v1.1](https://huggingface.co/nvidia/Nemotron-Parse-v1.1)

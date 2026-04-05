@@ -2,6 +2,15 @@
 
 [Google's Gemma](https://ai.google.dev/gemma) is a family of open-weight language models built on the same research and technology as Gemini. Gemma models are available in multiple sizes and versions, with improvements in each generation including local sliding window attention (Gemma 2) and interleaved global/local attention (Gemma 3).
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `GemmaForCausalLM` / `Gemma2ForCausalLM` / `Gemma3ForCausalLM` |
+| **Parameters** | 1B – 27B |
+| **HF Org** | [google](https://huggingface.co/google) |
+:::
+
 ## Available Models
 
 - **Gemma 3**: 1B, 4B, 12B, 27B
@@ -41,6 +50,6 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) for full SFT an
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/google/gemma-2b
-- https://huggingface.co/google/gemma-2-9b-it
-- https://huggingface.co/google/gemma-3-1b-it
+- [google/gemma-2b](https://huggingface.co/google/gemma-2b)
+- [google/gemma-2-9b-it](https://huggingface.co/google/gemma-2-9b-it)
+- [google/gemma-3-1b-it](https://huggingface.co/google/gemma-3-1b-it)

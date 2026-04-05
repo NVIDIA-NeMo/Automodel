@@ -2,6 +2,15 @@
 
 [Qwen3 MoE](https://qwenlm.github.io/blog/qwen3/) is the Mixture-of-Experts variant of the Qwen3 series from Alibaba Cloud, activating a small fraction of parameters per token for efficient large-scale training.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation (MoE) |
+| **Architecture** | `Qwen3MoeForCausalLM` |
+| **Parameters** | 30B – 235B total |
+| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
+:::
+
 ## Available Models
 
 - **Qwen3-30B-A3B**: 30B total parameters, 3B activated per token
@@ -31,5 +40,5 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) and the [Large 
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/Qwen/Qwen3-30B-A3B
-- https://huggingface.co/Qwen/Qwen3-235B-A22B
+- [Qwen/Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B)
+- [Qwen/Qwen3-235B-A22B](https://huggingface.co/Qwen/Qwen3-235B-A22B)

@@ -2,6 +2,15 @@
 
 [MiniMax-M2](https://huggingface.co/MiniMaxAI) is MiniMax's large Mixture-of-Experts language model with linear attention for efficient long-context inference.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation (MoE) |
+| **Architecture** | `MiniMaxM2ForCausalLM` |
+| **Parameters** | varies |
+| **HF Org** | [MiniMaxAI](https://huggingface.co/MiniMaxAI) |
+:::
+
 ## Available Models
 
 - **MiniMax-M2.1**
@@ -31,4 +40,4 @@ See the [Large MoE Fine-Tuning Guide](../../../guides/llm/large_moe_finetune.md)
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/MiniMaxAI/MiniMax-M2.1
+- [MiniMaxAI/MiniMax-M2.1](https://huggingface.co/MiniMaxAI/MiniMax-M2.1)

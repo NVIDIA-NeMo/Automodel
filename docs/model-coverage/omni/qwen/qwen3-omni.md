@@ -2,6 +2,15 @@
 
 [Qwen3-Omni](https://qwenlm.github.io/blog/qwen3/) is Alibaba Cloud's omnimodal model supporting text, image, audio, and video inputs in a single unified architecture with a MoE language backbone.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Omnimodal (Text·Image·Audio·Video) |
+| **Architecture** | `Qwen3OmniForConditionalGeneration` |
+| **Parameters** | 30B total / 3B active |
+| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
+:::
+
 ## Available Models
 
 - **Qwen3-Omni-30B-A3B**: 30B total, 3B activated (MoE)
@@ -28,4 +37,4 @@ See the [VLM / Omni Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B
+- [Qwen/Qwen3-Omni-30B-A3B](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B)

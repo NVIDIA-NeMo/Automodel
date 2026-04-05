@@ -2,6 +2,15 @@
 
 [Seed-Coder](https://huggingface.co/ByteDance-Seed/Seed-Coder-8B-Instruct) and [Seed-OSS](https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct) are open-weight models from ByteDance. Both use the `Qwen2ForCausalLM` architecture under the hood.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `Qwen2ForCausalLM` |
+| **Parameters** | 8B – 36B |
+| **HF Org** | [ByteDance-Seed](https://huggingface.co/ByteDance-Seed) |
+:::
+
 ## Available Models
 
 - **Seed-Coder-8B-Instruct**: 8B code model
@@ -33,5 +42,5 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/ByteDance-Seed/Seed-Coder-8B-Instruct
-- https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct
+- [ByteDance-Seed/Seed-Coder-8B-Instruct](https://huggingface.co/ByteDance-Seed/Seed-Coder-8B-Instruct)
+- [ByteDance-Seed/Seed-OSS-36B-Instruct](https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct)

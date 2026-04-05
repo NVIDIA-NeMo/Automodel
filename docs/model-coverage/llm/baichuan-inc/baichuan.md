@@ -2,6 +2,15 @@
 
 [Baichuan](https://github.com/baichuan-inc/Baichuan2) is a Chinese-English bilingual language model series from Baichuan Inc., featuring strong Chinese language performance.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `BaiChuanForCausalLM` |
+| **Parameters** | 7B – 13B |
+| **HF Org** | [baichuan-inc](https://huggingface.co/baichuan-inc) |
+:::
+
 ## Available Models
 
 - **Baichuan2-13B-Chat**
@@ -32,4 +41,4 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/baichuan-inc/Baichuan2-13B-Chat
+- [baichuan-inc/Baichuan2-13B-Chat](https://huggingface.co/baichuan-inc/Baichuan2-13B-Chat)

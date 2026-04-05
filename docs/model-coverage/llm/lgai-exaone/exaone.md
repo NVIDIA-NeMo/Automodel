@@ -2,6 +2,15 @@
 
 [EXAONE](https://www.lgresearch.ai/exaone) is a bilingual (Korean-English) language model series from LG AI Research, with strong performance on Korean-language benchmarks.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `ExaoneForCausalLM` |
+| **Parameters** | 7.8B |
+| **HF Org** | [LGAI-EXAONE](https://huggingface.co/LGAI-EXAONE) |
+:::
+
 ## Available Models
 
 - **EXAONE-3.0-7.8B-Instruct**
@@ -23,4 +32,4 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct
+- [LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct](https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct)

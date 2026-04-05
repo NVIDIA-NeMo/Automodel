@@ -2,6 +2,15 @@
 
 [HunyuanVideo 1.5](https://huggingface.co/hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v) is a 13B parameter text-to-video diffusion model from the Hunyuan community, supporting 720p resolution video generation with flow matching training.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text-to-Video |
+| **Architecture** | DiT (Flow Matching) |
+| **Parameters** | 13B |
+| **HF Org** | [hunyuanvideo-community](https://huggingface.co/hunyuanvideo-community) |
+:::
+
 ## Available Models
 
 - **HunyuanVideo-1.5-Diffusers-720p_t2v**: 13B parameters
@@ -28,4 +37,4 @@ See the [Diffusion Training and Fine-Tuning Guide](../../../guides/diffusion/fin
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v
+- [hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v](https://huggingface.co/hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v)

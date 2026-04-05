@@ -2,6 +2,15 @@
 
 [Jais](https://huggingface.co/inceptionai/jais-13b) is an Arabic-English bilingual language model from Inception (formerly G42/Inception AI), trained on a large Arabic and English corpus.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `JAISLMHeadModel` |
+| **Parameters** | 13B – 30B |
+| **HF Org** | [inceptionai](https://huggingface.co/inceptionai) |
+:::
+
 ## Available Models
 
 - **jais-30b-chat-v3**: 30B
@@ -28,4 +37,4 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/inceptionai/jais-13b
+- [inceptionai/jais-13b](https://huggingface.co/inceptionai/jais-13b)

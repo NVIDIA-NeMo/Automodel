@@ -2,6 +2,15 @@
 
 [GPT-OSS](https://huggingface.co/openai/gpt-oss-20b) is OpenAI's open-weight model family featuring QuickGELU activations and activation clamping for training stability.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `GptOssForCausalLM` |
+| **Parameters** | 20B – 120B |
+| **HF Org** | [openai](https://huggingface.co/openai) |
+:::
+
 ## Available Models
 
 - **gpt-oss-20b**: 20B parameters
@@ -31,5 +40,5 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/openai/gpt-oss-20b
-- https://huggingface.co/openai/gpt-oss-120b
+- [openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b)
+- [openai/gpt-oss-120b](https://huggingface.co/openai/gpt-oss-120b)

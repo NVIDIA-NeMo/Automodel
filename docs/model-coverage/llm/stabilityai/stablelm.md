@@ -2,6 +2,15 @@
 
 [StableLM](https://stability.ai/stable-lm) is Stability AI's series of open language models, available in base and instruction-tuned variants across multiple sizes.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `StableLmForCausalLM` |
+| **Parameters** | 3B – 7B |
+| **HF Org** | [stabilityai](https://huggingface.co/stabilityai) |
+:::
+
 ## Available Models
 
 - **stablelm-3b-4e1t**: 3B
@@ -24,4 +33,4 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/stabilityai/stablelm-3b-4e1t
+- [stabilityai/stablelm-3b-4e1t](https://huggingface.co/stabilityai/stablelm-3b-4e1t)

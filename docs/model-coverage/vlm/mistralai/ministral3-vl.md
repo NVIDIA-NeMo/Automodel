@@ -2,6 +2,15 @@
 
 [Ministral3](https://mistral.ai/news/ministraux/) is Mistral AI's efficient small model series. The vision-capable variants support image-text inputs for multimodal tasks.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Image-Text-to-Text |
+| **Architecture** | `Mistral3ForConditionalGeneration` |
+| **Parameters** | 3B – 14B |
+| **HF Org** | [mistralai](https://huggingface.co/mistralai) |
+:::
+
 ## Available Models
 
 - **Ministral-3-14B-Instruct-2512**
@@ -34,4 +43,4 @@ See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/mistralai/Ministral-3-8B-Instruct-2512
+- [mistralai/Ministral-3-8B-Instruct-2512](https://huggingface.co/mistralai/Ministral-3-8B-Instruct-2512)

@@ -2,6 +2,15 @@
 
 [GLM-4.5 and GLM-4.7](https://huggingface.co/zai-org) are Mixture-of-Experts variants of the GLM family released under the `zai-org` HuggingFace organization. GLM-4.7-Flash is a lighter variant with fewer active parameters.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation (MoE) |
+| **Architecture** | `Glm4MoeForCausalLM` / `Glm4MoeLiteForCausalLM` |
+| **Parameters** | varies |
+| **HF Org** | [zai-org](https://huggingface.co/zai-org) |
+:::
+
 ## Available Models
 
 - **GLM-4.5-Air** (`Glm4MoeForCausalLM`)
@@ -36,6 +45,6 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) and the [Large 
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/zai-org/GLM-4.5-Air
-- https://huggingface.co/zai-org/GLM-4.7
-- https://huggingface.co/zai-org/GLM-4.7-Flash
+- [zai-org/GLM-4.5-Air](https://huggingface.co/zai-org/GLM-4.5-Air)
+- [zai-org/GLM-4.7](https://huggingface.co/zai-org/GLM-4.7)
+- [zai-org/GLM-4.7-Flash](https://huggingface.co/zai-org/GLM-4.7-Flash)

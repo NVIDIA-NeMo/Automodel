@@ -2,6 +2,15 @@
 
 [Mixtral](https://mistral.ai/news/mixtral-of-experts/) is Mistral AI's Mixture-of-Experts model series. Each token is processed by a subset of experts, enabling a large total parameter count with efficient per-token compute.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation (MoE) |
+| **Architecture** | `MixtralForCausalLM` |
+| **Parameters** | 47B total / 13B active |
+| **HF Org** | [mistralai](https://huggingface.co/mistralai) |
+:::
+
 ## Available Models
 
 - **Mixtral-8x7B**: 8 experts, 2 active per token (~13B active)
@@ -32,5 +41,5 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) and the [Large 
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/mistralai/Mixtral-8x7B-v0.1
-- https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1
+- [mistralai/Mixtral-8x7B-v0.1](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1)
+- [mistralai/Mixtral-8x7B-Instruct-v0.1](https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1)

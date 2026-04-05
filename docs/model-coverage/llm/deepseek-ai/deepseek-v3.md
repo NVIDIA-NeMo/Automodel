@@ -4,6 +4,15 @@
 
 [Moonlight](https://huggingface.co/moonshotai/Moonlight-16B-A3B) by Moonshot AI also uses this architecture with 16B total / 3B activated parameters.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation (MoE) |
+| **Architecture** | `DeepseekV3ForCausalLM` / `DeepseekV32ForCausalLM` |
+| **Parameters** | 671B total / 37B active |
+| **HF Org** | [deepseek-ai](https://huggingface.co/deepseek-ai) |
+:::
+
 ## Available Models
 
 - **DeepSeek-V3**: 671B total, 37B activated
@@ -38,6 +47,6 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) and the [Large 
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/deepseek-ai/DeepSeek-V3
-- https://huggingface.co/deepseek-ai/DeepSeek-V3-Base
-- https://huggingface.co/moonshotai/Moonlight-16B-A3B
+- [deepseek-ai/DeepSeek-V3](https://huggingface.co/deepseek-ai/DeepSeek-V3)
+- [deepseek-ai/DeepSeek-V3-Base](https://huggingface.co/deepseek-ai/DeepSeek-V3-Base)
+- [moonshotai/Moonlight-16B-A3B](https://huggingface.co/moonshotai/Moonlight-16B-A3B)

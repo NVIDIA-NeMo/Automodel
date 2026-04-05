@@ -2,6 +2,15 @@
 
 [Moonlight](https://huggingface.co/moonshotai/Moonlight-16B-A3B) is a Mixture-of-Experts language model from Moonshot AI trained using Muon optimizer. It uses the `DeepseekV3ForCausalLM` architecture with 16B total parameters and 3B activated per token.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation (MoE) |
+| **Architecture** | `DeepseekV3ForCausalLM` |
+| **Parameters** | 16B total / 3B active |
+| **HF Org** | [moonshotai](https://huggingface.co/moonshotai) |
+:::
+
 ## Available Models
 
 - **Moonlight-16B-A3B**: 16B total, 3B activated
@@ -29,4 +38,4 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/moonshotai/Moonlight-16B-A3B
+- [moonshotai/Moonlight-16B-A3B](https://huggingface.co/moonshotai/Moonlight-16B-A3B)

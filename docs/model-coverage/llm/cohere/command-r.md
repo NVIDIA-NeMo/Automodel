@@ -2,6 +2,15 @@
 
 [Cohere Command-R](https://cohere.com/command) is a series of enterprise-grade language models optimized for retrieval-augmented generation (RAG) and tool use. Command-R7B uses the updated `Cohere2ForCausalLM` architecture.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `CohereForCausalLM` / `Cohere2ForCausalLM` |
+| **Parameters** | 7B – 104B |
+| **HF Org** | [CohereForAI](https://huggingface.co/CohereForAI) |
+:::
+
 ## Available Models
 
 - **c4ai-command-r-v01**: 35B
@@ -33,5 +42,5 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/CohereForAI/c4ai-command-r-v01
-- https://huggingface.co/CohereForAI/c4ai-command-r7b-12-2024
+- [CohereForAI/c4ai-command-r-v01](https://huggingface.co/CohereForAI/c4ai-command-r-v01)
+- [CohereForAI/c4ai-command-r7b-12-2024](https://huggingface.co/CohereForAI/c4ai-command-r7b-12-2024)

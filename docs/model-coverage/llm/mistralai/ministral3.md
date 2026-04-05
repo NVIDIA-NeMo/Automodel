@@ -4,6 +4,15 @@
 
 Both use the `Mistral3ForConditionalGeneration` architecture.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `Mistral3ForConditionalGeneration` |
+| **Parameters** | 3B – 24B |
+| **HF Org** | [mistralai](https://huggingface.co/mistralai) |
+:::
+
 ## Available Models
 
 **Ministral3:**
@@ -40,5 +49,5 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/mistralai/Ministral-3-8B-Instruct-2512
-- https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512
+- [mistralai/Ministral-3-8B-Instruct-2512](https://huggingface.co/mistralai/Ministral-3-8B-Instruct-2512)
+- [mistralai/Devstral-Small-2-24B-Instruct-2512](https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512)

@@ -2,6 +2,15 @@
 
 [IBM Granite](https://www.ibm.com/granite) is IBM's family of enterprise-focused language models. Granite 3.x models are trained on a mix of code and language data and are optimized for enterprise tasks including summarization, classification, and RAG. PowerLM (IBM Research) also uses this architecture.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `GraniteForCausalLM` |
+| **Parameters** | 2B – 8B |
+| **HF Org** | [ibm-granite](https://huggingface.co/ibm-granite) |
+:::
+
 ## Available Models
 
 - **Granite 3.3 2B Instruct**
@@ -34,5 +43,5 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/ibm-granite/granite-3.0-2b-base
-- https://huggingface.co/ibm-granite/granite-3.1-8b-instruct
+- [ibm-granite/granite-3.0-2b-base](https://huggingface.co/ibm-granite/granite-3.0-2b-base)
+- [ibm-granite/granite-3.1-8b-instruct](https://huggingface.co/ibm-granite/granite-3.1-8b-instruct)

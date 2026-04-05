@@ -6,6 +6,15 @@
 This model requires `trust_remote_code: true` in your recipe YAML.
 :::
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `NemotronFlashForCausalLM` |
+| **Parameters** | 1B |
+| **HF Org** | [nvidia](https://huggingface.co/nvidia) |
+:::
+
 ## Available Models
 
 - **Nemotron-Flash-1B**: 1B parameters
@@ -33,4 +42,4 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/nvidia/Nemotron-Flash-1B
+- [nvidia/Nemotron-Flash-1B](https://huggingface.co/nvidia/Nemotron-Flash-1B)

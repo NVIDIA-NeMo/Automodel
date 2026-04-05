@@ -2,6 +2,15 @@
 
 [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) is a 12B parameter text-to-image diffusion transformer from Black Forest Labs, trained with flow matching. It produces high-fidelity images and is designed for non-commercial research and development use.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text-to-Image |
+| **Architecture** | DiT (Flow Matching) |
+| **Parameters** | 12B |
+| **HF Org** | [black-forest-labs](https://huggingface.co/black-forest-labs) |
+:::
+
 ## Available Models
 
 - **FLUX.1-dev**: 12B parameters
@@ -29,4 +38,4 @@ See the [Diffusion Training and Fine-Tuning Guide](../../../guides/diffusion/fin
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/black-forest-labs/FLUX.1-dev
+- [black-forest-labs/FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev)

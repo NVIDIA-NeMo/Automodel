@@ -2,6 +2,15 @@
 
 [GLM-4](https://github.com/THUDM/GLM-4) is Tsinghua University (THUDM)'s fourth-generation General Language Model, featuring strong multilingual capabilities and tool-use support.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `GlmForCausalLM` / `Glm4ForCausalLM` |
+| **Parameters** | 9B – 32B |
+| **HF Org** | [THUDM](https://huggingface.co/THUDM) |
+:::
+
 ## Available Models
 
 - **GLM-4-9B-Chat-HF** (`GlmForCausalLM`): 9B
@@ -32,5 +41,5 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/THUDM/glm-4-9b-chat-hf
-- https://huggingface.co/THUDM/GLM-4-32B-0414
+- [THUDM/glm-4-9b-chat-hf](https://huggingface.co/THUDM/glm-4-9b-chat-hf)
+- [THUDM/GLM-4-32B-0414](https://huggingface.co/THUDM/GLM-4-32B-0414)

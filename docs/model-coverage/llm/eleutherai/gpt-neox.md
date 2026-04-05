@@ -2,6 +2,15 @@
 
 [GPT-NeoX](https://github.com/EleutherAI/gpt-neox) is EleutherAI's large-scale language model architecture. The same `GPTNeoXForCausalLM` architecture is used by the Pythia scaling suite, OpenAssistant, Databricks Dolly, and StableLM models.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `GPTNeoXForCausalLM` |
+| **Parameters** | 1B – 20B |
+| **HF Org** | [EleutherAI](https://huggingface.co/EleutherAI) |
+:::
+
 ## Available Models
 
 - **GPT-NeoX-20B** (EleutherAI)
@@ -30,5 +39,5 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/EleutherAI/gpt-neox-20b
-- https://huggingface.co/EleutherAI/pythia-12b
+- [EleutherAI/gpt-neox-20b](https://huggingface.co/EleutherAI/gpt-neox-20b)
+- [EleutherAI/pythia-12b](https://huggingface.co/EleutherAI/pythia-12b)

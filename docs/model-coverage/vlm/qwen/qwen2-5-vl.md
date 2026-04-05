@@ -2,6 +2,15 @@
 
 [Qwen2.5-VL](https://qwenlm.github.io/blog/qwen2.5-vl/) is Alibaba Cloud's vision language model series supporting image and video understanding. It features dynamic resolution processing and integrates with the Qwen2.5 language backbone.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Image-Text-to-Text |
+| **Architecture** | `Qwen2_5VLForConditionalGeneration` |
+| **Parameters** | 2B – 72B |
+| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
+:::
+
 ## Available Models
 
 - **Qwen2.5-VL-72B-Instruct**
@@ -35,5 +44,5 @@ See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct
-- https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct
+- [Qwen/Qwen2.5-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct)
+- [Qwen/Qwen2-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct)

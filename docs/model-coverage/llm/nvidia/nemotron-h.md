@@ -2,6 +2,15 @@
 
 [NVIDIA Nemotron-H](https://developer.nvidia.com/blog/nemotron-h-efficient-hybrid-mamba-transformer-models/) is a hybrid Mamba-2 / transformer architecture that interleaves selective state space layers with standard attention layers for improved efficiency on long sequences.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `NemotronHForCausalLM` |
+| **Parameters** | 9B – 30B |
+| **HF Org** | [nvidia](https://huggingface.co/nvidia) |
+:::
+
 ## Available Models
 
 - **NVIDIA-Nemotron-Nano-9B-v2**: 9B hybrid model
@@ -35,6 +44,6 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2
-- https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-12B-v2
-- https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+- [nvidia/NVIDIA-Nemotron-Nano-9B-v2](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2)
+- [nvidia/NVIDIA-Nemotron-Nano-12B-v2](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-12B-v2)
+- [nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)

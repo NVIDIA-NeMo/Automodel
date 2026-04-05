@@ -2,6 +2,15 @@
 
 [Gemma 3 VL](https://ai.google.dev/gemma/docs/gemma3) is Google's multimodal extension of Gemma 3, supporting image-text inputs for tasks like image captioning and visual question answering. Gemma 3n is a next-generation efficiency-focused variant.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Image-Text-to-Text |
+| **Architecture** | `Gemma3ForConditionalGeneration` |
+| **Parameters** | 4B – 27B |
+| **HF Org** | [google](https://huggingface.co/google) |
+:::
+
 ## Available Models
 
 - **Gemma 3 27B IT** (VL)
@@ -36,5 +45,5 @@ See the [Gemma 3 & Gemma 3n Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/google/gemma-3-4b-it
-- https://huggingface.co/google/gemma-3-27b-it
+- [google/gemma-3-4b-it](https://huggingface.co/google/gemma-3-4b-it)
+- [google/gemma-3-27b-it](https://huggingface.co/google/gemma-3-27b-it)

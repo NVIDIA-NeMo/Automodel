@@ -2,6 +2,15 @@
 
 [StarCoder](https://huggingface.co/blog/starcoder) is BigCode's code language model trained on the Stack dataset. It uses Multi-Query Attention and Fill-in-the-Middle (FIM) objectives. WizardCoder also uses this architecture.
 
+:::{card}
+| | |
+|---|---|
+| **Task** | Code Generation |
+| **Architecture** | `GPTBigCodeForCausalLM` |
+| **Parameters** | 1B – 15.5B |
+| **HF Org** | [bigcode](https://huggingface.co/bigcode) |
+:::
+
 ## Available Models
 
 - **StarCoder**: 15.5B
@@ -26,4 +35,4 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- https://huggingface.co/bigcode/starcoder
+- [bigcode/starcoder](https://huggingface.co/bigcode/starcoder)
