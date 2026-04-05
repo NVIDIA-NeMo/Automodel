@@ -685,7 +685,11 @@ class MeshView:
 class FakeWorldMesh:
     def __init__(self, sizes_by_key, mesh_dim_names):
         self._sizes = sizes_by_key
-        self.mesh_dim_names = set(mesh_dim_names)
+        self.mesh_dim_names = tuple(mesh_dim_names)
+        self._flatten_mapping = {}
+
+    def _get_root_mesh(self):
+        return self
 
     def __getitem__(self, key):
         return MeshView(self._sizes[key])
@@ -708,7 +712,7 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     monkeypatch.setattr(P, "apply_ac", apply_ac_mock)
     monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
 
-    world_mesh = FakeWorldMesh({("dp",): 2, "tp": 1, "cp": 1}, mesh_dim_names=["dp", "tp", "cp"])
+    world_mesh = FakeWorldMesh({"dp": 2, ("dp",): 2, "tp": 1, "cp": 1}, mesh_dim_names=["dp", "tp", "cp"])
     moe_mesh = FakeMoeMesh({"ep": 2, ("es1", "es2"): 2})
 
     # model.model.moe_config.n_routed_experts must be divisible by ep size (2)
