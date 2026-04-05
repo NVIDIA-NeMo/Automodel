@@ -4,8 +4,6 @@ A reverse-chronological log of every model added to NeMo AutoModel. The **Recipe
 
 See the [Model Coverage Overview](overview.md) for release summaries, and the [LLM](llm/index.md) / [VLM](vlm/index.md) / [Omni](omni/index.md) / [Diffusion](diffusion/index.md) pages for the full architecture listings.
 
----
-
 | Date | Model | HF Model ID | Modality | Recipe |
 |------|-------|-------------|----------|--------|
 | 2026-04-02 | Gemma 4 | [`google/gemma-4-4b-it`](https://huggingface.co/google/gemma-4-4b-it) | VLM | [gemma4_4b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b.yaml) |
@@ -50,20 +48,11 @@ See the [Model Coverage Overview](overview.md) for release summaries, and the [L
 | Sep 2025 | Cohere Command-R | [`CohereForAI/c4ai-command-r-v01`](https://huggingface.co/CohereForAI/c4ai-command-r-v01) | LLM | [cohere_command_r_7b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/cohere/cohere_command_r_7b_squad.yaml) |
 | Sep 2025 | StarCoder 2 | [`bigcode/starcoder2-3b`](https://huggingface.co/bigcode/starcoder2-3b) | LLM | [starcoder_2_7b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/starcoder/starcoder_2_7b_squad.yaml) |
 | Sep 2025 | Falcon 3 | [`tiiuae/Falcon3-7B-Instruct`](https://huggingface.co/tiiuae/Falcon3-7B-Instruct) | LLM | [falcon3_7b_instruct_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon3_7b_instruct_squad.yaml) |
-
----
-
-## Upcoming (v0.3.0)
-
-Models in the current development cycle, not yet in a stable release:
-
-| Model | HF Model ID | Modality | Recipe |
-|-------|-------------|----------|--------|
-| Qwen3-Omni | [`Qwen/Qwen3-30B-A3B`](https://huggingface.co/Qwen/Qwen3-30B-A3B) | Omni | [qwen3_omni_moe_30b_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_omni_moe_30b_te_deepep.yaml) |
-| Phi-4-multimodal | [`microsoft/Phi-4-multimodal-instruct`](https://huggingface.co/microsoft/Phi-4-multimodal-instruct) | Omni | [phi4_mm_cv17.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/phi4/phi4_mm_cv17.yaml) |
-| InternVL 3.5 | [`OpenGVLab/InternVL3-4B`](https://huggingface.co/OpenGVLab/InternVL3-4B) | VLM | [internvl_3_5_4b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/internvl/internvl_3_5_4b.yaml) |
-| Ministral 3 (3B / 8B / 14B) | [`mistralai/Ministral-8B-Instruct-2410`](https://huggingface.co/mistralai/Ministral-8B-Instruct-2410) | VLM | [ministral3_8b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml) |
-| Qwen3-Next | [`Qwen/Qwen3-235B-A22B`](https://huggingface.co/Qwen/Qwen3-235B-A22B) | LLM | [qwen3_next_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml) |
-| FLUX.1-dev | [`black-forest-labs/FLUX.1-dev`](https://huggingface.co/black-forest-labs/FLUX.1-dev) | Diffusion | [flux_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux_t2i_flow.yaml) |
-| Wan 2.1 T2V | [`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) | Diffusion | [wan2_1_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow.yaml) |
-| HunyuanVideo 1.5 | [`hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v`](https://huggingface.co/hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v) | Diffusion | [hunyuan_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_t2v_flow.yaml) |
+| — *(v0.3.0)* | Qwen3-Omni | [`Qwen/Qwen3-30B-A3B`](https://huggingface.co/Qwen/Qwen3-30B-A3B) | Omni | [qwen3_omni_moe_30b_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_omni_moe_30b_te_deepep.yaml) |
+| — *(v0.3.0)* | Phi-4-multimodal | [`microsoft/Phi-4-multimodal-instruct`](https://huggingface.co/microsoft/Phi-4-multimodal-instruct) | Omni | [phi4_mm_cv17.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/phi4/phi4_mm_cv17.yaml) |
+| — *(v0.3.0)* | InternVL 3.5 | [`OpenGVLab/InternVL3-4B`](https://huggingface.co/OpenGVLab/InternVL3-4B) | VLM | [internvl_3_5_4b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/internvl/internvl_3_5_4b.yaml) |
+| — *(v0.3.0)* | Ministral 3 (3B / 8B / 14B) | [`mistralai/Ministral-8B-Instruct-2410`](https://huggingface.co/mistralai/Ministral-8B-Instruct-2410) | VLM | [ministral3_8b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml) |
+| — *(v0.3.0)* | Qwen3-Next | [`Qwen/Qwen3-235B-A22B`](https://huggingface.co/Qwen/Qwen3-235B-A22B) | LLM | [qwen3_next_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml) |
+| — *(v0.3.0)* | FLUX.1-dev | [`black-forest-labs/FLUX.1-dev`](https://huggingface.co/black-forest-labs/FLUX.1-dev) | Diffusion | [flux_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux_t2i_flow.yaml) |
+| — *(v0.3.0)* | Wan 2.1 T2V | [`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) | Diffusion | [wan2_1_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow.yaml) |
+| — *(v0.3.0)* | HunyuanVideo 1.5 | [`hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v`](https://huggingface.co/hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v) | Diffusion | [hunyuan_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_t2v_flow.yaml) |

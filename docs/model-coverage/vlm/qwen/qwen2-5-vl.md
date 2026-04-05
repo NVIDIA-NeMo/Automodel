@@ -41,12 +41,27 @@
 
 ## Try with NeMo AutoModel
 
+**1. Install** ([full instructions](../../../guides/installation.md)):
+
+```bash
+pip install nemo-automodel
+```
+
+**2. Clone the repo** to get the example recipes:
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+```
+
+**3. Run the recipe** from inside the repo:
+
 ```bash
 automodel --nproc-per-node=8 examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml
 ```
 
 :::{dropdown} Run with Docker
-Pull the NeMo AutoModel container and mount a checkpoint directory:
+**1. Pull the container** and mount a checkpoint directory:
 
 ```bash
 docker run --gpus all -it --rm \
@@ -55,7 +70,13 @@ docker run --gpus all -it --rm \
   nvcr.io/nvidia/nemo-automodel:26.02.00
 ```
 
-Then inside the container:
+**2.** Navigate to the AutoModel directory (where the recipes are):
+
+```bash
+cd /opt/Automodel
+```
+
+**3. Run the recipe**:
 
 ```bash
 automodel --nproc-per-node=8 examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml

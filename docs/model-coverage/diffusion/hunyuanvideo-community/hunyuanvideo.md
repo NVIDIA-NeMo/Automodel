@@ -34,6 +34,21 @@
 
 ## Try with NeMo AutoModel
 
+**1. Install** ([full instructions](../../../guides/installation.md)):
+
+```bash
+pip install nemo-automodel
+```
+
+**2. Clone the repo** to get the example recipes:
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+```
+
+**3. Run the recipe** from inside the repo:
+
 ```bash
 torchrun --nproc-per-node=8 \
   examples/diffusion/finetune/finetune.py \
@@ -41,7 +56,7 @@ torchrun --nproc-per-node=8 \
 ```
 
 :::{dropdown} Run with Docker
-Pull the NeMo AutoModel container and mount a checkpoint directory:
+**1. Pull the container** and mount a checkpoint directory:
 
 ```bash
 docker run --gpus all -it --rm \
@@ -50,7 +65,13 @@ docker run --gpus all -it --rm \
   nvcr.io/nvidia/nemo-automodel:26.02.00
 ```
 
-Then inside the container:
+**2.** Navigate to the AutoModel directory (where the recipes are):
+
+```bash
+cd /opt/Automodel
+```
+
+**3. Run the recipe**:
 
 ```bash
 torchrun --nproc-per-node=8 \

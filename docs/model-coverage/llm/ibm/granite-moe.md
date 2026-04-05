@@ -36,16 +36,33 @@ IBM Granite MoE models extend the Granite architecture with Mixture-of-Experts l
 
 Install NeMo AutoModel and follow the fine-tuning guide to configure a recipe for this model.
 
+**1. Install** ([full instructions](../../../guides/installation.md)):
+
 ```bash
 pip install nemo-automodel
 ```
 
+**2. Clone the repo** to get example recipes you can adapt:
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+```
+
 :::{dropdown} Run with Docker
+**1. Pull the container** and mount a checkpoint directory:
+
 ```bash
 docker run --gpus all -it --rm \
   --shm-size=8g \
   -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
   nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+**2.** The recipes are at `/opt/Automodel/examples/` — navigate there:
+
+```bash
+cd /opt/Automodel
 ```
 :::
 
