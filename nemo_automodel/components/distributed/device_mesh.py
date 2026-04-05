@@ -218,7 +218,7 @@ def _create_fsdp2_device_mesh(
     # Flatten submeshes
     device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
     device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_cp")
-    dp_cp_mesh = device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
+    device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
 
     # Derive EP mesh by flattening all non-pp dims and unflattening into (ep_shard, ep).
     moe_mesh = None

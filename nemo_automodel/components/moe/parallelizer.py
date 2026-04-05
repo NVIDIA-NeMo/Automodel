@@ -29,7 +29,6 @@ from torch.distributed.tensor import Shard, distribute_module, distribute_tensor
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
-from nemo_automodel.components.distributed.mesh_utils import get_submesh
 from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
 from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.layers import (
@@ -373,8 +372,10 @@ def parallelize_model(
     else:
         ep_shard_mesh = None
 
-    fsdp_enabled = dp_axis_names is not None and get_submesh(world_mesh, tuple(dp_axis_names)).size() > 1
-    fsdp_mesh = get_submesh(world_mesh, tuple(dp_axis_names)) if fsdp_enabled else None
+    from nemo_automodel.components.distributed.mesh_utils import get_submesh as _get_submesh
+
+    fsdp_enabled = dp_axis_names is not None and _get_submesh(world_mesh, tuple(dp_axis_names)).size() > 1
+    fsdp_mesh = _get_submesh(world_mesh, tuple(dp_axis_names)) if fsdp_enabled else None
     if fsdp_enabled:
         apply_fsdp(
             model,

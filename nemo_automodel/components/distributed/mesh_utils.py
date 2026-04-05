@@ -226,7 +226,7 @@ def _create_fsdp2_device_mesh(
     # Flatten submeshes
     device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP)
     device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_SHARD_CP)
-    dp_cp_mesh = device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_CP)
+    device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_CP)
 
     # Derive EP mesh by flattening all non-pp dims and unflattening into (ep_shard, ep).
     # EP spans dp, cp, and tp — the full non-pp rank space.
@@ -338,12 +338,18 @@ def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
         return device_mesh[names]
 
     # Some dims were created via _flatten(); resolve sizes and unflatten from parent.
+    # Find a parent flattened mesh that can be decomposed into the requested shape
+    # by trying _unflatten on each candidate (PyTorch validates the size match).
     from math import prod
 
     sizes = tuple(get_flat_mesh(device_mesh, n).size() for n in names)
     target = prod(sizes)
     root = device_mesh._get_root_mesh()
     for fm in root._flatten_mapping.values():
-        if fm.size() == target:
+        if fm.size() != target:
+            continue
+        try:
             return fm._unflatten(0, sizes, names)
+        except (ValueError, RuntimeError):
+            continue
     return device_mesh[names]

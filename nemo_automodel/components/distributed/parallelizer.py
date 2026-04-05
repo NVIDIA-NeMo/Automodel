@@ -43,11 +43,11 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
-
-from nemo_automodel.components.distributed.mesh_utils import get_submesh
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
+
+from nemo_automodel.components.distributed.mesh_utils import get_submesh
 
 
 def _is_transformers_v5_or_higher() -> bool:
