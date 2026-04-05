@@ -43,6 +43,15 @@ git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
 ```
 
+**3. Fine-tune** by adapting a base LLM recipe — override the model ID on the CLI:
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+  --model.pretrained_model_name_or_path <MODEL_HF_ID>
+```
+
+Replace `<MODEL_HF_ID>` with the model ID from **Example HF Models** above.
+
 :::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
 
@@ -57,6 +66,13 @@ docker run --gpus all -it --rm \
 
 ```bash
 cd /opt/Automodel
+```
+
+**3. Fine-tune**:
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+  --model.pretrained_model_name_or_path <MODEL_HF_ID>
 ```
 :::
 
