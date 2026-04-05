@@ -692,7 +692,12 @@ class FakeWorldMesh:
         return self
 
     def __getitem__(self, key):
-        return MeshView(self._sizes[key])
+        # Support both string "dp" and tuple ("dp",) lookups
+        if key in self._sizes:
+            return MeshView(self._sizes[key])
+        if isinstance(key, str) and (key,) in self._sizes:
+            return MeshView(self._sizes[(key,)])
+        raise KeyError(key)
 
 
 class FakeMoeMesh:
