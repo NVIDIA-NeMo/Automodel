@@ -30,7 +30,7 @@
 
 | Recipe | Dataset | Description |
 |---|---|---|
-| [`internvl_3_5_4b.yaml`](../../../examples/vlm_finetune/internvl/internvl_3_5_4b.yaml) | MedPix-VQA | SFT — InternVL3.5 4B on MedPix |
+| {download}`internvl_3_5_4b.yaml <../../../examples/vlm_finetune/internvl/internvl_3_5_4b.yaml>` | MedPix-VQA | SFT — InternVL3.5 4B on MedPix |
 
 ## Fine-Tuning
 

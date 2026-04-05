@@ -31,8 +31,8 @@
 
 | Recipe | Description |
 |---|---|
-| [`minimax_m2.1_hellaswag_pp.yaml`](../../../examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml) | SFT — MiniMax-M2.1 on HellaSwag with pipeline parallelism |
-| [`minimax_m2.5_hellaswag_pp.yaml`](../../../examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml) | SFT — MiniMax-M2.5 on HellaSwag with pipeline parallelism |
+| {download}`minimax_m2.1_hellaswag_pp.yaml <../../../examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml>` | SFT — MiniMax-M2.1 on HellaSwag with pipeline parallelism |
+| {download}`minimax_m2.5_hellaswag_pp.yaml <../../../examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml>` | SFT — MiniMax-M2.5 on HellaSwag with pipeline parallelism |
 
 ## Fine-Tuning
 

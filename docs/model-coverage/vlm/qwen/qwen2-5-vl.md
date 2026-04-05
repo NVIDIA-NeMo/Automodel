@@ -36,7 +36,7 @@
 
 | Recipe | Dataset | Description |
 |---|---|---|
-| [`qwen2_5_vl_3b_rdr.yaml`](../../../examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml) | rdr-items | SFT — Qwen2.5-VL 3B on RDR Items |
+| {download}`qwen2_5_vl_3b_rdr.yaml <../../../examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml>` | rdr-items | SFT — Qwen2.5-VL 3B on RDR Items |
 
 ## Fine-Tuning
 

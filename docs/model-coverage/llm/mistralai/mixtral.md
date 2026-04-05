@@ -32,8 +32,8 @@
 
 | Recipe | Description |
 |---|---|
-| [`mixtral-8x7b-v0-1_squad.yaml`](../../../examples/llm_finetune/mistral/mixtral-8x7b-v0-1_squad.yaml) | SFT — Mixtral 8x7B on SQuAD |
-| [`mixtral-8x7b-v0-1_squad_peft.yaml`](../../../examples/llm_finetune/mistral/mixtral-8x7b-v0-1_squad_peft.yaml) | LoRA — Mixtral 8x7B on SQuAD |
+| {download}`mixtral-8x7b-v0-1_squad.yaml <../../../examples/llm_finetune/mistral/mixtral-8x7b-v0-1_squad.yaml>` | SFT — Mixtral 8x7B on SQuAD |
+| {download}`mixtral-8x7b-v0-1_squad_peft.yaml <../../../examples/llm_finetune/mistral/mixtral-8x7b-v0-1_squad_peft.yaml>` | LoRA — Mixtral 8x7B on SQuAD |
 
 ## Fine-Tuning
 

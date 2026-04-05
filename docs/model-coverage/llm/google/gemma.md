@@ -39,10 +39,10 @@
 
 | Recipe | Description |
 |---|---|
-| [`gemma_2_9b_it_squad.yaml`](../../../examples/llm_finetune/gemma/gemma_2_9b_it_squad.yaml) | SFT — Gemma 2 9B IT on SQuAD |
-| [`gemma_2_9b_it_squad_peft.yaml`](../../../examples/llm_finetune/gemma/gemma_2_9b_it_squad_peft.yaml) | LoRA — Gemma 2 9B IT on SQuAD |
-| [`gemma_3_270m_squad.yaml`](../../../examples/llm_finetune/gemma/gemma_3_270m_squad.yaml) | SFT — Gemma 3 270M on SQuAD |
-| [`gemma_3_270m_squad_peft.yaml`](../../../examples/llm_finetune/gemma/gemma_3_270m_squad_peft.yaml) | LoRA — Gemma 3 270M on SQuAD |
+| {download}`gemma_2_9b_it_squad.yaml <../../../examples/llm_finetune/gemma/gemma_2_9b_it_squad.yaml>` | SFT — Gemma 2 9B IT on SQuAD |
+| {download}`gemma_2_9b_it_squad_peft.yaml <../../../examples/llm_finetune/gemma/gemma_2_9b_it_squad_peft.yaml>` | LoRA — Gemma 2 9B IT on SQuAD |
+| {download}`gemma_3_270m_squad.yaml <../../../examples/llm_finetune/gemma/gemma_3_270m_squad.yaml>` | SFT — Gemma 3 270M on SQuAD |
+| {download}`gemma_3_270m_squad_peft.yaml <../../../examples/llm_finetune/gemma/gemma_3_270m_squad_peft.yaml>` | LoRA — Gemma 3 270M on SQuAD |
 
 ## Fine-Tuning
 

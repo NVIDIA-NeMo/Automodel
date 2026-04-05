@@ -34,8 +34,8 @@
 
 | Recipe | Description |
 |---|---|
-| [`granite_3_3_2b_instruct_squad.yaml`](../../../examples/llm_finetune/granite/granite_3_3_2b_instruct_squad.yaml) | SFT — Granite 3.3 2B Instruct on SQuAD |
-| [`granite_3_3_2b_instruct_squad_peft.yaml`](../../../examples/llm_finetune/granite/granite_3_3_2b_instruct_squad_peft.yaml) | LoRA — Granite 3.3 2B Instruct on SQuAD |
+| {download}`granite_3_3_2b_instruct_squad.yaml <../../../examples/llm_finetune/granite/granite_3_3_2b_instruct_squad.yaml>` | SFT — Granite 3.3 2B Instruct on SQuAD |
+| {download}`granite_3_3_2b_instruct_squad_peft.yaml <../../../examples/llm_finetune/granite/granite_3_3_2b_instruct_squad_peft.yaml>` | LoRA — Granite 3.3 2B Instruct on SQuAD |
 
 ## Fine-Tuning
 

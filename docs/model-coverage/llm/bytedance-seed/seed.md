@@ -31,10 +31,10 @@
 
 | Recipe | Description |
 |---|---|
-| [`seed_coder_8b_instruct_squad.yaml`](../../../examples/llm_finetune/seed/seed_coder_8b_instruct_squad.yaml) | SFT — Seed-Coder 8B on SQuAD |
-| [`seed_coder_8b_instruct_squad_peft.yaml`](../../../examples/llm_finetune/seed/seed_coder_8b_instruct_squad_peft.yaml) | LoRA — Seed-Coder 8B on SQuAD |
-| [`seed_oss_36B_hellaswag.yaml`](../../../examples/llm_finetune/seed/seed_oss_36B_hellaswag.yaml) | SFT — Seed-OSS 36B on HellaSwag |
-| [`seed_oss_36B_hellaswag_peft.yaml`](../../../examples/llm_finetune/seed/seed_oss_36B_hellaswag_peft.yaml) | LoRA — Seed-OSS 36B on HellaSwag |
+| {download}`seed_coder_8b_instruct_squad.yaml <../../../examples/llm_finetune/seed/seed_coder_8b_instruct_squad.yaml>` | SFT — Seed-Coder 8B on SQuAD |
+| {download}`seed_coder_8b_instruct_squad_peft.yaml <../../../examples/llm_finetune/seed/seed_coder_8b_instruct_squad_peft.yaml>` | LoRA — Seed-Coder 8B on SQuAD |
+| {download}`seed_oss_36B_hellaswag.yaml <../../../examples/llm_finetune/seed/seed_oss_36B_hellaswag.yaml>` | SFT — Seed-OSS 36B on HellaSwag |
+| {download}`seed_oss_36B_hellaswag_peft.yaml <../../../examples/llm_finetune/seed/seed_oss_36B_hellaswag_peft.yaml>` | LoRA — Seed-OSS 36B on HellaSwag |
 
 ## Fine-Tuning
 

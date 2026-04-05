@@ -29,8 +29,8 @@
 
 | Recipe | Description |
 |---|---|
-| [`wan2_1_t2v_flow.yaml`](../../../examples/diffusion/finetune/wan2_1_t2v_flow.yaml) | Fine-tune — Wan 2.1 T2V with flow matching |
-| [`wan2_1_t2v_flow.yaml`](../../../examples/diffusion/pretrain/wan2_1_t2v_flow.yaml) | Pretrain — Wan 2.1 T2V with flow matching |
+| {download}`wan2_1_t2v_flow.yaml <../../../examples/diffusion/finetune/wan2_1_t2v_flow.yaml>` | Fine-tune — Wan 2.1 T2V with flow matching |
+| {download}`wan2_1_t2v_flow.yaml <../../../examples/diffusion/pretrain/wan2_1_t2v_flow.yaml>` | Pretrain — Wan 2.1 T2V with flow matching |
 
 ## Training
 

@@ -37,9 +37,9 @@
 
 | Recipe | Description |
 |---|---|
-| [`deepseek_v32_hellaswag_pp.yaml`](../../../examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml) | SFT — DeepSeek-V3.2 on HellaSwag with pipeline parallelism |
-| [`moonlight_16b_te.yaml`](../../../examples/llm_finetune/moonlight/moonlight_16b_te.yaml) | SFT — Moonlight 16B with Transformer Engine |
-| [`moonlight_16b_te_packed_sequence.yaml`](../../../examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml) | SFT — Moonlight 16B with packed sequences |
+| {download}`deepseek_v32_hellaswag_pp.yaml <../../../examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml>` | SFT — DeepSeek-V3.2 on HellaSwag with pipeline parallelism |
+| {download}`moonlight_16b_te.yaml <../../../examples/llm_finetune/moonlight/moonlight_16b_te.yaml>` | SFT — Moonlight 16B with Transformer Engine |
+| {download}`moonlight_16b_te_packed_sequence.yaml <../../../examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml>` | SFT — Moonlight 16B with packed sequences |
 
 ## Fine-Tuning
 

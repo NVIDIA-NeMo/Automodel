@@ -33,8 +33,8 @@
 
 | Recipe | Description |
 |---|---|
-| [`starcoder_2_7b_squad.yaml`](../../../examples/llm_finetune/starcoder/starcoder_2_7b_squad.yaml) | SFT — StarCoder2 7B on SQuAD |
-| [`starcoder_2_7b_hellaswag_fp8.yaml`](../../../examples/llm_finetune/starcoder/starcoder_2_7b_hellaswag_fp8.yaml) | SFT — StarCoder2 7B on HellaSwag with FP8 |
+| {download}`starcoder_2_7b_squad.yaml <../../../examples/llm_finetune/starcoder/starcoder_2_7b_squad.yaml>` | SFT — StarCoder2 7B on SQuAD |
+| {download}`starcoder_2_7b_hellaswag_fp8.yaml <../../../examples/llm_finetune/starcoder/starcoder_2_7b_hellaswag_fp8.yaml>` | SFT — StarCoder2 7B on HellaSwag with FP8 |
 
 ## Fine-Tuning
 

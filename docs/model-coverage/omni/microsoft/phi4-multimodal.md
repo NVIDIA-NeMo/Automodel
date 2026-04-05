@@ -29,7 +29,7 @@
 
 | Recipe | Dataset | Description |
 |---|---|---|
-| [`phi4_mm_cv17.yaml`](../../../examples/vlm_finetune/phi4/phi4_mm_cv17.yaml) | CommonVoice 17 | SFT — Phi-4-multimodal on CommonVoice (audio-text) |
+| {download}`phi4_mm_cv17.yaml <../../../examples/vlm_finetune/phi4/phi4_mm_cv17.yaml>` | CommonVoice 17 | SFT — Phi-4-multimodal on CommonVoice (audio-text) |
 
 ## Fine-Tuning
 

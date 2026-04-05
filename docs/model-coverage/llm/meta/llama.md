@@ -42,8 +42,8 @@
 
 | Recipe | Description |
 |---|---|
-| [`llama3_2_1b_squad.yaml`](../../../examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) | SFT — Llama 3.2 1B on SQuAD |
-| [`llama_3_3_70b_instruct_squad.yaml`](../../../examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad.yaml) | SFT — Llama 3.3 70B Instruct on SQuAD |
+| {download}`llama3_2_1b_squad.yaml <../../../examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml>` | SFT — Llama 3.2 1B on SQuAD |
+| {download}`llama_3_3_70b_instruct_squad.yaml <../../../examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad.yaml>` | SFT — Llama 3.3 70B Instruct on SQuAD |
 
 ## Fine-Tuning
 

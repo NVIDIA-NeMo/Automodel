@@ -32,8 +32,8 @@
 
 | Recipe | Description |
 |---|---|
-| [`olmo_2_0425_1b_instruct_squad.yaml`](../../../examples/llm_finetune/olmo/olmo_2_0425_1b_instruct_squad.yaml) | SFT — OLMo2 0425 1B Instruct on SQuAD |
-| [`olmo_2_0425_1b_instruct_squad_peft.yaml`](../../../examples/llm_finetune/olmo/olmo_2_0425_1b_instruct_squad_peft.yaml) | LoRA — OLMo2 0425 1B Instruct on SQuAD |
+| {download}`olmo_2_0425_1b_instruct_squad.yaml <../../../examples/llm_finetune/olmo/olmo_2_0425_1b_instruct_squad.yaml>` | SFT — OLMo2 0425 1B Instruct on SQuAD |
+| {download}`olmo_2_0425_1b_instruct_squad_peft.yaml <../../../examples/llm_finetune/olmo/olmo_2_0425_1b_instruct_squad_peft.yaml>` | LoRA — OLMo2 0425 1B Instruct on SQuAD |
 
 ## Fine-Tuning
 

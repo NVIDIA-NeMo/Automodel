@@ -33,9 +33,9 @@
 
 | Recipe | Dataset | Description |
 |---|---|---|
-| [`ministral3_3b_medpix.yaml`](../../../examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml) | MedPix-VQA | SFT — Ministral3 3B on MedPix |
-| [`ministral3_8b_medpix.yaml`](../../../examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml) | MedPix-VQA | SFT — Ministral3 8B on MedPix |
-| [`ministral3_14b_medpix.yaml`](../../../examples/vlm_finetune/mistral/ministral3_14b_medpix.yaml) | MedPix-VQA | SFT — Ministral3 14B on MedPix |
+| {download}`ministral3_3b_medpix.yaml <../../../examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml>` | MedPix-VQA | SFT — Ministral3 3B on MedPix |
+| {download}`ministral3_8b_medpix.yaml <../../../examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml>` | MedPix-VQA | SFT — Ministral3 8B on MedPix |
+| {download}`ministral3_14b_medpix.yaml <../../../examples/vlm_finetune/mistral/ministral3_14b_medpix.yaml>` | MedPix-VQA | SFT — Ministral3 14B on MedPix |
 
 ## Fine-Tuning
 

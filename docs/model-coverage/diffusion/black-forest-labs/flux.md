@@ -29,8 +29,8 @@
 
 | Recipe | Description |
 |---|---|
-| [`flux_t2i_flow.yaml`](../../../examples/diffusion/finetune/flux_t2i_flow.yaml) | Fine-tune — FLUX.1-dev with flow matching |
-| [`flux_t2i_flow.yaml`](../../../examples/diffusion/pretrain/flux_t2i_flow.yaml) | Pretrain — FLUX.1-dev with flow matching |
+| {download}`flux_t2i_flow.yaml <../../../examples/diffusion/finetune/flux_t2i_flow.yaml>` | Fine-tune — FLUX.1-dev with flow matching |
+| {download}`flux_t2i_flow.yaml <../../../examples/diffusion/pretrain/flux_t2i_flow.yaml>` | Pretrain — FLUX.1-dev with flow matching |
 
 ## Training
 

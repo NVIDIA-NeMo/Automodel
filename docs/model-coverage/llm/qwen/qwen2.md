@@ -34,8 +34,8 @@
 
 | Recipe | Description |
 |---|---|
-| [`qwen2_5_7b_squad.yaml`](../../../examples/llm_finetune/qwen/qwen2_5_7b_squad.yaml) | SFT — Qwen2.5 7B on SQuAD |
-| [`qwq_32b_squad_peft.yaml`](../../../examples/llm_finetune/qwen/qwq_32b_squad_peft.yaml) | LoRA — QwQ 32B on SQuAD |
+| {download}`qwen2_5_7b_squad.yaml <../../../examples/llm_finetune/qwen/qwen2_5_7b_squad.yaml>` | SFT — Qwen2.5 7B on SQuAD |
+| {download}`qwq_32b_squad_peft.yaml <../../../examples/llm_finetune/qwen/qwq_32b_squad_peft.yaml>` | LoRA — QwQ 32B on SQuAD |
 
 ## Fine-Tuning
 

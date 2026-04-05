@@ -29,7 +29,7 @@
 
 | Recipe | Description |
 |---|---|
-| [`hunyuan_t2v_flow.yaml`](../../../examples/diffusion/finetune/hunyuan_t2v_flow.yaml) | Fine-tune — HunyuanVideo 1.5 with flow matching |
+| {download}`hunyuan_t2v_flow.yaml <../../../examples/diffusion/finetune/hunyuan_t2v_flow.yaml>` | Fine-tune — HunyuanVideo 1.5 with flow matching |
 
 ## Training
 

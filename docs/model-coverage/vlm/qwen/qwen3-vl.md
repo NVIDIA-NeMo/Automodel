@@ -33,10 +33,10 @@
 
 | Recipe | Dataset | Description |
 |---|---|---|
-| [`qwen3_vl_4b_instruct_rdr.yaml`](../../../examples/vlm_finetune/qwen3/qwen3_vl_4b_instruct_rdr.yaml) | rdr-items | SFT — Qwen3-VL 4B on RDR Items |
-| [`qwen3_vl_8b_instruct_rdr.yaml`](../../../examples/vlm_finetune/qwen3/qwen3_vl_8b_instruct_rdr.yaml) | rdr-items | SFT — Qwen3-VL 8B on RDR Items |
-| [`qwen3_vl_moe_30b_te_deepep.yaml`](../../../examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml) | MedPix-VQA | SFT — Qwen3-VL-MoE 30B with TE + DeepEP |
-| [`qwen3_vl_moe_235b.yaml`](../../../examples/vlm_finetune/qwen3/qwen3_vl_moe_235b.yaml) | MedPix-VQA | SFT — Qwen3-VL-MoE 235B |
+| {download}`qwen3_vl_4b_instruct_rdr.yaml <../../../examples/vlm_finetune/qwen3/qwen3_vl_4b_instruct_rdr.yaml>` | rdr-items | SFT — Qwen3-VL 4B on RDR Items |
+| {download}`qwen3_vl_8b_instruct_rdr.yaml <../../../examples/vlm_finetune/qwen3/qwen3_vl_8b_instruct_rdr.yaml>` | rdr-items | SFT — Qwen3-VL 8B on RDR Items |
+| {download}`qwen3_vl_moe_30b_te_deepep.yaml <../../../examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml>` | MedPix-VQA | SFT — Qwen3-VL-MoE 30B with TE + DeepEP |
+| {download}`qwen3_vl_moe_235b.yaml <../../../examples/vlm_finetune/qwen3/qwen3_vl_moe_235b.yaml>` | MedPix-VQA | SFT — Qwen3-VL-MoE 235B |
 
 ## Fine-Tuning
 

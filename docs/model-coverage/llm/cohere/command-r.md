@@ -33,8 +33,8 @@
 
 | Recipe | Description |
 |---|---|
-| [`cohere_command_r_7b_squad.yaml`](../../../examples/llm_finetune/cohere/cohere_command_r_7b_squad.yaml) | SFT — Command-R 7B on SQuAD |
-| [`cohere_command_r_7b_squad_peft.yaml`](../../../examples/llm_finetune/cohere/cohere_command_r_7b_squad_peft.yaml) | LoRA — Command-R 7B on SQuAD |
+| {download}`cohere_command_r_7b_squad.yaml <../../../examples/llm_finetune/cohere/cohere_command_r_7b_squad.yaml>` | SFT — Command-R 7B on SQuAD |
+| {download}`cohere_command_r_7b_squad_peft.yaml <../../../examples/llm_finetune/cohere/cohere_command_r_7b_squad_peft.yaml>` | LoRA — Command-R 7B on SQuAD |
 
 ## Fine-Tuning
 
