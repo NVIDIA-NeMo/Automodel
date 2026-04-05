@@ -338,18 +338,37 @@ def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
         return device_mesh[names]
 
     # Some dims were created via _flatten(); resolve sizes and unflatten from parent.
-    # Find a parent flattened mesh that can be decomposed into the requested shape
-    # by trying _unflatten on each candidate (PyTorch validates the size match).
+    # Strategy: find a parent flattened mesh whose size equals the product of
+    # requested dims, unflatten it, then validate that process groups for any
+    # dim that also exists on the root mesh are identical (guards against
+    # ambiguous size collisions between different flattened meshes).
     from math import prod
+
+    import torch.distributed as dist
 
     sizes = tuple(get_flat_mesh(device_mesh, n).size() for n in names)
     target = prod(sizes)
     root = device_mesh._get_root_mesh()
+    root_dim_names = set(device_mesh.mesh_dim_names)
+
     for fm in root._flatten_mapping.values():
         if fm.size() != target:
             continue
         try:
-            return fm._unflatten(0, sizes, names)
+            result = fm._unflatten(0, sizes, names)
         except (ValueError, RuntimeError):
             continue
+        # Validate: for each requested name that is a root-mesh dim,
+        # the process group must match the root mesh's group for that dim.
+        valid = True
+        for name in names:
+            if name not in root_dim_names:
+                continue
+            expected = set(dist.get_process_group_ranks(device_mesh[name].get_group()))
+            actual = set(dist.get_process_group_ranks(result[name].get_group()))
+            if expected != actual:
+                valid = False
+                break
+        if valid:
+            return result
     return device_mesh[names]

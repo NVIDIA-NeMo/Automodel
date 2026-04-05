@@ -606,6 +606,9 @@ class TestWanParallelizationStrategy:
         return mesh, dp_mesh, tp_mesh
 
     def _mock_env(self, monkeypatch):
+        # Mock dist.get_process_group_ranks for get_submesh validation
+        monkeypatch.setattr("torch.distributed.get_process_group_ranks", lambda g: [0], raising=False)
+
         fully_shard_mock = MagicMock(side_effect=lambda model, **kwargs: model)
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.parallelizer.fully_shard",
