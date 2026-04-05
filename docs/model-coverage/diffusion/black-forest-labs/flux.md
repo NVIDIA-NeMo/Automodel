@@ -23,7 +23,7 @@
 
 | Model | HF ID |
 |---|---|
-| FLUX.1-dev | `black-forest-labs/FLUX.1-dev` |
+| FLUX.1-dev | [`black-forest-labs/FLUX.1-dev`](https://huggingface.co/black-forest-labs/FLUX.1-dev) |
 
 ## Example Recipes
 

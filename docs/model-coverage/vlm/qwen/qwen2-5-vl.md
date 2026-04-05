@@ -28,9 +28,9 @@
 
 | Model | HF ID |
 |---|---|
-| Qwen2.5-VL 3B Instruct | `Qwen/Qwen2.5-VL-3B-Instruct` |
-| Qwen2.5-VL 7B Instruct | `Qwen/Qwen2.5-VL-7B-Instruct` |
-| Qwen2-VL 7B Instruct | `Qwen/Qwen2-VL-7B-Instruct` |
+| Qwen2.5-VL 3B Instruct | [`Qwen/Qwen2.5-VL-3B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) |
+| Qwen2.5-VL 7B Instruct | [`Qwen/Qwen2.5-VL-7B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) |
+| Qwen2-VL 7B Instruct | [`Qwen/Qwen2-VL-7B-Instruct`](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct) |
 
 ## Example Recipes
 

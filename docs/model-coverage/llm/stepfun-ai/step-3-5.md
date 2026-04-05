@@ -23,7 +23,7 @@
 
 | Model | HF ID |
 |---|---|
-| Step-3.5-Flash | `stepfun-ai/Step-3.5-Flash` |
+| Step-3.5-Flash | [`stepfun-ai/Step-3.5-Flash`](https://huggingface.co/stepfun-ai/Step-3.5-Flash) |
 
 ## Example Recipes
 

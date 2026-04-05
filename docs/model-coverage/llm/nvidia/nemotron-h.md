@@ -25,9 +25,9 @@
 
 | Model | HF ID |
 |---|---|
-| Nemotron-Nano 9B v2 | `nvidia/NVIDIA-Nemotron-Nano-9B-v2` |
-| Nemotron-Nano 12B v2 | `nvidia/NVIDIA-Nemotron-Nano-12B-v2` |
-| Nemotron-3-Nano 30B A3B | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` |
+| Nemotron-Nano 9B v2 | [`nvidia/NVIDIA-Nemotron-Nano-9B-v2`](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2) |
+| Nemotron-Nano 12B v2 | [`nvidia/NVIDIA-Nemotron-Nano-12B-v2`](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-12B-v2) |
+| Nemotron-3-Nano 30B A3B | [`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16) |
 
 ## Example Recipes
 

@@ -25,8 +25,8 @@
 
 | Model | HF ID |
 |---|---|
-| DeepSeek LLM 7B Chat | `deepseek-ai/deepseek-llm-7b-chat` |
-| DeepSeek LLM 67B Chat | `deepseek-ai/deepseek-llm-67b-chat` |
+| DeepSeek LLM 7B Chat | [`deepseek-ai/deepseek-llm-7b-chat`](https://huggingface.co/deepseek-ai/deepseek-llm-7b-chat) |
+| DeepSeek LLM 67B Chat | [`deepseek-ai/deepseek-llm-67b-chat`](https://huggingface.co/deepseek-ai/deepseek-llm-67b-chat) |
 
 
 ## Try with NeMo AutoModel

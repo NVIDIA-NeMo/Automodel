@@ -23,7 +23,7 @@
 
 | Model | HF ID |
 |---|---|
-| HunyuanVideo 1.5 720p T2V | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` |
+| HunyuanVideo 1.5 720p T2V | [`hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v`](https://huggingface.co/hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v) |
 
 ## Example Recipes
 

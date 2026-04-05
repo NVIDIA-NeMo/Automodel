@@ -25,10 +25,10 @@
 
 | Model | HF ID |
 |---|---|
-| Qwen2.5 7B Instruct | `Qwen/Qwen2.5-7B-Instruct` |
-| Qwen2.5 72B Instruct | `Qwen/Qwen2.5-72B-Instruct` |
-| Qwen2 7B Instruct | `Qwen/Qwen2-7B-Instruct` |
-| QwQ 32B Preview | `Qwen/QwQ-32B-Preview` |
+| Qwen2.5 7B Instruct | [`Qwen/Qwen2.5-7B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) |
+| Qwen2.5 72B Instruct | [`Qwen/Qwen2.5-72B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-72B-Instruct) |
+| Qwen2 7B Instruct | [`Qwen/Qwen2-7B-Instruct`](https://huggingface.co/Qwen/Qwen2-7B-Instruct) |
+| QwQ 32B Preview | [`Qwen/QwQ-32B-Preview`](https://huggingface.co/Qwen/QwQ-32B-Preview) |
 
 ## Example Recipes
 

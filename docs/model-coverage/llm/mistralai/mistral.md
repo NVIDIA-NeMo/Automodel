@@ -25,9 +25,9 @@
 
 | Model | HF ID |
 |---|---|
-| Mistral 7B v0.1 | `mistralai/Mistral-7B-v0.1` |
-| Mistral 7B Instruct v0.1 | `mistralai/Mistral-7B-Instruct-v0.1` |
-| Mistral Nemo Instruct 2407 | `mistralai/Mistral-Nemo-Instruct-2407` |
+| Mistral 7B v0.1 | [`mistralai/Mistral-7B-v0.1`](https://huggingface.co/mistralai/Mistral-7B-v0.1) |
+| Mistral 7B Instruct v0.1 | [`mistralai/Mistral-7B-Instruct-v0.1`](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.1) |
+| Mistral Nemo Instruct 2407 | [`mistralai/Mistral-Nemo-Instruct-2407`](https://huggingface.co/mistralai/Mistral-Nemo-Instruct-2407) |
 
 ## Example Recipes
 

@@ -26,8 +26,8 @@
 
 | Model | HF ID |
 |---|---|
-| Command-R v01 | `CohereForAI/c4ai-command-r-v01` |
-| Command-R7B | `CohereForAI/c4ai-command-r7b-12-2024` |
+| Command-R v01 | [`CohereForAI/c4ai-command-r-v01`](https://huggingface.co/CohereForAI/c4ai-command-r-v01) |
+| Command-R7B | [`CohereForAI/c4ai-command-r7b-12-2024`](https://huggingface.co/CohereForAI/c4ai-command-r7b-12-2024) |
 
 ## Example Recipes
 

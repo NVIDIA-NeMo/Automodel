@@ -23,7 +23,7 @@
 
 | Model | HF ID |
 |---|---|
-| Solar Pro Preview Instruct | `upstage/solar-pro-preview-instruct` |
+| Solar Pro Preview Instruct | [`upstage/solar-pro-preview-instruct`](https://huggingface.co/upstage/solar-pro-preview-instruct) |
 
 
 ## Try with NeMo AutoModel

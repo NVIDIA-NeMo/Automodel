@@ -27,9 +27,9 @@
 
 | Model | HF ID |
 |---|---|
-| InternLM3 8B Instruct | `internlm/internlm3-8b-instruct` |
-| InternLM2 7B | `internlm/internlm2-7b` |
-| InternLM 7B | `internlm/internlm-7b` |
+| InternLM3 8B Instruct | [`internlm/internlm3-8b-instruct`](https://huggingface.co/internlm/internlm3-8b-instruct) |
+| InternLM2 7B | [`internlm/internlm2-7b`](https://huggingface.co/internlm/internlm2-7b) |
+| InternLM 7B | [`internlm/internlm-7b`](https://huggingface.co/internlm/internlm-7b) |
 
 
 ## Try with NeMo AutoModel

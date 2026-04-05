@@ -26,9 +26,9 @@
 
 | Model | HF ID |
 |---|---|
-| Falcon 7B | `tiiuae/falcon-7b` |
-| Falcon 40B | `tiiuae/falcon-40b` |
-| Falcon RW 7B | `tiiuae/falcon-rw-7b` |
+| Falcon 7B | [`tiiuae/falcon-7b`](https://huggingface.co/tiiuae/falcon-7b) |
+| Falcon 40B | [`tiiuae/falcon-40b`](https://huggingface.co/tiiuae/falcon-40b) |
+| Falcon RW 7B | [`tiiuae/falcon-rw-7b`](https://huggingface.co/tiiuae/falcon-rw-7b) |
 
 ## Example Recipes
 

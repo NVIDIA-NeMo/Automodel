@@ -24,8 +24,8 @@
 
 | Model | HF ID |
 |---|---|
-| ChatGLM3 6B | `THUDM/chatglm3-6b` |
-| ChatGLM2 6B | `THUDM/chatglm2-6b` |
+| ChatGLM3 6B | [`THUDM/chatglm3-6b`](https://huggingface.co/THUDM/chatglm3-6b) |
+| ChatGLM2 6B | [`THUDM/chatglm2-6b`](https://huggingface.co/THUDM/chatglm2-6b) |
 
 
 ## Try with NeMo AutoModel

@@ -24,8 +24,8 @@
 
 | Model | HF ID |
 |---|---|
-| Llama-4-Scout-17B-16E-Instruct | `meta-llama/Llama-4-Scout-17B-16E-Instruct` |
-| Llama-4-Maverick-17B-128E-Instruct | `meta-llama/Llama-4-Maverick-17B-128E-Instruct` |
+| Llama-4-Scout-17B-16E-Instruct | [`meta-llama/Llama-4-Scout-17B-16E-Instruct`](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct) |
+| Llama-4-Maverick-17B-128E-Instruct | [`meta-llama/Llama-4-Maverick-17B-128E-Instruct`](https://huggingface.co/meta-llama/Llama-4-Maverick-17B-128E-Instruct) |
 
 
 ## Try with NeMo AutoModel

@@ -24,8 +24,8 @@
 
 | Model | HF ID |
 |---|---|
-| Seed-Coder 8B Instruct | `ByteDance-Seed/Seed-Coder-8B-Instruct` |
-| Seed-OSS 36B Instruct | `ByteDance-Seed/Seed-OSS-36B-Instruct` |
+| Seed-Coder 8B Instruct | [`ByteDance-Seed/Seed-Coder-8B-Instruct`](https://huggingface.co/ByteDance-Seed/Seed-Coder-8B-Instruct) |
+| Seed-OSS 36B Instruct | [`ByteDance-Seed/Seed-OSS-36B-Instruct`](https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct) |
 
 ## Example Recipes
 

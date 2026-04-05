@@ -27,7 +27,7 @@ This model requires `trust_remote_code: true` in your recipe YAML.
 
 | Model | HF ID |
 |---|---|
-| Nemotron-Flash 1B | `nvidia/Nemotron-Flash-1B` |
+| Nemotron-Flash 1B | [`nvidia/Nemotron-Flash-1B`](https://huggingface.co/nvidia/Nemotron-Flash-1B) |
 
 ## Example Recipes
 

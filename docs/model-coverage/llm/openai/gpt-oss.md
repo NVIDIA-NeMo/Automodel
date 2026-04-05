@@ -24,8 +24,8 @@
 
 | Model | HF ID |
 |---|---|
-| GPT-OSS 20B | `openai/gpt-oss-20b` |
-| GPT-OSS 120B | `openai/gpt-oss-120b` |
+| GPT-OSS 20B | [`openai/gpt-oss-20b`](https://huggingface.co/openai/gpt-oss-20b) |
+| GPT-OSS 120B | [`openai/gpt-oss-120b`](https://huggingface.co/openai/gpt-oss-120b) |
 
 ## Example Recipes
 

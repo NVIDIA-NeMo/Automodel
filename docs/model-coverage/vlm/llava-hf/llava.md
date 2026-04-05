@@ -29,12 +29,12 @@
 
 | Model | HF ID |
 |---|---|
-| LLaVA 1.5 7B | `llava-hf/llava-1.5-7b-hf` |
-| LLaVA 1.5 13B | `llava-hf/llava-1.5-13b-hf` |
-| LLaVA-NeXT Mistral 7B | `llava-hf/llava-v1.6-mistral-7b-hf` |
-| LLaVA-NeXT 34B | `llava-hf/llava-v1.6-34b-hf` |
-| LLaVA-NeXT-Video 7B | `llava-hf/LLaVA-NeXT-Video-7B-hf` |
-| LLaVA-OneVision 7B | `llava-hf/llava-onevision-qwen2-7b-ov-hf` |
+| LLaVA 1.5 7B | [`llava-hf/llava-1.5-7b-hf`](https://huggingface.co/llava-hf/llava-1.5-7b-hf) |
+| LLaVA 1.5 13B | [`llava-hf/llava-1.5-13b-hf`](https://huggingface.co/llava-hf/llava-1.5-13b-hf) |
+| LLaVA-NeXT Mistral 7B | [`llava-hf/llava-v1.6-mistral-7b-hf`](https://huggingface.co/llava-hf/llava-v1.6-mistral-7b-hf) |
+| LLaVA-NeXT 34B | [`llava-hf/llava-v1.6-34b-hf`](https://huggingface.co/llava-hf/llava-v1.6-34b-hf) |
+| LLaVA-NeXT-Video 7B | [`llava-hf/LLaVA-NeXT-Video-7B-hf`](https://huggingface.co/llava-hf/LLaVA-NeXT-Video-7B-hf) |
+| LLaVA-OneVision 7B | [`llava-hf/llava-onevision-qwen2-7b-ov-hf`](https://huggingface.co/llava-hf/llava-onevision-qwen2-7b-ov-hf) |
 
 
 ## Try with NeMo AutoModel

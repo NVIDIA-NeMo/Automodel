@@ -26,8 +26,8 @@
 
 | Model | HF ID |
 |---|---|
-| MiniCPM 2B SFT | `openbmb/MiniCPM-2B-sft-bf16` |
-| MiniCPM3 4B | `openbmb/MiniCPM3-4B` |
+| MiniCPM 2B SFT | [`openbmb/MiniCPM-2B-sft-bf16`](https://huggingface.co/openbmb/MiniCPM-2B-sft-bf16) |
+| MiniCPM3 4B | [`openbmb/MiniCPM3-4B`](https://huggingface.co/openbmb/MiniCPM3-4B) |
 
 
 ## Try with NeMo AutoModel

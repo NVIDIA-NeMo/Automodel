@@ -23,7 +23,7 @@ Qwen3-Next is an advanced MoE language model from Alibaba Cloud's Qwen team desi
 
 | Model | HF ID |
 |---|---|
-| Qwen3-Next 80B A3B Instruct | `Qwen/Qwen3-Next-80B-A3B-Instruct` |
+| Qwen3-Next 80B A3B Instruct | [`Qwen/Qwen3-Next-80B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct) |
 
 ## Example Recipes
 

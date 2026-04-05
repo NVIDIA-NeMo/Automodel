@@ -23,7 +23,7 @@
 
 | Model | HF ID |
 |---|---|
-| Minitron 8B Base | `nvidia/Minitron-8B-Base` |
+| Minitron 8B Base | [`nvidia/Minitron-8B-Base`](https://huggingface.co/nvidia/Minitron-8B-Base) |
 
 
 ## Try with NeMo AutoModel

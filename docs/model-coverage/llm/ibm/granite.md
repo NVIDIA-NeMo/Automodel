@@ -26,9 +26,9 @@
 
 | Model | HF ID |
 |---|---|
-| Granite 3.0 2B Base | `ibm-granite/granite-3.0-2b-base` |
-| Granite 3.1 8B Instruct | `ibm-granite/granite-3.1-8b-instruct` |
-| PowerLM 3B | `ibm/PowerLM-3b` |
+| Granite 3.0 2B Base | [`ibm-granite/granite-3.0-2b-base`](https://huggingface.co/ibm-granite/granite-3.0-2b-base) |
+| Granite 3.1 8B Instruct | [`ibm-granite/granite-3.1-8b-instruct`](https://huggingface.co/ibm-granite/granite-3.1-8b-instruct) |
+| PowerLM 3B | [`ibm/PowerLM-3b`](https://huggingface.co/ibm/PowerLM-3b) |
 
 ## Example Recipes
 

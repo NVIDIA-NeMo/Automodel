@@ -23,7 +23,7 @@
 
 | Model | HF ID |
 |---|---|
-| GritLM 7B vllm | `parasail-ai/GritLM-7B-vllm` |
+| GritLM 7B vllm | [`parasail-ai/GritLM-7B-vllm`](https://huggingface.co/parasail-ai/GritLM-7B-vllm) |
 
 
 ## Try with NeMo AutoModel

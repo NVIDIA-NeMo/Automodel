@@ -26,8 +26,8 @@
 
 | Model | HF ID |
 |---|---|
-| Qwen3-VL 4B Instruct | `Qwen/Qwen3-VL-4B-Instruct` |
-| Qwen3-VL 8B Instruct | `Qwen/Qwen3-VL-8B-Instruct` |
+| Qwen3-VL 4B Instruct | [`Qwen/Qwen3-VL-4B-Instruct`](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct) |
+| Qwen3-VL 8B Instruct | [`Qwen/Qwen3-VL-8B-Instruct`](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct) |
 
 ## Example Recipes
 

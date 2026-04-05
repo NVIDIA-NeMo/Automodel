@@ -23,7 +23,7 @@
 
 | Model | HF ID |
 |---|---|
-| Wan 2.1 T2V 1.3B | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` |
+| Wan 2.1 T2V 1.3B | [`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) |
 
 ## Example Recipes
 

@@ -24,8 +24,8 @@
 
 | Model | HF ID |
 |---|---|
-| Phi-3-small-8k-instruct | `microsoft/Phi-3-small-8k-instruct` |
-| Phi-3-small-128k-instruct | `microsoft/Phi-3-small-128k-instruct` |
+| Phi-3-small-8k-instruct | [`microsoft/Phi-3-small-8k-instruct`](https://huggingface.co/microsoft/Phi-3-small-8k-instruct) |
+| Phi-3-small-128k-instruct | [`microsoft/Phi-3-small-128k-instruct`](https://huggingface.co/microsoft/Phi-3-small-128k-instruct) |
 
 
 ## Try with NeMo AutoModel

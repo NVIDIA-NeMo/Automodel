@@ -24,8 +24,8 @@
 
 | Model | HF ID |
 |---|---|
-| OLMoE 1B 7B | `allenai/OLMoE-1B-7B-0924` |
-| OLMoE 1B 7B Instruct | `allenai/OLMoE-1B-7B-0924-Instruct` |
+| OLMoE 1B 7B | [`allenai/OLMoE-1B-7B-0924`](https://huggingface.co/allenai/OLMoE-1B-7B-0924) |
+| OLMoE 1B 7B Instruct | [`allenai/OLMoE-1B-7B-0924-Instruct`](https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct) |
 
 
 ## Try with NeMo AutoModel

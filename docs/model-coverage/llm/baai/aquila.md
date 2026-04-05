@@ -25,8 +25,8 @@
 
 | Model | HF ID |
 |---|---|
-| Aquila 7B | `BAAI/Aquila-7B` |
-| AquilaChat 7B | `BAAI/AquilaChat-7B` |
+| Aquila 7B | [`BAAI/Aquila-7B`](https://huggingface.co/BAAI/Aquila-7B) |
+| AquilaChat 7B | [`BAAI/AquilaChat-7B`](https://huggingface.co/BAAI/AquilaChat-7B) |
 
 
 ## Try with NeMo AutoModel

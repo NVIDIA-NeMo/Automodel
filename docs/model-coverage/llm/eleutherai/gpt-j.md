@@ -24,8 +24,8 @@
 
 | Model | HF ID |
 |---|---|
-| GPT-J 6B | `EleutherAI/gpt-j-6b` |
-| GPT4All-J | `nomic-ai/gpt4all-j` |
+| GPT-J 6B | [`EleutherAI/gpt-j-6b`](https://huggingface.co/EleutherAI/gpt-j-6b) |
+| GPT4All-J | [`nomic-ai/gpt4all-j`](https://huggingface.co/nomic-ai/gpt4all-j) |
 
 
 ## Try with NeMo AutoModel

@@ -25,9 +25,9 @@
 
 | Model | HF ID |
 |---|---|
-| StarCoder | `bigcode/starcoder` |
-| SantaCoder | `bigcode/gpt_bigcode-santacoder` |
-| WizardCoder 15B | `WizardLM/WizardCoder-15B-V1.0` |
+| StarCoder | [`bigcode/starcoder`](https://huggingface.co/bigcode/starcoder) |
+| SantaCoder | [`bigcode/gpt_bigcode-santacoder`](https://huggingface.co/bigcode/gpt_bigcode-santacoder) |
+| WizardCoder 15B | [`WizardLM/WizardCoder-15B-V1.0`](https://huggingface.co/WizardLM/WizardCoder-15B-V1.0) |
 
 
 ## Try with NeMo AutoModel

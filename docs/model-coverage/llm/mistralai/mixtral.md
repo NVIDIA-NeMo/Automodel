@@ -25,8 +25,8 @@
 
 | Model | HF ID |
 |---|---|
-| Mixtral 8x7B v0.1 | `mistralai/Mixtral-8x7B-v0.1` |
-| Mixtral 8x7B Instruct v0.1 | `mistralai/Mixtral-8x7B-Instruct-v0.1` |
+| Mixtral 8x7B v0.1 | [`mistralai/Mixtral-8x7B-v0.1`](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1) |
+| Mixtral 8x7B Instruct v0.1 | [`mistralai/Mixtral-8x7B-Instruct-v0.1`](https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1) |
 
 ## Example Recipes
 

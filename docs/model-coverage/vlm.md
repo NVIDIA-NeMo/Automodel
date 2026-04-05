@@ -48,28 +48,28 @@ The following VLM architectures have built-in FSDP2 parallelization support in N
 
 | Architecture | Example HF Models |
 |--------------|-------------------|
-| `Qwen2VLForConditionalGeneration` | `Qwen/Qwen2-VL-7B-Instruct`, `Qwen/Qwen2-VL-2B-Instruct` |
-| `SmolVLMForConditionalGeneration` | `HuggingFaceTB/SmolVLM-Instruct`, `HuggingFaceTB/SmolVLM-256M-Instruct` |
-| `LlavaForConditionalGeneration` | `llava-hf/llava-1.5-7b-hf`, `llava-hf/llava-1.5-13b-hf` |
-| `LlavaNextForConditionalGeneration` | `llava-hf/llava-v1.6-mistral-7b-hf`, `llava-hf/llava-v1.6-34b-hf` |
-| `LlavaNextVideoForConditionalGeneration` | `llava-hf/LLaVA-NeXT-Video-7B-hf` |
-| `LlavaOnevisionForConditionalGeneration` | `llava-hf/llava-onevision-qwen2-7b-ov-hf` |
-| `Llama4ForConditionalGeneration` | `meta-llama/Llama-4-Scout-17B-16E-Instruct`, `meta-llama/Llama-4-Maverick-17B-128E-Instruct` |
+| `Qwen2VLForConditionalGeneration` | [`Qwen/Qwen2-VL-7B-Instruct`](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct), [`Qwen/Qwen2-VL-2B-Instruct`](https://huggingface.co/Qwen/Qwen2-VL-2B-Instruct) |
+| `SmolVLMForConditionalGeneration` | [`HuggingFaceTB/SmolVLM-Instruct`](https://huggingface.co/HuggingFaceTB/SmolVLM-Instruct), [`HuggingFaceTB/SmolVLM-256M-Instruct`](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct) |
+| `LlavaForConditionalGeneration` | [`llava-hf/llava-1.5-7b-hf`](https://huggingface.co/llava-hf/llava-1.5-7b-hf), [`llava-hf/llava-1.5-13b-hf`](https://huggingface.co/llava-hf/llava-1.5-13b-hf) |
+| `LlavaNextForConditionalGeneration` | [`llava-hf/llava-v1.6-mistral-7b-hf`](https://huggingface.co/llava-hf/llava-v1.6-mistral-7b-hf), [`llava-hf/llava-v1.6-34b-hf`](https://huggingface.co/llava-hf/llava-v1.6-34b-hf) |
+| `LlavaNextVideoForConditionalGeneration` | [`llava-hf/LLaVA-NeXT-Video-7B-hf`](https://huggingface.co/llava-hf/LLaVA-NeXT-Video-7B-hf) |
+| `LlavaOnevisionForConditionalGeneration` | [`llava-hf/llava-onevision-qwen2-7b-ov-hf`](https://huggingface.co/llava-hf/llava-onevision-qwen2-7b-ov-hf) |
+| `Llama4ForConditionalGeneration` | [`meta-llama/Llama-4-Scout-17B-16E-Instruct`](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct), [`meta-llama/Llama-4-Maverick-17B-128E-Instruct`](https://huggingface.co/meta-llama/Llama-4-Maverick-17B-128E-Instruct) |
 
 
 ## Dataset Examples
 
 :::{tip}
-In these guides, we use the `quintend/rdr-items` and `naver-clova-ix/cord-v2` datasets for demonstration purposes, but you can use your own data.
+In these guides, we use the [`quintend/rdr-items`](https://huggingface.co/quintend/rdr-items) and [`naver-clova-ix/cord-v2`](https://huggingface.co/naver-clova-ix/cord-v2) datasets for demonstration purposes, but you can use your own data.
 
 To do so, update the recipe YAML `dataset` section (for example `dataset._target_`, `path_or_dataset`, and `split`) and ensure your `dataloader.collate_fn` matches the model/dataset. See [VLM datasets](../guides/vlm/dataset.md) and [dataset overview](../guides/dataset-overview.md).
 :::
 
 ### RDR Items Dataset
-The rdr items dataset [`quintend/rdr-items`](https://huggingface.co/datasets/quintend/rdr-items) is a small dataset containing 48 images with descriptions. This dataset serves as an example of how to prepare image-text data for VLM fine-tuning. For complete instructions on dataset preprocessing and the collate functions used, see the [Gemma Fine-Tuning Guide](../guides/omni/gemma3-3n.md).
+The rdr items dataset [`quintend/rdr-items`](https://huggingface.co/quintend/rdr-items) is a small dataset containing 48 images with descriptions. This dataset serves as an example of how to prepare image-text data for VLM fine-tuning. For complete instructions on dataset preprocessing and the collate functions used, see the [Gemma Fine-Tuning Guide](../guides/omni/gemma3-3n.md).
 
 ### CORD-v2 Dataset
-The cord-v2 dataset [`naver-clova-ix/cord-v2`](https://huggingface.co/datasets/naver-clova-ix/cord-v2) contains receipts with descriptions in JSON format. This demonstrates handling structured data in VLMs. The [Gemma Fine-Tuning Guide](../guides/omni/gemma3-3n.md) provides detailed examples of custom preprocessing and collate functions for similar datasets.
+The cord-v2 dataset [`naver-clova-ix/cord-v2`](https://huggingface.co/naver-clova-ix/cord-v2) contains receipts with descriptions in JSON format. This demonstrates handling structured data in VLMs. The [Gemma Fine-Tuning Guide](../guides/omni/gemma3-3n.md) provides detailed examples of custom preprocessing and collate functions for similar datasets.
 
 ## Train VLM Models
 All supported models can be fine-tuned using either full SFT or PEFT approaches. The [Gemma Fine-Tuning Guide](../guides/omni/gemma3-3n.md) provides complete instructions for:

@@ -23,7 +23,7 @@
 
 | Model | HF ID |
 |---|---|
-| Mistral-Small-4 119B Instruct | `mistralai/Mistral-Small-4-119B-Instruct-2512` |
+| Mistral-Small-4 119B Instruct | [`mistralai/Mistral-Small-4-119B-Instruct-2512`](https://huggingface.co/mistralai/Mistral-Small-4-119B-Instruct-2512) |
 
 ## Example Recipes
 

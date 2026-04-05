@@ -23,7 +23,7 @@
 
 | Model | HF ID |
 |---|---|
-| Phi-4-multimodal-instruct | `microsoft/Phi-4-multimodal-instruct` |
+| Phi-4-multimodal-instruct | [`microsoft/Phi-4-multimodal-instruct`](https://huggingface.co/microsoft/Phi-4-multimodal-instruct) |
 
 ## Example Recipes
 

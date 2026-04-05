@@ -26,10 +26,10 @@
 
 | Model | HF ID |
 |---|---|
-| Jais 13B | `inceptionai/jais-13b` |
-| Jais 13B Chat | `inceptionai/jais-13b-chat` |
-| Jais 30B v3 | `inceptionai/jais-30b-v3` |
-| Jais 30B Chat v3 | `inceptionai/jais-30b-chat-v3` |
+| Jais 13B | [`inceptionai/jais-13b`](https://huggingface.co/inceptionai/jais-13b) |
+| Jais 13B Chat | [`inceptionai/jais-13b-chat`](https://huggingface.co/inceptionai/jais-13b-chat) |
+| Jais 30B v3 | [`inceptionai/jais-30b-v3`](https://huggingface.co/inceptionai/jais-30b-v3) |
+| Jais 30B Chat v3 | [`inceptionai/jais-30b-chat-v3`](https://huggingface.co/inceptionai/jais-30b-chat-v3) |
 
 
 ## Try with NeMo AutoModel

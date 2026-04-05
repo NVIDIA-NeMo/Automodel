@@ -23,9 +23,9 @@
 
 | Model | HF ID |
 |---|---|
-| Qwen3 0.6B | `Qwen/Qwen3-0.6B` |
-| Qwen3 8B | `Qwen/Qwen3-8B` |
-| Qwen3 32B | `Qwen/Qwen3-32B` |
+| Qwen3 0.6B | [`Qwen/Qwen3-0.6B`](https://huggingface.co/Qwen/Qwen3-0.6B) |
+| Qwen3 8B | [`Qwen/Qwen3-8B`](https://huggingface.co/Qwen/Qwen3-8B) |
+| Qwen3 32B | [`Qwen/Qwen3-32B`](https://huggingface.co/Qwen/Qwen3-32B) |
 
 ## Example Recipes
 

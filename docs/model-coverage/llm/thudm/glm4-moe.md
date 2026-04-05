@@ -26,9 +26,9 @@
 
 | Model | HF ID |
 |---|---|
-| GLM-4.5-Air | `zai-org/GLM-4.5-Air` |
-| GLM-4.7 | `zai-org/GLM-4.7` |
-| GLM-4.7-Flash | `zai-org/GLM-4.7-Flash` |
+| GLM-4.5-Air | [`zai-org/GLM-4.5-Air`](https://huggingface.co/zai-org/GLM-4.5-Air) |
+| GLM-4.7 | [`zai-org/GLM-4.7`](https://huggingface.co/zai-org/GLM-4.7) |
+| GLM-4.7-Flash | [`zai-org/GLM-4.7-Flash`](https://huggingface.co/zai-org/GLM-4.7-Flash) |
 
 ## Example Recipes
 

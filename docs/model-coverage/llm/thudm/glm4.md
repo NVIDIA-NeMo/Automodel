@@ -25,8 +25,8 @@
 
 | Model | HF ID |
 |---|---|
-| GLM-4-9B-Chat-HF | `THUDM/glm-4-9b-chat-hf` |
-| GLM-4-32B-0414 | `THUDM/GLM-4-32B-0414` |
+| GLM-4-9B-Chat-HF | [`THUDM/glm-4-9b-chat-hf`](https://huggingface.co/THUDM/glm-4-9b-chat-hf) |
+| GLM-4-32B-0414 | [`THUDM/GLM-4-32B-0414`](https://huggingface.co/THUDM/GLM-4-32B-0414) |
 
 ## Example Recipes
 

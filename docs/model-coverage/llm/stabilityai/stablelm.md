@@ -24,8 +24,8 @@
 
 | Model | HF ID |
 |---|---|
-| StableLM 3B 4E1T | `stabilityai/stablelm-3b-4e1t` |
-| StableLM Base Alpha 7B v2 | `stabilityai/stablelm-base-alpha-7b-v2` |
+| StableLM 3B 4E1T | [`stabilityai/stablelm-3b-4e1t`](https://huggingface.co/stabilityai/stablelm-3b-4e1t) |
+| StableLM Base Alpha 7B v2 | [`stabilityai/stablelm-base-alpha-7b-v2`](https://huggingface.co/stabilityai/stablelm-base-alpha-7b-v2) |
 
 
 ## Try with NeMo AutoModel

@@ -28,11 +28,11 @@
 
 | Model | HF ID |
 |---|---|
-| Phi-4 | `microsoft/Phi-4` |
-| Phi-4-mini-instruct | `microsoft/Phi-4-mini-instruct` |
-| Phi-3-mini-4k-instruct | `microsoft/Phi-3-mini-4k-instruct` |
-| Phi-3-mini-128k-instruct | `microsoft/Phi-3-mini-128k-instruct` |
-| Phi-3-medium-128k-instruct | `microsoft/Phi-3-medium-128k-instruct` |
+| Phi-4 | [`microsoft/Phi-4`](https://huggingface.co/microsoft/Phi-4) |
+| Phi-4-mini-instruct | [`microsoft/Phi-4-mini-instruct`](https://huggingface.co/microsoft/Phi-4-mini-instruct) |
+| Phi-3-mini-4k-instruct | [`microsoft/Phi-3-mini-4k-instruct`](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct) |
+| Phi-3-mini-128k-instruct | [`microsoft/Phi-3-mini-128k-instruct`](https://huggingface.co/microsoft/Phi-3-mini-128k-instruct) |
+| Phi-3-medium-128k-instruct | [`microsoft/Phi-3-medium-128k-instruct`](https://huggingface.co/microsoft/Phi-3-medium-128k-instruct) |
 
 ## Example Recipes
 

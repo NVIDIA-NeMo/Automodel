@@ -23,7 +23,7 @@
 
 | Model | HF ID |
 |---|---|
-| Bamba 9B | `ibm-ai-platform/Bamba-9B` |
+| Bamba 9B | [`ibm-ai-platform/Bamba-9B`](https://huggingface.co/ibm-ai-platform/Bamba-9B) |
 
 
 ## Try with NeMo AutoModel

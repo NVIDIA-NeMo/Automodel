@@ -25,8 +25,8 @@
 
 | Model | HF ID |
 |---|---|
-| Baichuan2 13B Chat | `baichuan-inc/Baichuan2-13B-Chat` |
-| Baichuan 7B | `baichuan-inc/Baichuan-7B` |
+| Baichuan2 13B Chat | [`baichuan-inc/Baichuan2-13B-Chat`](https://huggingface.co/baichuan-inc/Baichuan2-13B-Chat) |
+| Baichuan 7B | [`baichuan-inc/Baichuan-7B`](https://huggingface.co/baichuan-inc/Baichuan-7B) |
 
 ## Example Recipes
 

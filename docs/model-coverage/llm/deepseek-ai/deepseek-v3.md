@@ -28,10 +28,10 @@
 
 | Model | HF ID |
 |---|---|
-| DeepSeek-V3 | `deepseek-ai/DeepSeek-V3` |
-| DeepSeek-V3-Base | `deepseek-ai/DeepSeek-V3-Base` |
-| DeepSeek-V3.2 | `deepseek-ai/DeepSeek-V3.2` |
-| Moonlight 16B A3B | `moonshotai/Moonlight-16B-A3B` |
+| DeepSeek-V3 | [`deepseek-ai/DeepSeek-V3`](https://huggingface.co/deepseek-ai/DeepSeek-V3) |
+| DeepSeek-V3-Base | [`deepseek-ai/DeepSeek-V3-Base`](https://huggingface.co/deepseek-ai/DeepSeek-V3-Base) |
+| DeepSeek-V3.2 | [`deepseek-ai/DeepSeek-V3.2`](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) |
+| Moonlight 16B A3B | [`moonshotai/Moonlight-16B-A3B`](https://huggingface.co/moonshotai/Moonlight-16B-A3B) |
 
 ## Example Recipes
 

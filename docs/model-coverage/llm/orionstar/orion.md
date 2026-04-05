@@ -24,8 +24,8 @@
 
 | Model | HF ID |
 |---|---|
-| Orion 14B Base | `OrionStarAI/Orion-14B-Base` |
-| Orion 14B Chat | `OrionStarAI/Orion-14B-Chat` |
+| Orion 14B Base | [`OrionStarAI/Orion-14B-Base`](https://huggingface.co/OrionStarAI/Orion-14B-Base) |
+| Orion 14B Chat | [`OrionStarAI/Orion-14B-Chat`](https://huggingface.co/OrionStarAI/Orion-14B-Chat) |
 
 
 ## Try with NeMo AutoModel

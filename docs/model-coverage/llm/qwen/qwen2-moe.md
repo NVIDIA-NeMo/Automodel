@@ -23,8 +23,8 @@
 
 | Model | HF ID |
 |---|---|
-| Qwen1.5 MoE A2.7B | `Qwen/Qwen1.5-MoE-A2.7B` |
-| Qwen1.5 MoE A2.7B Chat | `Qwen/Qwen1.5-MoE-A2.7B-Chat` |
+| Qwen1.5 MoE A2.7B | [`Qwen/Qwen1.5-MoE-A2.7B`](https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B) |
+| Qwen1.5 MoE A2.7B Chat | [`Qwen/Qwen1.5-MoE-A2.7B-Chat`](https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B-Chat) |
 
 ## Example Recipes
 

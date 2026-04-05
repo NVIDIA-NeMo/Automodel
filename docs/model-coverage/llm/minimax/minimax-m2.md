@@ -24,8 +24,8 @@
 
 | Model | HF ID |
 |---|---|
-| MiniMax M2.1 | `MiniMaxAI/MiniMax-M2.1` |
-| MiniMax M2.5 | `MiniMaxAI/MiniMax-M2.5` |
+| MiniMax M2.1 | [`MiniMaxAI/MiniMax-M2.1`](https://huggingface.co/MiniMaxAI/MiniMax-M2.1) |
+| MiniMax M2.5 | [`MiniMaxAI/MiniMax-M2.5`](https://huggingface.co/MiniMaxAI/MiniMax-M2.5) |
 
 ## Example Recipes
 

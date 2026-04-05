@@ -23,7 +23,7 @@
 
 | Model | HF ID |
 |---|---|
-| Moonlight 16B A3B | `moonshotai/Moonlight-16B-A3B` |
+| Moonlight 16B A3B | [`moonshotai/Moonlight-16B-A3B`](https://huggingface.co/moonshotai/Moonlight-16B-A3B) |
 
 ## Example Recipes
 

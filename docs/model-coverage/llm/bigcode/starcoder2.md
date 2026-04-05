@@ -25,9 +25,9 @@
 
 | Model | HF ID |
 |---|---|
-| StarCoder2 3B | `bigcode/starcoder2-3b` |
-| StarCoder2 7B | `bigcode/starcoder2-7b` |
-| StarCoder2 15B | `bigcode/starcoder2-15b` |
+| StarCoder2 3B | [`bigcode/starcoder2-3b`](https://huggingface.co/bigcode/starcoder2-3b) |
+| StarCoder2 7B | [`bigcode/starcoder2-7b`](https://huggingface.co/bigcode/starcoder2-7b) |
+| StarCoder2 15B | [`bigcode/starcoder2-15b`](https://huggingface.co/bigcode/starcoder2-15b) |
 
 ## Example Recipes
 

@@ -24,8 +24,8 @@
 
 | Model | HF ID |
 |---|---|
-| SmolVLM Instruct | `HuggingFaceTB/SmolVLM-Instruct` |
-| SmolVLM 256M Instruct | `HuggingFaceTB/SmolVLM-256M-Instruct` |
+| SmolVLM Instruct | [`HuggingFaceTB/SmolVLM-Instruct`](https://huggingface.co/HuggingFaceTB/SmolVLM-Instruct) |
+| SmolVLM 256M Instruct | [`HuggingFaceTB/SmolVLM-256M-Instruct`](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct) |
 
 
 ## Try with NeMo AutoModel

@@ -31,10 +31,10 @@ Both use the `Mistral3ForConditionalGeneration` architecture.
 
 | Model | HF ID |
 |---|---|
-| Ministral-3 3B Instruct | `mistralai/Ministral-3-3B-Instruct-2512` |
-| Ministral-3 8B Instruct | `mistralai/Ministral-3-8B-Instruct-2512` |
-| Ministral-3 14B Instruct | `mistralai/Ministral-3-14B-Instruct-2512` |
-| Devstral Small 2 24B | `mistralai/Devstral-Small-2-24B-Instruct-2512` |
+| Ministral-3 3B Instruct | [`mistralai/Ministral-3-3B-Instruct-2512`](https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512) |
+| Ministral-3 8B Instruct | [`mistralai/Ministral-3-8B-Instruct-2512`](https://huggingface.co/mistralai/Ministral-3-8B-Instruct-2512) |
+| Ministral-3 14B Instruct | [`mistralai/Ministral-3-14B-Instruct-2512`](https://huggingface.co/mistralai/Ministral-3-14B-Instruct-2512) |
+| Devstral Small 2 24B | [`mistralai/Devstral-Small-2-24B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512) |
 
 ## Example Recipes
 

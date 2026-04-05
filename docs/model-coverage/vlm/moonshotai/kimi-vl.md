@@ -24,7 +24,7 @@
 
 | Model | HF ID |
 |---|---|
-| Kimi-VL-A3B-Instruct | `moonshotai/Kimi-VL-A3B-Instruct` |
+| Kimi-VL-A3B-Instruct | [`moonshotai/Kimi-VL-A3B-Instruct`](https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct) |
 
 ## Example Recipes
 

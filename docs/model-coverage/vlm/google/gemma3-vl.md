@@ -25,8 +25,8 @@
 
 | Model | HF ID |
 |---|---|
-| Gemma 3 4B IT | `google/gemma-3-4b-it` |
-| Gemma 3 27B IT | `google/gemma-3-27b-it` |
+| Gemma 3 4B IT | [`google/gemma-3-4b-it`](https://huggingface.co/google/gemma-3-4b-it) |
+| Gemma 3 27B IT | [`google/gemma-3-27b-it`](https://huggingface.co/google/gemma-3-27b-it) |
 
 ## Example Recipes
 

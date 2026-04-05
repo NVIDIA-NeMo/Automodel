@@ -23,7 +23,7 @@
 
 | Model | HF ID |
 |---|---|
-| Nemotron-Parse v1.1 | `nvidia/Nemotron-Parse-v1.1` |
+| Nemotron-Parse v1.1 | [`nvidia/Nemotron-Parse-v1.1`](https://huggingface.co/nvidia/Nemotron-Parse-v1.1) |
 
 ## Example Recipes
 

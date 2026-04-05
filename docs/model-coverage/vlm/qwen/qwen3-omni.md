@@ -23,7 +23,7 @@
 
 | Model | HF ID |
 |---|---|
-| Qwen3-Omni 30B A3B | `Qwen/Qwen3-Omni-30B-A3B` |
+| Qwen3-Omni 30B A3B | [`Qwen/Qwen3-Omni-30B-A3B`](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B) |
 
 ## Example Recipes
 

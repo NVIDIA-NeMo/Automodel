@@ -24,7 +24,7 @@
 
 | Model | HF ID |
 |---|---|
-| EXAONE 3.0 7.8B Instruct | `LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct` |
+| EXAONE 3.0 7.8B Instruct | [`LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct`](https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct) |
 
 
 ## Try with NeMo AutoModel

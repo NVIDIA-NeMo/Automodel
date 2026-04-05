@@ -23,7 +23,7 @@
 
 | Model | HF ID |
 |---|---|
-| Llama-3.3-Nemotron-Super-49B-v1 | `nvidia/Llama-3_3-Nemotron-Super-49B-v1` |
+| Llama-3.3-Nemotron-Super-49B-v1 | [`nvidia/Llama-3_3-Nemotron-Super-49B-v1`](https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1) |
 
 
 ## Try with NeMo AutoModel

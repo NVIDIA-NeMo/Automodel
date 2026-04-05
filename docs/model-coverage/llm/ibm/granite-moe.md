@@ -27,9 +27,9 @@ IBM Granite MoE models extend the Granite architecture with Mixture-of-Experts l
 
 | Model | HF ID |
 |---|---|
-| Granite 3.0 1B A400M Base | `ibm-granite/granite-3.0-1b-a400m-base` |
-| Granite 3.0 3B A800M Instruct | `ibm-granite/granite-3.0-3b-a800m-instruct` |
-| PowerMoE 3B | `ibm/PowerMoE-3b` |
+| Granite 3.0 1B A400M Base | [`ibm-granite/granite-3.0-1b-a400m-base`](https://huggingface.co/ibm-granite/granite-3.0-1b-a400m-base) |
+| Granite 3.0 3B A800M Instruct | [`ibm-granite/granite-3.0-3b-a800m-instruct`](https://huggingface.co/ibm-granite/granite-3.0-3b-a800m-instruct) |
+| PowerMoE 3B | [`ibm/PowerMoE-3b`](https://huggingface.co/ibm/PowerMoE-3b) |
 
 
 ## Try with NeMo AutoModel

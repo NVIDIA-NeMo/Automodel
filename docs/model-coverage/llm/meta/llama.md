@@ -28,15 +28,15 @@
 
 | Model | HF ID |
 |---|---|
-| Llama 3.2 1B | `meta-llama/Llama-3.2-1B` |
-| Llama 3.2 3B | `meta-llama/Llama-3.2-3B` |
-| Llama 3.1 8B | `meta-llama/Meta-Llama-3.1-8B-Instruct` |
-| Llama 3.1 70B | `meta-llama/Meta-Llama-3.1-70B-Instruct` |
-| Llama 3.1 405B | `meta-llama/Meta-Llama-3.1-405B-Instruct` |
-| Llama 3 8B | `meta-llama/Meta-Llama-3-8B-Instruct` |
-| Llama 3 70B | `meta-llama/Meta-Llama-3-70B-Instruct` |
-| Llama 2 70B | `meta-llama/Llama-2-70b-hf` |
-| Yi 34B | `01-ai/Yi-34B` |
+| Llama 3.2 1B | [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B) |
+| Llama 3.2 3B | [`meta-llama/Llama-3.2-3B`](https://huggingface.co/meta-llama/Llama-3.2-3B) |
+| Llama 3.1 8B | [`meta-llama/Meta-Llama-3.1-8B-Instruct`](https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct) |
+| Llama 3.1 70B | [`meta-llama/Meta-Llama-3.1-70B-Instruct`](https://huggingface.co/meta-llama/Meta-Llama-3.1-70B-Instruct) |
+| Llama 3.1 405B | [`meta-llama/Meta-Llama-3.1-405B-Instruct`](https://huggingface.co/meta-llama/Meta-Llama-3.1-405B-Instruct) |
+| Llama 3 8B | [`meta-llama/Meta-Llama-3-8B-Instruct`](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) |
+| Llama 3 70B | [`meta-llama/Meta-Llama-3-70B-Instruct`](https://huggingface.co/meta-llama/Meta-Llama-3-70B-Instruct) |
+| Llama 2 70B | [`meta-llama/Llama-2-70b-hf`](https://huggingface.co/meta-llama/Llama-2-70b-hf) |
+| Yi 34B | [`01-ai/Yi-34B`](https://huggingface.co/01-ai/Yi-34B) |
 
 ## Example Recipes
 

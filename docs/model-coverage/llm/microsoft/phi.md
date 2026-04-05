@@ -24,8 +24,8 @@
 
 | Model | HF ID |
 |---|---|
-| Phi-2 | `microsoft/phi-2` |
-| Phi-1.5 | `microsoft/phi-1_5` |
+| Phi-2 | [`microsoft/phi-2`](https://huggingface.co/microsoft/phi-2) |
+| Phi-1.5 | [`microsoft/phi-1_5`](https://huggingface.co/microsoft/phi-1_5) |
 
 ## Example Recipes
 

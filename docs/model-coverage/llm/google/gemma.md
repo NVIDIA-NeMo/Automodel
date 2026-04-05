@@ -27,13 +27,13 @@
 
 | Model | HF ID |
 |---|---|
-| Gemma 1.1 2B IT | `google/gemma-1.1-2b-it` |
-| Gemma 2B | `google/gemma-2b` |
-| Gemma 2 9B IT | `google/gemma-2-9b-it` |
-| Gemma 2 27B | `google/gemma-2-27b` |
-| Gemma 3 1B IT | `google/gemma-3-1b-it` |
-| Gemma 3 4B IT | `google/gemma-3-4b-it` |
-| Gemma 3 27B IT | `google/gemma-3-27b-it` |
+| Gemma 1.1 2B IT | [`google/gemma-1.1-2b-it`](https://huggingface.co/google/gemma-1.1-2b-it) |
+| Gemma 2B | [`google/gemma-2b`](https://huggingface.co/google/gemma-2b) |
+| Gemma 2 9B IT | [`google/gemma-2-9b-it`](https://huggingface.co/google/gemma-2-9b-it) |
+| Gemma 2 27B | [`google/gemma-2-27b`](https://huggingface.co/google/gemma-2-27b) |
+| Gemma 3 1B IT | [`google/gemma-3-1b-it`](https://huggingface.co/google/gemma-3-1b-it) |
+| Gemma 3 4B IT | [`google/gemma-3-4b-it`](https://huggingface.co/google/gemma-3-4b-it) |
+| Gemma 3 27B IT | [`google/gemma-3-27b-it`](https://huggingface.co/google/gemma-3-27b-it) |
 
 ## Example Recipes
 

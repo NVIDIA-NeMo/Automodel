@@ -24,7 +24,7 @@
 
 | Model | HF ID |
 |---|---|
-| InternVL3.5 4B | `OpenGVLab/InternVL3-5-4B` |
+| InternVL3.5 4B | [`OpenGVLab/InternVL3-5-4B`](https://huggingface.co/OpenGVLab/InternVL3-5-4B) |
 
 ## Example Recipes
 
