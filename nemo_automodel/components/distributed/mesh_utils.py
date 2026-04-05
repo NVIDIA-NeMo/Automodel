@@ -352,7 +352,7 @@ def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
     sizes = tuple(get_flat_mesh(device_mesh, n).size() for n in names)
     target = prod(sizes)
     root = device_mesh._get_root_mesh()
-    root_dim_names = set(device_mesh.mesh_dim_names)
+    mesh_dim_names = set(device_mesh.mesh_dim_names)
 
     for fm in root._flatten_mapping.values():
         if fm.size() != target:
@@ -365,7 +365,7 @@ def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
         # the process group must match the root mesh's group for that dim.
         valid = True
         for name in names:
-            if name not in root_dim_names:
+            if name not in mesh_dim_names:
                 continue
             expected = set(dist.get_process_group_ranks(device_mesh[name].get_group()))
             actual = set(dist.get_process_group_ranks(result[name].get_group()))
