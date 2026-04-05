@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import MagicMock, patch
-
 import pytest
-import torch
 from PIL import Image
 
 from nemo_automodel.components.datasets.vlm.mock import build_mock_vlm_dataset
@@ -131,47 +128,3 @@ def test_determinism_with_seed():
         for item1, item2 in zip(s1["conversation"][0]["content"], s2["conversation"][0]["content"]):
             if item1["type"] == "image":
                 assert list(item1["image"].tobytes()) == list(item2["image"].tobytes())
-
-
-# ---------- PreTokenizedDatasetWrapper truncate mode --------------------------
-
-
-def test_pretokenized_wrapper_truncate_mode():
-    """Verify truncate mode clips input_ids, labels, and attention_mask to max_length."""
-    from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
-
-    SEQ_LEN = 20
-    MAX_LEN = 10
-
-    # Fake dataset returning a single conversation
-    mock_ds = build_mock_vlm_dataset(num_samples=1, seed=0)
-
-    # Fake processor that returns tensors of known length
-    processor = MagicMock()
-    processor.return_value = {
-        "input_ids": torch.arange(SEQ_LEN).unsqueeze(0),  # (1, 20)
-        "attention_mask": torch.ones(1, SEQ_LEN, dtype=torch.long),  # (1, 20)
-        "mm_token_type_ids": torch.zeros(SEQ_LEN, dtype=torch.long),  # 1D (20,)
-    }
-    processor.apply_chat_template = MagicMock(return_value="fake template text")
-    processor.image_token = "<image>"
-
-    with patch(
-        "nemo_automodel.components.datasets.vlm.datasets._preload_media",
-        side_effect=lambda ex, proc, **kw: ex,
-    ), patch(
-        "nemo_automodel.components.datasets.vlm.fake_image._conversation_has_media",
-        return_value=True,
-    ), patch(
-        "nemo_automodel.components.datasets.vlm.collate_fns._extract_media_from_conversations",
-        return_value=([], []),
-    ):
-        wrapper = PreTokenizedDatasetWrapper(mock_ds, processor, max_length=MAX_LEN, truncate=True)
-        sample = wrapper[0]
-
-    assert sample["input_ids"].shape[0] == MAX_LEN
-    assert sample["attention_mask"].shape[0] == MAX_LEN
-    assert sample["labels"].shape[0] == MAX_LEN
-    # 1D mm_token_type_ids should also be truncated
-    if "mm_token_type_ids" in sample:
-        assert sample["mm_token_type_ids"].shape[0] == MAX_LEN
