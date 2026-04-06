@@ -7,6 +7,8 @@
 # but you can potentially run it on less GPUs by reducing the local batch size.
 # ------------------------------------------------------------------------------------------------
 
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 1024
   local_batch_size: 128

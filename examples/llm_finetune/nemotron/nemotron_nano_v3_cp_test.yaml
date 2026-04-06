@@ -11,6 +11,8 @@
 #     --config examples/llm_finetune/nemotron/nemotron_nano_v3_cp_test.yaml \
 #     --distributed.cp_size 2 --distributed.ep_size 4
 
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1
