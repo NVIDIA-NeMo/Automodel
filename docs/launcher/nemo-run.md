@@ -48,7 +48,7 @@ def my_slurm_cluster():
         exclusive=True,
         packager=run.Packager(),
     )
-    executor.container_image = "nvcr.io/nvidia/nemo:dev"
+    executor.container_image = "nvcr.io/nvidia/nemo-automodel:26.02"
     executor.container_mounts = ["/data:/data", "/checkpoints:/checkpoints"]
     executor.env_vars = {"HF_HOME": "/data/hf_cache"}
     executor.time = "04:00:00"
@@ -67,7 +67,7 @@ import nemo_run as run
 def my_k8s_cluster():
     return run.KubeflowExecutor(
         namespace="training",
-        image="nvcr.io/nvidia/nemo:dev",
+        image="nvcr.io/nvidia/nemo-automodel:26.02",
         num_nodes=1,
         nprocs_per_node=8,
         gpus_per_node=8,
