@@ -158,7 +158,7 @@ class TestCheckpointResumeConsistency:
         what is saved and what is expected on resume.
         """
         num_hidden, num_shared = 6, 3
-        model = _FakeModel(num_hidden_layers=num_hidden, num_kv_shared_layers=num_shared).cuda()
+        model = _FakeModel(num_hidden_layers=num_hidden, num_kv_shared_layers=num_shared)
         first_shared = num_hidden - num_shared
         dead = _dead_param_names(model, first_shared, num_hidden)
 
@@ -167,7 +167,7 @@ class TestCheckpointResumeConsistency:
         optimizer = torch.optim.Adam(all_trainable, lr=1e-3)
 
         # Forward/backward only uses non-dead params (q_proj + mlp)
-        x = torch.randn(2, 16, device="cuda")
+        x = torch.randn(2, 16, device="cpu")
         loss = model(x).sum()
         loss.backward()
         optimizer.step()
@@ -195,7 +195,7 @@ class TestCheckpointResumeConsistency:
     def test_fix_dead_params_excluded_from_optimizer(self):
         """WITH fix: frozen params excluded from optimizer -> consistent save/load."""
         num_hidden, num_shared = 6, 3
-        model = _FakeModel(num_hidden_layers=num_hidden, num_kv_shared_layers=num_shared).cuda()
+        model = _FakeModel(num_hidden_layers=num_hidden, num_kv_shared_layers=num_shared)
         first_shared = num_hidden - num_shared
         dead = _dead_param_names(model, first_shared, num_hidden)
 
@@ -213,7 +213,7 @@ class TestCheckpointResumeConsistency:
                 assert id(param) not in optimizer_param_ids, f"Frozen param {name} should not be in optimizer"
 
         # Forward/backward/step works normally
-        x = torch.randn(2, 16, device="cuda")
+        x = torch.randn(2, 16, device="cpu")
         loss = model(x).sum()
         loss.backward()
         optimizer.step()
@@ -227,7 +227,7 @@ class TestCheckpointResumeConsistency:
     def test_checkpoint_save_load_roundtrip(self):
         """Full save/load roundtrip succeeds with the fix applied."""
         num_hidden, num_shared = 6, 3
-        model = _FakeModel(num_hidden_layers=num_hidden, num_kv_shared_layers=num_shared).cuda()
+        model = _FakeModel(num_hidden_layers=num_hidden, num_kv_shared_layers=num_shared)
 
         # Apply fix
         freeze_unused_kv_sharing_params(model)
@@ -236,7 +236,7 @@ class TestCheckpointResumeConsistency:
         optimizer = torch.optim.Adam(trainable_params, lr=1e-3)
 
         # Train one step
-        x = torch.randn(2, 16, device="cuda")
+        x = torch.randn(2, 16, device="cpu")
         loss = model(x).sum()
         loss.backward()
         optimizer.step()
@@ -250,13 +250,13 @@ class TestCheckpointResumeConsistency:
             )
 
             # Create a fresh model + optimizer (simulating resume)
-            model2 = _FakeModel(num_hidden_layers=num_hidden, num_kv_shared_layers=num_shared).cuda()
+            model2 = _FakeModel(num_hidden_layers=num_hidden, num_kv_shared_layers=num_shared)
             freeze_unused_kv_sharing_params(model2)
             trainable_params2 = list(filter(lambda p: p.requires_grad, model2.parameters()))
             optimizer2 = torch.optim.Adam(trainable_params2, lr=1e-3)
 
             # Need to do a dummy step so optimizer state structure exists for load
-            x2 = torch.randn(2, 16, device="cuda")
+            x2 = torch.randn(2, 16, device="cpu")
             loss2 = model2(x2).sum()
             loss2.backward()
             optimizer2.step()
