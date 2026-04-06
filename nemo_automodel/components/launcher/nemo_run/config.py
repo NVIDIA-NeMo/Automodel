@@ -22,41 +22,29 @@ from dataclasses import dataclass, field
 _NEMORUN_HOME = os.environ.get("NEMORUN_HOME", os.path.join(os.path.expanduser("~"), ".nemo_run"))
 DEFAULT_EXECUTORS_FILE = os.path.join(_NEMORUN_HOME, "executors.py")
 
+# Keys that belong to NemoRunConfig itself (not executor overrides).
+_LAUNCHER_KEYS = frozenset({
+    "executor", "job_name", "detach", "tail_logs",
+    "executors_file", "job_dir", "overrides",
+})
+
 
 @dataclass
 class NemoRunConfig:
     """Configuration for the NeMo-Run launcher backend.
 
-    The ``executor`` field is interpreted in two ways:
+    The ``executor`` field selects a named executor from
+    ``$NEMORUN_HOME/executors.py``, or ``"local"`` for local execution.
 
-    1. **Named executor** -- if a name matches a key in the ``EXECUTOR_MAP``
-       dictionary found in ``$NEMORUN_HOME/executors.py`` (or the file given by
-       ``executors_file``), that pre-built executor object is loaded and any
-       override fields (``nodes``, ``devices``, ``container_image``, ``time``,
-       ``mounts``, ``env_vars``) are applied on top.
-
-    2. **Inline executor type** -- the string ``"local"`` creates a
-       ``run.LocalExecutor`` directly from the fields in this config.
+    Any key not recognised as a launcher setting is collected into
+    ``overrides`` and applied directly to the executor via ``setattr``.
+    This means any executor attribute (``nodes``, ``partition``,
+    ``container_image``, ``time``, ``env_vars``, etc.) can be overridden
+    from YAML without changes to this config class.
     """
 
     # Executor selection: name from EXECUTOR_MAP or "local"
     executor: str = "local"
-
-    # Compute resources (override values applied to named executors)
-    nodes: int | None = None
-    devices: int | None = None  # GPUs per node (maps to ntasks_per_node / gpus_per_node)
-
-    # Container
-    container_image: str | None = None
-
-    # Time limit (e.g. Slurm wall time)
-    time: str | None = None
-
-    # Container mounts (appended to existing executor mounts)
-    mounts: list[str] = field(default_factory=list)
-
-    # Environment variables (merged into existing executor env_vars)
-    env_vars: dict[str, str] = field(default_factory=dict)
 
     # Job metadata
     job_name: str = ""
@@ -71,8 +59,20 @@ class NemoRunConfig:
     # Local directory for job artifacts (config snapshot, logs)
     job_dir: str = ""
 
-    def __post_init__(self) -> None:
-        if self.nodes is not None and self.nodes < 1:
-            raise ValueError(f"'nodes' must be >= 1, got: {self.nodes}")
-        if self.devices is not None and self.devices < 1:
-            raise ValueError(f"'devices' must be >= 1, got: {self.devices}")
+    # Arbitrary executor attribute overrides (e.g. nodes, partition,
+    # container_image, time, env_vars).  Populated automatically from
+    # unrecognised YAML keys by ``from_dict``.
+    overrides: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "NemoRunConfig":
+        """Build from a raw YAML dict, splitting launcher keys from executor overrides."""
+        launcher_kwargs = {}
+        overrides = {}
+        for k, v in d.items():
+            if k in _LAUNCHER_KEYS:
+                launcher_kwargs[k] = v
+            else:
+                overrides[k] = v
+        launcher_kwargs.setdefault("overrides", {}).update(overrides)
+        return cls(**launcher_kwargs)

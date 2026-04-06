@@ -21,10 +21,6 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Fixed remote path where the job config YAML is written inside the container.
-REMOTE_CONFIG_PATH = "/tmp/automodel_job_config.yaml"
-
-
 def load_executor_from_file(name: str, executors_file: str) -> Any:
     """Load a named executor from a Python file containing an ``EXECUTOR_MAP``.
 
@@ -75,33 +71,23 @@ def load_executor_from_file(name: str, executors_file: str) -> Any:
     return executor
 
 
-def apply_overrides(executor: Any, *, nodes: int | None, devices: int | None,
-                    container_image: str | None, time: str | None,
-                    mounts: list[str] | None, env_vars: dict[str, str] | None) -> None:
-    """Apply YAML override fields to an existing executor in-place.
+def apply_overrides(executor: Any, overrides: dict) -> None:
+    """Apply arbitrary YAML overrides to an executor via ``setattr``.
 
-    Only non-None values are applied.  Mounts and env_vars are *merged* with
-    existing values rather than replacing them.
+    Dict and list values are *merged* with existing executor attributes
+    (dicts are updated, lists are extended).  All other values are set
+    directly.
     """
-    if nodes is not None:
-        executor.nodes = nodes
-    if devices is not None:
-        if hasattr(executor, "ntasks_per_node"):
-            executor.ntasks_per_node = devices
-        if hasattr(executor, "gpus_per_node"):
-            executor.gpus_per_node = devices
-    if container_image is not None:
-        executor.container_image = container_image
-    if time is not None:
-        executor.time = time
-    if mounts:
-        existing = getattr(executor, "container_mounts", []) or []
-        executor.container_mounts = list(existing) + list(mounts)
-    if env_vars:
-        existing = getattr(executor, "env_vars", {}) or {}
-        merged = dict(existing)
-        merged.update(env_vars)
-        executor.env_vars = merged
+    for key, value in overrides.items():
+        existing = getattr(executor, key, None)
+        if isinstance(value, dict) and isinstance(existing, dict):
+            merged = dict(existing)
+            merged.update(value)
+            setattr(executor, key, merged)
+        elif isinstance(value, list) and isinstance(existing, list):
+            setattr(executor, key, list(existing) + list(value))
+        else:
+            setattr(executor, key, value)
 
 
 def submit_nemo_run_job(script: Any, executor: Any, job_name: str,
@@ -126,13 +112,14 @@ def submit_nemo_run_job(script: Any, executor: Any, job_name: str,
         )
 
     exp_name = job_name or "automodel"
+    task_name = job_name or "automodel"
     logger.info(
         "Submitting NeMo-Run experiment '%s' (executor=%s, detach=%s)",
         exp_name, type(executor).__name__, detach,
     )
 
     with run.Experiment(exp_name) as exp:
-        exp.add(script, executor=executor, name=job_name or "automodel")
+        exp.add(script, executor=executor, name=task_name)
         exp.run(detach=detach, tail_logs=tail_logs)
 
     return 0

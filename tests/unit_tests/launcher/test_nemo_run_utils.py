@@ -28,7 +28,6 @@ _mock_run.Experiment.return_value = _mock_exp
 sys.modules["nemo_run"] = _mock_run
 
 from nemo_automodel.components.launcher.nemo_run.utils import (  # noqa: E402
-    REMOTE_CONFIG_PATH,
     apply_overrides,
     load_executor_from_file,
     submit_nemo_run_job,
@@ -132,153 +131,86 @@ class TestLoadExecutorFromFile:
 
 
 class TestApplyOverrides:
-    def test_nodes_override(self):
+    def test_scalar_override(self):
         executor = mock.MagicMock()
         executor.nodes = 1
-        apply_overrides(executor, nodes=4, devices=None, container_image=None,
-                        time=None, mounts=None, env_vars=None)
+        apply_overrides(executor, {"nodes": 4})
         assert executor.nodes == 4
 
-    def test_devices_override_ntasks_per_node(self):
-        executor = mock.MagicMock(spec=["ntasks_per_node"])
-        executor.ntasks_per_node = 1
-        apply_overrides(executor, nodes=None, devices=8, container_image=None,
-                        time=None, mounts=None, env_vars=None)
-        assert executor.ntasks_per_node == 8
-
-    def test_devices_override_gpus_per_node(self):
-        executor = mock.MagicMock(spec=["gpus_per_node"])
-        executor.gpus_per_node = 1
-        apply_overrides(executor, nodes=None, devices=4, container_image=None,
-                        time=None, mounts=None, env_vars=None)
-        assert executor.gpus_per_node == 4
-
-    def test_devices_override_both_attrs(self):
-        executor = mock.MagicMock(spec=["ntasks_per_node", "gpus_per_node"])
-        executor.ntasks_per_node = 1
-        executor.gpus_per_node = 1
-        apply_overrides(executor, nodes=None, devices=8, container_image=None,
-                        time=None, mounts=None, env_vars=None)
-        assert executor.ntasks_per_node == 8
-        assert executor.gpus_per_node == 8
-
-    def test_container_image_override(self):
+    def test_string_override(self):
         executor = mock.MagicMock()
-        apply_overrides(executor, nodes=None, devices=None,
-                        container_image="nvcr.io/nvidia/nemo:24.05",
-                        time=None, mounts=None, env_vars=None)
+        apply_overrides(executor, {"container_image": "nvcr.io/nvidia/nemo:24.05"})
         assert executor.container_image == "nvcr.io/nvidia/nemo:24.05"
 
-    def test_time_override(self):
-        executor = mock.MagicMock()
-        apply_overrides(executor, nodes=None, devices=None, container_image=None,
-                        time="08:00:00", mounts=None, env_vars=None)
-        assert executor.time == "08:00:00"
-
-    def test_mounts_merge(self):
-        executor = mock.MagicMock()
-        executor.container_mounts = ["/data:/data"]
-        apply_overrides(executor, nodes=None, devices=None, container_image=None,
-                        time=None, mounts=["/models:/models", "/scratch:/scratch"],
-                        env_vars=None)
-        assert executor.container_mounts == [
-            "/data:/data",
-            "/models:/models",
-            "/scratch:/scratch",
-        ]
-
-    def test_mounts_merge_with_empty_existing(self):
-        executor = mock.MagicMock()
-        executor.container_mounts = []
-        apply_overrides(executor, nodes=None, devices=None, container_image=None,
-                        time=None, mounts=["/new:/new"], env_vars=None)
-        assert executor.container_mounts == ["/new:/new"]
-
-    def test_mounts_merge_with_none_existing(self):
-        executor = mock.MagicMock()
-        executor.container_mounts = None
-        apply_overrides(executor, nodes=None, devices=None, container_image=None,
-                        time=None, mounts=["/new:/new"], env_vars=None)
-        assert executor.container_mounts == ["/new:/new"]
-
-    def test_env_vars_merge(self):
+    def test_dict_merge(self):
         executor = mock.MagicMock()
         executor.env_vars = {"EXISTING": "val1"}
-        apply_overrides(executor, nodes=None, devices=None, container_image=None,
-                        time=None, mounts=None, env_vars={"NEW": "val2"})
+        apply_overrides(executor, {"env_vars": {"NEW": "val2"}})
         assert executor.env_vars == {"EXISTING": "val1", "NEW": "val2"}
 
-    def test_env_vars_merge_overwrites_existing(self):
+    def test_dict_merge_overwrites_existing_key(self):
         executor = mock.MagicMock()
         executor.env_vars = {"KEY": "old"}
-        apply_overrides(executor, nodes=None, devices=None, container_image=None,
-                        time=None, mounts=None, env_vars={"KEY": "new"})
+        apply_overrides(executor, {"env_vars": {"KEY": "new"}})
         assert executor.env_vars["KEY"] == "new"
 
-    def test_env_vars_merge_with_none_existing(self):
+    def test_dict_replaces_non_dict_existing(self):
         executor = mock.MagicMock()
         executor.env_vars = None
-        apply_overrides(executor, nodes=None, devices=None, container_image=None,
-                        time=None, mounts=None, env_vars={"K": "V"})
+        apply_overrides(executor, {"env_vars": {"K": "V"}})
         assert executor.env_vars == {"K": "V"}
 
-    def test_none_values_not_applied(self):
+    def test_list_merge(self):
+        executor = mock.MagicMock()
+        executor.container_mounts = ["/data:/data"]
+        apply_overrides(executor, {"container_mounts": ["/models:/models"]})
+        assert executor.container_mounts == ["/data:/data", "/models:/models"]
+
+    def test_list_merge_with_empty_existing(self):
+        executor = mock.MagicMock()
+        executor.container_mounts = []
+        apply_overrides(executor, {"container_mounts": ["/new:/new"]})
+        assert executor.container_mounts == ["/new:/new"]
+
+    def test_list_replaces_non_list_existing(self):
+        executor = mock.MagicMock()
+        executor.container_mounts = None
+        apply_overrides(executor, {"container_mounts": ["/new:/new"]})
+        assert executor.container_mounts == ["/new:/new"]
+
+    def test_empty_overrides_is_noop(self):
         executor = mock.MagicMock()
         executor.nodes = 1
-        executor.container_image = "original:v1"
-        executor.time = "01:00:00"
-        apply_overrides(executor, nodes=None, devices=None, container_image=None,
-                        time=None, mounts=None, env_vars=None)
-        # None values should leave the executor unchanged
+        apply_overrides(executor, {})
         assert executor.nodes == 1
-        assert executor.container_image == "original:v1"
-        assert executor.time == "01:00:00"
 
-    def test_empty_mounts_not_applied(self):
+    def test_multiple_overrides_applied(self):
         executor = mock.MagicMock()
-        executor.container_mounts = ["/existing:/existing"]
-        apply_overrides(executor, nodes=None, devices=None, container_image=None,
-                        time=None, mounts=[], env_vars=None)
-        # Empty list is falsy, should not modify
-        assert executor.container_mounts == ["/existing:/existing"]
-
-    def test_empty_env_vars_not_applied(self):
-        executor = mock.MagicMock()
-        executor.env_vars = {"EXISTING": "val"}
-        apply_overrides(executor, nodes=None, devices=None, container_image=None,
-                        time=None, mounts=None, env_vars={})
-        # Empty dict is falsy, should not modify
-        assert executor.env_vars == {"EXISTING": "val"}
-
-    def test_all_overrides_applied(self):
-        executor = mock.MagicMock(spec=["nodes", "ntasks_per_node", "gpus_per_node",
-                                        "container_image", "time",
-                                        "container_mounts", "env_vars"])
         executor.nodes = 1
-        executor.ntasks_per_node = 1
-        executor.gpus_per_node = 1
         executor.container_image = "old:v1"
         executor.time = "01:00:00"
         executor.container_mounts = ["/old:/old"]
         executor.env_vars = {"OLD": "val"}
 
-        apply_overrides(
-            executor,
-            nodes=4,
-            devices=8,
-            container_image="new:v2",
-            time="08:00:00",
-            mounts=["/new:/new"],
-            env_vars={"NEW": "val2"},
-        )
+        apply_overrides(executor, {
+            "nodes": 4,
+            "container_image": "new:v2",
+            "time": "08:00:00",
+            "container_mounts": ["/new:/new"],
+            "env_vars": {"NEW": "val2"},
+        })
 
         assert executor.nodes == 4
-        assert executor.ntasks_per_node == 8
-        assert executor.gpus_per_node == 8
         assert executor.container_image == "new:v2"
         assert executor.time == "08:00:00"
         assert executor.container_mounts == ["/old:/old", "/new:/new"]
         assert executor.env_vars == {"OLD": "val", "NEW": "val2"}
+
+    def test_arbitrary_attr_via_setattr(self):
+        executor = mock.MagicMock()
+        apply_overrides(executor, {"partition": "interactive", "gres": "gpu:4"})
+        assert executor.partition == "interactive"
+        assert executor.gres == "gpu:4"
 
 
 # ---------------------------------------------------------------------------
@@ -287,58 +219,62 @@ class TestApplyOverrides:
 
 
 class TestSubmitNemoRunJob:
-    def test_returns_zero(self):
-        script = mock.MagicMock()
-        executor = mock.MagicMock()
-        result = submit_nemo_run_job(script, executor, "my_job", detach=True,
-                                     tail_logs=False)
+    """Tests for submit_nemo_run_job.
+
+    Each test patches sys.modules so the ``import nemo_run`` inside
+    submit_nemo_run_job picks up a fresh mock rather than the real package.
+    """
+
+    @staticmethod
+    def _make_mock():
+        mr = mock.MagicMock()
+        me = mock.MagicMock()
+        me.__enter__ = mock.MagicMock(return_value=me)
+        me.__exit__ = mock.MagicMock(return_value=False)
+        mr.Experiment.return_value = me
+        return mr, me
+
+    def test_returns_zero(self, monkeypatch):
+        mr, _ = self._make_mock()
+        monkeypatch.setitem(sys.modules, "nemo_run", mr)
+        result = submit_nemo_run_job(mock.MagicMock(), mock.MagicMock(), "my_job",
+                                     detach=True, tail_logs=False)
         assert result == 0
 
-    def test_experiment_created_with_job_name(self):
-        script = mock.MagicMock()
-        executor = mock.MagicMock()
-        submit_nemo_run_job(script, executor, "test_exp", detach=True,
-                            tail_logs=False)
-        _mock_run.Experiment.assert_called_once_with("test_exp")
+    def test_experiment_created_with_job_name(self, monkeypatch):
+        mr, _ = self._make_mock()
+        monkeypatch.setitem(sys.modules, "nemo_run", mr)
+        submit_nemo_run_job(mock.MagicMock(), mock.MagicMock(), "test_exp",
+                            detach=True, tail_logs=False)
+        mr.Experiment.assert_called_once_with("test_exp")
 
-    def test_experiment_add_called(self):
-        script = mock.MagicMock()
-        executor = mock.MagicMock()
-        submit_nemo_run_job(script, executor, "job1", detach=True,
-                            tail_logs=False)
-        _mock_exp.add.assert_called_once_with(
-            script, executor=executor, name="job1",
-        )
+    def test_experiment_add_called(self, monkeypatch):
+        mr, me = self._make_mock()
+        monkeypatch.setitem(sys.modules, "nemo_run", mr)
+        script, executor = mock.MagicMock(), mock.MagicMock()
+        submit_nemo_run_job(script, executor, "job1",
+                            detach=True, tail_logs=False)
+        me.add.assert_called_once_with(script, executor=executor, name="job1")
 
-    def test_experiment_run_called_with_detach(self):
-        script = mock.MagicMock()
-        executor = mock.MagicMock()
-        submit_nemo_run_job(script, executor, "job1", detach=True,
-                            tail_logs=True)
-        _mock_exp.run.assert_called_once_with(detach=True, tail_logs=True)
+    def test_experiment_run_called_with_detach(self, monkeypatch):
+        mr, me = self._make_mock()
+        monkeypatch.setitem(sys.modules, "nemo_run", mr)
+        submit_nemo_run_job(mock.MagicMock(), mock.MagicMock(), "job1",
+                            detach=True, tail_logs=True)
+        me.run.assert_called_once_with(detach=True, tail_logs=True)
 
-    def test_experiment_run_called_without_detach(self):
-        script = mock.MagicMock()
-        executor = mock.MagicMock()
-        submit_nemo_run_job(script, executor, "job1", detach=False,
-                            tail_logs=False)
-        _mock_exp.run.assert_called_once_with(detach=False, tail_logs=False)
+    def test_experiment_run_called_without_detach(self, monkeypatch):
+        mr, me = self._make_mock()
+        monkeypatch.setitem(sys.modules, "nemo_run", mr)
+        submit_nemo_run_job(mock.MagicMock(), mock.MagicMock(), "job1",
+                            detach=False, tail_logs=False)
+        me.run.assert_called_once_with(detach=False, tail_logs=False)
 
-    def test_empty_job_name_uses_automodel(self):
-        script = mock.MagicMock()
-        executor = mock.MagicMock()
-        submit_nemo_run_job(script, executor, "", detach=True,
-                            tail_logs=False)
-        _mock_run.Experiment.assert_called_once_with("automodel")
-        _mock_exp.add.assert_called_once_with(
-            script, executor=executor, name="automodel",
-        )
-
-
-# ---------------------------------------------------------------------------
-# REMOTE_CONFIG_PATH constant
-# ---------------------------------------------------------------------------
-
-
-def test_remote_config_path_value():
-    assert REMOTE_CONFIG_PATH == "/tmp/automodel_job_config.yaml"
+    def test_empty_job_name_uses_automodel(self, monkeypatch):
+        mr, me = self._make_mock()
+        monkeypatch.setitem(sys.modules, "nemo_run", mr)
+        script, executor = mock.MagicMock(), mock.MagicMock()
+        submit_nemo_run_job(script, executor, "",
+                            detach=True, tail_logs=False)
+        mr.Experiment.assert_called_once_with("automodel")
+        me.add.assert_called_once_with(script, executor=executor, name="automodel")
