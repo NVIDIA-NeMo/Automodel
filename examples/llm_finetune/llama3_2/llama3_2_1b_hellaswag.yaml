@@ -90,6 +90,7 @@ optimizer:
   # min_lr: 1.0e-5
 
 ci:
+  recipe_owner: akoumpa
   time: "00:15:00"
   checkpoint_robustness:
     hf_kl_threshold: 5e-3

@@ -99,6 +99,7 @@ optimizer:
 #   save_dir: <your_wandb_save_dir> 
 
 ci:
+  recipe_owner: hemildesai
   time: "00:20:00"
   node_multiplier: true
   checkpoint_robustness:

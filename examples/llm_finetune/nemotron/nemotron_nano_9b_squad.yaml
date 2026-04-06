@@ -96,6 +96,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  recipe_owner: HuiyingLi
   time: "00:15:00"
   checkpoint_robustness:
     hf_kl_threshold: 5e-3

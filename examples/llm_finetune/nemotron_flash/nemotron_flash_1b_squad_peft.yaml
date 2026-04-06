@@ -118,3 +118,5 @@ ci:
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
 
+ci:
+  recipe_owner: akoumpa
