@@ -59,7 +59,18 @@ check_model_inputs = get_check_model_inputs_decorator()
 
 
 class LlamaAttention(CombinedQKVAttentionMixin, nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper with combined QKV projection."""
+    """Multi-headed attention from 'Attention Is All You Need' paper.
+
+    Supports two projection modes controlled by ``config.use_combined_projections``
+    (default ``True``):
+
+    * ``True``: fused ``qkv_proj`` via :class:`CombinedQKVAttentionMixin` — fewer
+      kernel launches, preferred for training throughput.
+    * ``False``: separate ``q_proj`` / ``k_proj`` / ``v_proj`` — identical to the
+      default HuggingFace Llama implementation.  Use this when LoRA adapter weights
+      must stay outside the FSDP shard group (the combined projection bundles LoRA
+      adapters into the same FSDP unit, preventing per-adapter replication).
+    """
 
     def __init__(
         self,
@@ -75,14 +86,27 @@ class LlamaAttention(CombinedQKVAttentionMixin, nn.Module):
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
-        # Combined QKV projection for improved efficiency
-        self.setup_qkv_projection(
-            hidden_size=config.hidden_size,
-            num_attention_heads=config.num_attention_heads,
-            num_key_value_heads=config.num_key_value_heads,
-            head_dim=self.head_dim,
-            bias=config.attention_bias,
-        )
+        if getattr(config, "use_combined_projections", True):
+            # Combined QKV projection for improved efficiency
+            self.setup_qkv_projection(
+                hidden_size=config.hidden_size,
+                num_attention_heads=config.num_attention_heads,
+                num_key_value_heads=config.num_key_value_heads,
+                head_dim=self.head_dim,
+                bias=config.attention_bias,
+            )
+        else:
+            # Separate projections — same layout as HuggingFace default Llama
+            self.use_combined_qkv = False
+            self.q_proj = nn.Linear(
+                config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+            )
+            self.k_proj = nn.Linear(
+                config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            )
+            self.v_proj = nn.Linear(
+                config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            )
 
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
@@ -100,8 +124,12 @@ class LlamaAttention(CombinedQKVAttentionMixin, nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        # Compute Q, K, V using mixin (handles fused or separate projection)
-        q, k, v = self.compute_qkv(hidden_states)
+        if self.use_combined_qkv:
+            q, k, v = self.compute_qkv(hidden_states)
+        else:
+            q = self.q_proj(hidden_states)
+            k = self.k_proj(hidden_states)
+            v = self.v_proj(hidden_states)
 
         query_states = q.view(hidden_shape).transpose(1, 2)
         key_states = k.view(hidden_shape).transpose(1, 2)
@@ -164,6 +192,28 @@ class LlamaMLP(nn.Module):
         return self.down_proj(self.act_fn(gate) * up)
 
 
+class LlamaSeparateMLP(nn.Module):
+    """SwiGLU MLP with separate gate_proj and up_proj — identical to HuggingFace default.
+
+    Use this (via ``config.use_combined_projections=False``) when LoRA adapter weights
+    on gate_proj / up_proj must remain outside the FSDP shard group.
+    """
+
+    def __init__(self, config: LlamaConfig):
+        super().__init__()
+        from transformers.activations import ACT2FN
+
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     """Single Llama decoder layer with RMSNorm, attention, and MLP.
 
@@ -184,8 +234,10 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
             layer_idx=layer_idx,
         )
 
-        # ALWAYS use combined gate_up MLP for efficiency
-        self.mlp = CombinedGateUpMLP(config=config)
+        if getattr(config, "use_combined_projections", True):
+            self.mlp = CombinedGateUpMLP(config=config)
+        else:
+            self.mlp = LlamaSeparateMLP(config=config)
 
         self.input_layernorm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
@@ -402,7 +454,11 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         self,
         config: LlamaConfig,
         backend: Optional[BackendConfig] = None,
+        use_combined_projections: bool = True,
     ):
+        # Apply projection mode to config before building sub-modules so that
+        # LlamaAttention and LlamaDecoderLayer see the correct flag.
+        config.use_combined_projections = use_combined_projections
         super().__init__(config)
         self.config = config
         self.backend = backend or BackendConfig()
@@ -420,8 +476,10 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
             self.to(dtype=config.torch_dtype)
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            _use_combined = getattr(config, "use_combined_projections", True)
+            _proj_mode = "COMBINED QKV and gate_up projections" if _use_combined else "SEPARATE q/k/v and gate/up projections (HF-style)"
             print(f"[LlamaForCausalLM] Attention implementation: {self.config._attn_implementation}")
-            print("[LlamaForCausalLM] Custom implementation with COMBINED QKV and gate_up projections")
+            print(f"[LlamaForCausalLM] Custom implementation with {_proj_mode}")
             print(f"[LlamaForCausalLM] torch_dtype: {self.config.torch_dtype}")
 
     def get_input_embeddings(self):

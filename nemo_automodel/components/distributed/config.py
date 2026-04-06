@@ -68,6 +68,26 @@ class FSDP2Config:
         enable_fsdp2_prefetch (bool): Enable explicit FSDP2 forward/backward weight prefetching.
             When True, each layer prefetches the next layer's all-gathers during its own
             copy-out, overlapping communication with compute. Default: True.
+        use_reentrant_ac (bool): Use REENTRANT activation checkpointing instead of NO_REENTRANT.
+            Only has effect when enable_compile or enable_async_tensor_parallel is True.
+            Set to True to verify whether REENTRANT vs NO_REENTRANT AC affects NCCL P2P
+            coalescing (ncclSendRecv kernel count). Default: False (NO_REENTRANT).
+        fsdp2_allocate_from_pg (bool): Allocate FSDP2 AllGather/ReduceScatter buffers from
+            NCCL's pre-registered memory pool instead of torch.empty. Eliminates per-operation
+            NCCL memory registration overhead and may enable zero-copy for AllGather output.
+            Requires NCCL backend support (ncclMemAlloc, available in NCCL 2.19+). Default: False.
+        prioritize_all_gather (bool): Use a separate NCCL communicator for ReduceScatter so
+            AllGather and ReduceScatter can run in parallel. By default FSDP2 uses one
+            communicator for both, causing NCCL to serialize them even on different CUDA
+            streams. Enabling this creates a dedicated RS communicator over the same DP ranks,
+            eliminating the head-of-line blocking that exposes backward AllGather. Default: False.
+        fsdp_layer_group_size (int): Number of transformer layers to group into a single FSDP
+            unit. Default is 1 (each layer is its own FSDP unit). Setting to 2 groups pairs
+            of layers, halving the AllGather count and associated CatArrayBatchedCopy /
+            elementwise copy-out overhead at the cost of larger per-AllGather buffers.
+            Only affects ModuleList-structured layer stacks (standard HF transformer models).
+        fsdp2_no_cat_array (bool): Disable FSDP2 CatArrayBatchedCopy kernel for AllGather
+            copy-out, falling back to per-parameter element-wise copies. Default: False.
     """
 
     sequence_parallel: bool = False
@@ -80,6 +100,11 @@ class FSDP2Config:
     enable_async_tensor_parallel: bool = False
     enable_compile: bool = False
     enable_fsdp2_prefetch: bool = True
+    use_reentrant_ac: bool = False
+    fsdp2_allocate_from_pg: bool = False
+    prioritize_all_gather: bool = False
+    fsdp_layer_group_size: int = 1
+    fsdp2_no_cat_array: bool = False
 
     def __post_init__(self):
         if self.mp_policy is None:

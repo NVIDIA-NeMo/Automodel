@@ -64,10 +64,19 @@ class TPLinear(nn.Linear):
     """
 
     def forward(self, x):
-        # bmm is only needed during AOT-autograd tracing to avoid aten.view recursion on
-        # sharded DTensor activations. In eager mode F.linear is safe and avoids the extra
-        # unsqueeze/expand/bmm kernel launches.
-        if not torch.compiler.is_compiling():
+        # bmm avoids aten.view which cannot flatten a sharded dimension.
+        # Required during AOT-autograd tracing AND in eager mode when x has
+        # Shard(0) or Shard(1) — e.g. sequence-parallel hidden_states arriving
+        # as [batch, seq_local, hidden] with S(1) under FSDP+TP.
+        from torch.distributed.tensor import DTensor
+        from torch.distributed.tensor.placement_types import Shard as _Shard
+
+        _x_needs_bmm = (
+            isinstance(x, DTensor)
+            and x.dim() == 3
+            and any(isinstance(p, _Shard) and p.dim < 2 for p in x.placements)
+        )
+        if not torch.compiler.is_compiling() and not _x_needs_bmm:
             return F.linear(x, self.weight, self.bias)
         if x.dim() == 3:
             b = x.shape[0]
@@ -128,6 +137,15 @@ class RowwiseParallelLora(RowwiseParallel):
         # Rowwise shard weight to Shard(1), bias to Replicate(), weight be Shard(1)
         # means Rowwise as nn.Linear is input * weight^T + bias, where
         # weight would become Shard(0)
+        #
+        # distribute_module iterates named_modules() and calls this fn for every
+        # submodule (lora_A, lora_B, ...) in addition to the root module.  The root
+        # call already sets each submodule's weight to the correct placement, so
+        # subsequent submodule calls would clash (e.g. trying to re-distribute
+        # lora_B.weight from Replicate() → Shard(1)).  Return early if the weight
+        # is already a DTensor — the parent call handled it.
+        if isinstance(getattr(module, "weight", None), DTensor):
+            return
         _distribute_param(module, "weight", device_mesh, self.src_data_rank, [Shard(1)])
         if getattr(module, "bias", None) is not None:
             _distribute_param(module, "bias", device_mesh, self.src_data_rank, [Replicate()])

@@ -304,8 +304,17 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
             setattr(cfg_opt, attr, dtype_from_str(val))
 
     if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
-        # TP does not support foreach
-        cfg_opt.foreach = False
+        # TP does not support foreach; skip for optimizers that don't accept it (e.g. FusedAdam).
+        # Use vars() to check only the class's own __init__ rather than inspect.signature(opt_cls)
+        # which traverses the MRO and may find `foreach` from a parent (e.g. torch.optim.Adam)
+        # even when the subclass's own __init__ doesn't accept it.
+        opt_cls = getattr(cfg_opt, "_target_", None)
+        if isinstance(opt_cls, type):
+            own_init = vars(opt_cls).get("__init__")
+            if own_init is not None and "foreach" in inspect.signature(own_init).parameters:
+                cfg_opt.foreach = False
+        elif opt_cls is not None and "foreach" in inspect.signature(opt_cls).parameters:
+            cfg_opt.foreach = False
 
     optimizer = []
     has_dion_optimizer = is_dion_optimizer(cfg_opt)

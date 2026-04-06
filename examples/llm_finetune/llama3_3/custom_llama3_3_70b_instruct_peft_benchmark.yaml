@@ -14,7 +14,7 @@ benchmark:
 
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 8
+  local_batch_size: 4
   ckpt_every_steps: 50
   val_every_steps: 1000
   max_steps: 10
@@ -60,6 +60,7 @@ distributed:
   enable_compile: true
 
   pipeline:
+    pp_seq_len: 4096
     pp_schedule: interleaved1f1b
     pp_microbatch_size: 1
     layers_per_stage: 2
@@ -83,11 +84,12 @@ dataloader:
   # Note: model_config will be auto-injected by train_ft.py for PP models
 
 optimizer:
-  _target_: torch.optim.Adam
-  betas: [0.9, 0.999]
-  eps: 1e-8
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
   lr: 1.0e-5
   weight_decay: 0
+  adam_w_mode: false
+  bias_correction: true
+  master_weights: true
 
 lr_scheduler:
   lr_decay_style: cosine

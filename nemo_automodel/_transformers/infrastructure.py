@@ -174,6 +174,7 @@ def _instantiate_pipeline(
     config: Optional[PipelineConfig],
     mesh: MeshContext,
     device: Optional[torch.device] = None,
+    sequence_parallel: bool = False,
 ) -> Optional[AutoPipeline]:
     """Instantiate AutoPipeline from config.
 
@@ -181,6 +182,9 @@ def _instantiate_pipeline(
         config: Pipeline config. If None or pp_size <= 1, returns None.
         mesh: MeshContext holding device_mesh, moe_mesh, and axis names.
         device: Target device for pipeline computation.
+        sequence_parallel: Whether sequence parallelism is active (from the
+            distributed/TP config). When True with tp_size > 1, inter-stage
+            activation buffers are sized for the local sequence shard.
 
     Returns:
         AutoPipeline instance, or None if pipeline parallelism is not enabled.
@@ -195,6 +199,7 @@ def _instantiate_pipeline(
         world_mesh=mesh.device_mesh,
         moe_mesh=mesh.moe_mesh,
         device=device,
+        sequence_parallel=sequence_parallel,
         **mesh.pipeline_axis_kwargs(),
         **config_dict,
     )
@@ -283,7 +288,8 @@ def instantiate_infrastructure(
     ep_size = mesh.ep_size if mesh.ep_size > 1 else ep_size
 
     model_wrapper = _instantiate_distributed(distributed_config, mesh)
-    autopipeline = _instantiate_pipeline(pipeline_config, mesh, device)
+    _seq_parallel = bool(getattr(distributed_config, "sequence_parallel", False))
+    autopipeline = _instantiate_pipeline(pipeline_config, mesh, device, sequence_parallel=_seq_parallel)
 
     parallelize_fn = None
     if ep_size > 1:
@@ -516,8 +522,9 @@ def apply_model_infrastructure(
         from nemo_automodel.components.distributed.parallelizer import _apply_per_layer_compile
 
         model_parts = model.parts if hasattr(model, "parts") else [model]
+        use_reentrant_ac = getattr(model_wrapper, "use_reentrant_ac", False)
         for mp in model_parts:
-            _apply_per_layer_compile(mp)
+            _apply_per_layer_compile(mp, use_reentrant_ac=use_reentrant_ac)
 
     # Freeze parameters after checkpoint loading and parallelization
     # This catches params created during parallelization (e.g., GroupedExpertsTE in init_token_dispatcher)

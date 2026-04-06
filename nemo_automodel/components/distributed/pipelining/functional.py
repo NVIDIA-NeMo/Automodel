@@ -235,6 +235,9 @@ def _precompute_stage_shapes(
     model_config,
     microbatch_size: int,
     seq_len: int,
+    tp_size: int = 1,
+    sequence_parallel: bool = False,
+    cp_size: int = 1,
 ) -> None:
     """Precompute input/output meta tensors for each pipeline stage to bypass serial shape inference.
 
@@ -251,9 +254,22 @@ def _precompute_stage_shapes(
         model_config: The HuggingFace model config (``model.config``).
         microbatch_size: Microbatch size used by the pipeline schedule.
         seq_len: Sequence length of the input data.
+        tp_size: Tensor parallel size (default 1). When >1 with sequence_parallel,
+            inter-stage activations are sharded along the sequence dimension so the
+            local shard size is seq_len // tp_size.
+        sequence_parallel: Whether sequence parallelism is active. When True with
+            tp_size > 1, recv buffers are sized for the local sequence shard so that
+            P2P transfers of DTensor.to_local() shards fit correctly.
     """
     hidden_size = model_config.hidden_size
     vocab_size = model_config.vocab_size
+
+    # With SP+TP, inter-stage activations are sharded along the seq dim.
+    # Each TP rank sends its local shard via to_local(), so buffers must be
+    # sized for the local shard, not the full logical tensor.
+    # With CP, each rank only processes seq_len // cp_size tokens regardless of SP.
+    inter_stage_seq_len = seq_len // tp_size if (sequence_parallel and tp_size > 1) else seq_len
+    inter_stage_seq_len = inter_stage_seq_len // cp_size if cp_size > 1 else inter_stage_seq_len
 
     for stage in stages:
         # Infer the computation dtype from the stage's parameters
@@ -264,24 +280,30 @@ def _precompute_stage_shapes(
 
         # --- inputs_meta ---
         if stage.is_first:
-            # First stage receives input_ids: [mb, seq_len] int64
-            stage.inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
+            # First stage receives input_ids: [mb, local_seq_len] int64.
+            # With CP, the training loop pre-shards input_ids to seq_len // cp_size.
+            stage.inputs_meta = (torch.empty(microbatch_size, inter_stage_seq_len, device="meta", dtype=torch.long),)
         else:
-            # Non-first stages receive hidden_states: [mb, seq_len, hidden_size]
-            stage.inputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
+            # Non-first stages receive hidden_states from the previous stage.
+            # With SP+TP the previous stage sends its local shard: [mb, seq/tp, hidden].
+            stage.inputs_meta = (torch.empty(microbatch_size, inter_stage_seq_len, hidden_size, device="meta", dtype=model_dtype),)
 
         # --- outputs_meta ---
         has_lm_head = hasattr(stage.submod, "lm_head") and stage.submod.lm_head is not None
         if has_lm_head:
-            # Last stage with lm_head produces logits: [mb, seq_len, vocab_size]
-            outputs_meta = (torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=model_dtype),)
+            # Last stage with lm_head produces logits: [mb, local_seq_len, vocab_size].
+            # With CP each rank produces logits for its seq chunk only.
+            outputs_meta = (torch.empty(microbatch_size, inter_stage_seq_len, vocab_size, device="meta", dtype=model_dtype),)
+        elif stage.is_last:
+            outputs_meta = (torch.empty(microbatch_size, inter_stage_seq_len, hidden_size, device="meta", dtype=model_dtype),)
         else:
-            # Intermediate stages produce hidden_states: [mb, seq_len, hidden_size]
-            outputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
+            # Intermediate stages send their local shard to the next stage.
+            outputs_meta = (torch.empty(microbatch_size, inter_stage_seq_len, hidden_size, device="meta", dtype=model_dtype),)
         stage._configure_outputs_meta(outputs_meta)
 
     logger.info(
-        f"Precomputed pipeline stage shapes (seq_len={seq_len}, microbatch_size={microbatch_size}) — "
+        f"Precomputed pipeline stage shapes (seq_len={seq_len}, inter_stage_seq_len={inter_stage_seq_len}, "
+        f"microbatch_size={microbatch_size}, tp_size={tp_size}, cp_size={cp_size}, sequence_parallel={sequence_parallel}) — "
         f"serial shape inference bypassed"
     )
 
@@ -587,8 +609,13 @@ def pipeline_model(
     round_to_pp_multiple: str | None = None,
     patch_stage_backward_maybe_with_nosync: bool = False,
     seq_len: int | None = None,
+    sequence_parallel: bool = False,
 ) -> tuple[_PipelineSchedule, list[torch.nn.Module], bool, bool, list[PipelineStage]]:
     """HF-specific pipeline model splitting."""
+    from nemo_automodel.components.distributed.pipelining.pp_schedule_patch import apply_pp_schedule_patch
+
+    apply_pp_schedule_patch()
+
     pp_size = world_mesh[pp_axis_name].size()
     assert pp_size > 1, "Pipeline parallelism is not enabled"
 
@@ -622,10 +649,22 @@ def pipeline_model(
             model_parts[i] = m
             stages[i].submod = m
 
+    # Set DTensor recv metadata on non-first stages so the pp_schedule_patch
+    # can reconstruct DTensors from plain P2P-received tensors.
+    if sequence_parallel and tp_axis_name and tp_axis_name in world_mesh.mesh_dim_names:
+        from torch.distributed._tensor import Shard
+        tp_mesh = world_mesh[tp_axis_name]
+        for stage in stages:
+            if not stage.is_first:
+                # One activation tensor: hidden_states sharded along sequence dim (Shard(1))
+                stage._fwd_recv_dtensor_meta = [(tp_mesh, [Shard(1)])]
+
     # Precompute stage shapes to bypass serial P2P shape inference.
     # This must happen *after* parallelization so that dtypes are final.
     if seq_len is not None:
-        _precompute_stage_shapes(stages, model.config, microbatch_size, seq_len)
+        _tp_size = world_mesh[tp_axis_name].size() if (tp_axis_name and tp_axis_name in world_mesh.mesh_dim_names) else 1
+        _cp_size = world_mesh[cp_axis_name].size() if (cp_axis_name and cp_axis_name in world_mesh.mesh_dim_names) else 1
+        _precompute_stage_shapes(stages, model.config, microbatch_size, seq_len, tp_size=_tp_size, sequence_parallel=sequence_parallel, cp_size=_cp_size)
 
     # Build pipeline schedule
     pp_schedule = build_pipeline_schedule(

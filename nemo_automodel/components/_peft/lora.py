@@ -76,30 +76,46 @@ class PeftConfig:
 
 
 def _dtensor_linear(x: torch.Tensor, weight: torch.Tensor, bias=None) -> torch.Tensor:
-    """Drop-in for F.linear that avoids DTensor+compile backward recursion.
+    """Drop-in for F.linear that avoids aten.view on a Shard(0/1) activation dim.
 
-    Both F.linear and torch.matmul decompose 3D × 2D input as:
-        view(x, [-1, in]) + mm + view(out, [b, seq, out])
-    In AOT-autograd backward tracing the view on a Shard(2) DTensor activation
-    (e.g. [1, seq, hidden/tp]) hits _propagate_op_sharding_dispatch_slow_path for
-    aten.view (no DTensor rule for the shard-dim-index change) → infinite recursion.
+    F.linear internally calls aten.view([b, s, h] → [b*s, h]) which fails when any of
+    dims 0 or 1 is sharded — DTensor's view propagation has no rule for shard-dim-index
+    changes (Shard(1) on 3D → would need to become Shard(0) on 2D).
 
-    torch.bmm is a native 3D op whose backward is also bmm — no view is emitted.
-    We expand the 2D weight to 3D with an extra batch dim to match x's batch size.
-    DTensor has explicit strategies for bmm (Replicate × Shard(2) → Shard(2) for
-    ColwiseParallel; Shard(2) × Shard(1) → Partial for RowwiseParallel reduce).
+    Fix: redistribute x to Replicate on the TP mesh (explicit AllGather on seq dim),
+    then call F.linear normally. On a Replicated tensor, aten.view([b,s,h]→[b*s,h]) is
+    fine (no sharding to propagate). DTensor handles the rest (ColwiseParallel gives
+    Shard(2) output, RowwiseParallel gives Partial → AllReduce). The backward of
+    redistribute is a ReduceScatter, which is the correct seq-parallel gradient.
 
-    Note: expand(b, -1, -1) dispatches through DTensor's ShardingPropagator lru_cache
-    keyed on DTensorSpec. With dynamic shapes, b is a SymInt making DTensorSpec hash
-    raise TypeError.  This is handled by _patch_dtensor_spec_hash_for_symint() in
-    parallelizer.py which falls back to a placement-only hash for SymInt shapes.
+    This avoids the bmm workaround (b separate GEMMs, batch-sum for grad_W,
+    CatArrayBatchedCopy / split_with_sizes_copy_out in backward) in favour of:
+    - forward:  AllGather (redistribute) + single mm (F.linear on 2D x) ✓
+    - backward: ReduceScatter (redistribute.backward) + single mm for grad_x ✓
+
+    Non-DTensor 3D path (compile tracing with plain/fake tensors) still falls back to
+    bmm since redistribute is not meaningful without a device mesh.
     """
-    if x.dim() == 3:
+    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor.placement_types import Replicate as _Replicate, Shard as _Shard
+
+    if isinstance(x, DTensor) and x.dim() == 3 and any(
+        isinstance(p, _Shard) and p.dim < 2 for p in x.placements
+    ):
+        # AllGather: replace Shard(d<2) with Replicate, keep other placements unchanged
+        new_placements = tuple(
+            _Replicate() if isinstance(p, _Shard) and p.dim < 2 else p
+            for p in x.placements
+        )
+        x_rep = x.redistribute(placements=new_placements)
+        return F.linear(x_rep, weight, bias)
+    elif x.dim() == 3:
+        # Non-DTensor 3D (compile tracing with fake/plain tensor): fall back to bmm
         b = x.shape[0]
         out = torch.bmm(x, weight.t().unsqueeze(0).expand(b, -1, -1))
+        return out + bias if bias is not None else out
     else:
-        out = torch.mm(x, weight.t())
-    return out + bias if bias is not None else out
+        return F.linear(x, weight, bias)
 
 
 class LinearLoRA(nn.Linear):
@@ -263,10 +279,21 @@ class LinearLoRA(nn.Linear):
             bias = self.bias
             if bias is not None and bias.numel() == 0:
                 bias = None
-            # _dtensor_linear (bmm) is only needed during AOT-autograd tracing to avoid
-            # aten.view infinite recursion on Shard(2) DTensor activations. In eager mode
-            # F.linear is safe and avoids the bmm kernel-launch overhead.
-            if torch.compiler.is_compiling():
+            # _dtensor_linear (bmm) avoids aten.view which cannot flatten a sharded
+            # dimension. Required during AOT-autograd tracing (Shard(2) activations)
+            # AND in eager mode when x carries Shard(0) or Shard(1) — e.g. with
+            # sequence parallelism (FSDP+TP) where hidden_states arrive as
+            # [batch, seq_local, hidden] with S(1).  F.linear internally calls
+            # aten.view([b, s, h] -> [b*s, h]) which fails when dim 1 is sharded.
+            from torch.distributed.tensor import DTensor
+            from torch.distributed.tensor.placement_types import Shard as _Shard
+
+            _x_needs_bmm = (
+                isinstance(x, DTensor)
+                and x.dim() == 3
+                and any(isinstance(p, _Shard) and p.dim < 2 for p in x.placements)
+            )
+            if torch.compiler.is_compiling() or _x_needs_bmm:
                 res = _dtensor_linear(x, self.weight, bias)
             else:
                 res = F.linear(x, self.weight, bias)
@@ -349,14 +376,6 @@ class TritonLinearLoRA(LinearLoRA):
         Returns:
             torch.Tensor: the output tensor.
         """
-        # LoRATritonFunction.apply does not support DTensor inputs (TP-sharded weights).
-        # When weights are DTensors, fall through to LinearLoRA.forward which handles
-        # DTensors correctly via _dtensor_linear and avoids torch.compile graph breaks.
-        from torch.distributed.tensor import DTensor
-
-        if isinstance(self.lora_A.weight, DTensor) or isinstance(self.lora_B.weight, DTensor):
-            return LinearLoRA.forward(self, x)
-
         # If LinearLoRA is used to monkey-patch a nn.Linear module, we want to use nn.Linear's
         # forward in the case where it uses quantized weights. We store a reference to nn.Linear's
         # forward in `super_fwd` attribute. If the attribute does not exist we do the usual linear.

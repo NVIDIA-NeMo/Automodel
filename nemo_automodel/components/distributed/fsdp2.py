@@ -71,6 +71,11 @@ class FSDP2Manager:
         self.enable_async_tensor_parallel = config.enable_async_tensor_parallel
         self.enable_compile = config.enable_compile
         self.enable_fsdp2_prefetch = config.enable_fsdp2_prefetch
+        self.use_reentrant_ac = config.use_reentrant_ac
+        self.fsdp2_allocate_from_pg = config.fsdp2_allocate_from_pg
+        self.prioritize_all_gather = config.prioritize_all_gather
+        self.fsdp_layer_group_size = config.fsdp_layer_group_size
+        self.fsdp2_no_cat_array = config.fsdp2_no_cat_array
 
     def parallelize(self, model):
         """
@@ -112,5 +117,10 @@ class FSDP2Manager:
             enable_async_tensor_parallel=self.enable_async_tensor_parallel,
             enable_compile=self.enable_compile,
             enable_fsdp2_prefetch=self.enable_fsdp2_prefetch,
+            use_reentrant_ac=self.use_reentrant_ac,
+            fsdp2_allocate_from_pg=self.fsdp2_allocate_from_pg,
+            prioritize_all_gather=self.prioritize_all_gather,
+            fsdp_layer_group_size=self.fsdp_layer_group_size,
+            fsdp2_no_cat_array=self.fsdp2_no_cat_array,
         )
         return model

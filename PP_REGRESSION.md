@@ -4,7 +4,7 @@
 
 | | Container | PyTorch | MFU |
 |---|---|---|---|
-| **Old (target)** | `nemo-automodel:26.02.rc2` | ~2.6 | **~22%** |
+| **Old (target)** | `nemo-automodel:26.02.rc2` | 2.9 | **~22%** |
 | **New (regressed)** | `nemo-automodel:nightly_202604` | 2.11.0a0 | **~16.8%** |
 
 Config: PP=4, TP=2, interleaved 1F1B, compile=True, 8×H100, Llama-3.3-70B PEFT (LoRA r=16).
@@ -13,19 +13,29 @@ Config: PP=4, TP=2, interleaved 1F1B, compile=True, 8×H100, Llama-3.3-70B PEFT 
 
 ## Root Cause
 
-PT 2.11 changed `get_schedule_class("interleaved1f1b")` to return `_PipelineScheduleRuntime` instead of the old pure-Python `ScheduleInterleavedWith1F1B`.
+`get_schedule_class("interleaved1f1b")` returns `ScheduleInterleaved1F1B` in both containers — the class name is unchanged. What changed is its **implementation**:
 
-The new runtime issues **152 P2P send/recv ops per ga_step** vs **80 in the old schedule** — measured directly from nsys kernel summaries.
+| | 26.02.rc2 | nightly_202604 (PT 2.11) |
+|---|---|---|
+| `ScheduleInterleaved1F1B` base class | pure-Python standalone | **subclass of `_PipelineScheduleRuntime`** |
+| P2P send/recv ops per ga_step (nsys) | **80** | **152** |
+
+PT 2.11 silently re-implemented `ScheduleInterleaved1F1B` on top of `_PipelineScheduleRuntime`:
+
+```python
+>>> from torch.distributed.pipelining.schedules import ScheduleInterleaved1F1B
+>>> [c.__name__ for c in ScheduleInterleaved1F1B.__mro__]
+['ScheduleInterleaved1F1B', '_PipelineScheduleRuntime', 'PipelineScheduleMulti', ...]
+```
+
+The `_PipelineScheduleRuntime` backend uses a `pipeline_order_with_comms` state machine that adds extra send/recv handshakes across warmup→steady→cooldown phase transitions. The old pure-Python schedule overlapped these with compute; the new runtime issues them as separate serialized ops.
 
 ```
-n_microbatches=4, virtual_stages_per_rank=10, PP=4
-Theoretical minimum: 4 × 10 × 2 = 80 (send+recv per microbatch per stage)
-New runtime actual:  152  (+72 extra from warmup/cooldown handshakes)
+Setup: n_microbatches=4, virtual_stages_per_rank=10, PP=4
+Theoretical minimum comms: 4 × 10 × 2 = 80  (send+recv per microbatch per stage boundary)
+New runtime actual:         152               (+72 extra handshakes)
+Extra per training step:   (152 - 80) × 8 ga_steps = 576 extra NCCL ops
 ```
-
-The extra 72 ops are fence-style handshakes in the `_PipelineScheduleRuntime` state machine across the warmup→steady→cooldown phase transitions. These fall outside compute-overlap windows, extending pipeline bubbles on every rank.
-
-At ga_steps=8: `(152 - 80) × 8 = 576 extra NCCL ops per training step`.
 
 ---
 
@@ -34,42 +44,45 @@ At ga_steps=8: `(152 - 80) × 8 = 576 extra NCCL ops per training step`.
 | Hypothesis | Test | Result |
 |---|---|---|
 | `batch_p2p` (PyTorch PRs #175572, #178815) | Backported + benchmarked | No improvement on NVLink |
-| `direct_copy_kernel_cuda` from BMM transpose | Einsum replacement benchmark | Neutral (BMM=16.84%, einsum=16.81%) |
-| GA without PP | fsdp_tp run | ~26% MFU — not regressed |
-| TP, FSDP, compile | All tested in isolation | Not the cause |
+| `direct_copy_kernel_cuda` from BMM `.t().expand()` | Einsum replacement on both fsdp_tp and PP+TP configs | Neutral — BMM=16.84%, einsum=16.81% |
+| GA without PP | fsdp_tp benchmark (TP=2, FSDP2, compile) | ~26% MFU — not regressed |
+| TP / FSDP2 / compile individually | Tested in isolation | Not the cause |
 
 ---
 
-## Fix to Test
+## Fix Options
 
-**Location:** `nemo_automodel/components/distributed/pipelining/functional.py`, line 542
+`ScheduleInterleaved1F1B` in PT 2.11 inherits from `_PipelineScheduleRuntime` — there is no pure-Python fallback in the same container.
+
+**Option A — File upstream PyTorch issue** *(recommended)*
+Report to PyTorch distributed team with nsys evidence: `_PipelineScheduleRuntime`-based interleaved 1F1B regresses P2P op count from 80 → 152 vs the prior pure-Python implementation.
+
+**Option B — Vendor the old pure-Python schedule**
+Extract `ScheduleInterleaved1F1B` from `26.02.rc2`'s `schedules.py` and add it as a local class. Force it in `functional.py:542`:
 
 ```python
-# Current (PT 2.11 resolves to _PipelineScheduleRuntime):
-schedule_class = get_schedule_class(pipeline_parallel_schedule)
-
-# Proposed fix: pin the old Python class for interleaved1f1b
-from torch.distributed.pipelining.schedules import ScheduleInterleavedWith1F1B
+# nemo_automodel/components/distributed/pipelining/functional.py, line 542
+from nemo_automodel.components.distributed.pipelining.legacy_schedule import LegacyScheduleInterleaved1F1B
 if pipeline_parallel_schedule == "interleaved1f1b":
-    schedule_class = ScheduleInterleavedWith1F1B
+    schedule_class = LegacyScheduleInterleaved1F1B
 else:
     schedule_class = get_schedule_class(pipeline_parallel_schedule)
 ```
 
-This forces the old 80-op schedule while leaving all other schedule types unaffected.
+**Option C — Stay on 26.02.rc2**
+Block the container upgrade until upstream resolves the regression.
 
 ---
 
 ## Reproducer
 
 ```bash
-# Regressed (new container):
-sbatch benchmark_bmm_pp4tp2.sbatch          # → ~16.8% MFU
+# Current regressed state:
+sbatch benchmark_bmm_pp4tp2.sbatch        # → ~16.8% MFU
 
-# Expected fix:
-# Apply the patch above, then:
-sbatch benchmark_bmm_pp4tp2.sbatch          # → ~22% MFU (hypothesis)
+# Reference (old container, confirms target):
+sbatch benchmark_old_container.sbatch     # → ~22% MFU
 
-# Reference (old container):
-sbatch benchmark_old_container.sbatch       # → ~22% MFU
+# After Option B fix:
+sbatch benchmark_bmm_pp4tp2.sbatch        # → ~22% MFU (expected)
 ```

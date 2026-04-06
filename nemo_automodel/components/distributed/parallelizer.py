@@ -78,6 +78,9 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 )
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
+from nemo_automodel.components.distributed.pipelining.hf_utils import (
+    _patch_is_packed_sequence_for_pp_training,
+)
 from nemo_automodel.components.distributed.optimized_tp_plans import (
     LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
     PARALLELIZE_FUNCTIONS,
@@ -105,6 +108,31 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+class FSDPLayerGroupWrapper(nn.Module):
+    """Wraps N transformer layers into one FSDP unit to reduce AllGather count.
+
+    Grouping G layers into one FSDP unit reduces the AllGather count by G×,
+    halving the CatArrayBatchedCopy + elementwise copy-out overhead. Each
+    AllGather is G× larger, but kernel launch + synchronization overhead is
+    reduced G×.
+
+    The forward passes hidden_states through all inner layers sequentially,
+    forwarding all other kwargs (attention_mask, position_ids, position_embeddings,
+    etc.) unchanged to each layer. Returns the output tuple of the final layer.
+    Suitable for training (use_cache=False, output_attentions=False).
+    """
+
+    def __init__(self, layers: list):
+        super().__init__()
+        self.group = nn.ModuleList(layers)
+
+    def forward(self, hidden_states, **kwargs):
+        for layer in self.group:
+            outputs = layer(hidden_states, **kwargs)
+            hidden_states = outputs[0]
+        return (hidden_states,)
+
+
 class ParallelizationStrategy(ABC):
     """Abstract base class for model parallelization strategies."""
 
@@ -121,6 +149,7 @@ class ParallelizationStrategy(ABC):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        **kwargs,
     ) -> nn.Module:
         """Apply parallelization strategy to the model."""
         pass
@@ -144,6 +173,11 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         enable_async_tensor_parallel: bool = False,
         enable_compile: bool = False,
         enable_fsdp2_prefetch: bool = True,
+        use_reentrant_ac: bool = False,
+        fsdp2_allocate_from_pg: bool = False,
+        prioritize_all_gather: bool = False,
+        fsdp_layer_group_size: int = 1,
+        fsdp2_no_cat_array: bool = False,
     ) -> nn.Module:
         """Apply the default parallelization flow."""
         tp_mesh = device_mesh[tp_mesh_name]
@@ -159,6 +193,11 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
 
         # TP sharding with enhanced plan generation
         if tp_mesh.size() > 1:
+            # Eliminate CPU-GPU sync from transformers._is_packed_sequence which calls
+            # .item() on a GPU tensor every forward pass. This patch was previously only
+            # applied in the PP path; non-packed TP training needs it too.
+            _patch_is_packed_sequence_for_pp_training()
+
             # async-TP (_micro_pipeline_tp) overlaps ReduceScatter with compute.
             # Without SP, row-parallel layers emit AllReduce (not ReduceScatter),
             # so there is nothing for the micro-pipeline to overlap — force SP on.
@@ -198,6 +237,17 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             if enable_async_tensor_parallel:
                 torch._inductor.config._micro_pipeline_tp = True
                 logger.info("Async tensor parallel enabled — ensure torch.compile is also enabled")
+                # Enable symmetric memory for the TP group so Inductor's
+                # fused_all_gather_matmul and fused_matmul_reduce_scatter kernels
+                # can fire (both are gated on is_symm_mem_enabled_for_group).
+                if tp_mesh.size() > 1:
+                    try:
+                        from torch.distributed._symmetric_memory import enable_symm_mem_for_group
+                        tp_group_name = tp_mesh._dim_group_names[0]
+                        enable_symm_mem_for_group(tp_group_name)
+                        logger.info(f"Symmetric memory enabled for TP group '{tp_group_name}'")
+                    except Exception as e:
+                        logger.warning(f"Could not enable symmetric memory for TP group: {e}")
 
         # Apply activation checkpointing to linear layers if requested
         if activation_checkpointing:
@@ -209,11 +259,12 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 except Exception:
                     pass
 
+            ckpt_impl = CheckpointImpl.REENTRANT if use_reentrant_ac else CheckpointImpl.NO_REENTRANT
             for i, layer in enumerate(layers):
                 if hasattr(layer, "mlp"):
-                    layers[i].mlp = checkpoint_wrapper(layer.mlp)
+                    layers[i].mlp = checkpoint_wrapper(layer.mlp, checkpoint_impl=ckpt_impl)
                 if hasattr(layer, "self_attn"):
-                    layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
+                    layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn, checkpoint_impl=ckpt_impl)  # type: ignore
 
         # Per-layer compile: deferred to after checkpoint loading in apply_model_infrastructure
         # to avoid _orig_mod key prefix mismatch when loading HF checkpoints.
@@ -230,7 +281,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             )
 
         # Find transformer layers and apply parallelisms
-        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy, pp_enabled, enable_fsdp2_prefetch)
+        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy, pp_enabled, enable_fsdp2_prefetch, fsdp_layer_group_size)
 
         # Apply FSDP to the root model
         # Do not reshard after forward for root model because its parameters
@@ -242,6 +293,15 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             reshard_after_forward=False,
             offload_policy=offload_policy,
         )
+
+        # Enable NCCL-managed buffer allocation to eliminate per-op memory registration.
+        if fsdp2_allocate_from_pg:
+            _inject_allocate_from_pg(model)
+
+        # Inject separate RS communicator so AllGather and ReduceScatter run
+        # on independent NCCL communicators and don't serialize each other.
+        if prioritize_all_gather:
+            _inject_separate_rs_process_group(model)
 
         return model
 
@@ -261,6 +321,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        **kwargs,
     ) -> nn.Module:
         """Apply NemotronH-specific parallelization."""
         assert not sequence_parallel, "Sequence parallelism is not supported for NemotronHForCausalLM"
@@ -330,6 +391,7 @@ class WanParallelizationStrategy(ParallelizationStrategy):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        **kwargs,
     ) -> nn.Module:
         # Not using custom tp_shard_plan; apply Wan-specific plan
         tp_mesh = device_mesh[tp_mesh_name]
@@ -395,8 +457,10 @@ class WanParallelizationStrategy(ParallelizationStrategy):
                 output_dtype=torch.float32,
             )
 
+        dp_replicate_mesh = device_mesh[dp_replicate_mesh_name]
+
         # Apply FSDP sharding recursively and to root
-        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
+        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy, dp_replicate_mesh=dp_replicate_mesh)
 
         return fully_shard(
             model,
@@ -422,6 +486,7 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
+        **kwargs,
     ) -> nn.Module:
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
         dp_mesh = device_mesh[dp_mesh_dim_names]
@@ -441,8 +506,10 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
                     checkpoint_impl=CheckpointImpl.NO_REENTRANT,
                 )
 
+        dp_replicate_mesh = device_mesh[dp_replicate_mesh_name]
+
         # Apply FSDP sharding recursively and to root
-        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
+        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy, dp_replicate_mesh=dp_replicate_mesh)
 
         return fully_shard(
             model,
@@ -570,7 +637,7 @@ def _patch_dtensor_spec_hash_for_symint() -> None:
     DTensorSpec._symint_hash_patched = True
 
 
-def _apply_per_layer_compile(model: nn.Module) -> None:
+def _apply_per_layer_compile(model: nn.Module, use_reentrant_ac: bool = False) -> None:
     """Apply NO_REENTRANT AC to self_attn/mlp, then compile the whole decoder layer.
 
     Strategy: wrap self_attn and mlp with NO_REENTRANT checkpoint_wrapper, then call
@@ -640,15 +707,11 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
     items = module_list.items() if isinstance(module_list, nn.ModuleDict) else enumerate(module_list)
 
     compiled_count = 0
-    for i, layer in items:
-        # Unwrap any existing layer-level checkpoint wrapper (e.g. from PP path).
-        if isinstance(layer, CheckpointWrapper):
-            actual_layer = layer._checkpoint_wrapped_module
-            layer_was_wrapped = True
-        else:
-            actual_layer = layer
-            layer_was_wrapped = False
+    ckpt_impl = CheckpointImpl.REENTRANT if use_reentrant_ac else CheckpointImpl.NO_REENTRANT
 
+    def _compile_single_layer(actual_layer):
+        """Apply NO_REENTRANT AC re-wrap + torch.compile to one transformer layer."""
+        nonlocal compiled_count
         any_ac = False
         for attr in ("self_attn", "mlp"):
             existing = getattr(actual_layer, attr, None)
@@ -662,7 +725,9 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
             # NO_REENTRANT: handled as a higher-order op inside the compiled layer graph.
             # The recompute runs within the compiled backward under enable_grad, ensuring
             # AOT autograd sees requires_grad=True LoRA weights and computes their grads.
-            setattr(actual_layer, attr, checkpoint_wrapper(inner, checkpoint_impl=CheckpointImpl.NO_REENTRANT))
+            # use_reentrant_ac=True switches to REENTRANT for hypothesis testing (e.g.,
+            # verifying whether REENTRANT vs NO_REENTRANT affects NCCL P2P coalescing).
+            setattr(actual_layer, attr, checkpoint_wrapper(inner, checkpoint_impl=ckpt_impl))
             any_ac = True
 
         # Unwrap layernorms — they are lightweight and do not need AC.
@@ -675,16 +740,139 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
             # Compile the whole decoder layer with NO_REENTRANT AC already inside it.
             # First invocation happens during training under torch.enable_grad(), so
             # AOT autograd traces a joint fwd+bwd graph with full LoRA grad support.
-            module_list[i] = torch.compile(actual_layer)
             compiled_count += 1
+            return torch.compile(actual_layer)
+        return actual_layer
+
+    for i, layer in items:
+        # Unwrap any existing layer-level checkpoint wrapper (e.g. from PP path).
+        if isinstance(layer, CheckpointWrapper):
+            actual_layer = layer._checkpoint_wrapped_module
+            layer_was_wrapped = True
+        else:
+            actual_layer = layer
+            layer_was_wrapped = False
+
+        # FSDPLayerGroupWrapper: compile each inner layer individually.
+        if isinstance(actual_layer, FSDPLayerGroupWrapper):
+            for j in range(len(actual_layer.group)):
+                actual_layer.group[j] = _compile_single_layer(actual_layer.group[j])
+            continue
+
+        compiled = _compile_single_layer(actual_layer)
+        if compiled is not actual_layer:
+            module_list[i] = compiled
         elif layer_was_wrapped:
             module_list[i] = layer
 
+    ac_impl_name = "REENTRANT" if use_reentrant_ac else "NO_REENTRANT"
     logger.info(
         "Per-layer torch.compile applied to %d decoder layers "
-        "(self_attn + mlp with NO_REENTRANT AC inside layer-level compile)",
+        "(self_attn + mlp with %s AC inside layer-level compile)",
         compiled_count,
+        ac_impl_name,
     )
+
+
+def _inject_allocate_from_pg(model: nn.Module) -> None:
+    """Enable NCCL-managed buffer allocation for all FSDP2 param groups.
+
+    By default FSDP2 allocates AllGather and ReduceScatter buffers via torch.empty,
+    which requires NCCL to register each new buffer at runtime. With
+    allocate_memory_from_process_group=True, NCCL allocates from its own pre-registered
+    memory pool, eliminating per-operation registration overhead and potentially
+    enabling zero-copy for the AllGather output buffer.
+    """
+    from torch.distributed.fsdp._fully_shard._fsdp_common import FSDPMeshInfo
+
+    injected = 0
+    for submodule in model.modules():
+        if not callable(getattr(submodule, "_get_fsdp_state", None)):
+            continue
+        state = submodule._get_fsdp_state()
+        pg = state._fsdp_param_group
+        if pg is None:
+            continue
+        pg.allocate_memory_from_process_group = True
+        injected += 1
+    logger.info(f"Enabled allocate_memory_from_process_group on {injected} FSDP param groups")
+
+
+def _inject_separate_rs_process_group(model: nn.Module) -> None:
+    """Inject a separate NCCL communicator for ReduceScatter into all FSDP2 param groups.
+
+    By default FSDP2 uses the same process group for both AllGather and ReduceScatter.
+    NCCL serializes collectives on the same communicator even across different CUDA
+    streams, so RS_{i} blocks the prefetched AG_{i-1} in the backward pass.
+
+    This function creates a second NCCL communicator over the same DP ranks and injects
+    it as the RS communicator, allowing AG and RS to run in parallel through NCCL.
+
+    Uses class-level monkey-patching of FSDPParamGroup._reduce_scatter_process_group
+    so it works regardless of which PyTorch installation is active (venv vs container).
+    """
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+    from torch.distributed.fsdp._fully_shard._fsdp_common import FSDPMeshInfo
+
+    # Monkey-patch the property on the class so the override check works in
+    # whichever torch installation the container uses (no need to edit torch source).
+    if not getattr(FSDPParamGroup, "_rs_pg_patched", False):
+        _orig_fget = FSDPParamGroup._reduce_scatter_process_group.fget
+
+        def _patched_rs_pg(self):
+            if getattr(self, "_rs_override_pg", None) is not None:
+                return self._rs_override_pg
+            return _orig_fget(self)
+
+        FSDPParamGroup._reduce_scatter_process_group = property(_patched_rs_pg)
+        FSDPParamGroup._rs_pg_patched = True
+
+    # Collect FSDP param groups and find the shard process group for this rank.
+    # dist.new_group is a collective: ALL world ranks must call it the same number
+    # of times with the same rank lists in the same order.
+    # With tp_size > 1 there are tp_size distinct DP-shard groups (one per TP rank).
+    # We infer all of them from this rank's shard group and call new_group for each,
+    # so every rank participates in all new_group calls.
+    fsdp_param_groups = []
+    my_shard_pg = None
+    for submodule in model.modules():
+        if not callable(getattr(submodule, "_get_fsdp_state", None)):
+            continue
+        state = submodule._get_fsdp_state()
+        pg = state._fsdp_param_group
+        if pg is None or not isinstance(pg.mesh_info, FSDPMeshInfo):
+            continue
+        fsdp_param_groups.append(pg)
+        if my_shard_pg is None:
+            my_shard_pg = pg.mesh_info.shard_process_group
+
+    if not fsdp_param_groups or my_shard_pg is None:
+        logger.warning("No FSDP param groups found; skipping separate RS process group injection")
+        return
+
+    my_shard_ranks = sorted(torch.distributed.get_process_group_ranks(my_shard_pg))
+    dp_size = len(my_shard_ranks)
+    # stride between consecutive members = tp_size (e.g. [0,2,4,6] → stride=2)
+    stride = (my_shard_ranks[1] - my_shard_ranks[0]) if dp_size > 1 else 1
+    my_rank = torch.distributed.get_rank()
+
+    # Create one new NCCL communicator per TP-rank offset (stride offsets total).
+    # All world ranks participate in each new_group call (required by NCCL).
+    my_rs_pg = None
+    for offset in range(stride):
+        group_ranks = sorted([offset + i * stride for i in range(dp_size)])
+        new_pg = torch.distributed.new_group(ranks=group_ranks, backend="nccl")
+        if my_rank in group_ranks:
+            my_rs_pg = new_pg
+            logger.info(
+                f"Created separate RS process group over DP ranks {group_ranks} "
+                f"to prioritize AllGather over ReduceScatter"
+            )
+
+    # Inject the new RS communicator into all FSDP param groups on this rank.
+    for pg in fsdp_param_groups:
+        pg._rs_override_pg = my_rs_pg
+    logger.info(f"Injected separate RS process group into {len(fsdp_param_groups)} FSDP param groups")
 
 
 def apply_fsdp2_sharding_recursively(
@@ -694,6 +882,7 @@ def apply_fsdp2_sharding_recursively(
     offload_policy: Optional[OffloadPolicy] = None,
     pp_enabled: bool = False,
     enable_fsdp2_prefetch: bool = True,
+    fsdp_layer_group_size: int = 1,
 ) -> None:
     """
     Recursively apply FSDP2 sharding to modules, with optimizations for ModuleList.
@@ -718,13 +907,65 @@ def apply_fsdp2_sharding_recursively(
         This function modifies the module in-place by replacing modules with their
         FSDP2-subclassed versions.
     """
-    if isinstance(module, nn.ModuleList):
-        for layer_id, child_module in enumerate(module):
-            # If child is also a ModuleList (nested structure), recurse instead of wrapping
-            # since ModuleList doesn't have a forward() method required by fully_shard
-            if isinstance(child_module, nn.ModuleList):
-                apply_fsdp2_sharding_recursively(child_module, mesh, mp_policy, offload_policy, pp_enabled, enable_fsdp2_prefetch)
-            else:
+    if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
+        # After pipeline splitting, functional.py replaces nn.ModuleList with nn.ModuleDict
+        # (keyed by string layer indices).  Normalise both to a list of (key, child) pairs.
+        if isinstance(module, nn.ModuleDict):
+            all_items = list(module.items())
+            _is_container = lambda c: isinstance(c, (nn.ModuleList, nn.ModuleDict))
+        else:
+            all_items = [(i, module[i]) for i in range(len(module))]
+            _is_container = lambda c: isinstance(c, nn.ModuleList)
+
+        flat_layer_items = [(k, c) for k, c in all_items if not _is_container(c)]
+        nested_items     = [(k, c) for k, c in all_items if _is_container(c)]
+        flat_layers = [c for _, c in flat_layer_items]
+        nested_lists = nested_items  # kept for len() checks below
+
+        # Recurse into any nested ModuleLists first (unchanged behavior).
+        for layer_id, child_module in nested_lists:
+            apply_fsdp2_sharding_recursively(child_module, mesh, mp_policy, offload_policy, pp_enabled, enable_fsdp2_prefetch, fsdp_layer_group_size)
+
+        # Only group when all children are flat layers — no nested ModuleLists mixed in.
+        if fsdp_layer_group_size > 1 and len(flat_layers) > 0 and len(nested_lists) == 0:
+            # Group flat layers into FSDPLayerGroupWrapper units.
+            # This halves (or more) the AllGather count, reducing CatArray + elementwise overhead.
+            # Inner layers already have AC applied; _apply_per_layer_compile handles compile.
+            g = fsdp_layer_group_size
+            groups = []
+            for start in range(0, len(flat_layers), g):
+                chunk = flat_layers[start : start + g]
+                for child in chunk:
+                    _pre_shard_combined_projections(child, mesh, mp_policy, offload_policy)
+                if len(chunk) == 1:
+                    groups.append(chunk[0])
+                else:
+                    groups.append(FSDPLayerGroupWrapper(chunk))
+
+            n_groups = len(groups)
+            # Rebuild the ModuleList in-place with the grouped units.
+            module._modules = {str(i): g_unit for i, g_unit in enumerate(groups)}
+
+            for group_id, group_unit in enumerate(groups):
+                if pp_enabled:
+                    reshard_after_forward = False
+                else:
+                    reshard_after_forward = group_id < n_groups - 1
+                fully_shard(
+                    group_unit,
+                    mesh=mesh,
+                    mp_policy=mp_policy,
+                    reshard_after_forward=reshard_after_forward,
+                    offload_policy=offload_policy,
+                )
+                module[group_id] = group_unit
+
+            logger.info(
+                f"FSDP layer grouping: {len(flat_layers)} layers → {n_groups} FSDP units "
+                f"(group_size={fsdp_layer_group_size})"
+            )
+        else:
+            for enum_id, (layer_key, child_module) in enumerate(flat_layer_items):
                 # Pre-shard combined projection submodules on dim 1 so that
                 # the parent fully_shard (dim 0) skips them automatically.
                 _pre_shard_combined_projections(child_module, mesh, mp_policy, offload_policy)
@@ -734,7 +975,7 @@ def apply_fsdp2_sharding_recursively(
                 if pp_enabled:
                     reshard_after_forward = False
                 else:
-                    reshard_after_forward = int(layer_id) < len(module) - 1
+                    reshard_after_forward = enum_id < len(flat_layer_items) - 1
                 fully_shard(
                     child_module,
                     mesh=mesh,
@@ -742,19 +983,27 @@ def apply_fsdp2_sharding_recursively(
                     reshard_after_forward=reshard_after_forward,
                     offload_policy=offload_policy,
                 )
-                module[layer_id] = child_module
+                module[layer_key] = child_module
 
         # Set up explicit forward/backward prefetch chains when layers are being resharded.
         # With PP, reshard_after_forward=False so weights are always gathered — no prefetch needed.
         if not pp_enabled and enable_fsdp2_prefetch:
-            layers = [module[i] for i in range(len(module)) if not isinstance(module[i], nn.ModuleList)]
-            for i in range(len(layers) - 1):
-                layers[i].set_modules_to_forward_prefetch([layers[i + 1]])
-            for i in range(1, len(layers)):
-                layers[i].set_modules_to_backward_prefetch([layers[i - 1]])
+            fsdp_units = [c for _, c in flat_layer_items if not _is_container(c)]
+            for i in range(len(fsdp_units) - 1):
+                fsdp_units[i].set_modules_to_forward_prefetch([fsdp_units[i + 1]])
+            # Backward prefetch: fire 2 layers early so the AllGather for layer i-2 runs
+            # during layer i-1's ~5ms backward compute and is ready when layer i-2 starts.
+            # FSDP2 post-backward hooks fire at END of each layer's backward, so 1-ahead
+            # triggers just as the next layer starts (0.477ms exposed). By also issuing
+            # a 2-ahead trigger we hide AllGather behind the prior layer's compute.
+            for i in range(1, len(fsdp_units)):
+                targets = [fsdp_units[i - 1]]          # 1-ahead: ensures correctness
+                if i >= 2:
+                    targets.append(fsdp_units[i - 2])  # 2-ahead: hides AllGather behind compute
+                fsdp_units[i].set_modules_to_backward_prefetch(targets)
     else:
         for name, sub_module in module.named_children():
-            apply_fsdp2_sharding_recursively(sub_module, mesh, mp_policy, offload_policy, pp_enabled, enable_fsdp2_prefetch)
+            apply_fsdp2_sharding_recursively(sub_module, mesh, mp_policy, offload_policy, pp_enabled, enable_fsdp2_prefetch, fsdp_layer_group_size)
 
 
 def get_hf_tp_shard_plan(model):
@@ -1354,6 +1603,11 @@ def fsdp2_strategy_parallelize(
     enable_async_tensor_parallel: bool = False,
     enable_compile: bool = False,
     enable_fsdp2_prefetch: bool = True,
+    use_reentrant_ac: bool = False,
+    fsdp2_allocate_from_pg: bool = False,
+    prioritize_all_gather: bool = False,
+    fsdp_layer_group_size: int = 1,
+    fsdp2_no_cat_array: bool = False,
 ):
     """
     Apply parallelisms and activation checkpointing to the model.
@@ -1410,6 +1664,11 @@ def fsdp2_strategy_parallelize(
         enable_async_tensor_parallel=enable_async_tensor_parallel,
         enable_compile=enable_compile,
         enable_fsdp2_prefetch=enable_fsdp2_prefetch,
+        use_reentrant_ac=use_reentrant_ac,
+        fsdp2_allocate_from_pg=fsdp2_allocate_from_pg,
+        prioritize_all_gather=prioritize_all_gather,
+        fsdp_layer_group_size=fsdp_layer_group_size,
+        fsdp2_no_cat_array=fsdp2_no_cat_array,
     )
 
 
@@ -1434,6 +1693,7 @@ def megatron_fsdp_strategy_parallelize(
     fsdp_double_buffer: bool = False,
     dp_shard_dim: str = "dp",
     tp_dim: str = "tp",
+    activation_checkpointing: bool = False,
 ):
     """
     Apply tensor/data parallelism (MegatronFSDP) and optional activation-checkpointing to the model.
@@ -1503,6 +1763,15 @@ def megatron_fsdp_strategy_parallelize(
     # TP sharding.
     if tp_mesh.size() > 1:
         parallelize_module(model, tp_mesh, tp_shard_plan)
+
+    # Activation checkpointing via HF's gradient_checkpointing_enable (applied after TP,
+    # before MegatronFSDP wrapping so that recompute runs on TP-sharded forward).
+    if activation_checkpointing:
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+            logger.info("MegatronFSDP: applied gradient_checkpointing_enable() on model")
+        else:
+            logger.error("MegatronFSDP: model has no gradient_checkpointing_enable(); AC skipped")
 
     # Import MegatronFSDP unit modules specified by the user.
     megatron_fsdp_unit_modules = import_classes_from_paths(megatron_fsdp_unit_modules)

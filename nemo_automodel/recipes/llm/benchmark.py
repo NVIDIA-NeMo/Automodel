@@ -287,13 +287,15 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     logger.warning("[autonvtx] Could not import autonvtx, module breakdown will be unavailable")
 
         # Main benchmarking loop
+        _emit_nvtx_ctx = None
         for i in range(steps):
             self.step_scheduler.step = i
             # Start nsys profiling if configured
             if i == nsys_start and rank in nsys_ranks:
                 logger.info(f"Rank {rank} | Starting nsys profiling")
                 torch.cuda.cudart().cudaProfilerStart()
-                torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+                _emit_nvtx_ctx = torch.autograd.profiler.emit_nvtx(record_shapes=True)
+                _emit_nvtx_ctx.__enter__()
 
             if rank == 0:
                 logger.info(f"Rank {rank} | Iteration {i}")
@@ -385,6 +387,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             # Stop nsys profiling if configured
             if i == nsys_end and rank in nsys_ranks:
                 logger.info(f"Rank {rank} | Stopping nsys profiling")
+                if _emit_nvtx_ctx is not None:
+                    _emit_nvtx_ctx.__exit__(None, None, None)
+                    _emit_nvtx_ctx = None
                 torch.cuda.cudart().cudaProfilerStop()
 
             self._maybe_collect_garbage()
