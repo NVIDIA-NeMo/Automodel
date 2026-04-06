@@ -108,5 +108,6 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  recipe_owner: hemildesai
   node_multiplier: true
   time: "00:15:00"

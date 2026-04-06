@@ -106,6 +106,7 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  recipe_owner: hemildesai
   local_batch_size: 16
   nodes: 4
   time: "01:00:00"

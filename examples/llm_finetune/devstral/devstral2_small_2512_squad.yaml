@@ -101,5 +101,6 @@ lr_scheduler:
 #   save_dir: <your_wandb_save_dir> 
 
 ci:
+  recipe_owner: akoumpa
   node_multiplier: true
   time: "00:15:00"

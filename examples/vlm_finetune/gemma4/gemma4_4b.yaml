@@ -96,3 +96,6 @@ freeze_config:
 #   project: <your-project>
 #   entity: <your-entity>
 #   name: <your-run-name>
+
+ci:
+  recipe_owner: hemildesai

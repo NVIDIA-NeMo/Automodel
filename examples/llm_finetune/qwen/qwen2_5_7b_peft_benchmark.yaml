@@ -97,4 +97,7 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: qwen2_5_7b_peft_benchmark
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: ZhiyuLi-Nvidia

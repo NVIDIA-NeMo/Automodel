@@ -137,5 +137,6 @@ optimizer:
 
 
 ci:
+  recipe_owner: hemildesai
   local_batch_size: 2
   time: "00:30:00"

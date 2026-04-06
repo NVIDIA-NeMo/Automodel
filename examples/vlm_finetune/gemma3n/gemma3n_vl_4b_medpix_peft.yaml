@@ -114,3 +114,6 @@ freeze_config:
 #   wandb_entity: 
 #   wandb_exp_name:
 #   wandb_save_dir:
+
+ci:
+  recipe_owner: akoumpa

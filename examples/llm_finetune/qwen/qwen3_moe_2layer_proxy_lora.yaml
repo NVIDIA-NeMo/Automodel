@@ -138,4 +138,5 @@ optimizer:
   eps: 1e-8
 
 ci:
+  recipe_owner: ZhiyuLi-Nvidia
   local_batch_size: 1

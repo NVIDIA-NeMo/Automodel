@@ -116,5 +116,6 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  recipe_owner: akoumpa
   nodes: 2
   time: "00:30:00"

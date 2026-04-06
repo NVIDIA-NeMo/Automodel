@@ -100,4 +100,5 @@ optimizer:
   eps: 1e-8
 
 ci:
+  recipe_owner: adil-a
   nodes: 2

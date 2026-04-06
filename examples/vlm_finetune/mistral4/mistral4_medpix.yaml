@@ -116,5 +116,6 @@ wandb:
   name: mistral4-medpix
 
 ci:
+  recipe_owner: akoumpa
   nodes: 4
   time: "00:30:00"

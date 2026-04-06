@@ -94,3 +94,6 @@ freeze_config:
 #   entity:
 #   name:
 #   save_dir:
+
+ci:
+  recipe_owner: akoumpa

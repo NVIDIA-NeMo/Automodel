@@ -107,4 +107,5 @@ freeze_config:
 #   name: <your_experiment_name>
 
 ci:
+  recipe_owner: HuiyingLi
   time: "00:30:00"

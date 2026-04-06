@@ -106,4 +106,7 @@ freeze_config:
 # wandb:
 #   project: 
 #   entity: 
-#   name: 
+#   name:
+
+ci:
+  recipe_owner: adil-a
