@@ -919,7 +919,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     stage0_model = self.model_parts[0]
                     n_microbatches = self.pp._info.schedule._n_microbatches
                     batch_size = input_ids.shape[0]
-                    image_grid.shape[0]
 
                     pixel_values_chunks, image_grid_chunks = _chunk_vlm_media(
                         pixel_values,
