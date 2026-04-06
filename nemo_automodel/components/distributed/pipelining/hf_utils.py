@@ -106,6 +106,13 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         if causal_mask_mapping is None:
             # If causal_mask_mapping is missing, fall back to on-the-fly computation.
             # This is not recommended for compilation, as it introduces runtime overhead.
+            # TODO(PP): In pipeline parallelism, causal_mask_mapping is passed as a kwarg
+            # but it is a dict (not a tensor), so it cannot be chunked by the PP schedule.
+            # Non-first stages receive causal_mask_mapping=None and hit this fallback,
+            # recomputing the mask every microbatch. This is a performance issue but not
+            # a correctness bug since each stage has the full config to recompute correctly.
+            # Long-term fix: pass the mask through stage input/output or compute it once
+            # per stage and cache it.
             logger.warning(
                 "causal_mask_mapping not provided; computing it here. "
                 "This is slow and not recommended for compilation. "
