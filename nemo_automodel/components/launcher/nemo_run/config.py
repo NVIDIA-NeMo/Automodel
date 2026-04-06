@@ -23,10 +23,17 @@ _NEMORUN_HOME = os.environ.get("NEMORUN_HOME", os.path.join(os.path.expanduser("
 DEFAULT_EXECUTORS_FILE = os.path.join(_NEMORUN_HOME, "executors.py")
 
 # Keys that belong to NemoRunConfig itself (not executor overrides).
-_LAUNCHER_KEYS = frozenset({
-    "executor", "job_name", "detach", "tail_logs",
-    "executors_file", "job_dir", "overrides",
-})
+_LAUNCHER_KEYS = frozenset(
+    {
+        "executor",
+        "job_name",
+        "detach",
+        "tail_logs",
+        "executors_file",
+        "job_dir",
+        "overrides",
+    }
+)
 
 
 @dataclass
