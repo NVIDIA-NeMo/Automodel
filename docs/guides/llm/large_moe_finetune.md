@@ -2,7 +2,7 @@
 
 ## Introduction
 
-Mixture-of-Experts (MoE) architectures have become the dominant design for frontier language models, activating only a fraction of their total parameters per token to deliver strong performance at reduced compute cost. This guide walks through fine-tuning four example MoE LLMs with NVIDIA NeMo Automodel. For a full list of supported architectures, see the [LLM model coverage](../../model-coverage/llm.md) page.
+Mixture-of-Experts (MoE) architectures have become the dominant design for frontier language models, activating only a fraction of their total parameters per token to deliver strong performance at reduced compute cost. This guide walks through fine-tuning four example MoE LLMs with NVIDIA NeMo Automodel. For a full list of supported architectures, see the [LLM model coverage](../../model-coverage/llm/index.md) page.
 
 | Model | HF Checkpoint | Validated Using |
 |-------|--------------|-----------------|

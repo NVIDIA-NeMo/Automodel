@@ -241,10 +241,11 @@ performance-summary.md
 :hidden:
 :caption: Model Coverage
 model-coverage/overview.md
-model-coverage/llm.md
-model-coverage/vlm.md
-model-coverage/diffusion.md
-model-coverage/troubleshooting.md
+model-coverage/latest-models.md
+model-coverage/llm/index.md
+model-coverage/vlm/index.md
+model-coverage/omni/index.md
+model-coverage/diffusion/index.md
 ::::
 
 ::::{toctree}
