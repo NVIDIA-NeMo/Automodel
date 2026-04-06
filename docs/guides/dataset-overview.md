@@ -76,6 +76,7 @@ See the detailed guide, [Column-Mapped Text Instruction Dataset](llm/column-mapp
     - `truncation`: truncation strategy ("do_not_truncate", "longest_first", etc.)
     - `start_of_turn_token`: token marking assistant response start (for answer-only loss)
     - `chat_template`: optional override for tokenizer's chat template
+    - `skip_invalid_samples`: if ``true``, skip malformed JSONL lines when reading local files and drop samples that fail OpenAI message validation after load (warnings log skip counts); default ``false`` fails fast on bad rows
   - Notes:
     - Requires a tokenizer with chat template support
     - Supports both single-turn and multi-turn tool calling
@@ -97,6 +98,7 @@ See the detailed guide, [Column-Mapped Text Instruction Dataset](llm/column-mapp
   - `start_of_turn_token`: token marking assistant response start (for answer-only loss)
   - `chat_template`: optional override for tokenizer's chat template
   - `mask_reasoning_content`: optionally exclude rendered `reasoning_content` tokens from loss
+  - `skip_invalid_samples`: if ``true``, skip malformed JSONL lines when reading local files and drop samples that fail OpenAI message validation after load (warnings log skip counts); default ``false`` fails fast on bad rows
 :::{note}
 - Requires a tokenizer with chat template support
 - Supports both single-turn and multi-turn tool calling
@@ -107,6 +109,7 @@ See the detailed guide, [Column-Mapped Text Instruction Dataset](llm/column-mapp
 - If your dataset contains `reasoning_content`, your chat template must render it explicitly or it will be dropped
 - For multi-turn tool-calling datasets, prefer chat templates that use `{% generation %}` blocks so assistant-turn loss masking is exact
 - Set `mask_reasoning_content: true` if you want to train on the final assistant answer while excluding rendered reasoning traces from loss
+- Set `skip_invalid_samples: true` for noisy local JSONL or mixed-quality Hub rows so bad lines are skipped instead of failing the run
 :::
 - Example YAML:
 ```yaml
@@ -120,6 +123,7 @@ dataset:
   seq_length: 2048
   start_of_turn_token: "<start_of_turn>"
   mask_reasoning_content: false
+  skip_invalid_samples: false
 ```
   - Expected data format (OpenAI messages format):
 ```json
