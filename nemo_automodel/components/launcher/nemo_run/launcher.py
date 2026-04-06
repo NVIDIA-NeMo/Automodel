@@ -121,7 +121,7 @@ class NemoRunLauncher(Launcher):
         # implemented by every backend).
         try:
             devices = executor.nproc_per_node()
-        except (NotImplementedError, Exception):
+        except NotImplementedError:
             devices = 1
 
         # Enable native Torchrun launcher (must be set *before* experiment.run

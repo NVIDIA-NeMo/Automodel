@@ -110,7 +110,7 @@ nemo_run:
   executor: my_slurm             # Name from EXECUTOR_MAP in $NEMORUN_HOME/executors.py
   container_image: /images/custom.sqsh  # Override executor's default image
   nodes: 1                       # Override number of nodes
-  devices: 8                     # GPUs per node
+  ntasks_per_node: 8             # GPUs per node
   time: "04:00:00"               # Override time limit
   job_name: qwen3_moe_finetune   # Experiment and job name
 
@@ -137,17 +137,12 @@ The CLI detects the `nemo_run:` key, strips it from the training config, loads t
 | Field | Default | Description |
 |---|---|---|
 | `executor` | `"local"` | Name from `EXECUTOR_MAP` in `$NEMORUN_HOME/executors.py`, or `"local"` for local execution |
-| `nodes` | *(from executor)* | Override number of nodes |
-| `devices` | *(from executor)* | Override GPUs per node (`ntasks_per_node` / `gpus_per_node`) |
-| `container_image` | *(from executor)* | Override container image path (`.sqsh` file or registry URI) |
-| `time` | *(from executor)* | Override time limit (e.g. `"04:00:00"`) |
-| `mounts` | `[]` | Additional container mounts (appended to executor's existing mounts) |
-| `env_vars` | `{}` | Additional environment variables (merged with executor's existing variables) |
 | `job_name` | `<recipe_class_name>` | Experiment and job name |
 | `detach` | `true` | Return immediately after submission |
 | `tail_logs` | `false` | Stream logs after submission |
 | `executors_file` | `$NEMORUN_HOME/executors.py` | Path to the executor definitions file |
 | `job_dir` | `./nemo_run_jobs` | Local directory for job artifacts (config snapshot) |
+| *(any other key)* | *(from executor)* | Applied directly to the executor via `setattr`. Use the executor's native attribute names (e.g. `nodes`, `ntasks_per_node`, `partition`, `container_image`, `time`, `env_vars`). Dicts are merged, lists are extended. |
 
 ## Examples
 
@@ -157,7 +152,7 @@ The CLI detects the `nemo_run:` key, strips it from the training config, loads t
 nemo_run:
   executor: my_slurm
   nodes: 1
-  devices: 8
+  ntasks_per_node: 8
   job_name: single_node_finetune
 ```
 
@@ -167,7 +162,7 @@ nemo_run:
 nemo_run:
   executor: my_slurm
   nodes: 2
-  devices: 8
+  ntasks_per_node: 8
   time: "08:00:00"
   job_name: multinode_pretrain
 ```
@@ -195,7 +190,7 @@ Use `executor: local` to run on the current machine. No `$NEMORUN_HOME/executors
 ```yaml
 nemo_run:
   executor: local
-  devices: 2
+  ntasks_per_node: 2
   job_name: local_test
 ```
 
