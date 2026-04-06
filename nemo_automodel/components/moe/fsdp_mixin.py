@@ -44,13 +44,15 @@ def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
     if hasattr(module, "visual") and isinstance(module.visual, FSDPModule):
         yield module.visual
 
-    # Check experts in each layer
+    # Check experts in each layer (Qwen-style: block.mlp.experts; Gemma4-style: block.moe.experts)
     if hasattr(_model, "layers"):
         for _, block in _model.layers.named_children():
-            if hasattr(block, "mlp") and hasattr(block.mlp, "experts"):
-                experts = block.mlp.experts
-                if isinstance(experts, FSDPModule):
-                    yield experts
+            for attr in ("mlp", "moe"):
+                mod = getattr(block, attr, None)
+                if mod is not None and hasattr(mod, "experts"):
+                    experts = mod.experts
+                    if isinstance(experts, FSDPModule):
+                        yield experts
 
 
 def _configure_fsdp_module(
