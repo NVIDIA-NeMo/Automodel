@@ -122,4 +122,4 @@ lr_scheduler:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
-  recipe_owner: zeel2104
+  recipe_owner: adil-a
