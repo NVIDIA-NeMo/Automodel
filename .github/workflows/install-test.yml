@@ -117,7 +117,7 @@ jobs:
 
           export PATH="./bin/:$PATH"
 
-          uv sync --link-mode copy --locked --all-groups
+          uv sync --link-mode copy --locked --all-groups --extra all
 
           uv pip install --no-deps -e .
 
@@ -148,7 +148,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12"]
-        extra-groups: ["", "vlm", "fa"]
+        extra-groups: ["", "cuda", "vlm", "fa", "all"]
     env:
       EXTRA: ${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
     steps:
@@ -168,7 +168,7 @@ jobs:
 
           PIP_ARGS=()
 
-          if [[ $EXTRA == *"fa"* ]]; then
+          if [[ $EXTRA == *"fa"* || $EXTRA == *"cuda"* || $EXTRA == *"all"* ]]; then
             pip install --index-url https://download.pytorch.org/whl/cu128 "torch<=2.8.0"
             pip install numpy packaging psutil pybind11 setuptools wheel wheel_stub
             PIP_ARGS=(--no-build-isolation)
