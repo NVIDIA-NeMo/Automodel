@@ -293,6 +293,25 @@ class ChatDataset(Dataset):
         unshifted: bool = False,
         skip_invalid_samples: bool = False,
     ) -> None:
+        """Load OpenAI-format chat rows and tokenize via the chat template.
+
+        Args:
+            path_or_dataset_id: Hugging Face dataset id, local JSON/JSONL path(s), Parquet file, or Parquet directory.
+            tokenizer: Tokenizer with chat template support (required).
+            split: Dataset split or slice (e.g. ``train``, ``train[1024:]``).
+            name: Optional Hub subset / config name.
+            seq_length: Maximum sequence length for padding and truncation in formatting.
+            padding: Padding mode for ``format_chat_template``.
+            truncation: Truncation mode for ``format_chat_template``.
+            start_of_turn_token: Optional token marking assistant turns for answer-only loss.
+            chat_template: Optional Jinja template string overriding ``tokenizer.chat_template``.
+            shuffle_seed: If set, shuffles Hub/Parquet data before applying a split slice.
+            mask_reasoning_content: If ``True``, exclude rendered reasoning traces from the loss mask.
+            unshifted: Passed through to ``format_chat_template``.
+            skip_invalid_samples: If ``True``, skip non-JSON JSONL lines when reading local files and drop rows
+                that fail message validation after load (warning logs include skip counts). If ``False``, invalid
+                data raises during load or first use.
+        """
         if tokenizer is None:
             raise ValueError("Tokenizer is required")
 
