@@ -121,4 +121,4 @@ freeze_config:
 #   name: kimi2vl_finetune
 
 ci:
-  recipe_owner: HuiyingLi
+  recipe_owner: akoumpa

@@ -106,4 +106,4 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
-  recipe_owner: HuiyingLi
+  recipe_owner: hemildesai

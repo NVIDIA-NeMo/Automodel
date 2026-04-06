@@ -102,4 +102,4 @@ freeze_config:
 #   save_dir:
 
 ci:
-  recipe_owner: HuiyingLi
+  recipe_owner: akoumpa

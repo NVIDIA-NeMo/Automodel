@@ -100,4 +100,4 @@ freeze_config:
 #   name: <your-run-name>
 
 ci:
-  recipe_owner: HuiyingLi
+  recipe_owner: hemildesai
