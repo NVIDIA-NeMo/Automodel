@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,18 +13,18 @@
 # limitations under the License.
 
 
+# To run this recipe, please use the following command:
+# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_8b_v1_squad_peft.yaml
+# Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
-# To run this recipe:
-#   automodel examples/llm_finetune/baichuan/baichuan_2_7b_squad_peft.yaml --nproc-per-node 8
-# Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 256
+  global_batch_size: 64
   local_batch_size: 8
-  ckpt_every_steps: 50
-  val_every_steps: 50  # will run every x number of gradient steps
+  ckpt_every_steps: 1000
+  val_every_steps: 1000  # will run every x number of gradient steps
   max_steps: 100
 
 dist_env:
@@ -38,30 +38,10 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: baichuan-inc/Baichuan2-7B-Chat
-  torch_dtype: bf16
+  pretrained_model_name_or_path: nvidia/Llama-3.1-Nemotron-Nano-8B-v1
   trust_remote_code: true
+  force_hf: true
 
-tokenizer:
-  _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
-  pretrained_model_name_or_path: baichuan-inc/Baichuan2-7B-Chat
-  trust_remote_code: true
-
-checkpoint:
-  enabled: false
-  checkpoint_dir: checkpoints/
-  model_save_format: safetensors # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
-
-peft:
-  _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
-  dim: 8
-  alpha: 32
-  use_triton: True
-  # dtype needs a fix to resolve to type instead of string
-  # lora_dtype: torch.bfloat16
-  
 # torch.compile configuration
 compile:
   enabled: false
@@ -69,6 +49,13 @@ compile:
   fullgraph: false
   dynamic: true  # Set to false for better performance with fixed shapes
   backend: null  # Use default backend (inductor)
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: True
+  dim: 8
+  alpha: 32
+  use_triton: True
 
 distributed:
   strategy: fsdp2
@@ -87,13 +74,12 @@ dataset:
   split: train
 
 packed_sequence:
-  # Set packed_sequence_size > 0 to run with packed sequences
   packed_sequence_size: 0
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: false
+  shuffle: True
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
@@ -117,19 +103,12 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
-  recipe_owner: adil-a
-  time: "00:45:00"
+  time: "00:15:00"
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
-    trust_remote_code: true
     distributed.tp_size: 2
-    tokenizer_name: baichuan-inc/Baichuan2-7B-Chat
+    tokenizer_name: nvidia/Llama-3.1-Nemotron-Nano-8B-v1
+    check_fused_qkv_keys: true
+    no_check_resume: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
-
-# Uncomment and configure for W&B logging
-# wandb:
-#   project: <your_wandb_project>
-#   entity: <your_wandb_entity>
-#   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir>
