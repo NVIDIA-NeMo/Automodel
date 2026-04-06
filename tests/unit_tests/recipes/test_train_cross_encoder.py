@@ -71,10 +71,12 @@ def test_batch_mrr_perfect_ranking():
 def test_batch_mrr_worst_ranking():
     """3-class output, targets at the last rank -> each RR = 1/3."""
     # For each row the target class has the lowest score.
-    output = torch.tensor([
-        [0.1, 0.5, 0.9],  # target=0, score 0.1 is lowest -> rank 3
-        [0.9, 0.5, 0.1],  # target=2, score 0.1 is lowest -> rank 3
-    ])
+    output = torch.tensor(
+        [
+            [0.1, 0.5, 0.9],  # target=0, score 0.1 is lowest -> rank 3
+            [0.9, 0.5, 0.1],  # target=2, score 0.1 is lowest -> rank 3
+        ]
+    )
     target = torch.tensor([0, 2])
     mrr_sum = batch_mrr(output, target)
     torch.testing.assert_close(mrr_sum, torch.tensor(2.0 / 3.0))
@@ -82,10 +84,12 @@ def test_batch_mrr_worst_ranking():
 
 def test_batch_mrr_mixed():
     """Mixed ranks: rank 1 (RR=1) and rank 2 (RR=0.5) -> sum = 1.5."""
-    output = torch.tensor([
-        [0.1, 0.9],  # target=1, score 0.9 is highest -> rank 1
-        [0.9, 0.8],  # target=1, score 0.8 is second  -> rank 2
-    ])
+    output = torch.tensor(
+        [
+            [0.1, 0.9],  # target=1, score 0.9 is highest -> rank 1
+            [0.9, 0.8],  # target=1, score 0.8 is second  -> rank 2
+        ]
+    )
     target = torch.tensor([1, 1])
     mrr_sum = batch_mrr(output, target)
     torch.testing.assert_close(mrr_sum, torch.tensor(1.5))
@@ -99,11 +103,13 @@ def test_batch_mrr_wider_output():
     Row 2: scores [0.3, 0.8, 0.5, 0.2], target=3 -> sorted order [1,2,0,3] -> rank 4, RR=1/4
     Sum = 1 + 1/3 + 1/4 = 19/12
     """
-    output = torch.tensor([
-        [0.1, 0.4, 0.9, 0.6],
-        [0.9, 0.1, 0.5, 0.7],
-        [0.3, 0.8, 0.5, 0.2],
-    ])
+    output = torch.tensor(
+        [
+            [0.1, 0.4, 0.9, 0.6],
+            [0.9, 0.1, 0.5, 0.7],
+            [0.3, 0.8, 0.5, 0.2],
+        ]
+    )
     target = torch.tensor([2, 2, 3])
     mrr_sum = batch_mrr(output, target)
     torch.testing.assert_close(mrr_sum, torch.tensor(19.0 / 12.0))

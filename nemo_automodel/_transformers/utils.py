@@ -15,6 +15,7 @@
 import logging
 from typing import Any, Optional
 
+import torch
 from transformers import AutoConfig
 
 logger = logging.getLogger(__name__)
@@ -46,8 +47,8 @@ def _should_load_before_shard(
     need_checkpoint_load = bool(pretrained_model_name_or_path and load_base_model)
     result = no_pp and no_tp and no_ep and no_peft and need_checkpoint_load
     logger.debug(
-        "[_should_load_before_shard] no_pp={} no_tp={} no_ep={} need_load={} peft={} -> {}".format(
-            no_pp, no_tp, no_ep, need_checkpoint_load, peft_config is not None, result
+        "[_should_load_before_shard] no_pp={} no_tp={} no_ep={} no_peft={} need_load={} -> {}".format(
+            no_pp, no_tp, no_ep, no_peft, need_checkpoint_load, result
         )
     )
     return result
@@ -195,12 +196,29 @@ def apply_cache_compatibility_patches():
     if not getattr(mu.PreTrainedModel.post_init, "_nemo_tied_keys_patched", False):
         _orig_post_init = mu.PreTrainedModel.post_init
 
+        def _find_embedding_source(model):
+            """Resolve the weight name of the input embedding layer.
+
+            Prefer get_input_embeddings() (explicit HF contract), fall back
+            to scanning for the first nn.Embedding in the module tree.
+            """
+            embed = model.get_input_embeddings()
+            if embed is not None:
+                for name, module in model.named_modules():
+                    if module is embed:
+                        return f"{name}.weight"
+            # Fallback: first nn.Embedding (custom models that don't
+            # override get_input_embeddings).
+            for name, module in model.named_modules():
+                if isinstance(module, torch.nn.Embedding):
+                    return f"{name}.weight"
+            return "model.embed_tokens.weight"
+
         def _patched_post_init(self):
             tied = getattr(self, "_tied_weights_keys", None)
             if isinstance(tied, list):
-                model_type = getattr(getattr(self, "config", None), "model_type", None)
-                if model_type == "phi4mm":
-                    self._tied_weights_keys = {k: "model.embed_tokens.weight" for k in tied}
+                source = _find_embedding_source(self)
+                self._tied_weights_keys = {k: source for k in tied}
             return _orig_post_init(self)
 
         mu.PreTrainedModel.post_init = _patched_post_init

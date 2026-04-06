@@ -19,7 +19,6 @@ from nemo_automodel.components.models.common.bidirectional import EncoderStateDi
 
 
 class TestEncoderStateDictAdapter:
-
     @pytest.fixture
     def adapter(self):
         return EncoderStateDictAdapter()

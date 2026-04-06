@@ -14,6 +14,16 @@
 
 from __future__ import annotations
 
+import warnings
+
+warnings.warn(
+    "Running recipes via examples/ scripts is deprecated. "
+    "Use: automodel <config.yaml> [--nproc-per-node N]\n"
+    "See BREAKING_CHANGES.md for details.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.retrieval import TrainBiEncoderRecipe
 
@@ -21,10 +31,8 @@ from nemo_automodel.recipes.retrieval import TrainBiEncoderRecipe
 def main(default_config_path="examples/retrieval/bi_encoder/llama3_2_1b.yaml"):
     """Main entry point for the bi-encoder fine-tuning recipe.
 
-    Loads the configuration, sets up the recipe, and initiates the training loop.
-
-    Args:
-        default_config_path: Path to the default configuration file
+    .. deprecated::
+        Use ``automodel <config.yaml>`` instead.
     """
     cfg = parse_args_and_load_config(default_config_path)
     recipe = TrainBiEncoderRecipe(cfg)

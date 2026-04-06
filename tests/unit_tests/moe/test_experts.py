@@ -22,6 +22,8 @@ HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_CUDA = torch.cuda.is_available()
 SKIP_TE_TESTS = not (HAVE_TE and HAVE_CUDA)
 
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
@@ -31,8 +33,6 @@ from nemo_automodel.components.moe.experts import (
     get_expert_activation_for_deepep,
     is_gated_activation,
 )
-from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.models.common import BackendConfig
 
 
 @pytest.fixture
@@ -679,6 +679,38 @@ class TestGroupedExpertsDeepEP:
         )
 
         assert result.shape == value.shape
+
+    def test_grouped_experts_deepep_init_with_hybridep_backend(self, moe_config):
+        """Test GroupedExpertsDeepEP initialization with hybridep backend."""
+        experts = GroupedExpertsDeepEP(moe_config, dispatcher_backend="hybridep", dispatcher_num_sms=24)
+
+        assert experts.dispatcher_backend == "hybridep"
+        assert experts.dispatcher_num_sms == 24
+        assert experts.config == moe_config
+
+    def test_grouped_experts_deepep_token_dispatcher_init_hybridep(self, moe_config):
+        """Test init_token_dispatcher passes hybridep config to TokenDispatcherConfig."""
+        experts = GroupedExpertsDeepEP(moe_config, dispatcher_backend="hybridep", dispatcher_num_sms=24)
+
+        mock_mesh = Mock()
+        mock_mesh.size.return_value = 2
+        mock_mesh.get_local_rank.return_value = 0
+        mock_mesh.get_group.return_value = Mock()
+
+        with patch("nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher") as mock_dispatcher:
+            mock_dispatcher.return_value = Mock()
+
+            experts.init_token_dispatcher(mock_mesh)
+
+            # Verify the TokenDispatcherConfig was created with hybridep settings
+            call_kwargs = mock_dispatcher.call_args
+            config_arg = call_kwargs.kwargs.get("config") or call_kwargs[1].get("config")
+            if config_arg is None:
+                config_arg = call_kwargs[0][2]  # positional arg
+            assert config_arg.moe_flex_dispatcher_backend == "hybridep"
+            assert config_arg.moe_hybridep_num_sms == 24
+            assert config_arg.moe_deepep_num_sms == 24
+
 
 class TestNonGatedActivations:
     """Test non-gated activation support (ReLU²) for memory-efficient MoE.

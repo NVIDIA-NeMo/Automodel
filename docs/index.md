@@ -72,6 +72,7 @@ Find the right guide for your task.
 | **PEFT (LoRA)**             | You want to fine-tune on limited GPU memory; updates <1 % of parameters             | Instruction / chat dataset                        | LLM       | [Start LoRA](guides/llm/finetune.md)        |
 | **Tool / function calling** | Your model needs to call APIs or tools with structured arguments                    | Function-calling dataset (queries + tool schemas) | LLM       | [Add tool calling](guides/llm/toolcalling.md)             |
 | **Fine-tune VLM**           | Your task involves both images and text (e.g., visual QA, captioning)               | Image + text dataset                              | VLM       | [Fine-tune VLM](guides/omni/gemma3-3n.md)                 |
+| **Fine-tune Gemma 4**       | You want to fine-tune Gemma 4 for structured extraction from images (e.g., receipts) | Image + text dataset                              | VLM       | [Fine-tune Gemma 4](guides/vlm/gemma4.md)                 |
 | **Fine-tune Diffusion**     | You want to fine-tune a diffusion model for image or video generation               | Video / Image dataset                             | Diffusion | [Fine-tune Diffusion](guides/diffusion/finetune.md)       |
 | **Fine-tune VLM-MoE**       | You need large-scale vision-language training with sparse MoE efficiency            | Image + text dataset                              | VLM (MoE) | [Fine-tune VLM-MoE](guides/vlm/qwen3_5.md)                |
 | **Embedding fine-tune**     | You want to improve text similarity for search, retrieval, or RAG         | Text pairs / retrieval corpus                     | LLM       | {bdg-info}`Coming Soon`                                   |
@@ -106,7 +107,7 @@ Install NeMo AutoModel and launch your first training job.
 :::{grid-item-card} {octicon}`download;1.5em;sd-mr-1` Installation
 :link: guides/installation
 :link-type: doc
-Install via PyPI, Docker, or from source.
+Install via PyPI, Docker, or from source. Use `nemo-automodel[cli]` for lightweight login-node installs.
 :::
 
 :::{grid-item-card} {octicon}`gear;1.5em;sd-mr-1` Configuration
@@ -122,7 +123,7 @@ Run on a single GPU or multi-GPU with torchrun.
 :::
 
 :::{grid-item-card} {octicon}`server;1.5em;sd-mr-1` Cluster (SLURM)
-:link: launcher/cluster
+:link: launcher/slurm
 :link-type: doc
 Multi-node training with SLURM and the `automodel` CLI.
 :::
@@ -221,8 +222,6 @@ about/key-features.md
 guides/installation.md
 guides/configuration.md
 guides/huggingface-api-compatibility.md
-launcher/local-workstation.md
-launcher/cluster.md
 repository-structure.md
 ::::
 
@@ -242,10 +241,11 @@ performance-summary.md
 :hidden:
 :caption: Model Coverage
 model-coverage/overview.md
-model-coverage/llm.md
-model-coverage/vlm.md
-model-coverage/diffusion.md
-model-coverage/troubleshooting.md
+model-coverage/latest-models.md
+model-coverage/llm/index.md
+model-coverage/vlm/index.md
+model-coverage/omni/index.md
+model-coverage/diffusion/index.md
 ::::
 
 ::::{toctree}
@@ -260,6 +260,7 @@ guides/llm/pretraining.md
 guides/llm/nanogpt-pretraining.md
 guides/llm/sequence-classification.md
 guides/omni/gemma3-3n.md
+guides/vlm/gemma4.md
 guides/vlm/qwen3_5.md
 guides/diffusion/finetune.md
 guides/quantization-aware-training.md
@@ -283,6 +284,9 @@ guides/diffusion/dataset.md
 :hidden:
 :caption: Job Launchers
 
+launcher/overview.md
+launcher/local-workstation.md
+launcher/slurm.md
 launcher/skypilot.md
 ::::
 

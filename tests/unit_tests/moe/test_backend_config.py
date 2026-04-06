@@ -205,6 +205,37 @@ class TestBackendConfigEnableDeepepDeprecation:
             assert "will be removed in a future release" in warning_message
 
 
+class TestBackendConfigHybridEP:
+    """Test BackendConfig HybridEP dispatcher support."""
+
+    def test_hybridep_dispatcher_valid(self):
+        """Test that BackendConfig accepts hybridep dispatcher."""
+        config = BackendConfig(dispatcher="hybridep")
+        assert config.dispatcher == "hybridep"
+
+    def test_hybridep_dispatcher_num_sms_default(self):
+        """Test that dispatcher_num_sms defaults to 20."""
+        config = BackendConfig(dispatcher="hybridep")
+        assert config.dispatcher_num_sms == 20
+
+    def test_hybridep_dispatcher_num_sms_custom(self):
+        """Test that dispatcher_num_sms accepts a custom value."""
+        config = BackendConfig(dispatcher="hybridep", dispatcher_num_sms=24)
+        assert config.dispatcher_num_sms == 24
+
+    def test_te_experts_falls_back_with_hybridep(self):
+        """Test that te experts with hybridep dispatcher is valid (no fallback)."""
+        config = BackendConfig(experts="te", dispatcher="hybridep")
+        assert config.experts == "te"
+        assert config.dispatcher == "hybridep"
+
+    def test_gmm_experts_falls_back_with_hybridep(self):
+        """Test that gmm experts with hybridep dispatcher is valid (no fallback)."""
+        config = BackendConfig(experts="gmm", dispatcher="hybridep")
+        assert config.experts == "gmm"
+        assert config.dispatcher == "hybridep"
+
+
 class TestMoEConfig:
     """Test MoEConfig dataclass."""
 

@@ -33,6 +33,7 @@ except ImportError:
 
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.megatron.moe_utils import (
+    weighted_bias_geglu_impl,
     weighted_bias_swiglu_impl,
 )
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher, TokenDispatcherConfig
@@ -92,7 +93,7 @@ def is_gated_activation(activation: str) -> bool:
     Non-gated activations (ReLU²) only use up_proj, requiring up_projs tensor
     with shape [n_experts, dim, inter_dim] - 50% memory savings.
     """
-    return activation in ("swiglu", "quick_geglu")
+    return activation in ("swiglu", "quick_geglu", "geglu")
 
 
 def _permute_tokens_for_grouped_mm(
@@ -550,6 +551,8 @@ def get_expert_activation_for_deepep(config: MoEConfig):
             alpha=config.activation_alpha,
             linear_offset=1.0,
         )
+    elif config.expert_activation == "geglu":
+        return weighted_bias_geglu_impl
     elif config.expert_activation == "relu2":
         return relu2_deepep
     else:
@@ -573,7 +576,13 @@ class GroupedExpertsDeepEP(nn.Module):
         down_projs (nn.Parameter): Linear layer for hidden-to-output transformation.
     """
 
-    def __init__(self, config: MoEConfig, backend: Optional["BackendConfig"] = None):
+    def __init__(
+        self,
+        config: MoEConfig,
+        backend: Optional["BackendConfig"] = None,
+        dispatcher_backend: str = "deepep",
+        dispatcher_num_sms: int = 20,
+    ):
         """
         Initializes the GroupedExperts module.
 
@@ -581,6 +590,8 @@ class GroupedExpertsDeepEP(nn.Module):
             config: MoE configuration containing expert parameters.
             backend: Backend configuration. When backend.experts == "torch_mm",
                 uses torch._grouped_mm; otherwise uses grouped_gemm.ops.gmm.
+            dispatcher_backend: Backend for the flex token dispatcher ("deepep" or "hybridep").
+            dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
         """
         super().__init__()
 
@@ -588,6 +599,8 @@ class GroupedExpertsDeepEP(nn.Module):
         self.use_torch_mm = backend is not None and backend.experts == "torch_mm"
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
+        self.dispatcher_backend = dispatcher_backend
+        self.dispatcher_num_sms = dispatcher_num_sms
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -615,6 +628,9 @@ class GroupedExpertsDeepEP(nn.Module):
             num_moe_experts=self.config.n_routed_experts,
             moe_permute_fusion=True,
             moe_enable_deepep=True,
+            moe_flex_dispatcher_backend=self.dispatcher_backend,
+            moe_deepep_num_sms=self.dispatcher_num_sms,
+            moe_hybridep_num_sms=self.dispatcher_num_sms,
         )
 
         self.n_routed_experts = self.config.n_routed_experts
@@ -700,6 +716,7 @@ class GroupedExpertsDeepEP(nn.Module):
                         self.expert_activation,
                     )
             else:
+                tokens_per_expert = tokens_per_expert.to("cpu")
                 output1 = ops.gmm(
                     permuted_local_hidden_states,
                     gate_and_up_projs,
@@ -759,6 +776,8 @@ class GroupedExpertsTE(nn.Module):
         self,
         config: MoEConfig,
         backend: Optional["BackendConfig"] = None,
+        dispatcher_backend: str = "deepep",
+        dispatcher_num_sms: int = 20,
     ):
         """
         Initialize the GroupedExpertsTEGroupedLinear module.
@@ -766,6 +785,8 @@ class GroupedExpertsTE(nn.Module):
         Args:
             config: MoE configuration containing expert parameters.
             backend: Backend configuration (reserved for future use).
+            dispatcher_backend: Backend for the flex token dispatcher ("deepep" or "hybridep").
+            dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
         """
         from transformer_engine.pytorch import GroupedLinear
 
@@ -781,6 +802,8 @@ class GroupedExpertsTE(nn.Module):
         self.dim = config.dim
         self.moe_inter_dim = config.moe_inter_dim
         self.is_gated = is_gated_activation(config.expert_activation)
+        self.dispatcher_backend = dispatcher_backend
+        self.dispatcher_num_sms = dispatcher_num_sms
 
         # Gated (SwiGLU, Quick-GEGLU): out_features = moe_inter_dim * 2
         # Non-gated (ReLU²): out_features = moe_inter_dim
@@ -1086,6 +1109,9 @@ class GroupedExpertsTE(nn.Module):
             num_moe_experts=self.config.n_routed_experts,
             moe_permute_fusion=True,
             moe_enable_deepep=True,
+            moe_flex_dispatcher_backend=self.dispatcher_backend,
+            moe_deepep_num_sms=self.dispatcher_num_sms,
+            moe_hybridep_num_sms=self.dispatcher_num_sms,
         )
 
         local_expert_indices_offset = self.ep_rank * self.num_local_experts
