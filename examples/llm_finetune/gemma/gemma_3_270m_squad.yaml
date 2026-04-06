@@ -91,12 +91,18 @@ optimizer:
   weight_decay: 0
   # min_lr: 1.0e-5
 
+ci:
+  recipe_owner: HuiyingLi
+  time: "00:20:00"
+  checkpoint_robustness:
+    hf_kl_threshold: 6e-3
+    tokenizer_name: google/gemma-3-270m
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500
+
 # Uncomment and configure for W&B logging
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
-
-ci:
-  recipe_owner: HuiyingLi
