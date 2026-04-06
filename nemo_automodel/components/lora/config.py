@@ -31,6 +31,7 @@ class LoRAConfig:
                         None = use per-model defaults from
                         MODEL_DEFAULT_TARGET_MODULES.
     """
+
     enabled: bool = False
     rank: int = 64
     alpha: float = 64.0
@@ -103,7 +104,7 @@ HUNYUAN_DEFAULT_TARGET_MODULES = [
 
 # Registry used by inject_lora() in setup.py
 MODEL_DEFAULT_TARGET_MODULES: dict[str, list[str]] = {
-    "flux":    FLUX_DEFAULT_TARGET_MODULES,
-    "wan":     WAN_DEFAULT_TARGET_MODULES,
+    "flux": FLUX_DEFAULT_TARGET_MODULES,
+    "wan": WAN_DEFAULT_TARGET_MODULES,
     "hunyuan": HUNYUAN_DEFAULT_TARGET_MODULES,
 }

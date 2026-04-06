@@ -431,10 +431,7 @@ class NeMoAutoDiffusionPipeline:
             # Pre-FSDP2 lora_params refs are stored on pipe and remain valid
             # after wrapping (FSDP2 preserves original Parameter objects).
             if model_type is None:
-                raise ValueError(
-                    "model_type must be set when lora_cfg.enabled=True. "
-                    "Options: 'flux', 'wan', 'hunyuan'"
-                )
+                raise ValueError("model_type must be set when lora_cfg.enabled=True. Options: 'flux', 'wan', 'hunyuan'")
             from nemo_automodel.components.lora.setup import inject_lora
 
             pipe._lora_params = {}
@@ -442,9 +439,7 @@ class NeMoAutoDiffusionPipeline:
 
             for name, module in _iter_pipeline_modules(pipe):
                 if name == "transformer":
-                    lora_params, peft_config = inject_lora(
-                        module, lora_cfg, model_type
-                    )
+                    lora_params, peft_config = inject_lora(module, lora_cfg, model_type)
                     pipe._lora_params[name] = lora_params
                     pipe._lora_peft_config = peft_config
                     logger.info(

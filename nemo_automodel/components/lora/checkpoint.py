@@ -98,7 +98,7 @@ def gather_lora_state_dict(
         for k, v in full_sd.items():
             if "lora_A" not in k and "lora_B" not in k:
                 continue
-            new_key = re.sub(r'(\.lora_[AB])\.[^.]+\.', r'\1.', k)
+            new_key = re.sub(r"(\.lora_[AB])\.[^.]+\.", r"\1.", k)
             lora_sd[new_key] = v
 
         # Diagnose: check gathered norms
@@ -152,10 +152,7 @@ def save_lora_weights(
     # 1. Save weight tensors via safetensors
     weights_path = os.path.join(output_dir, "adapter_model.safetensors")
     save_file(
-        {
-            k: v.detach().cpu().contiguous()
-            for k, v in lora_sd.items()
-        },
+        {k: v.detach().cpu().contiguous() for k, v in lora_sd.items()},
         weights_path,
     )
     logger.info(f"[LoRA] Saved weights  → {weights_path}")
@@ -164,9 +161,7 @@ def save_lora_weights(
     # LoraConfig inherits PeftConfigMixin.save_pretrained()
     # Writes: rank, alpha, target_modules, dropout, init_lora_weights, peft_type
     peft_config.save_pretrained(output_dir)
-    logger.info(
-        f"[LoRA] Saved config   → {os.path.join(output_dir, 'adapter_config.json')}"
-    )
+    logger.info(f"[LoRA] Saved config   → {os.path.join(output_dir, 'adapter_config.json')}")
 
 
 def load_lora_weights_for_inference(
@@ -205,6 +200,7 @@ def load_lora_weights_for_inference(
         from peft import LoraConfig
         from peft.tuners.lora import LoraModel as PeftLoraModel
         from safetensors.torch import load_file
+
         peft_config = LoraConfig.from_pretrained(lora_path)
         PeftLoraModel(transformer, {"default": peft_config}, "default")  # injects lora.Linear in-place
 
@@ -213,16 +209,14 @@ def load_lora_weights_for_inference(
 
         # Strip "base_model.model." prefix added by get_peft_model_state_dict
         prefix = "base_model.model."
-        state_dict = {
-            k[len(prefix):] if k.startswith(prefix) else k: v
-            for k, v in state_dict.items()
-        }
+        state_dict = {k[len(prefix) :] if k.startswith(prefix) else k: v for k, v in state_dict.items()}
 
         # Re-insert adapter name stripped by get_peft_model_state_dict on save:
         # "lora_A.weight" → "lora_A.default.weight"
         state_dict = {
-            k.replace("lora_A.weight", f"lora_A.{adapter_name}.weight")
-             .replace("lora_B.weight", f"lora_B.{adapter_name}.weight"): v
+            k.replace("lora_A.weight", f"lora_A.{adapter_name}.weight").replace(
+                "lora_B.weight", f"lora_B.{adapter_name}.weight"
+            ): v
             for k, v in state_dict.items()
         }
 

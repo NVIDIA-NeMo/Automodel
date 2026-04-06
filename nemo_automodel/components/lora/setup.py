@@ -41,9 +41,11 @@ _PRE_INJECT_HOOKS: dict[str, Callable[[nn.Module], None]] = {}
 
 def register_pre_inject_hook(model_type: str):
     """Decorator to register a model-specific pre-injection setup function."""
+
     def decorator(fn: Callable[[nn.Module], None]):
         _PRE_INJECT_HOOKS[model_type] = fn
         return fn
+
     return decorator
 
 
@@ -74,8 +76,8 @@ def _wan_pre_inject(transformer: nn.Module) -> None:
 
 def inject_lora(
     transformer: nn.Module,
-    lora_cfg,        # LoRAConfig instance
-    model_type: str, # "flux" | "wan" | "hunyuan"
+    lora_cfg,  # LoRAConfig instance
+    model_type: str,  # "flux" | "wan" | "hunyuan"
 ) -> tuple[list[nn.Parameter], LoraConfig]:
     """
     Inject LoRA adapters into a transformer using PEFT.
@@ -117,10 +119,7 @@ def inject_lora(
         hook(transformer)
 
     # ── Resolve target modules ────────────────────────────────────────────────
-    target_modules = (
-        lora_cfg.target_modules
-        or MODEL_DEFAULT_TARGET_MODULES.get(model_type)
-    )
+    target_modules = lora_cfg.target_modules or MODEL_DEFAULT_TARGET_MODULES.get(model_type)
     if not target_modules:
         raise ValueError(
             f"No target_modules defined for model_type='{model_type}'. "
@@ -155,6 +154,7 @@ def inject_lora(
     # If set_adapter() failed (e.g. isinstance check on wrong BaseTunerLayer),
     # active_adapters = [] and lora_B never receives gradient → stays at zero.
     from peft.tuners.tuners_utils import BaseTunerLayer
+
     _lora_layers = [(n, m) for n, m in transformer.named_modules() if isinstance(m, BaseTunerLayer)]
     if _lora_layers:
         _name, _layer = _lora_layers[0]
@@ -182,16 +182,14 @@ def inject_lora(
     # module load time, which crashes when flash_attn is not built for the
     # current PyTorch/CUDA version.
     from diffusers.training_utils import cast_training_params
+
     cast_training_params([transformer], dtype=torch.bfloat16)
 
     # ── Collect lora_params BEFORE FSDP2 ─────────────────────────────────────
     # FSDP2 uses use_orig_params=True by default — it shards the .data of
     # each Parameter to a DTensor but keeps the Python object intact.
     # These refs remain valid and can be passed to AdamW after wrapping.
-    lora_params = [
-        p for n, p in transformer.named_parameters()
-        if "lora_" in n and p.requires_grad
-    ]
+    lora_params = [p for n, p in transformer.named_parameters() if "lora_" in n and p.requires_grad]
 
     # ── Logging ───────────────────────────────────────────────────────────────
     total_params = sum(p.numel() for p in transformer.parameters())
@@ -202,10 +200,7 @@ def inject_lora(
         f"{lora_param_count:,} trainable / {total_params:,} total "
         f"({100.0 * lora_param_count / total_params:.4f}%)"
     )
-    logger.info(
-        f"[LoRA] rank={lora_cfg.rank}, alpha={lora_cfg.alpha}, "
-        f"dropout={lora_cfg.dropout}"
-    )
+    logger.info(f"[LoRA] rank={lora_cfg.rank}, alpha={lora_cfg.alpha}, dropout={lora_cfg.dropout}")
     logger.info(f"[LoRA] target_modules={target_modules}")
     logger.info(f"[LoRA] Injected {len(injected_layer_names)} layers:")
     for layer_name in injected_layer_names:
