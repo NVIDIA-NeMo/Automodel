@@ -175,7 +175,7 @@ For multi-node jobs the launcher automatically adds `--nnodes`, `--node-rank`, `
 nemo_run:
   executor: my_slurm
   container_image: /images/automodel_nightly.sqsh
-  mounts:
+  container_mounts:
     - /scratch/datasets:/datasets
     - /scratch/checkpoints:/checkpoints
   env_vars:
