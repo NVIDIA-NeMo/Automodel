@@ -86,16 +86,13 @@ def resolve_checkpoint(path: str) -> str:
         if os.path.isdir(candidate) and os.path.isfile(os.path.join(candidate, "config.json")):
             return candidate
     raise FileNotFoundError(
-        f"Could not find a valid HF checkpoint at {path}. "
-        "Expected a directory with config.json and model safetensors."
+        f"Could not find a valid HF checkpoint at {path}. Expected a directory with config.json and model safetensors."
     )
 
 
 def load_model_and_tokenizer(checkpoint_path: str):
     """Load LLaDA model and tokenizer from an Automodel consolidated checkpoint."""
-    tokenizer = NeMoAutoTokenizer.from_pretrained(
-        checkpoint_path, trust_remote_code=True
-    )
+    tokenizer = NeMoAutoTokenizer.from_pretrained(checkpoint_path, trust_remote_code=True)
 
     # LLaDA requires mask token for diffusion sampling
     if tokenizer.mask_token is None:
@@ -119,6 +116,7 @@ def load_model_and_tokenizer(checkpoint_path: str):
 # ---------------------------------------------------------------------------
 # MDLM Sampling (self-contained, no dllm dependency)
 # ---------------------------------------------------------------------------
+
 
 def _add_gumbel_noise(logits, temperature):
     if temperature == 0.0:
@@ -147,8 +145,9 @@ def _get_num_transfer_tokens(mask_index, steps):
 
 
 @torch.no_grad()
-def generate(model, tokenizer, inputs, steps=128, max_new_tokens=128,
-             block_size=32, temperature=0.0, remasking="low_confidence"):
+def generate(
+    model, tokenizer, inputs, steps=128, max_new_tokens=128, block_size=32, temperature=0.0, remasking="low_confidence"
+):
     """Generate text via iterative masked-diffusion unmasking (MDLM)."""
     mask_id = tokenizer.mask_token_id
     eos_id = tokenizer.eos_token_id
@@ -179,11 +178,11 @@ def generate(model, tokenizer, inputs, steps=128, max_new_tokens=128,
             start = prompt_lens[j] + b * block_size
             end = min(start + block_size, prompt_lens[j] + max_new_tokens, T)
             if start < end:
-                block_mask[j, : end - start] = (x[j, start:end] == mask_id)
+                block_mask[j, : end - start] = x[j, start:end] == mask_id
 
         transfer_schedule = _get_num_transfer_tokens(block_mask, steps_per_block)
         for i in range(transfer_schedule.size(1)):
-            mask_index = (x == mask_id)
+            mask_index = x == mask_id
             logits = model(x, attention_mask=attention_mask).logits
 
             x0 = torch.argmax(_add_gumbel_noise(logits, temperature), dim=-1)
@@ -214,8 +213,7 @@ def generate(model, tokenizer, inputs, steps=128, max_new_tokens=128,
 
 
 @torch.no_grad()
-def infill(model, tokenizer, inputs, steps=128, block_size=32,
-           temperature=0.0, remasking="low_confidence"):
+def infill(model, tokenizer, inputs, steps=128, block_size=32, temperature=0.0, remasking="low_confidence"):
     """Fill [MASK] tokens in-place via MDLM unmasking."""
     mask_id = tokenizer.mask_token_id
     eos_id = tokenizer.eos_token_id
@@ -250,11 +248,11 @@ def infill(model, tokenizer, inputs, steps=128, block_size=32,
             width = max(0, min(seq_lens[j], stop) - start)
             widths.append(width)
             if width > 0:
-                block_mask[j, :width] = (x[j, start : start + width] == mask_id)
+                block_mask[j, :width] = x[j, start : start + width] == mask_id
 
         transfer_schedule = _get_num_transfer_tokens(block_mask, steps_per_block)
         for s in range(transfer_schedule.size(1)):
-            mask_full = (x == mask_id)
+            mask_full = x == mask_id
             logits = model(x, attention_mask=attention_mask).logits
 
             x0 = torch.argmax(_add_gumbel_noise(logits, temperature), dim=-1)
@@ -268,7 +266,7 @@ def infill(model, tokenizer, inputs, steps=128, block_size=32,
                 raise ValueError(f"Unknown remasking: {remasking}")
 
             for j in range(B):
-                x0_p[j, : start] = -float("inf")
+                x0_p[j, :start] = -float("inf")
                 x0_p[j, start + widths[j] :] = -float("inf")
 
             x0 = torch.where(mask_full, x0, x)
@@ -313,10 +311,12 @@ def main():
         description="Generate text from Automodel LLaDA checkpoints",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--checkpoint", required=True,
-                        help="Path to checkpoint (run dir, step dir, or consolidated dir)")
-    parser.add_argument("--prompt", action="append", required=True,
-                        help="Prompt(s) to generate from (repeat for multiple)")
+    parser.add_argument(
+        "--checkpoint", required=True, help="Path to checkpoint (run dir, step dir, or consolidated dir)"
+    )
+    parser.add_argument(
+        "--prompt", action="append", required=True, help="Prompt(s) to generate from (repeat for multiple)"
+    )
     parser.add_argument("--steps", type=int, default=128, help="Diffusion steps (default: 128)")
     parser.add_argument("--max_new_tokens", type=int, default=128, help="Max tokens to generate (default: 128)")
     parser.add_argument("--block_size", type=int, default=32, help="Block size (default: 32)")
@@ -350,13 +350,22 @@ def main():
             messages_list.append([{"role": "user", "content": content}])
 
         encoded = tokenizer.apply_chat_template(
-            messages_list, add_generation_prompt=False, tokenize=True, return_tensors=None,
+            messages_list,
+            add_generation_prompt=False,
+            tokenize=True,
+            return_tensors=None,
         )
         inputs = encoded["input_ids"]
 
-        outputs = infill(model, tokenizer, inputs, steps=args.steps,
-                         block_size=args.block_size, temperature=args.temperature,
-                         remasking=args.remasking)
+        outputs = infill(
+            model,
+            tokenizer,
+            inputs,
+            steps=args.steps,
+            block_size=args.block_size,
+            temperature=args.temperature,
+            remasking=args.remasking,
+        )
 
         for i, prompt in enumerate(args.prompt):
             print(f"\n{'─' * 80}")
@@ -373,13 +382,23 @@ def main():
         else:
             messages_list = [[{"role": "user", "content": p}] for p in args.prompt]
             encoded = tokenizer.apply_chat_template(
-                messages_list, add_generation_prompt=True, tokenize=True, return_tensors=None,
+                messages_list,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_tensors=None,
             )
             inputs = encoded["input_ids"]
 
-        outputs = generate(model, tokenizer, inputs, steps=args.steps,
-                           max_new_tokens=args.max_new_tokens, block_size=args.block_size,
-                           temperature=args.temperature, remasking=args.remasking)
+        outputs = generate(
+            model,
+            tokenizer,
+            inputs,
+            steps=args.steps,
+            max_new_tokens=args.max_new_tokens,
+            block_size=args.block_size,
+            temperature=args.temperature,
+            remasking=args.remasking,
+        )
 
         sequences = trim_response(tokenizer, outputs.tolist(), inputs)
         for i, (prompt, response) in enumerate(zip(args.prompt, sequences)):
