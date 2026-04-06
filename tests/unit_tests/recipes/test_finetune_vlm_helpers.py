@@ -2208,3 +2208,73 @@ def test_vlm_rope_fusion_stays_false_when_already_disabled(monkeypatch):
     trainer.setup()
 
     assert cfg.model.backend.rope_fusion is False
+
+
+# ---------------------------------------------------------------------------
+# _chunk_vlm_media tests
+# ---------------------------------------------------------------------------
+
+
+class TestChunkVlmMedia:
+    """Tests for _chunk_vlm_media PP microbatch splitting."""
+
+    def test_4d_pixel_values_simple_chunk(self):
+        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
+
+        pixel_values = torch.randn(4, 3, 56, 56)
+        image_grid = torch.tensor([[1, 2, 2]] * 4)
+        pv_chunks, ig_chunks = _chunk_vlm_media(pixel_values, image_grid, batch_size=4, n_microbatches=2)
+        assert len(pv_chunks) == 2
+        assert pv_chunks[0].shape[0] == 2
+        assert pv_chunks[1].shape[0] == 2
+
+    def test_n_images_per_sample_packed(self):
+        """Packed sequences: each batch item has variable number of images."""
+        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
+
+        # 2 batch items: first has 3 images, second has 1 image
+        # image_grid: 4 images total, each 2x2 patches = 4 patches each
+        image_grid = torch.tensor([[1, 2, 2], [1, 2, 2], [1, 2, 2], [1, 2, 2]])
+        pixel_values = torch.randn(16, 64)  # 4 images * 4 patches = 16 patches
+        n_images_per_sample = torch.tensor([3, 1])
+
+        pv_chunks, ig_chunks = _chunk_vlm_media(
+            pixel_values, image_grid, batch_size=2, n_microbatches=2,
+            n_images_per_sample=n_images_per_sample,
+        )
+        assert len(pv_chunks) == 2
+        assert ig_chunks[0].shape[0] == 3  # first batch item: 3 images
+        assert ig_chunks[1].shape[0] == 1  # second batch item: 1 image
+        assert pv_chunks[0].shape[0] == 12  # 3 images * 4 patches
+        assert pv_chunks[1].shape[0] == 4   # 1 image * 4 patches
+
+    def test_legacy_one_image_per_sample(self):
+        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
+
+        # 4 samples, 1 image each with different patch counts
+        image_grid = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 2], [1, 3, 3]])
+        patch_counts = image_grid.prod(dim=1)  # [4, 9, 4, 9] = 26 total
+        pixel_values = torch.randn(int(patch_counts.sum()), 64)
+
+        pv_chunks, ig_chunks = _chunk_vlm_media(
+            pixel_values, image_grid, batch_size=4, n_microbatches=2,
+        )
+        assert len(pv_chunks) == 2
+        assert ig_chunks[0].shape[0] == 2
+        assert ig_chunks[1].shape[0] == 2
+        assert pv_chunks[0].shape[0] == 4 + 9  # first 2 images
+        assert pv_chunks[1].shape[0] == 4 + 9  # last 2 images
+
+    def test_fallback_mismatched_images(self):
+        """When n_images != batch_size and no n_images_per_sample, all go to first mb."""
+        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
+
+        image_grid = torch.tensor([[1, 2, 2], [1, 2, 2], [1, 2, 2]])
+        pixel_values = torch.randn(12, 64)  # 3 images but batch_size=2
+
+        pv_chunks, ig_chunks = _chunk_vlm_media(
+            pixel_values, image_grid, batch_size=2, n_microbatches=2,
+        )
+        assert len(pv_chunks) == 2
+        assert pv_chunks[0].shape[0] == 12  # all in first
+        assert pv_chunks[1].shape[0] == 0   # empty
