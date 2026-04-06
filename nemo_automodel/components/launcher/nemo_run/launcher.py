@@ -116,9 +116,13 @@ class NemoRunLauncher(Launcher):
         nr_config = NemoRunConfig.from_dict(launcher_config)
         executor = self._resolve_executor(nr_config)
 
-        # Determine devices (GPUs per node) from the (possibly overridden) executor.
-        val = getattr(executor, "ntasks_per_node", None)
-        devices = int(val) if isinstance(val, (int, float)) and val else 1
+        # Determine devices (GPUs per node) via the executor's standard
+        # nproc_per_node() method (defined on the base Executor class and
+        # implemented by every backend).
+        try:
+            devices = executor.nproc_per_node()
+        except (NotImplementedError, Exception):
+            devices = 1
 
         # Enable native Torchrun launcher (must be set *before* experiment.run
         # because NeMo-Run reads it during the packaging phase).
