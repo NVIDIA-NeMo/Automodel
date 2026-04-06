@@ -50,10 +50,14 @@ def _infer_vocab_size(model_cfg):
     model_config = None
 
     if config_target is not None and callable(config_target):
-        target_name = getattr(config_target, "__qualname__", "")
-        if "AutoConfig" not in target_name:
-            model_config = config_target.from_pretrained(config_section.pretrained_model_name_or_path)
-    elif isinstance(config_target, str) and "AutoConfig" not in config_target:
+    if isinstance(config_target, str) and "AutoConfig" not in config_target:
+        import importlib
+
+        # Strip trailing method name (e.g. ".from_pretrained") to get "module.ClassName"
+        target = config_target
+        if target.endswith(".from_pretrained"):
+            target = target[: -len(".from_pretrained")]
+        module_path, class_name = target.rsplit(".", 1)
         import importlib
 
         module_path, class_name = config_target.rsplit(".", 1)
