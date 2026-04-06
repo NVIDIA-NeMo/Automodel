@@ -97,4 +97,4 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
-  recipe_owner: BoxiangW
+  recipe_owner: ZhiyuLi-Nvidia

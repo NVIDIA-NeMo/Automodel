@@ -128,4 +128,4 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
-  recipe_owner: Anakintano
+  recipe_owner: adil-a
