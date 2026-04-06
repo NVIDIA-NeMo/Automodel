@@ -22,7 +22,7 @@
 
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 8
+  local_batch_size: 2
   ckpt_every_steps: 1000
   val_every_steps: 100
   num_epochs: 2
@@ -95,9 +95,9 @@ dataset:
 
 packed_sequence:
   pretokenize: true
-  max_length: 2048
-  pack_size: 2048
-  collate_max_length: 2048
+  max_length: 4096
+  pack_size: 4096
+  collate_max_length: 4096
   packing_ratio: 0.9
   drop_long_samples: true
 
