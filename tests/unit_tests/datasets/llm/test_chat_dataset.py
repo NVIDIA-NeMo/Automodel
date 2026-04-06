@@ -176,6 +176,28 @@ def test_load_openai_messages_local_and_errors(tmp_path, monkeypatch):
     assert tcd._load_openai_messages("org/name", split="train") is sentinel
 
 
+def test_load_openai_messages_local_skip_invalid_samples(tmp_path):
+    jsonl = tmp_path / "broken.jsonl"
+    jsonl.write_text(
+        "\n".join(
+            [
+                json.dumps({"messages": [{"role": "user", "content": "ok-1"}]}),
+                '{"messages":[{"role":"user","content":"unterminated}]',
+                json.dumps({"messages": [{"role": "assistant", "content": "ok-2"}]}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(json.JSONDecodeError):
+        tcd._load_openai_messages(str(jsonl), skip_invalid_samples=False)
+
+    rows = tcd._load_openai_messages(str(jsonl), skip_invalid_samples=True)
+    assert len(rows) == 2
+    assert rows[0]["messages"][0]["content"] == "ok-1"
+    assert rows[1]["messages"][0]["content"] == "ok-2"
+
+
 def test_load_openai_messages_hf_shuffle_and_slice(monkeypatch):
     """Verify that HF datasets are shuffled before slicing."""
     monkeypatch.setattr(tcd, "_is_hf_repo_id", lambda v: True)
@@ -297,6 +319,29 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
     ds_bad = tcd.ChatDataset("ignored", tok)
     with pytest.raises(ValueError):
         _ = ds_bad[0]
+
+
+def test_chat_dataset_skip_invalid_samples_filters_bad_rows(monkeypatch):
+    class Tok:
+        eos_token_id = 1
+        chat_template = "{{ default }}"
+
+    tok = Tok()
+    monkeypatch.setattr(tcd, "_has_chat_template", lambda _tok: True)
+    monkeypatch.setattr(tcd, "_add_pad_token", lambda _tok: 3)
+    monkeypatch.setattr(tcd, "format_chat_template", lambda *a, **k: {"input_ids": [1], "labels": [1], "attention_mask": [1]})
+
+    dataset_rows = [
+        {"messages": [{"role": "user", "content": "ok"}]},
+        {"messages": "bad"},
+        {"messages": [{"role": "assistant", "content": "ok2"}]},
+    ]
+    monkeypatch.setattr(tcd, "_load_openai_messages", lambda *a, **k: dataset_rows)
+
+    ds = tcd.ChatDataset("ignored", tok, skip_invalid_samples=True)
+    assert len(ds) == 2
+    assert ds[0]["input_ids"] == [1]
+    assert ds[1]["attention_mask"] == [1]
 
 
 def test_resolve_chat_template_none():
