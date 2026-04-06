@@ -56,6 +56,26 @@ from nemo_automodel.components.moe.state_dict_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _swap_shard_placements_1_2(placements: tuple) -> tuple:
+    """Swap Shard dim 1 and dim 2 in DTensor placements after a transpose(1, 2).
+
+    When we transpose a 3-D tensor's dims 1 and 2, any Shard placement on those
+    dims must be swapped so that ``DTensor.from_local`` infers the correct global
+    shape.  Without this, the shard multiplier is applied to the wrong axis.
+    """
+    from torch.distributed._tensor import Shard
+
+    new = []
+    for p in placements:
+        if isinstance(p, Shard) and p.dim == 1:
+            new.append(Shard(2))
+        elif isinstance(p, Shard) and p.dim == 2:
+            new.append(Shard(1))
+        else:
+            new.append(p)
+    return tuple(new)
+
+
 def _create_dtensor_from_local_or_reference(
     local_tensor: torch.Tensor,
     reference_dtensor: Optional["torch.Tensor"],
@@ -230,10 +250,19 @@ class Step3p5StateDictAdapter(StateDictAdapter):
                         merged = torch.cat([gate_t, up_t], dim=-1).to(self.dtype)
 
                         native_key = f"{prefix}layers.{layer_num}.moe.experts.gate_and_up_projs"
-                        # Create DTensor using reference or device_mesh
-                        state_dict[native_key] = _create_dtensor_from_local_or_reference(
-                            merged, reference_dtensor, device_mesh, rank
-                        )
+                        # Create DTensor using reference or device_mesh.
+                        # Swap Shard(1)↔Shard(2) because we transposed dims 1 and 2.
+                        if reference_dtensor is not None and is_dtensor(reference_dtensor):
+                            swapped_placements = _swap_shard_placements_1_2(reference_dtensor.placements)
+                            from torch.distributed._tensor import DTensor
+
+                            state_dict[native_key] = DTensor.from_local(
+                                merged, reference_dtensor.device_mesh, swapped_placements
+                            )
+                        else:
+                            state_dict[native_key] = _create_dtensor_from_local_or_reference(
+                                merged, None, device_mesh, rank
+                            )
 
                         # Clean up
                         del pending_gate_up[layer_key]
@@ -247,10 +276,19 @@ class Step3p5StateDictAdapter(StateDictAdapter):
                     down_t = down_local.transpose(1, 2).to(self.dtype)
 
                     native_key = f"{prefix}layers.{layer_num}.moe.experts.down_projs"
-                    # Create DTensor using reference or device_mesh
-                    state_dict[native_key] = _create_dtensor_from_local_or_reference(
-                        down_t, reference_dtensor, device_mesh, rank
-                    )
+                    # Create DTensor using reference or device_mesh.
+                    # Swap Shard(1)↔Shard(2) because we transposed dims 1 and 2.
+                    if reference_dtensor is not None and is_dtensor(reference_dtensor):
+                        swapped_placements = _swap_shard_placements_1_2(reference_dtensor.placements)
+                        from torch.distributed._tensor import DTensor
+
+                        state_dict[native_key] = DTensor.from_local(
+                            down_t, reference_dtensor.device_mesh, swapped_placements
+                        )
+                    else:
+                        state_dict[native_key] = _create_dtensor_from_local_or_reference(
+                            down_t, None, device_mesh, rank
+                        )
 
             elif router_m:
                 # Router gate weight/bias - handle key mapping
@@ -343,10 +381,12 @@ class Step3p5StateDictAdapter(StateDictAdapter):
             gate_weight = gate_t.transpose(1, 2).contiguous()
             up_weight = up_t.transpose(1, 2).contiguous()
 
-            # Wrap in DTensor if original was DTensor
+            # Wrap in DTensor if original was DTensor.
+            # Swap Shard(1)↔Shard(2) because we transposed dims 1 and 2.
             if tensor_is_dtensor:
-                gate_weight = DTensor.from_local(gate_weight, device_mesh, placements)
-                up_weight = DTensor.from_local(up_weight, device_mesh, placements)
+                swapped = _swap_shard_placements_1_2(placements)
+                gate_weight = DTensor.from_local(gate_weight, device_mesh, swapped)
+                up_weight = DTensor.from_local(up_weight, device_mesh, swapped)
 
             return [
                 (f"{prefix}layers.{layer_num}.moe.gate_proj.weight", gate_weight),
@@ -373,9 +413,11 @@ class Step3p5StateDictAdapter(StateDictAdapter):
             # Transpose: [n_exp, inter, dim] -> [n_exp, dim, inter]
             down_weight = local_tensor.transpose(1, 2).contiguous()
 
-            # Wrap in DTensor if original was DTensor
+            # Wrap in DTensor if original was DTensor.
+            # Swap Shard(1)↔Shard(2) because we transposed dims 1 and 2.
             if tensor_is_dtensor:
-                down_weight = DTensor.from_local(down_weight, device_mesh, placements)
+                swapped = _swap_shard_placements_1_2(placements)
+                down_weight = DTensor.from_local(down_weight, device_mesh, swapped)
 
             return [
                 (f"{prefix}layers.{layer_num}.moe.down_proj.weight", down_weight),
