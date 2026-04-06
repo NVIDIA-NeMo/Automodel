@@ -57,8 +57,7 @@ Training is configured through a [YAML](https://en.wikipedia.org/wiki/YAML) conf
 
 Under the hood, both SFT and PEFT are executed by a **recipe**: a self-contained Python class that wires together model loading, dataset preparation, training, checkpointing, and logging. The fine-tuning recipe is [`TrainFinetuneRecipeForNextTokenPrediction`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py). The config file tells the recipe *what* to build; the recipe decides *how* to build it.
 
-::::{dropdown} How the Config System Works
-:class: note
+:::{dropdown} How the Config System Works
 
 NeMo AutoModel configs use a convention borrowed from [Hydra](https://hydra.cc/): the special **`_target_`** key tells the framework *which* Python class or function to call, and **every other key** in the same YAML block is passed as a keyword argument to that call. For example:
 
@@ -779,7 +778,7 @@ optimizer:
 | `model` | Yes | Set `pretrained_model_name_or_path` to your Hugging Face model ID. Source: [`auto_model.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/auto_model.py). |
 | `peft` | PEFT only | Remove entirely for SFT. Adjust `dim` and `alpha` to tune adapter capacity. `use_triton: True` enables an optimized LoRA kernel (requires the `triton` package). For reduced memory usage, see [QLoRA](#qlora-quantized-low-rank-adaptation). Source: [`lora.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/_peft/lora.py). |
 | `dataset` | Yes | Change `_target_`, `dataset_name`, and `split` for your data. Source: [`squad.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/squad.py). |
-| `dataloader` | Optional | Adjust `batch_size` and `shuffle`. Uses [`StatefulDataLoader`](https://pytorch.org/data/stable/stateful_dataloader.html) for checkpointable iteration. Collation: [`utils.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/utils.py). |
+| `dataloader` | Optional | Adjust `batch_size` and `shuffle`. Uses [`StatefulDataLoader`](https://meta-pytorch.org/data/main/torchdata.stateful_dataloader.html) for checkpointable iteration. Collation: [`utils.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/utils.py). |
 | `loss_fn` | Optional | Default is [`MaskedCrossEntropy`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/loss/masked_ce.py). Alternatives: [`ChunkedCrossEntropy`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/loss/chunked_ce.py) (long sequences), [`FusedLinearCrossEntropy`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/loss/linear_ce.py) (large vocabs), [`TEParallelCrossEntropy`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/loss/te_parallel_ce.py) (tensor-parallel). |
 | `rng` | Optional | Controls reproducibility. Source: [`rng.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/training/rng.py). |
 | `step_scheduler` | Yes | `grad_acc_steps` sets how many micro-batches accumulate per gradient step. `ckpt_every_steps` and `val_every_steps` are counted in gradient steps. |
