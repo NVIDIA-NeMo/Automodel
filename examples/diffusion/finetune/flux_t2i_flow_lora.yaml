@@ -11,24 +11,34 @@ dist_env:
 
 model:
   pretrained_model_name_or_path: "black-forest-labs/FLUX.1-dev"
-  # Required when lora.enabled=true — used by inject_lora() to select
-  # target modules and pre-inject hook
+  # Required when peft block is present — selects pre-inject hook and is
+  # passed to auto_diffusion_pipeline for model-specific setup.
   model_type: "flux"
   mode: "finetune"
   cache_dir: null
   attention_backend: "flash"
 
-# ── LoRA configuration ────────────────────────────────────────────────────────
-# Set enabled: false (or remove this section) for full fine-tune
-lora:
-  enabled: true
-  rank: 64
+# ── LoRA / PEFT configuration ─────────────────────────────────────────────────
+# Remove this section for full fine-tune.
+# Mirrors the LLM peft config pattern — PeftConfig is instantiated directly.
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  dim: 64
   alpha: 64
   dropout: 0.0
-  # null = use FLUX_DEFAULT_TARGET_MODULES from lora/config.py:
-  #   attn.to_q/k/v/out, attn.add_q/k/v_proj, attn.to_add_out,
-  #   ff.net.0.proj, ff.net.2, ff_context.net.0.proj, ff_context.net.2
-  target_modules: null
+  target_modules:
+    - "*.attn.to_q"
+    - "*.attn.to_k"
+    - "*.attn.to_v"
+    - "*.attn.to_out.0"
+    - "*.attn.add_q_proj"
+    - "*.attn.add_k_proj"
+    - "*.attn.add_v_proj"
+    - "*.attn.to_add_out"
+    - "*.ff.net.0.proj"
+    - "*.ff.net.2"
+    - "*.ff_context.net.0.proj"
+    - "*.ff_context.net.2"
 
 optim:
   learning_rate: 2e-5

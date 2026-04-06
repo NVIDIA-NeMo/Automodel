@@ -11,23 +11,25 @@ dist_env:
 
 model:
   pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-1.3B-Diffusers
-  # Required when lora.enabled=true — used by inject_lora() to:
-  #   1. Call _wan_pre_inject() which unfuses QKV projections
-  #   2. Select WAN_DEFAULT_TARGET_MODULES
+  # Required when peft block is present — triggers QKV unfuse before injection
+  # and is passed to auto_diffusion_pipeline for model-specific setup.
   model_type: "wan"
   mode: finetune
 
-# ── LoRA configuration ────────────────────────────────────────────────────────
-# Set enabled: false (or remove this section) for full fine-tune
-lora:
-  enabled: true
-  rank: 64
+# ── LoRA / PEFT configuration ─────────────────────────────────────────────────
+# Remove this section for full fine-tune.
+# Mirrors the LLM peft config pattern — PeftConfig is instantiated directly.
+# Note: unfuse_projections() is called automatically in the pipeline before injection.
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  dim: 64
   alpha: 64
   dropout: 0.0
-  # null = use WAN_DEFAULT_TARGET_MODULES from lora/config.py:
-  #   to_q, to_k, to_v, to_out.0
-  # Note: unfuse_projections() is called automatically before injection
-  target_modules: null
+  target_modules:
+    - "*.to_q"
+    - "*.to_k"
+    - "*.to_v"
+    - "*.to_out.0"
 
 optim:
   learning_rate: 5e-6

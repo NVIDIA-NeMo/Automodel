@@ -50,7 +50,7 @@ def build_model_and_optimizer(
     attention_backend: Optional[str] = None,
     optimizer_cfg: Optional[Dict[str, Any]] = None,
     pipeline_spec: Optional[Dict[str, Any]] = None,
-    lora_cfg=None,
+    peft_cfg=None,
     model_type=None,
 ) -> tuple[NeMoAutoDiffusionPipeline, torch.optim.Optimizer, Any]:
     """Build the diffusion model, parallel scheme, and optimizer.
@@ -71,9 +71,9 @@ def build_model_and_optimizer(
             - transformer_cls: str (e.g., "WanTransformer3DModel", "FluxTransformer2DModel")
             - subfolder: str (e.g., "transformer")
             - Optional: pipeline_cls, load_full_pipeline
-        lora_cfg: LoRAConfig instance or None. When enabled, only LoRA params
+        peft_cfg: PeftConfig instance or None. When provided, only LoRA params
             are trained; base weights are frozen and sharded by FSDP2 for memory.
-        model_type: "flux" | "wan" | "hunyuan". Required when lora_cfg.enabled.
+        model_type: "flux" | "wan" | "hunyuan". Required when peft_cfg is provided.
 
     Returns:
         Tuple of (pipeline, optimizer, device_mesh or None).
@@ -96,10 +96,10 @@ def build_model_and_optimizer(
 
     world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-    lora_enabled = lora_cfg is not None and lora_cfg.enabled
+    lora_enabled = peft_cfg is not None
     # param_dtype=None when LoRA: FSDP2 does not cast any parameter.
     # bf16 base weights stay bf16 (loaded dtype).
-    # fp32 LoRA weights stay fp32 (set by cast_training_params in inject_lora).
+    # bf16 LoRA weights stay bf16 (set via peft_cfg.lora_dtype in pipeline).
     # param_dtype=dtype when full fine-tune: FSDP2 casts everything to dtype (bf16).
     param_dtype = None if lora_enabled else dtype
 
@@ -163,7 +163,7 @@ def build_model_and_optimizer(
             components_to_load=["transformer"],
             load_for_training=True,
             low_cpu_mem_usage=True,
-            lora_cfg=lora_cfg,
+            peft_cfg=peft_cfg,
             model_type=model_type,
         )
     else:
@@ -200,8 +200,8 @@ def build_model_and_optimizer(
         trainable_params = [p for n, p in transformer_module.named_parameters() if "lora_" in n and p.requires_grad]
         if not trainable_params:
             raise RuntimeError(
-                "lora_cfg.enabled=True but no LoRA params found. "
-                "Check that target_modules match module names in the transformer."
+                "peft_cfg is set but no LoRA params found. "
+                "Check that peft.target_modules match module names in the transformer."
             )
         logging.info(
             "[LoRA] Optimizer: %d param tensors, %s elements",
@@ -424,25 +424,24 @@ class TrainDiffusionRecipe(BaseRecipe):
         pipeline_spec_cfg = self.cfg.get("model.pipeline_spec", None)
         pipeline_spec = pipeline_spec_cfg.to_dict() if pipeline_spec_cfg is not None else None
 
-        # ── LoRA configuration ────────────────────────────────────────────────
-        lora_cfg_raw = self.cfg.get("lora", None)
-        if lora_cfg_raw is not None:
-            from nemo_automodel.components.lora.config import LoRAConfig
-
-            raw = lora_cfg_raw.to_dict() if hasattr(lora_cfg_raw, "to_dict") else dict(lora_cfg_raw)
-            self.lora_cfg = LoRAConfig(**raw)
-        else:
-            self.lora_cfg = None
+        # ── PEFT / LoRA configuration ─────────────────────────────────────────
+        # Mirrors the LLM recipe pattern: peft block in YAML with _target_ pointing
+        # to PeftConfig is instantiated directly, no intermediate wrapper class.
+        self.peft_cfg = None
+        if self.cfg.get("peft", None) is not None:
+            self.peft_cfg = self.cfg.peft.instantiate()
 
         # model_type is explicit in yaml — no fragile string detection.
-        # Required when lora.enabled=true.
+        # Required when peft block is present.
         self.model_type = self.cfg.get("model.model_type", None)
-        if self.lora_cfg and self.lora_cfg.enabled and not self.model_type:
-            raise ValueError("model.model_type must be set when lora.enabled=true. Options: 'flux', 'wan', 'hunyuan'")
+        if self.peft_cfg is not None and not self.model_type:
+            raise ValueError(
+                "model.model_type must be set when peft config is provided. Options: 'flux', 'wan', 'hunyuan'"
+            )
 
         lora_status = (
-            f"enabled (rank={self.lora_cfg.rank}, alpha={self.lora_cfg.alpha})"
-            if self.lora_cfg and self.lora_cfg.enabled
+            f"enabled (dim={self.peft_cfg.dim}, alpha={self.peft_cfg.alpha})"
+            if self.peft_cfg is not None
             else "disabled (full fine-tune)"
         )
         logging.info(f"[INFO] LoRA: {lora_status}")
@@ -459,15 +458,15 @@ class TrainDiffusionRecipe(BaseRecipe):
             optimizer_cfg=self.cfg.get("optim.optimizer", {}),
             attention_backend=self.attention_backend,
             pipeline_spec=pipeline_spec,
-            lora_cfg=self.lora_cfg,
+            peft_cfg=self.peft_cfg,
             model_type=self.model_type,
         )
 
         self.model = self.pipe.transformer
         self.peft_config = None
         # Store peft_config ref for use in save_checkpoint().
-        # Set by inject_lora() and stored on pipe by from_pretrained().
-        self._lora_peft_config = getattr(self.pipe, "_lora_peft_config", None)
+        # Set by apply_lora_to_linear_modules() and stored on pipe by from_pretrained().
+        self._peft_config = getattr(self.pipe, "_peft_config", None)
 
         checkpoint_cfg = self.cfg.get("checkpoint", None)
 
@@ -490,7 +489,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             model_cache_dir=model_cache_dir if model_cache_dir is not None else HF_HUB_CACHE,
             model_repo_id=self.model_id,
             save_consolidated=checkpoint_cfg.get("save_consolidated"),
-            is_peft=bool(self.lora_cfg and self.lora_cfg.enabled),
+            is_peft=self.peft_cfg is not None,
             model_state_dict_keys=model_state_dict_keys,
             diffusers_compatible=checkpoint_cfg.get("diffusers_compatible", False),
         )
@@ -606,22 +605,22 @@ class TrainDiffusionRecipe(BaseRecipe):
                          Only main process writes to disk.
         Full fine-tune:  calls super().save_checkpoint() — unchanged behavior.
         """
-        if self.lora_cfg and self.lora_cfg.enabled:
+        if self.peft_cfg is not None:
             from nemo_automodel.components.lora.checkpoint import save_lora_weights
 
             output_dir = os.path.join(
                 self.checkpoint_config.checkpoint_dir,
                 f"checkpoint-{global_step}",
             )
-            if self._lora_peft_config is None:
+            if self._peft_config is None:
                 raise RuntimeError(
-                    "LoRA is enabled but _lora_peft_config is None. inject_lora() may not have run correctly."
+                    "LoRA is enabled but _peft_config is None. LoRA injection may not have run correctly."
                 )
             # All ranks must call this (FSDP2 gather is a distributed collective).
             # Only main process writes files.
             save_lora_weights(
                 transformer=self.model,
-                peft_config=self._lora_peft_config,
+                peft_config=self._peft_config,
                 output_dir=output_dir,
                 is_fsdp=self.device_mesh is not None,
                 is_main_process=is_main_process(),
@@ -680,7 +679,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                 grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm
 
                 # ── LoRA gradient diagnostic (step 1 only) ───────────────────
-                if global_step == 1 and self.lora_cfg and self.lora_cfg.enabled:
+                if global_step == 1 and self.peft_cfg is not None:
                     for n, p in self.model.named_parameters():
                         if "lora_B" in n:
                             try:

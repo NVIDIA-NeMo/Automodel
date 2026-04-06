@@ -365,7 +365,7 @@ class NeMoAutoDiffusionPipeline:
         move_to_device: bool = True,
         load_for_training: bool = False,
         components_to_load: Optional[Iterable[str]] = None,
-        lora_cfg=None,
+        peft_cfg=None,
         model_type=None,
         **kwargs,
     ) -> Tuple[DiffusionPipeline, Dict[str, ParallelManager]]:
@@ -386,10 +386,10 @@ class NeMoAutoDiffusionPipeline:
             move_to_device: Whether to move modules to device
             load_for_training: Whether to make parameters trainable
             components_to_load: Which components to process (default: all)
-            lora_cfg: LoRAConfig instance or None. When enabled, inject_lora() is
-                called before _apply_parallelization() (FSDP2 wrapping). Base weights
-                are frozen; LoRA params are collected pre-FSDP2 and stored on pipe.
-            model_type: "flux" | "wan" | "hunyuan". Required when lora_cfg.enabled.
+            peft_cfg: PeftConfig instance or None. When provided, LoRA is injected
+                before _apply_parallelization() (FSDP2 wrapping). Base weights
+                are frozen after FSDP2; LoRA params are collected pre-FSDP2 and stored on pipe.
+            model_type: "flux" | "wan" | "hunyuan". Required when peft_cfg is provided.
             **kwargs: Additional arguments passed to DiffusionPipeline.from_pretrained
 
         Returns:
@@ -423,25 +423,48 @@ class NeMoAutoDiffusionPipeline:
                     logger.info("[INFO] Moving module: %s to device/dtype", name)
                     _move_module_to_device(module, dev, torch_dtype)
 
-        if lora_cfg is not None and lora_cfg.enabled:
+        if peft_cfg is not None:
             # ── LoRA path ─────────────────────────────────────────────────────
-            # inject_lora() MUST run before _apply_parallelization (FSDP2).
-            # FSDP2 must see the final module structure (with lora.Linear wrappers)
+            # LoRA injection MUST run before _apply_parallelization (FSDP2).
+            # FSDP2 must see the final module structure (with LoRA-patched linears)
             # to correctly shard both base weights and LoRA weights.
             # Pre-FSDP2 lora_params refs are stored on pipe and remain valid
             # after wrapping (FSDP2 preserves original Parameter objects).
             if model_type is None:
-                raise ValueError("model_type must be set when lora_cfg.enabled=True. Options: 'flux', 'wan', 'hunyuan'")
-            from nemo_automodel.components.lora.setup import inject_lora
+                raise ValueError("model_type must be set when peft_cfg is provided. Options: 'flux', 'wan', 'hunyuan'")
+            import dataclasses
+
+            from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 
             pipe._lora_params = {}
-            pipe._lora_peft_config = None
+            pipe._peft_config = None
 
             for name, module in _iter_pipeline_modules(pipe):
                 if name == "transformer":
-                    lora_params, peft_config = inject_lora(module, lora_cfg, model_type)
+                    # Pre-inject hook: Wan fuses to_q/to_k/to_v for inference
+                    # efficiency — must unfuse before injection so individual
+                    # Linear modules are visible to the module matcher.
+                    if model_type == "wan":
+                        for block in module.blocks:
+                            block.attn1.unfuse_projections()
+                            block.attn2.unfuse_projections()
+                        logger.info("[LoRA] Wan: unfused attention projection groups")
+
+                    # Ensure LoRA weights are bf16 to match base weights in the
+                    # FSDP2 unit — mixed dtypes cause reduce-scatter to malfunction.
+                    cfg = peft_cfg
+                    if cfg.lora_dtype is None:
+                        cfg = dataclasses.replace(cfg, lora_dtype=torch.bfloat16)
+
+                    # skip_freeze=True: global base-weight freeze happens after
+                    # FSDP2 wrapping (see below). FSDP2 must see all params as
+                    # trainable during fully_shard() so gradient reduction is set
+                    # up correctly for LoRA params.
+                    apply_lora_to_linear_modules(module, cfg, skip_freeze=True)
+
+                    lora_params = [p for n, p in module.named_parameters() if "lora_" in n and p.requires_grad]
                     pipe._lora_params[name] = lora_params
-                    pipe._lora_peft_config = peft_config
+                    pipe._peft_config = cfg
                     logger.info(
                         "[LoRA] Stored %d lora_param tensors before FSDP2",
                         len(lora_params),
@@ -463,7 +486,7 @@ class NeMoAutoDiffusionPipeline:
         # nemo_automodel/_transformers/infrastructure.py lines 513-518.
         # FSDP2 must see all params as trainable during fully_shard(); freezing
         # before wrapping causes gradient reduction to malfunction for LoRA params.
-        if lora_cfg is not None and lora_cfg.enabled:
+        if peft_cfg is not None:
             for name, param in pipe.transformer.named_parameters():
                 if "lora_" not in name and param.requires_grad:
                     param.requires_grad_(False)

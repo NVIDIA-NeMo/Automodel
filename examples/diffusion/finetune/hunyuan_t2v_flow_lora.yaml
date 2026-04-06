@@ -11,23 +11,29 @@ dist_env:
 
 model:
   pretrained_model_name_or_path: "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v"
-  # Required when lora.enabled=true — used by inject_lora() to select
-  # HUNYUAN_DEFAULT_TARGET_MODULES (no pre-inject hook needed)
+  # Required when peft block is present — passed to auto_diffusion_pipeline
+  # for model-specific setup (no pre-inject hook needed for Hunyuan).
   model_type: "hunyuan"
   mode: "finetune"
   attention_backend: "flash"
 
-# ── LoRA configuration ────────────────────────────────────────────────────────
-# Set enabled: false (or remove this section) for full fine-tune
-lora:
-  enabled: true
-  rank: 64
+# ── LoRA / PEFT configuration ─────────────────────────────────────────────────
+# Remove this section for full fine-tune.
+# Mirrors the LLM peft config pattern — PeftConfig is instantiated directly.
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  dim: 64
   alpha: 64
   dropout: 0.0
-  # null = use HUNYUAN_DEFAULT_TARGET_MODULES from lora/config.py:
-  #   to_q, to_k, to_v, to_out.0,
-  #   add_q_proj, add_k_proj, add_v_proj, to_add_out
-  target_modules: null
+  target_modules:
+    - "*.to_q"
+    - "*.to_k"
+    - "*.to_v"
+    - "*.to_out.0"
+    - "*.add_q_proj"
+    - "*.add_k_proj"
+    - "*.add_v_proj"
+    - "*.to_add_out"
 
 optim:
   learning_rate: 5e-6
