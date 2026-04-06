@@ -275,7 +275,7 @@ def _chunk_vlm_media(
 
             patch_start = 0 if img_start == 0 else cumsum_patches[img_start - 1].item()
             patch_end = cumsum_patches[img_end - 1].item() if img_end > 0 else 0
-            pixel_values_chunks.append(pixel_values[int(patch_start):int(patch_end)])
+            pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
     elif n_images == batch_size:
         # Legacy: exactly 1 image per sample.
         patch_counts = image_grid.prod(dim=1)
@@ -290,7 +290,7 @@ def _chunk_vlm_media(
 
             patch_start = 0 if img_start == 0 else cumsum[img_start - 1].item()
             patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
-            pixel_values_chunks.append(pixel_values[int(patch_start):int(patch_end)])
+            pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
     else:
         pixel_values_chunks.append(pixel_values)
         image_grid_chunks.append(image_grid)
@@ -919,10 +919,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     stage0_model = self.model_parts[0]
                     n_microbatches = self.pp._info.schedule._n_microbatches
                     batch_size = input_ids.shape[0]
-                    n_images = image_grid.shape[0]
+                    image_grid.shape[0]
 
                     pixel_values_chunks, image_grid_chunks = _chunk_vlm_media(
-                        pixel_values, image_grid, batch_size, n_microbatches,
+                        pixel_values,
+                        image_grid,
+                        batch_size,
+                        n_microbatches,
                         n_images_per_sample=n_images_per_sample,
                     )
 
