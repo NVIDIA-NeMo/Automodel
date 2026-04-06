@@ -321,7 +321,8 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
         _ = ds_bad[0]
 
 
-def test_chat_dataset_skip_invalid_samples_filters_bad_rows(monkeypatch):
+def test_chat_dataset_skip_invalid_samples_does_not_filter_structured_bad_rows(monkeypatch):
+    """skip_invalid_samples only affects JSONL parse errors, not invalid message rows after load."""
     class Tok:
         eos_token_id = 1
         chat_template = "{{ default }}"
@@ -339,9 +340,11 @@ def test_chat_dataset_skip_invalid_samples_filters_bad_rows(monkeypatch):
     monkeypatch.setattr(tcd, "_load_openai_messages", lambda *a, **k: dataset_rows)
 
     ds = tcd.ChatDataset("ignored", tok, skip_invalid_samples=True)
-    assert len(ds) == 2
+    assert len(ds) == 3
     assert ds[0]["input_ids"] == [1]
-    assert ds[1]["attention_mask"] == [1]
+    with pytest.raises(ValueError):
+        _ = ds[1]
+    assert ds[2]["attention_mask"] == [1]
 
 
 def test_resolve_chat_template_none():
