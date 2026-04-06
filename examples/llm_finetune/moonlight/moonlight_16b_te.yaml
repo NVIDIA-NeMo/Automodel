@@ -130,4 +130,5 @@ optimizer:
 #   dir: /tmp/wandb
 
 ci:
+  recipe_owner: hemildesai
   node_multiplier: true

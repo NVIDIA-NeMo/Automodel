@@ -105,4 +105,5 @@ optimizer:
 #   save_dir: <your_wandb_save_dir> 
 
 ci:
+  recipe_owner: akoumpa
   time: "00:15:00"

@@ -113,4 +113,5 @@ optimizer:
   weight_decay: 0
 
 ci:
+  recipe_owner: hemildesai
   nodes: 32
