@@ -25,16 +25,18 @@ def _should_load_before_shard(
     autopipeline: Optional[object],
     tp_size: int,
     ep_size: int,
+    dp_shard_size: int,
     pretrained_model_name_or_path: str,
     load_base_model: bool,
     peft_config: Optional[object],
 ) -> bool:
     """Decide whether to load the checkpoint before FSDP/TP/EP sharding.
 
-    Load-before-shard is only safe when running single-GPU (no PP, TP, or EP)
-    and a checkpoint actually needs loading.
-    With any model parallelism the post-shard load path must be used to avoid
-    NCCL collective mismatches or key/device inconsistencies.
+    Load-before-shard is only safe when running single-GPU (no PP, TP, EP, or
+    FSDP sharding) and a checkpoint actually needs loading.
+    With any model parallelism or data-parallel sharding the post-shard load
+    path must be used to avoid OOM (full model on each GPU) or NCCL collective
+    mismatches.
 
     PEFT models skip this path and use the post-shard load so that base and
     adapter weights load in the same way as multi-GPU.
@@ -42,12 +44,13 @@ def _should_load_before_shard(
     no_pp = autopipeline is None
     no_tp = tp_size <= 1
     no_ep = ep_size <= 1
+    no_dp_shard = dp_shard_size <= 1
     no_peft = peft_config is None
     need_checkpoint_load = bool(pretrained_model_name_or_path and load_base_model)
-    result = no_pp and no_tp and no_ep and no_peft and need_checkpoint_load
+    result = no_pp and no_tp and no_ep and no_dp_shard and no_peft and need_checkpoint_load
     logger.debug(
-        "[_should_load_before_shard] no_pp={} no_tp={} no_ep={} need_load={} peft={} -> {}".format(
-            no_pp, no_tp, no_ep, need_checkpoint_load, peft_config is not None, result
+        "[_should_load_before_shard] no_pp={} no_tp={} no_ep={} no_dp_shard={} need_load={} peft={} -> {}".format(
+            no_pp, no_tp, no_ep, no_dp_shard, need_checkpoint_load, peft_config is not None, result
         )
     )
     return result

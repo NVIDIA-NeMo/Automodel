@@ -356,7 +356,10 @@ def _make_lazy_te_patcher():
         _original_grouped_linear_forward = TEGroupedLinear.forward
 
         def _patched_rmsnorm_forward(self, x):
-            if is_tensor_unallocated(x):
+            # Skip the unallocated-tensor short-circuit during torch.compile tracing:
+            # fake tensors used by inductor have data_ptr()==0 but are NOT unallocated —
+            # returning empty_like here produces a leaf with no grad_fn, breaking AOT autograd.
+            if is_tensor_unallocated(x) and not torch.compiler.is_compiling():
                 return torch.empty_like(x)
             return _original_rmsnorm_forward(self, x)
 

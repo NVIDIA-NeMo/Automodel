@@ -427,6 +427,7 @@ def apply_model_infrastructure(
         autopipeline=autopipeline,
         tp_size=mesh.tp_size,
         ep_size=mesh.ep_size,
+        dp_shard_size=mesh.dp_shard_size,
         pretrained_model_name_or_path=pretrained_model_name_or_path,
         load_base_model=load_base_model,
         peft_config=peft_config,

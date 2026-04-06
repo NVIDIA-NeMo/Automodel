@@ -178,6 +178,8 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         prioritize_all_gather: bool = False,
         fsdp_layer_group_size: int = 1,
         fsdp2_no_cat_array: bool = False,
+        fsdp2_backward_prefetch_depth: int = 2,
+        fsdp2_forward_prefetch_depth: int = 1,
     ) -> nn.Module:
         """Apply the default parallelization flow."""
         tp_mesh = device_mesh[tp_mesh_name]
@@ -281,7 +283,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             )
 
         # Find transformer layers and apply parallelisms
-        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy, pp_enabled, enable_fsdp2_prefetch, fsdp_layer_group_size)
+        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy, pp_enabled, enable_fsdp2_prefetch, fsdp_layer_group_size, fsdp2_backward_prefetch_depth, fsdp2_forward_prefetch_depth)
 
         # Apply FSDP to the root model
         # Do not reshard after forward for root model because its parameters
@@ -560,13 +562,11 @@ def register_parallel_strategy(arg=None, *, name: Optional[str] = None):
     return _register
 
 
-def _pre_shard_combined_projections(
-    module: nn.Module,
-    mesh: DeviceMesh,
-    mp_policy: Optional[MixedPrecisionPolicy],
-    offload_policy: Optional[OffloadPolicy] = None,
-) -> None:
-    """Pre-shard combined projection modules (qkv_proj, gate_up_proj) on dim 1.
+def _make_combined_proj_shard_fn(
+    *modules: nn.Module,
+) -> Optional[callable]:
+    """Return a shard_placement_fn for fully_shard that shards combined projection
+    parameters on dim 1 instead of the default dim 0, without creating separate FSDP units.
 
     Combined QKV and gate_up projections use interleaved layouts on dim 0
     (grouping Q/K/V rows or gate/up rows).  Standard FSDP ``Shard(0)`` can
@@ -579,32 +579,36 @@ def _pre_shard_combined_projections(
     state-dict adapter's ``_gather_1d_if_needed`` gathers them when the local
     shard doesn't align with interleaved group boundaries.
 
-    Follows the same pattern as MoE expert sharding
-    (``nemo_automodel/components/moe/parallelizer.py``).
+    Returns None when no combined projections are found (caller should omit
+    shard_placement_fn so FSDP uses its default behaviour).
     """
     try:
         from nemo_automodel.components.models.common.combined_projection.combined_mlp import CombinedGateUpMLP
         from nemo_automodel.components.models.common.combined_projection.combined_qkv import CombinedQKVAttentionMixin
     except ImportError:
-        return
+        return None
 
-    _shard_fn = lambda p: Shard(1) if p.ndim >= 2 else Shard(0)
+    combined_param_ids: set[int] = set()
+    for module in modules:
+        for sub in module.modules():
+            target = None
+            if isinstance(sub, CombinedQKVAttentionMixin) and hasattr(sub, "qkv_proj"):
+                target = sub.qkv_proj
+            elif isinstance(sub, CombinedGateUpMLP) and hasattr(sub, "gate_up_proj"):
+                target = sub.gate_up_proj
+            if target is not None:
+                for p in target.parameters():
+                    combined_param_ids.add(id(p))
 
-    for sub in module.modules():
-        target = None
-        if isinstance(sub, CombinedQKVAttentionMixin) and hasattr(sub, "qkv_proj"):
-            target = sub.qkv_proj
-        elif isinstance(sub, CombinedGateUpMLP) and hasattr(sub, "gate_up_proj"):
-            target = sub.gate_up_proj
+    if not combined_param_ids:
+        return None
 
-        if target is not None and not isinstance(target, FSDPModule):
-            fully_shard(
-                target,
-                mesh=mesh,
-                mp_policy=mp_policy,
-                offload_policy=offload_policy,
-                shard_placement_fn=_shard_fn,
-            )
+    def shard_fn(p: nn.Parameter) -> Shard:
+        if id(p) in combined_param_ids and p.ndim >= 2:
+            return Shard(1)
+        return Shard(0)
+
+    return shard_fn
 
 
 def _patch_dtensor_spec_hash_for_symint() -> None:
@@ -883,6 +887,8 @@ def apply_fsdp2_sharding_recursively(
     pp_enabled: bool = False,
     enable_fsdp2_prefetch: bool = True,
     fsdp_layer_group_size: int = 1,
+    fsdp2_backward_prefetch_depth: int = 2,
+    fsdp2_forward_prefetch_depth: int = 1,
 ) -> None:
     """
     Recursively apply FSDP2 sharding to modules, with optimizations for ModuleList.
@@ -924,7 +930,7 @@ def apply_fsdp2_sharding_recursively(
 
         # Recurse into any nested ModuleLists first (unchanged behavior).
         for layer_id, child_module in nested_lists:
-            apply_fsdp2_sharding_recursively(child_module, mesh, mp_policy, offload_policy, pp_enabled, enable_fsdp2_prefetch, fsdp_layer_group_size)
+            apply_fsdp2_sharding_recursively(child_module, mesh, mp_policy, offload_policy, pp_enabled, enable_fsdp2_prefetch, fsdp_layer_group_size, fsdp2_backward_prefetch_depth, fsdp2_forward_prefetch_depth)
 
         # Only group when all children are flat layers — no nested ModuleLists mixed in.
         if fsdp_layer_group_size > 1 and len(flat_layers) > 0 and len(nested_lists) == 0:
@@ -935,8 +941,6 @@ def apply_fsdp2_sharding_recursively(
             groups = []
             for start in range(0, len(flat_layers), g):
                 chunk = flat_layers[start : start + g]
-                for child in chunk:
-                    _pre_shard_combined_projections(child, mesh, mp_policy, offload_policy)
                 if len(chunk) == 1:
                     groups.append(chunk[0])
                 else:
@@ -951,12 +955,16 @@ def apply_fsdp2_sharding_recursively(
                     reshard_after_forward = False
                 else:
                     reshard_after_forward = group_id < n_groups - 1
+                # Build shard_placement_fn that uses Shard(1) for combined projection
+                # parameters (qkv_proj, gate_up_proj) without creating separate FSDP units.
+                shard_fn = _make_combined_proj_shard_fn(group_unit)
                 fully_shard(
                     group_unit,
                     mesh=mesh,
                     mp_policy=mp_policy,
                     reshard_after_forward=reshard_after_forward,
                     offload_policy=offload_policy,
+                    **({"shard_placement_fn": shard_fn} if shard_fn is not None else {}),
                 )
                 module[group_id] = group_unit
 
@@ -966,9 +974,9 @@ def apply_fsdp2_sharding_recursively(
             )
         else:
             for enum_id, (layer_key, child_module) in enumerate(flat_layer_items):
-                # Pre-shard combined projection submodules on dim 1 so that
-                # the parent fully_shard (dim 0) skips them automatically.
-                _pre_shard_combined_projections(child_module, mesh, mp_policy, offload_policy)
+                # Build shard_placement_fn that uses Shard(1) for combined projection
+                # parameters (qkv_proj, gate_up_proj) without creating separate FSDP units.
+                shard_fn = _make_combined_proj_shard_fn(child_module)
 
                 # With PP: keep weights gathered across microbatches (no per-microbatch all-gather).
                 # Without PP: reshard all but last layer to enable forward+backward weight prefetching.
@@ -982,6 +990,7 @@ def apply_fsdp2_sharding_recursively(
                     mp_policy=mp_policy,
                     reshard_after_forward=reshard_after_forward,
                     offload_policy=offload_policy,
+                    **({"shard_placement_fn": shard_fn} if shard_fn is not None else {}),
                 )
                 module[layer_key] = child_module
 
@@ -989,21 +998,24 @@ def apply_fsdp2_sharding_recursively(
         # With PP, reshard_after_forward=False so weights are always gathered — no prefetch needed.
         if not pp_enabled and enable_fsdp2_prefetch:
             fsdp_units = [c for _, c in flat_layer_items if not _is_container(c)]
-            for i in range(len(fsdp_units) - 1):
-                fsdp_units[i].set_modules_to_forward_prefetch([fsdp_units[i + 1]])
-            # Backward prefetch: fire 2 layers early so the AllGather for layer i-2 runs
-            # during layer i-1's ~5ms backward compute and is ready when layer i-2 starts.
-            # FSDP2 post-backward hooks fire at END of each layer's backward, so 1-ahead
-            # triggers just as the next layer starts (0.477ms exposed). By also issuing
-            # a 2-ahead trigger we hide AllGather behind the prior layer's compute.
+            if fsdp2_forward_prefetch_depth > 0:
+                for i in range(len(fsdp_units) - 1):
+                    targets = [fsdp_units[i + j] for j in range(1, fsdp2_forward_prefetch_depth + 1) if i + j < len(fsdp_units)]
+                    if targets:
+                        fsdp_units[i].set_modules_to_forward_prefetch(targets)
+            # Backward prefetch: fire N layers early so AllGather runs during prior layers'
+            # compute. depth=2 hides AllGather behind compute; depth=1 reduces peak memory
+            # (only 1 extra unsharded layer at a time) at a small throughput cost.
             for i in range(1, len(fsdp_units)):
-                targets = [fsdp_units[i - 1]]          # 1-ahead: ensures correctness
-                if i >= 2:
-                    targets.append(fsdp_units[i - 2])  # 2-ahead: hides AllGather behind compute
-                fsdp_units[i].set_modules_to_backward_prefetch(targets)
+                targets = []
+                for d in range(1, fsdp2_backward_prefetch_depth + 1):
+                    if i - d >= 0:
+                        targets.append(fsdp_units[i - d])
+                if targets:
+                    fsdp_units[i].set_modules_to_backward_prefetch(targets)
     else:
         for name, sub_module in module.named_children():
-            apply_fsdp2_sharding_recursively(sub_module, mesh, mp_policy, offload_policy, pp_enabled, enable_fsdp2_prefetch, fsdp_layer_group_size)
+            apply_fsdp2_sharding_recursively(sub_module, mesh, mp_policy, offload_policy, pp_enabled, enable_fsdp2_prefetch, fsdp_layer_group_size, fsdp2_backward_prefetch_depth, fsdp2_forward_prefetch_depth)
 
 
 def get_hf_tp_shard_plan(model):
@@ -1608,6 +1620,8 @@ def fsdp2_strategy_parallelize(
     prioritize_all_gather: bool = False,
     fsdp_layer_group_size: int = 1,
     fsdp2_no_cat_array: bool = False,
+    fsdp2_backward_prefetch_depth: int = 2,
+    fsdp2_forward_prefetch_depth: int = 1,
 ):
     """
     Apply parallelisms and activation checkpointing to the model.
@@ -1669,6 +1683,8 @@ def fsdp2_strategy_parallelize(
         prioritize_all_gather=prioritize_all_gather,
         fsdp_layer_group_size=fsdp_layer_group_size,
         fsdp2_no_cat_array=fsdp2_no_cat_array,
+        fsdp2_backward_prefetch_depth=fsdp2_backward_prefetch_depth,
+        fsdp2_forward_prefetch_depth=fsdp2_forward_prefetch_depth,
     )
 
 

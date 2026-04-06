@@ -88,6 +88,16 @@ class FSDP2Config:
             Only affects ModuleList-structured layer stacks (standard HF transformer models).
         fsdp2_no_cat_array (bool): Disable FSDP2 CatArrayBatchedCopy kernel for AllGather
             copy-out, falling back to per-parameter element-wise copies. Default: False.
+        fsdp2_backward_prefetch_depth (int): Number of layers to prefetch ahead during the
+            backward pass. ``2`` (default) fires AllGather 2 layers early, hiding latency
+            behind compute but holding 2 unsharded layers simultaneously. Set to ``1`` to
+            reduce peak memory at a small throughput cost. Only has effect when
+            ``enable_fsdp2_prefetch=True``. Default: 2.
+        fsdp2_forward_prefetch_depth (int): Number of layers to prefetch ahead during the
+            forward pass (including AC recompute during backward). ``1`` (default) prefetches
+            1 layer ahead. Set to ``0`` to disable forward prefetch entirely — saves ~1 layer
+            of unsharded params (~1-2 GB) at the cost of exposed forward AllGather latency.
+            Only has effect when ``enable_fsdp2_prefetch=True``. Default: 1.
     """
 
     sequence_parallel: bool = False
@@ -105,6 +115,8 @@ class FSDP2Config:
     prioritize_all_gather: bool = False
     fsdp_layer_group_size: int = 1
     fsdp2_no_cat_array: bool = False
+    fsdp2_backward_prefetch_depth: int = 2
+    fsdp2_forward_prefetch_depth: int = 1
 
     def __post_init__(self):
         if self.mp_policy is None:

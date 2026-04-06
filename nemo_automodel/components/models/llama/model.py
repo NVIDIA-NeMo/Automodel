@@ -51,7 +51,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.llama.rope_utils import LlamaRotaryEmbedding, apply_rotary_pos_emb
+from nemo_automodel.components.models.llama.rope_utils import LlamaRotaryEmbedding, apply_rotary_pos_emb, apply_rotary_pos_emb_fused
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 
@@ -76,6 +76,7 @@ class LlamaAttention(CombinedQKVAttentionMixin, nn.Module):
         self,
         config: LlamaConfig,
         layer_idx: int,
+        backend: Optional["BackendConfig"] = None,
     ):
         super().__init__()
         self.config = config
@@ -85,6 +86,7 @@ class LlamaAttention(CombinedQKVAttentionMixin, nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
+        self.rope_fusion = getattr(backend, "rope_fusion", False)
 
         if getattr(config, "use_combined_projections", True):
             # Combined QKV projection for improved efficiency
@@ -135,8 +137,12 @@ class LlamaAttention(CombinedQKVAttentionMixin, nn.Module):
         key_states = k.view(hidden_shape).transpose(1, 2)
         value_states = v.view(hidden_shape).transpose(1, 2)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if self.rope_fusion and len(position_embeddings) == 3:
+            cos, sin, freqs_cis = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb_fused(query_states, key_states, freqs_cis)
+        else:
+            cos, sin = position_embeddings[:2]
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         # Handle past_key_values if provided (for generation)
         if past_key_values is not None:
@@ -232,6 +238,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         self.self_attn = LlamaAttention(
             config=config,
             layer_idx=layer_idx,
+            backend=backend,
         )
 
         if getattr(config, "use_combined_projections", True):
@@ -329,7 +336,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.norm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
         )
-        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        self.rotary_emb = LlamaRotaryEmbedding(config=config, rope_fusion=backend.rope_fusion)
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
