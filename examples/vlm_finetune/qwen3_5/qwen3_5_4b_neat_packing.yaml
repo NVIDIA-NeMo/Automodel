@@ -105,3 +105,6 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_name>
+
+ci:
+  recipe_owner: HuiyingLi

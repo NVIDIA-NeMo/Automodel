@@ -99,5 +99,6 @@ optimizer:
 #   save_dir: <your_wandb_save_dir> 
 
 ci:
+  recipe_owner: HuiyingLi
   time: "00:30:00"
   nodes: 2

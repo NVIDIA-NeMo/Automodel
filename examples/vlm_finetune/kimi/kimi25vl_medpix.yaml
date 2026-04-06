@@ -125,5 +125,6 @@ freeze_config:
 #   name: <your_exp_name>
 
 ci:
+  recipe_owner: HuiyingLi
   nodes: 32
   time: "00:30:00"

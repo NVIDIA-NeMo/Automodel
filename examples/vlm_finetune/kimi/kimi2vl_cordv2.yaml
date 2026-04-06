@@ -119,3 +119,6 @@ freeze_config:
 #   project: <your_project_name>
 #   entity: <your_entity_name>
 #   name: kimi2vl_finetune
+
+ci:
+  recipe_owner: HuiyingLi
