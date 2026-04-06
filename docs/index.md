@@ -286,6 +286,7 @@ guides/diffusion/dataset.md
 launcher/overview.md
 launcher/local-workstation.md
 launcher/slurm.md
+launcher/nemo-run.md
 launcher/skypilot.md
 ::::
 

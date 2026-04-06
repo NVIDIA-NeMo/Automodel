@@ -47,6 +47,10 @@ def load_executor_from_file(name: str, executors_file: str) -> Any:
         )
 
     spec = importlib.util.spec_from_file_location("_nemo_run_executors", executors_file)
+    if spec is None or spec.loader is None:
+        raise ImportError(
+            f"Could not load executor definitions from {executors_file}"
+        )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
