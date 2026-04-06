@@ -39,15 +39,17 @@ class TestNEFTune:
     def test_noise_applied_during_training(self):
         model = SimpleModel()
         model.train()
+        input_ids = torch.randint(0, 100, (2, 16))
+
+        torch.manual_seed(42)
+        out_clean = model(input_ids)
+
         neftune = NEFTune(noise_alpha=5.0)
         neftune.activate(model)
+        torch.manual_seed(42)
+        out_noisy = model(input_ids)
 
-        input_ids = torch.randint(0, 100, (2, 16))
-        torch.manual_seed(42)
-        out1 = model(input_ids)
-        torch.manual_seed(42)
-        out2 = model(input_ids)
-        assert not torch.allclose(out1, out2), "NEFTune should add random noise during training"
+        assert not torch.allclose(out_clean, out_noisy), "NEFTune should change output compared to clean forward"
 
         neftune.deactivate(model)
 
