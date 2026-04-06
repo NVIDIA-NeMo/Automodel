@@ -107,6 +107,7 @@ jobs:
         env:
           PAT: ${{ secrets.PAT }}
           UV_PROJECT_ENVIRONMENT: ./venv
+          TORCH_CUDA_ARCH_LIST: "9.0 10.0 12.0"
         shell: bash
         run: |
           echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
@@ -172,6 +173,7 @@ jobs:
             pip install --index-url https://download.pytorch.org/whl/cu128 "torch<=2.8.0"
             pip install numpy packaging psutil pybind11 setuptools wheel wheel_stub
             PIP_ARGS=(--no-build-isolation)
+            export TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0"
           fi
 
           pip install ${PIP_ARGS[@]} .$EXTRA
