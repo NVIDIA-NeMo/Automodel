@@ -93,4 +93,5 @@ lr_scheduler:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  recipe_owner: adil-a
   nodes: 4

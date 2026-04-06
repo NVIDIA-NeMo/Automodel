@@ -116,4 +116,5 @@ nvtx: false
 #   entity: <your-wandb-entity>
 #   name: <your-wandb-exp-name>
 
-
+ci:
+  recipe_owner: HuiyingLi
