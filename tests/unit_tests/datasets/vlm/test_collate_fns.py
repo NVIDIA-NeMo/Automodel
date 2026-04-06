@@ -1843,11 +1843,12 @@ def test_drop_overlong_samples_filters_long(collate_mod):
     short_conv = [{"role": "user", "content": [{"type": "text", "text": "x" * 10}]}]
     long_conv = [{"role": "user", "content": [{"type": "text", "text": "x" * 100}]}]
 
-    result = collate_mod._drop_overlong_samples(
+    result, kept = collate_mod._drop_overlong_samples(
         [short_conv, long_conv], _DropTestProcessor(), max_length=50,
     )
     assert len(result) == 1
     assert result[0] is short_conv
+    assert kept == [0]
 
 
 def test_drop_overlong_samples_keeps_short(collate_mod):
@@ -1855,12 +1856,13 @@ def test_drop_overlong_samples_keeps_short(collate_mod):
     conv1 = [{"role": "user", "content": [{"type": "text", "text": "x" * 10}]}]
     conv2 = [{"role": "user", "content": [{"type": "text", "text": "x" * 20}]}]
 
-    result = collate_mod._drop_overlong_samples(
+    result, kept = collate_mod._drop_overlong_samples(
         [conv1, conv2], _DropTestProcessor(), max_length=50,
     )
     assert len(result) == 2
     assert result[0] is conv1
     assert result[1] is conv2
+    assert kept == [0, 1]
 
 
 def test_drop_overlong_samples_all_long_raises(collate_mod):
@@ -1879,8 +1881,9 @@ def test_drop_overlong_samples_none_max_length_noop(collate_mod):
     convs = [
         [{"role": "user", "content": [{"type": "text", "text": "x" * 9999}]}],
     ]
-    result = collate_mod._drop_overlong_samples(convs, _DropTestProcessor(), max_length=None)
+    result, kept = collate_mod._drop_overlong_samples(convs, _DropTestProcessor(), max_length=None)
     assert result is convs
+    assert kept == [0]
 
 
 def test_default_collate_fn_no_truncation(collate_mod, fake_qwen_utils, monkeypatch):

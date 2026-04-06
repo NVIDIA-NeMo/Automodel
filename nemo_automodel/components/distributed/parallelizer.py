@@ -190,21 +190,44 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 except Exception:
                     pass
 
-            for i, layer in enumerate(layers):
-                if hasattr(layer, "mlp"):
-                    layers[i].mlp = checkpoint_wrapper(layer.mlp)
-                if hasattr(layer, "self_attn"):
-                    layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
+            # For HF-native models in transformers >= 5.3.0, GradientCheckpointingLayer.__call__
+            # applies torch.utils.checkpoint at full-layer granularity when gradient_checkpointing=True.
+            # This avoids OOM memory fragmentation from 4 × N_layers CheckpointWrapper sub-module
+            # objects (mlp/self_attn/layernorms) + transformers 5.3.0 output_capturing.py overhead.
+            _use_hf_native_grad_ckpt = False
+            try:
+                from transformers.modeling_layers import (
+                    GradientCheckpointingLayer as _HFGradLayer,
+                )
 
-                if hasattr(layer, "input_layernorm"):
-                    layers[i].input_layernorm = checkpoint_wrapper(
-                        layers[i].input_layernorm  # type: ignore
-                    )
+                _use_hf_native_grad_ckpt = (
+                    bool(layers)
+                    and layers[0].__class__.__module__.startswith("transformers.")
+                    and isinstance(layers[0], _HFGradLayer)
+                    and getattr(model, "supports_gradient_checkpointing", False)
+                    and hasattr(model, "gradient_checkpointing_enable")
+                )
+            except ImportError:
+                pass  # transformers < 5.3.0, fall through to sub-module wrapping
 
-                if hasattr(layer, "post_attention_layernorm"):
-                    layers[i].post_attention_layernorm = checkpoint_wrapper(
-                        layers[i].post_attention_layernorm  # type: ignore
-                    )
+            if _use_hf_native_grad_ckpt:
+                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+            else:
+                for i, layer in enumerate(layers):
+                    if hasattr(layer, "mlp"):
+                        layers[i].mlp = checkpoint_wrapper(layer.mlp)
+                    if hasattr(layer, "self_attn"):
+                        layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
+
+                    if hasattr(layer, "input_layernorm"):
+                        layers[i].input_layernorm = checkpoint_wrapper(
+                            layers[i].input_layernorm  # type: ignore
+                        )
+
+                    if hasattr(layer, "post_attention_layernorm"):
+                        layers[i].post_attention_layernorm = checkpoint_wrapper(
+                            layers[i].post_attention_layernorm  # type: ignore
+                        )
 
         # Set up mixed precision policy
         if not mp_policy:
@@ -268,6 +291,36 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
             for layer in model.backbone.layers:
                 if layer.block_type == "mlp":
                     parallelize_module(layer, tp_mesh, mlp_tp_plan)
+
+        # Set up context parallel for Mamba and Attention layers
+        cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
+        if cp_mesh is not None and cp_mesh.size() > 1:
+            cp_group = cp_mesh.get_group()
+
+            for layer in layers:
+                if hasattr(layer, "block_type") and layer.block_type == "mamba":
+                    from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+
+                    mixer = layer.mixer
+                    mixer.cp = MambaContextParallel(
+                        cp_group=cp_group,
+                        num_heads=mixer.num_heads,
+                        head_dim=mixer.head_dim,
+                        n_groups=mixer.n_groups,
+                        d_state=mixer.ssm_state_size,
+                        mixer=mixer,
+                    )
+                elif hasattr(layer, "block_type") and layer.block_type == "attention":
+                    from transformer_engine.pytorch.attention import DotProductAttention
+
+                    attn_module = layer.mixer.attn_module
+                    if isinstance(attn_module, DotProductAttention):
+                        attn_module.set_context_parallel_group(
+                            cp_group,
+                            torch.distributed.get_process_group_ranks(cp_group),
+                            torch.cuda.Stream(),
+                            cp_comm_type="p2p",
+                        )
 
         if activation_checkpointing:
             for i in range(len(layers)):

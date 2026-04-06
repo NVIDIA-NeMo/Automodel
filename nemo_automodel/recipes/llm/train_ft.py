@@ -85,6 +85,7 @@ from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     _supports_seq_lens,
+    filter_forward_kwargs,
     resolve_trust_remote_code,
 )
 from nemo_automodel.recipes._dist_setup import setup_distributed
@@ -114,11 +115,21 @@ def _get_model_name(cfg_model):
         return None
 
 
-def _uses_te_dot_product_attention(cfg_model):
+def _uses_te_dot_product_attention(model_or_cfg):
+    """Check whether the model uses TE DotProductAttention.
+
+    Accepts either an instantiated nn.Module (preferred — inspects actual modules)
+    or a config object (fallback — checks backend.attn string).
+    """
+    if isinstance(model_or_cfg, torch.nn.Module):
+        try:
+            from transformer_engine.pytorch.attention import DotProductAttention
+        except ImportError:
+            return False
+        return any(isinstance(m, DotProductAttention) for m in model_or_cfg.modules())
+    # Config fallback for call sites before model is built
     return (
-        True
-        if hasattr(cfg_model, "backend") and hasattr(cfg_model.backend, "attn") and cfg_model.backend.attn == "te"
-        else False
+        hasattr(model_or_cfg, "backend") and hasattr(model_or_cfg.backend, "attn") and model_or_cfg.backend.attn == "te"
     )
 
 
@@ -549,17 +560,34 @@ def build_dataloader(
             if "shuffle" in cfg_dl:
                 del cfg_dl.shuffle
 
-            dist_sampler_kwargs = {
-                "num_replicas": dp_world_size,
-                "rank": dp_rank,
-                "shuffle": shuffle,
-            }
-            sampler = StatefulDistributedSampler(
-                ds,
-                seed=seed,
-                drop_last=True,
-                **dist_sampler_kwargs,
-            )
+            group_by_length = cfg_dl.get("group_by_length", False)
+            if "group_by_length" in cfg_dl:
+                del cfg_dl.group_by_length
+
+            if group_by_length:
+                from nemo_automodel.components.datasets.llm.length_grouped_sampler import (
+                    LengthGroupedSampler as LLMLengthGroupedSampler,
+                )
+
+                sampler = LLMLengthGroupedSampler(
+                    dataset=ds,
+                    batch_size=local_batch_size,
+                    seed=seed,
+                    num_replicas=dp_world_size,
+                    rank=dp_rank,
+                )
+            else:
+                dist_sampler_kwargs = {
+                    "num_replicas": dp_world_size,
+                    "rank": dp_rank,
+                    "shuffle": shuffle,
+                }
+                sampler = StatefulDistributedSampler(
+                    ds,
+                    seed=seed,
+                    drop_last=True,
+                    **dist_sampler_kwargs,
+                )
             dl_kwargs = {"sampler": sampler, "batch_size": local_batch_size}
             if pp_enabled:
                 dl_kwargs["drop_last"] = True
@@ -1285,7 +1313,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         train_ctx, batch = make_cp_batch_and_ctx(
             self.device_mesh,
             batch,
-            use_te=_uses_te_dot_product_attention(self.cfg.model) and _uses_thd_collater(self.cfg.dataloader),
+            use_te=_uses_te_dot_product_attention(
+                self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
+            )
+            and _uses_thd_collater(self.cfg.dataloader),
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
             num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
         )
@@ -1339,6 +1370,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else nullcontext()
             )
             with train_ctx(), sync_ctx, fp8_ctx:
+                batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)

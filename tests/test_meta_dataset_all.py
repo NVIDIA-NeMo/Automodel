@@ -36,8 +36,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from nemo_automodel.components.datasets.vlm.datasets import (
     _convert_sharegpt_to_conversation,
     _load_json_or_jsonl,
-    _resolve_lmdb_image,
 )
+from nemo_automodel.components.datasets.vlm.utils import _resolve_lmdb_image
 
 
 def load_first_n_lines(file_path, n):

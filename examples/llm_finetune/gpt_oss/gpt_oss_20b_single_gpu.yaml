@@ -14,6 +14,8 @@
 
 # Adjust batch config as needed.
 # Current config targeting DGX Spark
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 128
   local_batch_size: 32

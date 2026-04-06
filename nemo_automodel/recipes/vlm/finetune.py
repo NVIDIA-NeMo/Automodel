@@ -64,7 +64,7 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
+from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, filter_forward_kwargs
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -346,7 +346,12 @@ def build_dataloader(
         processor_kwargs = {}
 
         with FirstRankPerNode():
-            if cfg_processor is not None and hasattr(cfg_processor, "instantiate"):
+            # Ensure the processor has a _target_ attribute too
+            if (
+                cfg_processor is not None
+                and hasattr(cfg_processor, "instantiate")
+                and hasattr(cfg_processor, "_target_")
+            ):
                 processor = cfg_processor.instantiate()
             elif cfg_processor is not None:
                 processor_kwargs = cfg_processor.to_dict()
@@ -442,8 +447,8 @@ def build_dataloader(
             else:
                 processor_type = type(processor).__name__
                 if processor_type not in COLLATE_FNS:
-                    processor_type = "default"
                     logging.warning(f"You are using {processor_type} with default collate function.")
+                    processor_type = "default"
                 collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
 
         if hasattr(ds, "robust_collate"):
@@ -956,6 +961,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 else nullcontext()
             )
             with train_ctx(), sync_ctx:
+                batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)
@@ -1153,6 +1159,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
                 with train_ctx():
+                    batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                         out = self.model_parts[0](logits_to_keep=1, **batch)
                     else:

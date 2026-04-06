@@ -109,17 +109,18 @@ def _passthrough_create_causal_mask(
 ):
     """Replacement for ``create_causal_mask`` that passes through packed masks.
 
-    If the attention mask is already 4D (block-causal from sdpa collater) or
-    contains packed-sequence indices (values > 1), return it unchanged.
-    Otherwise, fall back to the original ``create_causal_mask`` from
-    ``transformers.masking_utils``.
+    FA2 handles masking internally, so always pass through.  For non-FA2
+    backends, pass through packed masks but delegate normal 2D masks to HF.
     """
+    if config is not None and getattr(config, "_attn_implementation", None) == "flash_attention_2":
+        return attention_mask
+
     if attention_mask is not None:
         if attention_mask.ndim == 4:
             return attention_mask
         if attention_mask.max() > 1:
             return attention_mask
-    # Not a packed mask — delegate to the original HF implementation.
+
     from transformers.masking_utils import create_causal_mask
 
     embeds = inputs_embeds if inputs_embeds is not None else input_embeds

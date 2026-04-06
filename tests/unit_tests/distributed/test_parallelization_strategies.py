@@ -122,6 +122,9 @@ def mock_device_mesh():
     dp_shard_mesh.ndim = 1
     tp_mesh.ndim = 1
 
+    # Mesh dimension names used by parallelizer to check for optional submeshes (e.g. "cp")
+    mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp", "tp")
+
     # Configure mesh access
     mesh.__getitem__.side_effect = lambda key: {
         "dp_replicate": dp_replicate_mesh,

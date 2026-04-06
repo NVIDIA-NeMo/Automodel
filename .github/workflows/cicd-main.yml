@@ -28,6 +28,7 @@ concurrency:
 permissions:
   id-token: write
   contents: read
+  pull-requests: read
 
 env:
   container-registry: nemoci.azurecr.io
@@ -45,7 +46,7 @@ jobs:
       NVIDIA_MANAGEMENT_ORG_PAT: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
 
   linting:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -76,7 +77,7 @@ jobs:
           uv run --active ruff format --check --verbose .
 
   import_linting:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -105,7 +106,7 @@ jobs:
           uv run lint-imports --debug --verbose --no-cache
 
   type_checking:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -213,7 +214,7 @@ jobs:
           dockerfile-path: "./docker/Dockerfile"
           has-azure-credentials: "true"
           PAT: ${{ secrets.PAT }}
-          repo-name: "Automodel"
+          repo-name: ${{ vars.CI_REPO_NAME || 'Automodel' }}
 
   cicd-unit-tests:
     strategy:
@@ -254,7 +255,7 @@ jobs:
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
-          container-image: ${{ env.container-registry }}/automodel:${{ github.sha }}
+          container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
           runner: ${{ matrix.runner }}
 
   cicd-e2e-tests:
@@ -303,6 +304,16 @@ jobs:
             timeout: 20
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          - test-name: L2_Context_Parallel
+            test-folder: context_parallel
+            timeout: 20
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          - test-name: L2_Retrieval
+            test-folder: retrieval
+            timeout: 20
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
     needs: [pre-flight, cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
@@ -329,7 +340,7 @@ jobs:
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ matrix.test-data-path }}
-          container-image: ${{ env.container-registry }}/automodel:${{ github.sha }}
+          container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
           runner: ${{ matrix.runner }}
 
   Nemo_CICD_Test:
@@ -381,6 +392,7 @@ jobs:
       )
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
+      && vars.ENABLE_CODECOV == 'true'
     environment: nemo-ci
     steps:
       - name: Generate fake coverage report
@@ -406,6 +418,7 @@ jobs:
         || success()
       )
       && !cancelled()
+      && vars.ENABLE_CODECOV == 'true'
     strategy:
       matrix:
         flag: [unit-test, e2e]

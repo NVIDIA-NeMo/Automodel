@@ -28,6 +28,7 @@ from nemo_automodel._transformers.auto_model import (
     _get_next_fallback_attn,
     _init_model,
     _patch_attention,
+    _patch_remote_code_compat,
 )
 from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
 from nemo_automodel._transformers.model_init import (
@@ -38,6 +39,7 @@ from nemo_automodel._transformers.model_init import (
     _patched_get_init_context,
     no_hf_meta_device,
 )
+from nemo_automodel.components.checkpoint.utils import _get_checkpoint_tensor_dtypes
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
 
@@ -490,6 +492,21 @@ class TestConsumeConfigOverrides:
         assert "explicit_param" in kwargs
 
 
+class TestGetCheckpointTensorDtypes:
+    def test_uses_provided_state_dict_dtypes(self):
+        state_dict = {
+            "linear.weight": torch.empty(2, 2, dtype=torch.bfloat16),
+            "norm.weight": torch.empty(2, dtype=torch.float32),
+        }
+
+        result = _get_checkpoint_tensor_dtypes("ignored", object(), {"state_dict": state_dict})
+
+        assert result == {
+            "linear.weight": torch.bfloat16,
+            "norm.weight": torch.float32,
+        }
+
+
 class TestFilterKwargsForInit:
     """Test cases for _filter_kwargs_for_init function."""
 
@@ -654,6 +671,51 @@ class TestModelMappingKeyErrorFallback:
         # Fallback: type(model) = FakeModel
         mock_wrap.assert_called_once_with(FakeModel)
 
+    def test_force_hf_pretrained_restores_checkpoint_dtype_per_tensor(self):
+        """force_hf pretrained path should restore each tensor dtype from the checkpoint."""
+
+        class FakeConfig:
+            name_or_path = "test-model"
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(2, 2, bias=False)
+                self.norm = torch.nn.LayerNorm(2)
+
+        fake_config = FakeConfig()
+        fake_model = FakeModel().to(torch.float32)
+
+        cls = self._make_cls({})
+        cls._from_pretrained_parent_class = MagicMock(return_value=fake_model)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch(
+                "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+                return_value={
+                    "linear.weight": torch.bfloat16,
+                    "norm.weight": torch.float32,
+                },
+            ),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
+        ):
+            mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
+            is_custom, model = _init_model(
+                cls,
+                "test-model",
+                attn_implementation="eager",
+                torch_dtype="auto",
+                quantization_config=None,
+                force_hf=True,
+            )
+
+        assert is_custom is False
+        assert cls._from_pretrained_parent_class.call_args.kwargs["torch_dtype"] == "auto"
+        assert fake_model.linear.weight.dtype == torch.bfloat16
+        assert fake_model.norm.weight.dtype == torch.float32
+        mock_wrap.assert_called_once_with(FakeModel)
+
     def test_fallback_path_known_config_type(self):
         """Fallback (non-force_hf, no custom model) path: _model_mapping succeeds."""
 
@@ -686,6 +748,50 @@ class TestModelMappingKeyErrorFallback:
             )
 
         assert is_custom is False
+        mock_wrap.assert_called_once_with(FakeModel)
+
+    def test_fallback_pretrained_restores_tied_weight_checkpoint_dtype(self):
+        """Fallback pretrained path should preserve tied-weight checkpoint dtypes."""
+
+        class FakeConfig:
+            name_or_path = "test-model"
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = torch.nn.Embedding(4, 3)
+                self.lm_head = torch.nn.Linear(3, 4, bias=False)
+                self.lm_head.weight = self.embed_tokens.weight
+
+        fake_config = FakeConfig()
+        fake_model = FakeModel().to(torch.float32)
+
+        cls = self._make_cls({})
+        cls._from_pretrained_parent_class = MagicMock(return_value=fake_model)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
+            patch(
+                "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+                return_value={"lm_head.weight": torch.bfloat16},
+            ),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
+        ):
+            mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
+            is_custom, model = _init_model(
+                cls,
+                "test-model",
+                attn_implementation="eager",
+                torch_dtype=torch.bfloat16,
+                quantization_config=None,
+                force_hf=False,
+            )
+
+        assert is_custom is False
+        assert cls._from_pretrained_parent_class.call_args.kwargs["torch_dtype"] == torch.bfloat16
+        assert fake_model.lm_head.weight is fake_model.embed_tokens.weight
+        assert fake_model.lm_head.weight.dtype == torch.bfloat16
+        assert fake_model.embed_tokens.weight.dtype == torch.bfloat16
         mock_wrap.assert_called_once_with(FakeModel)
 
     def test_fallback_path_skips_incompatible_shared_arch_custom_model(self):
@@ -1081,3 +1187,151 @@ class TestNoHfMetaDevice:
                 assert _get_hf_meta_device_disabled()
             assert _get_hf_meta_device_disabled()
         assert not _get_hf_meta_device_disabled()
+
+
+# =============================================================================
+# Tests for _patch_remote_code_compat
+# =============================================================================
+
+
+class TestPatchRemoteCodeCompat:
+    """Tests for the remote-code compatibility patch."""
+
+    @pytest.fixture(autouse=True)
+    def reset_patch_state(self):
+        """Reset the global patch state and restore original _finalize_model_loading."""
+        from transformers import PreTrainedModel
+
+        import nemo_automodel._transformers.auto_model as mod
+
+        orig_finalize = PreTrainedModel._finalize_model_loading
+        orig_flag = mod._remote_code_compat_applied
+        mod._remote_code_compat_applied = False
+        yield
+        PreTrainedModel._finalize_model_loading = orig_finalize
+        mod._remote_code_compat_applied = orig_flag
+
+    def test_patch_is_idempotent(self):
+        """Calling _patch_remote_code_compat twice should not double-wrap."""
+        from transformers import PreTrainedModel
+
+        _patch_remote_code_compat()
+        first = PreTrainedModel._finalize_model_loading
+        _patch_remote_code_compat()
+        second = PreTrainedModel._finalize_model_loading
+        assert first is second
+
+    def test_sets_all_tied_weights_keys(self):
+        """Patch should set all_tied_weights_keys if missing."""
+        from transformers import PreTrainedModel
+
+        _patch_remote_code_compat()
+
+        # Create a mock model missing the attribute
+        model = MagicMock(spec=[])
+        model.get_expanded_tied_weights_keys = MagicMock(return_value=["some.key"])
+        model.config = MagicMock()
+        model.config.use_cache = False
+
+        # The model class uses base tie_weights (no wrapping needed)
+        model_cls = type(model)
+        model_cls.tie_weights = PreTrainedModel.tie_weights
+
+        load_config = MagicMock()
+        loading_info = MagicMock()
+
+        # The patched finalize will call _orig_finalize which may fail on mock,
+        # but we can check the attribute was set before that point
+        try:
+            PreTrainedModel._finalize_model_loading(model, load_config, loading_info)
+        except Exception:
+            pass
+
+        assert hasattr(model, "all_tied_weights_keys")
+
+    def test_wraps_old_tie_weights_signature(self):
+        """Patch should wrap tie_weights that lacks `missing_keys` param."""
+        from transformers import PreTrainedModel
+
+        _patch_remote_code_compat()
+
+        # Create a real class with an old-style tie_weights (no missing_keys param)
+        class OldModel(PreTrainedModel):
+            config_class = type("DummyConfig", (), {"model_type": "dummy"})
+
+            def __init__(self):
+                # Skip PreTrainedModel.__init__ — we just need the class hierarchy
+                pass
+
+            def tie_weights(self):
+                self.tied = True
+
+        # Simulate what _compat_finalize does: inspect type(model) and wrap tie_weights
+        model = object.__new__(OldModel)
+        model.all_tied_weights_keys = []
+        model.config = types.SimpleNamespace(use_cache=False)
+        model.get_expanded_tied_weights_keys = lambda all_submodels=True: []
+
+        load_config = MagicMock()
+        loading_info = MagicMock()
+
+        try:
+            PreTrainedModel._finalize_model_loading(model, load_config, loading_info)
+        except Exception:
+            pass
+
+        # The wrapper should now accept missing_keys without TypeError
+        try:
+            OldModel.tie_weights(model, missing_keys=["foo"])
+        except TypeError:
+            pytest.fail("Wrapped tie_weights should accept missing_keys kwarg")
+
+    def test_sets_missing_config_defaults(self):
+        """Patch should set use_cache=False if missing from config."""
+        from transformers import PreTrainedModel
+
+        _patch_remote_code_compat()
+
+        model = MagicMock(spec=[])
+        model.get_expanded_tied_weights_keys = MagicMock(return_value=[])
+        model.config = types.SimpleNamespace()  # no use_cache attribute
+
+        model_cls = type(model)
+        model_cls.tie_weights = PreTrainedModel.tie_weights
+
+        load_config = MagicMock()
+        loading_info = MagicMock()
+
+        try:
+            PreTrainedModel._finalize_model_loading(model, load_config, loading_info)
+        except Exception:
+            pass
+
+        assert hasattr(model.config, "use_cache")
+        assert model.config.use_cache is False
+
+    def test_compatible_model_unaffected(self):
+        """A model that already has all required attributes should pass through unchanged."""
+        from transformers import PreTrainedModel
+
+        _patch_remote_code_compat()
+
+        model = MagicMock(spec=[])
+        model.all_tied_weights_keys = ["existing.key"]
+        model.config = MagicMock()
+        model.config.use_cache = True  # already set
+
+        model_cls = type(model)
+        model_cls.tie_weights = PreTrainedModel.tie_weights
+
+        load_config = MagicMock()
+        loading_info = MagicMock()
+
+        try:
+            PreTrainedModel._finalize_model_loading(model, load_config, loading_info)
+        except Exception:
+            pass
+
+        # Existing values should be preserved
+        assert model.all_tied_weights_keys == ["existing.key"]
+        assert model.config.use_cache is True
