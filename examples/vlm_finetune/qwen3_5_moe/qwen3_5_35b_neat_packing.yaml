@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# To run this recipe:
-#   automodel examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml --nproc-per-node 8
-# Adjust --nproc-per-node to the number of GPUs available on your machine.
+# Qwen3.5-MoE-35B-A3B VLM fine-tuning with EP=4 PP=2 and neat packing.
+#
+# Based on the working qwen3_5_35b.yaml EP=4 PP=2 config with packed_sequence
+# added. Requires transformers >= 5.3.0 (Qwen3.5-MoE support).
+#
+# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py \
+#   --config examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b_neat_packing.yaml
 
 recipe: FinetuneRecipeForVLM
 
 step_scheduler:
-  global_batch_size: 16
-  local_batch_size: 1
+  global_batch_size: 32
+  local_batch_size: 2
   ckpt_every_steps: 1000
   val_every_steps: 100
   num_epochs: 2
@@ -38,6 +42,7 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3.5-35B-A3B
+  attn_implementation: flash_attention_2
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
@@ -53,8 +58,8 @@ processor:
   pretrained_model_name_or_path: Qwen/Qwen3.5-35B-A3B
 
 checkpoint:
-  enabled: true
-  checkpoint_dir: /checkpoints/qwen3_5_35b/
+  enabled: false
+  checkpoint_dir: /checkpoints/qwen3_5_35b_packed/
   model_save_format: safetensors
   save_consolidated: false
 
@@ -62,11 +67,20 @@ distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 1
+  pp_size: 2
   dp_replicate_size: 1
-  ep_size: 8
+  ep_size: 4
 
   sequence_parallel: false
+
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    layers_per_stage: 10
+    patch_inner_model: false
+    patch_causal_lm_model: false
 
 freeze_config:
   freeze_vision_tower: true
@@ -81,12 +95,18 @@ dataset:
   path_or_dataset: mmoukouba/MedPix-VQA
   split: train
 
+packed_sequence:
+  pretokenize: true
+  max_length: 4096
+  pack_size: 4096
+  collate_max_length: 4096
+  packing_ratio: 0.9
+  drop_long_samples: true
+
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  num_workers: 1
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
-    max_length: 2048
+  num_workers: 0
+  pin_memory: true
   drop_last: true
 
 validation_dataset:
@@ -108,12 +128,7 @@ optimizer:
   lr: 5.0e-6
   weight_decay: 0.1
 
-ci:
-  time: "00:30:00"
-
-# Uncomment and configure for W&B logging
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_name>
-#   save_dir: <your_wandb_save_dir>
