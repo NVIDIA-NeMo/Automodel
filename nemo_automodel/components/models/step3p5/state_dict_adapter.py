@@ -81,6 +81,7 @@ def _create_dtensor_from_local_or_reference(
     reference_dtensor: Optional["torch.Tensor"],
     device_mesh: Optional["DeviceMesh"] = None,
     rank: Optional[int] = None,
+    placements_override: Optional[tuple] = None,
 ) -> torch.Tensor:
     """Create a DTensor from a local tensor.
 
@@ -93,6 +94,9 @@ def _create_dtensor_from_local_or_reference(
         reference_dtensor: Optional DTensor to copy mesh/placements from
         device_mesh: Device mesh for EP (used if reference is not DTensor)
         rank: Current rank for device placement
+        placements_override: If provided, use these placements instead of the
+            reference DTensor's placements. Useful after transposing the local
+            tensor, where shard dimensions need to be swapped.
 
     Returns:
         DTensor if mesh is available, otherwise local_tensor
@@ -100,8 +104,8 @@ def _create_dtensor_from_local_or_reference(
     from torch.distributed._tensor import DTensor
 
     if reference_dtensor is not None and is_dtensor(reference_dtensor):
-        # Use the exact same mesh and placements from the reference
-        return DTensor.from_local(local_tensor, reference_dtensor.device_mesh, reference_dtensor.placements)
+        placements = placements_override if placements_override is not None else reference_dtensor.placements
+        return DTensor.from_local(local_tensor, reference_dtensor.device_mesh, placements)
     elif device_mesh is not None:
         # Create DTensor using the provided mesh
         return create_dtensor_from_local(local_tensor, device_mesh, rank)
@@ -252,17 +256,14 @@ class Step3p5StateDictAdapter(StateDictAdapter):
                         native_key = f"{prefix}layers.{layer_num}.moe.experts.gate_and_up_projs"
                         # Create DTensor using reference or device_mesh.
                         # Swap Shard(1)↔Shard(2) because we transposed dims 1 and 2.
-                        if reference_dtensor is not None and is_dtensor(reference_dtensor):
-                            swapped_placements = _swap_shard_placements_1_2(reference_dtensor.placements)
-                            from torch.distributed._tensor import DTensor
-
-                            state_dict[native_key] = DTensor.from_local(
-                                merged, reference_dtensor.device_mesh, swapped_placements
-                            )
-                        else:
-                            state_dict[native_key] = _create_dtensor_from_local_or_reference(
-                                merged, None, device_mesh, rank
-                            )
+                        swapped = (
+                            _swap_shard_placements_1_2(reference_dtensor.placements)
+                            if reference_dtensor is not None and is_dtensor(reference_dtensor)
+                            else None
+                        )
+                        state_dict[native_key] = _create_dtensor_from_local_or_reference(
+                            merged, reference_dtensor, device_mesh, rank, placements_override=swapped
+                        )
 
                         # Clean up
                         del pending_gate_up[layer_key]
@@ -278,17 +279,14 @@ class Step3p5StateDictAdapter(StateDictAdapter):
                     native_key = f"{prefix}layers.{layer_num}.moe.experts.down_projs"
                     # Create DTensor using reference or device_mesh.
                     # Swap Shard(1)↔Shard(2) because we transposed dims 1 and 2.
-                    if reference_dtensor is not None and is_dtensor(reference_dtensor):
-                        swapped_placements = _swap_shard_placements_1_2(reference_dtensor.placements)
-                        from torch.distributed._tensor import DTensor
-
-                        state_dict[native_key] = DTensor.from_local(
-                            down_t, reference_dtensor.device_mesh, swapped_placements
-                        )
-                    else:
-                        state_dict[native_key] = _create_dtensor_from_local_or_reference(
-                            down_t, None, device_mesh, rank
-                        )
+                    swapped = (
+                        _swap_shard_placements_1_2(reference_dtensor.placements)
+                        if reference_dtensor is not None and is_dtensor(reference_dtensor)
+                        else None
+                    )
+                    state_dict[native_key] = _create_dtensor_from_local_or_reference(
+                        down_t, reference_dtensor, device_mesh, rank, placements_override=swapped
+                    )
 
             elif router_m:
                 # Router gate weight/bias - handle key mapping
