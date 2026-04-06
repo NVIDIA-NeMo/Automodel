@@ -57,7 +57,7 @@ Training is configured through a [YAML](https://en.wikipedia.org/wiki/YAML) conf
 
 Under the hood, both SFT and PEFT are executed by a **recipe**: a self-contained Python class that wires together model loading, dataset preparation, training, checkpointing, and logging. The fine-tuning recipe is [`TrainFinetuneRecipeForNextTokenPrediction`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py). The config file tells the recipe *what* to build; the recipe decides *how* to build it.
 
-:::{details} How the Config System Works
+::::{dropdown} How the Config System Works
 :class: note
 
 NeMo AutoModel configs use a convention borrowed from [Hydra](https://hydra.cc/): the special **`_target_`** key tells the framework *which* Python class or function to call, and **every other key** in the same YAML block is passed as a keyword argument to that call. For example:
