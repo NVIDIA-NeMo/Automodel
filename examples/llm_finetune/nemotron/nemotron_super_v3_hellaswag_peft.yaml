@@ -100,6 +100,18 @@ lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
 
+ci:
+  time: "00:15:00"
+  checkpoint_robustness:
+    hf_kl_threshold: 7e-2
+    experts_implementation: grouped_mm
+    trust_remote_code: true
+    tokenizer_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+    hf_device_map_auto: true
+    no_check_resume: true
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500
+
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>

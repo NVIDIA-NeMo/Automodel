@@ -94,4 +94,14 @@ lr_scheduler:
 
 ci:
   recipe_owner: adil-a
+  time: "00:15:00"
   nodes: 4
+  checkpoint_robustness:
+    hf_kl_threshold: 7e-2
+    experts_implementation: grouped_mm
+    trust_remote_code: true
+    tokenizer_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+    hf_device_map_auto: true
+    no_check_resume: true
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500

@@ -94,6 +94,15 @@ lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
 
+ci:
+  time: "00:15:00"
+  checkpoint_robustness:
+    hf_kl_threshold: 5e-3
+    distributed.tp_size: 2
+    tokenizer_name: nvidia/Nemotron-Flash-1B
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500
+
 # Uncomment and configure for W&B logging
 # wandb:
 #   project: <your_wandb_project>

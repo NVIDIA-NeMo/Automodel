@@ -7,10 +7,6 @@
 # but you can potentially run it on less GPUs by reducing the local batch size.
 # ------------------------------------------------------------------------------------------------
 
-# To run this recipe:
-#   automodel examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml --nproc-per-node 8
-# Adjust --nproc-per-node to the number of GPUs available on your machine.
-
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
@@ -46,16 +42,9 @@ model:
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
-peft:
-  _target_: nemo_automodel.components._peft.lora.PeftConfig
-  target_modules: ["*"]
-  dim: 32
-  alpha: 32
-  dropout: 0.0
-
 checkpoint:
   enabled: true
-  checkpoint_dir: checkpoints/qwen3_moe_lora
+  checkpoint_dir: checkpoints/qwen3_moe_sft
   model_save_format: safetensors
 
 distributed:
@@ -64,8 +53,9 @@ distributed:
   cp_size: 1
   pp_size: 1
   ep_size: 8
-  sequence_parallel: false
   activation_checkpointing: true
+
+  sequence_parallel: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -100,11 +90,9 @@ optimizer:
   eps: 1e-8
 
 ci:
-  recipe_owner: adil-a
   time: "00:15:00"
-  nodes: 2
   checkpoint_robustness:
-    hf_kl_threshold: 7e-2
+    hf_kl_threshold: 1e-4
     tokenizer_name: Qwen/Qwen3-30B-A3B
     no_check_resume: true
     dataset.num_samples_limit: 500

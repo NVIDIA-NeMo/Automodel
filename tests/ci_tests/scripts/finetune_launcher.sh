@@ -50,6 +50,38 @@ CMD="torchrun --nproc-per-node=${NPROC_PER_NODE} \
 if [ "$EXEC_CMD" = "python" ]; then CMD="python"; fi
 if [ "$EXEC_CMD" = "uv_python" ]; then CMD="uv run python"; fi
 
+# Checkpoint robustness variables
+ROBUSTNESS_COMMON="--config /opt/Automodel/${CONFIG_PATH} \
+  --checkpoint.checkpoint_dir $PIPELINE_DIR/$TEST_NAME/robustness_checkpoint \
+  --checkpoint.enabled true \
+  --checkpoint.model_save_format safetensors \
+  --checkpoint.save_consolidated true \
+  --step_scheduler.max_steps 5 \
+  --step_scheduler.ckpt_every_steps 5 \
+  --step_scheduler.val_every_steps 5 \
+  --step_scheduler.global_batch_size 16 \
+  --step_scheduler.local_batch_size 2"
+
+if [[ "${CONFIG_PATH}" == *peft* ]] || [[ "${CONFIG_PATH}" == *lora* ]]; then
+  ROBUSTNESS_COMMON="${ROBUSTNESS_COMMON} --peft.use_triton false"
+fi
+
+ROBUSTNESS_CMD="${CMD} --tee 3 --log-dir $PIPELINE_DIR/$TEST_NAME/robustness_logs \
+  -m pytest tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
+  ${ROBUSTNESS_COMMON}"
+
+# --- Finetune ---
 cd /opt/Automodel
 RUN_CMD="${CMD} ${TEST_SCRIPT_PATH} ${CONFIG} ${FINETUNE_ARGS}"
+echo "============================================"
+echo "[finetune] Running finetune..."
+echo "============================================"
 eval $RUN_CMD
+
+# --- Checkpoint Robustness ---
+if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
+  echo "============================================"
+  echo "[checkpoint_robustness] Running robustness test..."
+  echo "============================================"
+  eval $ROBUSTNESS_CMD
+fi
