@@ -83,3 +83,8 @@ parallelizer:
 
 ci:
   time: "00:30:00"
+  checkpoint_robustness:
+    hf_kl_threshold: 7e-2
+    tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    no_check_resume: true
+    experts_implementation: grouped_mm
