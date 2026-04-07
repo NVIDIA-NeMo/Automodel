@@ -13,6 +13,12 @@
 # limitations under the License.
 
 
+# To run this recipe:
+#   automodel examples/llm_finetune/qwen/qwen2_5_7b_squad.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 64
   local_batch_size: 4
@@ -95,4 +101,13 @@ optimizer:
 #   save_dir: <your_wandb_save_dir> 
 
 ci:
-  time: "00:15:00"
+  recipe_owner: HuiyingLi
+  time: "00:45:00"
+  checkpoint_robustness:
+    hf_kl_threshold: 9e-3
+    distributed.tp_size: 2
+    tokenizer_name: Qwen/Qwen2.5-7B
+    cross_tp_size: 2
+    cross_tp_kl_threshold: 9e-3
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500

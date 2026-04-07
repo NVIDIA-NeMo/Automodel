@@ -18,6 +18,8 @@
 # This recipe is validated on 2 8xH100 nodes.
 
 
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 16
   local_batch_size: 2
@@ -114,4 +116,13 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  recipe_owner: akoumpa
   nodes: 2
+  time: "00:45:00"
+  checkpoint_robustness:
+    hf_kl_threshold: 5e-3
+    distributed.tp_size: 8
+    tokenizer_name: nvidia/Llama-3_3-Nemotron-Super-49B-v1_5
+    hf_device_map_auto: true
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500

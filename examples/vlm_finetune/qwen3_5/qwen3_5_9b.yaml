@@ -15,6 +15,8 @@
 # torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/qwen3_5/qwen3_5_9b.yaml
 
 
+recipe: FinetuneRecipeForVLM
+
 step_scheduler:
   global_batch_size: 16
   local_batch_size: 2
@@ -95,6 +97,7 @@ optimizer:
   weight_decay: 0.1
 
 ci:
+  recipe_owner: HuiyingLi
   time: "00:30:00"
 
 # wandb:

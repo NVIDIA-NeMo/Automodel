@@ -15,6 +15,8 @@
 # torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py \
 #   --config examples/vlm_finetune/qwen3_5/qwen3_5_4b_neat_packing.yaml
 
+recipe: FinetuneRecipeForVLM
+
 step_scheduler:
   global_batch_size: 16
   local_batch_size: 1
@@ -103,3 +105,6 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_name>
+
+ci:
+  recipe_owner: HuiyingLi

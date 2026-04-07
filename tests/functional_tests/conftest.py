@@ -83,6 +83,7 @@ _OVERRIDES = [
     "distributed.activation_checkpointing",
     "dataset._target_",
     "dataset.path_or_dataset",
+    "dataset.num_samples_limit",
     "validation_dataset.path_or_dataset",
     "validation_dataset.split",
     "validation_dataset.num_samples_limit",
@@ -110,6 +111,29 @@ _OVERRIDES = [
     "qat.qat_config.groupsize",
     "dataloader.collate_fn.pad_seq_len_divisible",
     "validation_dataloader.collate_fn.pad_seq_len_divisible",
+    "kl_threshold",
+    "hf_kl_threshold",
+    "cross_tp_size",
+    "cross_tp_kl_threshold",
+    "tokenizer",
+    "experts_implementation",
+    "tokenizer_name",
+    "max_vram_gb",
+    "max_cpu_gb",
+    "resume_loss_threshold",
+    "cosine_threshold",
+    "dataloader.dataset.data_dir_list",
+    "tokenizer._target_",
+    "tokenizer.pretrained_model_name_or_path",
+    "tokenizer.trust_remote_code",
+]
+
+_BOOLEAN_OVERRIDES = [
+    "trust_remote_code",
+    "check_fused_qkv_keys",
+    "check_phantom_keys",
+    "check_resume",
+    "hf_device_map_auto",
 ]
 
 
@@ -125,3 +149,6 @@ def pytest_addoption(parser: pytest.Parser):
         # ``dest`` must be a valid Python identifier, so replace dots.
         dest = opt.replace(".", "_")
         parser.addoption(f"--{opt}", dest=dest, action="store", help=f"(passthrough) {opt}")
+    for opt in _BOOLEAN_OVERRIDES:
+        dest = opt.replace(".", "_")
+        parser.addoption(f"--{opt}", dest=dest, action="store_true", default=False, help=f"(passthrough) {opt}")

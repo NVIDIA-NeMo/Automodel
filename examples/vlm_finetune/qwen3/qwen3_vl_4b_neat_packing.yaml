@@ -25,6 +25,8 @@ step_scheduler:
   max_steps: 100
   num_epochs: 3
 
+recipe: FinetuneRecipeForVLM
+
 dist_env:
   backend: nccl
   timeout_minutes: 10
@@ -99,3 +101,6 @@ freeze_config:
   freeze_embeddings: true
   freeze_vision_tower: true
   freeze_language_model: false
+
+ci:
+  recipe_owner: HuiyingLi

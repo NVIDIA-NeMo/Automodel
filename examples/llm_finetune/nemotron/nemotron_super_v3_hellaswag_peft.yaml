@@ -19,6 +19,8 @@
 # This recipe requires 8x80GB of GPU memory.
 
 
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   num_epochs: 1
   global_batch_size: 256
@@ -98,8 +100,21 @@ lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
 
+ci:
+  recipe_owner: adil-a
+  time: "00:15:00"
+  checkpoint_robustness:
+    hf_kl_threshold: 7e-2
+    experts_implementation: grouped_mm
+    trust_remote_code: true
+    tokenizer_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+    hf_device_map_auto: true
+    no_check_resume: true
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500
+
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>

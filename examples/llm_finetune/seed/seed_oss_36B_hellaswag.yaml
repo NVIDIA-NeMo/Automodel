@@ -15,6 +15,12 @@
 # If transformers complains about unseen model, try to install transformers from 
 # git@github.com:Fazziekey/transformers.git@seed-oss
 
+# To run this recipe:
+#   automodel examples/llm_finetune/seed/seed_oss_36B_hellaswag.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 128
   local_batch_size: 8
@@ -92,4 +98,5 @@ optimizer:
 #   save_dir: <your_wandb_save_dir> 
 
 ci:
+  recipe_owner: hemildesai
   time: "00:30:00"

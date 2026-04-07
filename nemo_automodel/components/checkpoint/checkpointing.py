@@ -141,6 +141,7 @@ class CheckpointingConfig:
     # instead of the in-memory v5 config.  Useful when downstream consumers (e.g. vLLM) expect a v4-format config.
     diffusers_compatible: bool = False  # If True, use diffusers-compatible index filename
     # (diffusion_pytorch_model.safetensors.index.json) so checkpoints are loadable via diffusers from_pretrained().
+    best_metric_key: str = "default"  # Validation metric key used to select the best checkpoint.
 
     def __post_init__(self):
         """
@@ -521,7 +522,11 @@ class Checkpointer:
             and hasattr(model, "backbone")  # is HF remote code
         )
         skip_initialize_weights = (
-            model_class in ["Gemma3ForConditionalGeneration", "Gemma3ForCausalLM"]
+            model_class
+            in [
+                "Gemma3ForConditionalGeneration",
+                "Gemma3ForCausalLM",
+            ]
             or is_nemotron_v2
             or is_nemotron_v3_hf
         )

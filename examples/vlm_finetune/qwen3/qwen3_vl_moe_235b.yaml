@@ -13,6 +13,12 @@
 # limitations under the License.
 
 
+# To run this recipe:
+#   automodel examples/vlm_finetune/qwen3/qwen3_vl_moe_235b.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: FinetuneRecipeForVLM
+
 step_scheduler:
   global_batch_size: 256
   local_batch_size: 8
@@ -117,6 +123,7 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  recipe_owner: HuiyingLi
   nodes: 32
   time: "01:00:00"
   local_batch_size: 4

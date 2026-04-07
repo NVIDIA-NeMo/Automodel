@@ -115,6 +115,14 @@ RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
     cd ../ && rm -rf bitsandbytes; \
     fi
 
+# Install UCCL-EP (Azure-compatible RDMA for expert parallelism)
+COPY scripts/setup_uccl_ep.sh /opt/setup_uccl_ep.sh
+ARG INSTALL_UCCL_EP=False
+RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
+    bash /opt/setup_uccl_ep.sh --no-efa && \
+    rm -f /opt/setup_uccl_ep.sh; \
+    fi
+
 # Address base image CVE
 RUN pip install "aiohttp>=3.13.3" \
         "jaraco-context>=6.1.0" \

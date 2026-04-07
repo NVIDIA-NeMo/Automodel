@@ -27,6 +27,8 @@
 #     --config examples/llm_finetune/qwen/qwen3_moe_30b_te_packed_sequence_flashoptim.yaml
 
 
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 32
   local_batch_size: 4
@@ -125,3 +127,6 @@ optimizer:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: hemildesai

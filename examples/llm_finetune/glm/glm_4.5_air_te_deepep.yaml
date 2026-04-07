@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# To run this recipe:
+#   automodel examples/llm_finetune/glm/glm_4.5_air_te_deepep.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 512
   local_batch_size: 8
@@ -102,5 +108,6 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  recipe_owner: hemildesai
   nodes: 8
   time: "00:15:00"
