@@ -20,9 +20,7 @@ from nemo_automodel.components.training.step_scheduler import (
 
 
 class SizedDataLoader:
-    def __init__(
-        self, num_batches: int, global_batch_size: int = 1, local_batch_size: int = 1
-    ):
+    def __init__(self, num_batches: int, global_batch_size: int = 1, local_batch_size: int = 1):
         self.num_batches = num_batches
         # self.global_batch_size = global_batch_size
         # self.local_batch_size = local_batch_size
@@ -113,9 +111,7 @@ def test_resume(max_steps, ckpt_every_steps):
             continue
         if start_collecting:
             # record exact values; sequence starts at step ref_state['step']
-            ref_outputs.append(
-                (scheduler.step, scheduler.is_val_step, scheduler.is_ckpt_step)
-            )
+            ref_outputs.append((scheduler.step, scheduler.is_val_step, scheduler.is_ckpt_step))
 
     del scheduler
     scheduler = StepScheduler(
@@ -392,9 +388,7 @@ def test_scheduler_max_steps_priority():
         max_steps=1000,
     )
 
-    assert scheduler.num_epochs != 10, (
-        "Scheduler defaulted to 10 epochs despite max_steps being set!"
-    )
+    assert scheduler.num_epochs != 10, "Scheduler defaulted to 10 epochs despite max_steps being set!"
 
     scheduler_default = StepScheduler(
         global_batch_size=1,
@@ -404,9 +398,8 @@ def test_scheduler_max_steps_priority():
         dataloader=dataloader,
     )
 
-    assert scheduler_default.num_epochs == 10, (
-        "Should default to 10 epochs if nothing is provided"
-    )
+    assert scheduler_default.num_epochs == 10, "Should default to 10 epochs if nothing is provided"
+
 
 def test_scheduler_num_epochs_derived_from_max_steps():
     dataloader = SizedDataLoader(num_batches=10)
@@ -420,9 +413,7 @@ def test_scheduler_num_epochs_derived_from_max_steps():
     )
 
     print(scheduler.num_epochs)
-    assert scheduler.num_epochs == 2, (
-        "Derived number of epochs should be 2"
-    )
+    assert scheduler.num_epochs == 2, "Derived number of epochs should be 2"
 
 
 def test_save_checkpoint_every_epoch_false_disables_epoch_boundary_checkpoints():
