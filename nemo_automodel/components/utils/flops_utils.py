@@ -172,6 +172,10 @@ def mixtral_flops(config, gbs=1, seq_len=None):
 def qwen3_flops(config, gbs=1, seq_len=None):
     """Model FLOPs for Qwen3 family - accepts either AutoConfig or normalized config"""
 
+    # For VL composite configs, use the text_config sub-config
+    if hasattr(config, "text_config") and not hasattr(config, "num_hidden_layers"):
+        config = config.text_config
+
     if seq_len is None:
         seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
 
@@ -449,12 +453,31 @@ def deepseekv3_flops(config, gbs=1, seq_len=None):
     # MTP layers (optional)
     mtp_num_layers = config.mtp_num_layers if hasattr(config, "mtp_num_layers") else None
 
+    # DSA / sparse attention (DeepSeek V3.2)
+    index_topk = getattr(config, "index_topk", None)
+    index_n_heads = getattr(config, "index_n_heads", 0)
+    index_head_dim = getattr(config, "index_head_dim", 0)
+
     # self-attention flops
-    bmm1_flops = 0.5 * (qk_nope_head_dim + qk_rope_head_dim) * attention_heads * (seq_len**2)
-    bmm2_flops = 0.5 * v_head_dim * attention_heads * (seq_len**2)
+    if index_topk is not None and index_topk > 0:
+        # Sparse: each query attends to index_topk keys
+        bmm1_flops = (qk_nope_head_dim + qk_rope_head_dim) * attention_heads * seq_len * index_topk
+        bmm2_flops = v_head_dim * attention_heads * seq_len * index_topk
+    else:
+        # Full causal
+        bmm1_flops = 0.5 * (qk_nope_head_dim + qk_rope_head_dim) * attention_heads * (seq_len**2)
+        bmm2_flops = 0.5 * v_head_dim * attention_heads * (seq_len**2)
     per_input_attention_flops = 6 * (bmm1_flops + bmm2_flops) * layers
     if mtp_num_layers is not None:
         per_input_attention_flops += 6 * (bmm1_flops + bmm2_flops) * mtp_num_layers
+
+    # DSA indexer overhead (projections + full-sequence BMM per layer)
+    if index_topk is not None and index_topk > 0 and index_n_heads > 0:
+        idx_proj_params = (q_lora_rank or 0) * index_n_heads * index_head_dim + hs * index_head_dim + hs * index_n_heads
+        idx_bmm = index_n_heads * index_head_dim * seq_len * seq_len
+        per_layer_indexer = 6 * (idx_proj_params * seq_len + idx_bmm)
+        total_indexer_layers = layers + (mtp_num_layers or 0)
+        per_input_attention_flops += per_layer_indexer * total_indexer_layers
 
     # linear layer flops
     if q_lora_rank is not None:
@@ -572,8 +595,15 @@ def _non_mla_attn_layer_flops(config, gbs, seq_len):
 
 
 def _mamba_layer_flops(config, gbs, seq_len):
-    """Model FLOPs for Mamba layer. We ignore part of the flops of scan because the
-    chunk size is not known from model config."""
+    """Model FLOPs for Mamba layer.
+
+    Three components:
+      - in_proj:  input projections (x_proj, z_proj, dt_proj, B_proj, C_proj)
+      - scan:     SSM scan kernel (7x factor accounts for the full SSD scan cost)
+      - out_proj: output projection back to hidden_size
+    Multiplied by 6 (3x fwd+bwd * 2x FMA) for in_proj/out_proj (standard GEMMs),
+    and 7 * 3 = 21 for scan (non-GEMM kernel, higher op count per element).
+    """
     hs = config.hidden_size
     if hasattr(config, "mamba_state_dim"):
         mamba_state_dim = config.mamba_state_dim
@@ -595,11 +625,10 @@ def _mamba_layer_flops(config, gbs, seq_len):
         nheads = 2 * hs // mamba_head_dim  # default expand is 2
     d_in = nheads * mamba_head_dim
 
-    return (
-        (6 * gbs * seq_len * hs * (2 * d_in + 2 * mamba_num_groups * mamba_state_dim + nheads))
-        + (3 * 2 * gbs * seq_len * d_in * mamba_state_dim)
-        + (6 * gbs * seq_len * d_in * hs)
-    )
+    in_proj = 6 * gbs * seq_len * hs * (2 * d_in + 2 * mamba_num_groups * mamba_state_dim + nheads)
+    scan = 7 * 3 * gbs * seq_len * d_in * mamba_state_dim
+    out_proj = 6 * gbs * seq_len * d_in * hs
+    return in_proj + scan + out_proj
 
 
 def _hybrid_model_flops(config, gbs, seq_len):
@@ -625,13 +654,16 @@ def _hybrid_model_flops(config, gbs, seq_len):
         elif c == "E":
             num_moe_layers += 1
 
-    return (
-        num_attn_layers * _non_mla_attn_layer_flops(config, gbs, seq_len)
-        + num_mamba_layers * _mamba_layer_flops(config, gbs, seq_len)
-        + num_mlp_layers * _nemotronh_mlp_layer_flops(config, gbs, seq_len)
-        + num_moe_layers * _nemotronh_moe_layer_flops(config, gbs, seq_len)
-        + 6 * gbs * seq_len * hs * vocab_size
-    )
+    total = 6 * gbs * seq_len * hs * vocab_size
+    if num_attn_layers:
+        total += num_attn_layers * _non_mla_attn_layer_flops(config, gbs, seq_len)
+    if num_mamba_layers:
+        total += num_mamba_layers * _mamba_layer_flops(config, gbs, seq_len)
+    if num_mlp_layers:
+        total += num_mlp_layers * _nemotronh_mlp_layer_flops(config, gbs, seq_len)
+    if num_moe_layers:
+        total += num_moe_layers * _nemotronh_moe_layer_flops(config, gbs, seq_len)
+    return total
 
 
 def nemotronh_flops(config, gbs=1, seq_len=None):
@@ -860,6 +892,613 @@ def glm4_moe_flops(config, gbs=1, seq_len=None):
     return attention_flops + mlp_flops + vocab_flops
 
 
+def minimax_m2_flops(config, gbs=1, seq_len=None):
+    """Model FLOPs for MiniMax-M2 family - accepts either AutoConfig or normalized config.
+
+    Architecture: GQA attention (Q/K/V/O separate projections, head_dim may differ from
+    hidden_size // num_heads) + MoE with SwiGLU (no shared experts by default).
+    Optionally includes MTP (Multi-Token Prediction) modules gated by use_mtp.
+    """
+
+    if seq_len is None:
+        seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
+
+    layers = config.num_hidden_layers
+    hs = config.hidden_size
+    attention_heads = config.num_attention_heads
+    query_groups = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else attention_heads
+    vocab_size = config.vocab_size
+    head_dim = getattr(config, "head_dim", hs // attention_heads)
+    query_projection_to_hidden_size_ratio = (head_dim * attention_heads) / hs
+
+    # MoE config — all layers are MoE, no shared experts by default
+    ffn_hs = config.intermediate_size
+    moe_router_topk = config.num_experts_per_tok if hasattr(config, "num_experts_per_tok") else 8
+    shared_intermediate_size = getattr(config, "shared_intermediate_size", 0)
+
+    # MTP config (optional, gated by use_mtp)
+    use_mtp = getattr(config, "use_mtp", False)
+    num_mtp_modules = getattr(config, "num_mtp_modules", 0) if use_mtp else 0
+    mtp_transformer_layers = getattr(config, "mtp_transformer_layers", 1)
+
+    causal_self_attn = True
+    gated_linear_multiplier = 2  # SwiGLU: gate + up projections
+
+    # --- Attention flops (GQA with separate Q/K/V/O projections) ---
+    def _attention_flops_per_layer():
+        return (
+            6
+            * gbs
+            * seq_len
+            * hs
+            * hs
+            * query_projection_to_hidden_size_ratio
+            * (
+                (query_groups / attention_heads * 2 + 1)  # QKV gemm
+                + (seq_len / hs * 2 * (0.5 if causal_self_attn else 1))  # BMM (causal)
+                + 1  # output proj gemm
+            )
+        )
+
+    attention_flops = _attention_flops_per_layer() * layers
+
+    # --- MoE MLP flops (SwiGLU, all layers) ---
+    def _moe_mlp_flops_per_layer():
+        # Routed experts (topk selected)
+        routed = 6 * gbs * seq_len * hs * (1 + gated_linear_multiplier) * (ffn_hs * moe_router_topk)
+        # Shared experts (if any)
+        shared = (
+            6 * gbs * seq_len * hs * (1 + gated_linear_multiplier) * shared_intermediate_size
+            if shared_intermediate_size > 0
+            else 0
+        )
+        return routed + shared
+
+    mlp_flops = _moe_mlp_flops_per_layer() * layers
+
+    # --- Vocab flops (lm_head) ---
+    vocab_flops = 6 * gbs * seq_len * hs * vocab_size
+
+    # --- MTP module flops (optional) ---
+    mtp_flops = 0
+    if num_mtp_modules > 0:
+        total_mtp_layers = num_mtp_modules * mtp_transformer_layers
+        # Embedding projection per module: concat(hidden, next_embed) -> hidden  (2*hs -> hs)
+        mtp_flops += 6 * gbs * seq_len * hs * 2 * hs * num_mtp_modules
+        # Transformer layers (attention + MoE MLP)
+        mtp_flops += _attention_flops_per_layer() * total_mtp_layers
+        mtp_flops += _moe_mlp_flops_per_layer() * total_mtp_layers
+        # Vocab projection per module
+        mtp_flops += 6 * gbs * seq_len * hs * vocab_size * num_mtp_modules
+
+    return attention_flops + mlp_flops + vocab_flops + mtp_flops
+
+
+def _gdn_attention_per_layer_flops(
+    gbs,
+    seq_len,
+    hidden_size,
+    linear_key_head_dim,
+    linear_value_head_dim,
+    linear_num_key_heads,
+    linear_num_value_heads,
+    linear_conv_kernel_dim,
+):
+    """FLOPs for a single Gated DeltaNet (GDN / linear attention) layer.
+
+    Based on the GDN FLOPs calculator from Megatron-Bridge PR #2925.
+    """
+    qk_dim = linear_key_head_dim * linear_num_key_heads
+    v_dim = linear_value_head_dim * linear_num_value_heads
+
+    return (
+        3
+        * 2
+        * gbs
+        * seq_len
+        * (
+            hidden_size * (2 * qk_dim + 2 * v_dim + 2 * linear_num_value_heads)
+            + linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+            + linear_num_value_heads * (linear_value_head_dim**2) * 4
+            + hidden_size * v_dim
+        )
+    )
+
+
+def qwen3_5_flops(config, gbs=1, seq_len=None):
+    """Model FLOPs for Qwen3.5 family (MoE and Dense) with hybrid GDN/full attention.
+
+    Qwen3.5 uses a hybrid attention pattern: 75% GDN (linear attention) layers
+    and 25% standard GQA (full attention) layers (full_attention_interval=4).
+    Supports both the MoE variant (Qwen3.5-35B-A3B) and Dense variant (Qwen3.5-27B).
+    """
+    # For VL composite configs, use the text_config sub-config
+    if hasattr(config, "text_config") and not hasattr(config, "num_hidden_layers"):
+        config = config.text_config
+
+    if seq_len is None:
+        seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
+
+    layers = config.num_hidden_layers
+    hs = config.hidden_size
+    attention_heads = config.num_attention_heads
+    query_groups = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else attention_heads
+    vocab_size = config.vocab_size
+    head_dim = getattr(config, "head_dim", hs // attention_heads)
+
+    # GDN (linear attention) parameters
+    linear_key_head_dim = config.linear_key_head_dim
+    linear_value_head_dim = config.linear_value_head_dim
+    linear_num_key_heads = config.linear_num_key_heads
+    linear_num_value_heads = config.linear_num_value_heads
+    linear_conv_kernel_dim = getattr(config, "linear_conv_kernel_dim", 4)
+
+    # Determine layer counts from layer_types or full_attention_interval
+    if hasattr(config, "layer_types") and config.layer_types:
+        layer_types = config.layer_types
+        num_full_attn_layers = sum(1 for lt in layer_types if lt == "full_attention")
+        num_gdn_layers = layers - num_full_attn_layers
+    else:
+        full_attention_interval = getattr(config, "full_attention_interval", 4)
+        num_full_attn_layers = layers // full_attention_interval
+        num_gdn_layers = layers - num_full_attn_layers
+
+    # MoE fields
+    is_moe = hasattr(config, "num_experts") and config.num_experts is not None and config.num_experts > 1
+    moe_router_topk = getattr(config, "num_experts_per_tok", 1) if is_moe else 1
+    moe_intermediate_size = getattr(config, "moe_intermediate_size", 0) if is_moe else 0
+    shared_expert_intermediate_size = getattr(config, "shared_expert_intermediate_size", 0) if is_moe else 0
+    ffn_hs = getattr(config, "intermediate_size", 0) if not is_moe else 0
+
+    # MTP layers
+    mtp_num_layers = getattr(config, "mtp_num_hidden_layers", 0) or 0
+
+    causal_self_attn = True
+    gated_linear_multiplier = 2  # SwiGLU: gate + up projections
+
+    query_projection_to_hidden_size_ratio = (head_dim * attention_heads) / hs
+
+    # Qwen3.5 uses gated attention: Q proj outputs 2x (query + gate), applied as sigmoid(gate)*attn
+    attn_output_gate = getattr(config, "attn_output_gate", True)
+    q_gate_multiplier = 2 if attn_output_gate else 1
+
+    # --- Standard (full) attention flops per layer ---
+    full_attn_per_layer = (
+        6
+        * gbs
+        * seq_len
+        * hs
+        * hs
+        * query_projection_to_hidden_size_ratio
+        * (
+            (query_groups / attention_heads * 2 + q_gate_multiplier)  # QKV gemm (Q is 2x with gate)
+            + (seq_len / hs * 2 * (0.5 if causal_self_attn else 1))  # attention BMM
+            + 1  # output proj gemm
+        )
+    )
+
+    # --- GDN (linear attention) flops per layer ---
+    gdn_attn_per_layer = _gdn_attention_per_layer_flops(
+        gbs,
+        seq_len,
+        hs,
+        linear_key_head_dim,
+        linear_value_head_dim,
+        linear_num_key_heads,
+        linear_num_value_heads,
+        linear_conv_kernel_dim,
+    )
+
+    # Total attention flops
+    attention_flops = full_attn_per_layer * num_full_attn_layers + gdn_attn_per_layer * num_gdn_layers
+
+    # --- MLP flops ---
+    if is_moe:
+        # Routed experts (topk selected) + shared experts, all layers are MoE
+        routed_expert_flops = (
+            6 * gbs * layers * seq_len * hs * (1 + gated_linear_multiplier) * (moe_intermediate_size * moe_router_topk)
+        )
+        shared_expert_flops = (
+            6 * gbs * layers * seq_len * hs * (1 + gated_linear_multiplier) * shared_expert_intermediate_size
+        )
+        mlp_flops = routed_expert_flops + shared_expert_flops
+    else:
+        # Dense MLP with SwiGLU
+        mlp_flops = 6 * gbs * layers * seq_len * hs * (1 + gated_linear_multiplier) * ffn_hs
+
+    # --- Vocab flops ---
+    vocab_flops = 6 * gbs * seq_len * hs * vocab_size
+
+    # --- MTP flops ---
+    mtp_flops = 0
+    if mtp_num_layers > 0:
+        # Embedding projection per MTP layer: 2*hs -> hs
+        mtp_flops += 6 * gbs * seq_len * hs * 2 * hs * mtp_num_layers
+        # MTP layers reuse the last transformer layer pattern (assumed full attention)
+        mtp_flops += full_attn_per_layer * mtp_num_layers
+        # MTP MLP (same as main model's last layer)
+        if is_moe:
+            mtp_mlp_per_layer = (
+                6
+                * gbs
+                * seq_len
+                * hs
+                * (1 + gated_linear_multiplier)
+                * (moe_intermediate_size * moe_router_topk + shared_expert_intermediate_size)
+            )
+        else:
+            mtp_mlp_per_layer = 6 * gbs * seq_len * hs * (1 + gated_linear_multiplier) * ffn_hs
+        mtp_flops += mtp_mlp_per_layer * mtp_num_layers
+        # Vocab projection per MTP layer
+        mtp_flops += 6 * gbs * seq_len * hs * vocab_size * mtp_num_layers
+
+    return attention_flops + mlp_flops + vocab_flops + mtp_flops
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers for MLA (Multi-Latent Attention) + MoE models
+# ---------------------------------------------------------------------------
+
+
+def _mla_attention_per_layer_flops(
+    gbs,
+    seq_len,
+    hs,
+    attention_heads,
+    q_lora_rank,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    qk_nope_head_dim,
+    v_head_dim,
+    index_topk=None,
+    index_n_heads=0,
+    index_head_dim=0,
+):
+    """Per-layer FLOPs for Multi-Latent Attention (MLA).
+
+    Shared by DeepSeek V3, Kimi K2.5, Mistral Small 4, GLM-5, etc.
+
+    When index_topk is set (DSA / sparse attention), accounts for:
+      - Sparse main attention BMM: S * index_topk instead of 0.5 * S^2
+      - DSA indexer overhead: Q/K/weights projections + full S^2 indexer BMM
+    """
+    # --- Main MLA attention BMM ---
+    if index_topk is not None and index_topk > 0:
+        # Sparse attention: each query attends to index_topk keys (not full causal)
+        bmm1 = (qk_nope_head_dim + qk_rope_head_dim) * attention_heads * seq_len * index_topk
+        bmm2 = v_head_dim * attention_heads * seq_len * index_topk
+    else:
+        # Full causal attention
+        bmm1 = 0.5 * (qk_nope_head_dim + qk_rope_head_dim) * attention_heads * (seq_len**2)
+        bmm2 = 0.5 * v_head_dim * attention_heads * (seq_len**2)
+    bmm_flops = 6 * gbs * (bmm1 + bmm2)
+
+    # --- MLA linear projections ---
+    if q_lora_rank is not None:
+        q_params = hs * q_lora_rank + q_lora_rank * ((qk_nope_head_dim + qk_rope_head_dim) * attention_heads)
+    else:
+        q_params = hs * ((qk_nope_head_dim + qk_rope_head_dim) * attention_heads)
+
+    kr_params = hs * qk_rope_head_dim
+    kv_params = hs * kv_lora_rank + kv_lora_rank * ((qk_nope_head_dim + v_head_dim) * attention_heads)
+    o_params = v_head_dim * attention_heads * hs
+
+    linear_flops = 6 * gbs * seq_len * (q_params + kr_params + kv_params + o_params)
+
+    # --- DSA indexer overhead ---
+    indexer_flops = 0
+    if index_topk is not None and index_topk > 0 and index_n_heads > 0:
+        # Indexer projections: wq_b (q_lora -> idx_heads*idx_hd),
+        #                      wk (hs -> idx_hd), weights_proj (hs -> idx_heads)
+        idx_proj_params = (
+            (q_lora_rank or 0) * index_n_heads * index_head_dim  # wq_b
+            + hs * index_head_dim  # wk
+            + hs * index_n_heads  # weights_proj
+        )
+        # Indexer full-sequence BMM: Q@K^T over all positions to find top-k
+        idx_bmm = index_n_heads * index_head_dim * seq_len * seq_len
+        indexer_flops = 6 * gbs * (idx_proj_params * seq_len + idx_bmm)
+
+    return bmm_flops + linear_flops + indexer_flops
+
+
+def _mla_moe_model_flops(
+    gbs,
+    seq_len,
+    hs,
+    layers,
+    attention_heads,
+    vocab_size,
+    q_lora_rank,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    qk_nope_head_dim,
+    v_head_dim,
+    dense_ffn_hs,
+    moe_ffn_hs,
+    moe_router_topk,
+    moe_shared_expert_hs,
+    moe_layer_pattern,
+    mtp_num_layers=0,
+    index_topk=None,
+    index_n_heads=0,
+    index_head_dim=0,
+):
+    """FLOPs for MLA + MoE transformer models (DeepSeek-V3 style).
+
+    Args:
+        moe_layer_pattern: List of 0/1 per layer (0=dense, 1=MoE).
+        moe_shared_expert_hs: Total intermediate size for all shared experts combined.
+        index_topk: If set, use DSA sparse attention with this many selected positions.
+        index_n_heads: Number of heads in the DSA indexer.
+        index_head_dim: Head dimension of the DSA indexer.
+    """
+    # --- Attention (MLA on every layer) ---
+    mla_per_layer = _mla_attention_per_layer_flops(
+        gbs,
+        seq_len,
+        hs,
+        attention_heads,
+        q_lora_rank,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        qk_nope_head_dim,
+        v_head_dim,
+        index_topk=index_topk,
+        index_n_heads=index_n_heads,
+        index_head_dim=index_head_dim,
+    )
+    attention_flops = mla_per_layer * layers
+
+    # --- FFN (dense or MoE with shared experts, SwiGLU = 3 projections) ---
+    dense_layer_ffn_params = hs * dense_ffn_hs * 3
+    per_shared_expert_params = hs * moe_shared_expert_hs * 3
+    per_selected_expert_params = hs * moe_ffn_hs * 3
+
+    ffn_params = 0
+    for is_moe in moe_layer_pattern:
+        if is_moe == 0:
+            ffn_params += dense_layer_ffn_params
+        else:
+            ffn_params += per_shared_expert_params + (per_selected_expert_params * moe_router_topk)
+    ffn_flops = 6 * gbs * seq_len * ffn_params
+
+    # --- Vocab ---
+    vocab_flops = 6 * gbs * seq_len * hs * vocab_size
+
+    # --- MTP ---
+    mtp_flops = 0
+    if mtp_num_layers > 0:
+        mtp_flops += mla_per_layer * mtp_num_layers
+        last_is_moe = moe_layer_pattern[-1] if moe_layer_pattern else 0
+        if last_is_moe:
+            mtp_ffn_params = per_shared_expert_params + (per_selected_expert_params * moe_router_topk)
+        else:
+            mtp_ffn_params = dense_layer_ffn_params
+        mtp_flops += 6 * gbs * seq_len * mtp_ffn_params * mtp_num_layers
+        mtp_flops += 6 * gbs * seq_len * hs * vocab_size * mtp_num_layers
+        mtp_flops += 6 * gbs * seq_len * hs * 2 * hs * mtp_num_layers  # embedding projection
+
+    return attention_flops + ffn_flops + vocab_flops + mtp_flops
+
+
+def _build_moe_layer_pattern(config, layers):
+    """Build a list of 0/1 indicating dense(0) vs MoE(1) per layer.
+
+    Handles multiple config styles: first_k_dense_replace + moe_layer_freq,
+    mlp_layer_types list, etc.
+    """
+    mlp_layer_types = getattr(config, "mlp_layer_types", None)
+    if mlp_layer_types is not None:
+        return [0 if lt == "dense" else 1 for lt in mlp_layer_types]
+
+    first_k_dense = getattr(config, "first_k_dense_replace", 0)
+    moe_layer_freq = getattr(config, "moe_layer_freq", 1)
+    if isinstance(moe_layer_freq, list):
+        return moe_layer_freq
+    return [0] * first_k_dense + [
+        1 if ((i - first_k_dense) % moe_layer_freq == 0) else 0 for i in range(first_k_dense, layers)
+    ]
+
+
+def mla_moe_flops(config, gbs=1, seq_len=None):
+    """Model FLOPs for MLA + MoE models (Kimi K2, GLM-5, Mistral Small 4, etc.).
+
+    Handles VL wrappers by extracting text_config if present.
+    """
+    # Handle VL wrappers with nested text_config
+    cfg = config
+    if hasattr(config, "text_config") and not hasattr(config, "num_hidden_layers"):
+        cfg = config.text_config
+
+    if seq_len is None:
+        seq_len = getattr(cfg, "max_position_embeddings", 2048)
+
+    layers = cfg.num_hidden_layers
+    hs = cfg.hidden_size
+    n_shared = getattr(cfg, "n_shared_experts", 0)
+
+    # MoE intermediate size: try multiple field names
+    moe_int_size = getattr(cfg, "moe_intermediate_size", None)
+    if moe_int_size is None:
+        moe_int_size = getattr(cfg, "expert_ffn_hidden_size", cfg.intermediate_size)
+
+    # Dense FFN intermediate size
+    dense_ffn_hs = getattr(cfg, "intermediate_size", None)
+    if dense_ffn_hs is None:
+        dense_ffn_hs = getattr(cfg, "ffn_hidden_size", moe_int_size)
+
+    # Router top-k: try multiple field names
+    moe_topk = getattr(cfg, "num_experts_per_tok", None)
+    if moe_topk is None:
+        moe_topk = getattr(cfg, "moe_topk", 1)
+
+    moe_layer_pattern = _build_moe_layer_pattern(cfg, layers)
+
+    # MTP: try multiple field names used by different models
+    mtp = getattr(cfg, "num_nextn_predict_layers", None)
+    if mtp is None:
+        mtp = getattr(cfg, "mtp_num_layers", 0)
+    mtp = mtp or 0
+
+    # DSA (Dynamic Sparse Attention) indexer fields
+    idx_topk = getattr(cfg, "index_topk", None)
+    idx_n_heads = getattr(cfg, "index_n_heads", 0)
+    idx_head_dim = getattr(cfg, "index_head_dim", 0)
+
+    return _mla_moe_model_flops(
+        gbs=gbs,
+        seq_len=seq_len,
+        hs=hs,
+        layers=layers,
+        attention_heads=cfg.num_attention_heads,
+        vocab_size=cfg.vocab_size,
+        q_lora_rank=getattr(cfg, "q_lora_rank", None),
+        kv_lora_rank=cfg.kv_lora_rank,
+        qk_rope_head_dim=cfg.qk_rope_head_dim,
+        qk_nope_head_dim=cfg.qk_nope_head_dim,
+        v_head_dim=cfg.v_head_dim,
+        dense_ffn_hs=dense_ffn_hs,
+        moe_ffn_hs=moe_int_size,
+        moe_router_topk=moe_topk,
+        moe_shared_expert_hs=moe_int_size * n_shared,
+        moe_layer_pattern=moe_layer_pattern,
+        mtp_num_layers=mtp,
+        index_topk=idx_topk,
+        index_n_heads=idx_n_heads,
+        index_head_dim=idx_head_dim,
+    )
+
+
+def step3_5_flash_flops(config, gbs=1, seq_len=None):
+    """Model FLOPs for Step3.5-Flash (GQA + sliding-window / full attention + MoE).
+
+    Architecture: hybrid full/SWA attention with different head counts per type,
+    MoE with shared expert on most layers, first few layers dense, SwiGLU.
+    """
+    if seq_len is None:
+        seq_len = getattr(config, "max_position_embeddings", 2048)
+
+    layers = config.num_hidden_layers
+    hs = config.hidden_size
+    vocab_size = config.vocab_size
+
+    # Attention heads: full vs sliding may differ
+    full_attn_heads = config.num_attention_heads
+    attn_other = getattr(config, "attention_other_setting", None)
+    if attn_other is not None and isinstance(attn_other, dict):
+        sliding_attn_heads = attn_other.get("num_attention_heads", full_attn_heads)
+    else:
+        sliding_attn_heads = full_attn_heads
+    num_query_groups = getattr(config, "num_attention_groups", full_attn_heads)
+    head_dim = getattr(config, "head_dim", hs // full_attn_heads)
+    sliding_window = getattr(config, "sliding_window", 512)
+
+    # MoE config
+    moe_top_k = getattr(config, "moe_top_k", 8)
+    moe_ffn_hs = getattr(config, "moe_intermediate_size", 1280)
+    share_expert_dim = getattr(config, "share_expert_dim", moe_ffn_hs)
+    dense_ffn_hs = config.intermediate_size
+
+    # Which layers are MoE? Parse moe_layers_enum (comma-separated string or list)
+    moe_layers_raw = getattr(config, "moe_layers_enum", None)
+    if moe_layers_raw is not None:
+        if isinstance(moe_layers_raw, str):
+            moe_layers_set = set(int(x.strip()) for x in moe_layers_raw.split(",") if x.strip())
+        else:
+            moe_layers_set = set(int(x) for x in moe_layers_raw)
+    else:
+        # Default: first 3 dense, rest MoE
+        moe_layers_set = set(range(3, layers))
+
+    # Layer types (first `layers` entries; remaining are MTP layers)
+    layer_types = getattr(config, "layer_types", None)
+
+    # MTP
+    mtp_num_layers = getattr(config, "num_nextn_predict_layers", 0) or 0
+
+    # --- Per-layer FLOPs ---
+    total_attn = 0
+    total_mlp = 0
+
+    for i in range(layers):
+        # Determine attention type
+        if layer_types and i < len(layer_types):
+            is_full = layer_types[i] == "full_attention"
+        else:
+            is_full = i % 4 == 0  # default: every 4th starting from 0
+
+        if is_full:
+            total_attn += attention_flops_calculator(
+                seq_len,
+                hs,
+                full_attn_heads,
+                num_query_groups,
+                head_dim,
+                is_swa=False,
+            )
+        else:
+            total_attn += attention_flops_calculator(
+                seq_len,
+                hs,
+                sliding_attn_heads,
+                num_query_groups,
+                head_dim,
+                is_swa=True,
+                swa_window_size=sliding_window,
+            )
+
+        # MLP: MoE or dense (SwiGLU = gate + up + down = 3 projections)
+        if i in moe_layers_set:
+            total_mlp += moe_mlp_flops_calculator(
+                seq_len,
+                hs,
+                moe_ffn_hs,
+                moe_top_k,
+                gated_linear_unit=True,
+            )
+            # Shared expert (SwiGLU)
+            total_mlp += 6 * seq_len * hs * share_expert_dim * 3
+        else:
+            total_mlp += 6 * seq_len * hs * dense_ffn_hs * 3
+
+    # Vocab
+    total_vocab = loss_flops_calculator(seq_len, hs, vocab_size)
+
+    # MTP
+    mtp_total = 0
+    if mtp_num_layers > 0:
+        # Embedding projection per MTP module (2*hs -> hs)
+        mtp_total += 6 * seq_len * hs * 2 * hs * mtp_num_layers
+        # Each MTP module has one transformer layer (attention + MoE MLP)
+        mtp_total += (
+            attention_flops_calculator(
+                seq_len,
+                hs,
+                full_attn_heads,
+                num_query_groups,
+                head_dim,
+                is_swa=False,
+            )
+            * mtp_num_layers
+        )
+        mtp_total += (
+            moe_mlp_flops_calculator(
+                seq_len,
+                hs,
+                moe_ffn_hs,
+                moe_top_k,
+                gated_linear_unit=True,
+            )
+            * mtp_num_layers
+        )
+        mtp_total += 6 * seq_len * hs * share_expert_dim * 3 * mtp_num_layers
+        # Vocab per MTP module
+        mtp_total += loss_flops_calculator(seq_len, hs, vocab_size) * mtp_num_layers
+
+    return gbs * (total_attn + total_mlp + total_vocab + mtp_total)
+
+
 def get_flops_formula_for_hf_config(config: Any) -> Optional[Callable]:
     """
     Get the appropriate FLOPs formula function for a given HuggingFace config.
@@ -888,17 +1527,36 @@ def get_flops_formula_for_hf_config(config: Any) -> Optional[Callable]:
         "Qwen2Config": qwen3_flops,
         "Qwen3Config": qwen3_flops,
         "Qwen3MoeConfig": qwen3_flops,
+        "Qwen3_5Config": qwen3_5_flops,
+        "Qwen3_5MoeConfig": qwen3_5_flops,
+        "Qwen3NextConfig": qwen3_5_flops,  # Qwen3.5 Small 4B/9B (GDN + MoE)
+        "Qwen3VLMoeConfig": qwen3_flops,  # Qwen3 VL 235B text backbone
+        "Qwen3VLMoeTextConfig": qwen3_flops,
+        "Qwen3VLConfig": qwen3_flops,
+        "Qwen3VLTextConfig": qwen3_flops,
         # BERT family
         "BertConfig": bert_flops,
         "RobertaConfig": bert_flops,
         "AlbertConfig": bert_flops,
         "ElectraConfig": bert_flops,
-        # DeepSeek V3
+        # DeepSeek V3 / V3.2
         "DeepseekV3Config": deepseekv3_flops,
         # GPT-OSS
         "GptOssConfig": gpt_oss_flops,
-        # GLM4 MoE
-        "Glm4MoeConfig": glm4_moe_flops,
+        # GLM family
+        "Glm4Config": qwen3_flops,  # Dense GQA + SwiGLU (e.g. GLM-4-9B-0414)
+        "Glm4MoeConfig": glm4_moe_flops,  # GLM-4.7 (GQA + MoE)
+        "Glm4MoeLiteConfig": mla_moe_flops,  # GLM-4.7-Flash (MLA + MoE)
+        "GlmMoeDsaConfig": mla_moe_flops,  # GLM-5 (MLA + MoE)
+        # MiniMax-M2 / M2.5
+        "MiniMaxM2Config": minimax_m2_flops,
+        # MLA + MoE models (Mistral Small 4, Kimi K2.5)
+        "Mistral3Config": mla_moe_flops,  # Mistral Small 4 (VL wrapper, extracts text_config)
+        "KimiK2Config": mla_moe_flops,  # Kimi K2 / K2.5
+        "KimiK25Config": mla_moe_flops,
+        # Step3.5-Flash
+        "Step3p5Config": step3_5_flash_flops,
+        "LongcatFlashConfig": mla_moe_flops,  # MLA + MoE
         # T5 family (encoder-decoder)
         "T5Config": transformer_flops,
         "MT5Config": transformer_flops,

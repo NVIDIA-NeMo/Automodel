@@ -31,6 +31,49 @@ from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenP
 logger = logging.getLogger(__name__)
 
 
+def _infer_vocab_size(model_cfg):
+    """Infer vocab_size from a model config, handling custom config classes and VL composite configs.
+
+    Args:
+        model_cfg: The model config section (cfg.model) containing _target_, config, etc.
+
+    Returns:
+        The vocab_size integer, or raises AttributeError if not found.
+    """
+    from transformers import AutoConfig
+
+    config_section = model_cfg.config
+    trust_remote_code = getattr(config_section, "trust_remote_code", False)
+
+    # Use the config's _target_ if it's a custom config class (e.g. DeepseekV32Config)
+    config_target = getattr(config_section, "_target_", None)
+    model_config = None
+
+    if config_target is not None and callable(config_target):
+        target_name = getattr(config_target, "__qualname__", "")
+        if "AutoConfig" not in target_name:
+            model_config = config_target.from_pretrained(config_section.pretrained_model_name_or_path)
+    elif isinstance(config_target, str) and "AutoConfig" not in config_target:
+        import importlib
+
+        module_path, class_name = config_target.rsplit(".", 1)
+        mod = importlib.import_module(module_path)
+        config_cls = getattr(mod, class_name)
+        model_config = config_cls.from_pretrained(config_section.pretrained_model_name_or_path)
+
+    if model_config is None:
+        model_config = AutoConfig.from_pretrained(
+            config_section.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+        )
+
+    if hasattr(model_config, "vocab_size"):
+        return model_config.vocab_size
+    elif hasattr(model_config, "text_config") and hasattr(model_config.text_config, "vocab_size"):
+        return model_config.text_config.vocab_size
+    else:
+        raise AttributeError(f"Could not find vocab_size on {type(model_config).__name__} or its text_config")
+
+
 class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPrediction):
     """Benchmarking recipe for next-token prediction.
 
@@ -63,17 +106,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Infer vocab_size from model config and inject it into dataset config
         if hasattr(cfg, "dataset") and hasattr(cfg, "model"):
-            # Get vocab_size from model config
             if hasattr(cfg.model, "config") and hasattr(cfg.model.config, "pretrained_model_name_or_path"):
-                from transformers import AutoConfig
-
-                trust_remote_code = getattr(cfg.model.config, "trust_remote_code", False)
-
-                model_config = AutoConfig.from_pretrained(
-                    cfg.model.config.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
-                )
-                vocab_size = model_config.vocab_size
-                # Inject vocab_size into dataset config
+                vocab_size = _infer_vocab_size(cfg.model)
                 cfg.dataset.vocab_size = vocab_size
                 if logger.isEnabledFor(logging.INFO):
                     logger.info(f"Inferred vocab_size={vocab_size} from model config")
