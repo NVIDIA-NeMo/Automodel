@@ -37,7 +37,6 @@ from transformers import Qwen3Config
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
-    initialize_linear_module,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -60,7 +59,9 @@ class Block(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.self_attn = Qwen3Attention(config, backend)
-        self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear)
+        # Use "torch" backend (nn.Linear) so ColwiseParallel / RowwiseParallel
+        # can shard gate_proj / up_proj / down_proj without errors.
+        self.mlp = MLP(config.hidden_size, config.intermediate_size, "torch")
         self.input_layernorm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps
@@ -205,7 +206,8 @@ class Qwen3ForCausalLM(HFCheckpointingMixin, nn.Module):
         self.config = config
         self.backend = backend or BackendConfig()
         self.model = Qwen3Model(config, backend=self.backend)
-        self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        # nn.Linear (not TE linear) so ColwiseParallel can shard lm_head.
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         if getattr(config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.embed_tokens.weight

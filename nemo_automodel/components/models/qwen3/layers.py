@@ -25,7 +25,6 @@ from nemo_automodel.components.attention.utils import (
 )
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    initialize_linear_module,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
@@ -36,6 +35,10 @@ class Qwen3Attention(nn.Module):
 
     Uses separate q_proj / k_proj / v_proj so native key names match the HF checkpoint
     directly -- no state-dict conversion needed.
+
+    Uses nn.Linear (not TE linear) for projections so PyTorch ColwiseParallel / RowwiseParallel
+    can shard them without errors.  TE acceleration is still used for the attention kernel
+    itself via initialize_attn_module_and_func(attn_impl=backend.attn).
 
     Key differences from Qwen2:
     - Per-head q_norm and k_norm (RMSNorm) applied after projection, before RoPE
@@ -54,18 +57,11 @@ class Qwen3Attention(nn.Module):
 
         attention_bias = getattr(config, "attention_bias", False)
 
-        self.q_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_heads * self.head_dim, attention_bias
-        )
-        self.k_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, attention_bias
-        )
-        self.v_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, attention_bias
-        )
-        self.o_proj = initialize_linear_module(
-            backend.linear, self.num_heads * self.head_dim, config.hidden_size, False
-        )
+        # nn.Linear (not TE linear) so ColwiseParallel / RowwiseParallel work correctly.
+        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=attention_bias)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=attention_bias)
+        self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=attention_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
 
         # Per-head RMSNorm -- distinguishes Qwen3 from Qwen2
         self.q_norm = initialize_rms_norm_module(backend.rms_norm, self.head_dim, eps=config.rms_norm_eps)
