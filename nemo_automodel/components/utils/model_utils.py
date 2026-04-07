@@ -286,6 +286,56 @@ def apply_parameter_freezing(model, freeze_config):
             model.config.use_cache = False
 
 
+def freeze_unused_kv_sharing_params(model):
+    """Freeze dead K/V parameters in KV-shared layers.
+
+    Models like Gemma4 E2B/E4B use KV-sharing where the last N layers reuse
+    key/value states from earlier layers. The ``k_proj``, ``v_proj``,
+    ``k_norm``, and ``v_norm`` modules still exist in those shared layers but
+    are never used during forward. Their parameters therefore receive no
+    gradients, yet the optimizer still tracks them. On checkpoint resume the
+    distributed checkpoint framework expects optimizer state for every
+    parameter the optimizer was created with, but zero-gradient params may
+    have been excluded from the saved state — causing a ``RuntimeError``.
+
+    Calling this function **before** optimizer creation sets
+    ``requires_grad=False`` on the dead parameters so the optimizer never
+    tracks them, keeping save and load consistent.
+
+    Args:
+        model: The model (or pipeline-parallel model part).
+    """
+    # Walk potentially nested wrappers to find the text config.
+    text_config = getattr(getattr(model, "config", None), "text_config", None)
+    if text_config is None:
+        text_config = getattr(model, "config", None)
+
+    num_kv_shared = getattr(text_config, "num_kv_shared_layers", 0)
+    num_hidden = getattr(text_config, "num_hidden_layers", 0)
+    if num_kv_shared <= 0 or num_hidden <= 0:
+        return
+
+    first_shared = num_hidden - num_kv_shared
+    dead_projections = ("k_proj", "v_proj", "k_norm", "v_norm")
+
+    frozen_count = 0
+    for name, param in model.named_parameters():
+        for layer_idx in range(first_shared, num_hidden):
+            if any(f"layers.{layer_idx}.self_attn.{proj}" in name for proj in dead_projections):
+                param.requires_grad_(False)
+                frozen_count += 1
+                break
+
+    if frozen_count > 0:
+        logger.info(
+            "Froze %d dead KV-sharing parameters in layers %d–%d (num_kv_shared_layers=%d).",
+            frozen_count,
+            first_shared,
+            num_hidden - 1,
+            num_kv_shared,
+        )
+
+
 def cast_mixed_dtype_params_to_bf16(model):
     """Cast fp32 parameters and buffers to bf16 for FSDP2 compatibility."""
     for p in model.parameters():
