@@ -47,6 +47,8 @@ from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
 
+from nemo_automodel.components.distributed.mesh_utils import get_submesh
+
 
 def _is_transformers_v5_or_higher() -> bool:
     """Check if transformers version is 5.x or higher."""
@@ -148,7 +150,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
         # if dp_replicate_size > 1, use HSDP, else use FSDP
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        dp_mesh = device_mesh[dp_mesh_dim_names]
+        dp_mesh = get_submesh(device_mesh, dp_mesh_dim_names)
 
         # Extract layers from the model for parallelization
         layers = _extract_model_layers(model)
@@ -331,7 +333,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                     layers[i] = checkpoint_wrapper(layers[i])
 
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        dp_mesh = device_mesh[dp_mesh_dim_names]
+        dp_mesh = get_submesh(device_mesh, dp_mesh_dim_names)
 
         for layer in layers:
             parallelizer_utils.fully_shard_by_dtype(
@@ -372,7 +374,7 @@ class WanParallelizationStrategy(ParallelizationStrategy):
         # Not using custom tp_shard_plan; apply Wan-specific plan
         tp_mesh = device_mesh[tp_mesh_name]
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        dp_mesh = device_mesh[dp_mesh_dim_names]
+        dp_mesh = get_submesh(device_mesh, dp_mesh_dim_names)
 
         # Apply TP only when TP group size > 1
         if tp_mesh.size() > 1:
@@ -462,7 +464,7 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
         tp_mesh_name: str = "tp",
     ) -> nn.Module:
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        dp_mesh = device_mesh[dp_mesh_dim_names]
+        dp_mesh = get_submesh(device_mesh, dp_mesh_dim_names)
 
         # Mixed precision default like Default strategy
         if not mp_policy:

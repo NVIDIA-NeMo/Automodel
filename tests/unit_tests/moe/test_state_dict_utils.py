@@ -20,7 +20,6 @@ skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA 
 
 from nemo_automodel.components.moe.state_dict_utils import (
     is_dtensor,
-    get_submesh,
     get_expert_slice_for_rank,
     split_experts_weights_dtensor_aware,
     validate_dtensor_expert_sharding,
@@ -41,21 +40,6 @@ class TestIsDtensor:
             mock_tensor = Mock(spec=DTensor)
             mock_tensor.__class__ = DTensor
             assert is_dtensor(mock_tensor)
-
-
-class TestGetSubmesh:
-    def test_get_submesh(self):
-        with patch("torch.distributed.device_mesh._mesh_resources") as mock_mesh_resources:
-            mock_device_mesh = Mock()
-            mock_root_mesh = Mock()
-            mock_root_mesh.__getitem__ = Mock(return_value="submesh")
-            mock_mesh_resources.get_root_mesh.return_value = mock_root_mesh
-
-            result = get_submesh(mock_device_mesh, ("ep", "dp"))
-
-            mock_mesh_resources.get_root_mesh.assert_called_once_with(mock_device_mesh)
-            mock_root_mesh.__getitem__.assert_called_once_with(("ep", "dp"))
-            assert result == "submesh"
 
 
 class TestGetExpertSliceForRank:

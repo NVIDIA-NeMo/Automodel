@@ -20,10 +20,13 @@ Dict-parsing tests live in ``tests/unit_tests/recipes/test_dist_setup.py``.
 import pytest
 
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
+from unittest.mock import Mock
+
 from nemo_automodel.components.distributed.mesh import (
     STRATEGY_MAP,
     MeshAxisName,
     MeshContext,
+    _get_axis_size,
     _validate_distributed_setup,
 )
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
@@ -116,6 +119,56 @@ class TestMeshAxisNameEnum:
             "pp", "dp", "dp_replicate", "dp_shard", "dp_shard_cp",
             "dp_cp", "cp", "tp", "ep", "ep_shard",
         }
+
+
+# ---------------------------------------------------------------------------
+# _get_axis_size – supports _flatten() created dims
+# ---------------------------------------------------------------------------
+
+
+class TestGetAxisSize:
+    def _make_mock_mesh(self, dim_names, flatten_mapping=None):
+        mesh = Mock()
+        mesh.mesh_dim_names = dim_names
+        mesh._get_root_mesh = Mock(return_value=mesh)
+        mesh._flatten_mapping = flatten_mapping or {}
+
+        def getitem(name):
+            submesh = Mock()
+            submesh.size = Mock(return_value=4)
+            return submesh
+
+        mesh.__getitem__ = Mock(side_effect=getitem)
+        return mesh
+
+    def test_none_mesh_returns_default(self):
+        assert _get_axis_size(None, MeshAxisName.TP) == 1
+
+    def test_none_mesh_returns_custom_default(self):
+        assert _get_axis_size(None, MeshAxisName.DP, default=None) is None
+
+    def test_physical_dim_returns_size(self):
+        mesh = self._make_mock_mesh(("dp", "tp"))
+        result = _get_axis_size(mesh, MeshAxisName.TP)
+        assert result == 4
+        mesh.__getitem__.assert_called_once_with(MeshAxisName.TP)
+
+    def test_flattened_dim_returns_size(self):
+        dp_flat = Mock()
+        dp_flat.size = Mock(return_value=8)
+        mesh = self._make_mock_mesh(
+            ("dp_replicate", "dp_shard", "cp", "tp"),
+            flatten_mapping={"dp": dp_flat},
+        )
+        result = _get_axis_size(mesh, MeshAxisName.DP)
+        assert result == 8
+        # Should NOT go through __getitem__
+        mesh.__getitem__.assert_not_called()
+
+    def test_missing_dim_returns_default(self):
+        mesh = self._make_mock_mesh(("dp", "tp"), flatten_mapping={})
+        result = _get_axis_size(mesh, MeshAxisName.PP)
+        assert result == 1
 
 
 class TestHelperMethods:
