@@ -103,9 +103,7 @@ class Qwen3Model(nn.Module):
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
         )
-        self.layers = nn.ModuleDict()
-        for layer_id in range(config.num_hidden_layers):
-            self.layers[str(layer_id)] = Block(layer_id, config, backend)
+        self.layers = nn.ModuleList(Block(layer_id, config, backend) for layer_id in range(config.num_hidden_layers))
         self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
 
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -145,7 +143,7 @@ class Qwen3Model(nn.Module):
 
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
 
-        for layer in self.layers.values():
+        for layer in self.layers:
             h = layer(
                 x=h,
                 freqs_cis=freqs_cis,
@@ -164,7 +162,7 @@ class Qwen3Model(nn.Module):
             if self.norm is not None:
                 self.norm.reset_parameters()
             self.rotary_emb.device = buffer_device
-        for layer in self.layers.values():
+        for layer in self.layers:
             if layer is not None:
                 layer.init_weights(buffer_device=buffer_device)
 
