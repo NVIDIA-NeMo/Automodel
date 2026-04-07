@@ -367,7 +367,8 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
 
         # Delegate TP, AC, mixed precision to the default strategy, but
         # override the FSDP sharding to use fully_shard_by_dtype.
-        # Temporarily swap the global — safe because model init is single-threaded.
+        # Temporarily swap the global — safe because model init is single-threaded
+        # (one model is parallelized at a time). Not safe under concurrent calls.
         original_fn = globals()["apply_fsdp2_sharding_recursively"]
 
         def _fsdp_by_dtype(module, mesh, mp_policy, offload_policy=None):

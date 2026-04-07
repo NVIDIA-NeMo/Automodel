@@ -5,8 +5,8 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-from unittest.mock import MagicMock
+import sys
+import types
 
 import pytest
 import torch
@@ -39,41 +39,48 @@ def fake_model():
 
 
 class TestPatchHfModel:
-    def test_fp32_params_moved_to_holder(self, fake_model, monkeypatch):
-        """Float32 bare params are moved into _fp32_params submodule."""
-        # Monkeypatch the isinstance check to match our fake class
-        import nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn as mod
+    @staticmethod
+    def _stub_qwen3_5_modules(monkeypatch):
+        """Stub transformers.models.qwen3_5* so cp_linear_attn can be imported."""
+        for path in (
+            "transformers.models.qwen3_5_moe",
+            "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe",
+            "transformers.models.qwen3_5",
+            "transformers.models.qwen3_5.modeling_qwen3_5",
+        ):
+            if path not in sys.modules:
+                stub = types.ModuleType(path)
+                stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
+                stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
+                monkeypatch.setitem(sys.modules, path, stub)
 
-        monkeypatch.setattr(
-            mod, "__builtins__", mod.__builtins__ if hasattr(mod, "__builtins__") else {}
-        )
-        # Directly test the param-moving logic
+    def test_fp32_params_moved_to_holder(self, fake_model, monkeypatch):
+        """Float32 bare params are moved into _fp32_params submodule via real patch_hf_model."""
+        self._stub_qwen3_5_modules(monkeypatch)
+
+        # Remove cached cp_linear_attn so re-import picks up our stubs
+        cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
+        if cp_mod_key in sys.modules:
+            monkeypatch.delitem(sys.modules, cp_mod_key)
+
+        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import patch_hf_model
+
         la = fake_model.layers[0].linear_attn
         assert la.A_log.dtype == torch.float32
         assert la.dt_bias.dtype == torch.bfloat16
 
-        # Simulate the param wrapping logic
-        holder = None
-        for pname in list(la._parameters.keys()):
-            param = la._parameters[pname]
-            if param is not None and param.dtype == torch.float32:
-                if holder is None:
-                    holder = nn.Module()
-                setattr(holder, pname, param)
-                del la._parameters[pname]
-                la.__dict__[pname] = param
-        if holder is not None:
-            la.add_module("_fp32_params", holder)
+        patch_hf_model(fake_model, cp_enabled=False)
 
-        # A_log should be accessible via __dict__ but not in _parameters
+        # A_log (float32) should be moved out of _parameters into __dict__
         assert "A_log" not in la._parameters
-        assert la.A_log is holder.A_log  # same tensor
         assert la.A_log.dtype == torch.float32
-        # dt_bias stays as a regular parameter
+        # dt_bias (bfloat16) stays as a regular parameter
         assert "dt_bias" in la._parameters
-        # _fp32_params submodule exists
+        # _fp32_params submodule holds the moved param
         assert hasattr(la, "_fp32_params")
         assert la._fp32_params.A_log.dtype == torch.float32
+        # __dict__ reference and holder share the same tensor
+        assert la.A_log is la._fp32_params.A_log
 
     def test_no_class_swap_when_cp_disabled(self, fake_model):
         """With cp_enabled=False, class should not change."""
