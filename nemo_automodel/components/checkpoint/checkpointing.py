@@ -704,7 +704,7 @@ class Checkpointer:
         else:
             if is_cloud_path(path):
                 _ensure_msc_available()
-                storage_reader = msc.torch.MSCReader(path)
+                storage_reader = msc.torch.MultiStorageFileSystemReader(path)
             dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
         return state_dict
 
@@ -741,7 +741,7 @@ class Checkpointer:
         # Routes to MSC storage write for cloud paths
         if is_cloud_path(path):
             _ensure_msc_available()
-            storage_writer = msc.torch.MSCWriter(path)
+            storage_writer = msc.torch.MultiStorageFileSystemWriter(path)
 
         if self.config.is_async:
             ctx = self._model_ctx if is_model else self._optim_ctx

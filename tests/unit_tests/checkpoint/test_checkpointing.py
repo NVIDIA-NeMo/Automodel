@@ -854,7 +854,7 @@ class TestDoSave:
              patch("nemo_automodel.components.checkpoint.checkpointing.dcp"):
             Checkpointer._do_save(ckptr, state_dict, "msc://bucket/step-100")
 
-        mock_msc.torch.MSCWriter.assert_called_once_with("msc://bucket/step-100")
+        mock_msc.torch.MultiStorageFileSystemWriter.assert_called_once_with("msc://bucket/step-100")
 
     def test_local_path_does_not_use_msc_writer(self, tmp_path):
         ckptr = self._make_checkpointer()
@@ -864,7 +864,7 @@ class TestDoSave:
              patch("nemo_automodel.components.checkpoint.checkpointing.dcp"):
             Checkpointer._do_save(ckptr, state_dict, str(tmp_path / "step-100"))
 
-        mock_msc.torch.MSCWriter.assert_not_called()
+        mock_msc.torch.MultiStorageFileSystemWriter.assert_not_called()
 
     def test_msc_writer_receives_exact_path_not_subpath(self):
         ckptr = self._make_checkpointer()
@@ -875,7 +875,7 @@ class TestDoSave:
              patch("nemo_automodel.components.checkpoint.checkpointing.dcp"):
             Checkpointer._do_save(ckptr, state_dict, path)
 
-        mock_msc.torch.MSCWriter.assert_called_once_with(path)
+        mock_msc.torch.MultiStorageFileSystemWriter.assert_called_once_with(path)
 
     def test_async_save_still_uses_msc_writer(self):
         ckptr = self._make_checkpointer(is_async=True)
@@ -885,7 +885,7 @@ class TestDoSave:
              patch("nemo_automodel.components.checkpoint.checkpointing.dcp"):
             Checkpointer._do_save(ckptr, state_dict, "msc://bucket/step-100")
 
-        mock_msc.torch.MSCWriter.assert_called_once_with("msc://bucket/step-100")
+        mock_msc.torch.MultiStorageFileSystemWriter.assert_called_once_with("msc://bucket/step-100")
 
 
 class TestDoLoad:
@@ -904,7 +904,7 @@ class TestDoLoad:
              patch("nemo_automodel.components.checkpoint.checkpointing.dcp"):
             Checkpointer._do_load(ckptr, state_dict, "msc://bucket/step-100")
 
-        mock_msc.torch.MSCReader.assert_called_once_with("msc://bucket/step-100")
+        mock_msc.torch. MultiStorageFileSystemReader.assert_called_once_with("msc://bucket/step-100")
 
     def test_local_path_does_not_use_msc_reader(self, tmp_path):
         ckptr = self._make_checkpointer()
@@ -914,7 +914,7 @@ class TestDoLoad:
              patch("nemo_automodel.components.checkpoint.checkpointing.dcp"):
             Checkpointer._do_load(ckptr, state_dict, str(tmp_path / "step-100"))
 
-        mock_msc.torch.MSCReader.assert_not_called()
+        mock_msc.torch. MultiStorageFileSystemReader.assert_not_called()
 
     def test_peft_cloud_load_still_routes_through_msc_reader(self):
         ckptr = self._make_checkpointer(is_peft=True)
@@ -924,7 +924,7 @@ class TestDoLoad:
              patch("nemo_automodel.components.checkpoint.checkpointing.dcp"):
             Checkpointer._do_load(ckptr, state_dict, "msc://bucket/step-100")
 
-        mock_msc.torch.MSCReader.assert_called_once_with("msc://bucket/step-100")
+        mock_msc.torch. MultiStorageFileSystemReader.assert_called_once_with("msc://bucket/step-100")
 
     def test_save_and_load_use_same_path(self):
         config = MagicMock()
@@ -940,5 +940,5 @@ class TestDoLoad:
             Checkpointer._do_save(ckptr, state_dict, path)
             Checkpointer._do_load(ckptr, state_dict, path)
 
-        mock_msc.torch.MSCWriter.assert_called_once_with(path)
-        mock_msc.torch.MSCReader.assert_called_once_with(path)
+        mock_msc.torch.MultiStorageFileSystemWriter.assert_called_once_with(path)
+        mock_msc.torch. MultiStorageFileSystemReader.assert_called_once_with(path)
