@@ -1,0 +1,192 @@
+---
+title: "Run on a Cluster"
+description: ""
+position: 3
+---
+In this guide, you will learn how to submit distributed training jobs on Slurm clusters (single- or multi-node). For single-node workstation usage, see [Run on Your Local Workstation](/latest/launcher/local-workstation). For setup details, refer to our [Installation Guide](/latest/guides/installation).
+
+NeMo AutoModel uses recipes to run end-to-end workflows. If you're new to recipes, see the [Repository Structure](/latest/repository-structure) guide.
+
+## Quickstart
+
+```bash
+# Edit the reference script for your cluster, then submit:
+cp slurm.sub my_cluster.sub
+vim my_cluster.sub
+sbatch my_cluster.sub
+```
+
+For interactive testing on a Slurm node:
+  - Single node, single GPU
+    ```bash
+    automodel your_config.yaml
+    ```
+  - Single node, multiple GPUs
+    ```bash
+    automodel --nproc-per-node 8 your_config.yaml
+    ```
+
+## Submit a Batch Job with Slurm
+
+SLURM clusters vary widely: some use Pyxis containers, others use
+Singularity/Apptainer, and many run bare-metal with environment modules.
+Instead of trying to cover all variations in code, AutoModel provides a
+reference sbatch script that you copy and adapt to your cluster.
+
+### Getting Started
+
+1. Copy the reference script:
+
+```bash
+cp slurm.sub my_cluster.sub
+```
+
+2. Edit `my_cluster.sub` — change `CONFIG`, `#SBATCH` directives (account,
+   partition, nodes, time), container runtime, mounts, and secrets for your
+   cluster.
+
+3. Submit the job:
+
+```bash
+sbatch my_cluster.sub
+```
+
+### How It Works
+
+The reference `slurm.sub` script:
+
+1. Sets `CONFIG` to point at your YAML recipe config
+2. Allocates nodes via SBATCH directives
+3. Sets up the multi-node environment (`MASTER_ADDR`, `MASTER_PORT`)
+4. Runs `torchrun -m nemo_automodel.cli.app $CONFIG` on each node via `srun`
+5. Each torchrun worker detects the distributed environment and runs the recipe in-process
+
+All cluster-specific configuration (SBATCH directives, container runtime,
+mounts, NCCL tuning, secrets) lives in your sbatch script where you can see
+and edit it directly.
+
+### Examples
+
+**Pyxis container (NVIDIA clusters):**
+
+```bash
+#!/bin/bash
+#SBATCH -A my_account
+#SBATCH -p batch
+#SBATCH -t 01:00:00
+#SBATCH -N 8
+#SBATCH --gpus-per-node=8
+#SBATCH --ntasks-per-node=1
+#SBATCH -J automodel-finetune
+#SBATCH --output=slurm_jobs/%x_%j.out
+#SBATCH --error=slurm_jobs/%x_%j.err
+
+CONFIG=examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+
+CONT=/lustre/fsw/images/automodel.sqsh
+CONT_NAME=automodel-training
+CONT_MOUNT="\
+/home/$USER/Automodel:/opt/Automodel,\
+/home/$USER/.cache/huggingface:/root/.cache/huggingface"
+
+export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
+export MASTER_PORT=13742
+
+srun \
+    --container-name="${CONT_NAME}" \
+    --container-image="${CONT}" \
+    --container-mounts="${CONT_MOUNT}" \
+    --container-entrypoint \
+    --no-container-mount-home \
+    --export=ALL \
+    bash -c "\
+        cd /opt/Automodel && \
+        torchrun \
+            --nproc-per-node=\${SLURM_GPUS_PER_NODE:-8} \
+            --nnodes=\${SLURM_NNODES:-1} \
+            --rdzv_backend=c10d \
+            --rdzv_endpoint=\${MASTER_ADDR}:\${MASTER_PORT} \
+            -m nemo_automodel.cli.app ${CONFIG}"
+```
+
+**Bare-metal (no container):**
+
+```bash
+#!/bin/bash
+#SBATCH -A my_account
+#SBATCH -p gpu
+#SBATCH -N 2
+#SBATCH --gpus-per-node=8
+#SBATCH --time=01:00:00
+
+CONFIG=examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=13742
+
+module load cuda/12.8
+source /opt/venvs/automodel/bin/activate
+
+srun bash -c "\
+    torchrun \
+        --nproc-per-node=\${SLURM_GPUS_PER_NODE:-8} \
+        --nnodes=\${SLURM_NNODES:-1} \
+        --rdzv_backend=c10d \
+        --rdzv_endpoint=\${MASTER_ADDR}:\${MASTER_PORT} \
+        -m nemo_automodel.cli.app ${CONFIG}"
+```
+
+**Apptainer / Singularity:**
+
+```bash
+#!/bin/bash
+#SBATCH -A my_account
+#SBATCH -p gpu
+#SBATCH -N 2
+#SBATCH --gpus-per-node=8
+#SBATCH --time=01:00:00
+
+CONFIG=examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=13742
+
+srun apptainer exec --nv /shared/images/automodel.sif \
+    bash -c "\
+        torchrun \
+            --nproc-per-node=\${SLURM_GPUS_PER_NODE:-8} \
+            --nnodes=\${SLURM_NNODES:-1} \
+            --rdzv_backend=c10d \
+            --rdzv_endpoint=\${MASTER_ADDR}:\${MASTER_PORT} \
+            -m nemo_automodel.cli.app ${CONFIG}"
+```
+
+### Launch with Modified Code
+
+If the script is executed from within a Git repository accessible to Slurm
+workers, automodel will use the repository source over the installation
+inside the container image (it prepends `$CWD` to `PYTHONPATH` when it
+detects an editable checkout).
+
+```bash
+git clone git@github.com:NVIDIA-NeMo/Automodel.git automodel_test_repo
+cd automodel_test_repo/
+sbatch slurm.sub
+```
+
+## Customize Configuration Settings
+
+You can customize training by following the steps in this section.
+
+1. **Override config values**: Edit the `CONFIG` variable and add CLI overrides
+   in your torchrun command inside the sbatch script. For example, to change
+   the model:
+   ```bash
+   -m nemo_automodel.cli.app ${CONFIG} --model.pretrained_model_name_or_path Qwen/Qwen3-0.6B
+   ```
+
+2. **Edit the config file**: Modify the YAML directly for persistent changes.
+
+3. **Create custom configs**: Copy and modify existing configurations from the `examples/` directory.
+
+For single-node workflows, see our [Run on Your Local Workstation](/latest/launcher/local-workstation) guide.

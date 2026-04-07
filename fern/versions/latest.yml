@@ -1,0 +1,42 @@
+navigation:
+  - section: "Documentation"
+    contents:
+      - page: "Home"
+        path: ./latest/pages/index.mdx
+  - section: "Get Started"
+    contents:
+      - page: "About NeMo AutoModel"
+        path: ./latest/pages/about/index.mdx
+      - page: "Key Features and Concepts"
+        path: ./latest/pages/about/key-features.mdx
+      - page: "Install NeMo AutoModel"
+        path: ./latest/pages/guides/installation.mdx
+      - page: "YAML Configuration"
+        path: ./latest/pages/guides/configuration.mdx
+      - page: "\U0001F917 Transformers API Compatibility"
+        path: ./latest/pages/guides/huggingface-api-compatibility.mdx
+      - page: "Repository Structure"
+        path: ./latest/pages/repository-structure.mdx
+  - section: "Announcements"
+    contents:
+      - page: "Announcements"
+        path: ./latest/pages/announcements.mdx
+  - section: "NeMo AutoModel Performance"
+    contents:
+      - page: "Performance Summary"
+        path: ./latest/pages/performance-summary.mdx
+  - folder: ./latest/pages/model-coverage
+    title: "Model Coverage"
+    title-source: frontmatter
+  - folder: ./latest/pages/guides
+    title: "Recipes & E2E Examples"
+    title-source: frontmatter
+  - folder: ./latest/pages/guides
+    title: "Datasets"
+    title-source: frontmatter
+  - folder: ./latest/pages/launcher
+    title: "Job Launchers"
+    title-source: frontmatter
+  - folder: ./latest/pages/guides
+    title: "Development"
+    title-source: frontmatter
