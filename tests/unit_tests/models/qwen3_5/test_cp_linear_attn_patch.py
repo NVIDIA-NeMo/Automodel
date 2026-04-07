@@ -82,13 +82,19 @@ class TestPatchHfModel:
         # __dict__ reference and holder share the same tensor
         assert la.A_log is la._fp32_params.A_log
 
-    def test_no_class_swap_when_cp_disabled(self, fake_model):
-        """With cp_enabled=False, class should not change."""
+    def test_no_class_swap_when_cp_disabled(self, fake_model, monkeypatch):
+        """With cp_enabled=False, class should not change to CPAwareGatedDeltaNet."""
+        self._stub_qwen3_5_modules(monkeypatch)
+
+        cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
+        if cp_mod_key in sys.modules:
+            monkeypatch.delitem(sys.modules, cp_mod_key)
+
+        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import patch_hf_model
+
         la = fake_model.layers[0].linear_attn
-        original_class = type(la)
-        # The patch function checks isinstance(mod, Qwen3_5GatedDeltaNet)
-        # which won't match our fake, so just verify the flag logic
-        assert original_class is _FakeGatedDeltaNet
+        patch_hf_model(fake_model, cp_enabled=False)
+        assert type(la) is _FakeGatedDeltaNet
 
     def test_dict_access_preserves_tensor_identity(self, fake_model):
         """__dict__ reference and _fp32_params hold the same tensor."""

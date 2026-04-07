@@ -369,7 +369,8 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
         # override the FSDP sharding to use fully_shard_by_dtype.
         # Temporarily swap the global — safe because model init is single-threaded
         # (one model is parallelized at a time). Not safe under concurrent calls.
-        original_fn = globals()["apply_fsdp2_sharding_recursively"]
+        original_fn = globals().get("apply_fsdp2_sharding_recursively")
+        assert original_fn is not None, "apply_fsdp2_sharding_recursively not found in module globals"
 
         def _fsdp_by_dtype(module, mesh, mp_policy, offload_policy=None):
             if isinstance(module, nn.ModuleList):
