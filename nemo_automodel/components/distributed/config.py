@@ -119,6 +119,7 @@ class FSDP2Config:
     fsdp2_no_cat_array: bool = False
     fsdp2_backward_prefetch_depth: int = 2
     fsdp2_forward_prefetch_depth: int = 1
+
     def __post_init__(self):
         if self.mp_policy is None:
             self.mp_policy = MixedPrecisionPolicy(
@@ -127,6 +128,7 @@ class FSDP2Config:
                 output_dtype=torch.bfloat16,
                 cast_forward_inputs=True,
             )
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary (shallow, preserves policy objects)."""
         return {f.name: getattr(self, f.name) for f in fields(self)}
