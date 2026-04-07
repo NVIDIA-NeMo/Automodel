@@ -141,6 +141,7 @@ class CheckpointingConfig:
     # instead of the in-memory v5 config.  Useful when downstream consumers (e.g. vLLM) expect a v4-format config.
     diffusers_compatible: bool = False  # If True, use diffusers-compatible index filename
     # (diffusion_pytorch_model.safetensors.index.json) so checkpoints are loadable via diffusers from_pretrained().
+    best_metric_key: str = "default"  # Validation metric key used to select the best checkpoint.
 
     def __post_init__(self):
         """
@@ -501,10 +502,9 @@ class Checkpointer:
         # We need to set them to False and call initialize_weights to re-initialize the weights.
 
         # Some models cannot call initialize_weights when sharded with DTensors:
-        # - Gemma3ForConditionalGeneration / Gemma3ForCausalLM / Phi3ForCausalLM:
-        #   _init_weights() calls init.zeros_(module.weight[module.padding_idx]) on the
-        #   embedding layer, which triggers DTensor redistribute and fails with sharded
-        #   (TP) embeddings.
+        # - Gemma3ForConditionalGeneration / Gemma3ForCausalLM: _init_weights() calls
+        #   init.zeros_(module.weight[module.padding_idx]) on the embedding layer, which
+        #   triggers DTensor redistribute and fails with sharded (TP) embeddings.
         # - NemotronHForCausalLM: the HF remote code's _init_weights uses dt_bias.copy_()
         #   which fails with DTensors. This applies to:
         #   - v2 (non-MoE, no n_routed_experts): always uses HF remote code.
@@ -522,7 +522,11 @@ class Checkpointer:
             and hasattr(model, "backbone")  # is HF remote code
         )
         skip_initialize_weights = (
-            model_class in ["Gemma3ForConditionalGeneration", "Gemma3ForCausalLM", "Phi3ForCausalLM"]
+            model_class
+            in [
+                "Gemma3ForConditionalGeneration",
+                "Gemma3ForCausalLM",
+            ]
             or is_nemotron_v2
             or is_nemotron_v3_hf
         )

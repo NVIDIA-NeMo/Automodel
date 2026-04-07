@@ -252,8 +252,12 @@ def _precompute_stage_shapes(
         microbatch_size: Microbatch size used by the pipeline schedule.
         seq_len: Sequence length of the input data.
     """
-    hidden_size = model_config.hidden_size
-    vocab_size = model_config.vocab_size
+    # For VL composite configs, attributes are on text_config
+    cfg = model_config
+    if hasattr(cfg, "text_config") and not hasattr(cfg, "hidden_size"):
+        cfg = cfg.text_config
+    hidden_size = cfg.hidden_size
+    vocab_size = cfg.vocab_size
 
     for stage in stages:
         # Infer the computation dtype from the stage's parameters
@@ -399,9 +403,8 @@ def split_model_into_stages(
         )
         # Create a set of modules to keep
         modules_to_keep = set(module_names)
-        logger.info(
-            f"PP Rank {pp_rank}: Stage {stage_idx}: Keeping modules: {sorted(modules_to_keep, key=lambda x: x.split('.')[-1])}"
-        )
+        modules_sorted = sorted(modules_to_keep, key=lambda x: x.split(".")[-1])
+        logger.info(f"PP Rank {pp_rank}: Stage {stage_idx}: Keeping modules: {modules_sorted}")
 
         # Helper function to handle nested module removal
         def _process_module(parent_module, parent_name=""):

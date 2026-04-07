@@ -116,3 +116,6 @@ lr_scheduler:
 #     model_size: "1b"
 #     dataset: "squad"
 #     framework: "automodel"
+
+ci:
+  recipe_owner: akoumpa
