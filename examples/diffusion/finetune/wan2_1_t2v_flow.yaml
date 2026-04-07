@@ -73,3 +73,8 @@ checkpoint:
   save_consolidated: true
   diffusers_compatible: true
   restore_from: null
+
+ci:
+  time: "00:45:00"
+  processor: wan
+  target_frames: 17

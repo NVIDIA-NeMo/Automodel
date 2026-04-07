@@ -116,7 +116,10 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
         job['extends'] = f'.llm_{test_script}_test'
     else:
         test_script = "finetune"
-        job['extends'] = f'.{test_folder}_test'
+        # Replace slashes with underscores for valid YAML template names
+        # e.g., "diffusion/finetune" -> ".diffusion_finetune_test"
+        template_name = test_folder.replace('/', '_')
+        job['extends'] = f'.{template_name}_test'
 
     # Configure test stage based on test script
     if 'peft' in config.stem:
@@ -135,6 +138,9 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
         'nodes': 'TEST_NODE_COUNT',
         'node_multiplier': 'NODE_MULTIPLIER',
         'local_batch_size': 'LOCAL_BATCH_SIZE',
+        # Diffusion-specific: preprocessing configuration
+        'processor': 'PROCESSOR_NAME',
+        'target_frames': 'TARGET_FRAMES',
     }
     for ci_key, ci_var in ci_key_map.items():
         if ci_key in ci_config:
@@ -214,7 +220,8 @@ def main():
     pipeline = generate_pipeline(args.automodel_dir, args.scope, args.test_folder)
 
     if pipeline:
-        with open(f'generated_automodel_{args.test_folder}_tests.yml', 'w') as f:
+        output_name = args.test_folder.replace('/', '_')
+        with open(f'generated_automodel_{output_name}_tests.yml', 'w') as f:
             yaml.dump(pipeline, f)
         print(f"Generated pipeline with {len([k for k in pipeline.keys() if k != 'stages'])} jobs")
 

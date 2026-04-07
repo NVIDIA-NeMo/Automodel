@@ -12,9 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Unified CI launcher for LLM, VLM, and Diffusion finetuning.
+#
+# For diffusion pipelines (detected by PROCESSOR_NAME being set), this also
+# runs data preprocessing before finetuning and inference validation after.
+
+set -e
+
+# ── Stage 1: Data Preprocessing (diffusion only) ──
+if [[ -n "${PROCESSOR_NAME:-}" ]]; then
+  echo "========================================"
+  echo "Stage 1: Data Preprocessing"
+  echo "========================================"
+  cd /opt/Automodel
+  bash tests/ci_tests/scripts/diffusion_preprocess.sh
+fi
+
+# ── Stage 2: Finetuning ──
+
 # Test variables
 CONFIG="--config /opt/Automodel/${CONFIG_PATH} \
         --checkpoint.checkpoint_dir $PIPELINE_DIR/$TEST_NAME/checkpoint"
+
+# For diffusion, point dataloader at preprocessed cache
+if [[ -n "${PROCESSOR_NAME:-}" ]]; then
+  CONFIG="${CONFIG} \
+         --data.dataloader.cache_dir $PIPELINE_DIR/$TEST_NAME/data_cache"
+fi
 
 # Configure local batch size
 if [[ -n "$LOCAL_BATCH_SIZE" ]]; then
@@ -41,6 +65,11 @@ else
         --step_scheduler.val_every_steps 100"
 fi
 
+# Diffusion recipes have no validation loop; remove val_every_steps
+if [[ -n "${PROCESSOR_NAME:-}" ]]; then
+  CONFIG=$(echo "$CONFIG" | sed 's/--step_scheduler.val_every_steps [0-9]*//')
+fi
+
 # Command to execute, defaults to torchrun
 CMD="torchrun --nproc-per-node=${NPROC_PER_NODE} \
               --nnodes=${TEST_NODE_COUNT} \
@@ -53,3 +82,12 @@ if [ "$EXEC_CMD" = "uv_python" ]; then CMD="uv run python"; fi
 cd /opt/Automodel
 RUN_CMD="${CMD} ${TEST_SCRIPT_PATH} ${CONFIG} ${FINETUNE_ARGS}"
 eval $RUN_CMD
+
+# ── Stage 3: Inference Validation (diffusion only) ──
+if [[ -n "${PROCESSOR_NAME:-}" ]]; then
+  echo "========================================"
+  echo "Stage 3: Inference Validation"
+  echo "========================================"
+  cd /opt/Automodel
+  bash tests/ci_tests/scripts/diffusion_inference_validator.sh
+fi

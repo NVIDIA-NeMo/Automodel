@@ -80,3 +80,8 @@ dist_env:
   init_method: "env://"
 
 seed: 42
+
+ci:
+  time: "01:00:00"
+  processor: hunyuan
+  target_frames: 17

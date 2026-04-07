@@ -505,6 +505,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             start_step=int(self.global_step),
             start_epoch=int(self.start_epoch),
             num_epochs=int(self.num_epochs),
+            max_steps=getattr(self.cfg.step_scheduler, "max_steps", None),
         )
 
         self.load_checkpoint(self.restore_from)
