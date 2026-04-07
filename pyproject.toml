@@ -87,6 +87,8 @@ dependencies = [
     "torchao",
     "mlflow",
     "flashoptim>=0.1.3",
+    "localstack>=2026.3.0",
+    "multistorageclient[aws]",
 ]
 
 [project.optional-dependencies]

@@ -24,6 +24,12 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 import torch.distributed.checkpoint as dcp
 import yaml
+try:
+    import multistorageclient as msc
+    MSC_AVAILABLE = True
+except ImportError:
+    msc = None
+    MSC_AVAILABLE = False
 
 # Safe import of HF_HUB_CACHE from huggingface_hub.constants
 try:
@@ -57,6 +63,21 @@ from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
 if TYPE_CHECKING:
     from peft import PeftConfig
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+
+def is_cloud_path(path: str) -> bool:
+    """Check if path is a cloud storage path (MSC)."""
+    return path.startswith("msc://")
+
+
+def _ensure_msc_available() -> None:
+    """Raise an error if MSC is not installed but a cloud path is used."""
+    if not MSC_AVAILABLE:
+        raise ImportError(
+            "multistorageclient is required for cloud storage paths. "
+            "Install it with: pip install multi-storage-client"
+            "--index-url https://pypi.nvidia.com"
+        )
 
 
 def _is_geq_torch_2_9() -> bool:
@@ -711,6 +732,13 @@ class Checkpointer:
 
         ret = None
         planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
+
+        #Routes to MSC storage write for cloud paths
+        if is_cloud_path(path):
+            _ensure_msc_available()
+            storage_reader = msc.torch.MSC(path)
+        dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
+
         if self.config.is_async:
             ctx = self._model_ctx if is_model else self._optim_ctx
             ret = dcp.async_save(
@@ -974,8 +1002,14 @@ def save_config(config: dict[str, Any], weights_path: str) -> None:
         config: Config to save
         weights_path: Path to save config
     """
-    with open(os.path.join(weights_path, "config.yaml"), "w") as f:
-        yaml.dump(config, f, sort_keys=False, default_flow_style=False)
+    config_path = os.path.join(weights_path, "config.yaml")
+    if is_cloud_path(weights_path):
+        _ensure_msc_available()
+        with msc.open(config_path, "w") as f:
+            yaml.dump(config, f, sort_keys=False, default_flow_style=False)
+    else:
+        with open(config_path, "w") as f:
+            yaml.dump(config, f, sort_keys=False, default_flow_style=False)
 
 
 def _ensure_dirs(*dirs: Optional[str]) -> None:
@@ -987,7 +1021,8 @@ def _ensure_dirs(*dirs: Optional[str]) -> None:
     """
     for d in dirs:
         if d:
-            os.makedirs(d, exist_ok=True)
+            if not is_cloud_path(d):
+                os.makedirs(d, exist_ok=True)
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 

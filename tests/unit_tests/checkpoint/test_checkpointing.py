@@ -28,6 +28,10 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _is_custom_model,
     _model_has_dtensors,
     _reinit_rope_buffers,
+    is_cloud_path,
+    _ensure_msc_available,
+    _ensure_dirs,
+    save_config
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import _get_lm_head_weight_and_name
 
@@ -748,3 +752,46 @@ class TestCheckpointerSaveModelDiffusersRename:
 
         assert (consolidated_dir / "model.safetensors.index.json").exists()
         assert not (consolidated_dir / _DIFFUSERS_INDEX_FN).exists()
+
+
+# =============================================================================
+# Tests for cloud storage path support (MSC integration)
+# =============================================================================
+
+
+class TestIsCloudPath:
+    def test_msc_path_returns_true(self):
+        assert is_cloud_path("msc://my-bucket/checkpoints") is True
+
+    def test_local_path_returns_false(self):
+        assert is_cloud_path("/local/path/checkpoints") is False
+
+    def test_empty_string_returns_false(self):
+        assert is_cloud_path("") is False
+
+    def test_s3_path_without_msc_returns_false(self):
+        assert is_cloud_path("s3://my-bucket/checkpoints") is False
+
+
+class TestEnsureDirs:
+    def test_local_path_creates_directory(self, tmp_path):
+        new_dir = str(tmp_path / "new_dir")
+        _ensure_dirs(new_dir)
+        assert os.path.isdir(new_dir)
+
+    def test_cloud_path_skips_mkdir(self):
+        with patch("os.makedirs") as mock_makedirs:
+            _ensure_dirs("msc://bucket/path")
+            mock_makedirs.assert_not_called()
+
+
+class TestSaveConfigCloudPath:
+    def test_save_config_uses_msc_for_cloud_path(self):
+        config = {"model": "test", "lr": 0.001}
+        with patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc:
+            mock_msc.open = MagicMock()
+            mock_msc.open.return_value.__enter__ = MagicMock(return_value=MagicMock())
+            mock_msc.open.return_value.__exit__ = MagicMock(return_value=False)
+            save_config(config, "msc://bucket/checkpoints")
+            mock_msc.open.assert_called_once()
+
