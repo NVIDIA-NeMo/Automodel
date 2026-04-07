@@ -34,7 +34,8 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`glm_5_hellaswag_pp.yaml <../../../../examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml>` | SFT — GLM-5 / GLM-5.1 with EP=64, PP=4 on 32 nodes |
+| {download}`glm_5_hellaswag_pp.yaml <../../../../examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml>` | SFT — GLM-5 with EP=64, PP=4 on 32 nodes |
+| {download}`glm_5.1_hellaswag_pp.yaml <../../../../examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml>` | SFT — GLM-5.1 with EP=64, PP=4 on 32 nodes |
 
 ## Parallel Setup
 
