@@ -90,4 +90,3 @@ distributed:
   enable_compile: True
   patch_is_packed_sequence: True  # Patch transformers._is_packed_sequence to always return False: removes CPU-GPU sync per attention layer and ensures static shapes for torch.compile. Safe for non-packed (standard) training only.
   defer_fsdp_grad_sync: False   # Must be False with GA>1: True → delayed resharding → OOM
-  defer_rs_grad_accum: True     # GA=4: replaces 4× RS with 1× AllReduce (saves 2× RS bandwidth)
