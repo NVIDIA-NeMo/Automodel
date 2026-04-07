@@ -21,7 +21,7 @@
 #       -m nemo_automodel.cli.app \
 #       examples/llm_pretrain/custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml
 
-recipe: PretrainRecipeForNextTokenPrediction
+recipe: BenchmarkingRecipeForNextTokenPrediction
 
 seed: 42
 
