@@ -101,5 +101,14 @@ optimizer:
 #   save_dir: <your_wandb_save_dir> 
 
 ci:
-  time: "00:15:00"
+  time: "00:45:00"
   vllm_deploy: true
+  recipe_owner: HuiyingLi
+  checkpoint_robustness:
+    hf_kl_threshold: 9e-3
+    distributed.tp_size: 2
+    tokenizer_name: Qwen/Qwen2.5-7B
+    cross_tp_size: 2
+    cross_tp_kl_threshold: 9e-3
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500

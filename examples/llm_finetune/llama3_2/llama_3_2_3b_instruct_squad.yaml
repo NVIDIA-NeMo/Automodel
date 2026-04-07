@@ -96,6 +96,7 @@ optimizer:
 
 ci:
   vllm_deploy: true
+  recipe_owner: akoumpa
 
 # Uncomment and configure for W&B logging
 # wandb:

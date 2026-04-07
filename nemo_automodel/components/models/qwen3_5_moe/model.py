@@ -318,7 +318,14 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
             padding_mask = None
 
         if padding_mask is None and attention_mask is not None:
-            padding_mask = attention_mask.bool().logical_not()
+            if attention_mask.ndim <= 2:
+                # 1D/2D mask (standard or indexed packing mask): invert directly
+                padding_mask = attention_mask.bool().logical_not()
+            else:
+                # 4D mask [B, 1, S, S] (e.g. from sdpa packing collater):
+                # extract per-token padding from the diagonal (a token is padded
+                # if it cannot attend to itself).
+                padding_mask = attention_mask[:, 0].diagonal(dim1=-2, dim2=-1).bool().logical_not()
 
         hidden_states = inputs_embeds
 

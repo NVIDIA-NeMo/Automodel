@@ -2,7 +2,7 @@
 
 Databricks is a widely used platform for managing data, models, applications, and compute on the cloud. This guide shows how to use AutoModel for scalable, performant model training on Databricks.
 
-The specific example here fine-tunes a [Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B) model using the [SQuAD dataset](https://huggingface.co/datasets/rajpurkar/squad) from Hugging Face, but any AutoModel functionality (for example, {doc}`model pre-training <pretraining>`, {doc}`VLMs </model-coverage/vlm>`, {doc}`other supported models </model-coverage/overview>`) can also be run on Databricks.
+The specific example here fine-tunes a [Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B) model using the [SQuAD dataset](https://huggingface.co/datasets/rajpurkar/squad) from Hugging Face, but any AutoModel functionality (for example, {doc}`model pre-training <pretraining>`, {doc}`VLMs </model-coverage/vlm/index>`, {doc}`other supported models </model-coverage/overview>`) can also be run on Databricks.
 
 ## Provision Compute
 
