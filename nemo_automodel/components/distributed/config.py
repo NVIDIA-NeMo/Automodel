@@ -101,9 +101,6 @@ class FSDP2Config:
             memory at a small throughput cost.  Default ``2``.
         fsdp2_forward_prefetch_depth (int): Number of FSDP units to prefetch during
             forward pass.  Default ``1``.
-        defer_rs_grad_accum (bool): Defer ReduceScatter to the final micro-batch using
-            ``DeferredShardedReduceScatter``.  When ``True``, forces
-            ``defer_fsdp_grad_sync=False`` (the deferred RS mechanism replaces it).
     """
 
     sequence_parallel: bool = False
@@ -122,8 +119,6 @@ class FSDP2Config:
     fsdp2_no_cat_array: bool = False
     fsdp2_backward_prefetch_depth: int = 2
     fsdp2_forward_prefetch_depth: int = 1
-    defer_rs_grad_accum: bool = False
-
     def __post_init__(self):
         if self.mp_policy is None:
             self.mp_policy = MixedPrecisionPolicy(
@@ -132,9 +127,6 @@ class FSDP2Config:
                 output_dtype=torch.bfloat16,
                 cast_forward_inputs=True,
             )
-        if self.defer_rs_grad_accum:
-            self.defer_fsdp_grad_sync = False
-
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary (shallow, preserves policy objects)."""
         return {f.name: getattr(self, f.name) for f in fields(self)}

@@ -242,8 +242,6 @@ def prepare_for_grad_accumulation(model_parts: list[torch.nn.Module], pp_enabled
     for mp in model_parts:
         if hasattr(mp, "prepare_for_grad_accumulation"):
             mp.prepare_for_grad_accumulation(pp_enabled=pp_enabled)
-        if hasattr(mp, "_fsdp2_ga_state"):
-            mp._fsdp2_ga_state.is_final = False
 
 
 def prepare_after_first_microbatch():
@@ -272,8 +270,6 @@ def prepare_for_final_backward(model_parts: list[torch.nn.Module], pp_enabled: b
     for mp in model_parts:
         if hasattr(mp, "prepare_for_final_backward"):
             mp.prepare_for_final_backward(pp_enabled=pp_enabled)
-        if hasattr(mp, "_fsdp2_ga_state"):
-            mp._fsdp2_ga_state.is_final = True
 
 
 @torch.no_grad()
