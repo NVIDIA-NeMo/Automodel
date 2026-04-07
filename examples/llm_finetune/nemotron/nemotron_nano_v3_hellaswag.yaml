@@ -89,6 +89,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  recipe_owner: adil-a
   time: "00:15:00"
   checkpoint_robustness:
     hf_kl_threshold: 7e-2
@@ -103,6 +104,3 @@ ci:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
-
-ci:
-  recipe_owner: adil-a

@@ -100,6 +100,7 @@ optimizer:
   # min_lr: 1.0e-5
 
 ci:
+  recipe_owner: akoumpa
   time: "00:15:00"
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
@@ -115,6 +116,3 @@ ci:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
-
-ci:
-  recipe_owner: akoumpa
