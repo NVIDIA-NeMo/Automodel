@@ -248,19 +248,21 @@ def load_lora_weights_into_pipeline(pipe, cfg):
     if not lora_weights:
         return
 
-    from nemo_automodel.components.lora.checkpoint import load_lora_weights_for_inference
+    import json
 
-    adapter_name = getattr(cfg.model, "lora_adapter_name", "default")
+    from safetensors.torch import load_file
+
+    from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
+
     lora_path = Path(lora_weights)
     if not lora_path.exists():
         raise FileNotFoundError(f"LoRA weights directory not found: {lora_path}")
 
-    load_lora_weights_for_inference(
-        transformer=pipe.transformer,
-        lora_path=str(lora_path),
-        adapter_name=adapter_name,
-        device="cuda",
-    )
+    with open(lora_path / "adapter_config.json") as f:
+        peft_config = PeftConfig.from_dict(json.load(f))
+    apply_lora_to_linear_modules(pipe.transformer, peft_config, skip_freeze=True)
+    state_dict = load_file(lora_path / "adapter_model.safetensors", device="cuda")
+    pipe.transformer.load_state_dict(state_dict, strict=False)
 
 
 def _load_sharded_fsdp_checkpoint(transformer, sharded_dir, torch_dtype=torch.bfloat16):

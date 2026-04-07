@@ -463,10 +463,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
 
         self.model = self.pipe.transformer
-        self.peft_config = None
-        # Store peft_config ref for use in save_checkpoint().
-        # Set by apply_lora_to_linear_modules() and stored on pipe by from_pretrained().
-        self._peft_config = getattr(self.pipe, "_peft_config", None)
+        self.peft_config = getattr(self.pipe, "_peft_config", None)
 
         checkpoint_cfg = self.cfg.get("checkpoint", None)
 
@@ -595,38 +592,6 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         if dist.is_initialized():
             dist.barrier()
-
-    def save_checkpoint(self, epoch: int, global_step: int, avg_loss: float):
-        """
-        Override BaseRecipe.save_checkpoint() for LoRA-aware saving.
-
-        LoRA mode:       saves adapter_model.safetensors + adapter_config.json only.
-                         All ranks participate in FSDP2 gather (distributed collective).
-                         Only main process writes to disk.
-        Full fine-tune:  calls super().save_checkpoint() — unchanged behavior.
-        """
-        if self.peft_cfg is not None:
-            from nemo_automodel.components.lora.checkpoint import save_lora_weights
-
-            output_dir = os.path.join(
-                self.checkpoint_config.checkpoint_dir,
-                f"checkpoint-{global_step}",
-            )
-            if self._peft_config is None:
-                raise RuntimeError(
-                    "LoRA is enabled but _peft_config is None. LoRA injection may not have run correctly."
-                )
-            # All ranks must call this (FSDP2 gather is a distributed collective).
-            # Only main process writes files.
-            save_lora_weights(
-                transformer=self.model,
-                peft_config=self._peft_config,
-                output_dir=output_dir,
-                is_fsdp=self.device_mesh is not None,
-                is_main_process=is_main_process(),
-            )
-        else:
-            super().save_checkpoint(epoch, global_step, avg_loss)
 
     def run_train_validation_loop(self):
         logging.info("[INFO] Starting T2V training with Flow Matching")
