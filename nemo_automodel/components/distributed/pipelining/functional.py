@@ -664,6 +664,7 @@ def pipeline_model(
     round_to_pp_multiple: str | None = None,
     patch_stage_backward_maybe_with_nosync: bool = False,
     seq_len: int | None = None,
+    sequence_parallel: bool = False,
 ) -> tuple[_PipelineSchedule, list[torch.nn.Module], bool, bool, list[PipelineStage]]:
     """HF-specific pipeline model splitting."""
     pp_size = world_mesh[pp_axis_name].size()
