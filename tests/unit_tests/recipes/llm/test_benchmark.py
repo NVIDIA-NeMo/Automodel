@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction
+from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction, _infer_vocab_size
 
 
 class ConfigNamespace(SimpleNamespace):
@@ -178,6 +178,46 @@ class TestBenchmarkingRecipeInitialization:
                 recipe = BenchmarkingRecipeForNextTokenPrediction(mock_config)
 
                 assert mock_config.dataset.vocab_size == 50257
+
+    def test_infer_vocab_size_string_target(self, mock_config):
+        """Test _infer_vocab_size with a string _target_ (custom config class)."""
+        mock_model_config = MagicMock()
+        mock_model_config.vocab_size = 131072
+
+        model_cfg = ConfigNamespace(
+            config=ConfigNamespace(
+                _target_="some.package.module.CustomConfig",
+                pretrained_model_name_or_path="some-model",
+            )
+        )
+
+        with patch("importlib.import_module") as mock_import:
+            mock_module = MagicMock()
+            mock_module.CustomConfig.from_pretrained.return_value = mock_model_config
+            mock_import.return_value = mock_module
+
+            vocab_size = _infer_vocab_size(model_cfg)
+
+            mock_import.assert_called_once_with("some.package.module")
+            mock_module.CustomConfig.from_pretrained.assert_called_once_with("some-model")
+            assert vocab_size == 131072
+
+    def test_infer_vocab_size_vl_text_config(self, mock_config):
+        """Test _infer_vocab_size falls back to text_config.vocab_size for VL models."""
+        mock_model_config = MagicMock(spec=[])
+        mock_model_config.text_config = MagicMock()
+        mock_model_config.text_config.vocab_size = 151936
+
+        model_cfg = ConfigNamespace(
+            config=ConfigNamespace(
+                _target_="transformers.AutoConfig.from_pretrained",
+                pretrained_model_name_or_path="some-vl-model",
+            )
+        )
+
+        with patch("transformers.AutoConfig.from_pretrained", return_value=mock_model_config):
+            vocab_size = _infer_vocab_size(model_cfg)
+            assert vocab_size == 151936
 
     def test_init_sets_batch_size_from_scheduler(self, mock_config):
         """Test that batch_size is set from step_scheduler."""
