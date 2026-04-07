@@ -129,3 +129,26 @@ configs:
 
   # -- seed --
   - seed/seed_coder_8b_instruct_squad_peft.yaml
+
+  # ==========================================================================
+  # NMP Customizer Contract Tests
+  # ==========================================================================
+
+  # -- gpt_oss --
+  - customizer/gpt_oss_full_sft.yaml
+  - customizer/gpt_oss_full_sft_chat.yaml
+  - customizer/gpt_oss_peft.yaml
+  - customizer/gpt_oss_peft_packing.yaml
+
+  # -- llama --
+  - customizer/llama_3_1_8b_full_sft_tp.yaml
+  - customizer/llama_3_2_1b_full_sft.yaml
+  - customizer/llama_3_2_1b_full_sft_chat.yaml
+  - customizer/llama_3_2_1b_peft.yaml
+  - customizer/llama_3_2_1b_peft_packing.yaml
+
+  # -- nemotron --
+  - customizer/nemotron_nano_full_sft.yaml
+  - customizer/nemotron_nano_full_sft_chat.yaml
+  - customizer/nemotron_nano_peft.yaml
+  - customizer/nemotron_nano_peft_packing.yaml
