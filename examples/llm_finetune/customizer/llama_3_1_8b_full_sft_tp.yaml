@@ -1,0 +1,79 @@
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+model:
+  pretrained_model_name_or_path: meta-llama/Llama-3.1-8B-Instruct
+  torch_dtype: auto
+  trust_remote_code: false
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  attn_implementation: sdpa
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: 4
+  tp_size: 2
+  pp_size: 1
+  cp_size: 1
+  ep_size: null
+  sequence_parallel: false
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  max_steps: 13
+  num_epochs: 1
+  val_every_steps: 12
+  ckpt_every_steps: 12
+optimizer:
+  _target_: torch.optim.Adam
+  lr: 5.0e-06
+  weight_decay: 0.01
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1.0e-08
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 0
+checkpoint:
+  enabled: true
+  model_save_format: safetensors
+  checkpoint_dir: ./checkpoints
+  save_consolidated: true
+  dequantize_base_checkpoint: true
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+  path_or_dataset_id: ./sample-datasets/prompt_completion/train.jsonl
+  split: train
+  column_mapping:
+    question: prompt
+    answer: completion
+  seq_length: 2048
+  answer_only_loss_mask: true
+  padding: do_not_pad
+  truncation: longest_first
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+  path_or_dataset_id: ./sample-datasets/prompt_completion/validation.jsonl
+  split: validation
+  column_mapping:
+    question: prompt
+    answer: completion
+  seq_length: 2048
+  answer_only_loss_mask: true
+  padding: do_not_pad
+  truncation: longest_first
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+ci:
+  time: "00:30:00"
