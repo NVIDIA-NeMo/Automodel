@@ -16,11 +16,12 @@ import logging
 from typing import Optional
 
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp._fully_shard import FSDPModule
 
 from nemo_automodel.components.distributed.config import FSDP2Config
+from nemo_automodel.components.distributed.deferred_rs import DeferredShardedReduceScatter, GAState
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.distributed.parallelizer import (
-    _get_parallel_plan,
     fsdp2_strategy_parallelize,
 )
 
@@ -78,6 +79,8 @@ class FSDP2Manager:
         self.fsdp2_no_cat_array = config.fsdp2_no_cat_array
         self.fsdp2_backward_prefetch_depth = config.fsdp2_backward_prefetch_depth
         self.fsdp2_forward_prefetch_depth = config.fsdp2_forward_prefetch_depth
+        self.defer_rs_grad_accum = config.defer_rs_grad_accum
+        self.ga_state: Optional[GAState] = None
 
     def parallelize(self, model):
         """
@@ -98,21 +101,17 @@ class FSDP2Manager:
                     logger.error("Model does not support gradient checkpointing.")
             return model
 
-        if self.device_mesh["tp"].size() > 1:
-            # Delegate plan selection to central helper
-            tp_shard_plan = _get_parallel_plan(
-                model,
-                sequence_parallel=bool(self.sequence_parallel),
-                tp_shard_plan=self.tp_plan,
-            )
-        else:
-            tp_shard_plan = None
-
+        # Pass tp_plan config value (str/None/explicit dict) directly so that
+        # fsdp2_strategy_parallelize can apply sequence_parallel forcing when
+        # enable_async_tensor_parallel=True.  Pre-generating a dict here would
+        # bypass that forcing (the dict passthrough in _get_parallel_plan skips
+        # the SP override, leaving row-parallel layers as AllReduce instead of
+        # ReduceScatter, which breaks async-TP overlap).
         fsdp2_strategy_parallelize(
             model,
             device_mesh=self.device_mesh,
             mp_policy=self.mp_policy,
-            tp_shard_plan=tp_shard_plan,
+            tp_shard_plan=self.tp_plan,
             offload_policy=self.offload_policy,
             sequence_parallel=bool(self.sequence_parallel),
             activation_checkpointing=self.activation_checkpointing,
@@ -127,4 +126,14 @@ class FSDP2Manager:
             fsdp2_backward_prefetch_depth=self.fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth=self.fsdp2_forward_prefetch_depth,
         )
+
+        if self.defer_rs_grad_accum:
+            ga_state = GAState()
+            for module in model.modules():
+                if isinstance(module, FSDPModule):
+                    module.set_custom_reduce_scatter(DeferredShardedReduceScatter(ga_state))
+            self.ga_state = ga_state
+            model._fsdp2_ga_state = ga_state
+            logger.info("Installed DeferredShardedReduceScatter on all FSDP modules.")
+
         return model

@@ -98,6 +98,13 @@ class FSDP2Config:
             1 layer ahead. Set to ``0`` to disable forward prefetch entirely — saves ~1 layer
             of unsharded params (~1-2 GB) at the cost of exposed forward AllGather latency.
             Only has effect when ``enable_fsdp2_prefetch=True``. Default: 1.
+        defer_rs_grad_accum (bool): Replace GA× ReduceScatter operations with local shard
+            accumulation + 1× AllReduce on the final microbatch. Equivalent to Megatron-FSDP's
+            no_sync() + deferred RS pattern: RS is linear, so sum_i(RS(grad_i)) =
+            RS(sum_i(grad_i)). Saves (GA-1)× RS bandwidth at the cost of 1× AllReduce
+            (2× RS bandwidth), net saving for GA >= 3. For GA=2 bandwidth is equal but
+            avoids GA-1 RS kernel launches and stream synchronizations. Automatically
+            sets defer_fsdp_grad_sync=False. Default: False.
     """
 
     sequence_parallel: bool = False
@@ -117,8 +124,14 @@ class FSDP2Config:
     fsdp2_no_cat_array: bool = False
     fsdp2_backward_prefetch_depth: int = 2
     fsdp2_forward_prefetch_depth: int = 1
+    defer_rs_grad_accum: bool = False
 
     def __post_init__(self):
+        if self.defer_rs_grad_accum:
+            # defer_rs_grad_accum handles deferred RS itself via the custom ReduceScatter.
+            # defer_fsdp_grad_sync skips RS entirely (prevents custom RS from firing),
+            # so force it off.
+            self.defer_fsdp_grad_sync = False
         if self.mp_policy is None:
             self.mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.bfloat16,
