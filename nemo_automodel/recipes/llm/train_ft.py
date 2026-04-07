@@ -1606,6 +1606,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # For PP, send val_loss and num_label_tokens from last stage to main rank
         if self.pp_enabled:
             val_loss = val_loss.to(self.dist_env.device)
+            # On non-last ranks total_num_label_tokens is 0; this tensor is just a recv buffer.
             pp_num_tokens = torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
             src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
             if self.dist_env.rank == src_rank:
