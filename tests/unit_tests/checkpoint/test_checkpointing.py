@@ -759,39 +759,186 @@ class TestCheckpointerSaveModelDiffusersRename:
 # =============================================================================
 
 
-class TestIsCloudPath:
-    def test_msc_path_returns_true(self):
-        assert is_cloud_path("msc://my-bucket/checkpoints") is True
-
-    def test_local_path_returns_false(self):
-        assert is_cloud_path("/local/path/checkpoints") is False
-
-    def test_empty_string_returns_false(self):
-        assert is_cloud_path("") is False
-
-    def test_s3_path_without_msc_returns_false(self):
-        assert is_cloud_path("s3://my-bucket/checkpoints") is False
+@pytest.mark.parametrize("path,expected", [
+    ("msc://my-bucket/checkpoints", True),
+    ("msc://",                       True),  
+    ("/local/path/checkpoints",      False),
+    ("",                             False),
+    ("s3://my-bucket/checkpoints",   False),  
+    ("msc:/missing-slash",           False), 
+    ("/msc://tricky",                False), 
+])
+def test_is_cloud_path(path, expected):
+    assert is_cloud_path(path) is expected
 
 
 class TestEnsureDirs:
-    def test_local_path_creates_directory(self, tmp_path):
-        new_dir = str(tmp_path / "new_dir")
-        _ensure_dirs(new_dir)
-        assert os.path.isdir(new_dir)
+    def test_creates_nested_local_dirs(self, tmp_path):
+        target = str(tmp_path / "a" / "b" / "c")
+        assert not os.path.exists(target)
+        _ensure_dirs(target)
+        assert os.path.isdir(target)
 
-    def test_cloud_path_skips_mkdir(self):
+    def test_existing_dir_does_not_raise(self, tmp_path):
+        _ensure_dirs(str(tmp_path))
+
+    def test_cloud_path_never_touches_filesystem(self):
         with patch("os.makedirs") as mock_makedirs:
-            _ensure_dirs("msc://bucket/path")
-            mock_makedirs.assert_not_called()
+            _ensure_dirs("msc://bucket/some/deep/path")
+        mock_makedirs.assert_not_called()
+
+    def test_local_path_passes_exist_ok_true(self, tmp_path):
+        target = str(tmp_path / "new")
+        with patch("os.makedirs") as mock_makedirs:
+            _ensure_dirs(target)
+        mock_makedirs.assert_called_once_with(target, exist_ok=True)
 
 
-class TestSaveConfigCloudPath:
-    def test_save_config_uses_msc_for_cloud_path(self):
-        config = {"model": "test", "lr": 0.001}
-        with patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc:
-            mock_msc.open = MagicMock()
-            mock_msc.open.return_value.__enter__ = MagicMock(return_value=MagicMock())
-            mock_msc.open.return_value.__exit__ = MagicMock(return_value=False)
+class TestSaveConfig:
+    def test_local_path_writes_valid_yaml(self, tmp_path):
+        import yaml
+        config = {"model": "llama3", "lr": 3e-4, "steps": 1000}
+        save_config(config, str(tmp_path))
+        cfg_file = tmp_path / "config.yaml"
+        assert cfg_file.exists()
+        loaded = yaml.safe_load(cfg_file.read_text())
+        assert loaded["lr"] == pytest.approx(3e-4)
+        assert loaded["steps"] == 1000
+
+    def test_cloud_path_uses_msc_open_not_builtin(self):
+        config = {"model": "llama3", "lr": 3e-4}
+        mock_file = MagicMock()
+        mock_ctx = MagicMock(
+            __enter__=MagicMock(return_value=mock_file),
+            __exit__=MagicMock(return_value=False),
+        )
+        with patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc, \
+             patch("builtins.open") as mock_builtin_open:
+            mock_msc.open.return_value = mock_ctx
             save_config(config, "msc://bucket/checkpoints")
-            mock_msc.open.assert_called_once()
 
+        mock_msc.open.assert_called_once()
+        mock_builtin_open.assert_not_called()
+
+    def test_config_written_inside_checkpoint_dir(self):
+        config = {"x": 1}
+        mock_file = MagicMock()
+        mock_ctx = MagicMock(
+            __enter__=MagicMock(return_value=mock_file),
+            __exit__=MagicMock(return_value=False),
+        )
+        with patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc:
+            mock_msc.open.return_value = mock_ctx
+            save_config(config, "msc://bucket/run42")
+
+        opened_path = mock_msc.open.call_args[0][0]
+        assert opened_path.startswith("msc://bucket/run42")
+
+
+class TestDoSave:
+    def _make_checkpointer(self, is_peft=False, is_async=False):
+        config = MagicMock()
+        config.is_peft = is_peft
+        config.is_async = is_async
+        ckptr = MagicMock(spec=Checkpointer)
+        ckptr.config = config
+        ckptr._model_ctx = MagicMock()
+        ckptr._optim_ctx = MagicMock()
+        return ckptr
+
+    def test_cloud_path_uses_msc_writer(self):
+        ckptr = self._make_checkpointer()
+        state_dict = {"weight": torch.ones(4)}
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc, \
+             patch("nemo_automodel.components.checkpoint.checkpointing.dcp"):
+            Checkpointer._do_save(ckptr, state_dict, "msc://bucket/step-100")
+
+        mock_msc.torch.MSCWriter.assert_called_once_with("msc://bucket/step-100")
+
+    def test_local_path_does_not_use_msc_writer(self, tmp_path):
+        ckptr = self._make_checkpointer()
+        state_dict = {"weight": torch.ones(4)}
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc, \
+             patch("nemo_automodel.components.checkpoint.checkpointing.dcp"):
+            Checkpointer._do_save(ckptr, state_dict, str(tmp_path / "step-100"))
+
+        mock_msc.torch.MSCWriter.assert_not_called()
+
+    def test_msc_writer_receives_exact_path_not_subpath(self):
+        ckptr = self._make_checkpointer()
+        state_dict = {"weight": torch.ones(4)}
+        path = "msc://bucket/checkpoints/step-200"
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc, \
+             patch("nemo_automodel.components.checkpoint.checkpointing.dcp"):
+            Checkpointer._do_save(ckptr, state_dict, path)
+
+        mock_msc.torch.MSCWriter.assert_called_once_with(path)
+
+    def test_async_save_still_uses_msc_writer(self):
+        ckptr = self._make_checkpointer(is_async=True)
+        state_dict = {"weight": torch.ones(4)}
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc, \
+             patch("nemo_automodel.components.checkpoint.checkpointing.dcp"):
+            Checkpointer._do_save(ckptr, state_dict, "msc://bucket/step-100")
+
+        mock_msc.torch.MSCWriter.assert_called_once_with("msc://bucket/step-100")
+
+
+class TestDoLoad:
+    def _make_checkpointer(self, is_peft=False):
+        config = MagicMock()
+        config.is_peft = is_peft
+        ckptr = MagicMock(spec=Checkpointer)
+        ckptr.config = config
+        return ckptr
+
+    def test_cloud_path_uses_msc_reader(self):
+        ckptr = self._make_checkpointer()
+        state_dict = {"weight": torch.zeros(4)}
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc, \
+             patch("nemo_automodel.components.checkpoint.checkpointing.dcp"):
+            Checkpointer._do_load(ckptr, state_dict, "msc://bucket/step-100")
+
+        mock_msc.torch.MSCReader.assert_called_once_with("msc://bucket/step-100")
+
+    def test_local_path_does_not_use_msc_reader(self, tmp_path):
+        ckptr = self._make_checkpointer()
+        state_dict = {"weight": torch.zeros(4)}
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc, \
+             patch("nemo_automodel.components.checkpoint.checkpointing.dcp"):
+            Checkpointer._do_load(ckptr, state_dict, str(tmp_path / "step-100"))
+
+        mock_msc.torch.MSCReader.assert_not_called()
+
+    def test_peft_cloud_load_still_routes_through_msc_reader(self):
+        ckptr = self._make_checkpointer(is_peft=True)
+        state_dict = {"weight": torch.zeros(4)}
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc, \
+             patch("nemo_automodel.components.checkpoint.checkpointing.dcp"):
+            Checkpointer._do_load(ckptr, state_dict, "msc://bucket/step-100")
+
+        mock_msc.torch.MSCReader.assert_called_once_with("msc://bucket/step-100")
+
+    def test_save_and_load_use_same_path(self):
+        config = MagicMock()
+        config.is_peft = False
+        config.is_async = False
+        ckptr = MagicMock(spec=Checkpointer)
+        ckptr.config = config
+        state_dict = {"weight": torch.ones(4)}
+        path = "msc://bucket/step-300"
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc, \
+             patch("nemo_automodel.components.checkpoint.checkpointing.dcp"):
+            Checkpointer._do_save(ckptr, state_dict, path)
+            Checkpointer._do_load(ckptr, state_dict, path)
+
+        mock_msc.torch.MSCWriter.assert_called_once_with(path)
+        mock_msc.torch.MSCReader.assert_called_once_with(path)

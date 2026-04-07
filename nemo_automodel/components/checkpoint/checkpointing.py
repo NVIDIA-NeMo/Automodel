@@ -24,8 +24,10 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 import torch.distributed.checkpoint as dcp
 import yaml
+
 try:
     import multistorageclient as msc
+
     MSC_AVAILABLE = True
 except ImportError:
     msc = None
@@ -700,6 +702,9 @@ class Checkpointer:
         if self.config.is_peft and is_model and (not is_init_step):
             state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
         else:
+            if is_cloud_path(path):
+                _ensure_msc_available()
+                storage_reader = msc.torch.MSCReader(path)
             dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
         return state_dict
 
@@ -733,11 +738,10 @@ class Checkpointer:
         ret = None
         planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
 
-        #Routes to MSC storage write for cloud paths
+        # Routes to MSC storage write for cloud paths
         if is_cloud_path(path):
             _ensure_msc_available()
-            storage_reader = msc.torch.MSC(path)
-        dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
+            storage_writer = msc.torch.MSCWriter(path)
 
         if self.config.is_async:
             ctx = self._model_ctx if is_model else self._optim_ctx
