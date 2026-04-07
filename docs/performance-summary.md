@@ -18,6 +18,8 @@ The table below shows training performance for full sequences with no padding ac
 | Qwen3 MoE 30B | 8 | 512 | 4 | 4 | 16 | 4096 | 1 | 1 | 1 | 8 | - | 8 | TE + DeepEP | 21.773 | 277 | 12,040 |
 | GPT-OSS 20B | 8 | 256 | 2 | 2 | 16 | 4096 | 1 | 1 | 1 | - | - | 8 | TE + DeepEP + FlexAttn | 10.04 | 279 | 13,058 |
 | GPT-OSS 120B | 64 | 512 | 2 | 2 | 4 | 4096 | 1 | 1 | 1 | - | - | 64 | TE + DeepEP + FlexAttn | 4.30 | 231 | 7,626 |
+| Llama3 70B | 64 | 128 | 1 | 1 | 4 | 8192 | 1 | 1 | 2 | - | - | 32 | TE + fsdp2_prefetch + AsyncTP | 16.71 | 440 | 979.96 |
+
 
 ## Fine-Tuning (LoRA) Performance
 
@@ -26,12 +28,12 @@ The table below shows finetuning (LoRA) performance for full sequences with no p
 ### System: DGX-H100, Precision: BF16
 | Model | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec/GPU |
 |-------|------:|----:|----:|----:|---:|-----------:|---:|---:|---:|---:|---:|-----:|---------|-------------------------:|---------------------:|---------------:|
-| Llama3 8B | 1 | 32 | 2 | 2 | 16 | 4096 | 1 | 1 | 1 | - | 1 | 1 | - | 10.51 | 402 | 12472.87 |
-| Qwen2.5 7B | 1 | 32 | 2 | 2 | 16 | 4096 | 1 | 1 | 1 | - | 1 | 1 | - | 9.29 | 423 | 14110.05 |
-| Llama3 70B | 8 | 32 | 1 | 4 | 4 | 4096 | 2 | 4 | 1 | - | 10 | 1 | - | 24.87 | 190 | 658.62 |
-| Qwen2.5 32B | 8 | 32 | 1 | 8 | 2 | 4096 | 1 | 4 | 1 | - | 8 | 1 | 2 | 8.40 | 261 | 1950.93 |
-| Llama3 70B 2-node | 16 | 32 | 1 | 4 | 2 | 4096 | 2 | 4 | 1 | - | 10 | 1 | 2 | 12.03 | 197 | 680.74 |
-| Qwen2.5 32B 2-node | 16 | 32 | 1 | 8 | 1 | 4096 | 1 | 4 | 1 | - | 8 | 1 | 4 | 4.48 | 244 | 1826.49 |
+| Llama3 8B | 1 | 32 | 2 | 2 | 16 | 4096 | 1 | 1 | 1 | - | 1 | 1 | TE + triton | 10.51 | 402 | 12472.87 |
+| Qwen2.5 7B | 1 | 32 | 2 | 2 | 16 | 4096 | 1 | 1 | 1 | - | 1 | 1 | TE + triton | 9.29 | 423 | 14110.05 |
+| Llama3 70B | 8 | 32 | 2 | 2 | 4 | 4096 | 2 | 1 | 1 | - | 1 | 4 | TE + triton + fsdp2_prefetch | 15.00 | 316 | 1091.85 |
+| Qwen2.5 32B | 8 | 32 | 2 | 2 | 4 | 4096 | 2 | 1 | 1 | - | 1 | 4 | TE + triton + fsdp2_prefetch | 7.28 | 301 | 2250.31 |
+| Llama3 70B 2-node | 16 | 32 | 2 | 2 | 2 | 4096 | 2 | 1 | 1 | - | 1 | 8 | TE + triton + fsdp2_prefetch | 8.32 | 285 | 984.85 |
+| Qwen2.5 32B 2-node | 16 | 32 | 2 | 2 | 2 | 4096 | 2 | 1 | 1 | - | 1 | 8 | TE + triton + fsdp2_prefetch | 3.95 | 277 | 2072.89 |
 
 ## Glossary
 
@@ -58,12 +60,13 @@ Pre-training benchmark configurations are available in [`examples/benchmark/conf
 - [`qwen3_moe_30b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/qwen3_moe_30b_te_deepep.yaml) - Qwen3 MoE with TE + DeepEP
 - [`gptoss_20b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/gptoss_20b_te_deepep.yaml) - GPT-OSS 20B with optimizations
 - [`gptoss_120b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/gptoss_120b_te_deepep.yaml) - GPT-OSS 120B optimized
+- [`custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_pretrain/custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml) - Llama3-70B Optimized
 - [`llama3_1_8b_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/llama3_1/llama3_1_8b_peft_benchmark.yaml) - Llama-8B Finetuning (LoRA) optimized
 - [`qwen2_5_7b_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/qwen/qwen2_5_7b_peft_benchmark.yaml) - Qwen2.5-7B Finetuning (LoRA) optimized
 - [`custom_llama3_3_70b_instruct_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark.yaml) - Llama-70B Finetuning (LoRA) optimized
-- [`qwen2_5_32b_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark.yaml) - Qwen2.5-32B Finetuning (LoRA) optimized
+- [`custom_qwen2_5_32b_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/qwen/custom_qwen2_5_32b_peft_benchmark.yaml) - Qwen2.5-32B Finetuning (LoRA) optimized
 - [`custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml) - Llama-70B Finetuning (LoRA) optimized on 2 nodes
-- [`qwen2_5_32b_peft_benchmark_2nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark_2nodes.yaml) - Qwen2.5-32B Finetuning (LoRA) optimized on 2 nodes
+- [`custom_qwen2_5_32b_peft_benchmark_2nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/qwen/custom_qwen2_5_32b_peft_benchmark_2nodes.yaml) - Qwen2.5-32B Finetuning (LoRA) optimized on 2 nodes
 
 :::{note}
 - All benchmarks use mock data for consistent performance measurement.
