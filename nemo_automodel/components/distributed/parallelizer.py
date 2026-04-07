@@ -1126,7 +1126,7 @@ def _get_parallel_plan(
 
     if isinstance(tp_shard_plan, dict):
         model_parallel_plan = tp_shard_plan
-        col_w = max(55, max(map(len, tp_shard_plan.keys())))
+        col_w = max(55, max(map(len, tp_shard_plan.keys()), default=0))
         plan_lines = "\n".join(f"  {k:<{col_w}} {v}" for k, v in tp_shard_plan.items())
         logger.info(f"Using parallel plan (dictionary):\n{plan_lines}")
     elif tp_shard_plan == LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME:
