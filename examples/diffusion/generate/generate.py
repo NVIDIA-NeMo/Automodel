@@ -38,6 +38,7 @@ Usage:
 
 import inspect
 import logging
+import os
 from pathlib import Path
 
 import torch
@@ -208,18 +209,108 @@ def load_checkpoint_into_pipeline(pipe, cfg):
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
 
-    consolidated_dir = checkpoint_dir / "model" / "consolidated"
-    if not consolidated_dir.is_dir():
-        raise FileNotFoundError(
-            f"No consolidated checkpoint directory found at {consolidated_dir}. "
-            "Ensure training used save_consolidated: true."
+    ema_path = checkpoint_dir / "ema_shadow.pt"
+    consolidated_path = checkpoint_dir / "consolidated_model.bin"
+    sharded_dir = checkpoint_dir / "model"
+
+    if ema_path.exists():
+        logger.info("Loading EMA checkpoint from %s", ema_path)
+        ema_state = torch.load(ema_path, map_location="cuda", weights_only=True)
+        pipe.transformer.load_state_dict(ema_state, strict=True)
+        logger.info("Loaded EMA checkpoint")
+    elif consolidated_path.exists():
+        logger.info("Loading consolidated checkpoint from %s", consolidated_path)
+        state_dict = torch.load(consolidated_path, map_location="cuda", weights_only=True)
+        if "model_state_dict" in state_dict:
+            state_dict = state_dict["model_state_dict"]
+        pipe.transformer.load_state_dict(state_dict, strict=True)
+        logger.info("Loaded consolidated checkpoint")
+    elif sharded_dir.is_dir() and any(name.endswith(".distcp") for name in os.listdir(sharded_dir)):
+        logger.info("Loading sharded FSDP checkpoint from %s", sharded_dir)
+        pipe.transformer = _load_sharded_fsdp_checkpoint(pipe.transformer, str(sharded_dir), torch_dtype)
+        pipe.transformer.to("cuda", dtype=torch_dtype)
+        logger.info("Loaded sharded FSDP checkpoint")
+    else:
+        logger.warning("No recognized checkpoint format found in %s, using base model weights", checkpoint_dir)
+
+
+def load_lora_weights_into_pipeline(pipe, cfg):
+    """Load LoRA adapter weights into the pipeline's transformer.
+
+    Reads adapter_model.safetensors + adapter_config.json from the directory
+    specified by model.lora_weights. Does nothing if lora_weights is null/unset.
+
+    Args:
+        pipe: The diffusion pipeline with a `.transformer` attribute.
+        cfg: Config node with optional `model.lora_weights`, `model.lora_adapter_name`.
+    """
+    lora_weights = getattr(cfg.model, "lora_weights", None)
+    if not lora_weights:
+        return
+
+    import json
+
+    from safetensors.torch import load_file
+
+    from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
+
+    lora_path = Path(lora_weights)
+    if not lora_path.exists():
+        raise FileNotFoundError(f"LoRA weights directory not found: {lora_path}")
+
+    with open(lora_path / "adapter_config.json") as f:
+        peft_config = PeftConfig.from_dict(json.load(f))
+    apply_lora_to_linear_modules(pipe.transformer, peft_config, skip_freeze=True)
+    state_dict = load_file(lora_path / "adapter_model.safetensors", device="cuda")
+    pipe.transformer.load_state_dict(state_dict, strict=False)
+
+
+def _load_sharded_fsdp_checkpoint(transformer, sharded_dir, torch_dtype=torch.bfloat16):
+    """Load sharded FSDP/DCP checkpoint into a transformer module.
+
+    Creates a temporary gloo process group for single-GPU loading if
+    torch.distributed is not already initialized.
+
+    Args:
+        transformer: The transformer nn.Module to load weights into.
+        sharded_dir: Path to the directory containing .distcp shard files.
+        torch_dtype: The dtype to cast the transformer to before loading.
+
+    Returns:
+        The unwrapped transformer module with loaded checkpoint weights.
+    """
+    from torch.distributed.checkpoint import FileSystemReader
+    from torch.distributed.checkpoint import load as dist_load
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import StateDictType
+    from torch.distributed.fsdp.api import ShardedStateDictConfig
+
+    init_dist = False
+    if not dist.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+        init_dist = True
+
+    try:
+        transformer.to(device="cuda", dtype=torch_dtype)
+        fsdp_transformer = FSDP(transformer, use_orig_params=True)
+
+        FSDP.set_state_dict_type(
+            fsdp_transformer,
+            StateDictType.SHARDED_STATE_DICT,
+            state_dict_config=ShardedStateDictConfig(offload_to_cpu=True),
         )
 
-    logger.info("Loading consolidated safetensors checkpoint from %s", consolidated_dir)
-    pipe.transformer = pipe.transformer.__class__.from_pretrained(str(consolidated_dir), torch_dtype=torch_dtype).to(
-        "cuda"
-    )
-    logger.info("Loaded consolidated safetensors checkpoint")
+        model_state = fsdp_transformer.state_dict()
+        dist_load(state_dict=model_state, storage_reader=FileSystemReader(sharded_dir))
+        fsdp_transformer.load_state_dict(model_state)
+
+        # Unwrap back to the original module for inference
+        return fsdp_transformer.module
+    finally:
+        if init_dist:
+            dist.destroy_process_group()
 
 
 def apply_optimizations(pipe, cfg):
@@ -307,6 +398,18 @@ def run_inference(pipe, cfg, is_rank0):
     if extra_kwargs is not None:
         pipe_kwargs.update(extra_kwargs.to_dict())
 
+    # LoRA scale: passed as attention_kwargs (newer diffusers) or
+    # cross_attention_kwargs (older diffusers) so the transformer forward()
+    # applies the correct contribution weight.
+    lora_weights = getattr(cfg.model, "lora_weights", None)
+    if lora_weights:
+        lora_scale = getattr(cfg.model, "lora_scale", 1.0)
+        call_sig = inspect.signature(pipe.__call__)
+        if "attention_kwargs" in call_sig.parameters:
+            pipe_kwargs["attention_kwargs"] = {"scale": lora_scale}
+        elif "cross_attention_kwargs" in call_sig.parameters:
+            pipe_kwargs["cross_attention_kwargs"] = {"scale": lora_scale}
+
     seed = getattr(cfg, "seed", 42)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -364,6 +467,9 @@ def main():
 
     # 3. Load checkpoint (if configured)
     load_checkpoint_into_pipeline(pipe, cfg)
+
+    # 3b. Load LoRA adapter weights (if configured)
+    load_lora_weights_into_pipeline(pipe, cfg)
 
     # 4. Apply VAE / memory optimizations
     apply_optimizations(pipe, cfg)
