@@ -836,6 +836,19 @@ class TestPrecomputeStageShapes:
         out_call = stage._configure_outputs_meta.call_args[0][0]
         assert out_call[0].device.type == "meta"
 
+    def test_vl_composite_config_fallback(self):
+        """VL composite configs (no hidden_size on root) should fall back to text_config."""
+        import types
+
+        text_config = types.SimpleNamespace(hidden_size=64, vocab_size=128)
+        vl_config = types.SimpleNamespace(text_config=text_config)
+
+        stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
+        _precompute_stage_shapes([stage], vl_config, microbatch_size=2, seq_len=16)
+
+        out_call = stage._configure_outputs_meta.call_args[0][0]
+        assert out_call[0].shape == (2, 16, 64)
+
     @patch('nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages')
     @patch('nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule')
     def test_pipeline_model_with_seq_len(self, mock_build_schedule, mock_split_stages):
