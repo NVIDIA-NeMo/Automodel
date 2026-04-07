@@ -52,15 +52,16 @@ class Qwen3Attention(nn.Module):
         self.backend = backend
 
         self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
+        # Use HF-convention name so _update_attention_head_counts_for_tp can update it after TP sharding.
+        self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = getattr(config, "head_dim", config.hidden_size // self.num_heads)
 
         attention_bias = getattr(config, "attention_bias", False)
 
         # nn.Linear (not TE linear) so ColwiseParallel / RowwiseParallel work correctly.
         self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=attention_bias)
-        self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=attention_bias)
-        self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=attention_bias)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=attention_bias)
+        self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
 
         # Per-head RMSNorm -- distinguishes Qwen3 from Qwen2
@@ -74,7 +75,7 @@ class Qwen3Attention(nn.Module):
             num_qk_channels=self.head_dim,
             num_v_channels=self.head_dim,
             softmax_scale=softmax_scale,
-            num_gqa_groups=self.num_kv_heads,
+            num_gqa_groups=self.num_key_value_heads,
         )
 
     def forward(
@@ -98,12 +99,12 @@ class Qwen3Attention(nn.Module):
 
         if qkv_format == "thd":
             q = q.view(num_tokens, self.num_heads, self.head_dim)
-            k = k.view(num_tokens, self.num_kv_heads, self.head_dim)
-            v = v.view(num_tokens, self.num_kv_heads, self.head_dim)
+            k = k.view(num_tokens, self.num_key_value_heads, self.head_dim)
+            v = v.view(num_tokens, self.num_key_value_heads, self.head_dim)
         else:
             q = q.view(bsz, seqlen, self.num_heads, self.head_dim)
-            k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
-            v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+            k = k.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
+            v = v.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
 
         # Per-head RMSNorm (Qwen3-specific)
         q = self.q_norm(q)
