@@ -182,6 +182,28 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 if _attention_is_head_sharded(model_parallel_plan):
                     _update_attention_head_counts_for_tp(model, tp_mesh.size())
 
+        # Set CP group on any TE DotProductAttention modules so ring-attention
+        # all-to-all communication is activated.  Without this, TE does local
+        # attention while cu_seqlens still reflects global sequence lengths,
+        # causing cuDNN to access memory out of bounds (err 700).
+        cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
+        if cp_mesh is not None and cp_mesh.size() > 1:
+            try:
+                from transformer_engine.pytorch.attention import DotProductAttention as _TEDotProdAttn
+
+                cp_group = cp_mesh.get_group()
+                cp_ranks = torch.distributed.get_process_group_ranks(cp_group)
+                cp_stream = torch.cuda.Stream()
+                for layer in layers:
+                    attn = getattr(layer, "self_attn", None)
+                    if attn is None:
+                        continue
+                    te_attn = getattr(attn, "attn_module", None)
+                    if isinstance(te_attn, _TEDotProdAttn):
+                        te_attn.set_context_parallel_group(cp_group, cp_ranks, cp_stream, cp_comm_type="p2p")
+            except ImportError:
+                pass
+
         # Apply activation checkpointing to linear layers if requested
         if activation_checkpointing:
             # Disable KV caching during training to ensure deterministic
