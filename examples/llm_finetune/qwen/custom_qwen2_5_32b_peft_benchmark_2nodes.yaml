@@ -8,8 +8,8 @@
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
- seed: 42
- 
+seed: 42
+
 # Benchmark section
 benchmark:
   warmup_steps: 5

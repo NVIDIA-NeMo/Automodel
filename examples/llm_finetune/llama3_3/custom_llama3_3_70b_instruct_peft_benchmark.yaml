@@ -8,6 +8,7 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 seed: 42
 
+# NEW: Add benchmark section
 benchmark:
   warmup_steps: 5
   peak_tflops: 989  # H100: 989, A100: 312
@@ -52,7 +53,7 @@ checkpoint:
 
 distributed:
   strategy: fsdp2
-  dp_size: null
+  dp_size: none
   tp_size: 2
   cp_size: 1
 
