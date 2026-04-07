@@ -18,12 +18,13 @@ Because Qwen3Attention uses separate q_proj / k_proj / v_proj and the MLP uses
 separate gate_proj / up_proj, the native key names already match the HF checkpoint
 format exactly -- no weight reshaping or renaming is required.
 
-This adapter is therefore a pass-through: from_hf and to_hf both return the
-input unchanged.  It exists so callers that expect a state_dict_adapter attribute
-still work without special-casing.
+This adapter is therefore a pass-through for weights, but it must still honour the
+``exclude_key_regex`` argument that the checkpointing infrastructure passes to
+strip TE-internal ``_extra_state`` keys before handing the state dict to DCP.
 """
 
-from typing import Any
+import re
+from typing import Any, Optional
 
 from transformers import Qwen3Config
 
@@ -31,7 +32,9 @@ from transformers import Qwen3Config
 class Qwen3StateDictAdapter:
     """Identity (pass-through) state dict adapter for Qwen3 dense models.
 
-    Native format == HF format, so no conversion is needed.
+    Native format == HF format, so no weight conversion is needed.
+    ``exclude_key_regex`` is honoured in ``to_hf`` to drop TE-internal
+    ``_extra_state`` entries before checkpoint loading.
     """
 
     def __init__(self, config: Qwen3Config):
@@ -40,7 +43,14 @@ class Qwen3StateDictAdapter:
     def from_hf(self, hf_state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
         return hf_state_dict
 
-    def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
+    def to_hf(
+        self,
+        state_dict: dict[str, Any],
+        exclude_key_regex: Optional[str] = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        if exclude_key_regex:
+            return {k: v for k, v in state_dict.items() if not re.match(exclude_key_regex, k)}
         return state_dict
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
