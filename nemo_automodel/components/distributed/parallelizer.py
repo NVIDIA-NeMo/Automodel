@@ -825,6 +825,7 @@ def apply_fsdp2_sharding_recursively(
                 f"FSDP layer grouping: {len(flat_layers)} layers -> {n_groups} FSDP units "
                 f"(group_size={fsdp_layer_group_size})"
             )
+            grouped_fsdp_units = groups
         else:
             for enum_id, (layer_key, child_module) in enumerate(flat_layer_items):
                 # With PP: keep weights gathered across microbatches (no per-microbatch all-gather).
@@ -841,11 +842,18 @@ def apply_fsdp2_sharding_recursively(
                     offload_policy=offload_policy,
                 )
                 module[layer_key] = child_module
+            grouped_fsdp_units = None
 
         # Set up explicit forward/backward prefetch chains when layers are being resharded.
         # With PP, reshard_after_forward=False so weights are always gathered -- no prefetch needed.
         if not pp_enabled and enable_fsdp2_prefetch:
-            fsdp_units = [c for _, c in flat_layer_items if not _is_container(c)]
+            # When grouping is active, prefetch chains must be set on the FSDPLayerGroupWrapper
+            # units (the actual fully_shard targets), not the original flat layers captured in
+            # flat_layer_items before grouping occurred.
+            if grouped_fsdp_units is not None:
+                fsdp_units = grouped_fsdp_units
+            else:
+                fsdp_units = [c for _, c in flat_layer_items if not _is_container(c)]
             if fsdp2_forward_prefetch_depth > 0:
                 for i in range(len(fsdp_units) - 1):
                     targets = [
