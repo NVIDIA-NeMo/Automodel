@@ -342,3 +342,74 @@ class NewState:
 ```
 
 Inside your recipe class, define the new state as an instance attribute using `self.new_state = NewState(...)`.
+
+## Cloud Storage Checkpoints (MSC)
+
+NeMo Automodel supports saving and loading checkpoints directly to cloud object storage
+using NVIDIA's [Multi-Storage Client (MSC)](https://nvidia.github.io/multi-storage-client/).
+This is useful when training on cloud clusters where local disk is ephemeral or too small
+to hold full distributed checkpoints.
+
+### Installation  
+
+```bash
+pip install multi-storage-client --index-url https://pypi.nvidia.com
+```
+
+### MSC Profile Configuration
+
+MSC authenticates with your storage provider via a profile configuration file at
+`~/.msc_config.yaml`. The profile name **must match the bucket name** in your
+`msc://` path — this is the most common source of errors when first setting up MSC.
+
+For example, if your checkpoint path is `msc://my-bucket/checkpoints`, your config
+must have a profile named `my-bucket`:
+```yaml
+profiles:
+  my-bucket:
+    storage_provider:
+      type: s3
+      options:
+        region_name: us-east-1
+    credentials:
+      type: s3
+      options:
+        access_key: YOUR_ACCESS_KEY
+        secret_key: YOUR_SECRET_KEY
+```
+
+MSC supports AWS S3, Azure Blob Storage, Google Cloud Storage, and NVIDIA AIStore.
+See the [MSC documentation](https://nvidia.github.io/multi-storage-client/) for
+provider-specific configuration.
+
+### Usage
+
+Set `checkpoint_dir` to an `msc://` path — everything else works the same as local
+checkpointing:
+```yaml
+checkpoint:
+  checkpoint_dir: msc://my-bucket/checkpoints
+```
+```bash
+automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+    --checkpoint.checkpoint_dir msc://my-bucket/checkpoints \
+    --checkpoint.model_save_format safetensors \
+    --checkpoint.save_consolidated true
+```
+
+After 20 steps you should see:
+
+>Saving checkpoint to msc://my-bucket/checkpoints/epoch_0_step_20
+
+
+The checkpoint layout in cloud storage is identical to the local layout described
+above. Resume works the same way — rerunning the command picks up from the
+`LATEST` symlink automatically:
+
+>Loading checkpoint from msc://my-bucket/checkpoints/epoch_0_step_20
+
+
+::: {note}
+Asynchronous checkpointing (`is_async: true`) is supported with MSC paths and is
+recommended for large models where synchronous cloud writes would stall training.
+:::
