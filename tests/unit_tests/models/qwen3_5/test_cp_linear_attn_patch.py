@@ -96,6 +96,24 @@ class TestPatchHfModel:
         patch_hf_model(fake_model, cp_enabled=False)
         assert type(la) is _FakeGatedDeltaNet
 
+    def test_class_swap_when_cp_enabled(self, fake_model, monkeypatch):
+        """With cp_enabled=True, class is swapped to CPAwareGatedDeltaNet."""
+        self._stub_qwen3_5_modules(monkeypatch)
+
+        cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
+        if cp_mod_key in sys.modules:
+            monkeypatch.delitem(sys.modules, cp_mod_key)
+
+        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import (
+            CPAwareGatedDeltaNet,
+            patch_hf_model,
+        )
+
+        la = fake_model.layers[0].linear_attn
+        patch_hf_model(fake_model, cp_enabled=True)
+        assert type(la) is CPAwareGatedDeltaNet
+        assert la._cp_mesh is None
+
     def test_dict_access_preserves_tensor_identity(self, fake_model):
         """__dict__ reference and _fp32_params hold the same tensor."""
         la = fake_model.layers[0].linear_attn
