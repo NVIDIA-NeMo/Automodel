@@ -23,7 +23,7 @@
 #   TEST_NAME     - Name of the test
 set -e
 
-CKPT_DIR="$PIPELINE_DIR/$TEST_NAME/checkpoint"
+CKPT_DIR="$PIPELINE_DIR/$TEST_NAME/checkpoint/LATEST"
 OUTPUT_DIR="$PIPELINE_DIR/$TEST_NAME/inference_outputs"
 
 # Map finetune config to generation config
