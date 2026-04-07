@@ -782,3 +782,149 @@ class TestAutoPipelineIntegration:
         assert ap._device == torch.device("cuda:1")
         assert ap.dtype == torch.float16
         assert ap.scale_grads_in_schedule is True
+
+
+class TestAutoPipelineUpdateSeqLen:
+    """Test AutoPipeline.update_seq_len method."""
+
+    def test_update_seq_len_before_build_raises(self):
+        """update_seq_len should fail if build() hasn't been called."""
+        world_mesh = FakeDeviceMesh()
+        ap = AutoPipeline(
+            world_mesh=world_mesh,
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=4,
+            device=torch.device("cpu"),
+        )
+        with pytest.raises(RuntimeError, match="AutoPipeline.build\\(\\) must be called before update_seq_len"):
+            ap.update_seq_len(128)
+
+    def test_update_seq_len_noop_when_unchanged(self, monkeypatch):
+        """update_seq_len should be a no-op when seq_len hasn't changed."""
+        _patch_autopipeline_monkey(monkeypatch)
+
+        model = DummyQwenForCausalLM(num_layers=4)
+        module_fqns = generate_hf_model_fqn_per_model_part(
+            num_stages=2, num_layers=4, include_embeddings=True,
+            include_lm_head=True, include_rotary_emb=True, fqn_prefix="model.",
+        )
+        world_mesh = FakeWorldMesh()
+        world_mesh["pp"] = FakePPMesh(size=2, local_rank=0)
+
+        ap = AutoPipeline(
+            world_mesh=world_mesh, pp_axis_name="pp", pp_schedule="1f1b",
+            pp_microbatch_size=1, pp_batch_size=2,
+            module_fqns_per_model_part=module_fqns, device=torch.device("cpu"),
+        )
+        ap.build(model, loss_fn=lambda x, y: torch.tensor(0.0))
+
+        # Patch reset_pp_stage_shapes to track calls (mock to avoid needing real config)
+        call_count = [0]
+        import nemo_automodel.components.distributed.pipelining.autopipeline as ap_mod
+        def counting_reset(*args, **kwargs):
+            call_count[0] += 1
+        monkeypatch.setattr(ap_mod, "reset_pp_stage_shapes", counting_reset)
+
+        # First call should trigger reset
+        ap.update_seq_len(128)
+        assert call_count[0] == 1
+        assert ap._pp_current_seq_len == 128
+
+        # Same seq_len should be a no-op
+        ap.update_seq_len(128)
+        assert call_count[0] == 1  # Not incremented
+
+    def test_update_seq_len_calls_reset(self, monkeypatch):
+        """update_seq_len should call reset_pp_stage_shapes with correct args."""
+        _patch_autopipeline_monkey(monkeypatch)
+
+        model = DummyQwenForCausalLM(num_layers=4)
+        module_fqns = generate_hf_model_fqn_per_model_part(
+            num_stages=2, num_layers=4, include_embeddings=True,
+            include_lm_head=True, include_rotary_emb=True, fqn_prefix="model.",
+        )
+        world_mesh = FakeWorldMesh()
+        world_mesh["pp"] = FakePPMesh(size=2, local_rank=0)
+
+        ap = AutoPipeline(
+            world_mesh=world_mesh, pp_axis_name="pp", pp_schedule="1f1b",
+            pp_microbatch_size=2, pp_batch_size=4,
+            module_fqns_per_model_part=module_fqns, device=torch.device("cpu"),
+        )
+        ap.build(model, loss_fn=lambda x, y: torch.tensor(0.0))
+
+        # Track the call args
+        import nemo_automodel.components.distributed.pipelining.autopipeline as ap_mod
+        captured_args = []
+        def mock_reset(schedule, stages, model_config, microbatch_size, seq_len):
+            captured_args.append((schedule, stages, model_config, microbatch_size, seq_len))
+        monkeypatch.setattr(ap_mod, "reset_pp_stage_shapes", mock_reset)
+
+        ap.update_seq_len(256)
+
+        assert len(captured_args) == 1
+        _, _, _, mb_size, sl = captured_args[0]
+        assert mb_size == 2  # pp_microbatch_size
+        assert sl == 256
+
+    def test_update_seq_len_tracks_current(self, monkeypatch):
+        """update_seq_len should track current seq_len and reset on change."""
+        _patch_autopipeline_monkey(monkeypatch)
+
+        model = DummyQwenForCausalLM(num_layers=4)
+        module_fqns = generate_hf_model_fqn_per_model_part(
+            num_stages=2, num_layers=4, include_embeddings=True,
+            include_lm_head=True, include_rotary_emb=True, fqn_prefix="model.",
+        )
+        world_mesh = FakeWorldMesh()
+        world_mesh["pp"] = FakePPMesh(size=2, local_rank=0)
+
+        ap = AutoPipeline(
+            world_mesh=world_mesh, pp_axis_name="pp", pp_schedule="1f1b",
+            pp_microbatch_size=1, pp_batch_size=2,
+            module_fqns_per_model_part=module_fqns, device=torch.device("cpu"),
+        )
+        ap.build(model, loss_fn=lambda x, y: torch.tensor(0.0))
+
+        import nemo_automodel.components.distributed.pipelining.autopipeline as ap_mod
+        call_count = [0]
+        def mock_reset(*a, **kw):
+            call_count[0] += 1
+        monkeypatch.setattr(ap_mod, "reset_pp_stage_shapes", mock_reset)
+
+        ap.update_seq_len(100)
+        assert ap._pp_current_seq_len == 100
+        assert call_count[0] == 1
+
+        # Different seq_len triggers reset
+        ap.update_seq_len(200)
+        assert ap._pp_current_seq_len == 200
+        assert call_count[0] == 2
+
+        # Same as current is a no-op
+        ap.update_seq_len(200)
+        assert call_count[0] == 2
+
+    def test_model_config_stored_after_build(self, monkeypatch):
+        """build() should store model.config for later use by update_seq_len."""
+        _patch_autopipeline_monkey(monkeypatch)
+
+        model = DummyQwenForCausalLM(num_layers=4)
+        module_fqns = generate_hf_model_fqn_per_model_part(
+            num_stages=2, num_layers=4, include_embeddings=True,
+            include_lm_head=True, include_rotary_emb=True, fqn_prefix="model.",
+        )
+        world_mesh = FakeWorldMesh()
+        world_mesh["pp"] = FakePPMesh(size=2, local_rank=0)
+
+        ap = AutoPipeline(
+            world_mesh=world_mesh, pp_axis_name="pp", pp_schedule="1f1b",
+            pp_microbatch_size=1, pp_batch_size=2,
+            module_fqns_per_model_part=module_fqns, device=torch.device("cpu"),
+        )
+
+        assert ap._model_config is None
+        ap.build(model, loss_fn=lambda x, y: torch.tensor(0.0))
+        assert ap._model_config is model.config
