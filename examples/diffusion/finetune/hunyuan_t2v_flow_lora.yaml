@@ -1,0 +1,103 @@
+seed: 42
+
+wandb:
+  project: hunyuan-video-training
+  mode: online
+  name: hunyuan_lora_run
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  pretrained_model_name_or_path: "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v"
+  # Required when peft block is present — passed to auto_diffusion_pipeline
+  # for model-specific setup (no pre-inject hook needed for Hunyuan).
+  model_type: "hunyuan"
+  mode: "finetune"
+  attention_backend: "flash"
+
+# ── LoRA / PEFT configuration ─────────────────────────────────────────────────
+# Remove this section for full fine-tune.
+# Mirrors the LLM peft config pattern — PeftConfig is instantiated directly.
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  dim: 64
+  alpha: 64
+  dropout: 0.0
+  target_modules:
+    - "*.to_q"
+    - "*.to_k"
+    - "*.to_v"
+    - "*.to_out.0"
+    - "*.add_q_proj"
+    - "*.add_k_proj"
+    - "*.add_v_proj"
+    - "*.to_add_out"
+
+optim:
+  learning_rate: 5e-6
+  optimizer:
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 0
+  min_lr: 1e-6
+
+# FSDP2 with param_dtype=None when LoRA enabled:
+#   base weights (bf16): sharded, no grad comms
+#   LoRA weights (fp32): sharded, grad allreduced by FSDP2
+fsdp:
+  dp_size: 8
+  dp_replicate_size: 1
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  cpu_offload: false
+  activation_checkpointing: true
+  use_hf_tp_plan: false
+
+flow_matching:
+  adapter_type: "hunyuan"
+  adapter_kwargs:
+    use_condition_latents: true
+    default_image_embed_shape: [729, 1152]
+  timestep_sampling: "logit_normal"
+  logit_mean: 0.0
+  logit_std: 1.0
+  flow_shift: 3.0
+  mix_uniform_ratio: 0.1
+  sigma_min: 0.0
+  sigma_max: 1.0
+  num_train_timesteps: 1000
+  i2v_prob: 0.3
+  use_loss_weighting: false
+  log_interval: 1000
+  summary_log_interval: 100
+
+step_scheduler:
+  num_epochs: 30
+  local_batch_size: 1
+  global_batch_size: 8
+  ckpt_every_steps: 1000
+  log_every: 10
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
+    cache_dir: PATH_TO_YOUR_DATA
+    model_type: hunyuan
+    base_resolution: [512, 512]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+    num_workers: 0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
+  model_save_format: torch_save
+  save_consolidated: false
+  restore_from: null

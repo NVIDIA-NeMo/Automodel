@@ -70,6 +70,10 @@ class SimpleAdapter(ModelAdapter):
             "hidden_states": context.noisy_latents,
             "timestep": context.timesteps.to(dtype),
             "encoder_hidden_states": text_embeddings,
+            # Pass so @apply_lora_scale on WanTransformer3DModel.forward()
+            # applies the correct LoRA scale. scale=1.0 = full contribution
+            # during training. At inference, set via attention_kwargs={"scale": s}.
+            "attention_kwargs": {"scale": 1.0},
         }
 
     def forward(self, model: nn.Module, inputs: Dict[str, Any]) -> torch.Tensor:
@@ -87,6 +91,7 @@ class SimpleAdapter(ModelAdapter):
             hidden_states=inputs["hidden_states"],
             timestep=inputs["timestep"],
             encoder_hidden_states=inputs["encoder_hidden_states"],
+            attention_kwargs=inputs.get("attention_kwargs"),
             return_dict=False,
         )
         return self.post_process_prediction(model_pred)

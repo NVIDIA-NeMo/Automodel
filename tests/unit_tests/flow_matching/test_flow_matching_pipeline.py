@@ -47,7 +47,7 @@ class MockModel(nn.Module):
         self.output_scale = output_scale
         self.linear = nn.Linear(1, 1)  # Dummy parameter for gradient tests
 
-    def forward(self, hidden_states, timestep, encoder_hidden_states, return_dict=False):
+    def forward(self, hidden_states, timestep, encoder_hidden_states, return_dict=False, **kwargs):
         # Return prediction with same shape as input hidden_states
         output = torch.randn_like(hidden_states) * self.output_scale
         # Add small scaled version of input to maintain gradient connection
@@ -933,7 +933,7 @@ class TestPipelineEdgeCases:
                 super().__init__()
                 self.linear = nn.Linear(1, 1)
 
-            def forward(self, hidden_states, timestep, encoder_hidden_states, return_dict=False):
+            def forward(self, hidden_states, timestep, encoder_hidden_states, return_dict=False, **kwargs):
                 return (torch.full_like(hidden_states, float("nan")),)
 
         nan_model = NanModel()

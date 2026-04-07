@@ -168,6 +168,10 @@ class HunyuanAdapter(ModelAdapter):
             "encoder_hidden_states_2": text_embeddings_2,
             "encoder_attention_mask_2": text_mask_2,
             "image_embeds": image_embeds,
+            # Pass so @apply_lora_scale on HunyuanVideo15Transformer3DModel.forward()
+            # applies the correct LoRA scale. scale=1.0 = full contribution
+            # during training. At inference, set via attention_kwargs={"scale": s}.
+            "attention_kwargs": {"scale": 1.0},
         }
 
     def forward(self, model: nn.Module, inputs: Dict[str, Any]) -> torch.Tensor:
@@ -189,6 +193,7 @@ class HunyuanAdapter(ModelAdapter):
             encoder_hidden_states_2=inputs["encoder_hidden_states_2"],
             encoder_attention_mask_2=inputs["encoder_attention_mask_2"],
             image_embeds=inputs["image_embeds"],
+            attention_kwargs=inputs.get("attention_kwargs"),
             return_dict=False,
         )
         return self.post_process_prediction(model_pred)
