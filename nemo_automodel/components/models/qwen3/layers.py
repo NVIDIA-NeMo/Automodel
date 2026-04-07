@@ -28,22 +28,20 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
-from nemo_automodel.components.models.common.combined_projection.combined_qkv import (
-    CombinedQKVAttentionMixin,
-)
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 
 
-class Qwen3Attention(CombinedQKVAttentionMixin, nn.Module):
-    """Qwen3 dense attention with combined QKV, per-head RMSNorm, RoPE, and TE/SDPA backends.
+class Qwen3Attention(nn.Module):
+    """Qwen3 dense attention with separate QKV projections, per-head RMSNorm, RoPE, and TE/SDPA.
+
+    Uses separate q_proj / k_proj / v_proj so native key names match the HF checkpoint
+    directly -- no state-dict conversion needed.
 
     Key differences from Qwen2:
-    - Per-head q_norm and k_norm (RMSNorm) applied after QKV split, before RoPE
-    - No attention bias (Qwen3 config has attention_bias=False)
-    - Supports both bshd (standard) and thd (sequence-packed) formats for CP
+    - Per-head q_norm and k_norm (RMSNorm) applied after projection, before RoPE
+    - No attention bias
 
-    Combined QKV layout for TP: [Q_group_0 | K_0 | V_0 | Q_group_1 | K_1 | V_1 | ...]
-    This layout ensures ColwiseParallel TP sharding gives each rank complete KV-head groups.
+    Supports both bshd (standard) and thd (sequence-packed + CP) formats.
     """
 
     def __init__(self, config: Qwen3Config, backend: BackendConfig):
@@ -56,17 +54,15 @@ class Qwen3Attention(CombinedQKVAttentionMixin, nn.Module):
 
         attention_bias = getattr(config, "attention_bias", False)
 
-        # Manually set up CombinedQKVAttentionMixin attributes so we can use
-        # initialize_linear_module for TE Linear (FP8) support.
-        self.use_combined_qkv = True
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self._num_kv_groups = self.num_heads // self.num_kv_heads
-        self._head_dim = self.head_dim
-        self._tp_checked = False
-
-        total_qkv_out = (self.num_heads + 2 * self.num_kv_heads) * self.head_dim
-        self.qkv_proj = initialize_linear_module(backend.linear, config.hidden_size, total_qkv_out, attention_bias)
+        self.q_proj = initialize_linear_module(
+            backend.linear, config.hidden_size, self.num_heads * self.head_dim, attention_bias
+        )
+        self.k_proj = initialize_linear_module(
+            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, attention_bias
+        )
+        self.v_proj = initialize_linear_module(
+            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, attention_bias
+        )
         self.o_proj = initialize_linear_module(
             backend.linear, self.num_heads * self.head_dim, config.hidden_size, False
         )
@@ -100,10 +96,10 @@ class Qwen3Attention(CombinedQKVAttentionMixin, nn.Module):
             qkv_format = "bshd"
             bsz, seqlen, _ = x.size()
 
-        # Combined QKV projection with KV-head-grouped de-interleaving (mixin)
-        q, k, v = self.compute_qkv(x)
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
 
-        # Reshape to expose head dimension for per-head norms
         if qkv_format == "thd":
             q = q.view(num_tokens, self.num_heads, self.head_dim)
             k = k.view(num_tokens, self.num_kv_heads, self.head_dim)
@@ -141,7 +137,7 @@ class Qwen3Attention(CombinedQKVAttentionMixin, nn.Module):
         return out
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02):
-        for linear in [self.qkv_proj, self.o_proj]:
+        for linear in [self.q_proj, self.k_proj, self.v_proj, self.o_proj]:
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
             if hasattr(linear, "bias") and linear.bias is not None:
                 nn.init.zeros_(linear.bias)

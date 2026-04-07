@@ -14,42 +14,34 @@
 
 """State dict adapter for Qwen3 dense model.
 
-Converts between the HF checkpoint format (separate q_proj/k_proj/v_proj and
-gate_proj/up_proj) and our native format (combined qkv_proj and gate_up_proj)
-which is required for correct TP ColwiseParallel sharding.
+Because Qwen3Attention uses separate q_proj / k_proj / v_proj and the MLP uses
+separate gate_proj / up_proj, the native key names already match the HF checkpoint
+format exactly -- no weight reshaping or renaming is required.
 
-The per-head q_norm and k_norm weights have the same key names in both formats
-and pass through unchanged -- no special handling is required.
+This adapter is therefore a pass-through: from_hf and to_hf both return the
+input unchanged.  It exists so callers that expect a state_dict_adapter attribute
+still work without special-casing.
 """
+
+from typing import Any
 
 from transformers import Qwen3Config
 
-from nemo_automodel.components.models.common.combined_projection.state_dict_adapter import (
-    CombinedProjectionStateDictAdapter,
-)
 
+class Qwen3StateDictAdapter:
+    """Identity (pass-through) state dict adapter for Qwen3 dense models.
 
-class Qwen3StateDictAdapter(CombinedProjectionStateDictAdapter):
-    """State dict adapter for Qwen3 dense models.
-
-    Handles the HF ↔ native format conversion:
-    - HF: separate ``q_proj``, ``k_proj``, ``v_proj`` weights
-    - Native: combined ``qkv_proj`` weight in KV-head-grouped interleaved layout
-    - HF: separate ``gate_proj``, ``up_proj`` weights
-    - Native: combined ``gate_up_proj`` weight in row-interleaved layout
-
-    Keys not matched by the above patterns (``q_norm``, ``k_norm``, ``o_proj``,
-    ``down_proj``, layer norms, embeddings, lm_head) pass through unchanged.
-
-    Example::
-
-        from transformers import Qwen3Config
-        config = Qwen3Config.from_pretrained("Qwen/Qwen3-32B")
-        adapter = Qwen3StateDictAdapter(config)
-
-        custom_sd = adapter.from_hf(hf_state_dict)
-        hf_sd = adapter.to_hf(custom_sd)
+    Native format == HF format, so no conversion is needed.
     """
 
     def __init__(self, config: Qwen3Config):
-        super().__init__(config)
+        self.config = config
+
+    def from_hf(self, hf_state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
+        return hf_state_dict
+
+    def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
+        return state_dict
+
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        return [(fqn, tensor)]

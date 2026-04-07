@@ -210,8 +210,8 @@ class Qwen3ForCausalLM(HFCheckpointingMixin, nn.Module):
         if getattr(config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.embed_tokens.weight
 
-        if self.backend.enable_hf_state_dict_adapter:
-            self.state_dict_adapter = Qwen3StateDictAdapter(config)
+        # Native key names already match HF format; adapter is a pass-through.
+        self.state_dict_adapter = Qwen3StateDictAdapter(config)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
