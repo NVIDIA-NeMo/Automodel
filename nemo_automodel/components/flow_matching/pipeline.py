@@ -42,6 +42,7 @@ from .adapters import (
     FluxAdapter,
     HunyuanAdapter,
     ModelAdapter,
+    QwenImageAdapter,
     SimpleAdapter,
 )
 
@@ -559,7 +560,7 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
     Factory function to create a model adapter by name.
 
     Args:
-        adapter_type: Type of adapter ("hunyuan", "simple", "flux")
+        adapter_type: Type of adapter ("hunyuan", "simple", "flux", "qwen_image")
         **kwargs: Additional arguments passed to the adapter constructor
 
     Returns:
@@ -569,6 +570,7 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
         "hunyuan": HunyuanAdapter,
         "simple": SimpleAdapter,
         "flux": FluxAdapter,
+        "qwen_image": QwenImageAdapter,
     }
 
     if adapter_type not in adapters:
