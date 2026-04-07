@@ -540,10 +540,14 @@ def apply_model_infrastructure(
     # These hooks strip attention_mask and set is_causal=True on self_attn modules
     # so that SDPA handles causal masking internally (compatible with DTensor sharding).
     if mesh.cp_size > 1 and not _uses_te_attention(model):
-        from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+        from nemo_automodel.components.distributed.cp_utils import (
+            attach_context_parallel_hooks,
+            attach_linear_attn_position_hooks,
+        )
 
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:
             attach_context_parallel_hooks(mp)
+            attach_linear_attn_position_hooks(mp)
 
     return model
