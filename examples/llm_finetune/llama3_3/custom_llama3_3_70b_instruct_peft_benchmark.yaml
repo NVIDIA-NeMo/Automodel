@@ -8,7 +8,6 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 seed: 42
 
-# NEW: Add benchmark section
 benchmark:
   warmup_steps: 5
   peak_tflops: 989  # H100: 989, A100: 312
@@ -19,7 +18,7 @@ benchmark:
 
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 4
+  local_batch_size: 2
   ckpt_every_steps: 50
   val_every_steps: 1000
   max_steps: 10
@@ -53,21 +52,17 @@ checkpoint:
 
 distributed:
   strategy: fsdp2
-  dp_size: none
+  dp_size: null
   tp_size: 2
   cp_size: 1
-  pp_size: 4
 
-  sequence_parallel: false
+  sequence_parallel: true
   activation_checkpointing: true
-
-  pipeline:
-    pp_schedule: interleaved1f1b
-    pp_microbatch_size: 1
-    layers_per_stage: 2
-    scale_grads_in_schedule: false
-    round_virtual_stages_to_pp_multiple: up
-    dtype: bf16
+  enable_async_tensor_parallel: true
+  enable_fsdp2_prefetch: true
+  enable_compile: true
+  defer_fsdp_grad_sync: false
+  patch_is_packed_sequence: true  # Patch transformers._is_packed_sequence to always return False: removes CPU-GPU sync per attention layer and ensures static shapes for torch.compile. Safe for non-packed (standard) training only.
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -82,7 +77,6 @@ dataset:
 dataloader:
   _target_: torch.utils.data.DataLoader
   batch_size: null  # Dataset already yields batches
-  # Note: model_config will be auto-injected by train_ft.py for PP models
 
 optimizer:
   _target_: torch.optim.Adam
