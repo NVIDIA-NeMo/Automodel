@@ -94,7 +94,7 @@ Find the right guide for your task -- fine-tuning, pretraining, distillation, di
 | **Fine-tune VLM**           | Your task involves both images and text (e.g., visual QA, captioning)               | Image + text dataset                              | VLM       | [Fine-tune VLM](guides/omni/gemma3-3n.md)                 |
 | **Fine-tune Gemma 4**       | You want to fine-tune Gemma 4 for structured extraction from images (e.g., receipts) | Image + text dataset                              | VLM       | [Fine-tune Gemma 4](guides/vlm/gemma4.md)                 |
 | **Fine-tune Diffusion**     | You want to fine-tune a diffusion model for image or video generation               | Video / Image dataset                             | Diffusion | [Fine-tune Diffusion](guides/diffusion/finetune.md)       |
-| **Fine-tune VLM-MoE**       | You need large-scale vision-language training with sparse MoE efficiency            | Image + text dataset                              | VLM (MoE) | [Fine-tune VLM-MoE](guides/vlm/qwen3_5.md)                |
+| **Fine-tune VLM-MoE**       | You need large-scale vision-language training with sparse MoE efficiency            | Image + text dataset                              | VLM (MoE) | [Fine-tune VLM-MoE](guides/vlm/qwen3-5.md)                |
 | **Embedding fine-tune**     | You want to improve text similarity for search, retrieval, or RAG         | Text pairs / retrieval corpus                     | LLM       | {bdg-info}`Coming Soon`                                   |
 | **Fine-tune a large MoE**   | You are adapting a large sparse MoE model (DeepSeek-V3, GLM-5, etc.) to your domain | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune MoE](guides/llm/large_moe_finetune.md)         |
 | **Sequence classification** | You need to classify text into categories (sentiment, topic, NLI)                   | Text + labels (e.g., GLUE MRPC)                   | LLM       | [Train classifier](guides/llm/sequence-classification.md) |
@@ -242,7 +242,7 @@ Overview <guides/overview.md>
 SFT & PEFT <guides/llm/finetune.md>
 Function Calling <guides/llm/toolcalling.md>
 guides/llm/knowledge-distillation.md
-Large MoE Fine-Tuning <guides/llm/large_moe_finetune.md>
+Large MoE Fine-Tuning <guides/llm/large-moe-finetune.md>
 Pretraining <guides/llm/pretraining.md>
 NanoGPT Pretraining <guides/llm/nanogpt-pretraining.md>
 Sequence Classification <guides/llm/sequence-classification.md>

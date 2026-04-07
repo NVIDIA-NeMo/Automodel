@@ -265,4 +265,3 @@ def test_get_grad_norm_inf():
     out = grad_utils.get_grad_norm(param, Mock(), Mock(), norm_type=math.inf)
 
     assert pytest.approx(out) == expected
-
