@@ -348,7 +348,10 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
                     else:
                         _pre_shard_combined_projections(child, mesh, mp_policy, offload_policy)
                         parallelizer_utils.fully_shard_by_dtype(
-                            child, mesh, mp_policy, offload_policy,
+                            child,
+                            mesh,
+                            mp_policy,
+                            offload_policy,
                         )
             else:
                 for _, sub in module.named_children():
@@ -357,7 +360,10 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
         globals()["apply_fsdp2_sharding_recursively"] = _fsdp_by_dtype
         try:
             result = super().parallelize(
-                model, device_mesh, dp_shard_cp_mesh_name=dp_shard_cp_mesh_name, **kwargs,
+                model,
+                device_mesh,
+                dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
+                **kwargs,
             )
         finally:
             globals()["apply_fsdp2_sharding_recursively"] = original_fn
@@ -603,7 +609,6 @@ def _pre_shard_combined_projections(
                 offload_policy=offload_policy,
                 shard_placement_fn=_shard_fn,
             )
-
 
 
 def apply_fsdp2_sharding_recursively(

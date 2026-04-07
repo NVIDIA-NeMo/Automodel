@@ -386,5 +386,6 @@ def patch_hf_model(model, cp_enabled=False):
     if patched > 0:
         _logger.info(
             "Patched %d GatedDeltaNet modules (cp=%s) with FSDP-safe fp32 param wrapping.",
-            patched, cp_enabled,
+            patched,
+            cp_enabled,
         )
