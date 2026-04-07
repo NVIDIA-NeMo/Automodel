@@ -66,7 +66,7 @@ class QwenImageProcessor(BaseModelProcessor):
                 - tokenizer: Qwen2 tokenizer
                 - text_encoder: Qwen2 text encoder
         """
-        from diffusers import AutoencoderKL, QwenImagePipeline
+        from diffusers import QwenImagePipeline
 
         logger.info("[Qwen-Image] Loading models from %s...", model_name)
 

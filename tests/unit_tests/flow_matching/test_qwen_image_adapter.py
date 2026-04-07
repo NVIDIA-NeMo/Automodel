@@ -20,8 +20,9 @@ import pytest
 import torch
 
 from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext
-from nemo_automodel.components.flow_matching.adapters.qwen_image import QwenImageAdapter
-
+from nemo_automodel.components.flow_matching.adapters.qwen_image import (
+    QwenImageAdapter,
+)
 
 # =============================================================================
 # TestQwenImageAdapterPackLatents
@@ -182,7 +183,8 @@ class TestPrepareInputs:
         noisy = torch.randn(1, 16, 8, 8)
         batch = {"text_embeddings": torch.randn(77, 2048)}  # 2D
         ctx = self._make_context(
-            noisy, batch,
+            noisy,
+            batch,
             timesteps=torch.tensor([500.0]),
             sigma=torch.tensor([0.5]),
         )
