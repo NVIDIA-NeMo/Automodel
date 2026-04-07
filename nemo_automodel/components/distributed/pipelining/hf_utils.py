@@ -239,6 +239,55 @@ def create_pipeline_forward_causal_lm() -> Callable:
     return pipeline_forward_causal_lm
 
 
+def patch_is_packed_sequence_for_training() -> None:
+    """Eliminate CPU-GPU sync from flash attention for standard (non-packed) training.
+
+    transformers._is_packed_sequence() returns a GPU bool scalar when batch_size==1,
+    which causes Python's ``if`` to call aten::is_nonzero — a CPU-GPU sync — once per
+    attention layer per forward pass.  With FSDP+TP+gradient-checkpointing this fires
+    hundreds of times per iteration.
+
+    For standard (non-packed) training sequences are never packed, so returning the
+    Python False immediately is both correct and avoids the sync.  Do NOT apply this
+    patch when using packed-sequence training (multiple sequences concatenated into one
+    tensor with position_ids that reset to 0 mid-sequence).
+    """
+    try:
+        import transformers.modeling_flash_attention_utils as _fa_utils
+
+        if getattr(_fa_utils, "_is_packed_sequence_patched", False):
+            return  # already patched
+
+        def _is_packed_sequence_no_sync(position_ids, batch_size):
+            # Non-packed training: position_ids is always a simple arange -- never packed.
+            return False
+
+        _fa_utils._is_packed_sequence = _is_packed_sequence_no_sync
+
+        # Also patch any module that imported _is_packed_sequence by reference at
+        # import time (e.g. "from modeling_flash_attention_utils import _is_packed_sequence").
+        _patch_targets = [
+            "transformers.models.llama.modeling_llama",
+            "transformers.integrations.flash_attention",
+            "transformers.modeling_flash_attention_utils",
+        ]
+        patched = ["modeling_flash_attention_utils"]
+        for _mod_name in _patch_targets:
+            try:
+                import importlib
+
+                _mod = importlib.import_module(_mod_name)
+                if hasattr(_mod, "_is_packed_sequence"):
+                    _mod._is_packed_sequence = _is_packed_sequence_no_sync
+                    patched.append(_mod_name.split(".")[-1])
+            except Exception:
+                pass
+
+        _fa_utils._is_packed_sequence_patched = True
+    except (ImportError, AttributeError):
+        pass
+
+
 def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm_model: bool = True) -> None:
     """Patch a HF model/module to produce pipeline-compatible forward.
 

@@ -422,6 +422,7 @@ def apply_model_infrastructure(
         autopipeline=autopipeline,
         tp_size=mesh.tp_size,
         ep_size=mesh.ep_size,
+        dp_shard_size=mesh.dp_shard_size,
         pretrained_model_name_or_path=pretrained_model_name_or_path,
         load_base_model=load_base_model,
         peft_config=peft_config,
@@ -512,6 +513,17 @@ def apply_model_infrastructure(
                 pretrained_model_name_or_path,
                 load_base_model=load_base_model,
             )
+
+    # Apply per-layer torch.compile after checkpoint loading so that the _orig_mod key prefix
+    # introduced by torch.compile doesn't conflict with HF checkpoint key names.
+    if isinstance(model_wrapper, FSDP2Manager) and (
+        model_wrapper.enable_compile or model_wrapper.enable_async_tensor_parallel
+    ):
+        from nemo_automodel.components.distributed.parallelizer import _apply_per_layer_compile
+
+        model_parts = model.parts if hasattr(model, "parts") else [model]
+        for mp in model_parts:
+            _apply_per_layer_compile(mp)
 
     # Freeze parameters after checkpoint loading and parallelization
     # This catches params created during parallelization (e.g., GroupedExpertsTE in init_token_dispatcher)

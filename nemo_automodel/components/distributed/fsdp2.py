@@ -16,11 +16,11 @@ import logging
 from typing import Optional
 
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp._fully_shard import FSDPModule
 
 from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.distributed.parallelizer import (
-    _get_parallel_plan,
     fsdp2_strategy_parallelize,
 )
 
@@ -68,6 +68,15 @@ class FSDP2Manager:
         self.activation_checkpointing = config.activation_checkpointing
         self.defer_fsdp_grad_sync = config.defer_fsdp_grad_sync
         self.backend = config.backend
+        self.enable_async_tensor_parallel = config.enable_async_tensor_parallel
+        self.enable_compile = config.enable_compile
+        self.enable_fsdp2_prefetch = config.enable_fsdp2_prefetch
+        self.fsdp_layer_group_size = config.fsdp_layer_group_size
+        self.fsdp2_no_cat_array = config.fsdp2_no_cat_array
+        self.fsdp2_backward_prefetch_depth = config.fsdp2_backward_prefetch_depth
+        self.fsdp2_forward_prefetch_depth = config.fsdp2_forward_prefetch_depth
+        self.defer_rs_grad_accum = config.defer_rs_grad_accum
+        self.ga_state: Optional[object] = None
 
     def parallelize(self, model):
         """
@@ -88,23 +97,37 @@ class FSDP2Manager:
                     logger.error("Model does not support gradient checkpointing.")
             return model
 
-        if self.device_mesh["tp"].size() > 1:
-            # Delegate plan selection to central helper
-            tp_shard_plan = _get_parallel_plan(
-                model,
-                sequence_parallel=bool(self.sequence_parallel),
-                tp_shard_plan=self.tp_plan,
-            )
-        else:
-            tp_shard_plan = None
+        if self.config.patch_is_packed_sequence:
+            from nemo_automodel.components.distributed.pipelining.hf_utils import patch_is_packed_sequence_for_training
+
+            patch_is_packed_sequence_for_training()
 
         fsdp2_strategy_parallelize(
             model,
             device_mesh=self.device_mesh,
             mp_policy=self.mp_policy,
-            tp_shard_plan=tp_shard_plan,
+            tp_shard_plan=self.tp_plan,
             offload_policy=self.offload_policy,
             sequence_parallel=bool(self.sequence_parallel),
             activation_checkpointing=self.activation_checkpointing,
+            enable_async_tensor_parallel=self.enable_async_tensor_parallel,
+            enable_compile=self.enable_compile,
+            enable_fsdp2_prefetch=self.enable_fsdp2_prefetch,
+            fsdp_layer_group_size=self.fsdp_layer_group_size,
+            fsdp2_no_cat_array=self.fsdp2_no_cat_array,
+            fsdp2_backward_prefetch_depth=self.fsdp2_backward_prefetch_depth,
+            fsdp2_forward_prefetch_depth=self.fsdp2_forward_prefetch_depth,
         )
+
+        if self.defer_rs_grad_accum:
+            from nemo_automodel.components.distributed.deferred_rs import DeferredShardedReduceScatter, GAState
+
+            ga_state = GAState()
+            for module in model.modules():
+                if isinstance(module, FSDPModule):
+                    module.set_custom_reduce_scatter(DeferredShardedReduceScatter(ga_state))
+            self.ga_state = ga_state
+            model._fsdp2_ga_state = ga_state
+            logger.info("Installed DeferredShardedReduceScatter on all FSDP modules.")
+
         return model

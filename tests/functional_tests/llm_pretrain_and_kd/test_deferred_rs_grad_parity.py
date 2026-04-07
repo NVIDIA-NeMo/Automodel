@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Combined projection modules for efficient transformer implementations."""
+from tests.utils.test_utils import run_test_script
 
-from nemo_automodel.components.models.common.combined_projection.combined_mlp import CombinedGateUpMLP
-from nemo_automodel.components.models.common.combined_projection.combined_qkv import CombinedQKVAttentionMixin
+TEST_FOLDER = "llm_pretrain_and_kd"
+DEFERRED_RS_GRAD_PARITY = "L2_DeferredRS_Grad_Parity.sh"
 
-__all__ = ["CombinedQKVAttentionMixin", "CombinedGateUpMLP"]
+
+class TestDeferredRSGradParity:
+    def test_defer_rs_grad_accum_matches_baseline_fsdp_dp2(self):
+        run_test_script(TEST_FOLDER, DEFERRED_RS_GRAD_PARITY)
