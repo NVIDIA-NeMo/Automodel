@@ -760,7 +760,7 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
     object.__setattr__(recipe, "device_mesh", None)
     object.__setattr__(recipe, "pp_enabled", True)
-    object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info))
+    object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info, update_seq_len=lambda seq_len: None))
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
     object.__setattr__(recipe, "te_fp8", None)
 
@@ -1694,7 +1694,7 @@ class TestRunTrainOptimStepSetsMoEScale:
 
         if pp_enabled:
             pp_info = SimpleNamespace(has_first_stage=True, has_last_stage=True)
-            object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info))
+            object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info, update_seq_len=lambda seq_len: None))
             mock_mesh = MagicMock()
             mock_mesh.reshape.return_value.__getitem__ = lambda self, idx: MagicMock(item=lambda: 0)
             object.__setattr__(recipe, "device_mesh", SimpleNamespace(mesh=mock_mesh))

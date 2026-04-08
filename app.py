@@ -27,13 +27,29 @@ For production use, prefer the installed ``automodel`` (or ``am``) entry-point.
 """
 
 import logging
+import os
 import sys
+import warnings
 
 from nemo_automodel.cli.app import main
+
+# Pydantic v2 emits UnsupportedFieldAttributeWarning for Field(repr=...) /
+# Field(frozen=...) used inside 3.12-style `type` aliases in third-party libs.
+# There is nothing actionable for us here, so silence them globally.
+try:
+    from pydantic.warnings import UnsupportedFieldAttributeWarning
+
+    warnings.filterwarnings("ignore", category=UnsupportedFieldAttributeWarning)
+except ImportError:
+    pass
 
 logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
+    # When launched via external torchrun, each worker runs this file.
+    # Silence non-rank-0 workers before any logging to avoid duplicate output.
+    if int(os.environ.get("RANK", "0")) > 0:
+        logging.disable(logging.CRITICAL)
     logging.basicConfig(level=logging.INFO)
     logger.info(
         "Running from source checkout (app.py). "

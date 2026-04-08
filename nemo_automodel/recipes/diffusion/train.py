@@ -50,6 +50,8 @@ def build_model_and_optimizer(
     attention_backend: Optional[str] = None,
     optimizer_cfg: Optional[Dict[str, Any]] = None,
     pipeline_spec: Optional[Dict[str, Any]] = None,
+    peft_cfg=None,
+    model_type=None,
 ) -> tuple[NeMoAutoDiffusionPipeline, torch.optim.Optimizer, Any]:
     """Build the diffusion model, parallel scheme, and optimizer.
 
@@ -69,6 +71,9 @@ def build_model_and_optimizer(
             - transformer_cls: str (e.g., "WanTransformer3DModel", "FluxTransformer2DModel")
             - subfolder: str (e.g., "transformer")
             - Optional: pipeline_cls, load_full_pipeline
+        peft_cfg: PeftConfig instance or None. When provided, only LoRA params
+            are trained; base weights are frozen and sharded by FSDP2 for memory.
+        model_type: "flux" | "wan" | "hunyuan". Required when peft_cfg is provided.
 
     Returns:
         Tuple of (pipeline, optimizer, device_mesh or None).
@@ -90,6 +95,13 @@ def build_model_and_optimizer(
         logging.info("[WARN] torch.distributed not initialized; proceeding in single-process mode")
 
     world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+    lora_enabled = peft_cfg is not None
+    # param_dtype=None when LoRA: FSDP2 does not cast any parameter.
+    # bf16 base weights stay bf16 (loaded dtype).
+    # bf16 LoRA weights stay bf16 (set via peft_cfg.lora_dtype in pipeline).
+    # param_dtype=dtype when full fine-tune: FSDP2 casts everything to dtype (bf16).
+    param_dtype = None if lora_enabled else dtype
 
     # Build manager args based on which config is provided
     if ddp_cfg is not None:
@@ -132,7 +144,7 @@ def build_model_and_optimizer(
             "use_hf_tp_plan": fsdp_cfg.get("use_hf_tp_plan", False),
             "activation_checkpointing": fsdp_cfg.get("activation_checkpointing", True),
             "mp_policy": MixedPrecisionPolicy(
-                param_dtype=dtype,
+                param_dtype=param_dtype,
                 reduce_dtype=torch.float32,
                 output_dtype=dtype,
             ),
@@ -151,6 +163,8 @@ def build_model_and_optimizer(
             components_to_load=["transformer"],
             load_for_training=True,
             low_cpu_mem_usage=True,
+            peft_cfg=peft_cfg,
+            model_type=model_type,
         )
     else:
         # Pretraining: initialize with random weights using pipeline_spec
@@ -177,9 +191,27 @@ def build_model_and_optimizer(
         logging.info(f"[INFO] Setting attention backend to {attention_backend}")
         transformer_module.set_attention_backend(attention_backend)
 
-    trainable_params = [p for p in transformer_module.parameters() if p.requires_grad]
-    if not trainable_params:
-        raise RuntimeError("No trainable parameters found in transformer module!")
+    if lora_enabled:
+        # Collect lora_params AFTER FSDP2 wrapping from the live wrapped module.
+        # Pre-FSDP2 refs (pipe._lora_params) are stale after fully_shard() —
+        # FSDP2 replaces parameter storage, so AdamW with stale refs never commits
+        # updates to the actual sharded parameters. Mirrors the LLM pattern in
+        # nemo_automodel/recipes/llm/train_ft.py line 313.
+        trainable_params = [p for n, p in transformer_module.named_parameters() if "lora_" in n and p.requires_grad]
+        if not trainable_params:
+            raise RuntimeError(
+                "peft_cfg is set but no LoRA params found. "
+                "Check that peft.target_modules match module names in the transformer."
+            )
+        logging.info(
+            "[LoRA] Optimizer: %d param tensors, %s elements",
+            len(trainable_params),
+            f"{sum(p.numel() for p in trainable_params):,}",
+        )
+    else:
+        trainable_params = [p for p in transformer_module.parameters() if p.requires_grad]
+        if not trainable_params:
+            raise RuntimeError("No trainable parameters found in transformer module!")
 
     optimizer_cfg = optimizer_cfg or {}
     weight_decay = optimizer_cfg.get("weight_decay", 0.01)
@@ -392,6 +424,28 @@ class TrainDiffusionRecipe(BaseRecipe):
         pipeline_spec_cfg = self.cfg.get("model.pipeline_spec", None)
         pipeline_spec = pipeline_spec_cfg.to_dict() if pipeline_spec_cfg is not None else None
 
+        # ── PEFT / LoRA configuration ─────────────────────────────────────────
+        # Mirrors the LLM recipe pattern: peft block in YAML with _target_ pointing
+        # to PeftConfig is instantiated directly, no intermediate wrapper class.
+        self.peft_cfg = None
+        if self.cfg.get("peft", None) is not None:
+            self.peft_cfg = self.cfg.peft.instantiate()
+
+        # model_type is explicit in yaml — no fragile string detection.
+        # Required when peft block is present.
+        self.model_type = self.cfg.get("model.model_type", None)
+        if self.peft_cfg is not None and not self.model_type:
+            raise ValueError(
+                "model.model_type must be set when peft config is provided. Options: 'flux', 'wan', 'hunyuan'"
+            )
+
+        lora_status = (
+            f"enabled (dim={self.peft_cfg.dim}, alpha={self.peft_cfg.alpha})"
+            if self.peft_cfg is not None
+            else "disabled (full fine-tune)"
+        )
+        logging.info(f"[INFO] LoRA: {lora_status}")
+
         (self.pipe, self.optimizer, self.device_mesh) = build_model_and_optimizer(
             model_id=self.model_id,
             finetune_mode=self.cfg.get("model.mode", "finetune").lower() == "finetune",
@@ -404,10 +458,12 @@ class TrainDiffusionRecipe(BaseRecipe):
             optimizer_cfg=self.cfg.get("optim.optimizer", {}),
             attention_backend=self.attention_backend,
             pipeline_spec=pipeline_spec,
+            peft_cfg=self.peft_cfg,
+            model_type=self.model_type,
         )
 
         self.model = self.pipe.transformer
-        self.peft_config = None
+        self.peft_config = getattr(self.pipe, "_peft_config", None)
 
         checkpoint_cfg = self.cfg.get("checkpoint", None)
 
@@ -430,7 +486,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             model_cache_dir=model_cache_dir if model_cache_dir is not None else HF_HUB_CACHE,
             model_repo_id=self.model_id,
             save_consolidated=checkpoint_cfg.get("save_consolidated"),
-            is_peft=False,
+            is_peft=self.peft_cfg is not None,
             model_state_dict_keys=model_state_dict_keys,
             diffusers_compatible=checkpoint_cfg.get("diffusers_compatible", False),
         )
@@ -482,6 +538,9 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         # Calculate total optimizer steps for LR scheduler
         total_steps = self.num_epochs * self.steps_per_epoch
+        max_steps = self.cfg.get("step_scheduler.max_steps", None)
+        if max_steps is not None:
+            total_steps = min(total_steps, max_steps)
 
         # Build LR scheduler (returns None if lr_scheduler not in config)
         # Wrap in list for compatibility with checkpointing (OptimizerState expects list)
@@ -500,11 +559,13 @@ class TrainDiffusionRecipe(BaseRecipe):
             local_batch_size=self.cfg.step_scheduler.local_batch_size,
             dp_size=int(self.dp_size),
             ckpt_every_steps=self.cfg.step_scheduler.ckpt_every_steps,
+            save_checkpoint_every_epoch=self.cfg.get("step_scheduler.save_checkpoint_every_epoch", True),
             dataloader=self.dataloader,
             val_every_steps=None,
             start_step=int(self.global_step),
             start_epoch=int(self.start_epoch),
             num_epochs=int(self.num_epochs),
+            max_steps=max_steps,
         )
 
         self.load_checkpoint(self.restore_from)
@@ -586,6 +647,19 @@ class TrainDiffusionRecipe(BaseRecipe):
 
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.clip_grad_max_norm)
                 grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm
+
+                # ── LoRA gradient diagnostic (step 1 only) ───────────────────
+                if global_step == 1 and self.peft_cfg is not None:
+                    for n, p in self.model.named_parameters():
+                        if "lora_B" in n:
+                            try:
+                                grad_val = p.grad.to_local().float().norm().item() if p.grad is not None else None
+                            except Exception:
+                                grad_val = p.grad.float().norm().item() if p.grad is not None else None
+                            logging.info(
+                                f"[GRAD CHECK] {n}: grad_norm={grad_val}, param_norm={p.data.float().norm().item():.6f}"
+                            )
+                            break
 
                 self.optimizer.step()
                 if self.lr_scheduler is not None:
