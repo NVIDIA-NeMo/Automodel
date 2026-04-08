@@ -94,8 +94,6 @@ class FSDP2Config:
         fsdp_layer_group_size (int): Number of transformer layers to group into a single
             FSDP unit.  Grouping ``G`` layers reduces AllGather count by ``G×``.
             Default ``1`` (no grouping).
-        fsdp2_no_cat_array (bool): Reserved flag — no implementation yet.  Will suppress
-            CatArrayBatchedCopy in FSDP2 AllGather when supported.  Default ``False``.
         fsdp2_backward_prefetch_depth (int): Number of FSDP units to prefetch during
             backward pass.  ``2`` hides AllGather behind compute; ``1`` reduces peak
             memory at a small throughput cost.  Default ``2``.
@@ -116,7 +114,6 @@ class FSDP2Config:
     enable_compile: bool = False
     enable_fsdp2_prefetch: bool = False
     fsdp_layer_group_size: int = 1
-    fsdp2_no_cat_array: bool = False
     fsdp2_backward_prefetch_depth: int = 2
     fsdp2_forward_prefetch_depth: int = 1
 

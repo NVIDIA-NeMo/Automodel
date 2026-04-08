@@ -174,7 +174,6 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         enable_compile: bool = False,
         enable_fsdp2_prefetch: bool = True,
         fsdp_layer_group_size: int = 1,
-        fsdp2_no_cat_array: bool = False,
         fsdp2_backward_prefetch_depth: int = 2,
         fsdp2_forward_prefetch_depth: int = 1,
     ) -> nn.Module:
@@ -1476,7 +1475,6 @@ def fsdp2_strategy_parallelize(
     enable_compile: bool = False,
     enable_fsdp2_prefetch: bool = True,
     fsdp_layer_group_size: int = 1,
-    fsdp2_no_cat_array: bool = False,
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
 ):
@@ -1536,7 +1534,6 @@ def fsdp2_strategy_parallelize(
         enable_compile=enable_compile,
         enable_fsdp2_prefetch=enable_fsdp2_prefetch,
         fsdp_layer_group_size=fsdp_layer_group_size,
-        fsdp2_no_cat_array=fsdp2_no_cat_array,
         fsdp2_backward_prefetch_depth=fsdp2_backward_prefetch_depth,
         fsdp2_forward_prefetch_depth=fsdp2_forward_prefetch_depth,
     )
