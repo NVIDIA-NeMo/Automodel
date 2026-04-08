@@ -169,6 +169,7 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
             'needs': [config.stem],
             'variables': {
                 'CONFIG_PATH': f'{config}',
+                'TEST_LEVEL': f'{scope}',
             }
         }
 
