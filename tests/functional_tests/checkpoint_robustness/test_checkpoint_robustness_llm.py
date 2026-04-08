@@ -275,63 +275,66 @@ def test_checkpoint_robustness():
     torch.cuda.empty_cache()
     _barrier()  # ensure all ranks free memory before rank 0 loads HF model
 
-    if _rank0():
-        from transformers import AutoModelForCausalLM
+    if not no_check_hf:
+        if _rank0():
+            from transformers import AutoModelForCausalLM
 
-        hf_kwargs = dict(torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code)
-        if experts_implementation:
-            hf_kwargs["experts_implementation"] = experts_implementation
-            hf_kwargs["trust_remote_code"] = False
-        if hf_device_map_auto:
-            hf_kwargs["device_map"] = "auto"
-
-        if is_peft:
-            from peft import PeftModel
-
+            hf_kwargs = dict(torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code)
+            if experts_implementation:
+                hf_kwargs["experts_implementation"] = experts_implementation
+                hf_kwargs["trust_remote_code"] = False
             if hf_device_map_auto:
-                base_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
+                hf_kwargs["device_map"] = "auto"
+
+            if is_peft:
+                from peft import PeftModel
+
+                if hf_device_map_auto:
+                    base_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
+                else:
+                    base_model = _fix_meta_rotary_embeddings(
+                        AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
+                    ).to(device)
+                peft_model = PeftModel.from_pretrained(base_model, str(ckpt_step_dir / "model"))
+                hf_logits = _get_logits(peft_model, input_ids, device)
+
+                # PEFT fused QKV key verification
+                if check_fused_qkv_keys:
+                    from safetensors import safe_open
+
+                    adapter_path = ckpt_step_dir / "model" / "adapter_model.safetensors"
+                    assert adapter_path.exists(), f"adapter_model.safetensors not found at {adapter_path}"
+                    with safe_open(str(adapter_path), framework="pt") as f:
+                        adapter_keys = list(f.keys())
+                    combined_keys = [k for k in adapter_keys if "qkv_proj" in k or "gate_up_proj" in k]
+                    assert len(combined_keys) == 0, (
+                        f"Fused QKV check failed: adapter_model.safetensors contains combined projection keys: "
+                        f"{combined_keys}"
+                    )
+                    print(f"[Fused QKV] No combined projection keys in adapter ({len(adapter_keys)} keys checked) ✓")
+
+                del peft_model, base_model
             else:
-                base_model = _fix_meta_rotary_embeddings(
-                    AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
-                ).to(device)
-            peft_model = PeftModel.from_pretrained(base_model, str(ckpt_step_dir / "model"))
-            hf_logits = _get_logits(peft_model, input_ids, device)
+                if hf_device_map_auto:
+                    hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
+                else:
+                    hf_model = _fix_meta_rotary_embeddings(
+                        AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
+                    ).to(device)
+                hf_logits = _get_logits(hf_model, input_ids, device)
+                del hf_model
 
-            # PEFT fused QKV key verification
-            if check_fused_qkv_keys:
-                from safetensors import safe_open
+            kl_hf = _kl_divergence_from_logits(reference_logits, hf_logits)
+            max_kl_hf = kl_hf.max().item()
+            print(f"[Phase 4] HF-loaded max KL: {max_kl_hf:.6e} (threshold: {hf_kl_threshold:.6e})")
+            assert max_kl_hf <= hf_kl_threshold, (
+                f"KL divergence between original and HF-loaded model too large: "
+                f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
+            )
 
-                adapter_path = ckpt_step_dir / "model" / "adapter_model.safetensors"
-                assert adapter_path.exists(), f"adapter_model.safetensors not found at {adapter_path}"
-                with safe_open(str(adapter_path), framework="pt") as f:
-                    adapter_keys = list(f.keys())
-                combined_keys = [k for k in adapter_keys if "qkv_proj" in k or "gate_up_proj" in k]
-                assert len(combined_keys) == 0, (
-                    f"Fused QKV check failed: adapter_model.safetensors contains combined projection keys: "
-                    f"{combined_keys}"
-                )
-                print(f"[Fused QKV] No combined projection keys in adapter ({len(adapter_keys)} keys checked) ✓")
-
-            del peft_model, base_model
-        else:
-            if hf_device_map_auto:
-                hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
-            else:
-                hf_model = _fix_meta_rotary_embeddings(
-                    AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
-                ).to(device)
-            hf_logits = _get_logits(hf_model, input_ids, device)
-            del hf_model
-
-        kl_hf = _kl_divergence_from_logits(reference_logits, hf_logits)
-        max_kl_hf = kl_hf.max().item()
-        print(f"[Phase 4] HF-loaded max KL: {max_kl_hf:.6e} (threshold: {hf_kl_threshold:.6e})")
-        assert max_kl_hf <= hf_kl_threshold, (
-            f"KL divergence between original and HF-loaded model too large: "
-            f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
-        )
-
-    _barrier()
+        _barrier()
+    elif _rank0():
+        print("[Phase 4] Skipped (no_check_hf=true)")
 
     # Phase 5 (optional): Cross-TP — reload consolidated with a different TP size
     if cross_tp_size > 0 and not is_peft:
