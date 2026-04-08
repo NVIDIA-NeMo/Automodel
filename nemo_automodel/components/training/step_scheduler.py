@@ -57,6 +57,7 @@ class StepScheduler(Stateful):
         dp_size: int,
         dataloader: Optional[int],
         ckpt_every_steps: Optional[int] = None,
+        save_checkpoint_every_epoch: bool = True,
         val_every_steps: Optional[int] = None,
         log_remote_every_steps: int = 1,
         gc_every_steps: Optional[int] = None,
@@ -74,6 +75,10 @@ class StepScheduler(Stateful):
             dp_size (int): Number of GPUs for data parallelism.
             dataloader: The training dataloader.
             ckpt_every_steps (Optional[int]): Frequency of checkpoint steps.
+            save_checkpoint_every_epoch (bool): Whether to save checkpoints at epoch boundaries.
+                When True, checkpoints are saved at the end of each epoch (is_last_batch).
+                When False, only periodic, last-step, and SIGTERM checkpoints are saved.
+                Default: True.
             val_every_steps (Optional[int]): Number of training steps between validation.
             log_remote_every_steps (int): Frequency of remote logging (e.g., WandB, MLflow). Default: 1 (every step).
             gc_every_steps (Optional[int]): Frequency of manual garbage collection steps.
@@ -133,6 +138,7 @@ class StepScheduler(Stateful):
                 ckpt_every_steps = self.epoch_len
             logger.info("ckpt_every_steps not provided; will save checkpoint every {} steps".format(ckpt_every_steps))
         self.ckpt_every_steps = ckpt_every_steps
+        self.save_checkpoint_every_epoch = save_checkpoint_every_epoch
 
         self.sig_handler = DistributedSignalHandler().__enter__()
         self.sigterm_flag = False
@@ -197,7 +203,8 @@ class StepScheduler(Stateful):
             bool: if true, the checkpoint should run.
         """
         is_ckpt_step = (self.step % self.ckpt_every_steps) == self.ckpt_every_steps - 1
-        return is_ckpt_step or self.is_last_batch or self.is_last_step or self.sigterm_received
+        is_epoch_boundary = self.save_checkpoint_every_epoch and self.is_last_batch
+        return is_ckpt_step or is_epoch_boundary or self.is_last_step or self.sigterm_received
 
     @property
     def is_gc_step(self):

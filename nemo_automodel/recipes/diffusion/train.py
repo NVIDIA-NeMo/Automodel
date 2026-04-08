@@ -538,6 +538,9 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         # Calculate total optimizer steps for LR scheduler
         total_steps = self.num_epochs * self.steps_per_epoch
+        max_steps = self.cfg.get("step_scheduler.max_steps", None)
+        if max_steps is not None:
+            total_steps = min(total_steps, max_steps)
 
         # Build LR scheduler (returns None if lr_scheduler not in config)
         # Wrap in list for compatibility with checkpointing (OptimizerState expects list)
@@ -556,11 +559,13 @@ class TrainDiffusionRecipe(BaseRecipe):
             local_batch_size=self.cfg.step_scheduler.local_batch_size,
             dp_size=int(self.dp_size),
             ckpt_every_steps=self.cfg.step_scheduler.ckpt_every_steps,
+            save_checkpoint_every_epoch=self.cfg.get("step_scheduler.save_checkpoint_every_epoch", True),
             dataloader=self.dataloader,
             val_every_steps=None,
             start_step=int(self.global_step),
             start_epoch=int(self.start_epoch),
             num_epochs=int(self.num_epochs),
+            max_steps=max_steps,
         )
 
         self.load_checkpoint(self.restore_from)
