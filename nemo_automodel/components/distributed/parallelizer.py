@@ -92,6 +92,7 @@ from nemo_automodel.components.distributed.parallel_styles import translate_to_l
 
 # TODO(boxiangw): Change to MegatronFSDP once it got published
 HAVE_MEGATRON_FSDP = False
+logging.getLogger("megatron_fsdp").setLevel(logging.WARNING)
 try:
     from megatron_fsdp import fully_shard as megatron_fsdp_fully_shard
     from megatron_fsdp import fully_shard_model as megatron_fsdp_fully_shard_model
@@ -1147,7 +1148,9 @@ def _get_parallel_plan(
 
     if isinstance(tp_shard_plan, dict):
         model_parallel_plan = tp_shard_plan
-        logger.info(f"Using parallel plan (dictionary). {tp_shard_plan}")
+        col_w = max(55, max(map(len, tp_shard_plan.keys()), default=0))
+        plan_lines = "\n".join(f"  {k:<{col_w}} {v}" for k, v in tp_shard_plan.items())
+        logger.info(f"Using parallel plan (dictionary):\n{plan_lines}")
     elif tp_shard_plan == LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME:
         model_arch = None
         if hasattr(model, "config") and hasattr(model.config, "architectures") and model.config.architectures:
