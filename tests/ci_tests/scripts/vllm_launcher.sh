@@ -40,13 +40,13 @@ fi
 echo "Using checkpoint: ${CKPT_BASE}"
 
 if [[ "$CI_JOB_STAGE" == *"peft"* ]]; then
-    python -m pytest $TEST_SCRIPT \
+    python -m pytest $TEST_SCRIPT -- \
         --mode peft \
         --config_path "$CONFIG_PATH" \
         --adapter_path "${CKPT_BASE}/model/" \
         --max_new_tokens 50
 else
-    python -m pytest $TEST_SCRIPT \
+    python -m pytest $TEST_SCRIPT -- \
         --mode sft \
         --config_path "$CONFIG_PATH" \
         --model_path "${CKPT_BASE}/model/consolidated/" \
