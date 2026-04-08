@@ -47,13 +47,19 @@ re-spawning torchrun.
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
 from nemo_automodel.cli.utils import load_yaml, resolve_recipe_name
 from nemo_automodel.components.config.loader import resolve_yaml_env_vars
 
-logging.getLogger().setLevel(logging.INFO)
+# When launched via external torchrun each worker imports this module.
+# Suppress non-rank-0 CLI output before setup_logging installs RankFilter.
+if int(os.environ.get("RANK", "0")) > 0:
+    logging.disable(logging.CRITICAL)
+else:
+    logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -140,11 +146,9 @@ def main():
 
     elif nemo_run_config := config.pop("nemo_run", None):
         logger.info("Launching job via NeMo-Run")
-        from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
         from nemo_automodel.components.launcher.nemo_run.launcher import NemoRunLauncher
 
-        cfg = parse_args_and_load_config(str(config_path))
-        return NemoRunLauncher().launch(cfg, config_path, recipe_target, nemo_run_config, extra)
+        return NemoRunLauncher().launch(config, config_path, recipe_target, nemo_run_config, extra)
 
     else:
         logger.info("Launching job interactively (local)")

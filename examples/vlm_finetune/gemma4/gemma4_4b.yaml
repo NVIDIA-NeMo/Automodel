@@ -35,7 +35,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: your/path/to/gemma4_4b
+  pretrained_model_name_or_path: google/gemma-4-E4B-it
   torch_dtype: torch.bfloat16
   use_liger_kernel: true
   use_sdpa_patching: false
@@ -92,7 +92,10 @@ freeze_config:
   freeze_audio_tower: true
   freeze_language_model: false
 
-wandb:
-  project: <your-project>
-  entity: <your-entity>
-  name: <your-run-name>
+# wandb:
+#   project: <your-project>
+#   entity: <your-entity>
+#   name: <your-run-name>
+
+ci:
+  recipe_owner: hemildesai

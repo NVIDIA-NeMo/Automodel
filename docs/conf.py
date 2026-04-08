@@ -121,4 +121,7 @@ html_extra_path = ["project.json", "versions1.json"]
 linkcheck_ignore = [
     ".*github\\.com.*",
     ".*githubusercontent\\.com.*",
+    ".*huggingface\\.co.*",  # Gated model pages require authentication; non-checkable from CI
+    ".*llama\\.com.*",  # Returns 400 to automated crawlers
+    ".*ai\\.meta\\.com.*",  # Returns 400 to automated crawlers
 ]

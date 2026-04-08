@@ -1,0 +1,95 @@
+# Mistral
+
+[Mistral AI](https://mistral.ai/) models are efficient transformer decoder models featuring sliding window attention for long context support. Mistral-Nemo is a 12B model developed jointly with NVIDIA.
+
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `MistralForCausalLM` |
+| **Parameters** | 7B – 12B |
+| **HF Org** | [mistralai](https://huggingface.co/mistralai) |
+:::
+
+## Available Models
+
+- **Mistral-7B**: v0.1, v0.2, v0.3
+- **Mistral-7B-Instruct**: v0.1, v0.2, v0.3
+- **Mistral-Nemo-Instruct-2407**: 12B
+
+## Architecture
+
+- `MistralForCausalLM`
+
+## Example HF Models
+
+| Model | HF ID |
+|---|---|
+| Mistral 7B v0.1 | [`mistralai/Mistral-7B-v0.1`](https://huggingface.co/mistralai/Mistral-7B-v0.1) |
+| Mistral 7B Instruct v0.1 | [`mistralai/Mistral-7B-Instruct-v0.1`](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.1) |
+| Mistral Nemo Instruct 2407 | [`mistralai/Mistral-Nemo-Instruct-2407`](https://huggingface.co/mistralai/Mistral-Nemo-Instruct-2407) |
+
+## Example Recipes
+
+| Recipe | Description |
+|---|---|
+| {download}`mistral_7b_squad.yaml <../../../../examples/llm_finetune/mistral/mistral_7b_squad.yaml>` | SFT — Mistral 7B on SQuAD |
+| {download}`mistral_7b_squad_peft.yaml <../../../../examples/llm_finetune/mistral/mistral_7b_squad_peft.yaml>` | LoRA — Mistral 7B on SQuAD |
+| {download}`mistral_nemo_2407_squad.yaml <../../../../examples/llm_finetune/mistral/mistral_nemo_2407_squad.yaml>` | SFT — Mistral Nemo 2407 on SQuAD |
+| {download}`mistral_nemo_2407_squad_peft.yaml <../../../../examples/llm_finetune/mistral/mistral_nemo_2407_squad_peft.yaml>` | LoRA — Mistral Nemo 2407 on SQuAD |
+
+
+## Try with NeMo AutoModel
+
+**1. Install** ([full instructions](../../../guides/installation.md)):
+
+```bash
+pip install nemo-automodel
+```
+
+**2. Clone the repo** to get the example recipes:
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+```
+
+**3. Run the recipe** from inside the repo:
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/mistral/mistral_7b_squad.yaml
+```
+
+:::{dropdown} Run with Docker
+**1. Pull the container** and mount a checkpoint directory:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+**2.** Navigate to the AutoModel directory (where the recipes are):
+
+```bash
+cd /opt/Automodel
+```
+
+**3. Run the recipe**:
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/mistral/mistral_7b_squad.yaml
+```
+:::
+
+See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+
+## Fine-Tuning
+
+See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+
+## Hugging Face Model Cards
+
+- [mistralai/Mistral-7B-v0.1](https://huggingface.co/mistralai/Mistral-7B-v0.1)
+- [mistralai/Mistral-Nemo-Instruct-2407](https://huggingface.co/mistralai/Mistral-Nemo-Instruct-2407)

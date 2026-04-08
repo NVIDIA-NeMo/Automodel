@@ -301,6 +301,18 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
                 _get_cp_stream(),
                 cp_comm_type=cp_comm_type,
             )
+        elif layer_type == "mamba":
+            from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+
+            mixer = block.self_attn  # NemotronV3Block.self_attn aliases mixer
+            mixer.cp = MambaContextParallel(
+                cp_group=cp_mesh.get_group(),
+                num_heads=mixer.num_heads,
+                head_dim=mixer.head_dim,
+                n_groups=mixer.n_groups,
+                d_state=mixer.ssm_state_size,
+                mixer=mixer,
+            )
         elif layer_type == "linear_attention":
             # FLA-based CP: store the CP mesh on the linear attention module so it
             # can recover dense token order and build its CP context during forward.
@@ -360,8 +372,10 @@ def parallelize_model(
     else:
         ep_shard_mesh = None
 
-    fsdp_enabled = dp_axis_names is not None and world_mesh[dp_axis_names].size() > 1
-    fsdp_mesh = world_mesh[tuple(dp_axis_names)] if fsdp_enabled else None
+    from nemo_automodel.components.distributed.mesh_utils import get_submesh as _get_submesh
+
+    fsdp_enabled = dp_axis_names is not None and _get_submesh(world_mesh, tuple(dp_axis_names)).size() > 1
+    fsdp_mesh = _get_submesh(world_mesh, tuple(dp_axis_names)) if fsdp_enabled else None
     if fsdp_enabled:
         apply_fsdp(
             model,

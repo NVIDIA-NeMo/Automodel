@@ -47,6 +47,8 @@ from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
 
+from nemo_automodel.components.distributed.mesh_utils import get_submesh
+
 
 def _is_transformers_v5_or_higher() -> bool:
     """Check if transformers version is 5.x or higher."""
@@ -90,6 +92,7 @@ from nemo_automodel.components.distributed.parallel_styles import translate_to_l
 
 # TODO(boxiangw): Change to MegatronFSDP once it got published
 HAVE_MEGATRON_FSDP = False
+logging.getLogger("megatron_fsdp").setLevel(logging.WARNING)
 try:
     from megatron_fsdp import fully_shard as megatron_fsdp_fully_shard
     from megatron_fsdp import fully_shard_model as megatron_fsdp_fully_shard_model
@@ -148,7 +151,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
         # if dp_replicate_size > 1, use HSDP, else use FSDP
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        dp_mesh = device_mesh[dp_mesh_dim_names]
+        dp_mesh = get_submesh(device_mesh, dp_mesh_dim_names)
 
         # Extract layers from the model for parallelization
         layers = _extract_model_layers(model)
@@ -292,6 +295,36 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                 if layer.block_type == "mlp":
                     parallelize_module(layer, tp_mesh, mlp_tp_plan)
 
+        # Set up context parallel for Mamba and Attention layers
+        cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
+        if cp_mesh is not None and cp_mesh.size() > 1:
+            cp_group = cp_mesh.get_group()
+
+            for layer in layers:
+                if hasattr(layer, "block_type") and layer.block_type == "mamba":
+                    from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+
+                    mixer = layer.mixer
+                    mixer.cp = MambaContextParallel(
+                        cp_group=cp_group,
+                        num_heads=mixer.num_heads,
+                        head_dim=mixer.head_dim,
+                        n_groups=mixer.n_groups,
+                        d_state=mixer.ssm_state_size,
+                        mixer=mixer,
+                    )
+                elif hasattr(layer, "block_type") and layer.block_type == "attention":
+                    from transformer_engine.pytorch.attention import DotProductAttention
+
+                    attn_module = layer.mixer.attn_module
+                    if isinstance(attn_module, DotProductAttention):
+                        attn_module.set_context_parallel_group(
+                            cp_group,
+                            torch.distributed.get_process_group_ranks(cp_group),
+                            torch.cuda.Stream(),
+                            cp_comm_type="p2p",
+                        )
+
         if activation_checkpointing:
             for i in range(len(layers)):
                 if layers[i].block_type == "mlp":
@@ -301,7 +334,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                     layers[i] = checkpoint_wrapper(layers[i])
 
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        dp_mesh = device_mesh[dp_mesh_dim_names]
+        dp_mesh = get_submesh(device_mesh, dp_mesh_dim_names)
 
         for layer in layers:
             parallelizer_utils.fully_shard_by_dtype(
@@ -342,7 +375,7 @@ class WanParallelizationStrategy(ParallelizationStrategy):
         # Not using custom tp_shard_plan; apply Wan-specific plan
         tp_mesh = device_mesh[tp_mesh_name]
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        dp_mesh = device_mesh[dp_mesh_dim_names]
+        dp_mesh = get_submesh(device_mesh, dp_mesh_dim_names)
 
         # Apply TP only when TP group size > 1
         if tp_mesh.size() > 1:
@@ -432,7 +465,7 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
         tp_mesh_name: str = "tp",
     ) -> nn.Module:
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        dp_mesh = device_mesh[dp_mesh_dim_names]
+        dp_mesh = get_submesh(device_mesh, dp_mesh_dim_names)
 
         # Mixed precision default like Default strategy
         if not mp_policy:
@@ -1093,7 +1126,9 @@ def _get_parallel_plan(
 
     if isinstance(tp_shard_plan, dict):
         model_parallel_plan = tp_shard_plan
-        logger.info(f"Using parallel plan (dictionary). {tp_shard_plan}")
+        col_w = max(55, max(map(len, tp_shard_plan.keys()), default=0))
+        plan_lines = "\n".join(f"  {k:<{col_w}} {v}" for k, v in tp_shard_plan.items())
+        logger.info(f"Using parallel plan (dictionary):\n{plan_lines}")
     elif tp_shard_plan == LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME:
         model_arch = None
         if hasattr(model, "config") and hasattr(model.config, "architectures") and model.config.architectures:
