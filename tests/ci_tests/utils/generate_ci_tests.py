@@ -81,7 +81,8 @@ def detect_yml_configurations(automodel_dir: str, scope: str, test_folder: str):
         config_path = f"{automodel_dir}/tests/ci_tests/configs/{test_folder}/{scope}_recipes.yml"
         with open(config_path, "r", encoding="utf-8") as f:
             test_configs = yaml.load(f)
-            yml_configs = [Path(f"examples/{test_folder}/{c}") for c in test_configs['configs']]
+            examples_dir = test_configs.get('examples_dir', test_folder)
+            yml_configs = [Path(f"examples/{examples_dir}/{c}") for c in test_configs['configs']]
 
     return yml_configs
 
@@ -144,6 +145,8 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
     # Configure test stage based on recipe type and robustness config
     if 'benchmark' in config.stem:
         job['stage'] = 'benchmark'
+    elif test_folder.startswith('diffusion'):
+        job['stage'] = 'diffusion_sft'
     elif 'peft' in config.stem:
         job['stage'] = 'peft_ckpt_robustness' if has_robustness else 'peft'
     else:

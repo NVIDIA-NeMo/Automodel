@@ -211,6 +211,7 @@ def load_checkpoint_into_pipeline(pipe, cfg):
 
     ema_path = checkpoint_dir / "ema_shadow.pt"
     consolidated_path = checkpoint_dir / "consolidated_model.bin"
+    consolidated_st_dir = checkpoint_dir / "model" / "consolidated"
     sharded_dir = checkpoint_dir / "model"
 
     if ema_path.exists():
@@ -225,6 +226,15 @@ def load_checkpoint_into_pipeline(pipe, cfg):
             state_dict = state_dict["model_state_dict"]
         pipe.transformer.load_state_dict(state_dict, strict=True)
         logger.info("Loaded consolidated checkpoint")
+    elif consolidated_st_dir.is_dir() and any(
+        name.endswith(".safetensors") for name in os.listdir(consolidated_st_dir)
+    ):
+        logger.info("Loading consolidated safetensors checkpoint from %s", consolidated_st_dir)
+        pipe.transformer = type(pipe.transformer).from_pretrained(
+            str(consolidated_st_dir), torch_dtype=torch_dtype
+        )
+        pipe.transformer.to("cuda")
+        logger.info("Loaded consolidated safetensors checkpoint")
     elif sharded_dir.is_dir() and any(name.endswith(".distcp") for name in os.listdir(sharded_dir)):
         logger.info("Loading sharded FSDP checkpoint from %s", sharded_dir)
         pipe.transformer = _load_sharded_fsdp_checkpoint(pipe.transformer, str(sharded_dir), torch_dtype)
