@@ -22,9 +22,18 @@ export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0"
 
 cd /opt/Automodel
+uv venv /tmp/vllm_deploy_venv
+source /tmp/vllm_deploy_venv/bin/activate
+uv pip install -r tests/ci_tests/requirements_deploy.txt
 
 TEST_SCRIPT="tests/functional_tests/checkpoint_robustness/test_checkpoint_vllm_deploy.py"
-CKPT_BASE="$PIPELINE_DIR/$TEST_NAME/checkpoint/epoch_0_step_99"
+CKPT_DIR="$PIPELINE_DIR/$TEST_NAME/robustness_checkpoint"
+CKPT_BASE=$(ls -d ${CKPT_DIR}/epoch_*_step_* 2>/dev/null | sort | tail -1)
+
+if [[ -z "$CKPT_BASE" ]]; then
+  echo "ERROR: No checkpoint found under ${CKPT_DIR}"
+  exit 1
+fi
 
 if [[ "$CI_JOB_STAGE" == *"peft"* ]]; then
     python -m pytest $TEST_SCRIPT \
