@@ -65,6 +65,7 @@ def test_print_trainable_parameters_counts(dummy_model, caplog, monkeypatch):
     and prints to stdout only when rank == 0.
     """
     import logging
+
     caplog.set_level(logging.DEBUG)
     dummy_model.other.weight.requires_grad = False
     trainable, total = model_utils.print_trainable_parameters(dummy_model)
@@ -75,6 +76,7 @@ def test_print_trainable_parameters_counts(dummy_model, caplog, monkeypatch):
     # Check logging output
     assert "Trainable parameters" in caplog.text
     assert "Total parameters" in caplog.text
+
 
 def test_print_trainable_parameters_non_zero_rank(dummy_model, capsys, monkeypatch):
     """
@@ -291,3 +293,129 @@ def test_init_empty_weights_handles_missing_is_hf_initialized():
     assert m.w.device.type == "meta"
     # _is_hf_initialized should NOT be present since it wasn't set originally
     assert not hasattr(m.w, "_is_hf_initialized")
+
+
+# =============================================================================
+# Tests for freeze_audio_tower with "speech" pattern
+# =============================================================================
+
+
+@pytest.fixture()
+def audio_model() -> nn.Module:
+    """Model with audio and speech submodules for freeze tests."""
+
+    class AudioModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.audio_encoder = nn.Linear(4, 4)
+            self.speech_adapter = nn.Linear(4, 4)
+            self.language_head = nn.Linear(4, 4)
+
+        def forward(self, x):
+            pass
+
+    return AudioModel()
+
+
+def test_freeze_audio_tower_freezes_speech_pattern(audio_model):
+    """freeze_audio_tower=True should freeze modules matching 'audio' and 'speech'."""
+    model_utils.apply_parameter_freezing(audio_model, {"freeze_audio_tower": True, "freeze_vision_tower": False})
+
+    assert not _any_requires_grad(audio_model.audio_encoder)
+    assert not _any_requires_grad(audio_model.speech_adapter)
+    assert _all_requires_grad(audio_model.language_head)
+
+
+def test_freeze_audio_tower_false_keeps_speech_trainable(audio_model):
+    """freeze_audio_tower=False should keep speech modules trainable."""
+    model_utils.apply_parameter_freezing(audio_model, {"freeze_audio_tower": False, "freeze_vision_tower": False})
+
+    assert _all_requires_grad(audio_model.audio_encoder)
+    assert _all_requires_grad(audio_model.speech_adapter)
+
+
+# =============================================================================
+# Tests for cast_mixed_dtype_params_to_bf16
+# =============================================================================
+
+
+def test_cast_mixed_dtype_params_to_bf16():
+    """cast_mixed_dtype_params_to_bf16 converts fp32 params and buffers to bf16."""
+    m = nn.Linear(4, 4)  # fp32 by default
+    m.register_buffer("my_buf", torch.ones(3, dtype=torch.float32))
+    assert m.weight.dtype == torch.float32
+    assert m.my_buf.dtype == torch.float32
+
+    model_utils.cast_mixed_dtype_params_to_bf16(m)
+
+    assert m.weight.dtype == torch.bfloat16
+    assert m.bias.dtype == torch.bfloat16
+    assert m.my_buf.dtype == torch.bfloat16
+
+
+def test_cast_mixed_dtype_preserves_bf16():
+    """Already-bf16 params should not be changed."""
+    m = nn.Linear(4, 4).to(torch.bfloat16)
+    model_utils.cast_mixed_dtype_params_to_bf16(m)
+    assert m.weight.dtype == torch.bfloat16
+
+
+# =============================================================================
+# Tests for phi4mm-specific logic in apply_parameter_freezing
+# =============================================================================
+
+
+def test_phi4mm_use_cache_disabled():
+    """For phi4mm models, apply_parameter_freezing sets use_cache=False."""
+    import types
+
+    m = nn.Linear(4, 4)
+    m.config = types.SimpleNamespace(model_type="phi4mm", use_cache=True)
+
+    model_utils.apply_parameter_freezing(m, {"freeze_vision_tower": False})
+    assert m.config.use_cache is False
+
+
+def test_non_phi4mm_use_cache_unchanged():
+    """For non-phi4mm models, use_cache should not be changed."""
+    import types
+
+    m = nn.Linear(4, 4)
+    m.config = types.SimpleNamespace(model_type="gemma3", use_cache=True)
+
+    model_utils.apply_parameter_freezing(m, {"freeze_vision_tower": False})
+    assert m.config.use_cache is True
+
+
+class TestFilterForwardKwargs:
+    def test_drops_unsupported_kwargs(self):
+        class Model(nn.Module):
+            def forward(self, input_ids, attention_mask=None):
+                return input_ids
+
+        model = Model()
+        batch = {
+            "input_ids": torch.ones(2, 3, dtype=torch.long),
+            "attention_mask": torch.ones(2, 3, dtype=torch.long),
+            "padding_mask": torch.zeros(2, 3, dtype=torch.bool),
+        }
+
+        filtered = model_utils.filter_forward_kwargs(model, batch)
+
+        assert set(filtered.keys()) == {"input_ids", "attention_mask"}
+        assert "padding_mask" in batch  # original dict is unchanged
+
+    def test_keeps_kwargs_when_forward_accepts_var_keyword(self):
+        class Model(nn.Module):
+            def forward(self, input_ids, **kwargs):
+                return input_ids, kwargs
+
+        model = Model()
+        batch = {
+            "input_ids": torch.ones(2, 3, dtype=torch.long),
+            "padding_mask": torch.zeros(2, 3, dtype=torch.bool),
+        }
+
+        filtered = model_utils.filter_forward_kwargs(model, batch)
+
+        assert filtered == batch

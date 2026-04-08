@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# To run this recipe:
+#   automodel examples/vlm_finetune/kimi/kimi25vl_medpix.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: FinetuneRecipeForVLM
+
 step_scheduler:
   global_batch_size: 512
   local_batch_size: 8
@@ -54,7 +60,7 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: torch
-    rms_norm: torch
+    rms_norm: torch_fp32
     rope_fusion: false
     enable_deepep: true
     fake_balanced_gate: false
@@ -117,3 +123,8 @@ freeze_config:
 #   project: <your_project_name>
 #   entity: <your_entity_name>
 #   name: <your_exp_name>
+
+ci:
+  recipe_owner: hemildesai
+  nodes: 32
+  time: "00:30:00"

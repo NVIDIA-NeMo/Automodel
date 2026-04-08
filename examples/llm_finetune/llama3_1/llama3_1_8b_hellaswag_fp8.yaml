@@ -13,11 +13,11 @@
 # limitations under the License.
 
 
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml
-# Adjust --nproc-per-node to the number of GPUs available on your host machine.
-#
-# This example demonstrates FP8 quantization for improved training performance on H100+ GPUs.
+# To run this recipe:
+#   automodel examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 32
@@ -116,4 +116,7 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: akoumpa

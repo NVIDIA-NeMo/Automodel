@@ -2,16 +2,10 @@ model:
   pretrained_model_name_or_path: "black-forest-labs/FLUX.1-dev"
   mode: "finetune"
   cache_dir: null
-  attention_backend: "_flash_3_hub"
-
-  pipeline_spec:
-    transformer_cls: "FluxTransformer2DModel"
-    subfolder: "transformer"
-    load_full_pipeline: false
-    enable_gradient_checkpointing: false
+  attention_backend: "flash"
 
 optim:
-  learning_rate: 1e-5
+  learning_rate: 2e-5
 
   optimizer:
     weight_decay: 0.01
@@ -29,19 +23,18 @@ fsdp:
 flow_matching:
   adapter_type: "flux"
   adapter_kwargs:
-    #Critical: use 3.5 guidance scale for finetuning
-    guidance_scale: 3.5
-    use_guidance_embeds: true
+    guidance_scale: 1
+    use_guidance_embeds: false
   timestep_sampling: "logit_normal"
   logit_mean: 0.0
   logit_std: 1.0
-  flow_shift: 3.0
-  mix_uniform_ratio: 0.1
+  flow_shift: 1.0
+  mix_uniform_ratio: 0.0
   sigma_min: 0.0
   sigma_max: 1.0
   num_train_timesteps: 1000
   i2v_prob: 0.0
-  use_loss_weighting: true
+  use_loss_weighting: false
   log_interval: 100
   summary_log_interval: 10
 
@@ -49,15 +42,17 @@ step_scheduler:
   num_epochs: 5000
   local_batch_size: 1
   global_batch_size: 8
-  ckpt_every_steps: 2000
+  ckpt_every_steps: 500
   log_every: 1
+  # max_steps: null  # Set to limit training to a specific number of steps
+  # save_checkpoint_every_epoch: true  # Set to false to disable epoch-boundary checkpoints
 
 data:
   dataloader:
-    _target_: nemo_automodel.components.datasets.diffusion.build_flux_multiresolution_dataloader
+    _target_: nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader
     cache_dir: PATH_TO_YOUR_DATA
     train_text_encoder: false
-    num_workers: 10
+    num_workers: 2
     # Supported resolutions include [256x256], [512x512], and [1024x1024].
     # While a 1:1 aspect ratio is currently used as a proxy for the closest image size,
     # the implementation is designed to support multiple aspect ratios.
@@ -69,8 +64,9 @@ data:
 checkpoint:
   enabled: true
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
-  model_save_format: torch_save
-  save_consolidated: false
+  model_save_format: safetensors
+  save_consolidated: true
+  diffusers_compatible: true
   restore_from: null
 
 wandb:

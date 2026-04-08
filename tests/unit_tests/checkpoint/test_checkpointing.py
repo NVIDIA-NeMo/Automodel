@@ -12,14 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
+import json
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
+from nemo_automodel.components.checkpoint._backports.hf_storage import _DIFFUSERS_INDEX_FN
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
+    CheckpointingConfig,
     _equally_divide_layers,
     _is_custom_model,
     _model_has_dtensors,
@@ -266,7 +270,6 @@ class TestIsCustomModel:
 
     def test_module_from_custom_namespace_is_custom(self):
         """A class whose __module__ starts with nemo_automodel.components.models. is custom."""
-        model = torch.nn.Module()
         # Simulate a custom model by patching __module__ on the class's MRO
         FakeCustom = type("FakeCustom", (torch.nn.Module,), {})
         FakeCustom.__module__ = "nemo_automodel.components.models.deepseek_v3.model"
@@ -357,7 +360,7 @@ class TestLoadModelCustomModelGuard:
 
     def _make_checkpointer(self):
         """Create a minimally configured Checkpointer for testing."""
-        from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig, Checkpointer
+        from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 
         config = CheckpointingConfig(
             enabled=True,
@@ -392,6 +395,26 @@ class TestLoadModelCustomModelGuard:
         # DCP path should NOT be used
         mock_dcp_load.assert_not_called()
 
+    @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=False)
+    @patch("nemo_automodel.components.checkpoint.checkpointing._is_bin_checkpoint", return_value=True)
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
+    def test_bin_checkpoint_uses_fast_path(self, mock_load_full, mock_load_hf, mock_is_bin, mock_is_st):
+        """Non-custom (HF) models with .bin checkpoints use the fast loading path."""
+        checkpointer = self._make_checkpointer()
+        model = torch.nn.Linear(4, 4)
+
+        mock_load_hf.return_value = {"weight": torch.randn(4, 4), "bias": torch.randn(4)}
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch.object(checkpointer, "_do_load") as mock_dcp_load,
+        ):
+            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
+
+        mock_load_full.assert_called_once()
+        mock_dcp_load.assert_not_called()
+
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
@@ -417,9 +440,7 @@ class TestLoadModelCustomModelGuard:
 
         with (
             patch("os.path.exists", return_value=True),
-            patch(
-                "nemo_automodel.components.checkpoint.checkpointing.ModelState"
-            ) as MockModelState,
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as MockModelState,
             patch(
                 "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
                 side_effect=lambda m, sd, **kw: sd,
@@ -530,6 +551,23 @@ class TestInitializeModelWeights:
 
         model.initialize_weights.assert_called_once()
 
+    @pytest.mark.parametrize(
+        "architecture",
+        ["Gemma3ForCausalLM", "Gemma3ForConditionalGeneration"],
+        ids=["causal_lm", "conditional_generation"],
+    )
+    def test_skips_for_gemma3(self, architecture):
+        """Gemma3 models should skip init — _init_weights zeros embedding padding_idx which fails with DTensors."""
+        model = self._make_meta_model()
+        model.config = SimpleNamespace(architectures=[architecture])
+        model._is_hf_initialized = True
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_not_called()
+        assert model._is_hf_initialized is True
+
     def test_handles_missing_config_gracefully(self):
         """Model without config.architectures should not raise."""
         with torch.device("meta"):
@@ -567,3 +605,146 @@ class TestInitializeModelWeights:
 
         sig = inspect.signature(Checkpointer.load_base_model)
         assert "peft_init_method" not in sig.parameters
+
+
+class TestLmHeadWeightTying:
+    """Tests that load_base_model calls tie_weights for tied models."""
+
+    def test_tie_weights_called_when_tied(self):
+        """load_base_model should call model.tie_weights() when tie_word_embeddings=True."""
+        import torch.nn as nn
+
+        class FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = nn.Embedding(10, 4)
+                self.lm_head = nn.Linear(4, 10, bias=False)
+                self.config = SimpleNamespace(tie_word_embeddings=True)
+                self.tie_weights_called = False
+
+            def tie_weights(self, **kwargs):
+                self.lm_head.weight = self.embed_tokens.weight
+                self.tie_weights_called = True
+
+        model = FakeModel()
+        assert model.lm_head.weight.data_ptr() != model.embed_tokens.weight.data_ptr()
+
+        from nemo_automodel.components.checkpoint.checkpointing import is_tied_word_embeddings
+
+        is_tied = is_tied_word_embeddings(model)
+        if hasattr(model, "tie_weights") and is_tied:
+            model.tie_weights()
+
+        assert model.tie_weights_called
+        assert model.lm_head.weight.data_ptr() == model.embed_tokens.weight.data_ptr()
+
+    def test_tie_weights_skipped_when_not_tied(self):
+        """load_base_model should skip tie_weights when tie_word_embeddings=False."""
+        import torch.nn as nn
+
+        class FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(4, 10, bias=False)
+                self.config = SimpleNamespace(tie_word_embeddings=False)
+                self.tie_weights_called = False
+
+            def tie_weights(self, **kwargs):
+                self.tie_weights_called = True
+
+        model = FakeModel()
+
+        from nemo_automodel.components.checkpoint.checkpointing import is_tied_word_embeddings
+
+        is_tied = is_tied_word_embeddings(model)
+        if hasattr(model, "tie_weights") and is_tied:
+            model.tie_weights()
+
+        assert not model.tie_weights_called
+
+
+# =============================================================================
+# Tests for Checkpointer.save_model — diffusers_compatible rename (all-ranks path)
+# =============================================================================
+
+
+class TestCheckpointerSaveModelDiffusersRename:
+    """Tests that save_model() renames the index on the all-ranks consolidation path."""
+
+    def _make_checkpointer(self, tmp_path, diffusers_compatible):
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path),
+            model_save_format="safetensors",
+            model_cache_dir=str(tmp_path / "cache"),
+            model_repo_id="test/model",
+            save_consolidated=True,
+            is_peft=False,
+            diffusers_compatible=diffusers_compatible,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+        # Mock internals to isolate the consolidation + rename logic
+        checkpointer._should_write_consolidated_safetensors = MagicMock(return_value=True)
+        checkpointer._should_write_hf_metadata = MagicMock(return_value=True)
+        checkpointer._maybe_build_consolidated_index = MagicMock(return_value={"w": 1})
+        checkpointer._get_storage_writer = MagicMock(return_value=MagicMock())
+        checkpointer._do_save = MagicMock(return_value=None)
+        checkpointer._addons = []
+        return checkpointer
+
+    @patch("nemo_automodel.components.checkpoint.checkpointing.consolidate_safetensors_files_on_every_rank")
+    @patch("nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf", side_effect=lambda *a, **kw: a[1])
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_save_model_renames_index_on_all_ranks_path(
+        self, mock_dist_init, mock_adapt, mock_consolidate, tmp_path
+    ):
+        weights_path = tmp_path / "step_100"
+        consolidated_dir = weights_path / "model" / "consolidated"
+
+        def _fake_consolidate(**kwargs):
+            os.makedirs(kwargs["output_dir"], exist_ok=True)
+            index_path = os.path.join(kwargs["output_dir"], "model.safetensors.index.json")
+            with open(index_path, "w") as f:
+                json.dump({"weight_map": {}}, f)
+
+        mock_consolidate.side_effect = _fake_consolidate
+
+        checkpointer = self._make_checkpointer(tmp_path, diffusers_compatible=True)
+
+        model = MagicMock()
+        model.state_dict.return_value = {"w": MagicMock()}
+
+        checkpointer.save_model(model, str(weights_path))
+
+        mock_consolidate.assert_called_once()
+        assert not (consolidated_dir / "model.safetensors.index.json").exists()
+        assert (consolidated_dir / _DIFFUSERS_INDEX_FN).exists()
+
+    @patch("nemo_automodel.components.checkpoint.checkpointing.consolidate_safetensors_files_on_every_rank")
+    @patch("nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf", side_effect=lambda *a, **kw: a[1])
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_save_model_preserves_index_when_not_diffusers_compatible(
+        self, mock_dist_init, mock_adapt, mock_consolidate, tmp_path
+    ):
+        weights_path = tmp_path / "step_100"
+        consolidated_dir = weights_path / "model" / "consolidated"
+
+        def _fake_consolidate(**kwargs):
+            os.makedirs(kwargs["output_dir"], exist_ok=True)
+            index_path = os.path.join(kwargs["output_dir"], "model.safetensors.index.json")
+            with open(index_path, "w") as f:
+                json.dump({"weight_map": {}}, f)
+
+        mock_consolidate.side_effect = _fake_consolidate
+
+        checkpointer = self._make_checkpointer(tmp_path, diffusers_compatible=False)
+
+        model = MagicMock()
+        model.state_dict.return_value = {"w": MagicMock()}
+
+        checkpointer.save_model(model, str(weights_path))
+
+        assert (consolidated_dir / "model.safetensors.index.json").exists()
+        assert not (consolidated_dir / _DIFFUSERS_INDEX_FN).exists()

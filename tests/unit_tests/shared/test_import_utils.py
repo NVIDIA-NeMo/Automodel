@@ -243,10 +243,13 @@ def test_get_check_model_inputs_decorator_combined():
     output_mod = types.ModuleType("transformers.utils.output_capturing")
     output_mod.capture_outputs = mock_capture
 
-    with patch.dict(sys.modules, {
-        "transformers.utils.generic": generic_mod,
-        "transformers.utils.output_capturing": output_mod,
-    }):
+    with patch.dict(
+        sys.modules,
+        {
+            "transformers.utils.generic": generic_mod,
+            "transformers.utils.output_capturing": output_mod,
+        },
+    ):
         decorator = si.get_check_model_inputs_decorator()
 
     assert callable(decorator)
@@ -265,10 +268,13 @@ def test_get_check_model_inputs_decorator_fallback_to_null():
     output_mod = types.ModuleType("transformers.utils.output_capturing")
     # Neither module has the expected attributes → both try-blocks raise ImportError
 
-    with patch.dict(sys.modules, {
-        "transformers.utils.generic": generic_mod,
-        "transformers.utils.output_capturing": output_mod,
-    }):
+    with patch.dict(
+        sys.modules,
+        {
+            "transformers.utils.generic": generic_mod,
+            "transformers.utils.output_capturing": output_mod,
+        },
+    ):
         result = si.get_check_model_inputs_decorator()
 
     assert result is si.null_decorator
@@ -297,6 +303,7 @@ def test_null_decorator_as_direct_decorator():
     """
     ``null_decorator`` must be a valid no-op decorator in ``@decorator`` form.
     """
+
     @si.null_decorator
     def _identity(x):
         return x
@@ -314,3 +321,12 @@ def test_null_decorator_as_factory():
         return x
 
     assert _identity(11) == 11
+
+
+@pytest.mark.skipif(
+    not si.safe_import("bitsandbytes")[0],
+    reason="bitsandbytes not installed",
+)
+def test_bitsandbytes_importable():
+    """bitsandbytes must be importable in the current environment."""
+    import bitsandbytes  # noqa: F401

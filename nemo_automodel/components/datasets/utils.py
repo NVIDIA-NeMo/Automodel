@@ -69,7 +69,7 @@ def pad_within_micro(batch, pad_token_id, pad_seq_len_divisible=None):
     """
     max_len = max(map(len, batch))
     if pad_seq_len_divisible:
-        max_len = (pad_seq_len_divisible - max_len % pad_seq_len_divisible) + max_len
+        max_len = math.ceil(max_len / pad_seq_len_divisible) * pad_seq_len_divisible
     if pad_token_id is None:
         # if it's none, extend the last token
         pad_token_id = batch[0][-1]
@@ -243,7 +243,14 @@ def default_collater(batch, pad_seq_len_divisible=None):
     }
 
     # convert to tensors
-    return {k: batchify(torch.LongTensor(v)) for k, v in ans.items()}
+    result = {k: batchify(torch.LongTensor(v)) for k, v in ans.items()}
+
+    # Add padding_mask similar to cp_utils.py
+    if "input_ids" in result:
+        input_ids_pad_token = get_pad_token_from_key("input_ids", pad_token_ids) or 0
+        result["padding_mask"] = (result["input_ids"] == input_ids_pad_token).bool()
+
+    return result
 
 
 def packed_sequence_thd_collater(batch):
@@ -265,20 +272,28 @@ def packed_sequence_thd_collater(batch):
     - Padding and stacking seq_lens and seq_lens_padded with sentinel value -1000
     - Including 'qkv_format': 'thd' in the output to indicate THD format
 
-    IMPORTANT: All examples in the batch must have the same token sequence length for input_ids,
-    labels, and position_ids. This is typically ensured by the dataset/packing logic that creates
-    fixed-length packed sequences.
+    When batch items lack packed-sequence metadata (seq_lens, seq_lens_padded, position_ids),
+    such as samples from ChatDataset, this collater synthesizes the missing fields so that each
+    sample is treated as a single-sequence "pack". Variable-length sequences are padded to the
+    longest length in the batch. This enables using THD format with TE context parallelism
+    without requiring the dataset to perform actual sequence packing.
 
     Args:
-        batch (List[dict]): A list of dictionaries, where each dictionary represents one packed example.
-            Each dictionary should contain:
+        batch (List[dict]): A list of dictionaries, where each dictionary represents one example.
+
+            For pre-packed data, each dictionary should contain:
             - 'input_ids': List[int] - Token IDs for all packed sequences (must be same length across batch)
             - 'labels': List[int] - Labels for all packed sequences (must be same length across batch)
             - 'position_ids': List[int] - Position IDs for all tokens (must be same length across batch)
             - 'seq_lens': List[int] - Actual sequence lengths for each packed sequence
             - 'seq_lens_padded': List[int] - Sequence lengths including identifier/padding tokens
 
-            Example batch with 2 examples, both with 6 total tokens:
+            For non-packed data (e.g. ChatDataset), each dictionary needs only:
+            - 'input_ids': List[int] - Token IDs (variable length across batch)
+            - 'labels': List[int] - Labels (same length as input_ids)
+            - 'attention_mask': List[int] - (optional) 1 for real tokens, 0 for padding
+
+            Example batch with 2 packed examples, both with 6 total tokens:
             [
                 {
                     'input_ids': [1, 2, 3, 99, 4, 5],  # Two sequences: [1,2,3] and [4,5] with sep token 99
@@ -308,14 +323,41 @@ def packed_sequence_thd_collater(batch):
         Note: seq_lens and seq_lens_padded are padded with -1000 to handle variable number of
         packed sequences per example. These sentinel values should be filtered out before use.
     """
-    # Remove padding token IDs if present (not used in passthrough)
+    # Extract and remove padding token metadata if present
+    pad_token_ids = None
     if len(batch) > 0 and "___PAD_TOKEN_IDS___" in batch[0]:
+        pad_token_ids = batch[0].get("___PAD_TOKEN_IDS___")
         for item in batch:
             item.pop("___PAD_TOKEN_IDS___", None)
 
-    # Extract all keys from the first batch item
     if len(batch) == 0:
         return {}
+
+    # If batch items lack packed-sequence metadata (e.g. from ChatDataset),
+    # synthesize seq_lens, seq_lens_padded, and position_ids so that each
+    # sample is treated as a single-sequence "pack".
+    if "seq_lens" not in batch[0]:
+        input_ids_pad = get_pad_token_from_key("input_ids", pad_token_ids) or 0
+        max_len = max(len(item["input_ids"]) for item in batch)
+
+        for item in batch:
+            cur_len = len(item["input_ids"])
+            if "attention_mask" in item:
+                actual_len = sum(item["attention_mask"])
+                item.pop("attention_mask")
+            else:
+                actual_len = cur_len
+
+            pad_amount = max_len - cur_len
+            item["seq_lens"] = [actual_len]
+            # seq_lens_padded must cover the full padded length so that
+            # cu_seqlens_padded[-1] == total_tokens in the downstream THD pipeline.
+            item["seq_lens_padded"] = [max_len]
+            item["position_ids"] = list(range(max_len))
+
+            if pad_amount > 0:
+                item["input_ids"] = list(item["input_ids"]) + [input_ids_pad] * pad_amount
+                item["labels"] = list(item["labels"]) + [-100] * pad_amount
 
     tokens = batchify(torch.stack([torch.tensor(x["input_ids"]) for x in batch]))
     labels = batchify(torch.stack([torch.tensor(x["labels"]) for x in batch]))
@@ -331,6 +373,77 @@ def packed_sequence_thd_collater(batch):
         "seq_lens": seq_lens,
         "seq_lens_padded": seq_lens_padded,
         "qkv_format": "thd",
+    }
+
+
+def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Convert an indexed attention mask to a 4D block-causal mask.
+
+    Args:
+        attention_mask: Integer tensor of shape ``[B, S]`` where each
+            position contains the 1-based index of the sub-sequence it
+            belongs to (0 = padding).
+
+    Returns:
+        Bool tensor of shape ``[B, 1, S, S]`` suitable for
+        ``eager`` / ``sdpa`` attention backends.  ``True`` means the
+        position is **allowed** to attend.
+    """
+    # attention_mask: [B, S]
+    B, S = attention_mask.shape
+
+    # same_doc[b, i, j] = True iff positions i and j belong to the same sub-sequence
+    mask_q = attention_mask.unsqueeze(2)  # [B, S, 1]
+    mask_k = attention_mask.unsqueeze(1)  # [B, 1, S]
+    same_doc = mask_q == mask_k  # [B, S, S]
+
+    # causal: position i can attend to position j only if j <= i
+    causal = torch.ones(S, S, dtype=torch.bool, device=attention_mask.device).tril()  # [S, S]
+
+    # not_padding: both positions must be non-padding (index > 0)
+    not_padding_q = (attention_mask > 0).unsqueeze(2)  # [B, S, 1]
+    not_padding_k = (attention_mask > 0).unsqueeze(1)  # [B, 1, S]
+
+    mask_4d = same_doc & causal.unsqueeze(0) & not_padding_q & not_padding_k  # [B, S, S]
+
+    return mask_4d.unsqueeze(1)  # [B, 1, S, S]
+
+
+def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -> dict:
+    """Collater for neat-packed LLM sequences.
+
+    Stacks ``input_ids``, ``labels``, ``position_ids`` and converts the
+    indexed ``attention_mask`` to the format required by the attention backend.
+
+    For ``flash_attention_2``: keeps the indexed 2D mask ``[B, S]``.
+    For ``sdpa`` / ``eager``: converts to a 4D block-causal float mask.
+
+    Args:
+        batch: List of sample dicts produced by ``neat_pack_dataset``.
+        attn_implementation: Attention backend (``"flash_attention_2"``,
+            ``"sdpa"``, or ``"eager"``).
+
+    Returns:
+        Dict with batched tensors ready for model forward.
+    """
+    if not batch:
+        return {}
+
+    input_ids = batchify(torch.stack([torch.as_tensor(x["input_ids"]) for x in batch]))
+    labels = batchify(torch.stack([torch.as_tensor(x["labels"]) for x in batch]))
+    position_ids = batchify(torch.stack([torch.as_tensor(x["position_ids"]) for x in batch]))
+    attention_mask = batchify(torch.stack([torch.as_tensor(x["attention_mask"]) for x in batch]))
+
+    if attn_implementation == "flash_attention_2":
+        mask_out = attention_mask
+    else:
+        mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
+
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "position_ids": position_ids,
+        "attention_mask": mask_out,
     }
 
 

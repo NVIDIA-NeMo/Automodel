@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# To run this recipe:
+#   automodel examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 seed: 1234
 
 step_scheduler:
@@ -55,7 +61,7 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
-    rms_norm: te
+    rms_norm: torch_fp32
     rope_fusion: true
     dispatcher: deepep
     experts: gmm
@@ -106,3 +112,8 @@ optimizer:
   eps: 1e-8
   lr: 1e-5
   weight_decay: 0
+
+ci:
+  recipe_owner: hemildesai
+  nodes: 8
+  time: "01:00:00"

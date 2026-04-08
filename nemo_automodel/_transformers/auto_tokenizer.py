@@ -120,7 +120,11 @@ class NeMoAutoTokenizer:
             tokenizer_cls = registry.get_custom_tokenizer_cls(model_type)
             if tokenizer_cls is not None:
                 logger.info(f"Using custom tokenizer {tokenizer_cls.__name__} for model type '{model_type}'")
-                return tokenizer_cls.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+                tokenizer = tokenizer_cls.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+                from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import _ensure_pad_token_id
+
+                _ensure_pad_token_id(tokenizer, pretrained_model_name_or_path)
+                return tokenizer
 
         # Fall back to default BOS/EOS enforced tokenizer
         from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import NeMoAutoTokenizerWithBosEosEnforced

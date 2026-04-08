@@ -45,20 +45,33 @@ env:
 runs:
   using: "composite"
   steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-      with:
-        path: NeMo-Automodel
-
-    - name: Setup python
-      uses: actions/setup-python@v5
-      with:
-        python-version: 3.12
-
     - name: Get PR info
       id: get-pr-info
       if: startsWith(github.ref, 'refs/heads/pull-request/')
       uses: nv-gha-runners/get-pr-info@main
+
+    - name: Get merge commit sha
+      shell: bash -x -e -u -o pipefail {0}
+      id: sha
+      env:
+        IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+      run: |
+        if [[ "$IS_PR" == "true" ]]; then
+          SHA=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
+        else
+          SHA=${GITHUB_SHA}
+        fi
+        echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
+
+    - name: Checkout
+      uses: actions/checkout@v6
+      with:
+        ref: ${{ steps.sha.outputs.main }}
+
+    - name: Setup python
+      uses: actions/setup-python@v6
+      with:
+        python-version: 3.12
 
     - name: Install Azure CLI
       shell: bash
@@ -130,7 +143,6 @@ runs:
         context: .
         build-args: |
           BASE_IMAGE=pytorch
-          INSTALL_TE=True
         cache-from: |
           type=registry,ref=${{ env.container-registry }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
           type=registry,ref=${{ env.container-registry }}/${{ env.REPO_LOWER }}:main-buildcache,mode=max

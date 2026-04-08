@@ -25,6 +25,7 @@ Heavy-lifting helpers live in sibling modules:
 """
 
 import gc
+import inspect
 import logging
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, List, Optional, Union
@@ -94,6 +95,7 @@ from nemo_automodel._transformers.model_init import (
     get_hf_config,
     get_is_hf_model,
     no_hf_meta_device,
+    resolve_sdpa_method,
 )
 
 if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
@@ -103,6 +105,60 @@ if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
 
 
 logger = logging.getLogger(__name__)
+
+_MAX_BUILD_RETRIES = 5
+
+_remote_code_compat_applied = False
+
+
+def _patch_remote_code_compat():
+    """Patch ``_finalize_model_loading`` for remote-code models written against older transformers.
+
+    Remote-code models (``trust_remote_code=True``) may be incompatible with
+    the installed transformers in several ways:
+
+    1. Missing ``all_tied_weights_keys`` -- set in ``post_init()`` which the
+       model may never call.
+    2. Overridden ``tie_weights()`` with an old signature that doesn't accept
+       the ``missing_keys`` kwarg added in newer transformers.
+
+    This one-time patch wraps ``_finalize_model_loading`` to fix these issues
+    on the fly.  For models that are already compatible the guards are no-ops.
+    """
+    global _remote_code_compat_applied
+    if _remote_code_compat_applied:
+        return
+    _orig_finalize = PreTrainedModel._finalize_model_loading
+
+    def _compat_finalize(model, load_config, loading_info):
+        # 1. Ensure all_tied_weights_keys exists
+        if not hasattr(model, "all_tied_weights_keys"):
+            model.all_tied_weights_keys = model.get_expanded_tied_weights_keys(all_submodels=True)
+
+        # 2. Wrap tie_weights if it doesn't accept `missing_keys`
+        model_cls = type(model)
+        if model_cls.tie_weights is not PreTrainedModel.tie_weights:
+            sig = inspect.signature(model_cls.tie_weights)
+            has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if "missing_keys" not in sig.parameters and not has_var_kw:
+                _orig_tie = model_cls.tie_weights
+
+                def _compat_tie(self, **kwargs):
+                    accepted = {k: v for k, v in kwargs.items() if k in sig.parameters}
+                    return _orig_tie(self, **accepted)
+
+                model_cls.tie_weights = _compat_tie
+
+        # 3. Set missing config defaults that older remote code models expect
+        _config_defaults = {"use_cache": False}
+        for attr, default in _config_defaults.items():
+            if not hasattr(model.config, attr):
+                setattr(model.config, attr, default)
+
+        return _orig_finalize(model, load_config, loading_info)
+
+    PreTrainedModel._finalize_model_loading = staticmethod(_compat_finalize)
+    _remote_code_compat_applied = True
 
 
 def _maybe_dequantize_fp8_for_peft(hf_native_quant_cfg, peft_config, pretrained_path):
@@ -145,8 +201,31 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         name = cls.__name__
         if name.startswith("NeMo"):
             cls.__name__ = name[4:]
-        model = super().from_pretrained(*args, **kwargs)
-        cls.__name__ = name
+        try:
+            model = super().from_pretrained(*args, **kwargs)
+        except (AttributeError, TypeError) as e:
+            if "all_tied_weights_keys" in str(e) or (isinstance(e, TypeError) and "tie_weights" in str(e)):
+                logger.warning(
+                    "Remote code model incompatible with installed transformers (%s). "
+                    "Applying compatibility patches and retrying.",
+                    e,
+                )
+                _patch_remote_code_compat()
+                model = super().from_pretrained(*args, **kwargs)
+            else:
+                raise
+        except OSError:
+            if kwargs.get("use_safetensors") is not False:
+                logger.warning(
+                    "Checkpoint resolution failed; retrying with use_safetensors=False "
+                    "(the model may only provide .bin checkpoints)."
+                )
+                kwargs["use_safetensors"] = False
+                model = super().from_pretrained(*args, **kwargs)
+            else:
+                raise
+        finally:
+            cls.__name__ = name
         return model
 
     @classmethod
@@ -181,6 +260,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         fp8_config,
         compile_config,
         load_base_model,
+        _retry_depth=0,
         **kwargs,
     ):
         """Shared model building logic for ``from_pretrained`` and ``from_config``.
@@ -201,6 +281,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         def _retry(**override):
             """Re-enter ``_build_model`` with overridden parameters."""
+            if _retry_depth >= _MAX_BUILD_RETRIES:
+                raise
             retry_kwargs = {
                 **kwargs,
                 "has_packed_sequence": has_packed_sequence,
@@ -228,6 +310,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 fp8_config=fp8_config,
                 compile_config=compile_config,
                 load_base_model=load_base_model,
+                _retry_depth=_retry_depth + 1,
                 **retry_kwargs,
             )
 
@@ -258,12 +341,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # Use meta device initialization when:
         # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)
         # - AND either multi-GPU (world_size > 1) or single-GPU custom model (not HF)
-        # - AND not using quantization (we let HF handle BitsAndBytes; don't init meta device)
+        # - AND not using quantization (we let HF handle BitsAndBytes/FP8; don't init meta device)
+        #   For non-HF models, native quant config is ignored.
         is_meta_device = all(
             [
                 not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)),
                 get_world_size_safe() > 1 or not is_hf_model,
-                quantization_config is None and _hf_native_quant_cfg is None,
+                quantization_config is None and (_hf_native_quant_cfg is None or not is_hf_model),
             ]
         )
         init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
@@ -282,11 +366,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     *model_args,
                     **kwargs,
                 )
-        except NotImplementedError as e:
-            if "Cannot copy out of meta tensor" in str(e) and is_meta_device:
+        except (NotImplementedError, RuntimeError) as e:
+            _meta_err_msgs = ("Cannot copy out of meta tensor", "cannot be called on meta tensors")
+            if any(msg in str(e) for msg in _meta_err_msgs) and is_meta_device:
                 logger.warning(
-                    "Model init hit 'Cannot copy out of meta tensor' (e.g. buffer created with meta but "
-                    "called .to(device)); retrying without meta device.",
+                    "Model init hit meta-tensor error (%s); retrying without meta device.",
+                    type(e).__name__,
                 )
                 del model
                 model = None
@@ -341,6 +426,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         if is_hf_model:
             _verify_sdpa_support(model, mesh.cp_size)
 
+        from nemo_automodel._transformers.capabilities import attach_capabilities_and_validate
+
+        attach_capabilities_and_validate(model, mesh)
+
         model = apply_model_infrastructure(
             model=model,
             pretrained_model_name_or_path=pretrained_path,
@@ -370,7 +459,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         *model_args,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: Optional[List[SDPBackend]] = None,
+        sdpa_method: Optional[List[Union[SDPBackend, str]]] = None,
         torch_dtype="auto",
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
@@ -407,8 +496,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 the model with Liger kernels for faster inference/training.
             use_sdpa_patching (bool, default=True): If `True`, patch the
                 model with SDPA-based attention optimizations.
-            sdpa_method (list[SDPBackend] | None, optional): Explicit list of
+            sdpa_method (list[SDPBackend | str] | None, optional): Explicit list of
                 SDPA back-ends to consider when `use_sdpa_patching=True`.
+                Accepts both SDPBackend enum values and string names (e.g.
+                ``["flash_attention", "efficient_attention"]``). When ``None``,
+                auto-selects based on CP and activation checkpointing.
             torch_dtype (str | torch.dtype | Literal["auto"], default="auto"):
                 Data type passed to the underlying `from_pretrained` call.
             attn_implementation (str, optional):
@@ -479,6 +571,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 raise
         is_hf_model = get_is_hf_model(hf_config, force_hf)
 
+        sdpa_method = resolve_sdpa_method(sdpa_method, device_mesh, activation_checkpointing)
+
         return cls._build_model(
             pretrained_model_name_or_path,
             *model_args,
@@ -510,7 +604,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         *model_args,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: Optional[List[SDPBackend]] = None,
+        sdpa_method: Optional[List[Union[SDPBackend, str]]] = None,
         torch_dtype: Union[str, torch.dtype] = "auto",
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
@@ -580,6 +674,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     raise
         _consume_config_overrides(config, kwargs)
         is_hf_model = get_is_hf_model(config, force_hf)
+
+        sdpa_method = resolve_sdpa_method(sdpa_method, device_mesh, activation_checkpointing)
 
         return cls._build_model(
             config,
@@ -734,33 +830,19 @@ class NeMoAutoModelForTextToWaveform(_BaseNeMoAutoModelClass, AutoModelForTextTo
     pass
 
 
-class NeMoAutoModelBiencoder:
-    """NeMo AutoModel for biencoder/embedding tasks with full infrastructure support.
+class _NeMoAutoModelForRetrievalBase:
+    """Private shared base for encoder auto-models.
 
-    This class provides a unified interface for loading biencoder models with
-    support for PEFT, FSDP, TP, CP, FP8, QAT, and other infrastructure features.
-    It uses the BiencoderModel.build() method to create the model and then applies
-    all infrastructure through apply_model_infrastructure().
-
-    This class properly integrates with the model registry and applies all
-    kernel patching and infrastructure support.
-
-    Examples:
-    --------
-    >>> model = NeMoAutoModelBiencoder.from_pretrained("meta-llama/Llama-3.2-1B")
-    >>> model = NeMoAutoModelBiencoder.from_pretrained(
-    ...     "meta-llama/Llama-3.2-1B",
-    ...     distributed_config=FSDP2Config(),
-    ... )
+    Subclasses set ``_ENCODER_CLS_NAME`` to select the concrete encoder class
+    from ``nemo_automodel._transformers.retrieval``.
     """
+
+    _ENCODER_CLS_NAME: Optional[str] = None  # "BiEncoderModel" or "CrossEncoderModel"
 
     @classmethod
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        share_encoder: bool = True,
-        pooling: str = "avg",
-        l2_normalize: bool = True,
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
@@ -775,18 +857,14 @@ class NeMoAutoModelBiencoder:
         peft_config: Optional[dict] = None,
         **kwargs,
     ) -> PreTrainedModel:
-        """
-        Load a biencoder model from pretrained weights with full infrastructure support.
+        """Load an encoder model with infrastructure (FSDP, PEFT, kernel patching, etc.).
 
-        This method builds a biencoder using BiencoderModel.build(), applies kernel
-        patching, and then applies all infrastructure (FSDP, checkpointing, etc.)
-        through apply_model_infrastructure().
+        This method builds an encoder via the subclass's ``_ENCODER_CLS_NAME``,
+        applies kernel patching, and then applies all infrastructure (FSDP,
+        checkpointing, etc.) through ``apply_model_infrastructure()``.
 
         Args:
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
-            share_encoder: Whether to share encoder weights between query and passage.
-            pooling: Pooling strategy ('avg', 'cls', 'last', etc.).
-            l2_normalize: Whether to L2 normalize embeddings.
             attn_implementation: Attention implementation to use (e.g.,
                 ``"flash_attention_2"``, ``"sdpa"``, ``"eager"``).
                 Defaults to ``DEFAULT_ATTN_IMPLEMENTATION``
@@ -801,25 +879,24 @@ class NeMoAutoModelBiencoder:
             distributed_config: Strategy-specific distributed training configuration.
             moe_config: MoE parallelizer configuration.
             compile_config: Configuration for torch.compile.
-            **kwargs: Additional arguments passed to BiencoderModel.build.
+            peft_config: PEFT/LoRA configuration dictionary.
+            **kwargs: Additional arguments passed to the encoder's ``build()`` method.
 
         Returns:
-            BiencoderModel instance with loaded weights and all infrastructure applied.
+            Encoder model instance with loaded weights and all infrastructure applied.
 
         Notes:
             If kernel patching fails, the method retries with adjusted parameters.
         """
-        from nemo_automodel._transformers.biencoder import BiencoderModel
+        from nemo_automodel._transformers import retrieval as _enc_mod
 
-        logger.info(f"Loading NeMoAutoModelBiencoder from {pretrained_model_name_or_path}")
+        encoder_cls = getattr(_enc_mod, cls._ENCODER_CLS_NAME)
+
+        logger.info(f"Loading {cls.__name__} from {pretrained_model_name_or_path}")
 
         def _retry(**override):
-            """Internal helper to re-enter this function with patched parameters."""
             return cls.from_pretrained(
                 pretrained_model_name_or_path,
-                share_encoder=share_encoder,
-                pooling=pooling,
-                l2_normalize=l2_normalize,
                 attn_implementation=attn_implementation,
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
@@ -835,10 +912,10 @@ class NeMoAutoModelBiencoder:
                 **kwargs,
             )
 
-        kwargs = dict(kwargs)
-        kwargs.pop("tp_size", None)
-        kwargs.pop("cp_size", None)
-        kwargs.pop("has_packed_sequence", None)
+        build_kwargs = dict(kwargs)
+        build_kwargs.pop("tp_size", None)
+        build_kwargs.pop("cp_size", None)
+        build_kwargs.pop("has_packed_sequence", None)
 
         if tp_plan is not None and distributed_config is not None:
             distributed_config.tp_plan = tp_plan
@@ -853,23 +930,18 @@ class NeMoAutoModelBiencoder:
             device=torch.device("cuda", torch.cuda.current_device()),
             mesh=mesh,
         )
-        loss_fn = None
 
-        is_meta_device = False
         device = torch.cuda.current_device()
 
-        model = BiencoderModel.build(
+        model = encoder_cls.build(
             model_name_or_path=pretrained_model_name_or_path,
-            share_encoder=share_encoder,
-            pooling=pooling,
-            l2_normalize=l2_normalize,
             attn_implementation=attn_implementation,
-            **kwargs,
+            **build_kwargs,
         )
 
         try:
             if use_liger_kernel:
-                logger.info("Applying Liger kernel patching to biencoder")
+                logger.info("Applying Liger kernel patching to encoder")
                 model = _patch_liger_kernel(model)
         except RuntimeError:
             logger.warning("Retrying without Liger kernels.")
@@ -879,7 +951,7 @@ class NeMoAutoModelBiencoder:
 
         try:
             if use_sdpa_patching:
-                logger.info("Applying SDPA patching to biencoder")
+                logger.info("Applying SDPA patching to encoder")
                 model = _patch_attention(model, sdpa_method)  # noqa: F821
         except Exception:
             logger.warning("Retrying without SDPA patching.")
@@ -890,7 +962,7 @@ class NeMoAutoModelBiencoder:
         model = apply_model_infrastructure(
             model=model,  # noqa: F821
             pretrained_model_name_or_path=pretrained_model_name_or_path,
-            is_meta_device=is_meta_device,
+            is_meta_device=False,
             device=device,
             model_wrapper=model_wrapper,
             mesh=mesh,
@@ -898,12 +970,79 @@ class NeMoAutoModelBiencoder:
             quantization_config=None,
             fp8_config=None,
             qat_quantizer=qat_quantizer,
-            loss_fn=loss_fn,
+            loss_fn=None,
             autopipeline=autopipeline,
             parallelize_fn=parallelize_fn,
             compile_config=compile_config,
-            load_base_model=False,  # BiencoderModel.build already loads weights
-            cache_dir=kwargs.get("cache_dir", hf_constants.HF_HUB_CACHE),
+            load_base_model=False,  # encoder_cls.build already loads weights
+            cache_dir=build_kwargs.get("cache_dir", hf_constants.HF_HUB_CACHE),
         )
 
         return model
+
+
+class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
+    """NeMo AutoModel for bi-encoder embedding tasks with full infrastructure support.
+
+    Wraps ``BiEncoderModel.build()`` with kernel patching, PEFT, FSDP, and
+    other distributed infrastructure via ``apply_model_infrastructure()``.
+
+    Examples:
+    --------
+    >>> model = NeMoAutoModelBiEncoder.from_pretrained("meta-llama/Llama-3.2-1B")
+    >>> model = NeMoAutoModelBiEncoder.from_pretrained(
+    ...     "meta-llama/Llama-3.2-1B",
+    ...     pooling="cls",
+    ...     l2_normalize=False,
+    ...     distributed_config=FSDP2Config(),
+    ... )
+    """
+
+    _ENCODER_CLS_NAME = "BiEncoderModel"
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        pooling: str = "avg",
+        l2_normalize: bool = True,
+        **kwargs,
+    ) -> PreTrainedModel:
+        """Load a bi-encoder model with infrastructure.
+
+        Accepts all arguments from ``_NeMoAutoModelForRetrievalBase.from_pretrained``
+        plus the bi-encoder-specific parameters below.
+
+        Args:
+            pretrained_model_name_or_path: Path to pretrained model or model identifier.
+            pooling: Pooling strategy (``'avg'``, ``'cls'``, ``'last'``, etc.).
+            l2_normalize: Whether to L2-normalize embeddings.
+            **kwargs: Forwarded to ``_NeMoAutoModelForRetrievalBase.from_pretrained``.
+
+        Returns:
+            BiEncoderModel instance with loaded weights and all infrastructure applied.
+        """
+        return super().from_pretrained(
+            pretrained_model_name_or_path,
+            pooling=pooling,
+            l2_normalize=l2_normalize,
+            **kwargs,
+        )
+
+
+class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
+    """NeMo AutoModel for cross-encoder scoring tasks with full infrastructure support.
+
+    Wraps ``CrossEncoderModel.build()`` with kernel patching, PEFT, FSDP, and
+    other distributed infrastructure via ``apply_model_infrastructure()``.
+
+    Examples:
+    --------
+    >>> model = NeMoAutoModelCrossEncoder.from_pretrained("meta-llama/Llama-3.2-1B")
+    >>> model = NeMoAutoModelCrossEncoder.from_pretrained(
+    ...     "meta-llama/Llama-3.2-1B",
+    ...     distributed_config=FSDP2Config(),
+    ... )
+    """
+
+    _ENCODER_CLS_NAME = "CrossEncoderModel"

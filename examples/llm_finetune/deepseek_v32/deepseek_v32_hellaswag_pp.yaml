@@ -15,6 +15,14 @@
 # Finetuning config for DeepSeek V3.2 on HellaSwag
 # Replace /path/to/deepseek-v32 with the path to the DeepSeek V3.2 model
 
+# To run this recipe:
+#   automodel examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+# Recipe validated using 256 H100 GPUs (32 nodes x 8)
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 seed: 1234
 
 step_scheduler:
@@ -63,7 +71,7 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa # TE requires the latest cudnn version so disabling by default
     linear: te
-    rms_norm: te
+    rms_norm: torch_fp32
     rope_fusion: false
     enable_deepep: true
     fake_balanced_gate: false
@@ -120,3 +128,8 @@ optimizer:
   eps: 1e-8
   lr: 1e-5
   weight_decay: 0
+
+ci:
+  recipe_owner: hemildesai
+  nodes: 32
+  time: "00:30:00"

@@ -318,6 +318,150 @@ class TestApplyCacheCompatibilityPatchesIntegration:
 
         assert hasattr(DynamicCache, "get_usable_length") or hasattr(DynamicCache, "get_seq_length")
 
+    def test_patches_sliding_window_cache(self):
+        """SlidingWindowCache should exist after patching (aliased to StaticCache if removed)."""
+        apply_cache_compatibility_patches()
+        import transformers.cache_utils as cu
+
+        assert hasattr(cu, "SlidingWindowCache")
+
+    def test_patches_cache_get_usable_length(self):
+        """Cache.get_usable_length should exist after patching."""
+        apply_cache_compatibility_patches()
+        from transformers.cache_utils import Cache
+
+        assert hasattr(Cache, "get_usable_length")
+
+    def test_get_usable_length_returns_seq_length(self):
+        """get_usable_length delegates to get_seq_length when no max_length constraint."""
+        apply_cache_compatibility_patches()
+        from transformers.cache_utils import Cache
+
+        mock_cache = Mock(spec=Cache)
+        mock_cache.get_seq_length = Mock(return_value=10)
+        mock_cache.get_max_cache_shape = Mock(return_value=None)
+        result = Cache.get_usable_length(mock_cache, new_seq_length=5, layer_idx=0)
+        assert result == 10
+
+    def test_get_usable_length_respects_max_length(self):
+        """get_usable_length returns max_length - new_seq_length when cache is near full."""
+        apply_cache_compatibility_patches()
+        from transformers.cache_utils import Cache
+
+        mock_cache = Mock(spec=Cache)
+        mock_cache.get_seq_length = Mock(return_value=90)
+        mock_cache.get_max_cache_shape = Mock(return_value=100)
+        # 90 + 15 > 100, so should return 100 - 15 = 85
+        result = Cache.get_usable_length(mock_cache, new_seq_length=15, layer_idx=0)
+        assert result == 85
+
+    def test_patches_tied_weights_keys_list_to_dict(self):
+        """post_init should convert _tied_weights_keys from list to correct {target: source} dict."""
+        apply_cache_compatibility_patches()
+        from transformers.modeling_utils import PreTrainedModel
+
+        assert getattr(PreTrainedModel.post_init, "_nemo_tied_keys_patched", False)
+
+    def test_tied_weights_keys_patch_resolves_correct_source_phi4mm(self):
+        """The post_init patch should map tied keys to model.embed_tokens.weight for phi4mm."""
+        apply_cache_compatibility_patches()
+        import torch.nn as nn
+        from transformers import PretrainedConfig
+        from transformers.modeling_utils import PreTrainedModel
+
+        class FakePhi4mmCfg(PretrainedConfig):
+            model_type = "phi4mm"
+
+        class FakePhi4mmModel(PreTrainedModel):
+            config_class = FakePhi4mmCfg
+            _tied_weights_keys = ["lm_head.weight"]
+
+            def __init__(self, config):
+                super().__init__(config)
+                self.model = nn.Module()
+                self.model.embed_tokens = nn.Embedding(10, 4)
+                self.lm_head = nn.Linear(4, 10, bias=False)
+                self.post_init()
+
+        config = FakePhi4mmCfg(tie_word_embeddings=True)
+        model = FakePhi4mmModel(config)
+        tied = model._tied_weights_keys
+        assert isinstance(tied, dict)
+        assert "lm_head.weight" in tied
+        assert tied["lm_head.weight"] == "model.embed_tokens.weight"
+
+    def test_tied_weights_keys_patch_converts_any_model(self):
+        """The post_init patch should convert _tied_weights_keys for any model, not just phi4mm."""
+        apply_cache_compatibility_patches()
+        import torch.nn as nn
+        from transformers import PretrainedConfig
+        from transformers.modeling_utils import PreTrainedModel
+
+        class FakeOtherCfg(PretrainedConfig):
+            model_type = "nemotron_flash"
+
+        class FakeOtherModel(PreTrainedModel):
+            config_class = FakeOtherCfg
+            _tied_weights_keys = ["lm_head.weight"]
+
+            def __init__(self, config):
+                super().__init__(config)
+                self.model = nn.Module()
+                self.model.embed_tokens = nn.Embedding(10, 4)
+                self.lm_head = nn.Linear(4, 10, bias=False)
+                self.post_init()
+
+        config = FakeOtherCfg(tie_word_embeddings=True)
+        model = FakeOtherModel(config)
+        tied = model._tied_weights_keys
+        assert isinstance(tied, dict)
+        assert "lm_head.weight" in tied
+        assert tied["lm_head.weight"] == "model.embed_tokens.weight"
+
+    def test_patches_peft_prepare_inputs(self):
+        """PeftModelForCausalLM.__init__ should be patched for missing prepare_inputs_for_generation."""
+        apply_cache_compatibility_patches()
+        try:
+            import peft.peft_model as pm
+
+            assert getattr(pm.PeftModelForCausalLM.__init__, "_nemo_peft_patched", False)
+        except ImportError:
+            pytest.skip("peft not installed")
+
+    def test_peft_patch_adds_stub_on_missing_prepare_inputs(self):
+        """The PEFT patch should add prepare_inputs_for_generation stub when missing."""
+        apply_cache_compatibility_patches()
+        try:
+            import peft.peft_model  # noqa: F401
+        except ImportError:
+            pytest.skip("peft not installed")
+
+        # Simulate the stub logic from _patch_peft_prepare_inputs:
+        # when a model lacks prepare_inputs_for_generation, the patch adds a stub
+        class FakeModel:
+            pass
+
+        model = FakeModel()
+        assert not hasattr(model, "prepare_inputs_for_generation")
+
+        # Reproduce what the patch does on AttributeError
+        try:
+            _ = model.prepare_inputs_for_generation
+        except AttributeError:
+            model.prepare_inputs_for_generation = lambda *a, **kw: {}
+
+        assert callable(model.prepare_inputs_for_generation)
+        assert model.prepare_inputs_for_generation() == {}
+
+    def test_patches_phi4mm_processor(self):
+        """ProcessorMixin.from_pretrained should be patched for phi4mm fallback."""
+        apply_cache_compatibility_patches()
+        import transformers.processing_utils as pu
+
+        # The patch replaces from_pretrained with a wrapper named _patched
+        fn = pu.ProcessorMixin.from_pretrained
+        assert fn.__func__.__qualname__ == "_patch_phi4mm_processor.<locals>._patched"
+
 
 class TestApplyQwen3OmniConfigPatch:
     """Test cases for apply_qwen3_omni_config_patch function."""

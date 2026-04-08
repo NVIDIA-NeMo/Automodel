@@ -12,20 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from pathlib import Path
-import json
+
 import pytest
 
 from nemo_automodel.components.datasets.llm import retrieval_dataset_inline as rdi
+
 
 def load_jsonl_one_line(path):
     ans = []
     with open(path, "r") as f:
         for line in f:
             ans.append(json.loads(line))
-            break # only load the first line
+            break  # only load the first line
     return ans
+
 
 def _embedding_testdata_training_file() -> Path:
     return Path(os.environ["TEST_DATA_DIR"]) / "embedding_testdata" / "training.jsonl"
@@ -39,7 +42,7 @@ def test_retrieval_dataset_inline_embedding_testdata_smoke():
     ds = rdi.make_retrieval_dataset(
         data_dir_list=str(data_file),
         data_type="train",
-        train_n_passages=2,  # 1 positive + 1 negative
+        n_passages=2,  # 1 positive + 1 negative
         do_shuffle=False,
         max_train_samples=1,
     )
@@ -55,7 +58,6 @@ def test_retrieval_dataset_inline_embedding_testdata_smoke():
     assert isinstance(ex.get("passage_instruction"), str)
 
     payload = load_jsonl_one_line(data_file)
-    assert ex['doc_text'][0] == payload[0]['pos_doc']
-    assert ex['doc_text'][1] == payload[0]['neg_doc'][0]
-    assert ex['question'] == payload[0]['query']
-
+    assert ex["doc_text"][0] == payload[0]["pos_doc"]
+    assert ex["doc_text"][1] == payload[0]["neg_doc"][0]
+    assert ex["question"] == payload[0]["query"]

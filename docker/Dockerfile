@@ -13,7 +13,7 @@
 # limitations under the License.
 
 ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:25.11-py3
+ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.02-py3
 ARG BASE_IMAGE=cuda
 
 FROM ${CUDA_IMAGE} AS cuda
@@ -74,21 +74,53 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     cd ../ && rm -rf TransformerEngine; \
     fi
 
-# Install Deepep
+# Install HybridEP
+## Dependency: RDMA Core
+RUN git clone https://github.com/linux-rdma/rdma-core.git && \
+    cd rdma-core && git checkout tags/v60.0 && sh build.sh
+ENV RDMA_CORE_HOME=/opt/rdma-core/build
+## Use stub of libnvidia-ml-dev during build only
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libnvidia-ml-dev
 COPY docker/common/deepep.patch /opt/deepep.patch
-ARG INSTALL_DEEPEP=False
-ARG DEEPEP_COMMIT=1dddd194c26911c35b4f53a148617dd73de0ffc9
-RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
-    git clone https://github.com/deepseek-ai/DeepEP.git && \
-    cd DeepEP && \
-    git pull && \
+ARG DEEPEP_COMMIT=7febc6e25660af0f54d95dd781ecdcd62265ecca
+RUN git clone -b hybrid-ep https://github.com/deepseek-ai/DeepEP.git
+ENV HYBRID_EP_MULTINODE=1
+RUN cd DeepEP && \
     git fetch origin $DEEPEP_COMMIT && \
     git checkout FETCH_HEAD && \
     patch -p1 < /opt/deepep.patch && \
     pip install --no-cache-dir nvidia-nvshmem-cu13==3.4.5 && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 pip install --no-build-isolation . && \
+    apt-get purge -y libnvidia-ml-dev && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/* && \
     rm -rf /opt/deepep.patch && \
-    rm -rf DeepEP; \
+    cd / && rm -rf DeepEP rdma-core
+
+# Install Bitsandbytes
+ARG INSTALL_BITSANDBYTES=True
+ARG BITSANDBYTES_COMMIT=0.49.2
+RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
+    git clone https://github.com/bitsandbytes-foundation/bitsandbytes.git && \
+    cd bitsandbytes && \
+    git pull && \
+    git fetch origin $BITSANDBYTES_COMMIT && \
+    git checkout FETCH_HEAD && \
+    cmake -DCOMPUTE_BACKEND=cuda -DCOMPUTE_CAPABILITY="80;86;90;100;110" -S . && \
+    make && \
+    cmake -DCOMPUTE_BACKEND=cpu -S . && \
+    make && \
+    pip install . && \
+    cd ../ && rm -rf bitsandbytes; \
+    fi
+
+# Install UCCL-EP (Azure-compatible RDMA for expert parallelism)
+COPY scripts/setup_uccl_ep.sh /opt/setup_uccl_ep.sh
+ARG INSTALL_UCCL_EP=False
+RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
+    bash /opt/setup_uccl_ep.sh --no-efa && \
+    rm -f /opt/setup_uccl_ep.sh; \
     fi
 
 # Address base image CVE
@@ -98,8 +130,7 @@ RUN pip install "aiohttp>=3.13.3" \
         "pillow>=12.1.1" \
         "protobuf>=6.33.5" \
         "setuptools>=80.10.2" \
-        "urllib3>=2.6.0" \
-        "wheel>=0.46.2"
+        "urllib3>=2.6.0"
 
 FROM automodel_dep as automodel_final
 
@@ -113,13 +144,14 @@ COPY docker/common/update_pyproject_pytorch.sh /opt/Automodel/docker/common/
 # Install Automodel
 ARG BASE_IMAGE=cuda
 ARG AUTOMODEL_INSTALL=all
+ARG UV_SYNC_ARGS="--locked"
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     --mount=type=cache,target=/root/.cache/uv \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi && \
-    uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups && \
+    uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS && \
     uv cache prune --ci
 
 COPY . /opt/Automodel

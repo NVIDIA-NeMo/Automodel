@@ -89,7 +89,6 @@ class PipelineSpec:
             pipeline_cls: "FluxPipeline"  # Optional
             subfolder: "transformer"
             load_full_pipeline: false
-            enable_gradient_checkpointing: true
     """
 
     # Required for from_config: transformer class name from diffusers
@@ -105,7 +104,6 @@ class PipelineSpec:
     load_full_pipeline: bool = False
 
     # Training optimizations
-    enable_gradient_checkpointing: bool = True
     low_cpu_mem_usage: bool = True
 
     @classmethod
@@ -367,7 +365,8 @@ class NeMoAutoDiffusionPipeline:
         move_to_device: bool = True,
         load_for_training: bool = False,
         components_to_load: Optional[Iterable[str]] = None,
-        enable_gradient_checkpointing: bool = True,
+        peft_cfg=None,
+        model_type=None,
         **kwargs,
     ) -> Tuple[DiffusionPipeline, Dict[str, ParallelManager]]:
         """
@@ -387,7 +386,10 @@ class NeMoAutoDiffusionPipeline:
             move_to_device: Whether to move modules to device
             load_for_training: Whether to make parameters trainable
             components_to_load: Which components to process (default: all)
-            enable_gradient_checkpointing: Enable gradient checkpointing for transformer
+            peft_cfg: PeftConfig instance or None. When provided, LoRA is injected
+                before _apply_parallelization() (FSDP2 wrapping). Base weights
+                are frozen after FSDP2; LoRA params are collected pre-FSDP2 and stored on pipe.
+            model_type: "flux" | "wan" | "hunyuan". Required when peft_cfg is provided.
             **kwargs: Additional arguments passed to DiffusionPipeline.from_pretrained
 
         Returns:
@@ -421,21 +423,74 @@ class NeMoAutoDiffusionPipeline:
                     logger.info("[INFO] Moving module: %s to device/dtype", name)
                     _move_module_to_device(module, dev, torch_dtype)
 
-        # Enable gradient checkpointing if configured
-        if enable_gradient_checkpointing:
-            if hasattr(pipe, "transformer") and hasattr(pipe.transformer, "enable_gradient_checkpointing"):
-                pipe.transformer.enable_gradient_checkpointing()
-                logger.info("[INFO] Enabled gradient checkpointing for transformer")
+        if peft_cfg is not None:
+            # ── LoRA path ─────────────────────────────────────────────────────
+            # LoRA injection MUST run before _apply_parallelization (FSDP2).
+            # FSDP2 must see the final module structure (with LoRA-patched linears)
+            # to correctly shard both base weights and LoRA weights.
+            # Pre-FSDP2 lora_params refs are stored on pipe and remain valid
+            # after wrapping (FSDP2 preserves original Parameter objects).
+            if model_type is None:
+                raise ValueError("model_type must be set when peft_cfg is provided. Options: 'flux', 'wan', 'hunyuan'")
+            import dataclasses
 
-        # If loading for training, ensure the target module parameters are trainable
-        if load_for_training:
+            from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
+
+            pipe._lora_params = {}
+            pipe._peft_config = None
+
             for name, module in _iter_pipeline_modules(pipe):
-                if not components_to_load or name in components_to_load:
-                    logger.info("[INFO] Ensuring params trainable: %s", name)
-                    _ensure_params_trainable(module, module_name=name)
+                if name == "transformer":
+                    # Pre-inject hook: Wan fuses to_q/to_k/to_v for inference
+                    # efficiency — must unfuse before injection so individual
+                    # Linear modules are visible to the module matcher.
+                    if model_type == "wan":
+                        for block in module.blocks:
+                            block.attn1.unfuse_projections()
+                            block.attn2.unfuse_projections()
+                        logger.info("[LoRA] Wan: unfused attention projection groups")
+
+                    # Ensure LoRA weights are bf16 to match base weights in the
+                    # FSDP2 unit — mixed dtypes cause reduce-scatter to malfunction.
+                    cfg = peft_cfg
+                    if cfg.lora_dtype is None:
+                        cfg = dataclasses.replace(cfg, lora_dtype=torch.bfloat16)
+
+                    # skip_freeze=True: global base-weight freeze happens after
+                    # FSDP2 wrapping (see below). FSDP2 must see all params as
+                    # trainable during fully_shard() so gradient reduction is set
+                    # up correctly for LoRA params.
+                    apply_lora_to_linear_modules(module, cfg, skip_freeze=True)
+
+                    lora_params = [p for n, p in module.named_parameters() if "lora_" in n and p.requires_grad]
+                    pipe._lora_params[name] = lora_params
+                    pipe._peft_config = cfg
+                    logger.info(
+                        "[LoRA] Stored %d lora_param tensors before FSDP2",
+                        len(lora_params),
+                    )
+        else:
+            # If loading for training, ensure the target module parameters are trainable
+            if load_for_training:
+                for name, module in _iter_pipeline_modules(pipe):
+                    if not components_to_load or name in components_to_load:
+                        logger.info("[INFO] Ensuring params trainable: %s", name)
+                        _ensure_params_trainable(module, module_name=name)
 
         # Apply parallelization (FSDP2 or DDP)
+        # LoRA: all params are trainable when fully_shard() runs so FSDP2 sets
+        # up gradient reduction for lora_A/lora_B correctly. Freeze happens below.
         created_managers = _apply_parallelization(pipe, parallel_scheme)
+
+        # Freeze base weights AFTER FSDP2 wrapping — mirrors the LLM pattern in
+        # nemo_automodel/_transformers/infrastructure.py lines 513-518.
+        # FSDP2 must see all params as trainable during fully_shard(); freezing
+        # before wrapping causes gradient reduction to malfunction for LoRA params.
+        if peft_cfg is not None:
+            for name, param in pipe.transformer.named_parameters():
+                if "lora_" not in name and param.requires_grad:
+                    param.requires_grad_(False)
+            logger.info("[LoRA] Froze base weights after FSDP2 wrapping")
 
         return pipe, created_managers
 
@@ -526,13 +581,6 @@ class NeMoAutoDiffusionPipeline:
             if move_to_device:
                 transformer = transformer.to(dev)
             pipe = cls(transformer=transformer)
-
-        # Enable gradient checkpointing if configured
-        if spec.enable_gradient_checkpointing:
-            target_transformer = getattr(pipe, "transformer", transformer)
-            if hasattr(target_transformer, "enable_gradient_checkpointing"):
-                target_transformer.enable_gradient_checkpointing()
-                logger.info("[INFO] Enabled gradient checkpointing for transformer")
 
         # Make parameters trainable (always true for from_config / pretraining)
         for name, module in _iter_pipeline_modules(pipe):

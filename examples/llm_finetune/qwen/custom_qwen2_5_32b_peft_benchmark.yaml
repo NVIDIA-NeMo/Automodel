@@ -1,5 +1,11 @@
 # Based on your existing config, modified for benchmarking
 
+# To run this recipe:
+#   automodel examples/llm_finetune/qwen/custom_qwen2_5_32b_peft_benchmark.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 seed: 42
 
 # Benchmark section
@@ -88,3 +94,7 @@ optimizer:
 lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
+
+ci:
+  recipe_owner: ZhiyuLi-Nvidia
+  time: "00:30:00"

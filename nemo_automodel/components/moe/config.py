@@ -55,7 +55,7 @@ class MoEConfig:
     norm_topk_prob: bool
     router_bias: bool = False
     expert_bias: bool = False
-    expert_activation: Literal["swiglu", "quick_geglu", "relu2"] = "swiglu"
+    expert_activation: Literal["swiglu", "quick_geglu", "geglu", "relu2"] = "swiglu"
     activation_alpha: float = 1.702
     activation_limit: float = 7.0
     softmax_before_topk: bool = False
@@ -64,6 +64,12 @@ class MoEConfig:
     shared_expert_inter_dim: int | None = None
     shared_expert_activation: str = "swiglu"  # Activation for shared experts ("swiglu" or "relu2")
     force_e_score_correction_bias: bool = False  # Force creation of e_score_correction_bias buffer
+    moe_latent_size: int | None = None
+
+    @property
+    def expert_dim(self) -> int:
+        """Dimension used for expert projections (latent size when set, otherwise model dim)."""
+        return self.moe_latent_size if self.moe_latent_size is not None else self.dim
 
     def __post_init__(self):
         if isinstance(self.dtype, str):

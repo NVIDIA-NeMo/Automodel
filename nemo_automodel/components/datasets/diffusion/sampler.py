@@ -18,9 +18,9 @@ from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import Sampler
 
-from .text_to_image_dataset import TextToImageDataset
+from .base_dataset import BaseMultiresolutionDataset
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ class SequentialBucketSampler(Sampler[List[int]]):
 
     def __init__(
         self,
-        dataset: TextToImageDataset,
+        dataset: BaseMultiresolutionDataset,
         base_batch_size: int = 32,
         base_resolution: Tuple[int, int] = (512, 512),
         drop_last: bool = True,
@@ -54,7 +54,7 @@ class SequentialBucketSampler(Sampler[List[int]]):
     ):
         """
         Args:
-            dataset: TextToImageDataset
+            dataset: BaseMultiresolutionDataset (or any subclass)
             base_batch_size: Batch size (fixed if dynamic_batch_size=False,
                             or base for scaling if dynamic_batch_size=True)
             base_resolution: Reference resolution for batch size scaling
@@ -77,6 +77,8 @@ class SequentialBucketSampler(Sampler[List[int]]):
         self.dynamic_batch_size = dynamic_batch_size
         self.seed = seed
         self.epoch = 0
+        self._batches_yielded = 0
+        self._batches_to_skip = 0
 
         # Handle Distributed Training (DDP)
         if num_replicas is None:
@@ -143,6 +145,18 @@ class SequentialBucketSampler(Sampler[List[int]]):
         """Crucial for reproducibility and different shuffles per epoch."""
         self.epoch = epoch
 
+    def state_dict(self) -> Dict:
+        """Return sampler state for mid-epoch checkpointing."""
+        return {
+            "epoch": self.epoch,
+            "batches_yielded": self._batches_yielded,
+        }
+
+    def load_state_dict(self, state_dict: Dict) -> None:
+        """Restore sampler state; the next __iter__ will skip already-yielded batches."""
+        self.epoch = state_dict["epoch"]
+        self._batches_to_skip = state_dict["batches_yielded"]
+
     def __iter__(self) -> Iterator[List[int]]:
         # Deterministic generator - SAME seed across all ranks
         g = torch.Generator()
@@ -153,6 +167,10 @@ class SequentialBucketSampler(Sampler[List[int]]):
         if self.shuffle_buckets:
             perm = torch.randperm(len(current_bucket_keys), generator=g).tolist()
             current_bucket_keys = [current_bucket_keys[i] for i in perm]
+
+        self._batches_yielded = 0
+        batches_to_skip = self._batches_to_skip
+        self._batches_to_skip = 0
 
         # 2. Iterate Buckets
         for key in current_bucket_keys:
@@ -170,8 +188,12 @@ class SequentialBucketSampler(Sampler[List[int]]):
             total_size = math.ceil(len(indices) / self.num_replicas) * self.num_replicas
             padding_size = total_size - len(indices)
             if padding_size > 0:
-                # Pad by repeating indices from the beginning
-                indices = indices + indices[:padding_size]
+                # Pad by cycling through indices to reach the required size.
+                # Simple slicing (indices[:padding_size]) fails when
+                # padding_size > len(indices), producing fewer elements than
+                # needed and causing uneven per-rank splits.
+                padding = [indices[i % len(indices)] for i in range(padding_size)]
+                indices = indices + padding
 
             # 5. DDP Splitting: Subsample indices for this rank
             indices = indices[self.rank :: self.num_replicas]
@@ -186,6 +208,11 @@ class SequentialBucketSampler(Sampler[List[int]]):
                 if not batch:
                     continue
 
+                if batches_to_skip > 0:
+                    batches_to_skip -= 1
+                    continue
+
+                self._batches_yielded += 1
                 yield batch
 
     def __len__(self) -> int:
@@ -222,103 +249,3 @@ class SequentialBucketSampler(Sampler[List[int]]):
             running_count += num_batches
 
         return {}
-
-
-def collate_fn_production(batch: List[Dict]) -> Dict:
-    """Production collate function with verification."""
-    # Verify all samples have same resolution
-    resolutions = [tuple(item["crop_resolution"].tolist()) for item in batch]
-    assert len(set(resolutions)) == 1, f"Mixed resolutions in batch: {set(resolutions)}"
-
-    # Stack tensors
-    latents = torch.stack([item["latent"] for item in batch])
-    crop_resolutions = torch.stack([item["crop_resolution"] for item in batch])
-    original_resolutions = torch.stack([item["original_resolution"] for item in batch])
-    crop_offsets = torch.stack([item["crop_offset"] for item in batch])
-
-    # Collect metadata
-    prompts = [item["prompt"] for item in batch]
-    image_paths = [item["image_path"] for item in batch]
-    bucket_ids = [item["bucket_id"] for item in batch]
-    aspect_ratios = [item["aspect_ratio"] for item in batch]
-
-    output = {
-        "latent": latents,
-        "crop_resolution": crop_resolutions,
-        "original_resolution": original_resolutions,
-        "crop_offset": crop_offsets,
-        "prompt": prompts,
-        "image_path": image_paths,
-        "bucket_id": bucket_ids,
-        "aspect_ratio": aspect_ratios,
-    }
-
-    # Handle text encodings
-    if "clip_hidden" in batch[0]:
-        output["clip_hidden"] = torch.stack([item["clip_hidden"] for item in batch])
-        output["pooled_prompt_embeds"] = torch.stack([item["pooled_prompt_embeds"] for item in batch])
-        output["prompt_embeds"] = torch.stack([item["prompt_embeds"] for item in batch])
-    else:
-        output["clip_tokens"] = torch.stack([item["clip_tokens"] for item in batch])
-        output["t5_tokens"] = torch.stack([item["t5_tokens"] for item in batch])
-
-    return output
-
-
-def build_multiresolution_dataloader(
-    *,
-    dataset: TextToImageDataset,
-    base_batch_size: int,
-    dp_rank: int,
-    dp_world_size: int,
-    base_resolution: Tuple[int, int] = (512, 512),
-    drop_last: bool = True,
-    shuffle: bool = True,
-    dynamic_batch_size: bool = False,
-    num_workers: int = 4,
-    pin_memory: bool = True,
-    prefetch_factor: int = 2,
-) -> Tuple[DataLoader, SequentialBucketSampler]:
-    """
-    Build production dataloader with sequential bucket iteration and distributed training support.
-
-    Args:
-        dataset: TextToImageDataset instance
-        base_batch_size: Batch size (fixed, or base for scaling if dynamic_batch_size=True)
-        dp_rank: Rank of current process in data parallel group
-        dp_world_size: Total number of processes in data parallel group
-        base_resolution: Reference resolution (only used if dynamic_batch_size=True)
-        drop_last: Drop incomplete batches
-        shuffle: Shuffle bucket order and samples within buckets each epoch
-        dynamic_batch_size: If True, scale batch size based on resolution.
-                           If False (default), use base_batch_size for all buckets.
-        num_workers: Number of data loading workers
-        pin_memory: Pin memory for faster GPU transfer
-        prefetch_factor: How many batches to prefetch per worker
-
-    Returns:
-        Tuple of (DataLoader, SequentialBucketSampler) for production training
-    """
-    sampler = SequentialBucketSampler(
-        dataset,
-        base_batch_size=base_batch_size,
-        base_resolution=base_resolution,
-        drop_last=drop_last,
-        shuffle_buckets=shuffle,
-        shuffle_within_bucket=shuffle,
-        dynamic_batch_size=dynamic_batch_size,
-        num_replicas=dp_world_size,
-        rank=dp_rank,
-    )
-
-    dataloader = DataLoader(
-        dataset,
-        batch_sampler=sampler,
-        collate_fn=collate_fn_production,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        persistent_workers=num_workers > 0,  # Keep workers alive between epochs
-    )
-
-    return dataloader, sampler

@@ -2,12 +2,12 @@ model:
   pretrained_model_name_or_path: "black-forest-labs/FLUX.1-dev"
   mode: "pretrain"
   cache_dir: null
+  attention_backend: "flash"
 
   pipeline_spec:
     transformer_cls: "FluxTransformer2DModel"
     subfolder: "transformer"
     load_full_pipeline: false
-    enable_gradient_checkpointing: false
 
 optim:
   learning_rate: 2e-5
@@ -22,7 +22,7 @@ lr_scheduler:
   min_lr: 1e-6
 
 fsdp:
-  dp_size: 32
+  dp_size: 8
   tp_size: 1
   cp_size: 1
   pp_size: 1
@@ -51,17 +51,19 @@ flow_matching:
 
 step_scheduler:
   num_epochs: 500000
-  local_batch_size: 2
-  global_batch_size: 64
+  local_batch_size: 1
+  global_batch_size: 8
   ckpt_every_steps: 1000
   log_every: 1
+  # max_steps: null  # Set to limit training to a specific number of steps
+  # save_checkpoint_every_epoch: true  # Set to false to disable epoch-boundary checkpoints
 
 data:
   dataloader:
-    _target_: nemo_automodel.components.datasets.diffusion.build_flux_multiresolution_dataloader
+    _target_: nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader
     cache_dir: PATH_TO_YOUR_DATA
     train_text_encoder: false
-    num_workers: 1
+    num_workers: 2
     # Supported resolutions include [256x256], [512x512], and [1024x1024].
     # While a 1:1 aspect ratio is currently used as a proxy for the closest image size,
     # the implementation is designed to support multiple aspect ratios.
@@ -73,8 +75,9 @@ data:
 checkpoint:
   enabled: true
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
-  model_save_format: torch_save
-  save_consolidated: false
+  model_save_format: safetensors
+  save_consolidated: true
+  diffusers_compatible: true
   restore_from:
 
 wandb:

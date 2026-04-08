@@ -37,6 +37,7 @@ from nemo_automodel._transformers.utils import apply_qwen3_omni_config_patch
 
 apply_qwen3_omni_config_patch()
 
+import nemo_automodel.components.checkpoint.utils as checkpoint_utils
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
@@ -71,10 +72,10 @@ def _filter_meta_device_from_init_context(contexts):
     return [c for c in contexts if not (isinstance(c, torch.device) and getattr(c, "type", None) == "meta")]
 
 
-def _patched_get_init_context(cls, dtype, is_quantized, _is_ds_init_called):
+def _patched_get_init_context(cls, *args, **kwargs):
     """Wrapper around PreTrainedModel.get_init_context that strips meta device when requested."""
     original = _patched_get_init_context.__wrapped__
-    contexts = original(cls, dtype, is_quantized, _is_ds_init_called)
+    contexts = original(cls, *args, **kwargs)
     if _get_hf_meta_device_disabled():
         return _filter_meta_device_from_init_context(contexts)
     return contexts
@@ -164,6 +165,24 @@ def _is_config_compatible_with_custom_model(arch_name: str, config) -> bool:
     return True
 
 
+def _resolve_custom_model_cls_for_config(config):
+    """Resolve the custom model class for *config*, if the config is compatible."""
+    architectures = get_architectures(config)
+    if not architectures:
+        return None
+
+    arch_name = architectures[0]
+    if not ModelRegistry.has_custom_model(arch_name):
+        return None
+
+    # Some architecture names are shared across multiple upstream variants.
+    # Screen them here before asking the registry for the custom implementation.
+    if not _is_config_compatible_with_custom_model(arch_name, config):
+        return None
+
+    return ModelRegistry.resolve_custom_model_cls(arch_name, config)
+
+
 def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
     """
     Get the HF config for the model.
@@ -172,6 +191,11 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
     trust_remote_code = kwargs.pop("trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path))
     hf_config = kwargs.get("config", None)
     if hf_config is None:
+        # Filter out nested dict kwargs before passing to AutoConfig.from_pretrained.
+        # Nested dicts (e.g. text_config={"key": val}) would replace entire sub-configs
+        # with incomplete dicts, losing all other fields. These nested overrides are
+        # instead handled by _consume_config_overrides which deep-merges them.
+        nested_kwargs = {k: kwargs.pop(k) for k in list(kwargs) if isinstance(kwargs[k], dict)}  # noqa: F841
         try:
             hf_config = AutoConfig.from_pretrained(
                 pretrained_model_name_or_path,
@@ -196,13 +220,10 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
 
 
 def get_is_hf_model(config, force_hf):
-    """
-    Resolve trust_remote_code default and determine if model is HF-based.
-    """
-    # Finally make sure flash_attention is available
-    architectures = getattr(config, "architectures", None) or []
-    is_hf_model = (not architectures or architectures[0] not in ModelRegistry.model_arch_name_to_cls) or force_hf
-    return is_hf_model
+    """Determine whether the model should use the HF (not custom) implementation."""
+    if force_hf:
+        return True
+    return _resolve_custom_model_cls_for_config(config) is None
 
 
 def _download_model_weights(hf_config, pretrained_model_name_or_path):
@@ -219,6 +240,77 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
         # `nemo_automodel.components.distributed.utils.FirstRankPerNode`.
         with dist_utils.FirstRankPerNode():
             snapshot_download(pretrained_model_name_or_path)
+
+
+def _get_model_tensor(model, name: str):
+    """Return a parameter or buffer by its fully-qualified state-dict key."""
+    try:
+        return model.get_parameter(name)
+    except (AttributeError, ValueError):
+        pass
+    try:
+        return model.get_buffer(name)
+    except (AttributeError, ValueError):
+        return None
+
+
+def _restore_loaded_model_dtype(
+    model, pretrained_model_name_or_path, hf_config, quantization_config, load_kwargs
+) -> None:
+    """Restore each loaded tensor to the exact dtype stored in the checkpoint.
+
+    Some modules allocate parameters in a wider dtype than the checkpoint.
+    HuggingFace then copies the checkpoint tensor into that existing tensor,
+    which upcasts the loaded value. We fix that by re-inspecting checkpoint
+    tensor dtypes per key and restoring each loaded parameter/buffer to the
+    dtype that was actually stored in the file.
+    """
+    if quantization_config is not None or getattr(hf_config, "quantization_config", None) is not None:
+        return
+
+    try:
+        checkpoint_dtypes = checkpoint_utils._get_checkpoint_tensor_dtypes(
+            pretrained_model_name_or_path, hf_config, load_kwargs
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to inspect checkpoint tensor dtypes for %s; leaving loaded dtypes unchanged: %s",
+            pretrained_model_name_or_path,
+            exc,
+        )
+        return
+
+    if not checkpoint_dtypes:
+        return
+
+    restored_dtype_by_tensor_id: dict[int, torch.dtype] = {}
+    restored_count = 0
+    for name, checkpoint_dtype in checkpoint_dtypes.items():
+        tensor = _get_model_tensor(model, name)
+        if tensor is None or tensor.dtype == checkpoint_dtype:
+            continue
+
+        seen_dtype = restored_dtype_by_tensor_id.get(id(tensor))
+        if seen_dtype is not None and seen_dtype != checkpoint_dtype:
+            logger.warning(
+                "Skipping conflicting checkpoint dtypes for aliased tensor %s: %s vs %s",
+                name,
+                seen_dtype,
+                checkpoint_dtype,
+            )
+            continue
+
+        try:
+            tensor.data = tensor.data.to(dtype=checkpoint_dtype)
+        except (RuntimeError, TypeError) as exc:
+            logger.warning("Failed to restore checkpoint dtype for %s to %s: %s", name, checkpoint_dtype, exc)
+            continue
+
+        restored_dtype_by_tensor_id[id(tensor)] = checkpoint_dtype
+        restored_count += 1
+
+    if restored_count > 0:
+        logger.info("Restored checkpoint dtypes for %d tensors from %s", restored_count, pretrained_model_name_or_path)
 
 
 def _init_model(
@@ -241,6 +333,7 @@ def _init_model(
     pretrained_model_name_or_path = (
         pretrained_model_name_or_path_or_config if is_pretrained_init else getattr(hf_config, "name_or_path")
     )
+    architectures = get_architectures(hf_config)
 
     # 1. if force_hf is True, use HF model class wrapped with mixin
     if force_hf:
@@ -255,6 +348,7 @@ def _init_model(
                     attn_implementation=attn_implementation,
                     **kwargs,
                 )
+            _restore_loaded_model_dtype(model, pretrained_model_name_or_path, hf_config, quantization_config, kwargs)
         else:
             model = cls._from_config_parent_class(
                 hf_config,
@@ -264,23 +358,24 @@ def _init_model(
                 **kwargs,
             )
         # Get HF model class and wrap with mixin
+        hf_model_cls = type(model)
         try:
-            hf_model_cls = cls._model_mapping[type(hf_config)]
+            if len(architectures) > 0 and architectures[0] != "NemotronHForCausalLM":
+                hf_model_cls = cls._model_mapping[type(hf_config)]
         except KeyError:
-            hf_model_cls = type(model)
+            pass  # fallback to use the model class from the model object
         model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
         return False, model
 
-    architectures = get_architectures(hf_config)
     # 2. If we have a custom model implementation available, we prioritize that over HF
-    if len(architectures) > 0 and architectures[0] in ModelRegistry.model_arch_name_to_cls:
+    model_cls = _resolve_custom_model_cls_for_config(hf_config)
+    if model_cls is not None:
         # if we are able to init the custom model, we will now download the model weights on local rank 0
         # Skip download for from_config (no pretrained path) or local paths
         if pretrained_model_name_or_path:
             _download_model_weights(hf_config, pretrained_model_name_or_path)
         logger.info(f"Using custom model implementation for {architectures[0]}")
         kwargs.pop("trust_remote_code", None)
-        model_cls = ModelRegistry.model_arch_name_to_cls[architectures[0]]
         # Treat config-related kwargs as config overrides (HF behavior) and
         # avoid forwarding them into model __init__.
         init_param_names = _get_init_param_names(model_cls)
@@ -293,7 +388,6 @@ def _init_model(
             return True, model_cls(hf_config, *model_args, **kwargs)
 
     # 3. fallback to HF model class wrapped with mixin
-
     model = None
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
@@ -306,6 +400,7 @@ def _init_model(
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
+        _restore_loaded_model_dtype(model, pretrained_model_name_or_path, hf_config, quantization_config, kwargs)
     else:
         model = cls._from_config_parent_class(
             hf_config,
@@ -315,10 +410,13 @@ def _init_model(
             **kwargs,
         )
 
+    # Get HF model class and wrap with mixin
+    hf_model_cls = type(model)
     try:
-        hf_model_cls = cls._model_mapping[type(hf_config)]
+        if len(architectures) > 0 and architectures[0] != "NemotronHForCausalLM":
+            hf_model_cls = cls._model_mapping[type(hf_config)]
     except KeyError:
-        hf_model_cls = type(model)
+        pass  # fallback to use the model class from the model object
     model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
     return False, model
 
@@ -369,7 +467,17 @@ def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str
             continue
         # Otherwise, if it looks like a config field, apply it to config.
         if k in config_keys:
-            setattr(config, k, kwargs.pop(k))
+            val = kwargs.pop(k)
+            # Deep-merge dict overrides into existing sub-config objects (e.g.
+            # text_config={"router_aux_loss_coef": 0}) instead of replacing the
+            # entire sub-config, which would lose all other fields.
+            if isinstance(val, dict):
+                existing = getattr(config, k, None)
+                if existing is not None and hasattr(existing, "to_dict"):
+                    for sub_k, sub_v in val.items():
+                        setattr(existing, sub_k, sub_v)
+                    continue
+            setattr(config, k, val)
 
 
 def _filter_kwargs_for_init(model_cls, kwargs: dict) -> dict:
@@ -391,3 +499,63 @@ def _filter_kwargs_for_init(model_cls, kwargs: dict) -> dict:
     # We pass `config` positionally.
     allowed.discard("config")
     return {k: v for k, v in kwargs.items() if k in allowed}
+
+
+def resolve_sdpa_method(
+    sdpa_method: list | None = None,
+    device_mesh=None,
+    activation_checkpointing: bool = False,
+) -> list["SDPBackend"] | None:  # noqa: F821
+    """Resolve SDPA backend list from config strings or runtime constraints.
+
+    When *sdpa_method* is provided (e.g. from YAML), string values are
+    converted to :class:`torch.nn.attention.SDPBackend` enum members.
+    Already-resolved ``SDPBackend`` values are passed through unchanged.
+    When ``None``, automatic defaults are applied based on context
+    parallelism and activation checkpointing settings.
+
+    Valid string values (case-insensitive): ``flash_attention``,
+    ``efficient_attention``, ``math``, ``cudnn_attention``.
+
+    Args:
+        sdpa_method: List of backend name strings or SDPBackend enum values,
+            or ``None`` to use automatic defaults.
+        device_mesh: Device mesh for distributed training.
+        activation_checkpointing: Whether activation checkpointing is enabled.
+
+    Returns:
+        Ordered list of :class:`SDPBackend` members, or ``None`` to use
+        PyTorch's default selection.
+    """
+    from torch.nn.attention import SDPBackend
+
+    _NAME_TO_BACKEND = dict(SDPBackend.__members__)
+
+    if sdpa_method is not None:
+        backends = []
+        for entry in sdpa_method:
+            if isinstance(entry, str):
+                key = entry.upper()
+                if key not in _NAME_TO_BACKEND:
+                    raise ValueError(f"Unknown SDPA backend '{entry}'. Valid values: {sorted(_NAME_TO_BACKEND.keys())}")
+                backends.append(_NAME_TO_BACKEND[key])
+            else:
+                backends.append(entry)
+        return backends
+
+    # Auto-select based on runtime constraints
+    cp_size = 1
+    if device_mesh is not None and "cp" in device_mesh.mesh_dim_names:
+        cp_size = device_mesh["cp"].size()
+
+    if cp_size > 1:
+        # CP with DTensor only supports flash and efficient backends;
+        # MATH is not compatible with DTensor.
+        return [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+    elif activation_checkpointing:
+        # For activation checkpointing, disable cudnn SDPA backend because
+        # it may not be selected during recomputation, causing:
+        # "Recomputed values have different metadata than during forward pass."
+        return [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+
+    return None

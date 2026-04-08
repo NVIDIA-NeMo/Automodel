@@ -14,9 +14,15 @@
 
 
 
+# To run this recipe:
+#   automodel examples/llm_finetune/baichuan/baichuan_2_7b_squad.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 64
-  local_batch_size: 8
+  local_batch_size: 1
   ckpt_every_steps: 50
   val_every_steps: 50  # will run every x number of gradient steps
   max_steps: 100
@@ -34,7 +40,12 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: baichuan-inc/Baichuan2-7B-Chat
   trust_remote_code: true
-  
+
+tokenizer:
+  _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: baichuan-inc/Baichuan2-7B-Chat
+  trust_remote_code: true
+
 # torch.compile configuration
 compile:
   enabled: false
@@ -88,9 +99,21 @@ lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
 
+ci:
+  recipe_owner: adil-a
+  time: "00:45:00"
+  checkpoint_robustness:
+    hf_kl_threshold: 5e-3
+    distributed.tp_size: 2
+    cross_tp_size: 2
+    cross_tp_kl_threshold: 5e-3
+    tokenizer_name: baichuan-inc/Baichuan2-7B-Chat
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500
+
 # Uncomment and configure for W&B logging
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>

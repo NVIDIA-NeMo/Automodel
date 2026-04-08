@@ -43,6 +43,7 @@ except ImportError:
 
 from nemo_automodel.components.checkpoint.checkpointing import save_config
 from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
+from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.garbage_collection import GarbageCollection
 from nemo_automodel.components.training.rng import StatefulRNG
@@ -351,9 +352,27 @@ class BaseRecipe:
             # Unwrap DDP if present
             if isinstance(unwrapped_model, DistributedDataParallel):
                 unwrapped_model = unwrapped_model.module
-            unwrapped_model.save_pretrained(
-                save_directory=path, checkpointer=self.checkpointer, tokenizer=tokenizer, peft_config=self.peft_config
-            )
+            # Models with HFCheckpointingMixin route save_pretrained through checkpointer.save_model (DCP).
+            # Models without it (e.g. diffusers) would use their native save_pretrained which fails on
+            # FSDP2-sharded DTensors, so fall back to checkpointer.save_model directly.
+            if hasattr(unwrapped_model, "save_pretrained") and hasattr(unwrapped_model.save_pretrained, "__func__"):
+                from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+
+                if isinstance(unwrapped_model, HFCheckpointingMixin):
+                    unwrapped_model.save_pretrained(
+                        save_directory=path,
+                        checkpointer=self.checkpointer,
+                        tokenizer=tokenizer,
+                        peft_config=self.peft_config,
+                    )
+                else:
+                    self.checkpointer.save_model(
+                        model=unwrapped_model, weights_path=path, peft_config=self.peft_config, tokenizer=tokenizer
+                    )
+            else:
+                self.checkpointer.save_model(
+                    model=unwrapped_model, weights_path=path, peft_config=self.peft_config, tokenizer=tokenizer
+                )
 
         # Sync before checkpointing for Dion
         optimizers = optimizer if isinstance(optimizer, list) else [optimizer]
@@ -687,9 +706,10 @@ class BaseRecipe:
     def _get_dp_group(self, include_cp: bool = False):
         if not self.device_mesh:
             return None
+
         if include_cp and self.device_mesh["cp"].size() > 1:
-            return self.device_mesh["dp_cp"].get_group()
-        return self.device_mesh["dp"].get_group()
+            return get_flat_mesh(self.device_mesh, "dp_cp").get_group()
+        return get_flat_mesh(self.device_mesh, "dp").get_group()
 
     def _get_dp_group_size(self, include_cp: bool = False):
         dp_group = self._get_dp_group(include_cp=include_cp)
@@ -712,9 +732,10 @@ class BaseRecipe:
             if dist.is_initialized():
                 return dist.get_rank()
             return 0
+
         if include_cp and self.device_mesh["cp"].size() > 1:
-            return self.device_mesh.get_local_rank("dp_cp")
-        return self.device_mesh.get_local_rank("dp")
+            return get_flat_mesh(self.device_mesh, "dp_cp").get_local_rank()
+        return get_flat_mesh(self.device_mesh, "dp").get_local_rank()
 
     def _get_tp_rank(self):
         if not self.device_mesh or self.device_mesh["tp"].size() == 1:

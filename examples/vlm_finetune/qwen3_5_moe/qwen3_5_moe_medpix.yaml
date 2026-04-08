@@ -13,6 +13,12 @@
 # limitations under the License.
 
 
+# To run this recipe:
+#   automodel examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: FinetuneRecipeForVLM
+
 step_scheduler:
   global_batch_size: 512
   local_batch_size: 8
@@ -37,7 +43,7 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
     linear: torch
-    rms_norm: torch
+    rms_norm: torch_fp32
     rope_fusion: false
     enable_deepep: false
     fake_balanced_gate: false
@@ -111,6 +117,10 @@ optimizer:
   lr: 1.0e-4
   weight_decay: 0.0
 
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 32
 
 # Uncomment and configure for W&B logging
 # wandb:

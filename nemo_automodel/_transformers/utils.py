@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from typing import Any, Optional
 
+import torch
 from transformers import AutoConfig
+
+logger = logging.getLogger(__name__)
 
 
 def _should_load_before_shard(
@@ -28,16 +32,26 @@ def _should_load_before_shard(
 ) -> bool:
     """Decide whether to load the checkpoint before FSDP/TP/EP sharding.
 
-    Load-before-shard is only safe when running single-GPU (no PP, TP, or EP),
-    a checkpoint actually needs loading, and no PEFT adapter is involved.
+    Load-before-shard is only safe when running single-GPU (no PP, TP, or EP)
+    and a checkpoint actually needs loading.
     With any model parallelism the post-shard load path must be used to avoid
     NCCL collective mismatches or key/device inconsistencies.
+
+    PEFT models skip this path and use the post-shard load so that base and
+    adapter weights load in the same way as multi-GPU.
     """
     no_pp = autopipeline is None
     no_tp = tp_size <= 1
     no_ep = ep_size <= 1
+    no_peft = peft_config is None
     need_checkpoint_load = bool(pretrained_model_name_or_path and load_base_model)
-    return no_pp and no_tp and no_ep and need_checkpoint_load and (peft_config is None)
+    result = no_pp and no_tp and no_ep and no_peft and need_checkpoint_load
+    logger.debug(
+        "[_should_load_before_shard] no_pp={} no_tp={} no_ep={} no_peft={} need_load={} -> {}".format(
+            no_pp, no_tp, no_ep, no_peft, need_checkpoint_load, result
+        )
+    )
+    return result
 
 
 def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
@@ -131,15 +145,164 @@ def _patch_special_tokens_pattern():
 
 
 def apply_cache_compatibility_patches():
-    """Apply compatibility patches for transformers cache utilities."""
+    """Apply compatibility patches for transformers cache utilities.
+
+    Patches applied here fix API removals/changes between transformers versions
+    so that both native and remote-code models can load and run.
+    """
     _patch_bytes_to_unicode()
     _patch_special_tokens_pattern()
 
-    # Alias cache API for models expecting get_usable_length
+    import transformers.cache_utils as cache_utils
+
+    # SlidingWindowCache was removed in transformers v5.x
+    if not hasattr(cache_utils, "SlidingWindowCache"):
+        cache_utils.SlidingWindowCache = cache_utils.StaticCache
+
+    # Cache.get_usable_length was removed in transformers v5.x
+    if not hasattr(cache_utils.Cache, "get_usable_length"):
+
+        def _get_usable_length(self, new_seq_length: int, layer_idx: int = 0) -> int:
+            max_length = self.get_max_cache_shape()
+            if max_length is not None and isinstance(max_length, dict):
+                max_length = max_length.get(layer_idx)
+            if max_length is not None and self.get_seq_length(layer_idx) + new_seq_length > max_length:
+                return max_length - new_seq_length
+            return self.get_seq_length(layer_idx)
+
+        cache_utils.Cache.get_usable_length = _get_usable_length
+
+    # Alias on DynamicCache as well
     from transformers.cache_utils import DynamicCache
 
     if not hasattr(DynamicCache, "get_usable_length") and hasattr(DynamicCache, "get_seq_length"):
         DynamicCache.get_usable_length = DynamicCache.get_seq_length
+
+    # DynamicCache.to_legacy_cache was removed in transformers v5.x
+    if not hasattr(DynamicCache, "to_legacy_cache"):
+
+        def _to_legacy_cache(self):
+            legacy_cache = ()
+            for layer_idx in range(len(self)):
+                legacy_cache += ((self.key_cache[layer_idx], self.value_cache[layer_idx]),)
+            return legacy_cache
+
+        DynamicCache.to_legacy_cache = _to_legacy_cache
+
+    # _tied_weights_keys changed from list to dict in transformers v5.x.
+    # Patch post_init to auto-convert list -> dict for remote-code models.
+    import transformers.modeling_utils as mu
+
+    if not getattr(mu.PreTrainedModel.post_init, "_nemo_tied_keys_patched", False):
+        _orig_post_init = mu.PreTrainedModel.post_init
+
+        def _find_embedding_source(model):
+            """Resolve the weight name of the input embedding layer.
+
+            Prefer get_input_embeddings() (explicit HF contract), fall back
+            to scanning for the first nn.Embedding in the module tree.
+            """
+            embed = model.get_input_embeddings()
+            if embed is not None:
+                for name, module in model.named_modules():
+                    if module is embed:
+                        return f"{name}.weight"
+            # Fallback: first nn.Embedding (custom models that don't
+            # override get_input_embeddings).
+            for name, module in model.named_modules():
+                if isinstance(module, torch.nn.Embedding):
+                    return f"{name}.weight"
+            return "model.embed_tokens.weight"
+
+        def _patched_post_init(self):
+            tied = getattr(self, "_tied_weights_keys", None)
+            if isinstance(tied, list):
+                source = _find_embedding_source(self)
+                self._tied_weights_keys = {k: source for k in tied}
+            return _orig_post_init(self)
+
+        mu.PreTrainedModel.post_init = _patched_post_init
+        mu.PreTrainedModel.post_init._nemo_tied_keys_patched = True  # type: ignore[attr-defined]
+
+    _patch_phi4mm_processor()
+    _patch_peft_prepare_inputs()
+
+
+def _patch_phi4mm_processor():
+    """Patch AutoProcessor.from_pretrained to fall back to the remote
+    Phi4MMProcessor when the native Phi4MultimodalProcessor fails
+    (hub processor_config.json points to native class but the tokenizer
+    lacks image_token/audio_token attributes the native processor expects).
+    """
+    import transformers.processing_utils as pu
+
+    if getattr(pu.ProcessorMixin.__dict__.get("from_pretrained"), "_nemo_phi4mm_patched", False):
+        return
+    _orig = pu.ProcessorMixin.from_pretrained.__func__
+
+    @classmethod  # type: ignore[misc]
+    def _patched(cls, pretrained_model_name_or_path, *args, **kwargs):
+        try:
+            return _orig(cls, pretrained_model_name_or_path, *args, **kwargs)
+        except AttributeError as e:
+            if "image_token" not in str(e) and "audio_token" not in str(e):
+                raise
+            import json
+
+            from huggingface_hub import hf_hub_download
+            from transformers import AutoTokenizer
+            from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+            kwargs.pop("trust_remote_code", None)
+            repo = pretrained_model_name_or_path
+
+            ProcessorCls = get_class_from_dynamic_module("processing_phi4mm.Phi4MMProcessor", repo)
+            ImageProcCls = get_class_from_dynamic_module("processing_phi4mm.Phi4MMImageProcessor", repo)
+            AudioProcCls = get_class_from_dynamic_module("processing_phi4mm.Phi4MMAudioFeatureExtractor", repo)
+
+            pp_path = hf_hub_download(repo, "preprocessor_config.json")
+            with open(pp_path) as f:
+                pp_cfg = json.load(f)
+
+            return ProcessorCls(
+                ImageProcCls(dynamic_hd=pp_cfg.get("dynamic_hd", 36)),
+                AudioProcCls(
+                    audio_compression_rate=pp_cfg.get("audio_compression_rate", 8),
+                    audio_downsample_rate=pp_cfg.get("audio_downsample_rate", 1),
+                    audio_feat_stride=pp_cfg.get("audio_feat_stride", 1),
+                ),
+                AutoTokenizer.from_pretrained(repo, trust_remote_code=True),
+            )
+
+    _patched._nemo_phi4mm_patched = True  # type: ignore[attr-defined]
+    pu.ProcessorMixin.from_pretrained = _patched
+
+
+def _patch_peft_prepare_inputs():
+    """Patch PeftModelForCausalLM.__init__ to handle models whose inner
+    backbone lacks prepare_inputs_for_generation (e.g. Phi4MM applies PEFT
+    to the inner Phi4MMModel, not the outer ForCausalLM).
+    """
+    try:
+        import peft.peft_model as pm
+
+        if getattr(pm.PeftModelForCausalLM.__init__, "_nemo_peft_patched", False):
+            return
+        _orig = pm.PeftModelForCausalLM.__init__
+
+        def _patched(self, model, peft_config, adapter_name="default", **kwargs):
+            try:
+                _orig(self, model, peft_config, adapter_name=adapter_name, **kwargs)
+            except AttributeError as e:
+                if "prepare_inputs_for_generation" not in str(e):
+                    raise
+                model.prepare_inputs_for_generation = lambda *a, **kw: {}
+                _orig(self, model, peft_config, adapter_name=adapter_name, **kwargs)
+
+        _patched._nemo_peft_patched = True  # type: ignore[attr-defined]
+        pm.PeftModelForCausalLM.__init__ = _patched
+    except ImportError:
+        pass
 
     # ---------------------------------------------------------------------
     # DTensor/TP compatibility patches

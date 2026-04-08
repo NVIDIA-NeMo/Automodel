@@ -13,9 +13,12 @@
 # limitations under the License.
 
 
-# To run this recipe, please use the following command:
-# python examples/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag_peft.yaml
 
+# To run this recipe:
+#   automodel examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag_peft.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 8
@@ -36,10 +39,9 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
-  trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    rms_norm: torch
+    rms_norm: torch_fp32
     linear: torch
 
 # torch.compile configuration
@@ -103,8 +105,21 @@ lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
 
+ci:
+  recipe_owner: adil-a
+  time: "00:15:00"
+  checkpoint_robustness:
+    hf_kl_threshold: 1e-1
+    experts_implementation: grouped_mm
+    trust_remote_code: true
+    tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    distributed.ep_size: 8
+    no_check_resume: true
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500
+
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>

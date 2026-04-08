@@ -19,13 +19,19 @@ step_scheduler:
   ckpt_every_steps: 1000
   num_epochs: 100
   log_every: 2
+  # max_steps: null  # Set to limit training to a specific number of steps
+  # save_checkpoint_every_epoch: true  # Set to false to disable epoch-boundary checkpoints
 
 data:
   dataloader:
-    _target_: nemo_automodel.components.datasets.diffusion.build_dataloader
-    meta_folder: PATH_TO_YOUR_DATA
+    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
+    cache_dir: PATH_TO_YOUR_DATA
+    model_type: wan
+    base_resolution: [512, 512]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
     num_workers: 2
-    device: cpu
 
 
 optim:
@@ -66,6 +72,7 @@ fsdp:
 checkpoint:
   enabled: true
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
-  model_save_format: torch_save
-  save_consolidated: false
+  model_save_format: safetensors
+  save_consolidated: true
+  diffusers_compatible: true
   restore_from: null

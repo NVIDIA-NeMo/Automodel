@@ -24,11 +24,17 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
-# Static mapping: architecture name → (module_path, class_name).
+# Static mapping: architecture name → (module_path, class_name[, tags]).
 # Analogous to HuggingFace transformers' MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.
 # Models are loaded lazily on first access rather than imported at startup.
+# Optional third element is a set of tags (e.g. {"retrieval"}) used by
+# downstream code to classify model archs without importing them.
 MODEL_ARCH_MAPPING = OrderedDict(
     [
+        (
+            "BaichuanForCausalLM",
+            ("nemo_automodel.components.models.baichuan.model", "BaichuanForCausalLM"),
+        ),
         (
             "DeepseekV3ForCausalLM",
             ("nemo_automodel.components.models.deepseek_v3.model", "DeepseekV3ForCausalLM"),
@@ -46,8 +52,20 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.glm4_moe_lite.model", "Glm4MoeLiteForCausalLM"),
         ),
         (
+            "GlmMoeDsaForCausalLM",
+            ("nemo_automodel.components.models.glm_moe_dsa.model", "GlmMoeDsaForCausalLM"),
+        ),
+        (
+            "Gemma4ForConditionalGeneration",
+            ("nemo_automodel.components.models.gemma4_moe.model", "Gemma4ForConditionalGeneration"),
+        ),
+        (
             "GptOssForCausalLM",
             ("nemo_automodel.components.models.gpt_oss.model", "GptOssForCausalLM"),
+        ),
+        (
+            "KimiK25ForConditionalGeneration",
+            ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLForConditionalGeneration"),
         ),
         (
             "KimiK25VLForConditionalGeneration",
@@ -62,11 +80,12 @@ MODEL_ARCH_MAPPING = OrderedDict(
             (
                 "nemo_automodel.components.models.llama_bidirectional.model",
                 "LlamaBidirectionalForSequenceClassification",
+                {"retrieval"},
             ),
         ),
         (
             "LlamaBidirectionalModel",
-            ("nemo_automodel.components.models.llama_bidirectional.model", "LlamaBidirectionalModel"),
+            ("nemo_automodel.components.models.llama_bidirectional.model", "LlamaBidirectionalModel", {"retrieval"}),
         ),
         (
             "LlamaForCausalLM",
@@ -79,6 +98,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "Ministral3ForCausalLM",
             ("nemo_automodel.components.models.mistral3.model", "Ministral3ForCausalLM"),
+        ),
+        (
+            "Mistral4ForCausalLM",
+            ("nemo_automodel.components.models.mistral4.model", "Mistral4ForCausalLM"),
+        ),
+        (
+            "Mistral3ForConditionalGeneration",
+            ("nemo_automodel.components.models.mistral4.model", "Mistral3ForConditionalGeneration"),
         ),
         (
             "NemotronHForCausalLM",
@@ -123,6 +150,34 @@ MODEL_ARCH_MAPPING = OrderedDict(
 )
 
 
+# Custom model_type → config class for models that have auto_map in their
+# checkpoint config.json.  Registered eagerly with AutoConfig so that
+# AutoConfig.from_pretrained can resolve them without trust_remote_code.
+_CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
+    "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
+    "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
+    "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
+    "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
+}
+
+
+def _register_custom_configs() -> None:
+    from transformers import AutoConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    for model_type, (module_path, cls_name) in _CUSTOM_CONFIG_REGISTRATIONS.items():
+        if model_type not in CONFIG_MAPPING:
+            try:
+                mod = importlib.import_module(module_path)
+                cfg_cls = getattr(mod, cls_name)
+                AutoConfig.register(model_type, cfg_cls)
+            except Exception:
+                logger.debug("Failed to register config for model_type=%s", model_type, exc_info=True)
+
+
+_register_custom_configs()
+
+
 class _LazyArchMapping:
     """Lazy-loading mapping from architecture name to model class.
 
@@ -131,8 +186,15 @@ class _LazyArchMapping:
     can be added at runtime via ``register``.
     """
 
-    def __init__(self, auto_map: Union[OrderedDict, Dict[str, Tuple[str, str]], None] = None):
-        self._auto_map: Dict[str, Tuple[str, str]] = OrderedDict(auto_map or {})
+    def __init__(self, auto_map: Union[OrderedDict, Dict[str, tuple], None] = None):
+        # Entries may be (module_path, class_name) or (module_path, class_name, tags).
+        # Strip the optional tags and store them separately.
+        self._auto_map: Dict[str, Tuple[str, str]] = OrderedDict()
+        self._tags: Dict[str, set] = {}
+        for key, value in (auto_map or {}).items():
+            self._auto_map[key] = (value[0], value[1])
+            if len(value) > 2:
+                self._tags[key] = value[2]
         self._loaded: Dict[str, Type[nn.Module]] = {}
         self._extra: Dict[str, Type[nn.Module]] = {}
         self._modules: Dict[str, object] = {}
@@ -176,6 +238,14 @@ class _LazyArchMapping:
             raise ValueError(f"Duplicated model implementation for {key}")
         self._extra[key] = value
 
+    def has_tag(self, key: str, tag: str) -> bool:
+        """Return ``True`` if *key* was registered with *tag*."""
+        return tag in self._tags.get(key, set())
+
+    def keys_with_tag(self, tag: str) -> set:
+        """Return all architecture names that have *tag*."""
+        return {k for k, tags in self._tags.items() if tag in tags}
+
     def keys(self):
         return set(self._auto_map.keys()) | set(self._extra.keys())
 
@@ -189,10 +259,12 @@ class _LazyArchMapping:
 @dataclass
 class _ModelRegistry:
     model_arch_name_to_cls: _LazyArchMapping = field(default=None)
+    _retrieval_archs: set = field(default_factory=set)
 
     def __post_init__(self):
         if self.model_arch_name_to_cls is None:
             self.model_arch_name_to_cls = _LazyArchMapping(MODEL_ARCH_MAPPING)
+        self._retrieval_archs = self.model_arch_name_to_cls.keys_with_tag("retrieval")
 
     @property
     def supported_models(self):
@@ -200,6 +272,37 @@ class _ModelRegistry:
 
     def get_model_cls_from_model_arch(self, model_arch: str) -> Type[nn.Module]:
         return self.model_arch_name_to_cls[model_arch]
+
+    def has_custom_model(self, arch_name: str) -> bool:
+        """Return ``True`` if *arch_name* has a custom (non-HF) implementation."""
+        return arch_name in self.model_arch_name_to_cls
+
+    def has_retrieval_model(self, arch_name: str) -> bool:
+        """Return ``True`` if *arch_name* is a registered retrieval/encoder architecture."""
+        return arch_name in self._retrieval_archs
+
+    def register_retrieval(self, arch_name: str) -> None:
+        """Mark *arch_name* as a retrieval/encoder architecture."""
+        self._retrieval_archs.add(arch_name)
+
+    def resolve_custom_model_cls(self, architecture: str, config) -> Union[Type[nn.Module], None]:
+        """Return the custom model class if it exists and supports *config*, else ``None``.
+
+        Custom model classes may define a ``supports_config(config)`` classmethod
+        to opt out for specific HF configs (e.g. a Mistral3 VLM with a dense
+        Ministral3 text backbone instead of the expected Mistral4 MoE+MLA).
+        """
+        if architecture not in self.model_arch_name_to_cls:
+            return None
+        model_cls = self.model_arch_name_to_cls[architecture]
+        if hasattr(model_cls, "supports_config") and not model_cls.supports_config(config):
+            logger.info(
+                "Custom model %s does not support config %s, falling back to HF",
+                model_cls.__name__,
+                type(config).__name__,
+            )
+            return None
+        return model_cls
 
     def register(self, arch_name: str, model_cls: Type[nn.Module], exist_ok: bool = False) -> None:
         """Register a custom model class for a given architecture name."""

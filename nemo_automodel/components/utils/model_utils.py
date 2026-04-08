@@ -30,6 +30,16 @@ import torch.nn as nn
 logger = logging.getLogger(__name__)
 
 
+def _get_forward_signature(model: nn.Module) -> inspect.Signature | None:
+    """Best-effort retrieval of ``model.forward`` signature."""
+    if not callable(getattr(model, "forward", None)):
+        return None
+    try:
+        return inspect.signature(model.forward)
+    except (ValueError, TypeError):
+        return None
+
+
 def _supports_logits_to_keep(model: nn.Module) -> bool:
     """
     Check if the model supports logits_to_keep.
@@ -40,10 +50,8 @@ def _supports_logits_to_keep(model: nn.Module) -> bool:
     Returns:
         bool: True if the model supports logits_to_keep, False otherwise.
     """
-    if callable(getattr(model, "forward", None)):
-        return "logits_to_keep" in set(inspect.signature(model.forward).parameters.keys())
-    else:
-        return False
+    sig = _get_forward_signature(model)
+    return sig is not None and "logits_to_keep" in sig.parameters
 
 
 def _supports_seq_lens(model: nn.Module) -> bool:
@@ -56,21 +64,40 @@ def _supports_seq_lens(model: nn.Module) -> bool:
 
     Returns False otherwise (passing seq_lens would cause "unexpected kwarg" error).
     """
-    if not callable(getattr(model, "forward", None)):
+    sig = _get_forward_signature(model)
+    if sig is None:
         return False
-    try:
-        sig = inspect.signature(model.forward)
-        params = sig.parameters
-        # Check for explicit seq_lens parameter
-        if "seq_lens" in params:
+    params = sig.parameters
+    # Check for explicit seq_lens parameter
+    if "seq_lens" in params:
+        return True
+    # Check for **kwargs (VAR_KEYWORD)
+    for param in params.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
             return True
-        # Check for **kwargs (VAR_KEYWORD)
-        for param in params.values():
-            if param.kind == inspect.Parameter.VAR_KEYWORD:
-                return True
-        return False
-    except (ValueError, TypeError):
-        return False
+    return False
+
+
+def filter_forward_kwargs(model: nn.Module, kwargs: dict) -> dict:
+    """Drop kwargs that ``model.forward`` does not accept.
+
+    If the model exposes ``**kwargs`` or its signature cannot be inspected, the
+    input kwargs are returned unchanged. The original dict is never mutated.
+    """
+    sig = _get_forward_signature(model)
+    if sig is None:
+        return dict(kwargs)
+
+    params = sig.parameters
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+        return dict(kwargs)
+
+    allowed = set(params.keys())
+    filtered = {key: value for key, value in kwargs.items() if key in allowed}
+    dropped = sorted(set(kwargs) - set(filtered))
+    if dropped:
+        logger.debug("Dropping unsupported forward kwargs for %s: %s", type(model).__name__, dropped)
+    return filtered
 
 
 def _get_logical_numel(param) -> int:
@@ -243,11 +270,80 @@ def apply_parameter_freezing(model, freeze_config):
 
     # Freeze audio tower
     if freeze_audio_tower:
-        _freeze_module_by_attribute_and_patterns(model, "audio_tower", ["audio", "audio_encoder"])
+        _freeze_module_by_attribute_and_patterns(model, "audio_tower", ["audio", "audio_encoder", "speech"])
 
     # Freeze language model backbone
     if freeze_language_model:
         _freeze_module_by_attribute_and_patterns(model, "language_model", ["language", "text", "llm"])
+
+    # Phi4MM: cast internal fp32 LoRA adapters to bf16 for FSDP2 compatibility,
+    # and disable KV cache (remote code uses legacy DynamicCache.key_cache
+    # attribute removed in transformers v5.x).
+    model_type = getattr(getattr(model, "config", None), "model_type", "")
+    if model_type == "phi4mm":
+        cast_mixed_dtype_params_to_bf16(model)
+        if hasattr(model, "config"):
+            model.config.use_cache = False
+
+
+def freeze_unused_kv_sharing_params(model):
+    """Freeze dead K/V parameters in KV-shared layers.
+
+    Models like Gemma4 E2B/E4B use KV-sharing where the last N layers reuse
+    key/value states from earlier layers. The ``k_proj``, ``v_proj``,
+    ``k_norm``, and ``v_norm`` modules still exist in those shared layers but
+    are never used during forward. Their parameters therefore receive no
+    gradients, yet the optimizer still tracks them. On checkpoint resume the
+    distributed checkpoint framework expects optimizer state for every
+    parameter the optimizer was created with, but zero-gradient params may
+    have been excluded from the saved state — causing a ``RuntimeError``.
+
+    Calling this function **before** optimizer creation sets
+    ``requires_grad=False`` on the dead parameters so the optimizer never
+    tracks them, keeping save and load consistent.
+
+    Args:
+        model: The model (or pipeline-parallel model part).
+    """
+    # Walk potentially nested wrappers to find the text config.
+    text_config = getattr(getattr(model, "config", None), "text_config", None)
+    if text_config is None:
+        text_config = getattr(model, "config", None)
+
+    num_kv_shared = getattr(text_config, "num_kv_shared_layers", 0)
+    num_hidden = getattr(text_config, "num_hidden_layers", 0)
+    if num_kv_shared <= 0 or num_hidden <= 0:
+        return
+
+    first_shared = num_hidden - num_kv_shared
+    dead_projections = ("k_proj", "v_proj", "k_norm", "v_norm")
+
+    frozen_count = 0
+    for name, param in model.named_parameters():
+        for layer_idx in range(first_shared, num_hidden):
+            if any(f"layers.{layer_idx}.self_attn.{proj}" in name for proj in dead_projections):
+                param.requires_grad_(False)
+                frozen_count += 1
+                break
+
+    if frozen_count > 0:
+        logger.info(
+            "Froze %d dead KV-sharing parameters in layers %d–%d (num_kv_shared_layers=%d).",
+            frozen_count,
+            first_shared,
+            num_hidden - 1,
+            num_kv_shared,
+        )
+
+
+def cast_mixed_dtype_params_to_bf16(model):
+    """Cast fp32 parameters and buffers to bf16 for FSDP2 compatibility."""
+    for p in model.parameters():
+        if p.dtype == torch.float32:
+            p.data = p.data.to(torch.bfloat16)
+    for b in model.buffers():
+        if b.dtype == torch.float32:
+            b.data = b.data.to(torch.bfloat16)
 
 
 def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, seqlens_padding_value=-1000):
@@ -316,7 +412,7 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
     """
     input_ids = input_ids.squeeze(0)
     position_ids = position_ids.squeeze(0)
-    if padding_mask is not None:
+    if isinstance(padding_mask, torch.Tensor):
         padding_mask = padding_mask.squeeze(0)
     for key, value in attn_kwargs.items():
         if isinstance(value, torch.Tensor):

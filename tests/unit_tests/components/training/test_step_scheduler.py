@@ -20,9 +20,7 @@ from nemo_automodel.components.training.step_scheduler import (
 
 
 class SizedDataLoader:
-    def __init__(
-        self, num_batches: int, global_batch_size: int = 1, local_batch_size: int = 1
-    ):
+    def __init__(self, num_batches: int, global_batch_size: int = 1, local_batch_size: int = 1):
         self.num_batches = num_batches
         # self.global_batch_size = global_batch_size
         # self.local_batch_size = local_batch_size
@@ -113,9 +111,7 @@ def test_resume(max_steps, ckpt_every_steps):
             continue
         if start_collecting:
             # record exact values; sequence starts at step ref_state['step']
-            ref_outputs.append(
-                (scheduler.step, scheduler.is_val_step, scheduler.is_ckpt_step)
-            )
+            ref_outputs.append((scheduler.step, scheduler.is_val_step, scheduler.is_ckpt_step))
 
     del scheduler
     scheduler = StepScheduler(
@@ -392,9 +388,7 @@ def test_scheduler_max_steps_priority():
         max_steps=1000,
     )
 
-    assert scheduler.num_epochs != 10, (
-        "Scheduler defaulted to 10 epochs despite max_steps being set!"
-    )
+    assert scheduler.num_epochs != 10, "Scheduler defaulted to 10 epochs despite max_steps being set!"
 
     scheduler_default = StepScheduler(
         global_batch_size=1,
@@ -404,9 +398,8 @@ def test_scheduler_max_steps_priority():
         dataloader=dataloader,
     )
 
-    assert scheduler_default.num_epochs == 10, (
-        "Should default to 10 epochs if nothing is provided"
-    )
+    assert scheduler_default.num_epochs == 10, "Should default to 10 epochs if nothing is provided"
+
 
 def test_scheduler_num_epochs_derived_from_max_steps():
     dataloader = SizedDataLoader(num_batches=10)
@@ -420,6 +413,60 @@ def test_scheduler_num_epochs_derived_from_max_steps():
     )
 
     print(scheduler.num_epochs)
-    assert scheduler.num_epochs == 2, (
-        "Derived number of epochs should be 2"
+    assert scheduler.num_epochs == 2, "Derived number of epochs should be 2"
+
+
+def test_save_checkpoint_every_epoch_false_disables_epoch_boundary_checkpoints():
+    """When save_checkpoint_every_epoch=False, epoch-end checkpoints don't trigger,
+    but last-step checkpoints still do."""
+    epoch_len = 4
+    dataloader = SizedDataLoader(num_batches=epoch_len)
+    scheduler = StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        ckpt_every_steps=1000,  # disable periodic checkpointing
+        save_checkpoint_every_epoch=False,
+        dataloader=dataloader,
+        num_epochs=100,
+        max_steps=10,
     )
+
+    ckpt_trigger_steps = []
+    for _ in scheduler.epochs:
+        for _ in scheduler:
+            if scheduler.is_ckpt_step:
+                ckpt_trigger_steps.append(scheduler.step)
+
+    # Only the last step should trigger (step 9, is_last_step=True)
+    # Epoch boundaries at steps 3 and 7 should NOT trigger
+    assert ckpt_trigger_steps == [9]
+
+    assert scheduler.step == 10
+    assert scheduler.is_ckpt_step is True
+
+
+def test_save_checkpoint_every_epoch_false_preserves_periodic_checkpoints():
+    """Periodic checkpoints still fire when save_checkpoint_every_epoch=False."""
+    epoch_len = 4
+    dataloader = SizedDataLoader(num_batches=epoch_len)
+    scheduler = StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        ckpt_every_steps=5,
+        save_checkpoint_every_epoch=False,
+        dataloader=dataloader,
+        num_epochs=100,
+        max_steps=10,
+    )
+
+    ckpt_trigger_steps = []
+    for _ in scheduler.epochs:
+        for _ in scheduler:
+            if scheduler.is_ckpt_step:
+                ckpt_trigger_steps.append(scheduler.step)
+
+    # Periodic at step 4 (step%5==4), last step at 9
+    # Epoch boundaries at 3 and 7 should NOT trigger
+    assert ckpt_trigger_steps == [4, 9]

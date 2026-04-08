@@ -416,6 +416,10 @@ def test_autoprocessor_exception_handling(caplog):
         cfg_ds = MagicMock()
         cfg_ds.instantiate.return_value = []
         cfg_ds.path_or_dataset = "test/dataset"
+        cfg_ds.get.side_effect = lambda key, default=None: {
+            "pretokenize": False, "packing": None, "max_length": None,
+            "chat_template": None, "preload_media": False,
+        }.get(key, default)
 
         cfg_dl = MagicMock()
         cfg_dl.get.return_value = None  # No custom settings
@@ -434,7 +438,6 @@ def test_autoprocessor_exception_handling(caplog):
 
 def test_autoprocessor_loads_inside_first_rank_per_node():
     """Test that processor instantiation happens inside the FirstRankPerNode context."""
-    import logging
 
     from nemo_automodel.recipes.vlm.finetune import build_dataloader
 
@@ -503,6 +506,10 @@ def test_autoprocessor_with_processor_kwargs(caplog):
         cfg_ds = MagicMock()
         cfg_ds.instantiate.return_value = []
         cfg_ds.path_or_dataset = "test/dataset"
+        cfg_ds.get.side_effect = lambda key, default=None: {
+            "pretokenize": False, "packing": None, "max_length": None,
+            "chat_template": None, "preload_media": False,
+        }.get(key, default)
 
         cfg_dl = MagicMock()
         cfg_dl.get.return_value = None  # No custom settings
@@ -516,6 +523,71 @@ def test_autoprocessor_with_processor_kwargs(caplog):
         # Verify the results
         assert processor is None
         mock_from_pretrained.assert_called_once_with("test/model", trust_remote_code=True, some_param="value")
+
+
+# -----------------------------------------------------------------------------
+# chat_template override tests for build_dataloader
+# -----------------------------------------------------------------------------
+
+
+def test_build_dataloader_chat_template_applied():
+    """chat_template in dataset config is applied to processor and not leaked to dataset target."""
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    ds_calls = []
+
+    def ds_factory(path_or_dataset, split=None):
+        ds_calls.append({"path_or_dataset": path_or_dataset, "split": split})
+        return []
+
+    class DummyProcessor:
+        def __init__(self):
+            self.chat_template = "{{ default }}"
+            self.tokenizer = SimpleNamespace(chat_template="{{ default }}")
+
+    processor = DummyProcessor()
+    cfg_ds = ConfigNode(
+        {"_target_": ds_factory, "path_or_dataset": "ds/path", "split": "train", "chat_template": "{{ custom }}"}
+    )
+    cfg_dl = MagicMock()
+    cfg_dl.get.return_value = None
+    cfg_dl.instantiate.return_value = MagicMock()
+
+    with patch("transformers.AutoProcessor.from_pretrained", return_value=processor), \
+         patch("torch.utils.data.distributed.DistributedSampler"), \
+         patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"default": MagicMock()}):
+        _, built_processor = build_dataloader(cfg_ds, cfg_dl, "model", None, None, 42, 1)
+
+    assert built_processor.chat_template == "{{ custom }}"
+    assert built_processor.tokenizer.chat_template == "{{ custom }}"
+    assert ds_calls == [{"path_or_dataset": "ds/path", "split": "train"}]
+
+
+def test_build_dataloader_no_chat_template():
+    """Without chat_template, processor template stays unchanged."""
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    def ds_factory(path_or_dataset, split=None):
+        return []
+
+    class DummyProcessor:
+        def __init__(self):
+            self.chat_template = "{{ original }}"
+            self.tokenizer = SimpleNamespace(chat_template="{{ original }}")
+
+    processor = DummyProcessor()
+    cfg_ds = ConfigNode({"_target_": ds_factory, "path_or_dataset": "ds/path", "split": "train"})
+    cfg_dl = MagicMock()
+    cfg_dl.get.return_value = None
+    cfg_dl.instantiate.return_value = MagicMock()
+
+    with patch("transformers.AutoProcessor.from_pretrained", return_value=processor), \
+         patch("torch.utils.data.distributed.DistributedSampler"), \
+         patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"default": MagicMock()}):
+        _, built_processor = build_dataloader(cfg_ds, cfg_dl, "model", None, None, 42, 1)
+
+    assert built_processor.chat_template == "{{ original }}"
+    assert built_processor.tokenizer.chat_template == "{{ original }}"
 
 
 # -----------------------------------------------------------------------------
@@ -1330,6 +1402,83 @@ class TestForwardBackwardStepPP:
         # Should log warning about mismatched images
         assert any("giving all images to first microbatch" in record.message for record in caplog.records)
 
+    def test_pp_vlm_chunking_with_image_sizes(self, pp_recipe, monkeypatch):
+        """Test VLM pixel_values chunking with image_sizes fallback (e.g., Mistral4-style)."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+        )
+
+        batch_size = 4
+        # image_sizes: [N_images, 2] — no image_grid_hws or image_grid_thw
+        image_sizes = torch.tensor([[224, 224], [224, 224], [224, 224], [224, 224]])
+        # 4D pixel_values: [N_images, C, H, W]
+        pixel_values = torch.randn(batch_size, 3, 224, 224)
+
+        batch = {
+            "labels": torch.randint(0, 100, (batch_size, 10)),
+            "input_ids": torch.randint(0, 100, (batch_size, 10)),
+            "pixel_values": pixel_values,
+            "image_sizes": image_sizes,
+        }
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=40,
+            num_batches=1,
+            is_train=True,
+        )
+
+        model = pp_recipe.model_parts[0]
+        assert model._vlm_pixel_values_chunks is None  # Cleared after step
+        assert model._vlm_image_grid_hws_chunks is None
+        assert model._vlm_chunk_idx is None
+        pp_recipe.pp.info.schedule.step.assert_called_once()
+        assert len(loss_buffer) == 1
+
+    def test_pp_vlm_chunking_4d_pixel_values(self, pp_recipe, monkeypatch):
+        """Test VLM pixel_values chunking when pixel_values is 4D [N, C, H, W]."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+        )
+
+        batch_size = 4
+        image_grid_hws = torch.tensor([[224, 224], [224, 224], [224, 224], [224, 224]])
+        # 4D pixel_values — triggers the new dim==4 chunking path
+        pixel_values = torch.randn(batch_size, 3, 224, 224)
+
+        batch = {
+            "labels": torch.randint(0, 100, (batch_size, 10)),
+            "input_ids": torch.randint(0, 100, (batch_size, 10)),
+            "pixel_values": pixel_values,
+            "image_grid_hws": image_grid_hws,
+        }
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=40,
+            num_batches=1,
+            is_train=True,
+        )
+
+        model = pp_recipe.model_parts[0]
+        assert model._vlm_pixel_values_chunks is None  # Cleared after step
+        assert model._vlm_image_grid_hws_chunks is None
+        assert model._vlm_chunk_idx is None
+        pp_recipe.pp.info.schedule.step.assert_called_once()
+        assert len(loss_buffer) == 1
+
     def test_pp_last_stage_computes_loss(self, pp_recipe, monkeypatch):
         """Test that last stage computes and buffers loss."""
 
@@ -2059,3 +2208,73 @@ def test_vlm_rope_fusion_stays_false_when_already_disabled(monkeypatch):
     trainer.setup()
 
     assert cfg.model.backend.rope_fusion is False
+
+
+# ---------------------------------------------------------------------------
+# _chunk_vlm_media tests
+# ---------------------------------------------------------------------------
+
+
+class TestChunkVlmMedia:
+    """Tests for _chunk_vlm_media PP microbatch splitting."""
+
+    def test_4d_pixel_values_simple_chunk(self):
+        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
+
+        pixel_values = torch.randn(4, 3, 56, 56)
+        image_grid = torch.tensor([[1, 2, 2]] * 4)
+        pv_chunks, ig_chunks = _chunk_vlm_media(pixel_values, image_grid, batch_size=4, n_microbatches=2)
+        assert len(pv_chunks) == 2
+        assert pv_chunks[0].shape[0] == 2
+        assert pv_chunks[1].shape[0] == 2
+
+    def test_n_images_per_sample_packed(self):
+        """Packed sequences: each batch item has variable number of images."""
+        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
+
+        # 2 batch items: first has 3 images, second has 1 image
+        # image_grid: 4 images total, each 2x2 patches = 4 patches each
+        image_grid = torch.tensor([[1, 2, 2], [1, 2, 2], [1, 2, 2], [1, 2, 2]])
+        pixel_values = torch.randn(16, 64)  # 4 images * 4 patches = 16 patches
+        n_images_per_sample = torch.tensor([3, 1])
+
+        pv_chunks, ig_chunks = _chunk_vlm_media(
+            pixel_values, image_grid, batch_size=2, n_microbatches=2,
+            n_images_per_sample=n_images_per_sample,
+        )
+        assert len(pv_chunks) == 2
+        assert ig_chunks[0].shape[0] == 3  # first batch item: 3 images
+        assert ig_chunks[1].shape[0] == 1  # second batch item: 1 image
+        assert pv_chunks[0].shape[0] == 12  # 3 images * 4 patches
+        assert pv_chunks[1].shape[0] == 4   # 1 image * 4 patches
+
+    def test_legacy_one_image_per_sample(self):
+        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
+
+        # 4 samples, 1 image each with different patch counts
+        image_grid = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 2], [1, 3, 3]])
+        patch_counts = image_grid.prod(dim=1)  # [4, 9, 4, 9] = 26 total
+        pixel_values = torch.randn(int(patch_counts.sum()), 64)
+
+        pv_chunks, ig_chunks = _chunk_vlm_media(
+            pixel_values, image_grid, batch_size=4, n_microbatches=2,
+        )
+        assert len(pv_chunks) == 2
+        assert ig_chunks[0].shape[0] == 2
+        assert ig_chunks[1].shape[0] == 2
+        assert pv_chunks[0].shape[0] == 4 + 9  # first 2 images
+        assert pv_chunks[1].shape[0] == 4 + 9  # last 2 images
+
+    def test_fallback_mismatched_images(self):
+        """When n_images != batch_size and no n_images_per_sample, all go to first mb."""
+        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
+
+        image_grid = torch.tensor([[1, 2, 2], [1, 2, 2], [1, 2, 2]])
+        pixel_values = torch.randn(12, 64)  # 3 images but batch_size=2
+
+        pv_chunks, ig_chunks = _chunk_vlm_media(
+            pixel_values, image_grid, batch_size=2, n_microbatches=2,
+        )
+        assert len(pv_chunks) == 2
+        assert pv_chunks[0].shape[0] == 12  # all in first
+        assert pv_chunks[1].shape[0] == 0   # empty
