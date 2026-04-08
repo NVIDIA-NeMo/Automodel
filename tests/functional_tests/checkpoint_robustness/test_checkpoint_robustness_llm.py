@@ -288,7 +288,9 @@ def test_checkpoint_robustness():
             if hf_device_map_auto:
                 base_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
             else:
-                base_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs).to(device)
+                base_model = _fix_meta_rotary_embeddings(
+                    AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
+                ).to(device)
             peft_model = PeftModel.from_pretrained(base_model, str(ckpt_step_dir / "model"))
             hf_logits = _get_logits(peft_model, input_ids, device)
 
