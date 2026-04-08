@@ -253,6 +253,7 @@ model-coverage/diffusion/index.md
 :caption: Recipes & E2E Examples
 guides/overview.md
 guides/llm/finetune.md
+guides/llm/finetuning-guide.md
 guides/llm/toolcalling.md
 guides/llm/knowledge-distillation.md
 guides/llm/large_moe_finetune.md
