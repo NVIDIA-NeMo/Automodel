@@ -12,100 +12,94 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Benchmarking config for Gptoss 120B Te Deepep
+
+# Benchmarking config for Kimi-K2.5-VL LoRA r2 (text backbone only)
 
 # To run this recipe:
-#   automodel examples/benchmark/configs/gptoss_120b_te_deepep.yaml --nproc-per-node 8
+#   automodel examples/benchmark/configs/peft/kimi25vl_lora.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 
+# NOTE: May need benchmark.py fix to handle VLM composite config
 seed: 1234
-
 benchmark:
   warmup_steps: 10
-  peak_tflops: 989  # H100 peak TFLOPs
+  peak_tflops: 989
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
-  num_nodes: 8
-
+  num_nodes: 16
 step_scheduler:
   gc_every_steps: 10
   global_batch_size: 512
-  local_batch_size: 1
+  local_batch_size: 4
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
   max_steps: 30
-
 distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 1
-  ep_size: 64
-
+  pp_size: 4
+  ep_size: 32
   sequence_parallel: false
-  activation_checkpointing: false
-
+  activation_checkpointing: true
   pipeline:
     pp_schedule: interleaved1f1b
-    pp_microbatch_size: 2
+    pp_microbatch_size: 1
     round_virtual_stages_to_pp_multiple: down
     scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
     layers_per_stage: 2
-
   moe:
     reshard_after_forward: false
-
+    wrap_outer_model: false
 dist_env:
   backend: nccl
   timeout_minutes: 10
-
 model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: openai/gpt-oss-120b
+    pretrained_model_name_or_path: moonshotai/Kimi-K2.5
+  trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
     rms_norm: te
-    rope_fusion: true
-    experts: torch_mm
-    dispatcher: hybridep
-    dispatcher_num_sms: 64
+    rope_fusion: false
+    experts: gmm
+    dispatcher: deepep
     fake_balanced_gate: true
-    enable_hf_state_dict_adapter: false
+    enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
-
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: ["*"]
+  dim: 32
+  alpha: 32
+  dropout: 0.0
+  moe_rank_scaling: true
 checkpoint:
   enabled: false
-
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
   fp32_upcast: false
-
 dataset:
   _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
   seq_len: 4096
   num_samples: 100000
-
 dataloader:
-  batch_size: null  # Dataset already yields batches
+  batch_size: null
   _target_: torch.utils.data.DataLoader
   num_workers: 0
-
 optimizer:
   _target_: torch.optim.Adam
-  betas:
-  - 0.9
-  - 0.999
+  betas: [0.9, 0.999]
   eps: 1e-8
   lr: 0.0001
   weight_decay: 0
-
