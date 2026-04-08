@@ -101,6 +101,7 @@ optimizer:
   # min_lr: 1.0e-5
 
 ci:
+  recipe_owner: akoumpa
   vllm_deploy: true
 
 # Uncomment and configure for W&B logging
@@ -109,6 +110,3 @@ ci:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
-
-ci:
-  recipe_owner: akoumpa
