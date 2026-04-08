@@ -92,6 +92,7 @@ _OVERRIDES = [
     "distributed.pipeline.pp_schedule",
     "distributed.pipeline.pp_microbatch_size",
     "distributed.pipeline.pp_batch_size",
+    "distributed.pipeline.layers_per_stage",
     "distributed.pipeline.round_virtual_stages_to_pp_multiple",
     "distributed.pipeline.scale_grads_in_schedule",
     "dataset.seq_length",
