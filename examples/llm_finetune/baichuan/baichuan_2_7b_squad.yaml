@@ -103,6 +103,7 @@ ci:
   recipe_owner: adil-a
   time: "00:45:00"
   checkpoint_robustness:
+    trust_remote_code: true
     hf_kl_threshold: 5e-3
     distributed.tp_size: 2
     cross_tp_size: 2

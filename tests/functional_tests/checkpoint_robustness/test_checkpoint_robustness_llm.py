@@ -88,7 +88,11 @@ def _extract_custom_args(argv):
         no_check_resume = ci_robustness.pop("no_check_resume", False)
         for k, v in ci_robustness.items():
             if k not in custom:
-                if isinstance(v, bool) and v:
+                if "." in k:
+                    # Dotted keys are config overrides (e.g. distributed.tp_size),
+                    # route them to the config parser instead of the custom dict.
+                    remaining.extend([f"--{k}", str(v)])
+                elif isinstance(v, bool) and v:
                     custom[k] = True
                 elif not isinstance(v, bool):
                     custom[k] = str(v)
@@ -222,7 +226,6 @@ def test_checkpoint_robustness():
         print(f"[Phantom keys] Scanned {len(sf_files)} files, no _blocks/_scales keys ✓")
 
     cfg = parse_args_and_load_config()
-    cfg.model.trust_remote_code = False
     if not is_peft:
         cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
         cfg.checkpoint.enabled = False
