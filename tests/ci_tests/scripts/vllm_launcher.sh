@@ -14,7 +14,7 @@
 
 #!/bin/bash
 # Unified vLLM deployment test launcher.
-# Determines SFT vs PEFT from CI_JOB_STAGE and passes --mode explicitly.
+# Determines SFT vs PEFT from CI_JOB_STAGE and passes --deploy_mode explicitly.
 # Expects: CONFIG_PATH, TEST_NAME, PIPELINE_DIR, CI_JOB_STAGE
 set -xeuo pipefail
 
@@ -40,15 +40,15 @@ fi
 echo "Using checkpoint: ${CKPT_BASE}"
 
 if [[ "$CI_JOB_STAGE" == *"peft"* ]]; then
-    python -m pytest $TEST_SCRIPT -- \
-        --mode peft \
+    python -m pytest $TEST_SCRIPT \
+        --deploy_mode peft \
         --config_path "$CONFIG_PATH" \
         --adapter_path "${CKPT_BASE}/model/" \
         --max_new_tokens 50
 else
-    python -m pytest $TEST_SCRIPT -- \
-        --mode sft \
+    python -m pytest $TEST_SCRIPT \
+        --deploy_mode sft \
         --config_path "$CONFIG_PATH" \
-        --model_path "${CKPT_BASE}/model/consolidated/" \
+        --deploy_model_path "${CKPT_BASE}/model/consolidated/" \
         --max_new_tokens 50
 fi

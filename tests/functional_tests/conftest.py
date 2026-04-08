@@ -111,8 +111,10 @@ _OVERRIDES = [
     "qat.qat_config.groupsize",
     "dataloader.collate_fn.pad_seq_len_divisible",
     "validation_dataloader.collate_fn.pad_seq_len_divisible",
-    "model_path",
+    "deploy_model_path",
     "adapter_path",
+    "config_path",
+    "deploy_mode",
     "max_new_tokens",
 ]
 

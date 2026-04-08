@@ -21,15 +21,15 @@ and produces non-empty output, without HF comparison.
 Usage:
   SFT (config-driven):
     python -m pytest test_checkpoint_vllm_deploy.py \
-        --mode sft --config_path recipe.yaml --model_path /path/to/checkpoint/model/consolidated/
+        --deploy_mode sft --config_path recipe.yaml --deploy_model_path /path/to/checkpoint/model/consolidated/
 
   PEFT (config-driven):
     python -m pytest test_checkpoint_vllm_deploy.py \
-        --mode peft --config_path recipe.yaml --adapter_path /path/to/checkpoint/model/
+        --deploy_mode peft --config_path recipe.yaml --adapter_path /path/to/checkpoint/model/
 
   Legacy (no config):
     python -m pytest test_checkpoint_vllm_deploy.py \
-        --model_path <hf_name_or_path> --tokenizer <hf_name> --trust_remote_code
+        --deploy_model_path <hf_name_or_path> --tokenizer <hf_name> --trust_remote_code
 """
 
 import sys
@@ -46,8 +46,8 @@ PROMPTS = [
 
 def _extract_custom_args(argv):
     custom_keys = {
-        "--model_path", "--tokenizer", "--max_new_tokens",
-        "--adapter_path", "--config_path", "--mode",
+        "--deploy_model_path", "--tokenizer", "--max_new_tokens",
+        "--adapter_path", "--config_path", "--deploy_mode",
     }
     boolean_keys = {"--vllm_smoke_test", "--trust_remote_code"}
     custom = {}
@@ -81,7 +81,7 @@ def _resolve_args(custom_args):
     smoke_test, trust_remote_code.
     """
     config_path = custom_args.get("config_path")
-    mode = custom_args.get("mode")  # "sft", "peft", or None (legacy)
+    mode = custom_args.get("deploy_mode")  # "sft", "peft", or None (legacy)
     cfg = _load_recipe_config(config_path) if config_path else {}
 
     model_cfg = cfg.get("model", {})
@@ -94,12 +94,12 @@ def _resolve_args(custom_args):
         model_path = model_cfg["pretrained_model_name_or_path"]
         adapter_path = custom_args["adapter_path"]
     elif mode == "sft":
-        # SFT: full model from --model_path
-        model_path = custom_args["model_path"]
+        # SFT: full model from --deploy_model_path
+        model_path = custom_args["deploy_model_path"]
         adapter_path = None
     else:
         # Legacy: caller provides everything explicitly
-        model_path = custom_args["model_path"]
+        model_path = custom_args["deploy_model_path"]
         adapter_path = custom_args.get("adapter_path")
 
     # -- tokenizer --
