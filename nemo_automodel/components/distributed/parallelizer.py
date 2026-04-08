@@ -188,9 +188,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             # earlier layers to later layers through the DynamicCache.  Disabling
             # the cache breaks this architectural dependency, so we must keep
             # use_cache=True for those models.
-            _text_cfg = getattr(getattr(model, "config", None), "text_config", None) or getattr(
-                model, "config", None
-            )
+            _text_cfg = getattr(getattr(model, "config", None), "text_config", None) or getattr(model, "config", None)
             _has_kv_sharing = getattr(_text_cfg, "num_kv_shared_layers", 0) > 0
 
             if not _has_kv_sharing:
