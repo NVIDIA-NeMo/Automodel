@@ -374,6 +374,69 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         )
 
 
+class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
+    """Parallelization strategy for Qwen3.5 dense models with mixed-dtype GatedDeltaNet.
+
+    Qwen3.5 has linear_attn layers with float32 params (A_log, norm) alongside
+    bfloat16 params. Overrides the FSDP sharding step to use fully_shard_by_dtype
+    per layer, and sets the CP mesh on CPAwareGatedDeltaNet modules.
+    """
+
+    def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
+        # Patch HF GatedDeltaNet for FSDP mixed-dtype support (and CP if enabled)
+        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import patch_hf_model
+
+        cp_mesh_name = dp_shard_cp_mesh_name.replace("dp_shard_", "")
+        cp_enabled = cp_mesh_name in device_mesh.mesh_dim_names and device_mesh[cp_mesh_name].size() > 1
+        patch_hf_model(model, cp_enabled=cp_enabled)
+
+        # Delegate TP, AC, mixed precision to the default strategy, but
+        # override the FSDP sharding to use fully_shard_by_dtype.
+        # Temporarily swap the global — safe because model init is single-threaded
+        # (one model is parallelized at a time). Not safe under concurrent calls.
+        original_fn = globals().get("apply_fsdp2_sharding_recursively")
+        assert original_fn is not None, "apply_fsdp2_sharding_recursively not found in module globals"
+
+        def _fsdp_by_dtype(module, mesh, mp_policy, offload_policy=None):
+            if isinstance(module, nn.ModuleList):
+                for layer_id, child in enumerate(module):
+                    if isinstance(child, nn.ModuleList):
+                        _fsdp_by_dtype(child, mesh, mp_policy, offload_policy)
+                    else:
+                        _pre_shard_combined_projections(child, mesh, mp_policy, offload_policy)
+                        parallelizer_utils.fully_shard_by_dtype(
+                            child,
+                            mesh,
+                            mp_policy,
+                            offload_policy,
+                        )
+            else:
+                for _, sub in module.named_children():
+                    _fsdp_by_dtype(sub, mesh, mp_policy, offload_policy)
+
+        globals()["apply_fsdp2_sharding_recursively"] = _fsdp_by_dtype
+        try:
+            result = super().parallelize(
+                model,
+                device_mesh,
+                dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
+                **kwargs,
+            )
+        finally:
+            globals()["apply_fsdp2_sharding_recursively"] = original_fn
+
+        # Set CP mesh on CPAwareGatedDeltaNet modules
+        if cp_enabled:
+            from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
+
+            cp_mesh = device_mesh[cp_mesh_name]
+            for _, mod in model.named_modules():
+                if isinstance(mod, CPAwareGatedDeltaNet):
+                    mod._cp_mesh = cp_mesh
+
+        return result
+
+
 class WanParallelizationStrategy(ParallelizationStrategy):
     """Parallelization strategy for Wan-style transformer modules used in Diffusers.
 
@@ -519,6 +582,8 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
 # Strategy registry mapping model class names to parallelization strategies
 PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
+    "Qwen3_5ForConditionalGeneration": Qwen3_5ParallelizationStrategy(),
+    "Qwen3_5ForCausalLM": Qwen3_5ParallelizationStrategy(),
     "WanTransformer3DModel": WanParallelizationStrategy(),
     "HunyuanVideo15Transformer3DModel": HunyuanParallelizationStrategy(),
 }
