@@ -166,7 +166,6 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
         vllm_job = {
             'extends': '.vllm_deploy_test',
             'stage': vllm_stage,
-            'needs': [config.stem],
             'variables': {
                 'CONFIG_PATH': f'{config}',
                 'TEST_LEVEL': f'{scope}',
