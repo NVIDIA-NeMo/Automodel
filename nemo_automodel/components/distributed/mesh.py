@@ -223,8 +223,14 @@ class MeshContext:
 # misc utils
 def _get_axis_size(mesh: Optional["DeviceMesh"], axis: MeshAxisName, default=1) -> Optional[int]:
     """Return the size of *axis* if present in *mesh*, else *default*."""
-    if mesh is not None and axis in mesh.mesh_dim_names:
+    if mesh is None:
+        return default
+    # Check mesh dims and _flatten() results on root mesh
+    if axis in mesh.mesh_dim_names:
         return mesh[axis].size()
+    root = mesh._get_root_mesh()
+    if axis in root._flatten_mapping:
+        return root._flatten_mapping[axis].size()
     return default
 
 
