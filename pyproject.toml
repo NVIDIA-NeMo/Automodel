@@ -280,7 +280,7 @@ requires-dist = ["torch", "packaging", "ninja", "setuptools"]
 pythonpath = ["."]
 
 [tool.coverage.paths]
-source = [".", "/opt/Automodel", "/home/runner/work/Automodel/Automodel"]
+source = ["nemo_automodel", "/opt/Automodel/nemo_automodel", "/home/runner/work/Automodel/Automodel/nemo_automodel"]
 
 [tool.coverage.run]
 source = ["nemo_automodel"]
