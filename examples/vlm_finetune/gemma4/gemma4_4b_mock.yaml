@@ -15,7 +15,7 @@
 # Gemma 4 4B VLM fine-tuning with mock dataset — fixed sequence length via pretokenize + truncate.
 # Every sample is exactly max_length tokens (image + text, truncated to fit).
 #
-# torchrun --nproc-per-node=2 nemo_automodel/recipes/vlm/finetune.py -c examples/vlm_finetune/gemma4/gemma4_4b_mock.yaml
+# torchrun --nproc-per-node=8 nemo_automodel/recipes/vlm/finetune.py -c examples/vlm_finetune/gemma4/gemma4_4b_mock.yaml
 
 recipe: FinetuneRecipeForVLM
 
@@ -57,7 +57,6 @@ distributed:
   tp_size: 1
   cp_size: 1
   sequence_parallel: false
-  activation_checkpointing: true
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
