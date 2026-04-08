@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sys
 import types
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -185,3 +186,246 @@ class TestQwen35ParallelizationStrategyRegistration:
         )
 
         assert isinstance(PARALLELIZATION_STRATEGIES["Qwen3_5ForCausalLM"], Qwen3_5ParallelizationStrategy)
+
+
+class TestQwen35ParallelizationStrategyParallelize:
+    """Tests for Qwen3_5ParallelizationStrategy.parallelize() method."""
+
+    @staticmethod
+    def _stub_qwen3_5_modules(monkeypatch):
+        """Stub transformers.models.qwen3_5* so cp_linear_attn can be imported."""
+        for path in (
+            "transformers.models.qwen3_5_moe",
+            "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe",
+            "transformers.models.qwen3_5",
+            "transformers.models.qwen3_5.modeling_qwen3_5",
+        ):
+            if path not in sys.modules:
+                stub = types.ModuleType(path)
+                stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
+                stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
+                monkeypatch.setitem(sys.modules, path, stub)
+
+    @pytest.fixture()
+    def mock_device_mesh(self):
+        """Create a mock device mesh with CP support."""
+        from torch.distributed.device_mesh import DeviceMesh
+
+        mesh = MagicMock(spec=DeviceMesh)
+        dp_shard_mesh = MagicMock()
+        dp_shard_mesh.size.return_value = 2
+        dp_shard_mesh.ndim = 1
+        tp_mesh = MagicMock()
+        tp_mesh.size.return_value = 1
+        tp_mesh.ndim = 1
+        cp_mesh = MagicMock()
+        cp_mesh.size.return_value = 1
+        cp_mesh.ndim = 1
+
+        mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp", "tp")
+        mesh.__getitem__ = MagicMock(side_effect=lambda key: {
+            "dp_replicate": MagicMock(size=MagicMock(return_value=1), ndim=1),
+            "dp_shard_cp": dp_shard_mesh,
+            "tp": tp_mesh,
+            "cp": cp_mesh,
+            ("dp_replicate", "dp_shard_cp"): dp_shard_mesh,
+        }[key])
+
+        return mesh, cp_mesh, tp_mesh
+
+    @pytest.fixture()
+    def mock_env(self, monkeypatch):
+        """Mock the distributed functions used by DefaultParallelizationStrategy."""
+        import nemo_automodel.components.distributed.parallelizer as par_mod
+        import nemo_automodel.components.distributed.parallelizer_utils as par_utils
+
+        fully_shard_mock = MagicMock(side_effect=lambda model, **kw: model)
+        monkeypatch.setattr(par_mod, "fully_shard", fully_shard_mock, raising=False)
+
+        apply_fsdp_mock = MagicMock()
+        monkeypatch.setattr(par_mod, "apply_fsdp2_sharding_recursively", apply_fsdp_mock, raising=False)
+
+        # Also mock fully_shard_by_dtype which _fsdp_by_dtype calls
+        fsdp_by_dtype_mock = MagicMock()
+        monkeypatch.setattr(par_utils, "fully_shard_by_dtype", fsdp_by_dtype_mock, raising=False)
+
+        # Mock _pre_shard_combined_projections which _fsdp_by_dtype calls
+        monkeypatch.setattr(par_mod, "_pre_shard_combined_projections", MagicMock(), raising=False)
+
+        extract_mock = MagicMock(return_value=[])
+        monkeypatch.setattr(par_mod, "_extract_model_layers", extract_mock, raising=False)
+
+        get_plan_mock = MagicMock(return_value={})
+        monkeypatch.setattr(par_mod, "_get_parallel_plan", get_plan_mock, raising=False)
+
+        validate_mock = MagicMock()
+        monkeypatch.setattr(par_mod, "validate_tp_mesh", validate_mock, raising=False)
+
+        parallelize_mod_mock = MagicMock()
+        monkeypatch.setattr(par_mod, "parallelize_module", parallelize_mod_mock, raising=False)
+
+        checkpoint_mock = MagicMock(side_effect=lambda x: x)
+        monkeypatch.setattr(par_mod, "checkpoint_wrapper", checkpoint_mock, raising=False)
+
+        return {
+            "apply_fsdp": apply_fsdp_mock,
+            "fully_shard": fully_shard_mock,
+            "fully_shard_by_dtype": fsdp_by_dtype_mock,
+        }
+
+    def test_parallelize_calls_patch_and_delegates(self, fake_model, monkeypatch, mock_device_mesh, mock_env):
+        """parallelize() patches the model and delegates to super()."""
+        self._stub_qwen3_5_modules(monkeypatch)
+
+        cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
+        if cp_mod_key in sys.modules:
+            monkeypatch.delitem(sys.modules, cp_mod_key)
+
+        from nemo_automodel.components.distributed.parallelizer import Qwen3_5ParallelizationStrategy
+
+        mesh, cp_mesh, tp_mesh = mock_device_mesh
+        strategy = Qwen3_5ParallelizationStrategy()
+
+        with patch(
+            "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.patch_hf_model"
+        ) as mock_patch:
+            result = strategy.parallelize(model=fake_model, device_mesh=mesh)
+
+        # patch_hf_model was called (cp_enabled=False because "cp" not in mesh_dim_names)
+        mock_patch.assert_called_once_with(fake_model, cp_enabled=False)
+        # super().parallelize ran fully_shard
+        mock_env["fully_shard"].assert_called()
+        assert result is fake_model
+
+    def test_parallelize_swaps_and_restores_fsdp_global(self, fake_model, monkeypatch, mock_device_mesh, mock_env):
+        """The globals swap for apply_fsdp2_sharding_recursively is restored after call."""
+        self._stub_qwen3_5_modules(monkeypatch)
+
+        cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
+        if cp_mod_key in sys.modules:
+            monkeypatch.delitem(sys.modules, cp_mod_key)
+
+        import nemo_automodel.components.distributed.parallelizer as par_mod
+        from nemo_automodel.components.distributed.parallelizer import Qwen3_5ParallelizationStrategy
+
+        original_fn = par_mod.apply_fsdp2_sharding_recursively
+        strategy = Qwen3_5ParallelizationStrategy()
+
+        # Track what function was used during super().parallelize()
+        called_with = {}
+
+        def spy_apply_fsdp(*args, **kwargs):
+            # During super().parallelize, the global should be the custom _fsdp_by_dtype
+            called_with["fn"] = par_mod.apply_fsdp2_sharding_recursively
+
+        mock_env["apply_fsdp"].side_effect = spy_apply_fsdp
+
+        with patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.patch_hf_model"):
+            strategy.parallelize(model=fake_model, device_mesh=mock_device_mesh[0])
+
+        # After call, global is restored
+        assert par_mod.apply_fsdp2_sharding_recursively is original_fn
+
+    def test_parallelize_restores_global_on_error(self, fake_model, monkeypatch, mock_device_mesh, mock_env):
+        """Global is restored even if super().parallelize() raises."""
+        self._stub_qwen3_5_modules(monkeypatch)
+
+        cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
+        if cp_mod_key in sys.modules:
+            monkeypatch.delitem(sys.modules, cp_mod_key)
+
+        import nemo_automodel.components.distributed.parallelizer as par_mod
+        from nemo_automodel.components.distributed.parallelizer import Qwen3_5ParallelizationStrategy
+
+        original_fn = par_mod.apply_fsdp2_sharding_recursively
+        strategy = Qwen3_5ParallelizationStrategy()
+
+        mock_env["fully_shard"].side_effect = RuntimeError("boom")
+
+        with patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.patch_hf_model"):
+            with pytest.raises(RuntimeError, match="boom"):
+                strategy.parallelize(model=fake_model, device_mesh=mock_device_mesh[0])
+
+        # Global still restored
+        assert par_mod.apply_fsdp2_sharding_recursively is original_fn
+
+    def test_parallelize_sets_cp_mesh_when_enabled(self, fake_model, monkeypatch, mock_device_mesh, mock_env):
+        """When CP is enabled, _cp_mesh is set on CPAwareGatedDeltaNet modules."""
+        self._stub_qwen3_5_modules(monkeypatch)
+
+        cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
+        if cp_mod_key in sys.modules:
+            monkeypatch.delitem(sys.modules, cp_mod_key)
+
+        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import (
+            CPAwareGatedDeltaNet,
+            patch_hf_model,
+        )
+        from nemo_automodel.components.distributed.parallelizer import Qwen3_5ParallelizationStrategy
+
+        mesh, cp_mesh, tp_mesh = mock_device_mesh
+        # Enable CP by adding "cp" to mesh_dim_names and making cp_mesh.size() > 1
+        mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp", "tp", "cp")
+        cp_mesh.size.return_value = 2
+
+        # Pre-patch the model so the module is CPAwareGatedDeltaNet
+        patch_hf_model(fake_model, cp_enabled=True)
+        la = fake_model.layers[0].linear_attn
+        assert type(la) is CPAwareGatedDeltaNet
+        assert la._cp_mesh is None
+
+        strategy = Qwen3_5ParallelizationStrategy()
+
+        with patch(
+            "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.patch_hf_model"
+        ):
+            strategy.parallelize(model=fake_model, device_mesh=mesh)
+
+        # CP mesh should be set
+        assert la._cp_mesh is cp_mesh
+
+    def test_fsdp_by_dtype_handles_module_list(self, monkeypatch, mock_device_mesh, mock_env):
+        """The custom _fsdp_by_dtype correctly iterates ModuleList children."""
+        self._stub_qwen3_5_modules(monkeypatch)
+
+        cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
+        if cp_mod_key in sys.modules:
+            monkeypatch.delitem(sys.modules, cp_mod_key)
+
+        import nemo_automodel.components.distributed.parallelizer as par_mod
+        from nemo_automodel.components.distributed.parallelizer import Qwen3_5ParallelizationStrategy
+
+        # Build a model with layers in a ModuleList
+        model = nn.Module()
+        model.config = types.SimpleNamespace(
+            num_attention_heads=8, num_key_value_heads=8, hidden_size=64,
+        )
+        model.__class__.__name__ = "Qwen3_5ForCausalLM"
+        inner = nn.Module()
+        layer = nn.Module()
+        layer.mlp = nn.Linear(4, 4)
+        inner.layers = nn.ModuleList([layer])
+        model.model = inner
+
+        mesh, cp_mesh, tp_mesh = mock_device_mesh
+
+        # Capture what the custom _fsdp_by_dtype does
+        shard_by_dtype_calls = []
+        with patch(
+            "nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype",
+            side_effect=lambda *a, **kw: shard_by_dtype_calls.append(a[0]),
+        ), patch(
+            "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.patch_hf_model"
+        ), patch(
+            "nemo_automodel.components.distributed.parallelizer._pre_shard_combined_projections"
+        ):
+            # Make extract_layers return the real layers
+            mock_env["apply_fsdp"].side_effect = lambda module, mesh, mp, offload=None: (
+                par_mod.apply_fsdp2_sharding_recursively(module, mesh, mp, offload)
+            )
+            strategy = Qwen3_5ParallelizationStrategy()
+            strategy.parallelize(model=model, device_mesh=mesh)
+
+        # fully_shard_by_dtype should have been called for the layer child
+        assert len(shard_by_dtype_calls) > 0
+        assert layer in shard_by_dtype_calls
