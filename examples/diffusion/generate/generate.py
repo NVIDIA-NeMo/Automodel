@@ -228,7 +228,9 @@ def load_checkpoint_into_pipeline(pipe, cfg):
         name.endswith(".safetensors") for name in os.listdir(consolidated_st_dir)
     ):
         logger.info("Loading consolidated safetensors checkpoint from %s", consolidated_st_dir)
-        pipe.transformer = type(pipe.transformer).from_pretrained(str(consolidated_st_dir), torch_dtype=torch_dtype)
+        pipe.transformer = type(pipe.transformer).from_pretrained(
+            str(consolidated_st_dir), torch_dtype=torch_dtype
+        )
         pipe.transformer.to("cuda")
         logger.info("Loaded consolidated safetensors checkpoint")
     elif sharded_dir.is_dir() and any(name.endswith(".distcp") for name in os.listdir(sharded_dir)):
