@@ -76,11 +76,7 @@ def _ensure_msc_available() -> None:
     """Raise an error if MSC is not installed but a cloud path is used."""
     if not MSC_AVAILABLE:
         raise ImportError(
-<<<<<<< HEAD
-            "multistorageclient is required for cloud storage paths. "
-=======
             "multistorageclient is required for cloud storage paths."
->>>>>>> 91a223c (fix: address review comments - PEFT cloud path, optional dependencies, and unit test fixes)
             "Install it with: pip install multi-storage-client "
             "--index-url https://pypi.nvidia.com"
         )
