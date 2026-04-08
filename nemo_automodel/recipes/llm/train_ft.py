@@ -115,11 +115,21 @@ def _get_model_name(cfg_model):
         return None
 
 
-def _uses_te_dot_product_attention(cfg_model):
+def _uses_te_dot_product_attention(model_or_cfg):
+    """Check whether the model uses TE DotProductAttention.
+
+    Accepts either an instantiated nn.Module (preferred — inspects actual modules)
+    or a config object (fallback — checks backend.attn string).
+    """
+    if isinstance(model_or_cfg, torch.nn.Module):
+        try:
+            from transformer_engine.pytorch.attention import DotProductAttention
+        except ImportError:
+            return False
+        return any(isinstance(m, DotProductAttention) for m in model_or_cfg.modules())
+    # Config fallback for call sites before model is built
     return (
-        True
-        if hasattr(cfg_model, "backend") and hasattr(cfg_model.backend, "attn") and cfg_model.backend.attn == "te"
-        else False
+        hasattr(model_or_cfg, "backend") and hasattr(model_or_cfg.backend, "attn") and model_or_cfg.backend.attn == "te"
     )
 
 
@@ -550,17 +560,34 @@ def build_dataloader(
             if "shuffle" in cfg_dl:
                 del cfg_dl.shuffle
 
-            dist_sampler_kwargs = {
-                "num_replicas": dp_world_size,
-                "rank": dp_rank,
-                "shuffle": shuffle,
-            }
-            sampler = StatefulDistributedSampler(
-                ds,
-                seed=seed,
-                drop_last=True,
-                **dist_sampler_kwargs,
-            )
+            group_by_length = cfg_dl.get("group_by_length", False)
+            if "group_by_length" in cfg_dl:
+                del cfg_dl.group_by_length
+
+            if group_by_length:
+                from nemo_automodel.components.datasets.llm.length_grouped_sampler import (
+                    LengthGroupedSampler as LLMLengthGroupedSampler,
+                )
+
+                sampler = LLMLengthGroupedSampler(
+                    dataset=ds,
+                    batch_size=local_batch_size,
+                    seed=seed,
+                    num_replicas=dp_world_size,
+                    rank=dp_rank,
+                )
+            else:
+                dist_sampler_kwargs = {
+                    "num_replicas": dp_world_size,
+                    "rank": dp_rank,
+                    "shuffle": shuffle,
+                }
+                sampler = StatefulDistributedSampler(
+                    ds,
+                    seed=seed,
+                    drop_last=True,
+                    **dist_sampler_kwargs,
+                )
             dl_kwargs = {"sampler": sampler, "batch_size": local_batch_size}
             if pp_enabled:
                 dl_kwargs["drop_last"] = True
@@ -835,7 +862,7 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
             val_check_interval=cfg.get("step_scheduler.val_every_steps", None),
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
-            pp_enabled=False,
+            pp_enabled=pp_enabled,
             cp_size=cfg.get("distributed.cp_size", 1),
             model=model,
         )[0]
@@ -1100,6 +1127,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
 
+        # NEFTune: noisy embeddings for improved instruction fine-tuning
+        neftune_cfg = self.cfg.get("neftune", None)
+        self.neftune = None
+        if neftune_cfg is not None:
+            from nemo_automodel.components.training.neftune import NEFTune
+
+            noise_alpha = neftune_cfg.get("noise_alpha", 5.0) if hasattr(neftune_cfg, "get") else neftune_cfg
+            self.neftune = NEFTune(noise_alpha=float(noise_alpha))
+            self.neftune.activate(self.model_parts[0])
+
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         # Initialize JSONL loggers
         self.metric_logger_train = build_metric_logger(
@@ -1286,7 +1323,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         train_ctx, batch = make_cp_batch_and_ctx(
             self.device_mesh,
             batch,
-            use_te=_uses_te_dot_product_attention(self.cfg.model) and _uses_thd_collater(self.cfg.dataloader),
+            use_te=_uses_te_dot_product_attention(
+                self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
+            )
+            and _uses_thd_collater(self.cfg.dataloader),
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
             num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
         )
@@ -1303,6 +1343,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     targets = None
 
                 input_ids = batch.pop("input_ids")
+
+                # Update PP stage shapes for the current batch's seq_len.
+                # This is a no-op when the length hasn't changed.
+                self.pp.update_seq_len(input_ids.shape[1])
 
                 # Filter out None values and empty dicts from batch to avoid PP chunking errors
                 batch_filtered = {
@@ -1554,18 +1598,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 total_num_label_tokens += num_label_tokens
 
         total_loss = self._dp_allreduce(total_loss, include_cp=True)
-        total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
+        total_num_label_tokens = self._dp_allreduce(
+            torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
+        ).item()
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
 
-        # For PP, send val_loss from last stage to main rank for logging
+        # For PP, send val_loss and num_label_tokens from last stage to main rank
         if self.pp_enabled:
             val_loss = val_loss.to(self.dist_env.device)
-            # Send loss to first rank from the last stage
+            # On non-last ranks total_num_label_tokens is 0; this tensor is just a recv buffer.
+            pp_num_tokens = torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
             src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
             if self.dist_env.rank == src_rank:
                 torch.distributed.send(val_loss, dst=0)
+                torch.distributed.send(pp_num_tokens, dst=0)
             elif self.dist_env.is_main:
                 torch.distributed.recv(val_loss, src=src_rank)
+                torch.distributed.recv(pp_num_tokens, src=src_rank)
+                total_num_label_tokens = pp_num_tokens.item()
 
         val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
 

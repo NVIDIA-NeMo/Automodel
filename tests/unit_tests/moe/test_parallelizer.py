@@ -685,10 +685,19 @@ class MeshView:
 class FakeWorldMesh:
     def __init__(self, sizes_by_key, mesh_dim_names):
         self._sizes = sizes_by_key
-        self.mesh_dim_names = set(mesh_dim_names)
+        self.mesh_dim_names = tuple(mesh_dim_names)
+        self._flatten_mapping = {}
+
+    def _get_root_mesh(self):
+        return self
 
     def __getitem__(self, key):
-        return MeshView(self._sizes[key])
+        # Support both string "dp" and tuple ("dp",) lookups
+        if key in self._sizes:
+            return MeshView(self._sizes[key])
+        if isinstance(key, str) and (key,) in self._sizes:
+            return MeshView(self._sizes[(key,)])
+        raise KeyError(key)
 
 
 class FakeMoeMesh:
@@ -708,7 +717,7 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     monkeypatch.setattr(P, "apply_ac", apply_ac_mock)
     monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
 
-    world_mesh = FakeWorldMesh({("dp",): 2, "tp": 1, "cp": 1}, mesh_dim_names=["dp", "tp", "cp"])
+    world_mesh = FakeWorldMesh({"dp": 2, ("dp",): 2, "tp": 1, "cp": 1}, mesh_dim_names=["dp", "tp", "cp"])
     moe_mesh = FakeMoeMesh({"ep": 2, ("es1", "es2"): 2})
 
     # model.model.moe_config.n_routed_experts must be divisible by ep size (2)
@@ -1250,6 +1259,46 @@ def test_apply_ac_raises_when_num_experts_not_available(monkeypatch):
 
     with pytest.raises(ValueError, match="num_experts must be provided"):
         P.apply_ac(model)
+
+
+def test_apply_ac_derives_num_experts_from_num_local_experts(monkeypatch):
+    """Test that apply_ac derives num_experts from config.num_local_experts (Mixtral/GPT-OSS style)."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    captured_num_experts = None
+
+    def fake_create_selective_checkpoint_contexts(policy_cb):
+        nonlocal captured_num_experts
+        torch_stub = sys.modules["torch"]
+        for ne in [32, 64, 128]:
+            rhs = type("Mat", (), {"shape": (256, ne)})()
+            result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs)
+            if result == P.CheckpointPolicy.MUST_SAVE:
+                captured_num_experts = ne
+        return "CTX"
+
+    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+        if context_fn is not None:
+            context_fn()
+        return block
+
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
+
+    class ConfigWithNumLocalExperts:
+        hidden_size = 256
+        num_local_experts = 32
+
+    class ModelWithNumLocalExperts:
+        def __init__(self):
+            self.config = ConfigWithNumLocalExperts()
+            self.layers = LayerContainer([DummyBlock()])
+
+    model = ModelWithNumLocalExperts()
+
+    P.apply_ac(model, ignore_router=True)
+
+    assert captured_num_experts == 32
 
 
 def test_apply_ac_accepts_explicit_hidden_size_and_num_experts(monkeypatch):

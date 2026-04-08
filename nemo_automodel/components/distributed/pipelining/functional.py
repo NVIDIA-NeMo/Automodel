@@ -230,6 +230,36 @@ def calculate_virtual_stages(
     return num_virtual_stages, stages_per_rank
 
 
+def _get_hidden_and_vocab_size(model_config) -> tuple[int, int]:
+    """Extract hidden_size and vocab_size from a model config.
+
+    Handles both flat configs (LLM) and nested configs where these attributes
+    live under ``text_config`` (VLM models such as Qwen3-VL, LLaVA, etc.).
+    """
+    hidden_size = getattr(model_config, "hidden_size", None)
+    vocab_size = getattr(model_config, "vocab_size", None)
+
+    if hidden_size is None or vocab_size is None:
+        text_config = getattr(model_config, "text_config", None)
+        if text_config is not None:
+            if hidden_size is None:
+                hidden_size = getattr(text_config, "hidden_size", None)
+            if vocab_size is None:
+                vocab_size = getattr(text_config, "vocab_size", None)
+
+    if hidden_size is None:
+        raise ValueError(
+            f"Cannot determine hidden_size from {type(model_config).__name__}. "
+            "Expected either model_config.hidden_size or model_config.text_config.hidden_size."
+        )
+    if vocab_size is None:
+        raise ValueError(
+            f"Cannot determine vocab_size from {type(model_config).__name__}. "
+            "Expected either model_config.vocab_size or model_config.text_config.vocab_size."
+        )
+    return hidden_size, vocab_size
+
+
 def _precompute_stage_shapes(
     stages: list[PipelineStage],
     model_config,
@@ -252,8 +282,7 @@ def _precompute_stage_shapes(
         microbatch_size: Microbatch size used by the pipeline schedule.
         seq_len: Sequence length of the input data.
     """
-    hidden_size = model_config.hidden_size
-    vocab_size = model_config.vocab_size
+    hidden_size, vocab_size = _get_hidden_and_vocab_size(model_config)
 
     for stage in stages:
         # Infer the computation dtype from the stage's parameters
@@ -284,6 +313,55 @@ def _precompute_stage_shapes(
         f"Precomputed pipeline stage shapes (seq_len={seq_len}, microbatch_size={microbatch_size}) — "
         f"serial shape inference bypassed"
     )
+
+
+def reset_pp_stage_shapes(
+    schedule: _PipelineSchedule,
+    stages: list[PipelineStage],
+    model_config,
+    microbatch_size: int,
+    seq_len: int,
+) -> None:
+    """Reset pipeline stage infrastructure and recompute shapes for a new sequence length.
+
+    VLM training produces batches with highly variable sequence lengths (image tokens expand
+    the sequence dramatically).  PyTorch's PipelineStage locks in output shapes and recv
+    buffer sizes on the first ``schedule.step()`` call (``_stages_initialized = True``).
+    Subsequent steps with a different seq_len therefore hit a shape-mismatch error.
+
+    This function resets the per-stage infrastructure so that ``_initialize_stages`` re-runs
+    on the next ``step()`` call.  It then calls ``_precompute_stage_shapes`` to set the
+    correct shapes analytically — avoiding the expensive real-valued forward pass that
+    ``_shape_inference`` would otherwise perform.
+
+    Args:
+        schedule: The active pipeline schedule.
+        stages: The local pipeline stages for this rank.
+        model_config: The HuggingFace model config (``model.config``).
+        microbatch_size: Per-microbatch batch size used by the schedule.
+        seq_len: Sequence length of the upcoming batch (e.g. ``input_ids.shape[1]``).
+    """
+    for stage in stages:
+        # Allow _configure_outputs_meta to be called again (it asserts _outputs_meta is None)
+        stage._outputs_meta = None
+        # Allow _shape_inference to re-run for non-first stages receiving new shapes
+        stage.inputs_meta = None
+        # Clear pre-allocated recv/send buffers; they will be reallocated by _prepare_forward_infra
+        stage.args_recv_info = {}
+        stage.grad_recv_info = {}
+        stage.grad_send_info = None
+
+    # Analytically set shapes for the new seq_len (no forward pass)
+    _precompute_stage_shapes(stages, model_config, microbatch_size, seq_len)
+
+    # Trigger _initialize_stage(s) on the next step() call.
+    # PipelineScheduleSingle uses singular, PipelineScheduleMulti uses plural.
+    if hasattr(schedule, "_stage_forward_initialized"):
+        schedule._stage_forward_initialized = False
+        schedule._stage_backward_initialized = False
+    if hasattr(schedule, "_stages_forward_initialized"):
+        schedule._stages_forward_initialized = False
+        schedule._stages_backward_initialized = False
 
 
 def split_model_into_stages(
@@ -399,9 +477,8 @@ def split_model_into_stages(
         )
         # Create a set of modules to keep
         modules_to_keep = set(module_names)
-        logger.info(
-            f"PP Rank {pp_rank}: Stage {stage_idx}: Keeping modules: {sorted(modules_to_keep, key=lambda x: x.split('.')[-1])}"
-        )
+        modules_sorted = sorted(modules_to_keep, key=lambda x: x.split(".")[-1])
+        logger.info(f"PP Rank {pp_rank}: Stage {stage_idx}: Keeping modules: {modules_sorted}")
 
         # Helper function to handle nested module removal
         def _process_module(parent_module, parent_name=""):
