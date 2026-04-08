@@ -23,6 +23,8 @@ step_scheduler:
   ckpt_every_steps: 1000
   num_epochs: 100
   log_every: 2
+  # max_steps: null  # Set to limit training to a specific number of steps
+  # save_checkpoint_every_epoch: true  # Set to false to disable epoch-boundary checkpoints
 
 data:
   dataloader:
