@@ -1,8 +1,8 @@
-# Sequence Classification (SFT/PEFT) with NeMo Automodel
+# Sequence Classification (SFT/PEFT) with NeMo AutoModel
 
 ## Introduction
 
-Sequence classification tasks (e.g., sentiment analysis, topic classification, GLUE tasks) map input text to a discrete label. NeMo Automodel provides a lightweight recipe specialized for this setting that integrates with popular pretrained model formats and dataset sources. Integration with Hugging Face is supported.
+Sequence classification tasks (e.g., sentiment analysis, topic classification, GLUE tasks) map input text to a discrete label. NeMo AutoModel provides a lightweight recipe specialized for this setting that integrates with popular pretrained model formats and dataset sources. Integration with Hugging Face is supported.
 
 This guide shows how to train a sequence classification model using the `TrainFinetuneRecipeForSequenceClassification` recipe, including optional Parameter-Efficient Fine-Tuning (LoRA).
 
@@ -57,9 +57,9 @@ checkpoint:
   save_consolidated: true
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-  dp_size: none
-  dp_replicate_size: 1
+  strategy: fsdp2
+  dp_size: null
+  dp_replicate_size: null
   tp_size: 1
   cp_size: 1
   sequence_parallel: false
@@ -115,5 +115,5 @@ optimizer:
 ```bash
 torchrun --nproc-per-node=2 examples/llm_seq_cls/seq_cls.py --config examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
 ```
-You can adjust the number of GPUs as necessary via the `--nproc-per-node` knob.
+You can adjust the number of GPUs as necessary using the `--nproc-per-node` knob.
 

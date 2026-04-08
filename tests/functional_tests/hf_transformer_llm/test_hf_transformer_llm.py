@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
+import shutil
 
 from tests.utils.test_utils import run_test_script
 
@@ -22,24 +22,43 @@ HF_TRANSFORMER_LLM_FSDP2_TP2_HF_TPPLAN_FILENAME = "L2_HF_Transformer_LLM_FSDP2_T
 HF_TRANSFORMER_LLM_MegatronFSDP_TP2_FILENAME = "L2_HF_Transformer_LLM_MegatronFSDP_TP2.sh"
 HF_TRANSFORMER_LLM_MegatronFSDP_TP2_HF_TPPLAN_FILENAME = "L2_HF_Transformer_LLM_MegatronFSDP_TP2_HF_TPPLAN.sh"
 HF_TRANSFORMER_LLM_DDP_FILENAME = "L2_HF_Transformer_LLM_DDP.sh"
+HF_TRANSFORMER_LLM_META_FSDP2_TP2_FILENAME = "L2_HF_Transformer_LLM_Meta_FSDP2_TP2.sh"
+
 
 
 class TestHFTransformerLLM:
     def test_hf_transformer_llm_ddp(self):
-        run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_DDP_FILENAME)
+        try:
+            run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_DDP_FILENAME)
+        finally:
+            shutil.rmtree("checkpoints/", ignore_errors=True)
 
-    @pytest.mark.pleasefixme
     def test_hf_transformer_llm_fsdp2_tp2(self):
-        run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_FSDP2_TP2_FILENAME)
-    
-    @pytest.mark.pleasefixme
-    def test_hf_transformer_llm_fsdp2_tp2_hf_tpplan(self):
-        run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_FSDP2_TP2_HF_TPPLAN_FILENAME)
+        try:
+            run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_FSDP2_TP2_FILENAME)
+        finally:
+            shutil.rmtree("checkpoints/", ignore_errors=True)
 
-    # @pytest.mark.pleasefixme
-    # def test_hf_transformer_llm_megatron_fsdp_tp2(self):
-    #     run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_MegatronFSDP_TP2_FILENAME)
-    
-    # @pytest.mark.pleasefixme
-    # def test_hf_transformer_llm_megatron_fsdp_tp2_hf_tpplan(self):
-    #     run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_MegatronFSDP_TP2_HF_TPPLAN_FILENAME)
+    def test_hf_transformer_llm_fsdp2_tp2_hf_tpplan(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_FSDP2_TP2_HF_TPPLAN_FILENAME)
+        finally:
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_hf_transformer_llm_megatron_fsdp_tp2(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_MegatronFSDP_TP2_FILENAME)
+        finally:
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_hf_transformer_llm_megatron_fsdp_tp2_hf_tpplan(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_MegatronFSDP_TP2_HF_TPPLAN_FILENAME)
+        finally:
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_hf_transformer_llm_meta_fsdp2_tp2(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_TRANSFORMER_LLM_META_FSDP2_TP2_FILENAME)
+        finally:
+            shutil.rmtree("checkpoints/", ignore_errors=True)

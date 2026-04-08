@@ -1,5 +1,11 @@
 # Based on your existing config, modified for benchmarking
 
+# To run this recipe:
+#   automodel examples/llm_finetune/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 seed: 42
 
 # NEW: Add benchmark section
@@ -46,22 +52,22 @@ checkpoint:
   save_consolidated: false
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   dp_size: 2
   tp_size: 2
   cp_size: 1
   pp_size: 4
+
   sequence_parallel: false
   activation_checkpointing: true
 
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.autopipeline.AutoPipeline
-  pp_schedule: interleaved1f1b
-  pp_microbatch_size: 1
-  layers_per_stage: 2
-  scale_grads_in_schedule: false
-  round_virtual_stages_to_pp_multiple: up
-  dtype: bf16
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 2
+    scale_grads_in_schedule: false
+    round_virtual_stages_to_pp_multiple: up
+    dtype: bf16
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -87,4 +93,7 @@ optimizer:
 
 lr_scheduler:
   lr_decay_style: cosine
-  min_lr: 1.0e-6 
+  min_lr: 1.0e-6
+
+ci:
+  recipe_owner: ZhiyuLi-Nvidia

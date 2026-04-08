@@ -13,13 +13,13 @@
 # limitations under the License.
 
 import logging
-from dataclasses import dataclass, field
-from typing import List, Optional
 
 import torch
 import torch.distributed as dist
-from torch.distributed.device_mesh import init_device_mesh
+import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
 
+from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.parallelizer import (
     _get_parallel_plan,
     megatron_fsdp_strategy_parallelize,
@@ -27,183 +27,81 @@ from nemo_automodel.components.distributed.parallelizer import (
 
 logger = logging.getLogger(__name__)
 
+try:
+    from megatron_fsdp import MegatronFSDP
+    from megatron_fsdp.fully_shard import fully_shard_optimizer as megatron_fsdp_fully_shard_optimizer
 
-@dataclass
+    HAS_MEGATRON_FSDP = True
+except (ImportError, FileNotFoundError):
+    # raise FileNotFoundError(
+    # E   FileNotFoundError: Could not find shared object file for Transformer Engine torch lib.
+    MegatronFSDP = None
+    megatron_fsdp_fully_shard_optimizer = None
+    HAS_MEGATRON_FSDP = False
+
+
 class MegatronFSDPManager:
     """
-    Manager for setting up and parallelizing models using MegatronFSDP with TP, DP, CP sharding.
+    Manager for parallelizing models using MegatronFSDP with TP, DP, CP sharding.
 
-    This manager initializes the torch.distributed process group, infers the group sizes
-    for data parallelism (DP) and tensor parallelism (TP), builds the device mesh for
-    distributed operations, and applies parallelization to the model using a prescribed
-    TP sharding plan. It also supports mixed precision and CPU offloading options.
+    This manager applies parallelization to the model using a prescribed
+    TP sharding plan. It supports mixed precision and various FSDP options.
 
-    Attributes:
-        dp_size (Optional[int]): Data-parallel group size. If None or non-positive, it is
-            inferred from WORLD_SIZE.
-        tp_size (Optional[int]): Tensor-parallel group size. Defaults to 1 if zero/None.
-        cp_size (int): Context-parallel group size for pipeline-like sharding.
-        sequence_parallel (bool): Enables sequence parallelism in the TP plan when True.
-        use_hf_tp_plan (bool): Use Hugging Face TP plan if True.
-        backend (str): Distributed backend to use (e.g., 'nccl' for GPUs or 'gloo' for CPUs).
-        world_size (int): Total number of processes.
+    The device mesh must be created externally and passed in.
 
-    Methods:
-        __post_init__():
-            Automatically sets up the distributed environment after initialization.
-        _setup_distributed():
-            Initializes the torch.distributed process group, infers parallel sizes,
-            builds the device mesh, and registers a destroy handler.
-        parallelize(model):
-            Applies FSDP2 and Tensor-Parallel sharding strategies to the given model.
+    Args:
+        config (MegatronFSDPConfig): Configuration for MegatronFSDP distributed training.
+        device_mesh (DeviceMesh): Device mesh for distributed operations.
+
+    Example:
+        from nemo_automodel.components.distributed.config import MegatronFSDPConfig
+
+        config = MegatronFSDPConfig(zero_dp_strategy=3, overlap_grad_reduce=True)
+        # device_mesh created externally via create_device_mesh()
+        manager = MegatronFSDPManager(config, device_mesh=device_mesh)
+        model, optimizer = manager.parallelize(model, optimizer)
     """
 
-    dp_size: Optional[int] = field(
-        default=None,
-        metadata={"help": "Data-parallel group size; if None, infer from WORLD_SIZE."},
-    )
-    tp_size: Optional[int] = field(
-        default=1,
-        metadata={"help": "Tensor-parallel group size; if None, defaults to 1."},
-    )
-    cp_size: Optional[int] = field(
-        default=1,
-        metadata={"help": "Context-parallel group size (for pipeline-like sharding)."},
-    )
-    sequence_parallel: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Enable sequence parallelism in TP plan if True. Not supported with MegatronFSDP right now."},
-    )
-    use_hf_tp_plan: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Use Hugging Face TP plan if True."},
-    )
-    backend: Optional[str] = field(default="nccl", metadata={"help": "Distributed backend, e.g. 'nccl' or 'gloo'."})
-    world_size: Optional[int] = field(
-        default=None,
-        # init=False,
-        metadata={"help": "Total number of processes."},
-    )
-    megatron_fsdp_unit_modules: Optional[List[str]] = field(
-        default_factory=lambda: [
-            "transformers.models.llama.modeling_llama.LlamaDecoderLayer",
-        ],
-        metadata={"help": "List of unit modules to be wrapped with MegatronFSDP."},
-    )
+    def __init__(
+        self,
+        config: MegatronFSDPConfig,
+        device_mesh: DeviceMesh,
+    ):
+        self.config = config
+        self.device_mesh = device_mesh
 
-    # MegatronFSDP config
-    zero_dp_strategy: Optional[int] = field(
-        default=3,
-        metadata={"help": "Data parallel sharding strategy."},
-    )
-    init_fsdp_with_meta_device: Optional[bool] = field(
-        default=False, metadata={"help": "Initialize MegatronFSDP with meta device if True."}
-    )
-    grad_reduce_in_fp32: Optional[bool] = field(default=False, metadata={"help": "Reduce gradients in fp32 if True."})
-    preserve_fp32_weights: Optional[bool] = field(default=False, metadata={"help": "Preserve fp32 weights if True."})
-    overlap_grad_reduce: Optional[bool] = field(default=True, metadata={"help": "Overlap gradient reduction if True."})
-    overlap_param_gather: Optional[bool] = field(
-        default=True, metadata={"help": "Overlap parameter gathering if True."}
-    )
-    check_for_nan_in_grad: Optional[bool] = field(
-        default=True, metadata={"help": "Check for NaN in gradients if True."}
-    )
-    average_in_collective: Optional[bool] = field(default=False, metadata={"help": "Average in collective if True."})
-    disable_bucketing: Optional[bool] = field(default=False, metadata={"help": "Disable bucketing if True."})
-    calculate_per_token_loss: Optional[bool] = field(
-        default=False, metadata={"help": "Calculate per token loss if True."}
-    )
-    keep_fp8_transpose_cache: Optional[bool] = field(
-        default=False, metadata={"help": "Keep fp8 transpose cache when using custom FSDP if True."}
-    )
-    nccl_ub: Optional[bool] = field(default=False, metadata={"help": "Use NCCL UBs if True."})
-    fsdp_double_buffer: Optional[bool] = field(default=False, metadata={"help": "Use double buffer if True."})
-
-    # Gradient / Activation checkpointing
-    activation_checkpointing: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Enable activation checkpointing for transformer MLP layers to save memory."},
-    )
-
-    def __post_init__(self):
-        """
-        Post-initialization hook that sets up the distributed environment.
-        """
-        return self._setup_distributed()
-
-    def _setup_distributed(self):
-        """
-        Initializes the distributed environment.
-
-        - Checks availability and initialization of torch.distributed.
-        - Infers data-parallel and tensor-parallel sizes if not provided.
-        - Builds a device mesh based on the specified mesh shape and dimension names.
-        - Flattens data and context dimensions if context parallelism is enabled.
-
-        Requires the environment variables: RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT.
-
-        Raises:
-            RuntimeError: If torch.distributed is not available or not initialized.
-
-        Returns:
-            FSDP2Manager: Instance with the device mesh configured.
-        """
-        if not dist.is_available():
-            raise RuntimeError("torch.distributed not available")
-
-        if not dist.is_initialized():
-            raise RuntimeError("expected torch.distributed to be initialized")
-
-        # infer if not provided
-        self.tp_size = self.tp_size or 1
-        self.cp_size = self.cp_size or 1
-
-        if self.dp_size is None or self.dp_size <= 0:
-            # Calculate dp_size to ensure dp_size * tp_size * cp_size == world_size
-            total_parallel_ranks = self.tp_size * self.cp_size
-            if self.world_size % total_parallel_ranks != 0:
-                raise ValueError(
-                    f"world_size ({self.world_size}) must be divisible by (tp_size * cp_size) "
-                    f"({self.tp_size} * {self.cp_size} = {total_parallel_ranks})"
-                )
-            self.dp_size = self.world_size // total_parallel_ranks
-
-        mesh_shape = (self.dp_size, self.cp_size, self.tp_size)
-        mesh_names = ("dp", "cp", "tp")
-        for shape, name in zip(mesh_shape, mesh_names):
-            assert isinstance(shape, int), "Expected {} to be an int, but got {}".format(name, type(shape))
-            assert shape > 0, "Expected {} > 0, {}".format(name, shape)
-
-        # build mesh [dp, cp, tp]
-        self.device_mesh = init_device_mesh(
-            device_type="cuda" if self.backend == "nccl" else "cpu",
-            mesh_shape=mesh_shape,
-            mesh_dim_names=mesh_names,
-        )
-        # flatten dp+cp if cp>1
-        if self.cp_size > 1:
-            self.device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
-        return self
+        # Extract config fields for easy access
+        self.sequence_parallel = config.sequence_parallel
+        self.megatron_fsdp_unit_modules = config.megatron_fsdp_unit_modules
+        self.zero_dp_strategy = config.zero_dp_strategy
+        self.init_fsdp_with_meta_device = config.init_fsdp_with_meta_device
+        self.grad_reduce_in_fp32 = config.grad_reduce_in_fp32
+        self.preserve_fp32_weights = config.preserve_fp32_weights
+        self.overlap_grad_reduce = config.overlap_grad_reduce
+        self.overlap_param_gather = config.overlap_param_gather
+        self.check_for_nan_in_grad = config.check_for_nan_in_grad
+        self.average_in_collective = config.average_in_collective
+        self.disable_bucketing = config.disable_bucketing
+        self.calculate_per_token_loss = config.calculate_per_token_loss
+        self.keep_fp8_transpose_cache = config.keep_fp8_transpose_cache
+        self.nccl_ub = config.nccl_ub
+        self.fsdp_double_buffer = config.fsdp_double_buffer
+        self.activation_checkpointing = config.activation_checkpointing
+        self.backend = config.backend
 
     def parallelize(self, model, optimizer=None):
         """
-        Parallelizes the given model using FSDP2 and TP sharding strategies.
-
-        This method must be called after the distributed environment has been set up.
-        It selects a TP sharding plan (currently supporting Hugging Face
-        TP plan via get_hf_tp_shard_plan) and applies the FSDP2 parallelization strategy.
+        Parallelizes the given model using MegatronFSDP and TP sharding strategies.
 
         Args:
             model: The model to be parallelized.
-            optimizer: The optimizer for the model. If None, user need to call model.finish_grad_sync()
-                before optimizer.step(), model.install_optimized_model_weights() and model.zero_grad_buffer()
-                after optimizer.zero_grad()
+            optimizer: The optimizer for the model. If None, user needs to call
+                model.finish_grad_sync() before optimizer.step(),
+                model.install_optimized_model_weights() and model.zero_grad_buffer()
+                after optimizer.zero_grad().
 
         Returns:
-            The parallelized model.
-
-        Raises:
-            NotImplemented: If the required TP sharding plan is not supported.
+            tuple: (parallelized_model, optimizer)
         """
         if dist.get_world_size() == 1:
             logger.info("World size is 1, skipping parallelization.")
@@ -228,18 +126,18 @@ class MegatronFSDPManager:
                 model,
                 sequence_parallel=False,  # explicit: SP not supported here
                 tp_shard_plan=None,
-                use_hf_tp_plan=self.use_hf_tp_plan,
             )
         else:
             tp_shard_plan = None
 
-        if self.cp_size > 1:
+        # Determine dp_shard_dim based on whether cp is in mesh
+        if "dp_cp" in self.device_mesh.mesh_dim_names:
             dp_shard_dim = "dp_cp"
         else:
             dp_shard_dim = "dp"
         tp_dim = "tp"
 
-        model = megatron_fsdp_strategy_parallelize(
+        model, optimizer = megatron_fsdp_strategy_parallelize(
             model,
             device_mesh=self.device_mesh,
             optimizer=optimizer,
@@ -262,4 +160,17 @@ class MegatronFSDPManager:
             tp_dim=tp_dim,
         )
 
-        return model
+        return model, optimizer
+
+
+def fully_shard_optimizer(
+    model: nn.Module, optimizer: torch.optim.Optimizer, preproc_state_dict_for_dcp_ckpt: bool = True
+) -> torch.optim.Optimizer:
+    """ """
+    if not isinstance(model, MegatronFSDP):
+        return optimizer
+    if not HAS_MEGATRON_FSDP:
+        raise ImportError(
+            "MegatronFSDP is not installed, please visit https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/distributed/fsdp/src for more information"
+        )
+    return megatron_fsdp_fully_shard_optimizer(optimizer)

@@ -1,21 +1,20 @@
-# Dataset Overview: LLM and VLM Datasets in NeMo Automodel
+# Dataset Overview: LLM, VLM, and Retrieval Datasets in NeMo AutoModel
 
-This page summarizes the datasets supported in NeMo Automodel for LLM and VLM and shows how to plug in your own datasets using Python functions or the YAML `_target_` mechanism.
+This page summarizes the datasets supported in NeMo AutoModel for LLM, VLM, and retrieval training and shows how to plug in your own datasets using Python functions or the YAML `_target_` mechanism.
 
-- See also: [LLM datasets](llm/dataset.md) and [VLM datasets](vlm/dataset.md) for deeper, task-specific guides.
+- See also: [LLM datasets](llm/dataset.md), [VLM datasets](vlm/dataset.md), and [Retrieval dataset](llm/retrieval-dataset.md) for deeper, task-specific guides.
 
 - If a dataset you need is missing, please open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) with a short description and example schema so we can prioritize support.
 ---
 
 ## LLM Datasets
 
-NeMo Automodel supports several common patterns for language modeling and instruction tuning.
-
-- **HellaSwag (completion SFT)**
-  - Wrapper: `nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`
-  - Use case: single-turn completion style SFT where a prompt (ctx) is followed by a gold continuation (ending)
-  - Key args: `path_or_dataset`, `split`, `num_samples_limit`
-  - Example YAML:
+NeMo AutoModel supports several common patterns for language modeling and instruction tuning.
+### HellaSwag (Completion SFT)
+- Wrapper: `nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`
+- Use case: single-turn completion-style SFT where a prompt (ctx) is followed by a gold continuation (ending)
+- Key args: `path_or_dataset`, `split`, `num_samples_limit`
+- Example YAML:
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
@@ -23,13 +22,14 @@ dataset:
   split: train
 ```
 
-- **SQuAD-style Question Answering (QA) (instruction SFT)**
-  - Factory: `nemo_automodel.components.datasets.llm.squad.make_squad_dataset`
-  - Use case: instruction/QA tuning with either prompt+answer formatting or chat-template formatting
-  - Notes:
-    - If the tokenizer has a chat template and you want answer-only loss, you must provide `start_of_turn_token`.
-    - Optional `seq_length` can be used for padding/truncation.
-  - Example YAML:
+### SQuAD-Style Question Answering (QA) (Instruction SFT)
+- Factory: `nemo_automodel.components.datasets.llm.squad.make_squad_dataset`
+- Use case: instruction/QA tuning with either prompt-and-answer formatting or chat-template formatting
+:::{note}
+- If the tokenizer has a chat template and you want answer-only loss, you must provide `start_of_turn_token`.
+- Optional `seq_length` can be used for padding/truncation.
+:::
+- Example YAML:
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
@@ -44,6 +44,9 @@ dataset:
   - Sources: local JSON/JSONL or Hugging Face Hub dataset ID
   - Notes:
     - For tokenizers with chat templates and answer-only loss, you may set `answer_only_loss_mask: true` and provide `start_of_turn_token`.
+    - Supports streaming mode for large datasets (see [Streaming Datasets](#streaming-datasets) section below).
+    - Map-style, non-streaming dataset (supports `len(ds)` and `ds[i]`)
+    - For streaming (including Delta Lake / Databricks), use `ColumnMappedTextInstructionIterableDataset`
   - Example YAML:
 ```yaml
 dataset:
@@ -73,13 +76,42 @@ See the detailed guide, [Column-Mapped Text Instruction Dataset](llm/column-mapp
     - `truncation`: truncation strategy ("do_not_truncate", "longest_first", etc.)
     - `start_of_turn_token`: token marking assistant response start (for answer-only loss)
     - `chat_template`: optional override for tokenizer's chat template
+    - `skip_invalid_samples`: if ``true``, skip malformed JSONL lines when reading local files (warnings log skip counts); default ``false`` fails fast on a bad line
   - Notes:
     - Requires a tokenizer with chat template support
     - Supports both single-turn and multi-turn tool calling
     - Tool definitions are provided in a `tools` field at the conversation level
     - Tool calls appear in assistant messages via `tool_calls` field
     - Tool responses use the `tool` role
-  - Example YAML:
+### ChatDataset (Multi-Turn Conversations and Tool Calling)
+- Class: `nemo_automodel.components.datasets.llm.ChatDataset`
+- Use case: multi-turn conversations and tool calling in OpenAI chat format
+- Sources: local JSON/JSONL or Hugging Face Hub dataset ID
+- Key args:
+  - `path_or_dataset_id`: path to local file(s) or Hugging Face dataset ID
+  - `tokenizer`: tokenizer instance (required; must have chat template support)
+  - `split`: dataset split (e.g., "train", "validation")
+  - `name`: dataset configuration/subset name
+  - `seq_length`: maximum sequence length for padding/truncation
+  - `padding`: padding strategy ("do_not_pad", "max_length", etc.)
+  - `truncation`: truncation strategy ("do_not_truncate", "longest_first", etc.)
+  - `start_of_turn_token`: token marking assistant response start (for answer-only loss)
+  - `chat_template`: optional override for tokenizer's chat template
+  - `mask_reasoning_content`: optionally exclude rendered `reasoning_content` tokens from loss
+  - `skip_invalid_samples`: if ``true``, skip malformed JSONL lines when reading local files (warnings log skip counts); default ``false`` fails fast on a bad line
+:::{note}
+- Requires a tokenizer with chat template support
+- Supports both single-turn and multi-turn tool calling
+- Assistant messages may also include `reasoning_content` for structured reasoning traces
+- Tool definitions are provided in a `tools` field at the conversation level
+- Tool calls appear in assistant messages through the `tool_calls` field
+- Tool responses use the `tool` role and must include `tool_call_id`
+- If your dataset contains `reasoning_content`, your chat template must render it explicitly or it will be dropped
+- For multi-turn tool-calling datasets, prefer chat templates that use `{% generation %}` blocks so assistant-turn loss masking is exact
+- Set `mask_reasoning_content: true` if you want to train on the final assistant answer while excluding rendered reasoning traces from loss
+- Set `skip_invalid_samples: true` for noisy local JSONL so lines that are not valid JSON are skipped instead of failing the load
+:::
+- Example YAML:
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.ChatDataset
@@ -90,17 +122,24 @@ dataset:
     pretrained_model_name_or_path: google/functiongemma-270m-it
   seq_length: 2048
   start_of_turn_token: "<start_of_turn>"
+  mask_reasoning_content: false
+  skip_invalid_samples: false
 ```
   - Expected data format (OpenAI messages format):
 ```json
 {
   "messages": [
     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+    },
+    {
       "role": "user",
-      "content": "What's the weather in Seattle?"
+      "content": "What's the weather in Seattle and should I bring an umbrella?"
     },
     {
       "role": "assistant",
+      "reasoning_content": "The user wants weather info and advice. I should call get_weather first, then decide whether an umbrella is needed.",
       "content": "",
       "tool_calls": [
         {
@@ -116,11 +155,12 @@ dataset:
     {
       "role": "tool",
       "tool_call_id": "call_1",
-      "content": "{\"temperature\": 65, \"condition\": \"cloudy\"}"
+      "content": "{\"temperature\": 55, \"condition\": \"rain\", \"precipitation_chance\": 0.85}"
     },
     {
       "role": "assistant",
-      "content": "It's 65°F and cloudy in Seattle."
+      "reasoning_content": "It is raining with a high precipitation chance, so I should recommend bringing an umbrella.",
+      "content": "It's currently 55 degrees F and raining in Seattle with an 85% chance of continued precipitation. Yes, definitely bring an umbrella."
     }
   ],
   "tools": [
@@ -140,6 +180,17 @@ dataset:
     }
   ]
 }
+```
+  - Template requirement example for `reasoning_content`:
+```jinja
+{%- if message.reasoning_content %}
+{% generation %}
+{{ "<think>\n" + message.reasoning_content + "\n</think>\n" }}
+{% endgeneration %}
+{%- endif %}
+{% generation %}
+{{ message.content }}
+{% endgeneration %}
 ```
   - For single-turn tool calling (one tool call per conversation), omit the tool response and final assistant message:
 ```json
@@ -184,20 +235,43 @@ dataset:
 }
 ```
 See the [Function Calling guide](llm/toolcalling.md) for an end-to-end example with FunctionGemma.
+For a small reasoning-style chat SFT starting point, see [qwen2_5_0p5b_instruct_fineproofs_chat.yaml](../../examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml).
 
-- **NanoGPT Binary Shards (pretraining)**
-  - Class: `nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset`
-  - Use case: token-level LM pretraining over `.bin` shards produced by NanoGPT-style preprocessors (supports legacy and current formats)
-  - Notes:
-    - Streams contiguous `seq_len` slices, supports optional BOS alignment and `.bos.idx` sidecar files
-    - Related tool: `tools/nanogpt_data_processor.py`
+### Retrieval (Embedding Fine-Tuning)
+- Factory: `nemo_automodel.components.datasets.llm.make_retrieval_dataset`
+- Collator: `nemo_automodel.components.datasets.llm.BiEncoderCollator`
+- Use case: embedding model fine-tuning with (query, positive doc, negative docs) contrastive learning
+- Supported schemas:
+  - Corpus-ID JSON (Merlin/NeMo-retriever style)
+  - Inline-text JSONL (e.g., `{"query": "...", "pos_doc": "...", "neg_doc": ["...", "..."]}`)
+- Example YAML:
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
+  data_dir_list: /abs/path/to/train.jsonl
+  data_type: train
+  n_passages: 5
+collate_fn:
+  _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
+  q_max_len: 512
+  p_max_len: 512
+```
+See the detailed guide, [Retrieval dataset](llm/retrieval-dataset.md), for more information.
 
-- **Megatron (pretraining; interoperable with pre-tokenized Megatron data)**
-  - Class: `nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining`
-  - Use case: large-scale LM pretraining over Megatron-LM formatted tokenized corpora
-  - Interoperability: If your corpus has already been tokenized/indexed for Megatron (i.e., `.bin`/`.idx` pairs), you can point Automodel to those assets directly. No re-tokenization required.
-  - Key args: `paths` (single path, glob, weighted list, or per-split dict), `seq_length`, `tokenizer`, `split`, `index_mapping_dir`, `splits_to_build`
-  - Example YAML:
+### NanoGPT Binary Shards (Pretraining)
+- Class: `nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset`
+- Use case: token-level LM pretraining over `.bin` shards produced by NanoGPT-style preprocessors (supports legacy and current formats)
+:::{note}
+- Streams contiguous `seq_len` slices, supports optional BOS alignment and `.bos.idx` sidecar files
+- Related tool: `tools/nanogpt_data_processor.py`
+:::
+
+### Megatron (Pretraining; Interoperable With Pre-Tokenized Megatron Data)
+- Class: `nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining`
+- Use case: large-scale LM pretraining over Megatron-LM formatted tokenized corpora
+- Interoperability: If your corpus has already been tokenized/indexed for Megatron (i.e., `.bin`/`.idx` pairs), you can point AutoModel to those assets directly. No re-tokenization required.
+- Key args: `paths` (single path, glob, weighted list, or per-split dict), `seq_length`, `tokenizer`, `split`, `index_mapping_dir`, `splits_to_build`
+- Example YAML:
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
@@ -212,6 +286,146 @@ dataset:
 ```
 See the detailed [pretraining guide](llm/pretraining.md), which uses MegatronPretraining data.
 
+## Streaming Datasets
+
+Streaming datasets enable processing very large datasets without loading them entirely into memory. This is particularly useful when working with datasets that exceed available RAM or when you want to start training immediately without waiting for the full dataset to download.
+
+### What Are Streaming Datasets?
+
+Streaming datasets load and process data incrementally, one batch at a time, rather than loading the entire dataset into memory upfront. This approach:
+
+- **Reduces memory footprint**: Only the current batch resides in memory
+- **Enables training on massive datasets**: Process terabyte-scale datasets on machines with limited RAM
+- **Faster startup**: Begin training immediately without waiting for full dataset download
+- **Efficient for remote datasets**: Stream directly from Hugging Face Hub without local storage
+
+### When to Use Streaming
+
+Use streaming mode when:
+
+- Your dataset is very large (hundreds of GB or TB)
+- Available memory is limited compared to dataset size
+- You want to start training quickly without downloading the full dataset
+- You're experimenting with a subset of a large dataset
+
+Avoid streaming when:
+
+- Your dataset is small enough to fit comfortably in memory
+- You need random access to samples (e.g., for certain sampling strategies)
+- You need to know the exact dataset length upfront
+- Training requires multiple passes with different orderings
+
+### How to Enable Streaming
+
+For `ColumnMappedTextInstructionDataset`, use the streaming variant by changing the class to `ColumnMappedTextInstructionIterableDataset`:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset.ColumnMappedTextInstructionIterableDataset
+  path_or_dataset_id: Muennighoff/natural-instructions
+  split: train
+  column_mapping:
+    context: definition
+    question: inputs
+    answer: targets
+  answer_only_loss_mask: true
+  start_of_turn_token: "<|assistant|>"
+```
+
+For Hugging Face datasets loaded directly, set `streaming=True`:
+
+```python
+from datasets import load_dataset
+
+# Non-streaming (loads entire dataset into memory)
+dataset = load_dataset("large-dataset/corpus", split="train", streaming=False)
+
+# Streaming (loads data incrementally)
+dataset = load_dataset("large-dataset/corpus", split="train", streaming=True)
+```
+
+### Streaming Limitations
+
+When using streaming datasets, be aware of these limitations:
+
+1. **No random access**: You cannot use `dataset[index]` to access specific samples. Streaming datasets only support iteration.
+
+2. **No length information**: The `len(dataset)` operation is not available. You cannot determine the total number of samples upfront.
+
+3. **Single-pass iteration**: Each iteration consumes the stream. To iterate multiple times, you need to recreate the dataset or use the `repeat_on_exhaustion` parameter.
+
+4. **Limited shuffling**: Shuffling is done with a buffer (not the entire dataset), which may not provide perfect randomization.
+
+### Distributed Training with Streaming
+
+Streaming datasets support distributed training through sharding:
+
+```python
+from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset import (
+    ColumnMappedTextInstructionIterableDataset
+)
+
+dataset = ColumnMappedTextInstructionIterableDataset(
+    path_or_dataset_id="large-dataset/corpus",
+    column_mapping={"question": "input", "answer": "output"},
+    tokenizer=tokenizer,
+)
+
+# Shard the dataset across workers
+dataset = dataset.shard(num_shards=8, index=worker_id)
+
+# Enable shuffling with a buffer
+dataset = dataset.shuffle(buffer_size=10000, seed=42)
+
+# Set epoch for deterministic shuffling across epochs
+dataset.set_epoch(epoch_num)
+```
+
+### Performance Considerations
+
+**Memory vs. Speed Trade-offs**:
+- Streaming reduces memory usage but may be slower than in-memory datasets
+- Network latency can impact streaming performance for remote datasets
+- Use local caching when repeatedly accessing the same remote dataset
+
+**Buffer Size for Shuffling**:
+- Larger buffers provide better randomization but use more memory
+- A buffer size of 10,000-100,000 samples is typically a good balance
+- For perfect shuffling, you need a buffer size equal to the dataset size (defeating the purpose of streaming)
+
+**Prefetching**:
+- Most streaming implementations prefetch data in the background
+- This helps hide network latency and keeps GPUs busy
+- Adjust prefetch settings based on your network speed and batch size
+
+### Example: Streaming a Large Dataset
+
+Here's a complete example of using streaming for a large instruction-tuning dataset:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset.ColumnMappedTextInstructionIterableDataset
+  path_or_dataset_id: HuggingFaceH4/ultrachat_200k
+  split: train_sft
+  column_mapping:
+    question: prompt
+    answer: completion
+  answer_only_loss_mask: true
+  start_of_turn_token: "<|assistant|>"
+  repeat_on_exhaustion: true  # Automatically restart when stream ends
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  batch_size: 4
+  num_workers: 4
+```
+
+This configuration:
+- Streams the dataset without loading it fully into memory
+- Automatically repeats when the stream is exhausted
+- Uses multiple workers for efficient data loading
+- Applies answer-only loss masking during tokenization
+
 ## Packed Sequence Support
 To reduce padding and improve throughput with variable-length sequences:
 ```yaml
@@ -219,7 +433,7 @@ packed_sequence:
   packed_sequence_size: 8192   # > 0 enables packing
   split_across_pack: false
 ```
-Use a collater that pads to an FP8-friendly multiple when training with FP8:
+Use a collator that pads to an FP8-friendly multiple when training with FP8:
 ```yaml
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -259,6 +473,18 @@ Each example follows the conversation schema expected by `apply_chat_template`, 
 }
 ```
 
+### Custom Chat Template
+By default, VLM fine-tuning uses the chat template built into the model's `AutoProcessor`. To override it, add `chat_template` under `dataset:` in your YAML config:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  split: train
+  chat_template: "{% for msg in messages %}{{ msg.role }}: {{ msg.content }}\n{% endfor %}"
+```
+
+`chat_template` accepts a Jinja template string, a path to a `.jinja` file, or a path to a JSON file containing a `chat_template` key. The override is applied to both the processor and its tokenizer before dataset instantiation.
+
 ### Collate Functions
 - `nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn`
 - `nemo_automodel.components.datasets.vlm.collate_fns.qwen2_5_collate_fn` (Qwen2.5 VL)
@@ -278,10 +504,42 @@ See [Gemma-3n](omni/gemma3-3n.md) and [VLM dataset](vlm/dataset.md) for end-to-e
 
 ---
 
-## Bring Your Own Dataset
-You can integrate custom datasets with zero code changes to NeMo Automodel by using `_target_` in YAML. There are three approaches:
+## Diffusion Datasets
 
-### 1) Point to an existing class or function (dotted path)
+Diffusion models don't train directly on raw images or videos. Instead, the data is first encoded into a compact numerical representation called a latent — this is what the model actually learns from. Text captions are similarly converted into text embeddings that the model uses as conditioning.
+
+This encoding is done once during preprocessing, and the results are saved as cache files (.meta). Training then reads these cache files directly, which is significantly faster than re-encoding on every step.
+
+The built-in preprocessing tool ([`tools/diffusion/preprocessing_multiprocess.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/diffusion/preprocessing_multiprocess.py)) handles this conversion. It uses a VAE (Variational Autoencoder) to encode visual data and a text encoder for captions, grouping outputs into resolution-bucketed directories compatible with the multiresolution dataloader.
+
+### Dataloader Builders
+
+- **Video (T2V)**: `nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader` — for Wan 2.1 and HunyuanVideo
+- **Image (T2I)**: `nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader` — for FLUX.1-dev
+
+### Example YAML (Video Dataloader)
+
+```yaml
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
+    cache_dir: /path/to/processed_meta
+    model_type: wan
+    base_resolution: [512, 512]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+    num_workers: 0
+```
+
+See the [Diffusion Dataset Preparation](diffusion/dataset.md) guide for full preprocessing instructions and configuration details.
+
+---
+
+## Bring Your Own Dataset
+You can integrate custom datasets with zero code changes to NeMo AutoModel by using `_target_` in YAML. There are three approaches:
+
+### Point to an Existing Class or Function (Dotted Path)
 - LLM example (class):
 ```yaml
 dataset:
@@ -303,7 +561,7 @@ dataset:
   split: train
 ```
 
-### 2) Point to a local Python file and function
+### Point to a Local Python File and Function
 ```yaml
 dataset:
   _target_: /abs/path/to/my_custom_dataset.py:build_my_dataset
@@ -312,7 +570,7 @@ dataset:
 ```
 Where `build_my_dataset` returns either a `datasets.Dataset` or a list/iterator of conversation dicts (for VLM).
 
-### 3) Use ColumnMappedTextInstructionDataset for most instruction datasets (LLM)
+### Use ColumnMappedTextInstructionDataset for Most Instruction Datasets (LLM)
 - Ideal when your data has columns like `instruction`, `input`, or `output` but with arbitrary names
 - Supports local JSON/JSONL and HF Hub
 ```yaml
@@ -327,7 +585,7 @@ dataset:
   start_of_turn_token: "<|assistant|>"
 ```
 
-### Minimal Custom Class Pattern (LLM Completion)
+### Implement a Minimal Custom Class Pattern (LLM Completion)
 If you prefer Python, implement `get_context` and `get_target` and reuse the built-in preprocessor:
 ```python
 from datasets import load_dataset
@@ -344,7 +602,7 @@ class MyCompletionDataset:
     def get_target(self, examples):
         return examples["my_target_field"]
 ```
-Then reference your class via `_target_` in YAML.
+Then reference your class with `_target_` in YAML.
 
 ### Important Considerations
 - **Chat templates**: If your tokenizer has a chat template and you want answer-only loss, provide the correct `start_of_turn_token` (LLM) or `start_of_response_token` (VLM collate functions).

@@ -24,7 +24,9 @@ logger = logging.getLogger(__name__)
 
 
 def _calculate_max_steps(
-    num_epochs: int, epoch_len: Optional[int], default_max_steps: int = 9223372036854775807
+    num_epochs: int,
+    epoch_len: Optional[int],
+    default_max_steps: int = 9223372036854775807,
 ) -> int:
     """
     Calculate the maximum number of steps.
@@ -32,6 +34,15 @@ def _calculate_max_steps(
     if epoch_len is None:
         return default_max_steps
     return num_epochs * epoch_len
+
+
+def _calculate_num_epochs(max_steps: Optional[int], epoch_len: Optional[int], default_num_epochs: int = 10) -> int:
+    """
+    Calculate the number of epochs out of maximum number of steps.
+    """
+    if epoch_len is None or max_steps is None:
+        return default_num_epochs
+    return ceil(max_steps / epoch_len)
 
 
 class StepScheduler(Stateful):
@@ -46,12 +57,14 @@ class StepScheduler(Stateful):
         dp_size: int,
         dataloader: Optional[int],
         ckpt_every_steps: Optional[int] = None,
+        save_checkpoint_every_epoch: bool = True,
         val_every_steps: Optional[int] = None,
         log_remote_every_steps: int = 1,
+        gc_every_steps: Optional[int] = None,
         start_step: int = 0,
         start_epoch: int = 0,
-        num_epochs: int = 10,
-        max_steps: int = None,
+        num_epochs: Optional[int] = None,
+        max_steps: Optional[int] = None,
     ):
         """
         Initialize the StepScheduler.
@@ -62,11 +75,16 @@ class StepScheduler(Stateful):
             dp_size (int): Number of GPUs for data parallelism.
             dataloader: The training dataloader.
             ckpt_every_steps (Optional[int]): Frequency of checkpoint steps.
+            save_checkpoint_every_epoch (bool): Whether to save checkpoints at epoch boundaries.
+                When True, checkpoints are saved at the end of each epoch (is_last_batch).
+                When False, only periodic, last-step, and SIGTERM checkpoints are saved.
+                Default: True.
             val_every_steps (Optional[int]): Number of training steps between validation.
             log_remote_every_steps (int): Frequency of remote logging (e.g., WandB, MLflow). Default: 1 (every step).
+            gc_every_steps (Optional[int]): Frequency of manual garbage collection steps.
             start_step (int): Initial global step. Used when resuming from checkpoint. Default: 0.
             start_epoch (int): Initial epoch. Used when resuming from checkpoint. Default: 0.
-            num_epochs (int): Total number of epochs. Default: 10.
+            num_epochs (Optional[int]): Total number of epochs. Default: None or calculated from max_steps if num_epochs is None or 10 if max_steps and num_epochs are both None.
             max_steps (Optional[int]): Maximum number of steps to run. If None, calculated from num_epochs.
         """
         assert global_batch_size % (local_batch_size * dp_size) == 0, (
@@ -81,17 +99,31 @@ class StepScheduler(Stateful):
         assert start_step >= 0, "start_step must be greater than or equal to 0"
         self.epoch = start_epoch
         assert start_epoch >= 0, "start_epoch must be greater than or equal to 0"
-        self.num_epochs = num_epochs
-        assert num_epochs > 0, "num_epochs must be greater than 0"
+
         # Throws with IterableDataset.
         try:
             self.epoch_len = ceil(len(dataloader) / self.grad_acc_steps)
         except:
             self.epoch_len = None
+
+        # This is for backward compatibility in the sense that num_epochs's default value was 10
+        if num_epochs is None:
+            num_epochs = _calculate_num_epochs(
+                max_steps,
+                self.epoch_len,
+            )
+
+        self.num_epochs = num_epochs
+        assert num_epochs is None or num_epochs > 0, (
+            "num_epochs must be greater than 0 or None if max_steps is provided"
+        )
+
         self.val_every_steps = val_every_steps
         assert val_every_steps is None or val_every_steps > 0, "val_every_steps must be greater than 0 if not None"
         self.log_remote_every_steps = log_remote_every_steps
         assert log_remote_every_steps > 0, "log_remote_every_steps must be greater than 0"
+        self.gc_every_steps = gc_every_steps
+        assert gc_every_steps is None or gc_every_steps > 0, "gc_every_steps must be greater than 0 if not None"
         if max_steps is None:
             assert self.epoch_len is not None, "epoch_len must be provided if max_steps is not provided"
             max_steps = _calculate_max_steps(self.num_epochs, self.epoch_len)
@@ -106,6 +138,7 @@ class StepScheduler(Stateful):
                 ckpt_every_steps = self.epoch_len
             logger.info("ckpt_every_steps not provided; will save checkpoint every {} steps".format(ckpt_every_steps))
         self.ckpt_every_steps = ckpt_every_steps
+        self.save_checkpoint_every_epoch = save_checkpoint_every_epoch
 
         self.sig_handler = DistributedSignalHandler().__enter__()
         self.sigterm_flag = False
@@ -170,7 +203,15 @@ class StepScheduler(Stateful):
             bool: if true, the checkpoint should run.
         """
         is_ckpt_step = (self.step % self.ckpt_every_steps) == self.ckpt_every_steps - 1
-        return is_ckpt_step or self.is_last_batch or self.is_last_step or self.sigterm_received
+        is_epoch_boundary = self.save_checkpoint_every_epoch and self.is_last_batch
+        return is_ckpt_step or is_epoch_boundary or self.is_last_step or self.sigterm_received
+
+    @property
+    def is_gc_step(self):
+        """
+        Returns whether this step needs to run manual garbage collection.
+        """
+        return self.gc_every_steps is not None and self.step % self.gc_every_steps == 0
 
     @property
     def is_last_step(self):

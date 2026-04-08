@@ -53,7 +53,7 @@ jobs:
         run: az acr login --name nemoci
 
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.TARGET_BRANCH }}
 
@@ -74,7 +74,7 @@ jobs:
           fi
 
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.SOURCE_BRANCH }}
 
@@ -91,7 +91,7 @@ jobs:
           bash -c 'source /opt/venv/env.sh && uv lock --upgrade'
 
       - name: Upload lock file
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: lock-file-${{ env.SOURCE_BRANCH }}
           path: uv.lock
@@ -105,7 +105,7 @@ jobs:
       TARGET_BRANCH: ${{ inputs.target-branch }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           token: ${{ secrets.PAT }}
           ref: ${{ env.TARGET_BRANCH }}
@@ -122,7 +122,7 @@ jobs:
           git_commit_gpgsign: true
 
       - name: Download lock file
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: lock-file-${{ env.SOURCE_BRANCH }}
 

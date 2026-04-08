@@ -11,7 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+
 import pytest
+
+os.environ.setdefault("HF_CACHE", "/home/TestData/lite/hf_cache")
+os.environ.setdefault("HF_HOME", "/home/TestData/HF_HOME")
+
+# Ensure the repository root is importable so functional tests can do
+# `from tests.utils.test_utils import run_test_script` reliably across
+# different pytest import modes / runners.
+#
+# (Without this, some environments do not include the repo root on sys.path,
+# causing `ModuleNotFoundError: No module named 'tests.utils'` during collection.)
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 # List of CLI overrides forwarded by the functional-test shell scripts.
 # Registering them with pytest prevents the test discovery phase from
@@ -20,9 +38,11 @@ _OVERRIDES = [
     "config",
     "model.pretrained_model_name_or_path",
     "model.config.pretrained_model_name_or_path",
+    "model.is_meta_device",
     "step_scheduler.max_steps",
     "step_scheduler.global_batch_size",
     "step_scheduler.local_batch_size",
+    "step_scheduler.val_every_steps",
     "dataset.tokenizer.pretrained_model_name_or_path",
     "validation_dataset.tokenizer.pretrained_model_name_or_path",
     "dataset.dataset_name",
@@ -41,11 +61,15 @@ _OVERRIDES = [
     "checkpoint.staging_dir",
     "dataloader.batch_size",
     "checkpoint.save_consolidated",
+    "loss_fn._target_",
     "peft.peft_fn",
     "peft.match_all_linear",
     "peft.dim",
     "peft.alpha",
+    "peft.dropout",
+    "peft.target_modules",
     "peft.use_triton",
+    "peft.use_dora",
     "peft._target_",
     "distributed",
     "distributed._target_",
@@ -53,25 +77,64 @@ _OVERRIDES = [
     "distributed.tp_size",
     "distributed.cp_size",
     "distributed.pp_size",
+    "distributed.ep_size",
+    "distributed.strategy",
     "distributed.sequence_parallel",
     "distributed.activation_checkpointing",
     "dataset._target_",
     "dataset.path_or_dataset",
+    "dataset.num_samples_limit",
     "validation_dataset.path_or_dataset",
+    "validation_dataset.split",
+    "validation_dataset.num_samples_limit",
     "validation_dataset.limit_dataset_samples",
-    "autopipeline._target_",
-    "autopipeline.pp_schedule",
-    "autopipeline.pp_microbatch_size",
-    "autopipeline.pp_batch_size",
-    "autopipeline.round_virtual_stages_to_pp_multiple",
-    "autopipeline.scale_grads_in_schedule",
+    "distributed.pipeline._target_",
+    "distributed.pipeline.pp_schedule",
+    "distributed.pipeline.pp_microbatch_size",
+    "distributed.pipeline.pp_batch_size",
+    "distributed.pipeline.layers_per_stage",
+    "distributed.pipeline.round_virtual_stages_to_pp_multiple",
+    "distributed.pipeline.scale_grads_in_schedule",
     "dataset.seq_length",
+    "dataset.seq_len",
     "validation_dataset.seq_length",
+    "teacher_model.pretrained_model_name_or_path",
     "freeze_config.freeze_language_model",
+    "model.output_hidden_states",
+    "model.text_config.output_hidden_states",
+    "benchmark.warmup_steps",
+    "packed_sequence.packed_sequence_size",
     "qat.fake_quant_after_n_steps",
     "qat.enabled",
     "qat.quantizer._target_",
     "qat.quantizer.groupsize",
+    "qat.qat_config._target_",
+    "qat.qat_config.groupsize",
+    "dataloader.collate_fn.pad_seq_len_divisible",
+    "validation_dataloader.collate_fn.pad_seq_len_divisible",
+    "kl_threshold",
+    "hf_kl_threshold",
+    "cross_tp_size",
+    "cross_tp_kl_threshold",
+    "tokenizer",
+    "experts_implementation",
+    "tokenizer_name",
+    "max_vram_gb",
+    "max_cpu_gb",
+    "resume_loss_threshold",
+    "cosine_threshold",
+    "dataloader.dataset.data_dir_list",
+    "tokenizer._target_",
+    "tokenizer.pretrained_model_name_or_path",
+    "tokenizer.trust_remote_code",
+]
+
+_BOOLEAN_OVERRIDES = [
+    "trust_remote_code",
+    "check_fused_qkv_keys",
+    "check_phantom_keys",
+    "check_resume",
+    "hf_device_map_auto",
 ]
 
 
@@ -87,3 +150,6 @@ def pytest_addoption(parser: pytest.Parser):
         # ``dest`` must be a valid Python identifier, so replace dots.
         dest = opt.replace(".", "_")
         parser.addoption(f"--{opt}", dest=dest, action="store", help=f"(passthrough) {opt}")
+    for opt in _BOOLEAN_OVERRIDES:
+        dest = opt.replace(".", "_")
+        parser.addoption(f"--{opt}", dest=dest, action="store_true", default=False, help=f"(passthrough) {opt}")

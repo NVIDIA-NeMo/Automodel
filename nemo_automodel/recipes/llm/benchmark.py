@@ -21,6 +21,7 @@ import torch
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.training.utils import (
+    prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
 )
@@ -28,6 +29,49 @@ from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 logger = logging.getLogger(__name__)
+
+
+def _infer_vocab_size(model_cfg):
+    """Infer vocab_size from a model config, handling custom config classes and VL composite configs.
+
+    Args:
+        model_cfg: The model config section (cfg.model) containing _target_, config, etc.
+
+    Returns:
+        The vocab_size integer, or raises AttributeError if not found.
+    """
+    from transformers import AutoConfig
+
+    config_section = model_cfg.config
+    trust_remote_code = getattr(config_section, "trust_remote_code", False)
+
+    # Use the config's _target_ if it's a custom config class (e.g. DeepseekV32Config)
+    config_target = getattr(config_section, "_target_", None)
+    model_config = None
+
+    if config_target is not None and callable(config_target):
+        target_name = getattr(config_target, "__qualname__", "")
+        if "AutoConfig" not in target_name:
+            model_config = config_target.from_pretrained(config_section.pretrained_model_name_or_path)
+    elif isinstance(config_target, str) and "AutoConfig" not in config_target:
+        import importlib
+
+        module_path, class_name = config_target.rsplit(".", 1)
+        mod = importlib.import_module(module_path)
+        config_cls = getattr(mod, class_name)
+        model_config = config_cls.from_pretrained(config_section.pretrained_model_name_or_path)
+
+    if model_config is None:
+        model_config = AutoConfig.from_pretrained(
+            config_section.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+        )
+
+    if hasattr(model_config, "vocab_size"):
+        return model_config.vocab_size
+    elif hasattr(model_config, "text_config") and hasattr(model_config.text_config, "vocab_size"):
+        return model_config.text_config.vocab_size
+    else:
+        raise AttributeError(f"Could not find vocab_size on {type(model_config).__name__} or its text_config")
 
 
 class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPrediction):
@@ -62,13 +106,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Infer vocab_size from model config and inject it into dataset config
         if hasattr(cfg, "dataset") and hasattr(cfg, "model"):
-            # Get vocab_size from model config
             if hasattr(cfg.model, "config") and hasattr(cfg.model.config, "pretrained_model_name_or_path"):
-                from transformers import AutoConfig
-
-                model_config = AutoConfig.from_pretrained(cfg.model.config.pretrained_model_name_or_path)
-                vocab_size = model_config.vocab_size
-                # Inject vocab_size into dataset config
+                vocab_size = _infer_vocab_size(cfg.model)
                 cfg.dataset.vocab_size = vocab_size
                 if logger.isEnabledFor(logging.INFO):
                     logger.info(f"Inferred vocab_size={vocab_size} from model config")
@@ -111,9 +150,17 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         self.tflops = flops / (10**12)
 
         if hasattr(self.cfg, "peft"):
-            # Calculate trainable vs non-trainable parameters without lora
-            lora_params = self.param_info["trainable_params"]
-            total_params = self.param_info["total_params"]
+            # Calculate trainable vs non-trainable parameters
+            # Need to get these before autopipeline splits the model across PP ranks
+            if self.pp is not None:
+                # PP enabled - use pre-sharding values stored on autopipeline
+                lora_params = self.pp.trainable_params_before_pp
+                total_params = self.pp.total_params_before_pp
+            else:
+                # No PP - model is not sharded, calculate directly
+                from nemo_automodel.components.utils.model_utils import print_trainable_parameters
+
+                lora_params, total_params = print_trainable_parameters(self.model_parts[0])
             frozen_params = total_params - lora_params
 
             # Adjust TFLOPS for PEFT: training has 3 computational phases:
@@ -196,6 +243,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Main benchmarking loop
         for i in range(steps):
+            self.step_scheduler.step = i
             # Start nsys profiling if configured
             if i == nsys_start and rank in nsys_ranks:
                 logger.info(f"Rank {rank} | Starting nsys profiling")
@@ -240,6 +288,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
                     torch.cuda.nvtx.range_pop()
 
+                    if ga_step_idx == 0:
+                        prepare_after_first_microbatch()
+
                 # Optimizer step
                 with self.timers("optimizer", log_level=2):
                     for opt in self.optimizer:
@@ -275,6 +326,11 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     f"loss={reporting_loss:.4f}"
                 )
 
+            # Collect and log MoE load balance metrics (inherited from train_ft)
+            self._collect_moe_load_balance()
+            if self._wandb_enabled and self.wandb_run is not None:
+                self._log_moe_metrics(i, self.wandb_run.log)
+
             # Calculate and log MFU
             self._log_iteration_metrics(iter_timer, ga_steps, peak_tflops, rank, i)
 
@@ -282,6 +338,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if i == nsys_end and rank in nsys_ranks:
                 logger.info(f"Rank {rank} | Stopping nsys profiling")
                 torch.cuda.cudart().cudaProfilerStop()
+
+            self._maybe_collect_garbage()
 
         # Final summary
         self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)

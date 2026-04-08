@@ -20,26 +20,7 @@ from torch.distributed.fsdp import FSDPModule, fully_shard
 from torch.distributed.pipelining._backward import stage_backward, stage_backward_input, stage_backward_weight
 from torch.nn.parallel import DistributedDataParallel
 
-IS_OPTIM_STEP = False
-
-
-def set_is_optim_step(value: bool) -> None:
-    """Set the global IS_OPTIM_STEP flag.
-
-    Args:
-        value: Whether we are in an optimization step.
-    """
-    global IS_OPTIM_STEP
-    IS_OPTIM_STEP = value
-
-
-def get_is_optim_step() -> bool:
-    """Get the global IS_OPTIM_STEP flag.
-
-    Returns:
-        Whether we are in an optimization step.
-    """
-    return IS_OPTIM_STEP
+from nemo_automodel.components.models.common.utils import get_is_optim_step
 
 
 def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
@@ -63,13 +44,15 @@ def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
     if hasattr(module, "visual") and isinstance(module.visual, FSDPModule):
         yield module.visual
 
-    # Check experts in each layer
+    # Check experts in each layer (Qwen-style: block.mlp.experts; Gemma4-style: block.moe.experts)
     if hasattr(_model, "layers"):
         for _, block in _model.layers.named_children():
-            if hasattr(block, "mlp") and hasattr(block.mlp, "experts"):
-                experts = block.mlp.experts
-                if isinstance(experts, FSDPModule):
-                    yield experts
+            for attr in ("mlp", "moe"):
+                mod = getattr(block, attr, None)
+                if mod is not None and hasattr(mod, "experts"):
+                    experts = mod.experts
+                    if isinstance(experts, FSDPModule):
+                        yield experts
 
 
 def _configure_fsdp_module(

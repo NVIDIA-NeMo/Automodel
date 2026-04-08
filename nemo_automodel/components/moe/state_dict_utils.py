@@ -26,10 +26,8 @@ def is_dtensor(tensor: torch.Tensor) -> bool:
 
 
 def get_submesh(device_mesh: DeviceMesh, dims: tuple[str, ...]) -> DeviceMesh:
-    from torch.distributed.device_mesh import _mesh_resources
-
-    root_mesh = _mesh_resources.get_root_mesh(device_mesh)
-    return root_mesh[dims]
+    """Access a submesh by dim names from the given mesh."""
+    return device_mesh[dims]
 
 
 def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> tuple[torch.Tensor, int, int]:

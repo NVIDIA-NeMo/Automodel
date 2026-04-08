@@ -15,10 +15,12 @@
 # Configuration for fine-tuning Qwen2.5-VL-3B with RDR dataset for image description
 
 
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/vlm_finetune/finetune.py --config recipes/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml
-# Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
+# To run this recipe:
+#   automodel examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: FinetuneRecipeForVLM
 
 step_scheduler:
   global_batch_size: 8
@@ -53,10 +55,11 @@ checkpoint:
   model_save_format: torch_save
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   dp_size: none
   tp_size: 1
   cp_size: 1
+
   sequence_parallel: false
 
 loss_fn:
@@ -91,3 +94,6 @@ freeze_config:
 #   entity:
 #   name:
 #   save_dir:
+
+ci:
+  recipe_owner: akoumpa

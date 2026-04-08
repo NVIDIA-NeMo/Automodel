@@ -665,3 +665,176 @@ class TestValidateHfModelForPipelineSupport:
 
         assert isinstance(output, BaseModelOutputWithPast)
         assert output.attentions is None
+
+    @patch('nemo_automodel.components.distributed.pipelining.hf_utils.get_text_module')
+    def test_rotary_emb_via_get_text_module(self, mock_get_text_module):
+        """Test that rotary_emb is accessed via get_text_module for multimodal model support."""
+        mock_model = Mock()
+        mock_model.config = Mock()
+        mock_model.gradient_checkpointing = False
+        mock_model.embed_tokens = None
+        mock_model.norm = None
+        mock_model.layers = None
+
+        # Create a mock text module with rotary_emb
+        mock_text_module = Mock()
+        mock_rotary = Mock()
+        mock_rotary.return_value = (torch.randn(1, 10, 64), torch.randn(1, 10, 64))
+        mock_text_module.rotary_emb = mock_rotary
+
+        mock_get_text_module.return_value = mock_text_module
+
+        forward_fn = create_pipeline_forward_inner("AutoModel")
+
+        inputs_embeds = torch.randn(1, 10, 768)
+        position_ids = torch.arange(10).unsqueeze(0)
+        output = forward_fn(mock_model, inputs_embeds=inputs_embeds, position_ids=position_ids)
+
+        # Verify get_text_module was called with the model
+        mock_get_text_module.assert_called_with(mock_model)
+
+        # Verify rotary_emb was called
+        mock_rotary.assert_called_once()
+
+    @patch('nemo_automodel.components.distributed.pipelining.hf_utils.get_text_module')
+    def test_rotary_emb_none_via_get_text_module(self, mock_get_text_module):
+        """Test that None rotary_emb from get_text_module is handled correctly."""
+        mock_model = Mock()
+        mock_model.config = Mock()
+        mock_model.gradient_checkpointing = False
+        mock_model.embed_tokens = None
+        mock_model.norm = None
+        mock_model.layers = None
+
+        # Create a mock text module with None rotary_emb
+        mock_text_module = Mock()
+        mock_text_module.rotary_emb = None
+
+        mock_get_text_module.return_value = mock_text_module
+
+        forward_fn = create_pipeline_forward_inner("AutoModel")
+
+        inputs_embeds = torch.randn(1, 10, 768)
+        # Should not raise error when rotary_emb is None
+        output = forward_fn(mock_model, inputs_embeds=inputs_embeds)
+
+        assert isinstance(output, BaseModelOutputWithPast)
+
+
+# -----------------------------------------------------------------------------
+# Tests for get_text_module, TEXT_MODULE_ATTRS, MULTIMODAL_SUFFIXES
+# -----------------------------------------------------------------------------
+
+from nemo_automodel.components.distributed.pipelining.hf_utils import (
+    get_text_module,
+    TEXT_MODULE_ATTRS,
+    MULTIMODAL_SUFFIXES,
+)
+
+
+class TestGetTextModule:
+    """Tests for get_text_module function."""
+
+    def test_returns_language_model_when_present(self):
+        """Test that language_model attribute is returned when present."""
+        class VLMModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Linear(10, 10)
+                self.visual = nn.Linear(5, 5)
+
+        model = VLMModel()
+        result = get_text_module(model)
+        assert result is model.language_model
+
+    def test_returns_text_model_when_present(self):
+        """Test that text_model attribute is returned when present."""
+        class VLMModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.text_model = nn.Linear(10, 10)
+                self.vision_encoder = nn.Linear(5, 5)
+
+        model = VLMModel()
+        result = get_text_module(model)
+        assert result is model.text_model
+
+    def test_returns_text_decoder_when_present(self):
+        """Test that text_decoder attribute is returned when present."""
+        class VLMModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.text_decoder = nn.Linear(10, 10)
+
+        model = VLMModel()
+        result = get_text_module(model)
+        assert result is model.text_decoder
+
+    def test_returns_model_when_no_text_attr(self):
+        """Test that model itself is returned when no text module attribute exists."""
+        class SimpleModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.Linear(10, 10)
+
+        model = SimpleModel()
+        result = get_text_module(model)
+        assert result is model
+
+    def test_returns_none_when_model_is_none(self):
+        """Test that None is returned when model is None."""
+        result = get_text_module(None)
+        assert result is None
+
+    def test_priority_order_language_model_first(self):
+        """Test that language_model has priority over text_model."""
+        class VLMModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Linear(10, 10)
+                self.text_model = nn.Linear(5, 5)
+
+        model = VLMModel()
+        result = get_text_module(model)
+        assert result is model.language_model
+
+    def test_skips_none_attribute(self):
+        """Test that None attributes are skipped."""
+        class VLMModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = None
+                self.text_model = nn.Linear(10, 10)
+
+        model = VLMModel()
+        result = get_text_module(model)
+        assert result is model.text_model
+
+
+class TestConstants:
+    """Tests for TEXT_MODULE_ATTRS and MULTIMODAL_SUFFIXES constants."""
+
+    def test_text_module_attrs_contains_expected_values(self):
+        """Test TEXT_MODULE_ATTRS contains the expected attribute names."""
+        assert "language_model" in TEXT_MODULE_ATTRS
+        assert "text_model" in TEXT_MODULE_ATTRS
+        assert "text_decoder" in TEXT_MODULE_ATTRS
+
+    def test_multimodal_suffixes_contains_vision_attrs(self):
+        """Test MULTIMODAL_SUFFIXES contains vision-related suffixes."""
+        assert "vision_tower" in MULTIMODAL_SUFFIXES
+        assert "visual" in MULTIMODAL_SUFFIXES
+        assert "image_encoder" in MULTIMODAL_SUFFIXES
+        assert "vision_encoder" in MULTIMODAL_SUFFIXES
+
+    def test_multimodal_suffixes_contains_audio_attrs(self):
+        """Test MULTIMODAL_SUFFIXES contains audio-related suffixes."""
+        assert "audio_tower" in MULTIMODAL_SUFFIXES
+        assert "audio_encoder" in MULTIMODAL_SUFFIXES
+        assert "audio_model" in MULTIMODAL_SUFFIXES
+
+    def test_multimodal_suffixes_contains_projector_attrs(self):
+        """Test MULTIMODAL_SUFFIXES contains projector-related suffixes."""
+        assert "mm_projector" in MULTIMODAL_SUFFIXES
+        assert "multi_modal_projector" in MULTIMODAL_SUFFIXES
+        assert "multimodal_projector" in MULTIMODAL_SUFFIXES

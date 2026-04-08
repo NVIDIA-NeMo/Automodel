@@ -14,31 +14,20 @@
 
 """Unit tests for optimized_tp_plans module."""
 
-import types
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
-    ParallelStyle,
     PrepareModuleInput,
     PrepareModuleOutput,
     RowwiseParallel,
     SequenceParallel,
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
-
-from nemo_automodel.components.distributed.optimized_tp_plans import (
-    RotaryEmbedParallel,
-    _parallelize_gemma3,
-    _parallelize_llama,
-    _parallelize_qwen,
-    PARALLELIZE_FUNCTIONS,
-)
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForCausalLM,
     Gemma3ForConditionalGeneration,
@@ -46,6 +35,15 @@ from transformers.models.gemma3.modeling_gemma3 import (
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
+
+from nemo_automodel.components.distributed.optimized_tp_plans import (
+    PARALLELIZE_FUNCTIONS,
+    RotaryEmbedParallel,
+    _get_class_qualname,
+    _parallelize_gemma3,
+    _parallelize_llama,
+    _parallelize_qwen,
+)
 
 
 class MockModel:
@@ -369,8 +367,6 @@ class TestParallelizeFunctions:
         sequence_patterns = [
             "model.norm",
             "model.layers.*.input_layernorm",
-            "model.layers.*.self_attn.q_norm",
-            "model.layers.*.self_attn.k_norm",
             "model.layers.*.post_attention_layernorm",
         ]
 
@@ -387,9 +383,10 @@ class TestParallelizeFunctions:
 
         result = _parallelize_qwen(model, sequence_parallel=True)
 
-        # Should include Qwen3-specific patterns like q_norm and k_norm
-        assert "model.layers.*.self_attn.q_norm" in result
-        assert "model.layers.*.self_attn.k_norm" in result
+        # Qwen3 has q_norm/k_norm inside attention, but those should remain unwrapped.
+        # Wrapping them with SequenceParallel can incorrectly tag head-sharded activations as sequence-sharded.
+        assert "model.layers.*.self_attn.q_norm" not in result
+        assert "model.layers.*.self_attn.k_norm" not in result
 
 
 class TestParallelizeFunctionsMapping:
@@ -407,7 +404,7 @@ class TestParallelizeFunctionsMapping:
         ]
 
         for model_type in expected_types:
-            assert model_type in PARALLELIZE_FUNCTIONS
+            assert _get_class_qualname(model_type) in PARALLELIZE_FUNCTIONS
 
     def test_mapping_functions_are_callable(self):
         """Test that all functions in the mapping are callable."""
@@ -416,8 +413,16 @@ class TestParallelizeFunctionsMapping:
 
     def test_mapping_functions_return_dict(self):
         """Test that all mapping functions return dictionaries."""
-        for model_type, func in PARALLELIZE_FUNCTIONS.items():
-            # Create a mock model of the appropriate type
+        all_model_types = [
+            Qwen2ForCausalLM,
+            Qwen3ForCausalLM,
+            Qwen3ForSequenceClassification,
+            LlamaForCausalLM,
+            Gemma3ForCausalLM,
+            Gemma3ForConditionalGeneration,
+        ]
+        for model_type in all_model_types:
+            func = PARALLELIZE_FUNCTIONS[_get_class_qualname(model_type)]
             mock_model = Mock()
             mock_model.__class__ = model_type
             # @akoumparouli: explicitly deleting the lm_head because the parallelizer asserts on it
@@ -430,16 +435,16 @@ class TestParallelizeFunctionsMapping:
 
     def test_qwen2_and_qwen3_use_same_function(self):
         """Test that Qwen2 and Qwen3 models use the same parallelization function."""
-        qwen2_func = PARALLELIZE_FUNCTIONS[Qwen2ForCausalLM]
-        qwen3_func = PARALLELIZE_FUNCTIONS[Qwen3ForCausalLM]
+        qwen2_func = PARALLELIZE_FUNCTIONS[_get_class_qualname(Qwen2ForCausalLM)]
+        qwen3_func = PARALLELIZE_FUNCTIONS[_get_class_qualname(Qwen3ForCausalLM)]
 
         assert qwen2_func is qwen3_func
         assert qwen2_func is _parallelize_qwen
 
     def test_gemma3_models_use_same_function(self):
         """Test that both Gemma3 model types use the same function."""
-        causal_func = PARALLELIZE_FUNCTIONS[Gemma3ForCausalLM]
-        conditional_func = PARALLELIZE_FUNCTIONS[Gemma3ForConditionalGeneration]
+        causal_func = PARALLELIZE_FUNCTIONS[_get_class_qualname(Gemma3ForCausalLM)]
+        conditional_func = PARALLELIZE_FUNCTIONS[_get_class_qualname(Gemma3ForConditionalGeneration)]
 
         assert causal_func is conditional_func
         assert causal_func is _parallelize_gemma3

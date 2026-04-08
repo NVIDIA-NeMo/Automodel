@@ -1,0 +1,131 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+configs:
+  # ==========================================================================
+  # SFT (Supervised Fine-Tuning)
+  # ==========================================================================
+
+  # -- baichuan --
+  - baichuan/baichuan_2_7b_squad.yaml
+
+  # -- cohere --
+  - cohere/cohere_command_r_7b_squad.yaml
+
+  # -- devstral --
+  - devstral/devstral2_small_2512_squad.yaml
+
+  # -- falcon --
+  - falcon/falcon3_7b_instruct_squad.yaml
+
+  # -- gemma --
+  - gemma/gemma_2_9b_it_squad.yaml
+  - gemma/gemma_3_270m_squad.yaml
+
+  # -- glm --
+  - glm/glm_4_9b_chat_hf_squad.yaml
+
+  # -- gpt_oss --
+  - gpt_oss/gpt_oss_20b.yaml
+  - gpt_oss/gpt_oss_20b_single_gpu.yaml
+
+  # -- granite --
+  - granite/granite_3_3_2b_instruct_squad.yaml
+
+  # -- llama --
+  - llama3_1/llama3_1_8b_hellaswag_pp.yaml
+  - llama3_2/llama3_2_1b_squad.yaml
+  - llama3_2/llama3_2_1b_hellaswag.yaml
+
+  # -- mistral --
+  - mistral/mistral_nemo_2407_squad.yaml
+  - mistral/ministral3_3b_squad.yaml
+
+  # -- moonlight --
+  - moonlight/moonlight_16b_te.yaml
+
+  # -- nemotron --
+  - nemotron/nemotron_nano_8b_v1_squad.yaml
+  - nemotron/nemotron_nano_9b_squad.yaml
+  - nemotron/nemotron_nano_v3_hellaswag.yaml
+  - nemotron/nemotron_super_v3_hellaswag.yaml
+  - nemotron/llama3_3_nemotron_super_49B_squad.yaml
+  - nemotron_flash/nemotron_flash_1b_squad.yaml
+
+  # -- olmo --
+  - olmo/olmo_2_0425_1b_instruct_squad.yaml
+
+  # -- phi --
+  - phi/phi_3_mini_it_squad.yaml
+  - phi/phi_4_squad.yaml
+
+  # -- qwen --
+  - qwen/qwen2_5_7b_squad.yaml
+  - qwen/qwen3_moe_30b_hellaswag.yaml
+  - qwen/qwen3_moe_30b_te_deepep.yaml
+
+  # -- seed --
+  - seed/seed_coder_8b_instruct_squad.yaml
+
+  # -- starcoder --
+  - starcoder/starcoder_2_7b_squad.yaml
+
+  # -- stepfun --
+  - stepfun/step_3.5_flash_hellaswag_pp.yaml
+
+  # ==========================================================================
+  # PEFT (Parameter-Efficient Fine-Tuning)
+  # ==========================================================================
+
+  # -- baichuan --
+  - baichuan/baichuan_2_7b_squad_peft.yaml
+
+  # -- falcon --
+  - falcon/falcon3_7b_instruct_squad_peft.yaml
+
+  # -- gemma --
+  - gemma/gemma_2_9b_it_squad_peft.yaml
+  - gemma/gemma_3_270m_squad_peft.yaml
+
+  # -- gpt_oss --
+  - gpt_oss/gpt_oss_20b_peft.yaml
+  - gpt_oss/gpt_oss_20b_single_gpu_peft.yaml
+
+  # -- llama --
+  - llama3_2/llama3_2_1b_hellaswag_peft.yaml
+
+  # -- mistral --
+  - mistral/ministral3_3b_squad_peft.yaml
+
+  # -- nemotron --
+  - nemotron/nemotron_nano_8b_v1_squad_peft.yaml
+  - nemotron/nemotron_nano_9b_squad_peft.yaml
+  - nemotron/nemotron_nano_v3_hellaswag_peft.yaml
+  - nemotron/nemotron_super_v3_hellaswag_peft.yaml
+  - nemotron/llama3_3_nemotron_super_49B_squad_peft.yaml
+  - nemotron_flash/nemotron_flash_1b_squad_peft.yaml
+
+  # -- phi --
+  - phi/phi_2_squad_peft.yaml
+  - phi/phi_2_squad_tp2_peft.yaml
+  - phi/phi_4_squad_peft.yaml
+  - phi/phi_4_squad_tp2_peft.yaml
+
+  # -- qwen --
+  - qwen/qwen2_5_7b_peft_benchmark.yaml
+  - qwen/qwen2_5_7b_squad_peft.yaml
+  - qwen/qwen3_moe_30b_lora.yaml
+
+  # -- seed --
+  - seed/seed_coder_8b_instruct_squad_peft.yaml

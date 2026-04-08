@@ -13,12 +13,12 @@
 # limitations under the License.
 
 
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config examples/llm_finetune/gemma/functiongemma_xlam.yaml
-# Adjust --nproc-per-node to the number of GPUs available on your host machine.
-#
-# For details, please refer to tutorial:https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/toolcalling.md
 
+# To run this recipe:
+#   automodel examples/llm_finetune/gemma/functiongemma_xlam.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 32
@@ -61,10 +61,10 @@ clip_grad_norm:
   max_norm: 1.0
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   dp_size: none
-  dp_replicate_size: 1
   cp_size: 1
+
   sequence_parallel: false
 
 loss_fn:
@@ -116,4 +116,5 @@ nvtx: false
 #   entity: <your-wandb-entity>
 #   name: <your-wandb-exp-name>
 
-
+ci:
+  recipe_owner: HuiyingLi

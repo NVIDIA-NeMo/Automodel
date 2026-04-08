@@ -1,0 +1,77 @@
+seed: 42
+
+wandb:
+  project: wan-t2v-flow-matching-pretrain
+  mode: online
+  name: wan2_1_t2v_fm_pretrain
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+  mode: pretrain
+  pipeline_spec:
+    transformer_cls: "WanTransformer3DModel"
+    subfolder: "transformer"
+    load_full_pipeline: false
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  num_epochs: 100
+  log_every: 2
+  # max_steps: null  # Set to limit training to a specific number of steps
+  # save_checkpoint_every_epoch: true  # Set to false to disable epoch-boundary checkpoints
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
+    cache_dir: PATH_TO_YOUR_DATA
+    model_type: wan
+    base_resolution: [512, 512]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+    num_workers: 2
+
+optim:
+  learning_rate: 5e-5
+  optimizer:
+    weight_decay: 0.1
+    betas: [0.9, 0.95]
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 0
+  min_lr: 1e-6
+
+
+flow_matching:
+  adapter_type: "simple"  # Options: "hunyuan", "simple"
+  adapter_kwargs: {}
+  use_sigma_noise: true
+  timestep_sampling: uniform
+  logit_mean: 0.0
+  logit_std: 1.5
+  flow_shift: 2.5
+  mix_uniform_ratio: 0.2
+  # "sigma_min": 0.0,  # PRETRAIN: No clamping, full range
+  # "sigma_max": 1.0,  # PRETRAIN: No clamping, full range
+
+fsdp:
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  dp_replicate_size: 1
+  dp_size: none
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
+  model_save_format: safetensors
+  save_consolidated: true
+  diffusers_compatible: true
+  restore_from: null

@@ -19,8 +19,9 @@ import torch
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
 
 from nemo_automodel.components.models.qwen3_next.model import Block, Qwen3NextForCausalLM, Qwen3NextModel
-from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.layers import MLP, MoE
+from nemo_automodel.components.models.common import BackendConfig
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -88,7 +89,8 @@ def backend_config():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
-        enable_deepep=False,
+        experts="torch",
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )

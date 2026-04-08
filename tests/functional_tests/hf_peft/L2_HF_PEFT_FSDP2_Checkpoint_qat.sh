@@ -20,7 +20,7 @@ export CUDA_VISIBLE_DEVICES="0,1"
 
 TORCH_NCCL_TRACE_BUFFER_SIZE=1000 \
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run \
---master-port=29503 --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace  \
+--master-port=29503 --nproc_per_node=2 --nnodes=1 -m coverage run  \
 nemo_automodel/recipes/llm/train_ft.py \
     --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
@@ -35,12 +35,11 @@ nemo_automodel/recipes/llm/train_ft.py \
     --step_scheduler.ckpt_every_steps 10 \
     --checkpoint.enabled true \
     --checkpoint.checkpoint_dir checkpoints/ \
-    --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
     --distributed.dp_size none \
     --distributed.tp_size 1 \
     --distributed.cp_size 1 \
     --distributed.sequence_parallel false \
+    --qat.enabled true \
     --qat.fake_quant_after_n_steps 1 \
-    --qat.enabled True \
-    --qat.quantizer._target_ torchao.quantization.qat.Int8DynActInt4WeightQATQuantizer \
-    --qat.quantizer.groupsize 32
+    --qat.qat_config._target_ nemo_automodel.components.quantization.qat.QATConfig \
+    --qat.qat_config.groupsize 32

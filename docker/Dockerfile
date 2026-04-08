@@ -13,7 +13,7 @@
 # limitations under the License.
 
 ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:25.11-py3
+ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.02-py3
 ARG BASE_IMAGE=cuda
 
 FROM ${CUDA_IMAGE} AS cuda
@@ -34,7 +34,15 @@ FROM ${PYTORCH_IMAGE} AS pytorch
 
 FROM ${BASE_IMAGE} AS update_base_container
 
+ENV PIP_NO_CACHE_DIR=1
 WORKDIR /opt
+
+ENV DEBIAN_FRONTEND=noninteractive
+# Address CVE-2025-68973
+RUN apt-get update && apt install -y --only-upgrade gnupg && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
 # Install uv
 ENV UV_VERSION="0.8.22"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
@@ -50,6 +58,8 @@ RUN if [ -f /usr/local/bin/torchrun ]; then \
         sed -i '1c\#!/opt/venv/bin/python3' /usr/local/bin/torchrun; \
     fi
 
+FROM update_base_container AS automodel_dep
+
 # Install TE
 ARG INSTALL_TE=False
 ARG TE_COMMIT=release_v2.11
@@ -64,37 +74,38 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     cd ../ && rm -rf TransformerEngine; \
     fi
 
-FROM update_base_container AS automodel_dep
-
-# Install Grouped Gemm
-RUN pip install --no-build-isolation git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
-
-# Install Mamba
-ARG INSTALL_MAMBA=False
-ARG MAMBA_COMMIT=6b32be06d026e170b3fdaf3ae6282c5a6ff57b06
-RUN if [ "$INSTALL_MAMBA" = "True" ]; then \
-    git clone https://github.com/Dao-AILab/causal-conv1d.git && \
-    cd causal-conv1d && \
-    git checkout v1.5.3 && \
-    CAUSAL_CONV1D_FORCE_BUILD=TRUE pip install --no-build-isolation -v . && \
-    cd ../ && rm -rf causal-conv1d && \
-    git clone https://github.com/state-spaces/mamba.git && \
-    cd mamba && \
-    git checkout $MAMBA_COMMIT && \
-    sed -i "/triton/d" setup.py && \
-    sed -i "/triton/d" pyproject.toml && \
-    pip install --no-build-isolation -v . && \
-    cd ../ && rm -rf mamba; \
-    fi
+# Install HybridEP
+## Dependency: RDMA Core
+RUN git clone https://github.com/linux-rdma/rdma-core.git && \
+    cd rdma-core && git checkout tags/v60.0 && sh build.sh
+ENV RDMA_CORE_HOME=/opt/rdma-core/build
+## Use stub of libnvidia-ml-dev during build only
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libnvidia-ml-dev
+COPY docker/common/deepep.patch /opt/deepep.patch
+ARG DEEPEP_COMMIT=7febc6e25660af0f54d95dd781ecdcd62265ecca
+RUN git clone -b hybrid-ep https://github.com/deepseek-ai/DeepEP.git
+ENV HYBRID_EP_MULTINODE=1
+RUN cd DeepEP && \
+    git fetch origin $DEEPEP_COMMIT && \
+    git checkout FETCH_HEAD && \
+    patch -p1 < /opt/deepep.patch && \
+    pip install --no-cache-dir nvidia-nvshmem-cu13==3.4.5 && \
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 pip install --no-build-isolation . && \
+    apt-get purge -y libnvidia-ml-dev && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/* && \
+    rm -rf /opt/deepep.patch && \
+    cd / && rm -rf DeepEP rdma-core
 
 # Install Bitsandbytes
-ARG INSTALL_BITSANDBYTES=False
-ARG BITSANDBYTES_COMMIT=0.48.2
+ARG INSTALL_BITSANDBYTES=True
+ARG BITSANDBYTES_COMMIT=0.49.2
 RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
     git clone https://github.com/bitsandbytes-foundation/bitsandbytes.git && \
     cd bitsandbytes && \
     git pull && \
-    git fetch origin $DEEPEP_COMMIT && \
+    git fetch origin $BITSANDBYTES_COMMIT && \
     git checkout FETCH_HEAD && \
     cmake -DCOMPUTE_BACKEND=cuda -DCOMPUTE_CAPABILITY="80;86;90;100;110" -S . && \
     make && \
@@ -104,35 +115,48 @@ RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
     cd ../ && rm -rf bitsandbytes; \
     fi
 
-# Install Deepep
-COPY docker/common/deepep.patch /opt/deepep.patch
-ARG INSTALL_DEEPEP=False
-ARG DEEPEP_COMMIT=1dddd194c26911c35b4f53a148617dd73de0ffc9
-RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
-    git clone https://github.com/deepseek-ai/DeepEP.git && \
-    cd DeepEP && \
-    git pull && \
-    git fetch origin $DEEPEP_COMMIT && \
-    git checkout FETCH_HEAD && \
-    patch -p1 < /opt/deepep.patch && \
-    pip install --no-cache-dir nvidia-nvshmem-cu13==3.4.5 && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
-    rm -rf /opt/deepep.patch && \
-    rm -rf DeepEP; \
+# Install UCCL-EP (Azure-compatible RDMA for expert parallelism)
+COPY scripts/setup_uccl_ep.sh /opt/setup_uccl_ep.sh
+ARG INSTALL_UCCL_EP=False
+RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
+    bash /opt/setup_uccl_ep.sh --no-efa && \
+    rm -f /opt/setup_uccl_ep.sh; \
     fi
 
+# Address base image CVE
+RUN pip install "aiohttp>=3.13.3" \
+        "jaraco-context>=6.1.0" \
+        "nbconvert>=7.17.0" \
+        "pillow>=12.1.1" \
+        "protobuf>=6.33.5" \
+        "setuptools>=80.10.2" \
+        "urllib3>=2.6.0"
+
 FROM automodel_dep as automodel_final
+
+WORKDIR /opt/Automodel
+
+COPY pyproject.toml uv.lock /opt/Automodel/
+COPY nemo_automodel/__init__.py nemo_automodel/package_info.py /opt/Automodel/nemo_automodel/
+COPY docker/common/uv-pytorch.toml docker/common/uv-pytorch.lock /opt/Automodel/docker/common/
+COPY docker/common/update_pyproject_pytorch.sh /opt/Automodel/docker/common/
 
 # Install Automodel
 ARG BASE_IMAGE=cuda
 ARG AUTOMODEL_INSTALL=all
-COPY . /opt/Automodel
-RUN cd /opt/Automodel && \
+ARG UV_SYNC_ARGS="--locked"
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    --mount=type=cache,target=/root/.cache/uv \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \
-        sed -i '/\[tool\.uv\]/r /opt/Automodel/docker/common/uv-pytorch.toml' pyproject.toml && \
-        mv /opt/Automodel/docker/common/uv-pytorch.lock /opt/Automodel/uv.lock; \
+        bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi && \
-    uv sync --locked --extra $AUTOMODEL_INSTALL --all-groups
+    uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS && \
+    uv cache prune --ci
+
+COPY . /opt/Automodel
+
+WORKDIR /opt/Automodel
 
 COPY <<EOF /opt/venv/env.sh
 export UV_PROJECT_ENVIRONMENT=/opt/venv

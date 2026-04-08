@@ -14,6 +14,12 @@
 
 
 
+# To run this recipe:
+#   automodel examples/llm_finetune/falcon/falcon3_7b_instruct_squad.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 64
   local_batch_size: 8
@@ -43,11 +49,11 @@ compile:
   backend: null  # Use default backend (inductor)
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   dp_size: none
-  dp_replicate_size: 1
   tp_size: 1
   cp_size: 1
+
   sequence_parallel: false
 
 loss_fn:
@@ -88,4 +94,7 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: adil-a

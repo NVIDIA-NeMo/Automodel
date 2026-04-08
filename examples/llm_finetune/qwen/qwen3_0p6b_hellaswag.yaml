@@ -13,10 +13,12 @@
 # limitations under the License.
 
 
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/qwen3_0/qwen3_0p6b_hellaswag.yaml
-# Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
+# To run this recipe:
+#   automodel examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 64
@@ -45,13 +47,12 @@ checkpoint:
   save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   dp_size: none
-  dp_replicate_size: 1 # dp_shard_size = dp_size / dp_replicate_size and dp_shard_size < dp_size. For DDP usecase, use DDPManager
   tp_size: 1
   cp_size: 1
+
   sequence_parallel: false
-  use_hf_tp_plan: false # if true, will attempt to get the TP plan from hf model.
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -94,3 +95,6 @@ optimizer:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: HuiyingLi

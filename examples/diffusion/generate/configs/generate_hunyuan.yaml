@@ -1,0 +1,32 @@
+model:
+  pretrained_model_name_or_path: "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v"
+  checkpoint: null
+  lora_weights: null              # set to: PATH_TO_CKPT/checkpoint-1000
+  lora_adapter_name: "default"   # must match adapter_name used at save time
+  lora_scale: 1.0                # lora_alpha / rank; 1.0 = full contribution
+
+
+inference:
+  num_inference_steps: 50
+  height: 480
+  width: 832
+  dtype: "bfloat16"
+  max_samples: 10
+  prompts:
+    - "A cat sitting on a windowsill watching the rain"
+  pipeline_kwargs:
+    num_frames: 49
+    negative_prompt: ""
+
+output:
+  output_dir: "./inference_outputs"
+  fps: 15
+
+distributed: null
+
+vae:
+  enable_slicing: true
+  enable_tiling: true
+  enable_cpu_offload: false
+
+seed: 42

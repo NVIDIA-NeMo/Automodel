@@ -1,0 +1,128 @@
+#!/bin/bash
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Run lm-evaluation-harness with vLLM backend on a finetuned checkpoint.
+#
+# Usage:
+#   bash run_eval.sh --model-path /path/to/checkpoint [OPTIONS] [-- EXTRA_LM_EVAL_ARGS]
+#
+# Required:
+#   --model-path PATH     Path to the model checkpoint directory
+#
+# Options:
+#   --tokenizer NAME      HF tokenizer name (default: Qwen/Qwen3-30B-A3B)
+#   --tasks TASKS         Comma-separated eval tasks (default: ifeval)
+#   --output-path PATH    Where to write results (default: auto-derived from model path)
+#   --thinking            Enable thinking mode for chat template
+#   --tp-size N           Tensor parallel size (default: 2)
+#   --dp-size N           Data parallel size (default: 4)
+#   --extra-model-args X  Extra CSV appended to --model_args
+#   --gen-kwargs X        Passed through to lm_eval --gen_kwargs
+#
+# Everything after "--" is forwarded to lm_eval verbatim.
+
+set -euo pipefail
+
+LM_EVAL_DIR="${LM_EVAL_DIR:-/opt/lm-evaluation-harness}"
+ENABLE_THINKING="False"
+TP_SIZE=2
+DP_SIZE=4
+EXTRA_MODEL_ARGS=""
+GEN_KWARGS=""
+EXTRA_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model-path)   MODEL_PATH="$2";   shift 2 ;;
+    --tokenizer)    TOKENIZER="$2";    shift 2 ;;
+    --tasks)        TASKS="$2";        shift 2 ;;
+    --output-path)  OUTPUT_PATH="$2";  shift 2 ;;
+    --thinking)     ENABLE_THINKING="True"; shift ;;
+    --tp-size)      TP_SIZE="$2";      shift 2 ;;
+    --dp-size)      DP_SIZE="$2";      shift 2 ;;
+    --extra-model-args) EXTRA_MODEL_ARGS="$2"; shift 2 ;;
+    --gen-kwargs)   GEN_KWARGS="$2";   shift 2 ;;
+    --)             shift; EXTRA_ARGS+=("$@"); break ;;
+    *)              echo "Unknown arg: $1"; exit 1 ;;
+  esac
+done
+
+if [ -z "${MODEL_PATH:-}" ]; then
+  echo "ERROR: --model-path is required"
+  exit 1
+fi
+
+: "${TOKENIZER:=Qwen/Qwen3-30B-A3B}"
+: "${TASKS:=ifeval}"
+: "${OUTPUT_PATH:=results/$(echo "$MODEL_PATH" | rev | cut -d'/' -f1-4 | rev)}"
+
+# ── Patch config.json for vLLM rope_theta compatibility ─────────────────────
+CONFIG="$MODEL_PATH/config.json"
+if [ -f "$CONFIG" ]; then
+  python3 - "$CONFIG" <<'PYEOF'
+import json, sys
+config_path = sys.argv[1]
+with open(config_path) as f:
+    cfg = json.load(f)
+if 'rope_parameters' in cfg and 'rope_theta' in cfg['rope_parameters']:
+    cfg['rope_theta'] = cfg['rope_parameters']['rope_theta']
+    with open(config_path, 'w') as f:
+        json.dump(cfg, f, indent=2)
+    print(f'Patched rope_theta={cfg["rope_theta"]} in {config_path}')
+else:
+    print('No rope_parameters.rope_theta found, skipping patch')
+PYEOF
+else
+  echo "WARNING: $CONFIG not found, skipping rope_theta patch"
+fi
+
+# ── Activate lm_eval venv ───────────────────────────────────────────────────
+VENV_DIR="$LM_EVAL_DIR/.venv"
+if [ ! -f "$VENV_DIR/bin/activate" ]; then
+  echo "ERROR: lm_eval venv not found at $VENV_DIR"
+  echo "Run setup_lm_eval.sh first."
+  exit 1
+fi
+source "$VENV_DIR/bin/activate"
+
+# ── Run evaluation ──────────────────────────────────────────────────────────
+cd "$LM_EVAL_DIR"
+
+MODEL_ARGS="pretrained=$MODEL_PATH,tokenizer=$TOKENIZER,tensor_parallel_size=$TP_SIZE,dtype=auto,gpu_memory_utilization=0.8,data_parallel_size=$DP_SIZE,enable_thinking=$ENABLE_THINKING"
+if [ -n "$EXTRA_MODEL_ARGS" ]; then
+  MODEL_ARGS="$MODEL_ARGS,$EXTRA_MODEL_ARGS"
+fi
+
+LM_EVAL_CMD=(
+  lm_eval
+  --model vllm
+  --model_args "$MODEL_ARGS"
+  --tasks "$TASKS"
+  --batch_size auto
+  --apply_chat_template
+  --fewshot_as_multiturn
+  --log_samples
+  --output_path "$OUTPUT_PATH"
+)
+
+if [ -n "$GEN_KWARGS" ]; then
+  LM_EVAL_CMD+=(--gen_kwargs "$GEN_KWARGS")
+fi
+
+if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
+  LM_EVAL_CMD+=("${EXTRA_ARGS[@]}")
+fi
+
+"${LM_EVAL_CMD[@]}"

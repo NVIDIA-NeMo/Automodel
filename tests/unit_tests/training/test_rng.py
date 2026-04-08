@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 import torch
 
-from nemo_automodel.components.training.rng import StatefulRNG, ScopedRNG, init_all_rng
+from nemo_automodel.components.training.rng import ScopedRNG, init_all_rng
 
 
 def _next_values():
@@ -30,6 +30,13 @@ def _next_values():
         np.random.rand(),
         torch.rand(1).item(),
     )
+
+
+def test_init_all_rng_seed_zero():
+    """``seed=0`` is a valid non-negative integer and must not raise."""
+    init_all_rng(0)
+    # Just verify we can draw from each backend without error
+    _next_values()
 
 
 def test_init_all_rng_reproducibility():

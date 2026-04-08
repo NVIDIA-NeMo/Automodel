@@ -29,10 +29,10 @@ jobs:
         python-version: ["3.10", "3.11", "3.12"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -45,7 +45,7 @@ jobs:
           pip install "."
 
       - name: Checkout check-imports
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
           ref: v0.39.0
@@ -73,10 +73,10 @@ jobs:
         python-version: ["3.12"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -92,7 +92,7 @@ jobs:
       - name: Set up UV
         uses: astral-sh/setup-uv@v1
         with:
-          version: 0.7.2
+          version: 0.9.26
 
       - name: Set up yq
         shell: bash
@@ -100,7 +100,7 @@ jobs:
           wget https://github.com/mikefarah/yq/releases/download/v4.45.4/yq_linux_amd64.tar.gz
           tar -xzf yq_linux_amd64.tar.gz
           mkdir -p ./bin
-          mv yq_linux_amd64 ./bin/yq 
+          mv yq_linux_amd64 ./bin/yq
           chmod +x ./bin/yq
 
       - name: Install project
@@ -110,7 +110,7 @@ jobs:
         shell: bash
         run: |
           echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
-          chmod 600 ~/.netrc 
+          chmod 600 ~/.netrc
 
           uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
           source ./venv/bin/activate
@@ -122,7 +122,7 @@ jobs:
           uv pip install --no-deps -e .
 
       - name: Checkout check-imports
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
           ref: v0.39.0
@@ -153,7 +153,7 @@ jobs:
       EXTRA: ${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install automodel${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
         shell: bash -x -e -u -o pipefail {0}
@@ -177,7 +177,7 @@ jobs:
           pip install ${PIP_ARGS[@]} .$EXTRA
 
       - name: Checkout check-imports
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
           ref: v0.39.0
@@ -200,15 +200,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: ["ubuntu-latest", "macos-latest"]
+        arch: ["${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}", "macos-latest"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up UV
         uses: astral-sh/setup-uv@v1
         with:
-          version: 0.7.2
+          version: 0.9.26
 
       - name: Install dependencies with UV
         env:
@@ -217,7 +217,7 @@ jobs:
         run: |
 
           echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
-          chmod 600 ~/.netrc 
+          chmod 600 ~/.netrc
 
           export PATH="${UV_PROJECT_ENVIRONMENT}/bin/:$PATH"
 
@@ -230,7 +230,7 @@ jobs:
           uv pip install --no-deps -e .
 
       - name: Checkout check-imports
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
           ref: v0.39.0
@@ -254,6 +254,9 @@ jobs:
       )
       && !cancelled()
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
       - name: Get workflow result
         id: result
         shell: bash -x -e -u -o pipefail {0}

@@ -1,0 +1,31 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+configs:
+  # SFT
+  - gemma3/gemma3_vl_4b_cord_v2.yaml
+  - gemma3n/gemma3n_vl_4b_medpix.yaml
+  - internvl/internvl_3_5_4b.yaml
+  - kimi/kimi2vl_cordv2.yaml
+  - mistral/ministral3_3b_medpix.yaml
+  - mistral4/mistral4_medpix.yaml
+  - nemotron/nemotron_parse_v1_1.yaml
+  - phi4/phi4_mm_cv17.yaml
+  - qwen2_5/qwen2_5_vl_3b_rdr.yaml
+  - qwen3/qwen3_vl_4b_instruct_rdr.yaml
+  - qwen3_5/qwen3_5_4b.yaml
+  - qwen3_5_moe/qwen3_5_35b.yaml
+  # PEFT
+  - gemma3/gemma3_vl_4b_cord_v2_peft.yaml
+  - gemma3n/gemma3n_vl_4b_medpix_peft.yaml

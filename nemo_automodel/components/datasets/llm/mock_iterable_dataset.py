@@ -23,12 +23,12 @@ class MockIterableDataset(IterableDataset):
     creating input_ids, labels, and position_ids for each sample.
     """
 
-    def __init__(self, vocab_size: int, seq_len: int, num_samples: int = 1000000, batch_size: int = 1):
+    def __init__(self, vocab_size: int = 1024, seq_len: int = 1024, num_samples: int = 1000000, batch_size: int = 1):
         """Initialize the mock dataset.
 
         Args:
-            vocab_size: Size of the vocabulary for generating random tokens
-            seq_len: Sequence length for each sample
+            vocab_size: Size of the vocabulary for generating random tokens (default: 1024)
+            seq_len: Sequence length for each sample (default: 1024)
             num_samples: Total number of samples to generate (default: 1M for infinite-like dataset)
             batch_size: Batch size to yield (default: 1 for unbatched samples)
         """

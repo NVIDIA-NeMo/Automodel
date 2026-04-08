@@ -25,13 +25,12 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerForConditionalGeneration as HFQwen3OmniMoeThinkerForConditionalGeneration,
 )
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_omni_moe.model import (
     Qwen3OmniMoeThinkerForConditionalGeneration,
     Qwen3OmniMoeThinkerTextModel,
 )
-from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig
-
+from nemo_automodel.components.moe.config import MoEConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -49,7 +48,8 @@ def backend_config():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
-        enable_deepep=False,
+        experts="torch",
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -259,3 +259,46 @@ def test_modelclass_export_exists():
     assert hasattr(omni_module, "ModelClass")
     assert omni_module.ModelClass is Qwen3OmniMoeThinkerForConditionalGeneration
 
+
+@patch.object(HFQwen3OmniMoeThinkerForConditionalGeneration, "__init__", new=_stub_hf_init)
+@patch("nemo_automodel.components.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
+def test_forward_unpacks_vision_features_from_named_output(rotary_cls, thinker_config, backend_config, moe_config, device):
+    """get_image_features / get_video_features return a named output object;
+    forward() must use .pooler_output and .deepstack_features, not tuple unpacking."""
+    rotary_cls.return_value = MagicMock(side_effect=lambda x, y: (torch.zeros_like(x), torch.zeros_like(x)))
+    model = Qwen3OmniMoeThinkerForConditionalGeneration(thinker_config, moe_config=moe_config, backend=backend_config).to(device)
+    model.config = thinker_config
+
+    hidden_size = thinker_config.text_config.hidden_size
+    vocab_size = thinker_config.text_config.vocab_size
+    batch, seq_len = 1, 6
+
+    fake_image_embed = torch.randn(2, hidden_size, device=device)
+    fake_deepstack = [torch.randn(2, hidden_size, device=device)]
+
+    fake_vision_output = SimpleNamespace(
+        last_hidden_state=torch.randn(2, hidden_size, device=device),
+        pooler_output=fake_image_embed,
+        hidden_states=None,
+        attentions=None,
+        deepstack_features=fake_deepstack,
+    )
+
+    hidden = torch.randn(batch, seq_len, hidden_size, device=device, dtype=model.lm_head.weight.dtype)
+    input_ids = torch.randint(0, vocab_size, (batch, seq_len), device=device)
+
+    with (
+        patch.object(model.model, "forward", return_value=hidden),
+        patch.object(model, "get_image_features", return_value=fake_vision_output) as mock_gif,
+        patch.object(model, "get_placeholder_mask", return_value=(
+            torch.zeros(batch, seq_len, 1, dtype=torch.bool, device=device),
+            torch.zeros(batch, seq_len, 1, dtype=torch.bool, device=device),
+            torch.zeros(batch, seq_len, 1, dtype=torch.bool, device=device),
+        )),
+    ):
+        pixel_values = torch.randn(1, 3, 224, 224, device=device)
+        image_grid_thw = torch.tensor([[1, 14, 14]], device=device)
+        logits = model(input_ids=input_ids, pixel_values=pixel_values, image_grid_thw=image_grid_thw)
+
+    mock_gif.assert_called_once()
+    assert logits.shape == (batch, seq_len, vocab_size)

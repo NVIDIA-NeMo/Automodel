@@ -96,16 +96,30 @@ def test_te_parallel_cross_entropy_with_masking(reduction):
 
     logits = torch.randn(batch_size, seq_length, vocab_size, dtype=dtype, device=device)
     targets = torch.randint(0, vocab_size, (batch_size, seq_length), device=device)
-    loss_mask = torch.randint(0, 2, (batch_size, seq_length), device=device)
+    # Put the mask on CPU to cover the branch that moves it to `labels.device`.
+    loss_mask = torch.randint(0, 2, (batch_size, seq_length), device=torch.device("cpu"))
+    if loss_mask.sum() == 0:
+        loss_mask[0, 0] = 1
+    num_label_tokens = int(loss_mask.sum().item())
 
     with torch.amp.autocast(device_type="cuda", dtype=dtype):
         # MaskedCrossEntropy fills in ignore_index for masked positions in-place, so we need to clone the targets for test correctness
-        masked_ce_loss = MaskedCrossEntropy(reduction=reduction)(logits, targets.clone(), mask=loss_mask)
+        masked_ce_loss = MaskedCrossEntropy(reduction=reduction)(
+            logits,
+            targets.clone(),
+            mask=loss_mask,
+            num_label_tokens=(num_label_tokens if reduction == "sum" else None),
+        )
         if reduction == "none":
             masked_ce_loss = masked_ce_loss.view(batch_size, seq_length)
 
     with torch.amp.autocast(device_type="cuda", dtype=dtype):
-        te_loss = TEParallelCrossEntropy(reduction=reduction)(logits, targets.clone(), mask=loss_mask)
+        te_loss = TEParallelCrossEntropy(reduction=reduction)(
+            logits,
+            targets.clone(),
+            mask=loss_mask,
+            num_label_tokens=(num_label_tokens if reduction == "sum" else None),
+        )
 
     masked_ce_loss = masked_ce_loss.float()
     te_loss = te_loss.float()
@@ -119,3 +133,18 @@ def test_te_parallel_cross_entropy_with_masking(reduction):
         assert torch.allclose(te_loss, masked_ce_loss, rtol=1e-2, atol=1e-2), (
             f"Loss mismatch with reduction={reduction}: MaskedCrossEntropy={masked_ce_loss}, TEParallelCrossEntropy={te_loss}"
         )
+
+
+@pytest.mark.skipif(not HAVE_TE_PARALLEL_CE, reason=MISSING_TE_PARALLEL_CE_MSG)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_te_parallel_cross_entropy_invalid_reduction_raises():
+    device = torch.device("cuda")
+    vocab_size = 128
+    dtype = torch.bfloat16
+
+    logits = torch.randn(2, 4, vocab_size, dtype=dtype, device=device)
+    targets = torch.randint(0, vocab_size, (2, 4), device=device)
+
+    with torch.amp.autocast(device_type="cuda", dtype=dtype):
+        with pytest.raises(ValueError, match=r"Invalid reduction:"):
+            TEParallelCrossEntropy(reduction="not-a-valid-reduction")(logits, targets)

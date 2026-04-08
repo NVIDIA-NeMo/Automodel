@@ -1,0 +1,36 @@
+# ── generate_flux_lora.yaml ──────────────────────────────────────────────────
+# Flux inference with LoRA weights
+# lora_weights: path to directory containing
+#   adapter_model.safetensors + adapter_config.json
+# lora_scale: typically lora_alpha / rank (e.g. 64/64 = 1.0)
+#   lower values reduce LoRA contribution, higher values amplify it
+
+model:
+  pretrained_model_name_or_path: "black-forest-labs/FLUX.1-dev"
+  checkpoint: null
+  lora_weights: null              # set to: PATH_TO_CKPT/checkpoint-1000
+  lora_scale: 1.0                # lora_alpha / rank; 1.0 = full contribution
+
+
+inference:
+  num_inference_steps: 28
+  guidance_scale: 3.5
+  height: 512
+  width: 512
+  dtype: "bfloat16"
+  max_samples: 10
+  prompts:
+    - "A cat sitting on a windowsill watching the rain"
+  pipeline_kwargs: {}
+
+output:
+  output_dir: "./inference_outputs"
+
+distributed: null
+
+vae:
+  enable_slicing: false
+  enable_tiling: false
+  enable_cpu_offload: true
+
+seed: 42

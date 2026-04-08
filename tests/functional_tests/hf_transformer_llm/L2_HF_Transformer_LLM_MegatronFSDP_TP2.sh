@@ -15,7 +15,7 @@
 #!/bin/bash
 set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
 examples/llm_finetune/finetune.py \
   --config examples/llm_finetune/llama3_2/llama3_2_1b_squad_megatron_fsdp.yaml \
   --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_mixtral_2l/ \
@@ -29,7 +29,7 @@ examples/llm_finetune/finetune.py \
   --dataset.limit_dataset_samples 10 \
   --validation_dataset.dataset_name $HF_CACHE/squad/ \
   --validation_dataset.limit_dataset_samples 10 \
-  --distributed._target_ nemo_automodel.components.distributed.megatron_fsdp.MegatronFSDPManager \
+  --distributed.strategy megatron_fsdp \
   --distributed.dp_size none \
   --distributed.tp_size 2 \
   --distributed.cp_size 1

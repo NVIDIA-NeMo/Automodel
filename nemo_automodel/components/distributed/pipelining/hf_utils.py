@@ -17,11 +17,41 @@ import types
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
+import torch.nn as nn
 
 if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+
+# Constants for identifying text/language modules in multimodal models
+TEXT_MODULE_ATTRS = ("language_model", "text_model", "text_decoder")
+MULTIMODAL_SUFFIXES = (
+    "vision_tower",
+    "visual",
+    "image_encoder",
+    "vision_encoder",
+    "audio_tower",
+    "audio_encoder",
+    "audio_model",
+    "mm_projector",
+    "multi_modal_projector",
+    "multimodal_projector",
+    "vision_projector",
+    "audio_projector",
+)
+
+
+def get_text_module(model: nn.Module) -> nn.Module:
+    """Return the nested text/LLM module if present, else the model itself."""
+    if model is None:
+        return model
+    for attr_name in TEXT_MODULE_ATTRS:
+        if hasattr(model, attr_name):
+            nested = getattr(model, attr_name)
+            if nested is not None:
+                return nested
+    return model
 
 
 def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callable:
@@ -76,6 +106,13 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         if causal_mask_mapping is None:
             # If causal_mask_mapping is missing, fall back to on-the-fly computation.
             # This is not recommended for compilation, as it introduces runtime overhead.
+            # TODO(PP): In pipeline parallelism, causal_mask_mapping is passed as a kwarg
+            # but it is a dict (not a tensor), so it cannot be chunked by the PP schedule.
+            # Non-first stages receive causal_mask_mapping=None and hit this fallback,
+            # recomputing the mask every microbatch. This is a performance issue but not
+            # a correctness bug since each stage has the full config to recompute correctly.
+            # Long-term fix: pass the mask through stage input/output or compute it once
+            # per stage and cache it.
             logger.warning(
                 "causal_mask_mapping not provided; computing it here. "
                 "This is slow and not recommended for compilation. "
@@ -102,8 +139,9 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
 
         # Rotary embeddings precomputation (shared across layers)
         position_embeddings = None
-        if hasattr(self, "rotary_emb") and self.rotary_emb is not None:
-            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        rotary_emb = get_text_module(self).rotary_emb
+        if rotary_emb is not None:
+            position_embeddings = rotary_emb(hidden_states, position_ids)
 
         if hasattr(self, "layers") and self.layers is not None:
             # Works for dict-like or list-like containers
@@ -115,7 +153,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                         getattr(decoder_layer, "attention_type"), causal_mask_mapping.get("full_attention")
                     )
 
-                hidden_states = decoder_layer(
+                layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=layer_attention_mask,
                     position_ids=position_ids,
@@ -123,8 +161,8 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
-                    **kwargs,
                 )
+                hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
 
         if hasattr(self, "norm") and self.norm is not None:
             hidden_states = self.norm(hidden_states)

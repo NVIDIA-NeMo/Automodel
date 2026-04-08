@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# To run this recipe:
+#   automodel examples/vlm_finetune/qwen3/qwen3_omni_moe_30b_te_deepep.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: FinetuneRecipeForVLM
+
 step_scheduler:
   global_batch_size: 32
   local_batch_size: 1
@@ -29,22 +35,20 @@ rng:
   seed: 1111
   ranked: true
 
-parallelizer:
-  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
-  activation_checkpointing: false
-
 model:
-  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  _target_: nemo_automodel.NeMoAutoModelForMultimodalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
-  # Customize this backend for fine grained control
-  # backend:
-  #   _target_: nemo_automodel.components.moe.utils.BackendConfig
-  #   attn: sdpa
-  #   linear: te
-  #   rms_norm: te
-  #   enable_deepep: true
-  #   fake_balanced_gate: false
-  #   enable_hf_state_dict_adapter: true
+  #Customize this backend for fine grained control
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: te
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: te
+    enable_deepep: true
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
 
 
 checkpoint:
@@ -54,12 +58,12 @@ checkpoint:
   save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  dp_replicate_size: 1
   ep_size: 8
+
   sequence_parallel: false
 
 freeze_config:
@@ -109,3 +113,7 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 
+
+ci:
+  recipe_owner: HuiyingLi
+  time: "00:30:00"

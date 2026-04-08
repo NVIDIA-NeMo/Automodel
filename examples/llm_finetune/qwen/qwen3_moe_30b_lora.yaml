@@ -7,6 +7,12 @@
 # but you can potentially run it on less GPUs by reducing the local batch size.
 # ------------------------------------------------------------------------------------------------
 
+# To run this recipe:
+#   automodel examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 1024
   local_batch_size: 128
@@ -25,16 +31,17 @@ rng:
   ranked: true
 
 model:
-  _target_: nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM.from_pretrained
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
   trust_remote_code: true
   torch_dtype: bfloat16
   backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: torch
-    rms_norm: te
-    enable_deepep: true
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -47,21 +54,18 @@ peft:
   dropout: 0.0
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints/qwen3_moe_lora
   model_save_format: safetensors
 
-parallelizer:
-  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
-  activation_checkpointing: true
-
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  dp_replicate_size: 1
   ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -94,3 +98,14 @@ optimizer:
   weight_decay: 0.01
   betas: [0.9, 0.95]
   eps: 1e-8
+
+ci:
+  recipe_owner: adil-a
+  time: "00:15:00"
+  nodes: 2
+  checkpoint_robustness:
+    hf_kl_threshold: 7e-2
+    tokenizer_name: Qwen/Qwen3-30B-A3B
+    no_check_resume: true
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500

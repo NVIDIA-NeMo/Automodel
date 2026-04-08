@@ -21,7 +21,7 @@ from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 from nemo_automodel.components.models.gpt_oss.layers import (
     GptOssAttention,
 )
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.shared.import_utils import is_te_min_version
 
 
@@ -79,7 +79,8 @@ def backend_config():
         linear="torch",
         attn="flex",
         rms_norm="torch",
-        enable_deepep=False,
+        experts="torch",
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
         rope_fusion=False,
@@ -92,7 +93,8 @@ def backend_config_with_rope_fusion():
         linear="torch",
         attn="flex",
         rms_norm="torch",
-        enable_deepep=False,
+        experts="torch",
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
         rope_fusion=True,
@@ -277,7 +279,8 @@ class TestGptOssAttentionWithTE:
             linear="torch",
             attn="te",
             rms_norm="torch",
-            enable_deepep=False,
+            experts="torch",
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
             rope_fusion=False,

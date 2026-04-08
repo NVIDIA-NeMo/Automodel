@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import math
-from functools import partial
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,11 +20,10 @@ import torch
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from nemo_automodel.components.attention.utils import postprocess_output_for_attn, preprocess_args_and_kwargs_for_attn
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_moe.layers import (
     Qwen3MoeAttention,
 )
-from nemo_automodel.components.moe.utils import BackendConfig
-
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -58,7 +56,8 @@ def sdpa_backend():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
-        enable_deepep=False,
+        experts="torch",
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -70,7 +69,8 @@ def te_backend():
         linear="torch",
         attn="te",
         rms_norm="torch",
-        enable_deepep=False,
+        experts="torch",
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -231,7 +231,10 @@ class TestQwen3MoeAttention:
 
     def test_softmax_scale_matches_head_dim(self, config, sdpa_backend):
         attention = Qwen3MoeAttention(config, sdpa_backend)
-        keywords = getattr(attention.attn_func, "keywords", {}) or {}
-        scale = keywords.get("scale")
+        with patch("torch.nn.functional.scaled_dot_product_attention", return_value=torch.zeros(1)) as mock_sdpa:
+            dummy = torch.zeros(1)
+            attention.attn_func(dummy, dummy, dummy)
+            _, call_kwargs = mock_sdpa.call_args
+            scale = call_kwargs.get("scale")
         assert scale is not None
         assert math.isclose(scale, config.head_dim ** -0.5, rel_tol=1e-6)

@@ -16,8 +16,8 @@ import torch
 from unittest.mock import Mock, patch
 from transformers import GptOssConfig
 
-from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.moe.utils import BackendConfig
+from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.models.common import BackendConfig
 
 from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
 
@@ -641,7 +641,8 @@ class TestConvertSingleTensorToHf:
 
     def create_mock_backend_config(self):
         backend = Mock()
-        backend.enable_deepep = False
+        backend.dispatcher = "torch"
+        backend.experts = "torch"
         return backend
 
     def test_applies_key_mapping(self):

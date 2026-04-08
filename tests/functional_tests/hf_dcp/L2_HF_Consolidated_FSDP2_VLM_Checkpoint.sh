@@ -18,7 +18,7 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
-TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
+TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
 -m pytest tests/functional_tests/checkpoint/test_hf_consolidated_vlm.py \
   --config examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml \
   --freeze_config.freeze_language_model false \
@@ -36,7 +36,6 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
   --checkpoint.checkpoint_dir checkpoints/ \
   --checkpoint.model_save_format safetensors \
   --checkpoint.save_consolidated true \
-  --distributed._target_ nemo_automodel.components.distributed.fsdp2.FSDP2Manager \
   --distributed.dp_size none \
   --distributed.tp_size 1 \
   --distributed.cp_size 1 \

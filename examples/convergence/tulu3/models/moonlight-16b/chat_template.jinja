@@ -1,0 +1,23 @@
+{%- if messages[0]['role'] == 'system' -%}
+<|im_system|>system<|im_middle|>{{ messages[0]['content'] }}<|im_end|>
+{%- else -%}
+<|im_system|>system<|im_middle|>You are a helpful assistant<|im_end|>
+{%- endif -%}
+{%- for message in messages -%}
+{%- if message.content is string -%}
+{%- set content = message.content -%}
+{%- else -%}
+{%- set content = '' -%}
+{%- endif -%}
+{%- if message['role'] == 'system' and loop.first -%}
+{%- elif message['role'] == 'user' -%}
+<|im_user|>user<|im_middle|>{{ content }}<|im_end|>
+{%- elif message['role'] == 'assistant' -%}
+<|im_assistant|>assistant<|im_middle|>{% generation %}{{ content }}<|im_end|>{% endgeneration %}
+{%- elif message['role'] == 'tool' -%}
+<|im_user|>user<|im_middle|><tool_response>{{ content }}</tool_response><|im_end|>
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+<|im_assistant|>assistant<|im_middle|>
+{%- endif -%}

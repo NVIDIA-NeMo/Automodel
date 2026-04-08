@@ -15,7 +15,7 @@
 #!/bin/bash
 set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
-TRANSFORMERS_OFFLINE=1 coverage run --data-file=/workspace/.coverage --source=/workspace --parallel-mode \
+TRANSFORMERS_OFFLINE=1 coverage run \
 examples/vlm_finetune/finetune.py \
   --config examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml \
   --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_gemma3_2l/ \
@@ -27,4 +27,4 @@ examples/vlm_finetune/finetune.py \
   --dataset.limit_dataset_samples 100 \
   --validation_dataset.path_or_dataset $HF_CACHE/mini_cord_v2/ \
   --validation_dataset.limit_dataset_samples 10 \
-  --distributed.activation_checkpointing true
+  --distributed_config.activation_checkpointing true

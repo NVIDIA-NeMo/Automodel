@@ -14,14 +14,25 @@
 
 from __future__ import annotations
 
+import warnings
+
+warnings.warn(
+    "Running recipes via examples/ scripts is deprecated. "
+    "Use: automodel <config.yaml> [--nproc-per-node N]\n"
+    "See BREAKING_CHANGES.md for details.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 
 def main(config="examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml"):
-    """Main entry point for the fine-tuning recipe.
+    """Main entry point for the VLM fine-tuning recipe.
 
-    Loads the configuration, sets up the recipe, and initiates the training loop.
+    .. deprecated::
+        Use ``automodel <config.yaml>`` instead.
     """
     cfg = parse_args_and_load_config(config)
     recipe = FinetuneRecipeForVLM(cfg)

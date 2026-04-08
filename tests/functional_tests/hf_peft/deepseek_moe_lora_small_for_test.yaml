@@ -24,9 +24,10 @@ rng:
   ranked: true
 
 model:
-  _target_: nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM.from_config
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: transformers.models.deepseek_v3.configuration_deepseek_v3.DeepseekV3Config
+    architectures: ["DeepseekV3ForCausalLM"]
     vocab_size: 32000
     hidden_size: 1024
     intermediate_size: 2816
@@ -67,11 +68,12 @@ model:
     norm_topk_prob: false
     dtype: bfloat16
   backend:
-    _target_: nemo_automodel.components.moe.utils.BackendConfig
+    _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
     linear: torch
     rms_norm: torch
-    enable_deepep: false
+    experts: torch
+    dispatcher: torch
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
@@ -87,22 +89,21 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/deepseek_small
   model_save_format: safetensors
-  load_base_model: false
 
 distributed:
-  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  strategy: fsdp2
   dp_size: none
-  dp_replicate_size: 1
   tp_size: 1
   cp_size: 1
+
   sequence_parallel: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: train
   tokenizer:
     pretrained_model_name_or_path: TinyLlama/TinyLlama-1.1B-Chat-v1.0
@@ -114,10 +115,10 @@ dataloader:
   num_workers: 2
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: validation
-  num_samples_limit: 128
+  limit_dataset_samples: 128
   tokenizer:
     pretrained_model_name_or_path: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 

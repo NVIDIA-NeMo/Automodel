@@ -15,8 +15,75 @@
 import json
 
 import pytest
+import torch
 
+from nemo_automodel.components.datasets.llm.formatting_utils import _get_right_trailing_pad_mask
 from nemo_automodel.components.datasets.llm.megatron_dataset import try_load_blend_from_json, get_list_of_files
+
+
+class TestGetRightTrailingPadMask:
+    """Unit tests for _get_right_trailing_pad_mask."""
+
+    # --- pad_token_id == eos_token_id (positional trailing-run logic) ---
+
+    def test_overlap_no_trailing_pad(self):
+        seq = torch.tensor([10, 20, 30, 99])
+        mask = _get_right_trailing_pad_mask(seq, pad_token_id=99, eos_token_id=99)
+        assert mask.tolist() == [False, False, False, False]
+
+    def test_overlap_single_trailing_pad(self):
+        seq = torch.tensor([10, 20, 99])
+        mask = _get_right_trailing_pad_mask(seq, pad_token_id=99, eos_token_id=99)
+        assert mask.tolist() == [False, False, False]
+
+    def test_overlap_multiple_trailing_pads(self):
+        seq = torch.tensor([10, 20, 99, 99, 99])
+        mask = _get_right_trailing_pad_mask(seq, pad_token_id=99, eos_token_id=99)
+        assert mask.tolist() == [False, False, False, True, True]
+
+    def test_overlap_mid_sequence_pad_tokens_untouched(self):
+        seq = torch.tensor([10, 99, 20, 99, 99, 99])
+        mask = _get_right_trailing_pad_mask(seq, pad_token_id=99, eos_token_id=99)
+        assert mask.tolist() == [False, False, False, False, True, True]
+
+    def test_overlap_all_pad_tokens(self):
+        seq = torch.tensor([99, 99, 99, 99])
+        mask = _get_right_trailing_pad_mask(seq, pad_token_id=99, eos_token_id=99)
+        assert mask.tolist() == [False, True, True, True]
+
+    def test_overlap_single_element(self):
+        seq = torch.tensor([99])
+        mask = _get_right_trailing_pad_mask(seq, pad_token_id=99, eos_token_id=99)
+        assert mask.tolist() == [False]
+
+    def test_overlap_no_pad_tokens_at_all(self):
+        seq = torch.tensor([10, 20, 30])
+        mask = _get_right_trailing_pad_mask(seq, pad_token_id=99, eos_token_id=99)
+        assert mask.tolist() == [False, False, False]
+
+    # --- pad_token_id != eos_token_id (simple equality fallback) ---
+
+    def test_distinct_simple_equality(self):
+        seq = torch.tensor([10, 0, 20, 0, 0])
+        mask = _get_right_trailing_pad_mask(seq, pad_token_id=0, eos_token_id=2)
+        assert mask.tolist() == [False, True, False, True, True]
+
+    def test_distinct_no_pad(self):
+        seq = torch.tensor([10, 20, 30])
+        mask = _get_right_trailing_pad_mask(seq, pad_token_id=0, eos_token_id=2)
+        assert mask.tolist() == [False, False, False]
+
+    def test_distinct_eos_not_masked(self):
+        seq = torch.tensor([10, 2, 0, 0])
+        mask = _get_right_trailing_pad_mask(seq, pad_token_id=0, eos_token_id=2)
+        assert mask.tolist() == [False, False, True, True]
+
+    # --- eos_token_id=None (simple equality fallback) ---
+
+    def test_eos_none_falls_back_to_equality(self):
+        seq = torch.tensor([10, 99, 20, 99, 99])
+        mask = _get_right_trailing_pad_mask(seq, pad_token_id=99, eos_token_id=None)
+        assert mask.tolist() == [False, True, False, True, True]
 
 
 def test_try_load_blend_from_json_success(tmp_path):
