@@ -29,12 +29,15 @@ uv pip install -r tests/ci_tests/requirements_deploy.txt
 TEST_SCRIPT="tests/functional_tests/checkpoint_robustness/test_checkpoint_vllm_deploy.py"
 FINETUNE_TEST_NAME="${TEST_NAME%_vllm_deploy}"
 CKPT_DIR="$PIPELINE_DIR/$FINETUNE_TEST_NAME/robustness_checkpoint"
-CKPT_BASE=$(ls -d ${CKPT_DIR}/epoch_*_step_* 2>/dev/null | sort | tail -1)
+CKPT_BASE=$(ls -d "${CKPT_DIR}"/epoch_*_step_* 2>/dev/null | sort | tail -1 || true)
 
 if [[ -z "$CKPT_BASE" ]]; then
   echo "ERROR: No checkpoint found under ${CKPT_DIR}"
+  echo "Contents of $PIPELINE_DIR/$FINETUNE_TEST_NAME/:"
+  ls -la "$PIPELINE_DIR/$FINETUNE_TEST_NAME/" 2>/dev/null || echo "  Directory does not exist"
   exit 1
 fi
+echo "Using checkpoint: ${CKPT_BASE}"
 
 if [[ "$CI_JOB_STAGE" == *"peft"* ]]; then
     python -m pytest $TEST_SCRIPT \
