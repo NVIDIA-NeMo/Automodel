@@ -92,3 +92,4 @@ lr_scheduler:
 
 ci:
   recipe_owner: ZhiyuLi-Nvidia
+  time: "00:30:00"
