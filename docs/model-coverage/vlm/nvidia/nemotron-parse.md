@@ -27,7 +27,7 @@
 
 ## Example Recipes
 
-| Recipe | Dataset | Description | Brev |
+| Recipe | Dataset | Description | Try on Brev |
 |---|---|---|---|
 | {download}`nemotron_parse_v1_1.yaml <../../../../examples/vlm_finetune/nemotron/nemotron_parse_v1_1.yaml>` | cord-v2 | SFT — Nemotron-Parse on CORD-v2 | [![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3BxDyGV2RLNqyftNxJO5rV5sp8x) |
 
