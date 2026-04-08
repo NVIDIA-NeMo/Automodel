@@ -408,6 +408,16 @@ def test_checkpoint_robustness():
         torch.cuda.empty_cache()
         _barrier()
 
+    # Skip the atexit-registered destroy_process_group() call. MoE models with expert
+    # parallelism create NCCL sub-groups (DeepEP) that leave pending collective state,
+    # causing destroy_process_group() to hang and SIGABRT. Since the process is about to
+    # exit, the OS reclaims all resources safely.
+    import atexit
+
+    from nemo_automodel.components.distributed.init_utils import destroy_global_state
+
+    atexit.unregister(destroy_global_state)
+
 
 if __name__ == "__main__":
     test_checkpoint_robustness()
