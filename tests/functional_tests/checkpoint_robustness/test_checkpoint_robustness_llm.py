@@ -24,6 +24,7 @@ Launch: torchrun --nproc-per-node=<N> -m pytest <this_file> -c <config.yaml>
 
 from __future__ import annotations
 
+import gc
 import os
 import sys
 from pathlib import Path
@@ -233,6 +234,7 @@ def test_checkpoint_robustness():
     original_pretrained_path = cfg.model.pretrained_model_name_or_path
 
     del trainer
+    gc.collect()
     torch.cuda.empty_cache()
 
     # Phantom key check: scan consolidated safetensors for leaked quantization keys
@@ -269,6 +271,7 @@ def test_checkpoint_robustness():
 
     # Phase 4: Load into vanilla HF (rank 0 only)
     del restored_trainer
+    gc.collect()
     torch.cuda.empty_cache()
     _barrier()  # ensure all ranks free memory before rank 0 loads HF model
 
@@ -355,6 +358,7 @@ def test_checkpoint_robustness():
         )
 
         del cross_tp_trainer
+        gc.collect()
         torch.cuda.empty_cache()
         _barrier()
 
@@ -389,6 +393,7 @@ def test_checkpoint_robustness():
                         baseline_losses[entry["step"]] = entry["loss"]
 
         del baseline_trainer
+        gc.collect()
         torch.cuda.empty_cache()
         shutil.rmtree(baseline_dir, ignore_errors=True)
 
@@ -436,6 +441,7 @@ def test_checkpoint_robustness():
             print(f"[Phase 6] Training resumption verified ({matched_steps} steps compared) ✓")
 
         del resume_trainer
+        gc.collect()
         torch.cuda.empty_cache()
         _barrier()
 
