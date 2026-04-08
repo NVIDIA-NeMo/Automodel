@@ -408,6 +408,13 @@ def test_checkpoint_robustness():
         torch.cuda.empty_cache()
         _barrier()
 
+    # Explicitly tear down the process group while all ranks are still synchronized.
+    # Without this, destroy_process_group() runs via atexit at non-deterministic times
+    # across ranks, causing NCCL ALLREDUCE timeouts during cleanup.
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     test_checkpoint_robustness()
