@@ -26,6 +26,35 @@ from nemo_automodel.components.distributed.parallelizer import (
 logger = logging.getLogger(__name__)
 
 
+def _patch_is_packed_sequence_for_training() -> None:
+    """Eliminate CPU-GPU sync from flash attention for standard (non-packed) training.
+
+    transformers._is_packed_sequence() returns a GPU bool scalar when batch_size==1,
+    which causes Python's ``if`` to call aten::is_nonzero — a CPU-GPU sync — once per
+    attention layer per forward pass.  With FSDP+TP+gradient-checkpointing this fires
+    hundreds of times per iteration.
+
+    For standard (non-packed) training sequences are never packed, so returning the
+    Python False immediately is both correct and avoids the sync.  Do NOT apply this
+    patch when using packed-sequence training (multiple sequences concatenated into one
+    tensor with position_ids that reset to 0 mid-sequence).
+    """
+    try:
+        import transformers.modeling_flash_attention_utils as _fa_utils
+
+        if getattr(_fa_utils, "_is_packed_sequence_patched", False):
+            return  # already patched
+
+        def _is_packed_sequence_no_sync(position_ids, batch_size):
+            # Non-packed training: position_ids is always a simple arange -- never packed.
+            return False
+
+        _fa_utils._is_packed_sequence = _is_packed_sequence_no_sync
+        _fa_utils._is_packed_sequence_patched = True
+    except (ImportError, AttributeError):
+        pass
+
+
 class FSDP2Manager:
     """
     Manager for parallelizing models using FSDP2 with TP, DP, CP sharding.
@@ -95,9 +124,7 @@ class FSDP2Manager:
             return model
 
         if self.config.patch_is_packed_sequence:
-            from nemo_automodel.components.distributed.pipelining.hf_utils import patch_is_packed_sequence_for_training
-
-            patch_is_packed_sequence_for_training()
+            _patch_is_packed_sequence_for_training()
 
         fsdp2_strategy_parallelize(
             model,
