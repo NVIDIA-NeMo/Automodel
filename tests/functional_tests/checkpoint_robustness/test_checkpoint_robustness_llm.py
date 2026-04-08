@@ -57,7 +57,7 @@ def _extract_custom_args(argv):
         "--max_cpu_gb",
         "--resume_loss_threshold",
     }
-    boolean_keys = {"--trust_remote_code", "--check_fused_qkv_keys", "--check_phantom_keys", "--check_resume", "--hf_device_map_auto"}
+    boolean_keys = {"--trust_remote_code", "--check_fused_qkv_keys", "--check_phantom_keys", "--check_resume", "--hf_device_map_auto", "--no_check_hf"}
     custom = {}
     remaining = []
     i = 0
@@ -99,6 +99,9 @@ def _extract_custom_args(argv):
         # Enable check_resume by default unless no_check_resume is set
         if not no_check_resume and "check_resume" not in custom:
             custom["check_resume"] = True
+    
+    if _rank0():
+        print(f"Custom args: {custom}, remaining: {remaining}")
 
     return custom, remaining
 
@@ -143,6 +146,26 @@ def _get_logits(model, input_ids, device) -> torch.Tensor:
         return logits.float().cpu()
 
 
+def _fix_meta_rotary_embeddings(model):
+    """Re-materialize RotaryEmbedding tensors stuck on meta device.
+
+    The HF remote Baichuan code creates inv_freq/cos_cached/sin_cached as
+    plain tensor attributes (not registered buffers), so HF's meta-device
+    init never materializes them.
+    """
+    for _name, mod in model.named_modules():
+        if hasattr(mod, "inv_freq") and mod.inv_freq.device.type == "meta":
+            dim = mod.inv_freq.shape[0] * 2
+            mod.inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+            max_pos = mod.max_seq_len_cached
+            t = torch.arange(max_pos, dtype=torch.float32)
+            freqs = torch.outer(t, mod.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            mod.cos_cached = emb.cos()[None, None, :, :].to(torch.float32)
+            mod.sin_cached = emb.sin()[None, None, :, :].to(torch.float32)
+    return model
+
+
 def _rank0() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
 
@@ -170,6 +193,7 @@ def test_checkpoint_robustness():
     check_resume = bool(custom_args.get("check_resume", False))
     resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
     hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
+    no_check_hf = bool(custom_args.get("no_check_hf", False))
 
     input_ids = _get_input_ids(tokenizer_name)
 
@@ -288,7 +312,9 @@ def test_checkpoint_robustness():
             if hf_device_map_auto:
                 hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
             else:
-                hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs).to(device)
+                hf_model = _fix_meta_rotary_embeddings(
+                    AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
+                ).to(device)
             hf_logits = _get_logits(hf_model, input_ids, device)
             del hf_model
 
