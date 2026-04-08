@@ -47,12 +47,18 @@ re-spawning torchrun.
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
 from nemo_automodel.cli.utils import load_yaml, resolve_recipe_name
 
-logging.getLogger().setLevel(logging.INFO)
+# When launched via external torchrun each worker imports this module.
+# Suppress non-rank-0 CLI output before setup_logging installs RankFilter.
+if int(os.environ.get("RANK", "0")) > 0:
+    logging.disable(logging.CRITICAL)
+else:
+    logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 

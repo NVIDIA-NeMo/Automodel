@@ -25,6 +25,7 @@ from torch.distributed.pipelining.stage import PipelineStage
 from nemo_automodel.components.distributed.pipelining.functional import (
     ParallelizeFnProtocol,
     pipeline_model,
+    reset_pp_stage_shapes,
 )
 from nemo_automodel.components.distributed.pipelining.hf_utils import (
     validate_hf_model_for_pipeline_support,
@@ -118,6 +119,8 @@ class AutoPipeline:
             model_parts=None,
             stages=None,
         )
+        self._model_config = None
+        self._pp_current_seq_len: Optional[int] = None
 
     def build(
         self,
@@ -168,11 +171,42 @@ class AutoPipeline:
         self._info.model_parts = model_parts
         self._info.stages = stages
 
+        # Store model config for runtime shape updates
+        self._model_config = model.config
+
         return self
 
     @property
     def info(self) -> PipelineInfo:
         return self._info
+
+    def update_seq_len(self, seq_len: int) -> None:
+        """Reset pipeline stage infrastructure for a new sequence length.
+
+        VLM training batches can have wildly different sequence lengths across steps
+        (image batches vs. text-only batches).  PyTorch's PipelineStage locks in recv
+        buffer sizes on the first step, causing a shape-mismatch error on later steps
+        with different seq_lens.
+
+        Call this before every ``schedule.step()`` to update the stage shapes without
+        running an expensive forward pass.  A no-op when seq_len has not changed.
+
+        Args:
+            seq_len: Sequence length of the upcoming batch (``input_ids.shape[1]``).
+        """
+        if seq_len == self._pp_current_seq_len:
+            return
+        if self._model_config is None:
+            raise RuntimeError("AutoPipeline.build() must be called before update_seq_len()")
+        reset_pp_stage_shapes(
+            self._info.schedule,
+            self._info.stages,
+            self._model_config,
+            self.pp_microbatch_size,
+            seq_len,
+        )
+        self._pp_current_seq_len = seq_len
+        logger.debug(f"PP stage shapes updated for seq_len={seq_len}")
 
     @property
     def parts(self) -> list[nn.Module]:
