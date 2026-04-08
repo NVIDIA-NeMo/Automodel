@@ -27,7 +27,8 @@ source /tmp/vllm_deploy_venv/bin/activate
 uv pip install -r tests/ci_tests/requirements_deploy.txt
 
 TEST_SCRIPT="tests/functional_tests/checkpoint_robustness/test_checkpoint_vllm_deploy.py"
-CKPT_DIR="$PIPELINE_DIR/$TEST_NAME/robustness_checkpoint"
+FINETUNE_TEST_NAME="${TEST_NAME%_vllm_deploy}"
+CKPT_DIR="$PIPELINE_DIR/$FINETUNE_TEST_NAME/robustness_checkpoint"
 CKPT_BASE=$(ls -d ${CKPT_DIR}/epoch_*_step_* 2>/dev/null | sort | tail -1)
 
 if [[ -z "$CKPT_BASE" ]]; then
