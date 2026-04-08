@@ -40,7 +40,7 @@ except ImportError:
     HF_HUB_CACHE = None
 
 from packaging.version import parse
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file, save_file, load as safetensors_load
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
@@ -76,7 +76,11 @@ def _ensure_msc_available() -> None:
     """Raise an error if MSC is not installed but a cloud path is used."""
     if not MSC_AVAILABLE:
         raise ImportError(
+<<<<<<< HEAD
             "multistorageclient is required for cloud storage paths. "
+=======
+            "multistorageclient is required for cloud storage paths."
+>>>>>>> 91a223c (fix: address review comments - PEFT cloud path, optional dependencies, and unit test fixes)
             "Install it with: pip install multi-storage-client "
             "--index-url https://pypi.nvidia.com"
         )
@@ -700,7 +704,14 @@ class Checkpointer:
         is_model = True if "/model" in path else False
         # PEFT loading is broadcasted from rank0 so it is a special case
         if self.config.is_peft and is_model and (not is_init_step):
-            state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
+            if is_cloud_path(path):
+                _ensure_msc_available()
+                adapter_path = path.rstrip("/") + "/adapter_model.safetensors"
+                with msc.open(adapter_path, "rb") as f:
+                    data = f.read()
+                state_dict = safetensors_load(data)
+            else:
+                state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
         else:
             if is_cloud_path(path):
                 _ensure_msc_available()
@@ -730,7 +741,13 @@ class Checkpointer:
         # PEFT saving is done on rank0 so it is a special case
         if self.config.is_peft and is_model:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                save_file(state_dict, os.path.join(path, "adapter_model.safetensors"))
+                if is_cloud_path(path):
+                    _ensure_msc_available()
+                    adapter_path = path.rstrip("/") + "/adapter_model.safetensors"
+                    with msc.open(adapter_path, "wb") as f:
+                        save_file(state_dict, f)
+                else:
+                    save_file(state_dict, os.path.join(path, "adapter_model.safetensors"))
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
             return

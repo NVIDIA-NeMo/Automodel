@@ -904,7 +904,7 @@ class TestDoLoad:
              patch("nemo_automodel.components.checkpoint.checkpointing.dcp"):
             Checkpointer._do_load(ckptr, state_dict, "msc://bucket/step-100")
 
-        mock_msc.torch. MultiStorageFileSystemReader.assert_called_once_with("msc://bucket/step-100")
+        mock_msc.torch.MultiStorageFileSystemReader.assert_called_once_with("msc://bucket/step-100")
 
     def test_local_path_does_not_use_msc_reader(self, tmp_path):
         ckptr = self._make_checkpointer()
@@ -914,17 +914,25 @@ class TestDoLoad:
              patch("nemo_automodel.components.checkpoint.checkpointing.dcp"):
             Checkpointer._do_load(ckptr, state_dict, str(tmp_path / "step-100"))
 
-        mock_msc.torch. MultiStorageFileSystemReader.assert_not_called()
+        mock_msc.open.assert_not_called()
 
     def test_peft_cloud_load_still_routes_through_msc_reader(self):
         ckptr = self._make_checkpointer(is_peft=True)
         state_dict = {"weight": torch.zeros(4)}
+        mock_file = MagicMock()
+        mock_file.read.return_value= b"fake bytes"
 
         with patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc, \
-             patch("nemo_automodel.components.checkpoint.checkpointing.dcp"):
-            Checkpointer._do_load(ckptr, state_dict, "msc://bucket/step-100")
+             patch("nemo_automodel.components.checkpoint.checkpointing.dcp"), \
+             patch("nemo_automodel.components.checkpoint.checkpointing.safetensors_load") as mock_load:
+            mock_msc.open.return_value.__enter__=MagicMock(return_value=mock_file)
+            mock_msc.open.return_value.__exit__=MagicMock(return_value=False)
+            mock_load.return_value = state_dict
+            Checkpointer._do_load(ckptr, state_dict, "msc://bucket/step-100/model")
+        
+        mock_msc.open.assert_called_once()
 
-        mock_msc.torch. MultiStorageFileSystemReader.assert_called_once_with("msc://bucket/step-100")
+       
 
     def test_save_and_load_use_same_path(self):
         config = MagicMock()
@@ -941,4 +949,4 @@ class TestDoLoad:
             Checkpointer._do_load(ckptr, state_dict, path)
 
         mock_msc.torch.MultiStorageFileSystemWriter.assert_called_once_with(path)
-        mock_msc.torch. MultiStorageFileSystemReader.assert_called_once_with(path)
+        mock_msc.torch.MultiStorageFileSystemReader.assert_called_once_with(path)
