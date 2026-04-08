@@ -100,7 +100,6 @@ class FSDP2Manager:
         self.enable_compile = config.enable_compile
         self.enable_fsdp2_prefetch = config.enable_fsdp2_prefetch
         self.fsdp_layer_group_size = config.fsdp_layer_group_size
-        self.fsdp2_no_cat_array = config.fsdp2_no_cat_array
         self.fsdp2_backward_prefetch_depth = config.fsdp2_backward_prefetch_depth
         self.fsdp2_forward_prefetch_depth = config.fsdp2_forward_prefetch_depth
 
@@ -138,7 +137,6 @@ class FSDP2Manager:
             enable_compile=self.enable_compile,
             enable_fsdp2_prefetch=self.enable_fsdp2_prefetch,
             fsdp_layer_group_size=self.fsdp_layer_group_size,
-            fsdp2_no_cat_array=self.fsdp2_no_cat_array,
             fsdp2_backward_prefetch_depth=self.fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth=self.fsdp2_forward_prefetch_depth,
         )
