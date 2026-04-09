@@ -185,13 +185,19 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
 
         # Apply activation checkpointing to linear layers if requested
         if activation_checkpointing:
-            # Disable KV caching during training to ensure deterministic
-            # shapes between forward and checkpoint recomputation.
-            if hasattr(model, "config") and getattr(model.config, "use_cache", None) is not False:
-                try:
-                    model.config.use_cache = False
-                except Exception:
-                    pass
+            # Models with KV-shared layers (e.g. Gemma4 2B/4B) pass K/V from
+            # earlier layers to later layers through the DynamicCache.  Disabling
+            # the cache breaks this architectural dependency, so we must keep
+            # use_cache=True for those models.
+            _text_cfg = getattr(getattr(model, "config", None), "text_config", None) or getattr(model, "config", None)
+            _has_kv_sharing = getattr(_text_cfg, "num_kv_shared_layers", 0) > 0
+
+            if not _has_kv_sharing:
+                if hasattr(model, "config") and getattr(model.config, "use_cache", None) is not False:
+                    try:
+                        model.config.use_cache = False
+                    except Exception:
+                        pass
 
             # For HF-native models in transformers >= 5.3.0, GradientCheckpointingLayer.__call__
             # applies torch.utils.checkpoint at full-layer granularity when gradient_checkpointing=True.
@@ -219,7 +225,10 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 for i, layer in enumerate(layers):
                     if hasattr(layer, "mlp"):
                         layers[i].mlp = checkpoint_wrapper(layer.mlp)
-                    if hasattr(layer, "self_attn"):
+                    # Skip self_attn checkpointing for KV-shared models:
+                    # recomputation would double-write to the DynamicCache,
+                    # corrupting K/V entries that shared layers depend on.
+                    if hasattr(layer, "self_attn") and not _has_kv_sharing:
                         layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
 
                     if hasattr(layer, "input_layernorm"):
