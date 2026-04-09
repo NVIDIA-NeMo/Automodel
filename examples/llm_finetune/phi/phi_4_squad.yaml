@@ -102,6 +102,7 @@ ci:
   recipe_owner: hemildesai
   time: "00:25:00"
   node_multiplier: true
+  vllm_deploy: true
   checkpoint_robustness:
     hf_kl_threshold: 1.2e-3
     tokenizer_name: microsoft/phi-4

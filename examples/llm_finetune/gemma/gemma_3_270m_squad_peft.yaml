@@ -99,6 +99,7 @@ optimizer:
   # min_lr: 1.0e-5
 
 ci:
+  vllm_deploy: true
   recipe_owner: HuiyingLi
   time: "00:20:00"
   checkpoint_robustness:

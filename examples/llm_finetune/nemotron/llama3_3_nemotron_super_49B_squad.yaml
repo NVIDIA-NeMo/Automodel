@@ -119,6 +119,7 @@ ci:
   recipe_owner: akoumpa
   nodes: 2
   time: "00:45:00"
+  vllm_deploy: true
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
     distributed.tp_size: 8

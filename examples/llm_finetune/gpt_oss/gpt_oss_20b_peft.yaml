@@ -115,6 +115,8 @@ optimizer:
   # min_lr: 1.0e-5
 
 ci:
+  vllm_deploy: true
+  vllm_smoke_test: true
   recipe_owner: akoumpa
   time: "00:15:00"
   checkpoint_robustness:
