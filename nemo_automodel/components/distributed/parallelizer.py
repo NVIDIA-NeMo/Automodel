@@ -417,7 +417,6 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
                     if isinstance(child, nn.ModuleList):
                         _fsdp_by_dtype(child, mesh, mp_policy, offload_policy)
                     else:
-                        _pre_shard_combined_projections(child, mesh, mp_policy, offload_policy)
                         parallelizer_utils.fully_shard_by_dtype(
                             child,
                             mesh,
@@ -808,7 +807,6 @@ def apply_fsdp2_sharding_recursively(
 
         flat_layer_items = [(k, c) for k, c in all_items if not _is_container(c)]
         nested_items = [(k, c) for k, c in all_items if _is_container(c)]
-        flat_layers = [c for _, c in flat_layer_items]
         nested_lists = nested_items  # kept for len() checks below
 
         # Recurse into any nested ModuleLists first (unchanged behavior).
