@@ -416,7 +416,6 @@ class HybridEPDispatch(torch.autograd.Function):
             num_of_experts_per_rank=num_local_experts,
             pad_multiple=pad_multiple,
             num_permuted_tokens=num_permuted_tokens,
-            non_blocking=non_blocking,
         )
 
         ctx.handle = handle

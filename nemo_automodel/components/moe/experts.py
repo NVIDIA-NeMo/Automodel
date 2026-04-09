@@ -716,7 +716,7 @@ class GroupedExpertsDeepEP(nn.Module):
                         self.expert_activation,
                     )
             else:
-                tokens_per_expert = tokens_per_expert.to("cpu")
+                tokens_per_expert = tokens_per_expert.to("cpu", dtype=torch.int64)
                 output1 = ops.gmm(
                     permuted_local_hidden_states,
                     gate_and_up_projs,
