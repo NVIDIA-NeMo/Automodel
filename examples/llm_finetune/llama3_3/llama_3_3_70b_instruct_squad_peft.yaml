@@ -105,3 +105,4 @@ lr_scheduler:
 
 ci:
   recipe_owner: akoumpa
+  time: "00:30:00"

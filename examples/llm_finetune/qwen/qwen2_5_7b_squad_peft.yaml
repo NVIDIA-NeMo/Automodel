@@ -101,8 +101,9 @@ optimizer:
   # min_lr: 1.0e-5
 
 ci:
+  vllm_deploy: true
   recipe_owner: HuiyingLi
-  time: "00:20:00"
+  time: "00:25:00"
   checkpoint_robustness:
     hf_kl_threshold: 8e-2
     distributed.tp_size: 2

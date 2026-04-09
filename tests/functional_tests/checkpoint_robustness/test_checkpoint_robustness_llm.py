@@ -24,6 +24,7 @@ Launch: torchrun --nproc-per-node=<N> -m pytest <this_file> -c <config.yaml>
 
 from __future__ import annotations
 
+import gc
 import os
 import sys
 from pathlib import Path
@@ -88,7 +89,11 @@ def _extract_custom_args(argv):
         no_check_resume = ci_robustness.pop("no_check_resume", False)
         for k, v in ci_robustness.items():
             if k not in custom:
-                if isinstance(v, bool) and v:
+                if "." in k:
+                    # Dotted keys are config overrides (e.g. distributed.tp_size),
+                    # route them to the config parser instead of the custom dict.
+                    remaining.extend([f"--{k}", str(v)])
+                elif isinstance(v, bool) and v:
                     custom[k] = True
                 elif not isinstance(v, bool):
                     custom[k] = str(v)
@@ -137,6 +142,26 @@ def _get_logits(model, input_ids, device) -> torch.Tensor:
         if isinstance(logits, DTensor):
             logits = logits.full_tensor()
         return logits.float().cpu()
+
+
+def _fix_meta_rotary_embeddings(model):
+    """Re-materialize RotaryEmbedding tensors stuck on meta device.
+
+    The HF remote Baichuan code creates inv_freq/cos_cached/sin_cached as
+    plain tensor attributes (not registered buffers), so HF's meta-device
+    init never materializes them.
+    """
+    for _name, mod in model.named_modules():
+        if hasattr(mod, "inv_freq") and mod.inv_freq.device.type == "meta":
+            dim = mod.inv_freq.shape[0] * 2
+            mod.inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+            max_pos = mod.max_seq_len_cached
+            t = torch.arange(max_pos, dtype=torch.float32)
+            freqs = torch.outer(t, mod.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            mod.cos_cached = emb.cos()[None, None, :, :].to(torch.float32)
+            mod.sin_cached = emb.sin()[None, None, :, :].to(torch.float32)
+    return model
 
 
 def _rank0() -> bool:
@@ -205,6 +230,7 @@ def test_checkpoint_robustness():
     original_pretrained_path = cfg.model.pretrained_model_name_or_path
 
     del trainer
+    gc.collect()
     torch.cuda.empty_cache()
 
     # Phantom key check: scan consolidated safetensors for leaked quantization keys
@@ -222,7 +248,6 @@ def test_checkpoint_robustness():
         print(f"[Phantom keys] Scanned {len(sf_files)} files, no _blocks/_scales keys ✓")
 
     cfg = parse_args_and_load_config()
-    cfg.model.trust_remote_code = False
     if not is_peft:
         cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
         cfg.checkpoint.enabled = False
@@ -242,6 +267,7 @@ def test_checkpoint_robustness():
 
     # Phase 4: Load into vanilla HF (rank 0 only)
     del restored_trainer
+    gc.collect()
     torch.cuda.empty_cache()
     _barrier()  # ensure all ranks free memory before rank 0 loads HF model
 
@@ -261,7 +287,9 @@ def test_checkpoint_robustness():
             if hf_device_map_auto:
                 base_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
             else:
-                base_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs).to(device)
+                base_model = _fix_meta_rotary_embeddings(
+                    AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
+                ).to(device)
             peft_model = PeftModel.from_pretrained(base_model, str(ckpt_step_dir / "model"))
             hf_logits = _get_logits(peft_model, input_ids, device)
 
@@ -285,7 +313,9 @@ def test_checkpoint_robustness():
             if hf_device_map_auto:
                 hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
             else:
-                hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs).to(device)
+                hf_model = _fix_meta_rotary_embeddings(
+                    AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
+                ).to(device)
             hf_logits = _get_logits(hf_model, input_ids, device)
             del hf_model
 
@@ -324,6 +354,7 @@ def test_checkpoint_robustness():
         )
 
         del cross_tp_trainer
+        gc.collect()
         torch.cuda.empty_cache()
         _barrier()
 
@@ -358,6 +389,7 @@ def test_checkpoint_robustness():
                         baseline_losses[entry["step"]] = entry["loss"]
 
         del baseline_trainer
+        gc.collect()
         torch.cuda.empty_cache()
         shutil.rmtree(baseline_dir, ignore_errors=True)
 
@@ -405,8 +437,19 @@ def test_checkpoint_robustness():
             print(f"[Phase 6] Training resumption verified ({matched_steps} steps compared) ✓")
 
         del resume_trainer
+        gc.collect()
         torch.cuda.empty_cache()
         _barrier()
+
+    # Skip the atexit-registered destroy_process_group() call. MoE models with expert
+    # parallelism create NCCL sub-groups (DeepEP) that leave pending collective state,
+    # causing destroy_process_group() to hang and SIGABRT. Since the process is about to
+    # exit, the OS reclaims all resources safely.
+    import atexit
+
+    from nemo_automodel.components.distributed.init_utils import destroy_global_state
+
+    atexit.unregister(destroy_global_state)
 
 
 if __name__ == "__main__":
