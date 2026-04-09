@@ -79,6 +79,7 @@ dependencies = [
     "mistral-common[image,audio,hf-hub,sentencepiece]",
     "opencv-python-headless==4.10.0.84",
     "pybind11",
+    "pydantic>=2.0",
     "pyyaml",
     "torch>=2.6.0,<=2.10.0",
     "torchdata",
