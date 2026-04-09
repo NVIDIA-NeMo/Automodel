@@ -112,6 +112,7 @@ ci:
   time: "00:15:00"
   checkpoint_robustness:
     hf_kl_threshold: 1e-1
+    hf_device_map_auto: true
     experts_implementation: grouped_mm
     trust_remote_code: true
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
