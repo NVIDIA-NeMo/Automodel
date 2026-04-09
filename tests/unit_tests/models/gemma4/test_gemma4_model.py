@@ -47,12 +47,11 @@ def _make_text_config(**overrides):
         num_hidden_layers=4,
         intermediate_size=128,
         rms_norm_eps=1e-6,
-        rope_theta=10000.0,
         max_position_embeddings=256,
         enable_moe_block=True,
         num_experts=4,
         top_k_experts=2,
-        expert_intermediate_size=64,
+        moe_intermediate_size=64,
         layer_types=["full_attention", "sliding_attention"] * 2,
         sliding_window=128,
         hidden_activation="gelu_pytorch_tanh",
@@ -74,7 +73,7 @@ def _make_moe_config(text_config=None):
     return MoEConfig(
         dim=tc.hidden_size,
         inter_dim=tc.intermediate_size,
-        moe_inter_dim=tc.expert_intermediate_size,
+        moe_inter_dim=tc.moe_intermediate_size,
         n_routed_experts=tc.num_experts,
         n_shared_experts=0,
         n_activated_experts=tc.top_k_experts,
@@ -317,7 +316,7 @@ class TestGemma4MoETextModelBackend:
         assert model.moe_config.dim == text_config.hidden_size
         assert model.moe_config.n_routed_experts == text_config.num_experts
         assert model.moe_config.n_activated_experts == text_config.top_k_experts
-        assert model.moe_config.moe_inter_dim == text_config.expert_intermediate_size
+        assert model.moe_config.moe_inter_dim == text_config.moe_intermediate_size
         assert model.moe_config.expert_activation == "geglu"
 
     def test_moe_config_accepts_override(self, text_config, backend_config, moe_config):
