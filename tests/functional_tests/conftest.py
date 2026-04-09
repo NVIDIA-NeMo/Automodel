@@ -111,6 +111,15 @@ _OVERRIDES = [
     "qat.qat_config.groupsize",
     "dataloader.collate_fn.pad_seq_len_divisible",
     "validation_dataloader.collate_fn.pad_seq_len_divisible",
+    "deploy_model_path",
+    "adapter_path",
+    "config_path",
+    "deploy_mode",
+    "max_new_tokens",
+]
+
+_BOOLEAN_OVERRIDES = [
+    "vllm_smoke_test",
     "kl_threshold",
     "hf_kl_threshold",
     "cross_tp_size",
@@ -126,9 +135,6 @@ _OVERRIDES = [
     "tokenizer._target_",
     "tokenizer.pretrained_model_name_or_path",
     "tokenizer.trust_remote_code",
-]
-
-_BOOLEAN_OVERRIDES = [
     "trust_remote_code",
     "check_fused_qkv_keys",
     "check_phantom_keys",
