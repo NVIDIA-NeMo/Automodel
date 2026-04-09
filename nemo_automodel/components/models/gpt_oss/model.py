@@ -149,11 +149,15 @@ class GptOssModel(nn.Module):
         **attn_kwargs: Any,
     ) -> torch.Tensor:
         if position_ids is None:
-            position_ids = (
-                torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
-            )
+            if input_ids.ndim == 1:
+                position_ids = torch.arange(0, input_ids.shape[0], device=input_ids.device)
+            else:
+                position_ids = (
+                    torch.arange(0, input_ids.shape[1], device=input_ids.device)
+                    .unsqueeze(0)
+                    .expand(input_ids.shape[0], -1)
+                )
 
-        # Compute cos/sin from RotaryEmbedding inv_freq and current position_ids; then concat [cos, sin]
         freqs_cis = position_ids_to_freqs_cis(
             self.rotary_emb,
             position_ids,
