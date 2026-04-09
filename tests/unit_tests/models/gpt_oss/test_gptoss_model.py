@@ -395,6 +395,61 @@ class TestGptOssForCausalLM:
             assert output.shape == (batch_size, seq_len, gpt_config.vocab_size)
             assert output.device == device
 
+    def test_forward_thd_unsqueeze(self, gpt_config, backend_config, device):
+        """Test that THD format produces 3D logits with unsqueezed batch dimension.
+
+        When qkv_format='thd' is used (sequence packing with TE attention),
+        the model squeezes [1, T] inputs to [T] via squeeze_input_for_thd,
+        producing 2D [T, V] logits. The forward method must unsqueeze to
+        [1, T, V] to match the expected 3D batch format.
+        """
+        model = GptOssForCausalLM(gpt_config, backend=backend_config)
+        model = model.to(device)
+
+        total_tokens = 16
+        # THD inputs arrive as [1, total_tokens] from the PP schedule
+        input_ids = torch.randint(0, gpt_config.vocab_size, (1, total_tokens), dtype=torch.long, device=device)
+        position_ids = torch.arange(total_tokens, device=device).unsqueeze(0)
+        cu_seqlens = torch.tensor([[0, 8, 16]], dtype=torch.int32, device=device)
+
+        with patch.object(model.model, "forward") as mock_model:
+            # After squeeze_input_for_thd, input is 1D [T], so backbone returns [T, H]
+            mock_model.return_value = torch.randn(total_tokens, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+
+            output = model(
+                input_ids,
+                position_ids=position_ids,
+                qkv_format="thd",
+                cu_seqlens=cu_seqlens,
+            )
+
+            # Logits must be 3D [1, T, V] after unsqueeze
+            assert output.ndim == 3
+            assert output.shape == (1, total_tokens, gpt_config.vocab_size)
+
+            # Verify backbone received squeezed 1D input_ids
+            call_args = mock_model.call_args
+            actual_input_ids = call_args[0][0]
+            assert actual_input_ids.ndim == 1
+            assert actual_input_ids.shape[0] == total_tokens
+
+    def test_forward_non_thd_no_unsqueeze(self, gpt_config, backend_config, device):
+        """Test that non-THD forward does not add extra dimensions."""
+        model = GptOssForCausalLM(gpt_config, backend=backend_config)
+        model = model.to(device)
+
+        batch_size, seq_len = 2, 8
+        input_ids = torch.randint(0, gpt_config.vocab_size, (batch_size, seq_len), dtype=torch.long, device=device)
+
+        with patch.object(model.model, "forward") as mock_model:
+            mock_model.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+
+            output = model(input_ids)
+
+            # Standard 3D output [B, S, V] without unsqueeze
+            assert output.ndim == 3
+            assert output.shape == (batch_size, seq_len, gpt_config.vocab_size)
+
     def test_initialize_weights(self, gpt_config, backend_config, device):
         """Test weight initialization."""
         model = GptOssForCausalLM(gpt_config, backend=backend_config)
