@@ -29,7 +29,7 @@
 
 | Recipe | Dataset | Description | Try on Brev |
 |---|---|---|---|
-| {download}`nemotron_parse_v1_1.yaml <../../../../examples/vlm_finetune/nemotron/nemotron_parse_v1_1.yaml>` | cord-v2 | SFT — Nemotron-Parse on CORD-v2 | [![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3BxDyGV2RLNqyftNxJO5rV5sp8x) |
+| {download}`nemotron_parse_v1_1.yaml <../../../../examples/vlm_finetune/nemotron/nemotron_parse_v1_1.yaml>` | cord-v2 | SFT — Nemotron-Parse on CORD-v2 | [![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3C6LDKU2DfOvpVTFhjw3YQ4djPM) |
 
 
 ## Try with NeMo AutoModel
@@ -82,7 +82,7 @@ See the [Installation Guide](../../../guides/installation.md) and [VLM Fine-Tuni
 
 Launch the end-to-end Nemotron Parse fine-tuning tutorial on Brev with a single click:
 
-[![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3BxDyGV2RLNqyftNxJO5rV5sp8x)
+[![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3C6LDKU2DfOvpVTFhjw3YQ4djPM)
 
 See also the [tutorial notebook](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/nemotron-parse/finetune.ipynb) and the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
 
