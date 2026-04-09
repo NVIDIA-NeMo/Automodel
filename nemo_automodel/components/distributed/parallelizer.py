@@ -153,7 +153,6 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
     ) -> nn.Module:
         """Apply the default parallelization flow."""
         tp_mesh = device_mesh[tp_mesh_name]
-        pp_enabled = "pp" in device_mesh.mesh_dim_names and device_mesh["pp"].size() > 1
 
         # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
         # if dp_replicate_size > 1, use HSDP, else use FSDP
@@ -274,7 +273,6 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             dp_mesh,
             mp_policy,
             offload_policy,
-            pp_enabled,
             enable_fsdp2_prefetch,
             fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth,
@@ -767,7 +765,6 @@ def apply_fsdp2_sharding_recursively(
     mesh: DeviceMesh,
     mp_policy: Optional[MixedPrecisionPolicy],
     offload_policy: Optional[OffloadPolicy] = None,
-    pp_enabled: bool = False,
     enable_fsdp2_prefetch: bool = True,
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
@@ -790,9 +787,6 @@ def apply_fsdp2_sharding_recursively(
         mp_policy (Optional[MixedPrecisionPolicy]): Mixed precision policy for FSDP.
         offload_policy (Optional[OffloadPolicy]): CPU offload policy for FSDP.
             Defaults to None.
-        pp_enabled (bool): Whether pipeline parallelism is enabled. When True,
-            reshard_after_forward=False for all layers (weights kept gathered across
-            microbatches) and no prefetch chains are set up.
         enable_fsdp2_prefetch (bool): Enable explicit forward/backward prefetch chains.
         fsdp2_backward_prefetch_depth (int): Backward prefetch depth.
         fsdp2_forward_prefetch_depth (int): Forward prefetch depth.
@@ -800,6 +794,8 @@ def apply_fsdp2_sharding_recursively(
         This function modifies the module in-place by replacing modules with their
         FSDP2-subclassed versions.
     """
+    pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
+
     if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
         # After pipeline splitting, functional.py replaces nn.ModuleList with nn.ModuleDict
         # (keyed by string layer indices). Normalise both to a list of (key, child) pairs.
@@ -822,7 +818,6 @@ def apply_fsdp2_sharding_recursively(
                 mesh,
                 mp_policy,
                 offload_policy,
-                pp_enabled,
                 enable_fsdp2_prefetch,
                 fsdp2_backward_prefetch_depth,
                 fsdp2_forward_prefetch_depth,
@@ -869,7 +864,6 @@ def apply_fsdp2_sharding_recursively(
                 mesh,
                 mp_policy,
                 offload_policy,
-                pp_enabled,
                 enable_fsdp2_prefetch,
                 fsdp2_backward_prefetch_depth,
                 fsdp2_forward_prefetch_depth,
