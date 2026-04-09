@@ -108,31 +108,6 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-class FSDPLayerGroupWrapper(nn.Module):
-    """Wraps N transformer layers into one FSDP unit to reduce AllGather count.
-
-    Grouping G layers into one FSDP unit reduces the AllGather count by G×,
-    halving the CatArrayBatchedCopy + elementwise copy-out overhead. Each
-    AllGather is G× larger, but kernel launch + synchronization overhead is
-    reduced G×.
-
-    The forward passes hidden_states through all inner layers sequentially,
-    forwarding all other kwargs (attention_mask, position_ids, position_embeddings,
-    etc.) unchanged to each layer. Returns the output tuple of the final layer.
-    Suitable for training (use_cache=False, output_attentions=False).
-    """
-
-    def __init__(self, layers: list):
-        super().__init__()
-        self.group = nn.ModuleList(layers)
-
-    def forward(self, hidden_states, **kwargs):
-        for layer in self.group:
-            outputs = layer(hidden_states, **kwargs)
-            hidden_states = outputs[0]
-        return (hidden_states,)
-
-
 class ParallelizationStrategy(ABC):
     """Abstract base class for model parallelization strategies."""
 
@@ -173,7 +148,6 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         enable_async_tensor_parallel: bool = False,
         enable_compile: bool = False,
         enable_fsdp2_prefetch: bool = True,
-        fsdp_layer_group_size: int = 1,
         fsdp2_backward_prefetch_depth: int = 2,
         fsdp2_forward_prefetch_depth: int = 1,
     ) -> nn.Module:
@@ -302,7 +276,6 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             offload_policy,
             pp_enabled,
             enable_fsdp2_prefetch,
-            fsdp_layer_group_size,
             fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth,
         )
@@ -776,12 +749,6 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
             actual_layer = layer
             layer_was_wrapped = False
 
-        # FSDPLayerGroupWrapper: compile each inner layer individually.
-        if isinstance(actual_layer, FSDPLayerGroupWrapper):
-            for j in range(len(actual_layer.group)):
-                actual_layer.group[j] = _compile_single_layer(actual_layer.group[j])
-            continue
-
         compiled = _compile_single_layer(actual_layer)
         if compiled is not actual_layer:
             module_list[i] = compiled
@@ -802,7 +769,6 @@ def apply_fsdp2_sharding_recursively(
     offload_policy: Optional[OffloadPolicy] = None,
     pp_enabled: bool = False,
     enable_fsdp2_prefetch: bool = True,
-    fsdp_layer_group_size: int = 1,
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
 ) -> None:
@@ -828,7 +794,6 @@ def apply_fsdp2_sharding_recursively(
             reshard_after_forward=False for all layers (weights kept gathered across
             microbatches) and no prefetch chains are set up.
         enable_fsdp2_prefetch (bool): Enable explicit forward/backward prefetch chains.
-        fsdp_layer_group_size (int): Number of layers to group into one FSDP unit.
         fsdp2_backward_prefetch_depth (int): Backward prefetch depth.
         fsdp2_forward_prefetch_depth (int): Forward prefetch depth.
     Note:
@@ -859,74 +824,30 @@ def apply_fsdp2_sharding_recursively(
                 offload_policy,
                 pp_enabled,
                 enable_fsdp2_prefetch,
-                fsdp_layer_group_size,
                 fsdp2_backward_prefetch_depth,
                 fsdp2_forward_prefetch_depth,
             )
 
-        # Only group when all children are flat layers -- no nested ModuleLists mixed in.
-        if fsdp_layer_group_size > 1 and len(flat_layers) > 0 and len(nested_lists) == 0:
-            # Group flat layers into FSDPLayerGroupWrapper units.
-            g = fsdp_layer_group_size
-            groups = []
-            for start in range(0, len(flat_layers), g):
-                chunk = flat_layers[start : start + g]
-                if len(chunk) == 1:
-                    groups.append(chunk[0])
-                else:
-                    groups.append(FSDPLayerGroupWrapper(chunk))
-
-            n_groups = len(groups)
-            # Rebuild the ModuleList in-place with the grouped units.
-            module._modules = {str(i): g_unit for i, g_unit in enumerate(groups)}
-
-            for group_id, group_unit in enumerate(groups):
-                if pp_enabled:
-                    reshard_after_forward = False
-                else:
-                    reshard_after_forward = group_id < n_groups - 1
-                fully_shard(
-                    group_unit,
-                    mesh=mesh,
-                    mp_policy=mp_policy,
-                    reshard_after_forward=reshard_after_forward,
-                    offload_policy=offload_policy,
-                )
-                module[group_id] = group_unit
-
-            logger.info(
-                f"FSDP layer grouping: {len(flat_layers)} layers -> {n_groups} FSDP units "
-                f"(group_size={fsdp_layer_group_size})"
+        for enum_id, (layer_key, child_module) in enumerate(flat_layer_items):
+            # With PP: keep weights gathered across microbatches (no per-microbatch all-gather).
+            # Without PP: reshard all but last layer to enable forward+backward weight prefetching.
+            if pp_enabled:
+                reshard_after_forward = False
+            else:
+                reshard_after_forward = enum_id < len(flat_layer_items) - 1
+            fully_shard(
+                child_module,
+                mesh=mesh,
+                mp_policy=mp_policy,
+                reshard_after_forward=reshard_after_forward,
+                offload_policy=offload_policy,
             )
-            grouped_fsdp_units = groups
-        else:
-            for enum_id, (layer_key, child_module) in enumerate(flat_layer_items):
-                # With PP: keep weights gathered across microbatches (no per-microbatch all-gather).
-                # Without PP: reshard all but last layer to enable forward+backward weight prefetching.
-                if pp_enabled:
-                    reshard_after_forward = False
-                else:
-                    reshard_after_forward = enum_id < len(flat_layer_items) - 1
-                fully_shard(
-                    child_module,
-                    mesh=mesh,
-                    mp_policy=mp_policy,
-                    reshard_after_forward=reshard_after_forward,
-                    offload_policy=offload_policy,
-                )
-                module[layer_key] = child_module
-            grouped_fsdp_units = None
+            module[layer_key] = child_module
 
         # Set up explicit forward/backward prefetch chains when layers are being resharded.
         # With PP, reshard_after_forward=False so weights are always gathered -- no prefetch needed.
         if not pp_enabled and enable_fsdp2_prefetch:
-            # When grouping is active, prefetch chains must be set on the FSDPLayerGroupWrapper
-            # units (the actual fully_shard targets), not the original flat layers captured in
-            # flat_layer_items before grouping occurred.
-            if grouped_fsdp_units is not None:
-                fsdp_units = grouped_fsdp_units
-            else:
-                fsdp_units = [c for _, c in flat_layer_items if not _is_container(c)]
+            fsdp_units = [c for _, c in flat_layer_items if not _is_container(c)]
             if fsdp2_forward_prefetch_depth > 0:
                 for i in range(len(fsdp_units) - 1):
                     targets = [
@@ -950,7 +871,6 @@ def apply_fsdp2_sharding_recursively(
                 offload_policy,
                 pp_enabled,
                 enable_fsdp2_prefetch,
-                fsdp_layer_group_size,
                 fsdp2_backward_prefetch_depth,
                 fsdp2_forward_prefetch_depth,
             )
@@ -1545,7 +1465,6 @@ def fsdp2_strategy_parallelize(
     enable_async_tensor_parallel: bool = False,
     enable_compile: bool = False,
     enable_fsdp2_prefetch: bool = True,
-    fsdp_layer_group_size: int = 1,
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
 ):
@@ -1604,7 +1523,6 @@ def fsdp2_strategy_parallelize(
         enable_async_tensor_parallel=enable_async_tensor_parallel,
         enable_compile=enable_compile,
         enable_fsdp2_prefetch=enable_fsdp2_prefetch,
-        fsdp_layer_group_size=fsdp_layer_group_size,
         fsdp2_backward_prefetch_depth=fsdp2_backward_prefetch_depth,
         fsdp2_forward_prefetch_depth=fsdp2_forward_prefetch_depth,
     )

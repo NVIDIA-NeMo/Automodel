@@ -91,9 +91,6 @@ class FSDP2Config:
             ``_orig_mod`` key-prefix mismatches.
         enable_fsdp2_prefetch (bool): Enable explicit forward/backward prefetch chains
             between FSDP2 sharded layers.  Default ``True``.
-        fsdp_layer_group_size (int): Number of transformer layers to group into a single
-            FSDP unit.  Grouping ``G`` layers reduces AllGather count by ``G×``.
-            Default ``1`` (no grouping).
         fsdp2_backward_prefetch_depth (int): Number of FSDP units to prefetch during
             backward pass.  ``2`` hides AllGather behind compute; ``1`` reduces peak
             memory at a small throughput cost.  Default ``2``.
@@ -113,7 +110,6 @@ class FSDP2Config:
     enable_async_tensor_parallel: bool = False
     enable_compile: bool = False
     enable_fsdp2_prefetch: bool = False
-    fsdp_layer_group_size: int = 1
     fsdp2_backward_prefetch_depth: int = 2
     fsdp2_forward_prefetch_depth: int = 1
 

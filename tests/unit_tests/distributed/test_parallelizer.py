@@ -831,48 +831,6 @@ class TestApplyFsdpShardingRecursively:
         call_args = mock_fully_shard.call_args_list[0]
         assert call_args[1]["reshard_after_forward"] is False
 
-    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    def test_apply_fsdp_sharding_layer_group_prefetch_targets_wrappers(
-        self, mock_fully_shard, mock_mesh, mock_mp_policy, mock_offload_policy
-    ):
-        """When fsdp_layer_group_size > 1, prefetch chains should target the FSDPLayerGroupWrapper
-        units (the actual fully_shard targets), not the original flat layers."""
-        from nemo_automodel.components.distributed.parallelizer import FSDPLayerGroupWrapper
-
-        layers = nn.ModuleList([nn.Linear(4, 4) for _ in range(4)])
-
-        def mock_shard(x, **kwargs):
-            x.set_modules_to_forward_prefetch = MagicMock()
-            x.set_modules_to_backward_prefetch = MagicMock()
-            return x
-
-        mock_fully_shard.side_effect = mock_shard
-
-        apply_fsdp2_sharding_recursively(
-            module=layers,
-            mesh=mock_mesh,
-            mp_policy=mock_mp_policy,
-            offload_policy=mock_offload_policy,
-            enable_fsdp2_prefetch=True,
-            fsdp_layer_group_size=2,
-            fsdp2_forward_prefetch_depth=1,
-            fsdp2_backward_prefetch_depth=1,
-        )
-
-        # fully_shard should have been called on the 2 wrapper units, not the 4 raw layers
-        assert mock_fully_shard.call_count == 2
-        sharded_units = [call[0][0] for call in mock_fully_shard.call_args_list]
-        assert all(isinstance(u, FSDPLayerGroupWrapper) for u in sharded_units)
-
-        # Forward prefetch: wrapper0 should prefetch wrapper1
-        wrapper0, wrapper1 = sharded_units
-        wrapper0.set_modules_to_forward_prefetch.assert_called_once_with([wrapper1])
-        wrapper1.set_modules_to_forward_prefetch.assert_not_called()
-
-        # Backward prefetch: wrapper1 should prefetch wrapper0
-        wrapper1.set_modules_to_backward_prefetch.assert_called_once_with([wrapper0])
-        wrapper0.set_modules_to_backward_prefetch.assert_not_called()
-
     def test_apply_fsdp_sharding_no_children(self, mock_mesh, mock_mp_policy, mock_offload_policy):
         """Test apply_fsdp2_sharding_recursively with a module that has no children."""
         leaf_module = nn.Linear(10, 10)
