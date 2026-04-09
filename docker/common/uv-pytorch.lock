@@ -2814,7 +2814,7 @@ wheels = [
 
 [[package]]
 name = "mistral-common"
-version = "1.9.0"
+version = "1.11.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jsonschema" },
@@ -2827,9 +2827,9 @@ dependencies = [
     { name = "tiktoken" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/41/5b/60bb9f8c424c9ec7708396096f92e34f77eca94d55f99326b72b5a322482/mistral_common-1.9.0.tar.gz", hash = "sha256:5f90ec606d1826a20a97d24aefb9bfff7f4cd4cd576b622d4857708c0577e6c2", size = 6337103, upload-time = "2026-01-29T00:28:07.982Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/61/97/753c85b5c0a19f4331ac99e0300ac8da06d4b29b629c9cb03064b38561bd/mistral_common-1.11.0.tar.gz", hash = "sha256:439b7fa38f9c3f020154af51bdf30eb81def507643017d8ce9f798384ec47ec3", size = 6355512, upload-time = "2026-04-01T13:54:12.36Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/64/12/8a3c9aaf58b49383d24f533edb2f81f073b59822317bd56bd66d0850caae/mistral_common-1.9.0-py3-none-any.whl", hash = "sha256:e25ed2f8c73f66cf3b1a48b2ddd649e044a0db7b9d9dd1af819eeb20ee1a6d94", size = 6517668, upload-time = "2026-01-29T00:28:04.96Z" },
+    { url = "https://files.pythonhosted.org/packages/60/e4/73ad3c27e3fb613c3ce0953c928202c46cddebac3989b87be1b6f305a9f6/mistral_common-1.11.0-py3-none-any.whl", hash = "sha256:1d3ecaf7c3aa7338cb37b596fd0fb294485753958ee8e7254a6cc23eb30b249b", size = 6531513, upload-time = "2026-04-01T13:54:16.536Z" },
 ]
 
 [package.optional-dependencies]
@@ -3387,7 +3387,7 @@ requires-dist = [
     { name = "mamba-ssm", marker = "extra == 'cuda'" },
     { name = "megatron-fsdp", specifier = ">=0.2.3" },
     { name = "mistral-common", extras = ["audio", "hf-hub", "image", "sentencepiece"] },
-    { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'", specifier = ">=1.9.0" },
+    { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'", specifier = ">=1.11.0" },
     { name = "mlflow" },
     { name = "nemo-automodel", extras = ["cuda"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["cuda"], marker = "extra == 'moe'" },
