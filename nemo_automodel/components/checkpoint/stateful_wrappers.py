@@ -96,6 +96,9 @@ def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
     state_dict = {}
     for name, param in model.named_parameters():
         if param.requires_grad:
+            # Strip _checkpoint_wrapped_module. from FQNs to match DCP's normalization.
+            # Without this, activation checkpointing causes key mismatches on reload.
+            name = name.replace("_checkpoint_wrapped_module.", "")
             param = param.full_tensor() if hasattr(param, "full_tensor") else param
             state_dict[name] = param.detach().cpu()
     return state_dict
@@ -110,7 +113,9 @@ def _set_peft_state_dict(model: torch.nn.Module, state_dict: dict[str, Any]) -> 
     """
     from torch.distributed.tensor import DTensor, Replicate
 
-    param_dict = dict(model.named_parameters())
+    # Strip _checkpoint_wrapped_module. from FQNs to match DCP's normalization.
+    # Without this, activation checkpointing causes key mismatches on reload.
+    param_dict = {name.replace("_checkpoint_wrapped_module.", ""): param for name, param in model.named_parameters()}
     loaded, skipped = 0, 0
 
     for name, saved_tensor in state_dict.items():

@@ -155,7 +155,8 @@ class PeftAddon:
         model_state = kwargs["model_state"]
         peft_config = kwargs["peft_config"]
         original_model_path = kwargs["original_model_path"]
-        hf_peft_config = _get_hf_peft_config(peft_config, model_state)
+        v4_compatible = kwargs.get("v4_compatible", False)
+        hf_peft_config = _get_hf_peft_config(peft_config, model_state, v4_compatible=v4_compatible)
         automodel_peft_metadata = _get_automodel_peft_metadata(peft_config)
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             # if the HF model has custom model code, we need to save it as part of the checkpoint
@@ -176,13 +177,14 @@ class PeftAddon:
         pass
 
 
-def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState) -> dict:
+def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState, v4_compatible: bool = False) -> dict:
     """
     Get the minimal PEFT config in the format expected by Hugging Face.
 
     Args:
         peft_config: Source PEFT configuration.
         model_state: Model wrapper used to infer target modules and model task.
+        v4_compatible: When True, use legacy per-expert expansion format.
 
     Returns:
         A dictionary containing the minimal HF-compatible PEFT configuration
@@ -197,7 +199,8 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState) -> d
         "FeatureExtraction": "FEATURE_EXTRACTION",
     }
     model_part = model_state.model[0]
-    target_modules = _extract_target_modules(model_part)
+    target_modules = _extract_target_modules(model_part, v4_compatible=v4_compatible)
+    target_parameters = _extract_target_parameters(model_part, v4_compatible=v4_compatible)
     try:
         arch_name = model_part.config.architectures[0]
         # "LlamaForCausalLM".split("For") → ["Llama", "CausalLM"]
@@ -217,7 +220,7 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState) -> d
     except KeyError:
         task_type = "CAUSAL_LM"
 
-    return {
+    config = {
         "task_type": task_type,
         "peft_type": "LORA",
         "r": peft_config.dim,
@@ -227,6 +230,9 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState) -> d
         "bias": "none",
         "base_model_name_or_path": name_or_path,
     }
+    if target_parameters:
+        config["target_parameters"] = target_parameters
+    return config
 
 
 def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
@@ -244,28 +250,43 @@ def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
     return {k: v for k, v in peft_config.to_dict().items() if k not in PEFT_KEYS}
 
 
-def _extract_target_modules(model: nn.Module) -> list[str]:
+def _is_qwen3_moe(model: nn.Module) -> bool:
+    """Check whether *model* uses the Qwen3 MoE state-dict adapter."""
+    adapter = getattr(model, "state_dict_adapter", None)
+    if adapter is None:
+        return False
+    from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3MoeStateDictAdapter
+
+    return isinstance(adapter, Qwen3MoeStateDictAdapter)
+
+
+def _extract_target_parameters(model: nn.Module, v4_compatible: bool = False) -> list[str]:
+    """Extract ``target_parameters`` for PEFT v0.18+ ParamWrapper format.
+
+    Returns fused expert parameter paths for Qwen3 MoE when not in legacy mode,
+    or an empty list otherwise.
+    """
+    if v4_compatible:
+        return []
+    if _is_qwen3_moe(model):
+        return ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]
+    return []
+
+
+def _extract_target_modules(model: nn.Module, v4_compatible: bool = False) -> list[str]:
     """
     Extract the target modules from the model used by LoRA/PEFT layers.
 
     Combined-projection module names (e.g. ``qkv_proj``, ``gate_up_proj``) are
-    expanded to the individual Hugging Face projection names so that the saved
-    ``adapter_config.json`` is compatible with vLLM, TensorRT-LLM and the
-    Hugging Face PEFT library.
+    expanded to the individual HF projection names for adapter_config.json
+    compatibility with vLLM, TensorRT-LLM, and HF PEFT.
 
-    For MoE expert LoRA (GroupedExpertsLoRA / GroupedExpertsDeepEPLoRA), the
-    grouped 3-D adapter parameters are expanded to per-expert HF projection
-    names (e.g. ``model.layers.0.mlp.experts.0.gate_proj``).
+    For MoE expert LoRA, grouped 3-D adapter parameters are expanded to
+    per-expert HF projection names unless the model is Qwen3 MoE in
+    non-legacy mode (where ``target_parameters`` is used instead).
 
-    Note:
-        When torch.compile is used, module names get prefixed with `_orig_mod.`.
-        This function strips those prefixes to get the original module names.
-
-    Args:
-        model: The model whose named modules are scanned.
-
-    Returns:
-        A sorted list of unique module name prefixes that contain LoRA layers.
+    Strips ``_orig_mod.`` (torch.compile) and ``_checkpoint_wrapped_module.``
+    (activation checkpointing) prefixes from module names.
     """
     # Mapping from combined projection names to their HF-compatible split names.
     _COMBINED_TO_SPLIT = {
@@ -278,10 +299,10 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
     final_target_modules = set()
     for name, _ in model.named_modules():
         if "lora" in name.lower():
-            # Remove the torch.compile _orig_mod prefix if present
             target_name = name.rsplit(".", 1)[0]
             if target_name.startswith("_orig_mod."):
                 target_name = target_name[len("_orig_mod.") :]
+            target_name = target_name.replace("_checkpoint_wrapped_module.", "")
 
             # Expand combined projection names to individual HF projection names
             last_component = target_name.rsplit(".", 1)[-1]
@@ -293,13 +314,14 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
             else:
                 final_target_modules.add(target_name)
 
-    # Detect MoE expert LoRA: adapter weights stored as nn.Parameter (not
-    # nn.Module) so they don't appear in named_modules(). Scan parameters
-    # and expand to per-expert HF projection names.
-    # Only applies to models that use split-expert state dict conversion
-    # (MoESplitExpertsStateDictMixin); models with natively merged experts
-    # (e.g. Qwen 3.5) don't need per-expert expansion.
-    if hasattr(model, "state_dict_adapter") and isinstance(model.state_dict_adapter, MoESplitExpertsStateDictMixin):
+    # MoE expert LoRA: adapter weights are nn.Parameter (not nn.Module) so
+    # they don't appear in named_modules(). Expand to per-expert HF names,
+    # unless Qwen3 MoE in non-legacy mode (uses target_parameters instead).
+    _has_split_expert_mixin = hasattr(model, "state_dict_adapter") and isinstance(
+        model.state_dict_adapter, MoESplitExpertsStateDictMixin
+    )
+    _skip_for_qwen3 = not v4_compatible and _is_qwen3_moe(model)
+    if _has_split_expert_mixin and not _skip_for_qwen3:
         seen_expert_groups: set[tuple[str, str]] = set()
         for name, param in model.named_parameters():
             if not param.requires_grad:
@@ -309,6 +331,7 @@ def _extract_target_modules(model: nn.Module) -> list[str]:
                     expert_path = name[: -len(f".{lora_suffix}")]
                     if expert_path.startswith("_orig_mod."):
                         expert_path = expert_path[len("_orig_mod.") :]
+                    expert_path = expert_path.replace("_checkpoint_wrapped_module.", "")
 
                     group = "gate_and_up" if "gate_and_up" in lora_suffix else "down"
                     if (expert_path, group) in seen_expert_groups:

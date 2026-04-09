@@ -59,7 +59,7 @@ ROBUSTNESS_COMMON="--config /opt/Automodel/${CONFIG_PATH} \
   --step_scheduler.max_steps 5 \
   --step_scheduler.ckpt_every_steps 5 \
   --step_scheduler.val_every_steps 5 \
-  --step_scheduler.global_batch_size 16 \
+  --step_scheduler.global_batch_size 32 \
   --step_scheduler.local_batch_size 2"
 
 if [[ "${CONFIG_PATH}" == *peft* ]] || [[ "${CONFIG_PATH}" == *lora* ]]; then
