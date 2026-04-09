@@ -76,12 +76,21 @@ RUN_CMD="${CMD} ${TEST_SCRIPT_PATH} ${CONFIG} ${FINETUNE_ARGS}"
 echo "============================================"
 echo "[finetune] Running finetune..."
 echo "============================================"
+FINETUNE_START=$SECONDS
 eval $RUN_CMD
+FINETUNE_ELAPSED=$((SECONDS - FINETUNE_START))
+echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"finetune\",\"seconds\":${FINETUNE_ELAPSED}}" >> $PIPELINE_DIR/$TEST_NAME/timing.jsonl
+echo "[timing] Finetune completed in ${FINETUNE_ELAPSED}s"
 
 # --- Checkpoint Robustness ---
 if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
   echo "============================================"
   echo "[checkpoint_robustness] Running robustness test..."
   echo "============================================"
+  ROBUSTNESS_START=$SECONDS
   eval $ROBUSTNESS_CMD
+  ROBUSTNESS_ELAPSED=$((SECONDS - ROBUSTNESS_START))
+  echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"robustness\",\"seconds\":${ROBUSTNESS_ELAPSED}}" >> $PIPELINE_DIR/$TEST_NAME/timing.jsonl
+  echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"total\",\"seconds\":$((SECONDS)),\"allocated\":\"${TIME}\"}" >> $PIPELINE_DIR/$TEST_NAME/timing.jsonl
+  echo "[timing] Robustness completed in ${ROBUSTNESS_ELAPSED}s (total: ${SECONDS}s)"
 fi
