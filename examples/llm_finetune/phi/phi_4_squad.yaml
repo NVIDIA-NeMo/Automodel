@@ -100,7 +100,7 @@ optimizer:
 
 ci:
   recipe_owner: hemildesai
-  time: "00:25:00"
+  time: "00:35:00"
   node_multiplier: true
   vllm_deploy: true
   checkpoint_robustness:
