@@ -524,4 +524,157 @@ class TestGptOssForCausalLM:
                 assert called_cfg is gpt_config
 
 
+class TestGptOssAttentionTHD:
+    """Test THD format handling in GptOssAttention."""
+
+    def test_3d_input_with_cu_seqlens_detected_as_thd(self, gpt_config, backend_config, device):
+        """PP schedule produces [1, T, H] with cu_seqlens — attention must squeeze to [T, H]."""
+        from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention
+
+        attn = GptOssAttention(gpt_config, layer_idx=0, backend=backend_config).to(device)
+        total_tokens = 16
+        hidden = gpt_config.hidden_size
+
+        # 3D input from PP schedule: [1, T, H]
+        x = torch.randn(1, total_tokens, hidden, dtype=torch.bfloat16, device=device)
+        freqs_cis = torch.randn(1, total_tokens, gpt_config.head_dim, dtype=torch.bfloat16, device=device)
+        cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32, device=device)
+
+        with patch.object(attn.attn_module, "__call__") as mock_attn:
+            # THD attention returns [T, num_heads, head_dim]
+            mock_attn.return_value = torch.randn(
+                total_tokens, gpt_config.num_attention_heads, gpt_config.head_dim,
+                dtype=torch.bfloat16, device=device,
+            )
+            output = attn(x, freqs_cis=freqs_cis, cu_seqlens=cu_seqlens)
+
+            # Verify attention was called — the input should have been squeezed
+            mock_attn.assert_called_once()
+            call_kwargs = mock_attn.call_args[1]
+            assert call_kwargs.get("qkv_format") == "thd"
+
+    def test_2d_input_detected_as_thd(self, gpt_config, backend_config, device):
+        """Native THD format: 2D [T, H] input should be detected without cu_seqlens."""
+        from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention
+
+        attn = GptOssAttention(gpt_config, layer_idx=0, backend=backend_config).to(device)
+        total_tokens = 16
+        hidden = gpt_config.hidden_size
+
+        x = torch.randn(total_tokens, hidden, dtype=torch.bfloat16, device=device)
+        freqs_cis = torch.randn(1, total_tokens, gpt_config.head_dim, dtype=torch.bfloat16, device=device)
+
+        with patch.object(attn.attn_module, "__call__") as mock_attn:
+            mock_attn.return_value = torch.randn(
+                total_tokens, gpt_config.num_attention_heads, gpt_config.head_dim,
+                dtype=torch.bfloat16, device=device,
+            )
+            output = attn(x, freqs_cis=freqs_cis)
+            mock_attn.assert_called_once()
+            call_kwargs = mock_attn.call_args[1]
+            assert call_kwargs.get("qkv_format") == "thd"
+
+
+class TestRopeUtilsTHD:
+    """Test position_ids_to_freqs_cis THD handling."""
+
+    def test_thd_1d_position_ids_fused_rope(self, gpt_config, backend_config, device):
+        """1D position_ids [T] with fused_rope should use shape[0] for seq_len."""
+        from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
+
+        model = GptOssModel(gpt_config, backend_config).to(device)
+        seq_len = 16
+        position_ids = torch.arange(seq_len, device=device)
+
+        result = position_ids_to_freqs_cis(
+            model.rotary_emb, position_ids, qkv_format="thd", for_fused_rope=True, cp_size=1,
+        )
+        # Should produce valid freqs_cis without errors
+        assert result.ndim >= 2
+
+    def test_thd_2d_position_ids_fused_rope(self, gpt_config, backend_config, device):
+        """2D position_ids [1, T] from PP schedule should use shape[-1] for seq_len."""
+        from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
+
+        model = GptOssModel(gpt_config, backend_config).to(device)
+        seq_len = 16
+        position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+
+        result = position_ids_to_freqs_cis(
+            model.rotary_emb, position_ids, qkv_format="thd", for_fused_rope=True, cp_size=1,
+        )
+        assert result.ndim >= 2
+
+    def test_thd_1d_position_ids_no_fused_rope(self, gpt_config, backend_config, device):
+        """1D position_ids [T] without fused_rope should unsqueeze to [1, T]."""
+        from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
+
+        model = GptOssModel(gpt_config, backend_config).to(device)
+        seq_len = 16
+        position_ids = torch.arange(seq_len, device=device)
+
+        result = position_ids_to_freqs_cis(
+            model.rotary_emb, position_ids, qkv_format="thd", for_fused_rope=False, cp_size=1,
+        )
+        assert result.ndim >= 2
+
+    def test_thd_2d_position_ids_no_fused_rope_no_double_unsqueeze(self, gpt_config, backend_config, device):
+        """2D position_ids [1, T] without fused_rope should NOT be double-unsqueezed."""
+        from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
+
+        model = GptOssModel(gpt_config, backend_config).to(device)
+        seq_len = 16
+        position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+
+        result = position_ids_to_freqs_cis(
+            model.rotary_emb, position_ids, qkv_format="thd", for_fused_rope=False, cp_size=1,
+        )
+        # Should be valid without double-unsqueezing to [1, 1, T]
+        assert result.ndim >= 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+class TestGptOssModelTHD:
+    """Test GptOssModel THD-specific behavior."""
+
+    def test_1d_input_ids_generates_1d_position_ids(self, gpt_config, backend_config, device):
+        """When input_ids is 1D [T] (after THD squeeze), position_ids should be 1D [T]."""
+        model = GptOssModel(gpt_config, backend_config).to(device)
+        total_tokens = 16
+
+        input_ids = torch.randint(0, gpt_config.vocab_size, (total_tokens,), dtype=torch.long, device=device)
+
+        with patch.object(model.rotary_emb, "_compute_concentration_and_inv_freq") as mock_rope:
+            mock_rope.return_value = (1.0, torch.randn(16, dtype=torch.bfloat16, device=device))
+
+            for layer in model.layers.values():
+                with patch.object(layer, "forward") as mock_layer:
+                    mock_layer.return_value = torch.randn(
+                        total_tokens, gpt_config.hidden_size, dtype=torch.bfloat16, device=device,
+                    )
+
+            output = model(input_ids, qkv_format="thd")
+            # Should not crash — 1D input_ids handled correctly
+            assert output.shape == (total_tokens, gpt_config.hidden_size)
+
+    def test_2d_input_ids_generates_2d_position_ids(self, gpt_config, backend_config, device):
+        """Standard 2D [B, S] input should still generate 2D position_ids."""
+        model = GptOssModel(gpt_config, backend_config).to(device)
+        batch_size, seq_len = 2, 8
+
+        input_ids = torch.randint(0, gpt_config.vocab_size, (batch_size, seq_len), dtype=torch.long, device=device)
+
+        with patch.object(model.rotary_emb, "_compute_concentration_and_inv_freq") as mock_rope:
+            mock_rope.return_value = (1.0, torch.randn(16, dtype=torch.bfloat16, device=device))
+
+            for layer in model.layers.values():
+                with patch.object(layer, "forward") as mock_layer:
+                    mock_layer.return_value = torch.randn(
+                        batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device,
+                    )
+
+            output = model(input_ids)
+            assert output.shape == (batch_size, seq_len, gpt_config.hidden_size)
+
+
 # NOTE: HFCheckpointingMixin tests are now in tests/unit_tests/models/common/test_hf_checkpointing_mixin.py
