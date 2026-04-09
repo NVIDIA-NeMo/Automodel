@@ -286,12 +286,6 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     if hasattr(layer, "self_attn") and not _has_kv_sharing:
                         layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
 
-        # Per-layer compile: deferred to after checkpoint loading in apply_model_infrastructure
-        # to avoid _orig_mod key prefix mismatch when loading HF checkpoints.
-        # Set the flag here so whole-model compile is skipped; actual compile applied later.
-        if (enable_async_tensor_parallel and tp_mesh.size() > 1) or enable_compile:
-            model._skip_whole_model_compile = True
-
         # Set up mixed precision policy
         if not mp_policy:
             mp_policy = MixedPrecisionPolicy(
@@ -702,7 +696,7 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
     """Apply NO_REENTRANT AC to self_attn/mlp, then compile the whole decoder layer.
 
     Strategy: wrap self_attn and mlp with NO_REENTRANT checkpoint_wrapper, then call
-    torch.compile on the *whole decoder layer* (not on the sub-modules).
+    module.compile() on the *whole decoder layer* (not on the sub-modules).
 
     Why this order matters for LoRA gradients:
 
@@ -715,12 +709,15 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
     (640/642 params showed zero grad in both sub-module REENTRANT and layer REENTRANT).
 
     By compiling at the *decoder-layer* level instead:
-    - The outer model's training loop calls torch.compile(actual_layer) for the first
-      time during a normal forward pass under torch.enable_grad().
+    - The outer model's training loop calls module.compile() for the first time during
+      a normal forward pass under torch.enable_grad().
     - AOT autograd traces a *joint* fwd+bwd graph that includes LoRA weight gradients.
     - NO_REENTRANT AC is handled as a higher-order op *inside* the compiled graph, so
       the recompute also runs inside the compiled backward -- still under enable_grad,
       with the full joint graph -- and LoRA grads accumulate correctly.
+
+    nn.Module.compile() is used instead of torch.compile() because it compiles in-place
+    without introducing the _orig_mod wrapper, preserving fully-qualified parameter names.
 
     _patch_dtensor_spec_hash_for_symint() is called here to allow torch.compile with
     dynamic shapes to coexist with DTensor's lru_cache-based sharding propagation.
@@ -767,7 +764,7 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
 
         if any_ac:
             compiled_count += 1
-            return torch.compile(actual_layer)
+            actual_layer.compile()
         return actual_layer
 
     for i, layer in items:

@@ -142,3 +142,10 @@ class FSDP2Manager:
         )
 
         return model
+
+    def maybe_compile(self, model):
+        """Apply per-layer compile after sharding, alongside whole-model compile_model()."""
+        if self.enable_compile or (self.enable_async_tensor_parallel and self.device_mesh["tp"].size() > 1):
+            from nemo_automodel.components.distributed.parallelizer import _apply_per_layer_compile
+
+            _apply_per_layer_compile(model)
