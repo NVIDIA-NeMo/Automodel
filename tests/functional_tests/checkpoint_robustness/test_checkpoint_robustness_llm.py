@@ -100,9 +100,6 @@ def _extract_custom_args(argv):
         # Enable check_resume by default unless no_check_resume is set
         if not no_check_resume and "check_resume" not in custom:
             custom["check_resume"] = True
-    
-    if _rank0():
-        print(f"Custom args: {custom}, remaining: {remaining}")
 
     return custom, remaining
 
