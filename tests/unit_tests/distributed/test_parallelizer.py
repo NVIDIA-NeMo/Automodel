@@ -1388,11 +1388,90 @@ class TestActivationCheckpointingKVSharing:
     # HF native gradient-checkpointing path
     # ------------------------------------------------------------------ #
 
-    def test_hf_native_grad_ckpt_preserves_use_cache_with_kv_sharing(self, monkeypatch):
-        """Even when the HF native path is taken, use_cache stays True for KV-shared models."""
+    # ------------------------------------------------------------------ #
+    # Exception / edge-case branches
+    # ------------------------------------------------------------------ #
+
+    def test_frozen_config_use_cache_except_branch(self):
+        """When ``model.config.use_cache = False`` raises, the except branch runs."""
+        model = _make_model_for_ac(use_cache=True, num_kv_shared_layers=0)
+
+        class _FrozenConfig:
+            use_cache = True
+            text_config = SimpleNamespace(num_kv_shared_layers=0)
+
+            def __setattr__(self, name, value):
+                raise AttributeError("frozen")
+
+        model.config = _FrozenConfig()  # type: ignore[attr-defined]
+        self._run_parallelize(model)
+        # use_cache stays True because the assignment raised and was caught
+        assert model.config.use_cache is True
+
+    def test_no_config_with_layers_does_not_crash(self):
+        """Model without ``config`` but with extractable layers does not crash."""
+
+        class _Bare(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleList([_FakeLayer() for _ in range(2)])  # type: ignore[attr-defined]
+
+            def forward(self, x):
+                return x
+
+        model = _Bare()
+        # no model.config → hasattr(model, "config") is False
+        self._run_parallelize(model)
+        # mlp should still be wrapped (activation_checkpointing still applies)
+        for layer in model.model.layers:
+            assert isinstance(layer.mlp, self._Wrapped)
+
+    def test_layer_missing_self_attn(self):
+        """Layers without ``self_attn`` are skipped gracefully."""
+
+        class _MlpOnlyLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mlp = nn.Linear(16, 16)
+
+            def forward(self, x):
+                return x
+
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        model.model.layers = nn.ModuleList([_MlpOnlyLayer() for _ in range(2)])
+        self._run_parallelize(model)
+        for layer in model.model.layers:
+            assert isinstance(layer.mlp, self._Wrapped)
+            assert not hasattr(layer, "self_attn")
+
+    def test_layer_missing_mlp(self):
+        """Layers without ``mlp`` are skipped gracefully."""
+
+        class _AttnOnlyLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = nn.Linear(16, 16)
+
+            def forward(self, x):
+                return x
+
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        model.model.layers = nn.ModuleList([_AttnOnlyLayer() for _ in range(2)])
+        self._run_parallelize(model)
+        for layer in model.model.layers:
+            assert isinstance(layer.self_attn, self._Wrapped)
+            assert not hasattr(layer, "mlp")
+
+    # ------------------------------------------------------------------ #
+    # HF native gradient-checkpointing path
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _setup_hf_native_model(monkeypatch, num_kv_shared_layers):
+        """Helper: configure a model + fake transformers module for the HF native path."""
         import types
 
-        # Create a fake transformers.modeling_layers module with GradientCheckpointingLayer
         class _FakeGradLayer(_FakeLayer):
             pass
 
@@ -1402,12 +1481,27 @@ class TestActivationCheckpointingKVSharing:
         fake_module.GradientCheckpointingLayer = _FakeGradLayer  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "transformers.modeling_layers", fake_module)
 
-        model = _make_model_for_ac(use_cache=True, num_kv_shared_layers=20)
+        model = _make_model_for_ac(use_cache=True, num_kv_shared_layers=num_kv_shared_layers)
         for i in range(len(model.model.layers)):
             model.model.layers[i] = _FakeGradLayer()
         model.supports_gradient_checkpointing = True  # type: ignore[attr-defined]
         model.gradient_checkpointing_enable = MagicMock()  # type: ignore[attr-defined]
+        return model
 
+    def test_hf_native_grad_ckpt_preserves_use_cache_with_kv_sharing(self, monkeypatch):
+        """Even when the HF native path is taken, use_cache stays True for KV-shared models."""
+        model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=20)
         self._run_parallelize(model)
 
         assert model.config.use_cache is True
+        model.gradient_checkpointing_enable.assert_called_once()
+
+    def test_hf_native_grad_ckpt_disables_use_cache_without_kv_sharing(self, monkeypatch):
+        """HF native path + no KV sharing: use_cache is set to False."""
+        model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=0)
+        self._run_parallelize(model)
+
+        assert model.config.use_cache is False
+        model.gradient_checkpointing_enable.assert_called_once_with(
+            gradient_checkpointing_kwargs={"use_reentrant": True}
+        )
