@@ -36,6 +36,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
     _maybe_adapt_state_dict_to_hf,
+    to_empty_parameters_only,
 )
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
@@ -430,15 +431,25 @@ def apply_model_infrastructure(
     checkpoint_already_loaded = False
     if load_before_shard:
         if is_meta_device:
-            lora_a_init = getattr(peft_config, "lora_A_init", None)
-            checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
+            # Materialize on CPU and load checkpoint there so peak GPU memory
+            # is 1x model size (the final model.to(device)), not 2x
+            # (materialized params + state-dict copy → OOM on large models).
+            # Skip initialize_weights: the checkpoint overwrites every param.
+            cpu = torch.device("cpu")
+            to_empty_parameters_only(model, device=cpu)
+            for module in model.modules():
+                for key in list(module._buffers):
+                    buf = module._buffers[key]
+                    if buf is not None and buf.device.type == "meta":
+                        module._buffers[key] = torch.empty_like(buf, device=cpu)
             checkpointer.load_base_model(
                 model,
-                device,
+                cpu,
                 cache_dir,
                 pretrained_model_name_or_path,
                 load_base_model=load_base_model,
             )
+            model.to(device)
         else:
             # Non-meta models already have weights from from_pretrained.
             # Still call load_base_model with load_base_model=False to
