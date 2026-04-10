@@ -94,7 +94,7 @@ class Block(nn.Module):
 
 
 class GlmMoeDsaModel(nn.Module):
-    def __init__(self, config: GlmMoeDsaConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
+    def __init__(self, config: GlmMoeDsaConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None, **kwargs):
         super().__init__()
         self.backend = backend
         self.config = config
@@ -109,7 +109,7 @@ class GlmMoeDsaModel(nn.Module):
             n_expert_groups=config.n_group,
             n_limited_groups=config.topk_group,
             train_gate=True,
-            gate_bias_update_factor=1e-5,
+            gate_bias_update_factor=kwargs.get("gate_bias_update_factor", 1e-5),
             score_func="sigmoid",
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0.0,
@@ -227,7 +227,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
-        self.model = GlmMoeDsaModel(config, backend=self.backend, moe_config=moe_config)
+        self.model = GlmMoeDsaModel(config, backend=self.backend, moe_config=moe_config, **kwargs)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = GlmMoeDsaStateDictAdapter(

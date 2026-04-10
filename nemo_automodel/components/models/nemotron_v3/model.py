@@ -47,6 +47,7 @@ class NemotronV3Model(nn.Module):
         backend: BackendConfig | None = None,
         *,
         moe_config: MoEConfig | None = None,
+        **kwargs,
     ):
         """Initialize NemotronV3Model.
 
@@ -65,7 +66,7 @@ class NemotronV3Model(nn.Module):
             n_expert_groups=config.n_group,
             n_limited_groups=config.topk_group,
             train_gate=False,  # Router weights are trained but not using bias updates
-            gate_bias_update_factor=0.0,
+            gate_bias_update_factor=kwargs.get("gate_bias_update_factor", 0.0),
             aux_loss_coeff=0.0,  # No aux loss for NemotronV3
             score_func="sigmoid",  # NemotronV3 uses sigmoid scoring
             route_scale=config.routed_scaling_factor,
@@ -260,7 +261,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         self.backend = backend or BackendConfig()
 
         # Base model
-        self.model = NemotronV3Model(config, backend=self.backend)
+        self.model = NemotronV3Model(config, backend=self.backend, **kwargs)
         self.output_hidden_states = config.to_dict().get("output_hidden_states", False)
 
         # LM head

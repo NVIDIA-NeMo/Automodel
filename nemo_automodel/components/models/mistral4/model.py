@@ -157,7 +157,7 @@ class Mistral4Block(Block):
         self.self_attn = Mistral4MLA(config, backend)
 
 
-def _build_moe_config(config) -> MoEConfig:
+def _build_moe_config(config, **kwargs) -> MoEConfig:
     """Build MoEConfig from a Mistral4 text config."""
     return MoEConfig(
         dim=config.hidden_size,
@@ -169,7 +169,7 @@ def _build_moe_config(config) -> MoEConfig:
         n_expert_groups=config.n_group,
         n_limited_groups=config.topk_group,
         train_gate=True,
-        gate_bias_update_factor=1e-5,
+        gate_bias_update_factor=kwargs.get("gate_bias_update_factor", 1e-5),
         score_func="softmax_with_bias",
         route_scale=config.routed_scaling_factor,
         aux_loss_coeff=0,
@@ -184,11 +184,12 @@ class Mistral4Model(nn.Module):
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
+        **kwargs,
     ):
         super().__init__()
         self.backend = backend
         self.config = config
-        self.moe_config = moe_config or _build_moe_config(config)
+        self.moe_config = moe_config or _build_moe_config(config, **kwargs)
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
         )
@@ -324,7 +325,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config = getattr(config, "text_config", config)
         self.config = config
         self.backend = backend or BackendConfig()
-        self.model = Mistral4Model(config, backend=self.backend, moe_config=moe_config)
+        self.model = Mistral4Model(config, backend=self.backend, moe_config=moe_config, **kwargs)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Mistral4StateDictAdapter(
@@ -436,9 +437,9 @@ if _HF_MISTRAL3_AVAILABLE:
         this module.
         """
 
-        def __init__(self, config, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
+        def __init__(self, config, backend: BackendConfig, *, moe_config: MoEConfig | None = None, **kwargs):
             super().__init__()
-            self.model = Mistral4Model(config, backend, moe_config=moe_config)
+            self.model = Mistral4Model(config, backend, moe_config=moe_config, **kwargs)
             self.moe_config = self.model.moe_config
             # lm_head lives inside language_model (like KimiVLLanguageModelBackend)
             # so the parallelizer wraps it as part of _model, matching the Kimi pattern.
@@ -656,7 +657,7 @@ if _HF_MISTRAL3_AVAILABLE:
             # Build components: vision tower from HF, projector from HF, text from our backend
             vision_tower = AutoModel.from_config(config.vision_config)
             multi_modal_projector = Mistral3MultiModalProjector(config)
-            language_model = Mistral4TextModelBackend(text_config, backend=backend, moe_config=moe_config)
+            language_model = Mistral4TextModelBackend(text_config, backend=backend, moe_config=moe_config, **kwargs)
 
             self.model = Mistral3Model(
                 config=config,

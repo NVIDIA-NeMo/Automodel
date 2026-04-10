@@ -224,6 +224,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
+        **kwargs,
     ):
         super().__init__()
         self.backend = backend
@@ -245,7 +246,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
             n_expert_groups=0,
             n_limited_groups=0,
             train_gate=True,
-            gate_bias_update_factor=0.0,
+            gate_bias_update_factor=kwargs.get("gate_bias_update_factor", 0.0),
             score_func="softmax",
             route_scale=1.0,
             aux_loss_coeff=getattr(config, "router_aux_loss_coef", 0.001),
@@ -433,7 +434,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         # Replace HF text decoder with our NeMo backend
         text_config = config.text_config if hasattr(config, "text_config") else config
-        self.model.language_model = Qwen3_5MoeTextModelBackend(text_config, backend=self.backend, moe_config=moe_config)
+        self.model.language_model = Qwen3_5MoeTextModelBackend(text_config, backend=self.backend, moe_config=moe_config, **kwargs)
 
         # Replace lm_head with NeMo backend linear
         self.lm_head = initialize_linear_module(
