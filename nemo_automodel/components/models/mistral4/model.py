@@ -443,12 +443,18 @@ if _HF_MISTRAL3_AVAILABLE:
         """
 
         def __init__(
-            self, config, backend: BackendConfig, *, moe_config: MoEConfig | None = None,
+            self,
+            config,
+            backend: BackendConfig,
+            *,
+            moe_config: MoEConfig | None = None,
             gate_bias_update_factor: float = 1e-3,
         ):
             super().__init__()
             self.model = Mistral4Model(
-                config, backend, moe_config=moe_config,
+                config,
+                backend,
+                moe_config=moe_config,
                 gate_bias_update_factor=gate_bias_update_factor,
             )
             self.moe_config = self.model.moe_config
@@ -669,7 +675,9 @@ if _HF_MISTRAL3_AVAILABLE:
             vision_tower = AutoModel.from_config(config.vision_config)
             multi_modal_projector = Mistral3MultiModalProjector(config)
             language_model = Mistral4TextModelBackend(
-                text_config, backend=backend, moe_config=moe_config,
+                text_config,
+                backend=backend,
+                moe_config=moe_config,
                 gate_bias_update_factor=kwargs.pop("gate_bias_update_factor", 1e-3),
             )
 

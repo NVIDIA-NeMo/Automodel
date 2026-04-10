@@ -81,7 +81,11 @@ class Block(nn.Module):
 
 class MiniMaxM2Model(nn.Module):
     def __init__(
-        self, config: Any, backend: BackendConfig, *, moe_config: MoEConfig | None = None,
+        self,
+        config: Any,
+        backend: BackendConfig,
+        *,
+        moe_config: MoEConfig | None = None,
         gate_bias_update_factor: float = 1e-3,
     ):
         super().__init__()
