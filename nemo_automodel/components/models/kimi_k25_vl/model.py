@@ -418,9 +418,11 @@ class MoonVision3dPatchEmbed(nn.Module):
 
 
 def tpool_patch_merger(
-    x: torch.Tensor, grid_thws: torch.Tensor, merge_kernel_size: List[int] = [2, 2]
+    x: torch.Tensor, grid_thws: torch.Tensor, merge_kernel_size: List[int] = None
 ) -> List[torch.Tensor]:
     """Merge patches with temporal pooling."""
+    if merge_kernel_size is None:
+        merge_kernel_size = []
     d_model = x.size(-1)
     outputs = []
     pre_sum = 0

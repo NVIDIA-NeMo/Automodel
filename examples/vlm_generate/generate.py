@@ -186,7 +186,7 @@ def generate_response(
         Generated text response
     """
     if image_url.startswith("http"):
-        image = Image.open(requests.get(image_url, stream=True).raw)
+        image = Image.open(requests.get(image_url, stream=True, timeout=10.0).raw)
     else:
         image = Image.open(image_url)
 
