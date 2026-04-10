@@ -61,7 +61,7 @@ def _build_moe_config(config) -> MoEConfig:
         n_expert_groups=config.n_group,                  # grouping for top-k routing
         n_limited_groups=config.topk_group,
         train_gate=True,
-        gate_bias_update_factor=1e-5,
+        gate_bias_update_factor=1e-3,
         score_func="sigmoid",          # or "softmax", "softmax_with_bias"
         route_scale=config.routed_scaling_factor,
         aux_loss_coeff=0,              # auxiliary load balancing loss coefficient

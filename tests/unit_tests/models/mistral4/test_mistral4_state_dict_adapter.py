@@ -45,7 +45,7 @@ def moe_config():
         n_expert_groups=1,
         n_limited_groups=1,
         train_gate=True,
-        gate_bias_update_factor=1e-5,
+        gate_bias_update_factor=1e-3,
         score_func="softmax_with_bias",
         route_scale=1.0,
         aux_loss_coeff=0,
