@@ -285,7 +285,7 @@ class TestNemotronV3Model:
             n_activated_experts=4,
             n_expert_groups=1,
             n_limited_groups=1,
-            train_gate=False,
+            train_gate=True,
             gate_bias_update_factor=0.0,
             aux_loss_coeff=0.0,
             score_func="softmax",

@@ -88,12 +88,21 @@ class Block(nn.Module):
 
 
 class GptOssModel(nn.Module):
-    def __init__(self, config: GptOssConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
+    def __init__(
+        self,
+        config: GptOssConfig,
+        backend: BackendConfig,
+        *,
+        moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
+    ):
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
         # GPT-OSS is MoE everywhere; set shared experts to 0 to disable shared path in our MoE wrapper.
-        self.moe_config = moe_config or MoEConfig(
+        moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
             moe_inter_dim=config.intermediate_size,
@@ -114,6 +123,9 @@ class GptOssModel(nn.Module):
             activation_alpha=1.702,
             activation_limit=getattr(config, "swiglu_limit", 7.0),
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
@@ -223,7 +235,8 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig(attn="flex")
-        self.model = GptOssModel(config, backend=self.backend, moe_config=moe_config)
+        moe_overrides = kwargs.pop("moe_overrides", None)
+        self.model = GptOssModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = GPTOSSStateDictAdapter(
