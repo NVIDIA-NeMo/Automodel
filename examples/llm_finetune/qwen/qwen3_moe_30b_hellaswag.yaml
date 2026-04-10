@@ -90,7 +90,7 @@ optimizer:
   eps: 1e-8
 
 ci:
-  recipe_owner: thomasdhc
+  recipe_owner: hemildesai
   time: "00:15:00"
   checkpoint_robustness:
     hf_kl_threshold: 1e-4
