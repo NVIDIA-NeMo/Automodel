@@ -430,7 +430,7 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
         original_fn = globals().get("apply_fsdp2_sharding_recursively")
         assert original_fn is not None, "apply_fsdp2_sharding_recursively not found in module globals"
 
-        def _fsdp_by_dtype(module, mesh, mp_policy, offload_policy=None):
+        def _fsdp_by_dtype(module, mesh, mp_policy, offload_policy=None, *args, **kwargs):
             if isinstance(module, nn.ModuleList):
                 for layer_id, child in enumerate(module):
                     if isinstance(child, nn.ModuleList):
