@@ -96,8 +96,9 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  vllm_deploy: true
   recipe_owner: HuiyingLi
-  time: "00:15:00"
+  time: "00:25:00"
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
     distributed.tp_size: 2
