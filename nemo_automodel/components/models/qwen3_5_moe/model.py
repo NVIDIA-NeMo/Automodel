@@ -224,10 +224,13 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
@@ -235,7 +238,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         # --------------- MoE config ---------------
         # Qwen3.5-MoE has MoE on every layer, with a shared expert + sigmoid gate.
         # No ``decoder_sparse_step`` — defaults to 1 so every layer is MoE.
-        self.moe_config = moe_config or MoEConfig(
+        moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.hidden_size,  # unused — no dense MLP layers
             moe_inter_dim=config.moe_intermediate_size,
@@ -257,6 +260,9 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
             shared_expert_gate=True,
             shared_expert_inter_dim=config.shared_expert_intermediate_size,
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         # --------------- Layers ---------------
         embed_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
@@ -433,7 +439,10 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         # Replace HF text decoder with our NeMo backend
         text_config = config.text_config if hasattr(config, "text_config") else config
-        self.model.language_model = Qwen3_5MoeTextModelBackend(text_config, backend=self.backend, moe_config=moe_config)
+        moe_overrides = kwargs.pop("moe_overrides", None)
+        self.model.language_model = Qwen3_5MoeTextModelBackend(
+            text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
+        )
 
         # Replace lm_head with NeMo backend linear
         self.lm_head = initialize_linear_module(
