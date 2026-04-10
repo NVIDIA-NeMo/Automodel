@@ -38,18 +38,6 @@ The table below shows fine-tuning (LoRA) performance for full sequences with no 
 
 ## Glossary
 
-- **MFU**: Model FLOPs Utilization - ratio of achieved compute to peak hardware capability
-- **TP**: Tensor Parallelism - splits individual layers across GPUs
-- **PP**: Pipeline Parallelism - splits model layers into stages
-- **EP**: Expert Parallelism - distributes MoE experts across GPUs
-- **DP**: Data Parallelism - replicates model and splits data
-- **VP**: Virtual Pipeline - number of pipeline stages per GPU for interleaving
-- **MBS**: Micro-Batch Size - size of one forward pass in pipeline
-- **LBS**: Local Batch Size - size of one step per GPU
-- **GBS**: Global Batch Size - total batch size across all GPUs
-- **GA**: Gradient Accumulation - number of local-batches before optimizer step
-- **TE**: Transformer Engine kernel optimizations - RMSNorm, Linear and DotProductAttention
-- **DeepEP**: Deep Expert Parallelism - advanced EP routing for MoE models
 - **MFU**: Model FLOPs Utilization — ratio of achieved compute to peak hardware capability
 - **TP**: Tensor Parallelism — splits individual layers across GPUs
 - **PP**: Pipeline Parallelism — splits model layers into stages
@@ -68,17 +56,6 @@ The table below shows fine-tuning (LoRA) performance for full sequences with no 
 
 Pre-training benchmark configurations are available in [`examples/benchmark/configs/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs) and fine-tuning (LoRA) configurations are in [`examples/llm_finetune/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune):
 
-- [`deepseek_v3_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/deepseek_v3_te_deepep.yaml) - DeepSeek V3 with TE + DeepEP
-- [`kimi_k2_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/kimi_k2_te_deepep.yaml) - Kimi K2 optimized configuration
-- [`qwen3_moe_30b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/qwen3_moe_30b_te_deepep.yaml) - Qwen3 MoE with TE + DeepEP
-- [`gptoss_20b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/gptoss_20b_te_deepep.yaml) - GPT-OSS 20B with optimizations
-- [`gptoss_120b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/gptoss_120b_te_deepep.yaml) - GPT-OSS 120B optimized
-- [`custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_pretrain/custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml) - Llama3-70B Optimized
-- [`llama3_1_8b_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/llama3_1/llama3_1_8b_peft_benchmark.yaml) - Llama-8B Finetuning (LoRA) optimized
-- [`qwen2_5_7b_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/qwen/qwen2_5_7b_peft_benchmark.yaml) - Qwen2.5-7B Finetuning (LoRA) optimized
-- [`custom_llama3_3_70b_instruct_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark.yaml) - Llama-70B Finetuning (LoRA) optimized
-- [`custom_qwen2_5_32b_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/qwen/custom_qwen2_5_32b_peft_benchmark.yaml) - Qwen2.5-32B Finetuning (LoRA) optimized
-- [`custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml) - Llama-70B Finetuning (LoRA) optimized on 2 nodes
 - [`deepseek_v3_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/deepseek_v3_te_deepep.yaml) — DeepSeek V3 with TE + DeepEP
 - [`kimi_k2_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/kimi_k2_te_deepep.yaml) — Kimi K2 optimized configuration
 - [`qwen3_moe_30b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs/qwen3_moe_30b_te_deepep.yaml) — Qwen3 MoE with TE + DeepEP

@@ -227,37 +227,46 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     except Exception:
                         pass
 
-            # For HF-native models in transformers >= 5.3.0, GradientCheckpointingLayer.__call__
-            # applies torch.utils.checkpoint at full-layer granularity when gradient_checkpointing=True.
-            # This avoids OOM memory fragmentation from 4 × N_layers CheckpointWrapper sub-module
-            # objects (mlp/self_attn/layernorms) + transformers 5.3.0 output_capturing.py overhead.
-            _use_hf_native_grad_ckpt = False
-            try:
-                from transformers.modeling_layers import (
-                    GradientCheckpointingLayer as _HFGradLayer,
-                )
-
-                _use_hf_native_grad_ckpt = (
-                    bool(layers)
-                    and layers[0].__class__.__module__.startswith("transformers.")
-                    and isinstance(layers[0], _HFGradLayer)
-                    and getattr(model, "supports_gradient_checkpointing", False)
-                    and hasattr(model, "gradient_checkpointing_enable")
-                )
-            except ImportError:
-                pass  # transformers < 5.3.0, fall through to sub-module wrapping
-
-            if _use_hf_native_grad_ckpt:
-                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+            if enable_compile:
+                # NO_REENTRANT is required for compile: REENTRANT's first forward runs under
+                # no_grad, causing AOT autograd to trace a forward-only graph that drops LoRA
+                # (and other trainable) weight gradients.  Wrapping must happen BEFORE FSDP2
+                # sharding so the module structure is stable when fully_shard() indexes params.
+                for layer in layers:
+                    for attr in ("self_attn", "mlp"):
+                        m = getattr(layer, attr, None)
+                        if m is not None:
+                            setattr(layer, attr, checkpoint_wrapper(m, checkpoint_impl=CheckpointImpl.NO_REENTRANT))
             else:
-                for i, layer in enumerate(layers):
-                    if hasattr(layer, "mlp"):
-                        layers[i].mlp = checkpoint_wrapper(layer.mlp)
-                    # Skip self_attn checkpointing for KV-shared models:
-                    # recomputation would double-write to the DynamicCache,
-                    # corrupting K/V entries that shared layers depend on.
-                    if hasattr(layer, "self_attn") and not _has_kv_sharing:
-                        layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
+                # Preserve original behavior when compile is disabled.
+                # For HF models on transformers >= 5.3.0, GradientCheckpointingLayer applies
+                # AC at full-layer granularity via __call__ -- fewer CheckpointWrapper objects
+                # and no memory-fragmentation overhead from sub-module wrapping.
+                _use_hf_native_grad_ckpt = False
+                try:
+                    from transformers.modeling_layers import GradientCheckpointingLayer as _HFGradLayer
+
+                    _use_hf_native_grad_ckpt = (
+                        bool(layers)
+                        and layers[0].__class__.__module__.startswith("transformers.")
+                        and isinstance(layers[0], _HFGradLayer)
+                        and getattr(model, "supports_gradient_checkpointing", False)
+                        and hasattr(model, "gradient_checkpointing_enable")
+                    )
+                except ImportError:
+                    pass
+
+                if _use_hf_native_grad_ckpt:
+                    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+                else:
+                    for layer in layers:
+                        if hasattr(layer, "mlp"):
+                            layer.mlp = checkpoint_wrapper(layer.mlp)
+                        # Skip self_attn checkpointing for KV-shared models:
+                        # recomputation would double-write to the DynamicCache,
+                        # corrupting K/V entries that shared layers depend on.
+                        if hasattr(layer, "self_attn") and not _has_kv_sharing:
+                            layer.self_attn = checkpoint_wrapper(layer.self_attn)
 
         # Set up mixed precision policy
         if not mp_policy:
@@ -663,34 +672,24 @@ def _patch_dtensor_spec_hash_for_symint() -> None:
 
 
 def _apply_per_layer_compile(model: nn.Module) -> None:
-    """Apply NO_REENTRANT AC to self_attn/mlp, then compile the whole decoder layer.
+    """Compile each decoder layer in-place after FSDP2 sharding.
 
-    Strategy: wrap self_attn and mlp with NO_REENTRANT checkpoint_wrapper, then call
-    module.compile() on the *whole decoder layer* (not on the sub-modules).
+    Compiles at decoder-layer granularity (not sub-module) so that AOT autograd traces
+    the joint fwd+bwd graph under the training loop's enable_grad context.  Sub-module
+    compile (e.g. on mlp alone) would be traced during activation checkpointing's first
+    forward pass which runs under no_grad, producing a forward-only graph that drops
+    LoRA and other trainable-parameter gradients.
 
-    Why this order matters for LoRA gradients:
+    Prerequisite: NO_REENTRANT checkpoint_wrapper must already be applied to self_attn
+    and mlp before FSDP2 sharding (done in DefaultParallelizationStrategy).  This
+    function only handles the compile step.
 
-    REENTRANT's first forward runs under torch.no_grad() (CheckpointFunction.forward
-    always wraps the run_function call in no_grad).  When torch.compile is called on a
-    sub-module from inside that no_grad context, AOT autograd traces a *forward-only*
-    graph -- it never compiles a backward, because no gradients can flow under no_grad.
-    When REENTRANT's backward then re-runs the sub-module under torch.enable_grad(),
-    it reuses that cached forward-only graph -> LoRA weight gradients are never computed
-    (640/642 params showed zero grad in both sub-module REENTRANT and layer REENTRANT).
+    nn.Module.compile() is used instead of torch.compile() to compile in-place without
+    introducing an _orig_mod wrapper, which would add a key prefix and break checkpoint
+    loading.
 
-    By compiling at the *decoder-layer* level instead:
-    - The outer model's training loop calls module.compile() for the first time during
-      a normal forward pass under torch.enable_grad().
-    - AOT autograd traces a *joint* fwd+bwd graph that includes LoRA weight gradients.
-    - NO_REENTRANT AC is handled as a higher-order op *inside* the compiled graph, so
-      the recompute also runs inside the compiled backward -- still under enable_grad,
-      with the full joint graph -- and LoRA grads accumulate correctly.
-
-    nn.Module.compile() is used instead of torch.compile() because it compiles in-place
-    without introducing the _orig_mod wrapper, preserving fully-qualified parameter names.
-
-    _patch_dtensor_spec_hash_for_symint() is called here to allow torch.compile with
-    dynamic shapes to coexist with DTensor's lru_cache-based sharding propagation.
+    _patch_dtensor_spec_hash_for_symint() is called to allow torch.compile with dynamic
+    shapes to coexist with DTensor's lru_cache-based sharding propagation.
     """
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
@@ -709,54 +708,13 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
     items = module_list.items() if isinstance(module_list, nn.ModuleDict) else enumerate(module_list)
 
     compiled_count = 0
+    for _, layer in items:
+        # Unwrap any layer-level checkpoint wrapper (PP path) to reach the actual decoder layer.
+        actual_layer = layer._checkpoint_wrapped_module if isinstance(layer, CheckpointWrapper) else layer
+        actual_layer.compile()
+        compiled_count += 1
 
-    def _compile_single_layer(actual_layer):
-        """Apply NO_REENTRANT AC re-wrap + torch.compile to one transformer layer."""
-        nonlocal compiled_count
-        any_ac = False
-        for attr in ("self_attn", "mlp"):
-            existing = getattr(actual_layer, attr, None)
-            if existing is None:
-                continue
-            # Unwrap any existing checkpoint wrapper so we can re-apply NO_REENTRANT.
-            if isinstance(existing, CheckpointWrapper):
-                inner = existing._checkpoint_wrapped_module
-            else:
-                inner = existing
-            setattr(actual_layer, attr, checkpoint_wrapper(inner, checkpoint_impl=CheckpointImpl.NO_REENTRANT))
-            any_ac = True
-
-        # Unwrap layernorms -- they are lightweight and do not need AC.
-        for attr in ("input_layernorm", "post_attention_layernorm"):
-            existing = getattr(actual_layer, attr, None)
-            if isinstance(existing, CheckpointWrapper):
-                setattr(actual_layer, attr, existing._checkpoint_wrapped_module)
-
-        if any_ac:
-            compiled_count += 1
-            actual_layer.compile()
-        return actual_layer
-
-    for i, layer in items:
-        # Unwrap any existing layer-level checkpoint wrapper (e.g. from PP path).
-        if isinstance(layer, CheckpointWrapper):
-            actual_layer = layer._checkpoint_wrapped_module
-            layer_was_wrapped = True
-        else:
-            actual_layer = layer
-            layer_was_wrapped = False
-
-        compiled = _compile_single_layer(actual_layer)
-        if compiled is not actual_layer:
-            module_list[i] = compiled
-        elif layer_was_wrapped:
-            module_list[i] = layer
-
-    logger.info(
-        "Per-layer torch.compile applied to %d decoder layers "
-        "(self_attn + mlp with NO_REENTRANT AC inside layer-level compile)",
-        compiled_count,
-    )
+    logger.info("Per-layer torch.compile applied to %d decoder layers", compiled_count)
 
 
 def apply_fsdp2_sharding_recursively(

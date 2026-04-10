@@ -124,6 +124,68 @@ def attach_context_parallel_hooks(model: torch.nn.Module):
             module.register_forward_pre_hook(_self_attn_pre_forward_hook, with_kwargs=True, prepend=True)
 
 
+def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
+    """Inject CP-aware SDPA into self_attn modules for compile + CP>1 correctness.
+
+    Problem: when per-layer torch.compile is active, Dynamo traces through the decoder
+    layer including Q/K/V projections.  At the F.scaled_dot_product_attention call site,
+    Q/K/V are already local tensors (DTensor metadata was never propagated through the
+    compiled graph).  The DTensor SDPA dispatch — which triggers the CP allgather — never
+    fires, so each rank silently attends only to its local sequence shard.
+
+    Fix: swap F.scaled_dot_product_attention with a @torch._dynamo.disable wrapper for
+    the duration of each self_attn forward.  Dynamo sees the disabled function and creates
+    a graph break there, so:
+      - Everything before (Q/K/V proj + RoPE) is compiled and fused.
+      - The disabled wrapper runs eagerly: re-wraps local Q/K/V as DTensors with
+        Shard(2) on the CP mesh so the DTensor SDPA dispatch fires the allgather.
+      - Everything after (O proj + residual + MLP) is compiled and fused.
+
+    Seq dim at the SDPA call is 2: tensors are [B, nH, S/cp_size, D] after HF reshape.
+    """
+    import torch.nn.functional as F_module
+    from torch.distributed.tensor import DTensor, Shard
+
+    _original_sdpa = F_module.scaled_dot_product_attention
+
+    @torch._dynamo.disable
+    def _cp_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False, **kwargs):
+        # Re-wrap local Q/K/V as DTensors so DTensor SDPA dispatch fires the CP allgather.
+        # Seq dim is 2: [B, nH, S/cp_size, D].
+        if not isinstance(query, DTensor):
+            query = DTensor.from_local(query, device_mesh=cp_mesh, placements=[Shard(2)])
+            key = DTensor.from_local(key, device_mesh=cp_mesh, placements=[Shard(2)])
+            value = DTensor.from_local(value, device_mesh=cp_mesh, placements=[Shard(2)])
+        out = _original_sdpa(
+            query, key, value,
+            attn_mask=attn_mask, dropout_p=dropout_p,
+            is_causal=is_causal, scale=scale, enable_gqa=enable_gqa,
+            **kwargs,
+        )
+        # Unwrap back to local tensor for the compiled O-proj + MLP region.
+        return out.to_local() if isinstance(out, DTensor) else out
+
+    def _pre_hook(module, args, kwargs):
+        F_module.scaled_dot_product_attention = _cp_sdpa
+        return args, kwargs
+
+    def _post_hook(module, inputs, output):
+        F_module.scaled_dot_product_attention = _original_sdpa
+
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+    for name, module in model.named_modules():
+        if name.endswith("self_attn"):
+            # Hook on the inner attention module so the hook fires during both
+            # the original forward AND gradient-checkpointing recompute.
+            # CheckpointWrapper's recompute bypasses __call__ (and thus pre-hooks
+            # on the wrapper itself), so we must hook on the wrapped module directly.
+            target = module._checkpoint_wrapped_module if isinstance(module, CheckpointWrapper) else module
+            target.register_forward_pre_hook(_pre_hook, with_kwargs=True)
+            # always_call=True ensures _original_sdpa is restored even if the forward raises.
+            target.register_forward_hook(_post_hook, always_call=True)
+
+
 def attach_linear_attn_position_hooks(model: torch.nn.Module):
     """Forward pre-hook on decoder layers to pass position_ids to linear_attn.
 
