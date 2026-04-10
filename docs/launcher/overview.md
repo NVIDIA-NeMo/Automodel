@@ -11,7 +11,7 @@ NeMo AutoModel provides several ways to launch training. The right choice depend
 | **SkyPilot** | Cloud training (AWS, GCP, Azure) with spot pricing | Any | [SkyPilot](./skypilot.md) |
 | **Slurm** | Multi-node batch jobs on HPC clusters | 8+ across nodes | [Slurm](./slurm.md) |
 
-### I have 1-2 GPUs on my workstation
+### I Have 1–2 GPUs on My Workstation
 
 Use the **interactive** launcher. No scheduler or cluster software needed:
 
