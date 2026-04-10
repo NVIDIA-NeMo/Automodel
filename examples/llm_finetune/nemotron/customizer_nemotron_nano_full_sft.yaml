@@ -1,3 +1,5 @@
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 dist_env:
   backend: nccl
   timeout_minutes: 30
