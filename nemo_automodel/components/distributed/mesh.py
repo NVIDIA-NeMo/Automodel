@@ -158,6 +158,11 @@ class MeshContext:
         """HSDP replication degree (from ``device_mesh``, default ``None``)."""
         return _get_axis_size(self.device_mesh, MeshAxisName.DP_REPLICATE, default=None)
 
+    @property
+    def dp_shard_size(self) -> int:
+        """DP shard degree (from ``device_mesh``, default ``1``)."""
+        return _get_axis_size(self.device_mesh, MeshAxisName.DP_SHARD, default=1)
+
     # Axis-name helpers (used by AutoPipeline and parallelize_model)
     def _dp_axis_names(self) -> Tuple[str, ...]:
         """DP axis names for FSDP mesh slicing."""

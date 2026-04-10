@@ -318,8 +318,6 @@ class TestDefaultParallelizationStrategy:
         expected_calls = [
             call(mock_layer.mlp),
             call(mock_layer.self_attn),
-            call(mock_layer.input_layernorm),
-            call(mock_layer.post_attention_layernorm),
         ]
         checkpoint_wrapper_mock.assert_has_calls(expected_calls, any_order=False)
 

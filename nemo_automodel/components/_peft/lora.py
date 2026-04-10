@@ -20,6 +20,8 @@ from typing import Any, Literal, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Shard as _Shard
 
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components._peft.lora_kernel import (
@@ -244,7 +246,21 @@ class LinearLoRA(nn.Linear):
             bias = self.bias
             if bias is not None and bias.numel() == 0:
                 bias = None
-            res = F.linear(x, self.weight, bias)
+            # bmm avoids aten.view which cannot flatten a sharded dimension.
+            # F.linear calls view([b,s,h]->[b*s,h]) which fails when dim 0/1 is sharded
+            # (sequence parallelism) or during AOT-autograd tracing with compile.
+            _x_needs_bmm = (
+                isinstance(x, DTensor)
+                and x.dim() == 3
+                and any(isinstance(p, _Shard) and p.dim < 2 for p in x.placements)
+            )
+            if torch.compiler.is_compiling() or _x_needs_bmm:
+                b = x.shape[0]
+                res = torch.bmm(x, self.weight.t().unsqueeze(0).expand(b, -1, -1))
+                if bias is not None:
+                    res = res + bias
+            else:
+                res = F.linear(x, self.weight, bias)
 
         if not self.use_dora:
             if self.dropout_position == "pre":

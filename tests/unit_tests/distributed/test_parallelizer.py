@@ -727,8 +727,13 @@ class TestApplyFsdpShardingRecursively:
         self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy, mock_offload_policy
     ):
         """Test apply_fsdp2_sharding_recursively with a ModuleList."""
-        # Set up mock return values
-        mock_fully_shard.side_effect = lambda x, **kwargs: x  # Return the module unchanged
+        # Set up mock return values - add FSDP2 prefetch methods that fully_shard normally provides
+        def mock_shard(x, **kwargs):
+            x.set_modules_to_forward_prefetch = MagicMock()
+            x.set_modules_to_backward_prefetch = MagicMock()
+            return x
+
+        mock_fully_shard.side_effect = mock_shard
 
         # Call the function
         apply_fsdp2_sharding_recursively(
@@ -756,8 +761,13 @@ class TestApplyFsdpShardingRecursively:
         self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy
     ):
         """Test apply_fsdp2_sharding_recursively with a ModuleList and no offload policy."""
-        # Set up mock return values
-        mock_fully_shard.side_effect = lambda x, **kwargs: x
+        # Set up mock return values - add FSDP2 prefetch methods that fully_shard normally provides
+        def mock_shard(x, **kwargs):
+            x.set_modules_to_forward_prefetch = MagicMock()
+            x.set_modules_to_backward_prefetch = MagicMock()
+            return x
+
+        mock_fully_shard.side_effect = mock_shard
 
         # Call the function without offload_policy
         apply_fsdp2_sharding_recursively(module=mock_module_list, mesh=mock_mesh, mp_policy=mock_mp_policy)

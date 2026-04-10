@@ -56,6 +56,12 @@ class FSDP2Config:
     Attributes:
         sequence_parallel (bool): Enable sequence parallelism in TP plan.
         tp_plan (Optional[dict]): Custom TP plan. If None, auto-selected based on model type.
+        patch_is_packed_sequence (bool): Patch ``transformers._is_packed_sequence`` to always
+            return Python ``False``. This does two things: (1) removes a CPU-GPU sync per
+            attention layer (``aten::is_nonzero`` triggered by HF when batch_size==1), and
+            (2) ensures static attention shapes for ``torch.compile``. Safe for standard
+            (non-packed) training only. Disable if using packed-sequence training
+            (position_ids that reset to 0 mid-sequence). Default ``False``.
         mp_policy (Optional[MixedPrecisionPolicy]): MixedPrecisionPolicy for FSDP2.
             Can be configured from YAML using the ``_target_`` pattern::
 
@@ -74,16 +80,38 @@ class FSDP2Config:
         activation_checkpointing (bool): Enable activation checkpointing.
         defer_fsdp_grad_sync (bool): Defer FSDP gradient sync to final micro-batch.
         backend (str): Distributed backend.
+        enable_async_tensor_parallel (bool): Enable async tensor parallelism via
+            ``torch._inductor.config._micro_pipeline_tp``.  Overlaps ReduceScatter with
+            compute in row-parallel layers.  Requires ``sequence_parallel=True`` (forced
+            automatically with a warning if not set).  Also enables symmetric memory for
+            the TP group.
+        enable_compile (bool): Apply per-layer ``torch.compile`` to transformer decoder
+            layers (with NO_REENTRANT activation checkpointing inside each compiled layer).
+            Skips whole-model compile so that checkpoint loading does not produce
+            ``_orig_mod`` key-prefix mismatches.
+        enable_fsdp2_prefetch (bool): Enable explicit forward/backward prefetch chains
+            between FSDP2 sharded layers.  Default ``True``.
+        fsdp2_backward_prefetch_depth (int): Number of FSDP units to prefetch during
+            backward pass.  ``2`` hides AllGather behind compute; ``1`` reduces peak
+            memory at a small throughput cost.  Default ``2``.
+        fsdp2_forward_prefetch_depth (int): Number of FSDP units to prefetch during
+            forward pass.  Default ``1``.
     """
 
     sequence_parallel: bool = False
     tp_plan: Optional[dict] = None
+    patch_is_packed_sequence: bool = False
     mp_policy: Optional[MixedPrecisionPolicy] = None
     offload_policy: Optional[CPUOffloadPolicy] = None
     autocast_dtype: Optional[torch.dtype] = None
     activation_checkpointing: bool = False
     defer_fsdp_grad_sync: bool = True
     backend: str = "nccl"
+    enable_async_tensor_parallel: bool = False
+    enable_compile: bool = False
+    enable_fsdp2_prefetch: bool = False
+    fsdp2_backward_prefetch_depth: int = 2
+    fsdp2_forward_prefetch_depth: int = 1
 
     def __post_init__(self):
         if self.mp_policy is None:
