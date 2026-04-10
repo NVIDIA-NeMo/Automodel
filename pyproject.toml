@@ -211,7 +211,7 @@ constraint-dependencies = [
     "mlflow>=3.11.1", # Address CVE (no fix available, pinning to latest)
     "tornado>=6.5.5",
     "onnx>=1.21.0",
-    "pyjwt>=2.10.1",
+    "pyjwt>=2.12.0",
     "pytest>=8.4.3",
     "pygments>=2.20.0",
 ]
