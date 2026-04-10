@@ -83,7 +83,7 @@ class DeepseekV32Model(DeepseekV3Model):
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
-        **kwargs,
+        gate_bias_update_factor: float = 1e-3,
     ):
         # Call grandparent __init__ to skip DeepseekV3Model's __init__
         nn.Module.__init__(self)
@@ -100,7 +100,7 @@ class DeepseekV32Model(DeepseekV3Model):
             n_expert_groups=config.n_group,
             n_limited_groups=config.topk_group,
             train_gate=True,
-            gate_bias_update_factor=kwargs.get("gate_bias_update_factor", 1e-3),
+            gate_bias_update_factor=gate_bias_update_factor,
             score_func="sigmoid",
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0,
@@ -171,7 +171,12 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         self.config = config
         self.backend = backend or BackendConfig()
         # Use V3.2 Model instead of V3 Model
-        self.model = DeepseekV32Model(config, backend=self.backend, moe_config=moe_config, **kwargs)
+        self.model = DeepseekV32Model(
+            config,
+            backend=self.backend,
+            moe_config=moe_config,
+            gate_bias_update_factor=kwargs.pop("gate_bias_update_factor", 1e-3),
+        )
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             # Use V3.2 adapter instead of V3 adapter
