@@ -268,9 +268,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
         # Base model
         moe_overrides = kwargs.pop("moe_overrides", None)
+        moe_config = kwargs.pop("moe_config", None)
         self.model = NemotronV3Model(
             config,
             backend=self.backend,
+            moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
         self.output_hidden_states = config.to_dict().get("output_hidden_states", False)
