@@ -177,11 +177,13 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
-        moe_overrides=None,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size

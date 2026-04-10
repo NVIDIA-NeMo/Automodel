@@ -104,6 +104,8 @@ class Glm4MoeModel(nn.Module):
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
         # Map HF GLM4 MoE config -> our MoE wrapper
         # GLM4 MoE config fields:

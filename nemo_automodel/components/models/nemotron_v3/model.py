@@ -60,6 +60,8 @@ class NemotronV3Model(nn.Module):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
         moe_defaults = dict(
             n_routed_experts=config.n_routed_experts,
             n_shared_experts=1,  # NemotronV3 has 1 shared expert

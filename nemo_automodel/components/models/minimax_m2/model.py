@@ -91,6 +91,8 @@ class MiniMaxM2Model(nn.Module):
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
         # Keep compatibility with generic MoE utilities that read config.num_experts.
         self.config.num_experts = getattr(config, "num_local_experts", getattr(config, "num_experts", None))
 

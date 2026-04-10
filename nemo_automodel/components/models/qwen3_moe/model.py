@@ -98,11 +98,18 @@ class Block(nn.Module):
 
 class Qwen3MoeModel(nn.Module):
     def __init__(
-        self, config: Qwen3MoeConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None, moe_overrides=None
+        self,
+        config: Qwen3MoeConfig,
+        backend: BackendConfig,
+        *,
+        moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
         # Map HF Qwen3 MoE config -> our MoE wrapper
         # Qwen config fields from example config:

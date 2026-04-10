@@ -192,6 +192,8 @@ class Mistral4Model(nn.Module):
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
         self.moe_config = moe_config or _build_moe_config(config, moe_overrides=moe_overrides)
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
@@ -455,6 +457,8 @@ if _HF_MISTRAL3_AVAILABLE:
             moe_overrides: dict | None = None,
         ):
             super().__init__()
+            if moe_config is not None and moe_overrides is not None:
+                raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
             self.model = Mistral4Model(
                 config,
                 backend,

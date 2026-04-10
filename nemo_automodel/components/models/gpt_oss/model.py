@@ -89,11 +89,18 @@ class Block(nn.Module):
 
 class GptOssModel(nn.Module):
     def __init__(
-        self, config: GptOssConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None, moe_overrides=None
+        self,
+        config: GptOssConfig,
+        backend: BackendConfig,
+        *,
+        moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
         # GPT-OSS is MoE everywhere; set shared experts to 0 to disable shared path in our MoE wrapper.
         moe_defaults = dict(
             dim=config.hidden_size,

@@ -49,11 +49,13 @@ class Qwen3OmniMoeThinkerTextModel(
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
-        moe_overrides=None,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
         # Map HF Qwen3OmniMoe config -> our MoE wrapper
         self.padding_idx = getattr(config, "pad_token_id", None)
